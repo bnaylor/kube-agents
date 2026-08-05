@@ -78,6 +78,9 @@ cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
 # ─── Universal Argument Parsing ──────────────────────────────────────────────
+# Seed from the environment so `NO_CONFIRM=1 make gcp-provision` works. A bare
+# assignment here would overwrite an inherited value, leaving the flag as the
+# only way to set it — and `make` has no way to pass one through to every stage.
 DRY_RUN="${DRY_RUN:-0}"
 NO_CONFIRM="${NO_CONFIRM:-0}"
 for arg in "$@"; do
