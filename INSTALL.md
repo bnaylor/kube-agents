@@ -178,6 +178,19 @@ make gcp-provision
   make gcp-provision ARGS="--dry-run"
   ```
 
+- **Unattended runs** (CI, cron, or an agent driving the install): the pipeline detects that
+  there is no terminal and takes the saved or default value for every prompt instead of
+  waiting for input. Force the same behaviour on a terminal with `NO_CONFIRM=1` (or `CI=true`).
+  `IMAGE_TAG` is the one value with no default — export it explicitly, so an unattended run
+  cannot silently pick a tag you did not choose:
+
+  ```bash
+  IMAGE_TAG=latest NO_CONFIRM=1 make gcp-provision
+  ```
+
+  Anything the run must not prompt for — API keys, Slack tokens — should be written to
+  `scripts/vars.sh` (or exported) beforehand. Values already present are reused as-is.
+
 #### Security & CMEK Encryption
 
 The automated installer includes local state hardening and Cloud KMS (CMEK) etcd database encryption:
