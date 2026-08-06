@@ -1464,5 +1464,126 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertNotEqual(sanitized, long_flag)
 
 
+class ReadOnlyOverTheSocketTest(unittest.TestCase):
+    """A mutation must stop at the proxy socket, not merely at a decision function."""
+
+    def setUp(self):
+        self.executed = []
+        owner = self
+
+        class RecordingExecutor:
+            ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+            def git_lease_violation(self, argv, cwd):
+                return None
+
+            def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+                owner.executed.append(argv)
+                return credential_proxy.ExecutionResult(
+                    exit_code=0, stdout="", stderr="",
+                    duration_ms=0, truncated=False, timed_out=False,
+                )
+
+        self.original_executor = getattr(CredentialProxyHandler, 'executor', None)
+        self.original_policy = getattr(CredentialProxyHandler, 'policy', None)
+        self.original_enforce = getattr(CredentialProxyHandler, 'enforce_read_only', True)
+        CredentialProxyHandler.executor = RecordingExecutor()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        if self.original_executor is not None:
+            CredentialProxyHandler.executor = self.original_executor
+        if self.original_policy is not None:
+            CredentialProxyHandler.policy = self.original_policy
+        CredentialProxyHandler.enforce_read_only = self.original_enforce
+
+    def _post(self, argv):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps({"requestId": "t", "argv": argv, "cwd": "/tmp"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_a_read_reaches_the_executor(self):
+        """kubectl get pods (a read) should reach the executor and return 200."""
+        status, payload = self._post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executed)
+
+    def test_a_kubectl_mutation_never_reaches_the_executor(self):
+        """kubectl delete ns prod (a mutation) should be blocked before reaching executor."""
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("kubernetes.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_a_gcloud_mutation_never_reaches_the_executor(self):
+        """gcloud container clusters delete should be blocked before reaching executor."""
+        status, payload = self._post(["gcloud", "container", "clusters", "delete", "c"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("gcp.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_identity_flag_refusal_over_the_wire(self):
+        """kubectl --as=admin@corp.com get secrets should be blocked for impersonation."""
+        status, payload = self._post(["kubectl", "--as=admin@corp.com", "get", "secrets"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("identity.caller-supplied-impersonation", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_kill_switch_allows_mutation_through(self):
+        """With enforce_read_only = False, mutations should reach the executor."""
+        CredentialProxyHandler.enforce_read_only = False
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(200, status)
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual([["kubectl", "delete", "ns", "prod"]], self.executed)
+
+    def test_credential_denylist_takes_precedence_over_read_only(self):
+        """A rule from the credential denylist should report its own rule_id, not read-only.
+
+        The gate runs after policy.blocked_by, so credential rules like
+        kubernetes.token-disclosure keep their own rule ids rather than being
+        masked by a read-only refusal.
+        """
+        # Create a policy with a rule that blocks token disclosure
+        rules = [
+            credential_proxy.Rule(
+                rule_id="kubernetes.token-disclosure",
+                pattern=__import__('re').compile(r"create\s+token", __import__('re').IGNORECASE),
+                message="Token disclosure is not allowed"
+            )
+        ]
+        CredentialProxyHandler.policy = Policy(
+            rules=rules,
+            blocked_message="blocked"
+        )
+
+        # This command matches the denylist rule, not the read-only gate
+        status, payload = self._post(["kubectl", "create", "token", "sa"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        # Should report the denylist rule, not read-only
+        self.assertEqual("kubernetes.token-disclosure", payload["rule"])
+        self.assertEqual([], self.executed)
+
+
 if __name__ == "__main__":
     unittest.main()
