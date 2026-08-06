@@ -106,23 +106,39 @@ class KubectlReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("kubernetes.read-only", decision.rule_id)
 
-    def test_known_subcommands_work_across_command_specific_flags(self):
-        # Adjacent bare words are treated as verb + subcommand. Known flags after
-        # the verb don't break this because we only skip known global flags before
-        # the first word.
+    def test_global_flags_between_verb_and_subcommand_are_skipped(self):
+        # Known global flags can appear between the verb and subcommand, and we
+        # skip them to find the subcommand. This allows real kubectl commands like
+        # `rollout -n prod status` to work correctly.
         cases = (
-            ["kubectl", "get", "pods", "-o", "wide"],
-            ["kubectl", "rollout", "status", "deploy/x"],
-            ["kubectl", "rollout", "restart", "deploy/x"],
-            ["kubectl", "config", "current-context"],
+            (["kubectl", "rollout", "-n", "prod", "status", "deploy/x"], True, "rollout -n status"),
+            (["kubectl", "auth", "-n", "prod", "can-i", "create", "pods"], True, "auth -n can-i"),
+            (["kubectl", "config", "--kubeconfig", "f", "view"], True, "config --kubeconfig view"),
         )
-        for argv in cases:
-            with self.subTest(argv=argv):
-                is_allowed = evaluate(argv).allowed
-                if "restart" in argv:
-                    self.assertFalse(is_allowed)
-                else:
-                    self.assertTrue(is_allowed)
+        for argv, expected_allowed, desc in cases:
+            with self.subTest(desc=desc):
+                self.assertEqual(evaluate(argv).allowed, expected_allowed, desc)
+
+    def test_unknown_flags_between_verb_and_subcommand_stop_parsing(self):
+        # An unknown flag between the verb and subcommand stops us from finding
+        # the subcommand, so a two-word verb is refused. This is safe because
+        # the unknown flag could have arbitrary arity.
+        decision = evaluate(["kubectl", "rollout", "-n", "status", "restart", "x"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("kubernetes.read-only", decision.rule_id)
+
+    def test_adjacent_subcommands_still_work(self):
+        # Subcommands that appear immediately after the verb are still found and
+        # evaluated correctly.
+        cases = (
+            (["kubectl", "rollout", "status", "deploy/x"], True, "rollout status"),
+            (["kubectl", "rollout", "restart", "deploy/x"], False, "rollout restart"),
+            (["kubectl", "config", "current-context"], True, "config current-context"),
+            (["kubectl", "get", "pods", "-o", "wide"], True, "get pods with flag after"),
+        )
+        for argv, expected_allowed, desc in cases:
+            with self.subTest(desc=desc):
+                self.assertEqual(evaluate(argv).allowed, expected_allowed, desc)
 
     def test_exec_is_read_only_refused(self):
         # exec is mutating (it runs arbitrary code in the container).

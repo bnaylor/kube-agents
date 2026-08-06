@@ -149,15 +149,27 @@ def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
         # Reached end of argv without finding a bare word.
         return None
 
-    # Phase 2: Look for a second bare word. Once we have the verb, a flag
-    # cannot hide it, so stop if the next token is a flag. Do not skip over
-    # flags hunting for word two -- that reopens the hole one level down.
-    # An unknown command-specific flag that takes a value could otherwise make
-    # `rollout --someflag status restart x` read as `("rollout","status")` and
-    # allow a restart. Better to false-refuse `rollout --unknown status x` as
-    # unreadable by stopping at the flag, rare, and the safe direction.
-    if index < len(argv) and not argv[index].startswith("-"):
-        word2 = argv[index]
+    # Phase 2: Look for a second bare word. Skip flags of known arity (we can
+    # correctly consume their values), but stop dead on anything unrecognized.
+    # This allows `kubectl rollout -n prod status x` to work (known flag, safe
+    # to skip) while refusing `kubectl rollout --unknown status x` (could hide
+    # the subcommand). An unknown command-specific flag that takes a value could
+    # otherwise make `rollout --someflag status restart x` read as
+    # `("rollout","status")` and allow a restart.
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("-"):
+            name, separator, _ = token.partition("=")
+            # Stop on unknown flags (arity unknown, could hide the subcommand).
+            if name not in _KUBECTL_FLAGS_WITH_VALUE and name not in _KUBECTL_BOOLEAN_FLAGS:
+                break
+            # Skip known flags, consuming their value if needed.
+            if name in _KUBECTL_FLAGS_WITH_VALUE and not separator:
+                index += 1
+            index += 1
+            continue
+        # Found a bare word (the subcommand).
+        word2 = token
         return (word1, word2)
 
     return (word1,)
