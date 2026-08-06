@@ -75,6 +75,61 @@ class KubectlReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("kubernetes.unreadable-command", decision.rule_id)
 
+    def test_boolean_global_flags_do_not_hide_the_verb(self):
+        # Boolean flags like --insecure-skip-tls-verify do not consume the next
+        # token, so the verb appears immediately after. This test pins the
+        # _KUBECTL_BOOLEAN_FLAGS constant.
+        decision = evaluate(["kubectl", "--insecure-skip-tls-verify", "get", "pods"])
+        self.assertTrue(decision.allowed)
+
+    def test_command_specific_flags_do_not_hide_the_verb(self):
+        # Flags after the verb cannot hide it, so we stop looking for a subcommand
+        # when we encounter one. These are all legitimate read commands.
+        cases = (
+            ["kubectl", "logs", "-f", "mypod"],
+            ["kubectl", "logs", "--tail=100", "mypod"],
+            ["kubectl", "get", "-o", "wide", "pods"],
+            ["kubectl", "get", "--all-namespaces", "pods"],
+            ["kubectl", "describe", "-l", "app=x", "pods"],
+            ["kubectl", "events", "--for", "pod/x"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed)
+
+    def test_false_refusal_on_unknown_command_specific_flag(self):
+        # Once we have the verb, an unknown flag cannot hide it. But stopping at
+        # the flag means we don't get a second word, so a two-word verb is refused.
+        # This is intentional: the alternative (skipping unknown flags) reopens the
+        # hole. `rollout --unknown status x` is false-refused, which is acceptable.
+        decision = evaluate(["kubectl", "rollout", "--unknown", "status", "x"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("kubernetes.read-only", decision.rule_id)
+
+    def test_known_subcommands_work_across_command_specific_flags(self):
+        # Adjacent bare words are treated as verb + subcommand. Known flags after
+        # the verb don't break this because we only skip known global flags before
+        # the first word.
+        cases = (
+            ["kubectl", "get", "pods", "-o", "wide"],
+            ["kubectl", "rollout", "status", "deploy/x"],
+            ["kubectl", "rollout", "restart", "deploy/x"],
+            ["kubectl", "config", "current-context"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                is_allowed = evaluate(argv).allowed
+                if "restart" in argv:
+                    self.assertFalse(is_allowed)
+                else:
+                    self.assertTrue(is_allowed)
+
+    def test_exec_is_read_only_refused(self):
+        # exec is mutating (it runs arbitrary code in the container).
+        decision = evaluate(["kubectl", "exec", "pod", "--", "rm", "-rf", "/"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("kubernetes.read-only", decision.rule_id)
+
     def test_git_and_gh_are_not_this_gates_business(self):
         # The artifact plane is where the agent is supposed to write, and the
         # git workspace lease already governs it.

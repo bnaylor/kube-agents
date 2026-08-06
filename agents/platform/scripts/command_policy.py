@@ -119,25 +119,48 @@ def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
 
     None is a refusal rather than a shrug: an argv whose verb cannot be found
     is an argv whose effect is unknown, and the caller denies on it.
+
+    This function applies the strict unknown-flag rule only to global flags
+    (which come before the verb). Command-specific flags (which come after)
+    cannot hide the verb, so we stop at the first one rather than skipping
+    over it. This avoids false refusals for common commands like `kubectl logs -f`.
     """
-    words: list[str] = []
+    # Phase 1: Skip global flags until we find the first bare word (the verb).
+    # Unknown flags are rejected; they could hide the verb.
     index = 1
-    while index < len(argv) and len(words) < 2:
+    while index < len(argv):
         token = argv[index]
         if token.startswith("-"):
             name, separator, _ = token.partition("=")
-            # Unknown flags (whether value-taking or boolean) are refused so that
-            # a new kubectl release doesn't silently bypass this gate. A flag we
-            # don't recognize could be anything; claim the verb is unreadable.
+            # Unknown flags are rejected so that a new kubectl release doesn't
+            # silently bypass this gate. A flag we don't recognize could be
+            # anything; claim the verb is unreadable.
             if name not in _KUBECTL_FLAGS_WITH_VALUE and name not in _KUBECTL_BOOLEAN_FLAGS:
                 return None
             if name in _KUBECTL_FLAGS_WITH_VALUE and not separator:
                 index += 1
             index += 1
             continue
-        words.append(token)
+        # Found the first bare word (the verb).
+        word1 = token
         index += 1
-    return tuple(words) if words else None
+        break
+    else:
+        # Reached end of argv without finding a bare word.
+        return None
+
+    # Phase 2: Look for a second bare word. Once we have the verb, a flag
+    # cannot hide it, so stop if the next token is a flag. Do not skip over
+    # flags hunting for word two -- that reopens the hole one level down.
+    # An unknown command-specific flag that takes a value could otherwise make
+    # `rollout --someflag status restart x` read as `("rollout","status")` and
+    # allow a restart. Better to false-refuse `rollout --unknown status x` as
+    # unreadable by stopping at the flag, rare, and the safe direction.
+    if index < len(argv) and not argv[index].startswith("-"):
+        word2 = argv[index]
+        return (word1, word2)
+
+    return (word1,)
 
 
 def _refuses_impersonation(argv: list[str]) -> bool:
