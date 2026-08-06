@@ -1199,6 +1199,17 @@ def read_only_enforced() -> bool:
 
     Defaults to on, and anything that is not exactly "false" leaves it on. A
     typo in a ConfigMap should not quietly hand an agent write access.
+
+    This switch is deliberately not documented in the customer-facing reference.
+    It is global, unscoped and has no expiry: setting it disables the read-only
+    posture for every command, every agent and every cluster in the Pod, for as
+    long as the ConfigMap says so, and today there is no impersonation layer
+    underneath to catch what gets through (see command_policy's module
+    docstring). It exists so an operator can recover from a bad allowlist
+    without waiting on an image build, and it should be reverted in the same
+    change that adds the missing verb to command_policy.KUBECTL_READ_VERBS or
+    GCLOUD_READ_COMMANDS. Adding the verb is the fix; this is the outage
+    stopgap.
     """
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
 
