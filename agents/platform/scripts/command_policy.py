@@ -75,25 +75,42 @@ KUBECTL_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
     }
 )
 
-# kubectl's global options, limited to those that consume the following
-# argument. Needed so `kubectl -n kube-system get pods` finds `get` and
-# `kubectl --kubeconfig delete` finds no verb at all.
+# kubectl's global options that consume the following argument. This is
+# enumerated exhaustively (via `kubectl options` on v1.36.3) rather than
+# enumerating unknowns: the next release adds a new flag, and under an allowlist
+# that would cause a silent bypass nobody sees. Under this denylist of
+# value-taking flags, an unknown flag that takes a value becomes unreadable --
+# someone reports it, and we update this set.
 _KUBECTL_FLAGS_WITH_VALUE = frozenset(
     {
         "-n", "--namespace", "--context", "--cluster", "--kubeconfig",
         "-s", "--server", "--user", "--token", "--request-timeout",
         "--cache-dir", "--certificate-authority", "--client-certificate",
         "--client-key", "--tls-server-name", "--username", "--password",
-        "--log-file", "--v",
+        "--kuberc", "--profile", "--profile-output", "--log-flush-frequency",
+        "-v", "--v", "--vmodule",
+    }
+)
+
+# kubectl's boolean global flags. An unrecognized flag (whether boolean or
+# value-taking) is treated as making the verb unreadable, which refuses the
+# command. This is the inverse of the allowlist for verbs: we enumerate what we
+# know, and anything else is assumed to be a hostile or novel flag that could
+# hide a verb.
+_KUBECTL_BOOLEAN_FLAGS = frozenset(
+    {
+        "-h", "--help",
+        "--insecure-skip-tls-verify", "--disable-compression",
+        "--match-server-version", "--warnings-as-errors",
     }
 )
 
 # Impersonation belongs to the broker. An agent that supplies its own `--as`
 # chooses its own principal, which inverts the model, so these are refused
-# before the verb is even read. Checked as a prefix match on the flag name so
-# `--as=x` and `--as x` are both caught.
+# before the verb is even read. Checked by exact membership on the flag name
+# (before the `=` separator) so `--as=x` and `--as x` are both caught.
 _IMPERSONATION_FLAGS = frozenset(
-    {"--as", "--as-group", "--as-uid", "--impersonate-service-account"}
+    {"--as", "--as-group", "--as-uid", "--as-user-extra", "--impersonate-service-account"}
 )
 
 
@@ -109,6 +126,11 @@ def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
         token = argv[index]
         if token.startswith("-"):
             name, separator, _ = token.partition("=")
+            # Unknown flags (whether value-taking or boolean) are refused so that
+            # a new kubectl release doesn't silently bypass this gate. A flag we
+            # don't recognize could be anything; claim the verb is unreadable.
+            if name not in _KUBECTL_FLAGS_WITH_VALUE and name not in _KUBECTL_BOOLEAN_FLAGS:
+                return None
             if name in _KUBECTL_FLAGS_WITH_VALUE and not separator:
                 index += 1
             index += 1
