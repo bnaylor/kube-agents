@@ -1,6 +1,10 @@
 # check=skip=InvalidDefaultArgInFrom
 ARG HERMES_AGENT_TAG
 ARG ENVOY_VERSION=v1.38.0
+# Global on purpose: an ARG declared after the first FROM belongs to that stage,
+# so watcher-builder's re-declaration would inherit no default and GOARCH would
+# expand to empty. See the watcher-builder stage for why this is pinned.
+ARG WATCHER_GOARCH=amd64
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 
 # The watcher binary must match the architecture the FINAL image ships as, which
@@ -18,13 +22,15 @@ FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 # $BUILDPLATFORM keeps the Go toolchain running natively; it cross-compiles to
 # WATCHER_GOARCH. Override that only if the runtime base gains other
 # architectures and the build starts targeting them.
-ARG WATCHER_GOARCH=amd64
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS watcher-builder
+# Pulls in the global declared above the first FROM. The `:-amd64` below is a
+# second belt: an empty GOARCH is not an error, it silently falls back to the
+# toolchain's own architecture, which with $BUILDPLATFORM is the build host.
 ARG WATCHER_GOARCH
 WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${WATCHER_GOARCH} \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${WATCHER_GOARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
