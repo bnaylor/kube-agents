@@ -152,7 +152,17 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
     {
         "--project", "--format", "--filter", "--region", "--zone",
         "--location", "--account", "--configuration", "--verbosity",
-        "--billing-project", "--sort-by", "--limit",
+        "--billing-project", "--sort-by", "--limit", "--trace-token",
+        "--flatten", "--access-token-file", "-z", "--page-size",
+    }
+)
+
+# gcloud boolean global flags that do not consume the following argument.
+# These are enumerated from gcloud help. An unknown flag is still rejected
+# as unreadable, but known boolean flags do not hide the command path.
+_GCLOUD_BOOLEAN_FLAGS = frozenset(
+    {
+        "--quiet", "-q", "--version", "-v", "--help", "-h",
     }
 )
 
@@ -187,15 +197,21 @@ def _gcloud_words(argv: list[str]) -> list[str] | None:
         token = argv[index]
         if token.startswith("-"):
             name, separator, _ = token.partition("=")
+            # Check if it's a known boolean flag (doesn't consume next token).
+            if name in _GCLOUD_BOOLEAN_FLAGS:
+                index += 1
+                continue
+            # Check if it's a known flag that consumes a value.
+            if name in _GCLOUD_FLAGS_WITH_VALUE:
+                # If it has =, the value is in this token. If not, skip next token.
+                if not separator:
+                    index += 1
+                index += 1
+                continue
             # Unknown flags are rejected so that a new gcloud release with a
             # flag we don't know the arity of does not silently bypass this
             # gate. The flag could take a value and hide the command path.
-            if name not in _GCLOUD_FLAGS_WITH_VALUE:
-                return None
-            if name in _GCLOUD_FLAGS_WITH_VALUE and not separator:
-                index += 1
-            index += 1
-            continue
+            return None
         words.append(token)
         index += 1
     return words

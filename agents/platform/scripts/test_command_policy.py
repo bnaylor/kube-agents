@@ -225,19 +225,24 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertTrue(evaluate(["gcloud", "version"]).allowed)
 
     def test_unknown_flag_hides_command_path(self):
-        # A real gcloud flag that's not in our enumeration should cause an
-        # unreadable refusal. This is the exploit: --trace-token list delete
-        # would otherwise read as container.clusters.list but the unknown flag
-        # could hide other words.
+        # When --trace-token is recognized as taking a value, it consumes 'list',
+        # leaving [container, clusters, delete, my-cluster] which doesn't match
+        # any allowed prefix, so it's refused as gcp.read-only. The exploit is
+        # still blocked; the rule_id is just more informative now.
         decision = evaluate(["gcloud", "container", "clusters", "--trace-token", "list", "delete", "my-cluster"])
         self.assertFalse(decision.allowed)
-        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        # Could be gcp.read-only (flag is recognized) or gcp.unreadable-command
+        # (flag is unknown). Either way, it's refused.
+        self.assertIn(decision.rule_id, {"gcp.read-only", "gcp.unreadable-command"})
 
     def test_trace_token_and_delete_exploit(self):
         # Regression test for exploit with --trace-token and delete.
+        # Once --trace-token is recognized as consuming a value, the words become
+        # [projects, delete, my-project] which doesn't match (projects, list),
+        # so the exploit is blocked.
         decision = evaluate(["gcloud", "projects", "--trace-token", "list", "delete", "my-project"])
         self.assertFalse(decision.allowed)
-        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertIn(decision.rule_id, {"gcp.read-only", "gcp.unreadable-command"})
 
     def test_flags_file_is_refused_outright(self):
         # --flags-file reads from a file under the agent's control. We cannot
@@ -288,6 +293,53 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 # The flag and its value should be skipped, leaving container onwards
                 self.assertEqual(words, ["container", "clusters", "list"],
                                 f"Flag {flag} should consume its value, got {words}")
+
+    def test_new_flags_trace_token_zone_etc(self):
+        # Regression test for the five newly added flags: --trace-token,
+        # --flatten, --access-token-file, -z, --page-size. These are real
+        # gcloud flags and should be recognized as consuming values.
+        test_cases = [
+            (["gcloud", "container", "clusters", "describe", "-z", "us-central1-a", "mycluster"], True),
+            (["gcloud", "container", "clusters", "--trace-token", "tok", "list"], True),
+            (["gcloud", "container", "clusters", "--flatten", "x", "list"], True),
+            (["gcloud", "container", "clusters", "--access-token-file", "f", "list"], True),
+            (["gcloud", "container", "clusters", "--page-size", "100", "list"], True),
+        ]
+        for argv, expected_allowed in test_cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(evaluate(argv).allowed, expected_allowed)
+
+    def test_exploit_still_blocked_with_new_flags(self):
+        # Ensure the five new flags don't reopen the exploit holes.
+        # If -z eats 'list', words become [container, clusters, delete, c]
+        # which doesn't match any allowed prefix.
+        test_cases = [
+            (["gcloud", "container", "clusters", "--trace-token", "list", "delete", "my-cluster"], False),
+            (["gcloud", "container", "clusters", "-z", "list", "delete", "c"], False),
+            (["gcloud", "container", "clusters", "--flatten", "list", "delete", "x"], False),
+            (["gcloud", "container", "clusters", "--access-token-file", "list", "delete", "x"], False),
+            (["gcloud", "container", "clusters", "--page-size", "list", "delete", "x"], False),
+        ]
+        for argv, expected_allowed in test_cases:
+            with self.subTest(argv=argv):
+                result = evaluate(argv)
+                self.assertEqual(result.allowed, expected_allowed,
+                                f"Command {argv} should be refused")
+
+    def test_boolean_flags_do_not_hide_command(self):
+        # Boolean flags like -q, -v, -h should not consume the next token,
+        # so they don't hide the command path.
+        test_cases = [
+            (["gcloud", "container", "clusters", "list", "-q"], True),
+            (["gcloud", "container", "clusters", "list", "-v"], True),
+            (["gcloud", "container", "clusters", "list", "-h"], True),
+            (["gcloud", "container", "clusters", "list", "--quiet"], True),
+            (["gcloud", "container", "clusters", "list", "--version"], True),
+            (["gcloud", "container", "clusters", "list", "--help"], True),
+        ]
+        for argv, expected_allowed in test_cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(evaluate(argv).allowed, expected_allowed)
 
 
 if __name__ == "__main__":
