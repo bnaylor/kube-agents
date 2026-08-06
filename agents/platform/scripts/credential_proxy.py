@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import command_policy
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -1193,11 +1194,41 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
+def read_only_enforced() -> bool:
+    """Is the read-only gate armed?
+
+    Defaults to on, and anything that is not exactly "false" leaves it on. A
+    typo in a ConfigMap should not quietly hand an agent write access.
+    """
+    return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
+
+
+def read_only_refusal(argv: list[str]) -> dict[str, str] | None:
+    """The blocked-response body for `argv`, or None if it may run.
+
+    Split out from the handler so the decision is testable without standing up
+    a socket, and so the gate reads the class attribute rather than the
+    environment on every request.
+    """
+    if not CredentialProxyHandler.enforce_read_only:
+        return None
+    decision = command_policy.evaluate(argv)
+    if decision.allowed:
+        return None
+    return {
+        "status": "blocked",
+        "code": "SECURITY_POLICY_BLOCKED",
+        "rule": decision.rule_id,
+        "message": decision.message,
+    }
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
     max_request_bytes: int
     slack_max_request_bytes: int
+    enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
 
@@ -1329,6 +1360,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": violation,
                 },
             )
+            return
+
+        # Runs after the credential denylist above, so a rule like
+        # `kubernetes.token-disclosure` keeps its own id and message rather
+        # than being reported as a read-only refusal. Ordering also means the
+        # denylist still catches `kubectl config view --raw`, which the
+        # allowlist would otherwise permit as a bare `config view`.
+        refusal = read_only_refusal(argv)
+        if refusal is not None:
+            LOGGER.warning(
+                "command refused request_id=%s rule=%s", request_id, refusal["rule"]
+            )
+            self._json(HTTPStatus.FORBIDDEN, refusal)
             return
 
         try:
@@ -1542,6 +1586,8 @@ def serve(args: argparse.Namespace) -> None:
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
+    CredentialProxyHandler.enforce_read_only = read_only_enforced()
+    LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

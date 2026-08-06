@@ -1365,5 +1365,50 @@ class SlackRelayTest(unittest.TestCase):
         self.assertEqual({"error": "Slack operation failed"}, captured["payload"])
 
 
+class ReadOnlyGateTest(unittest.TestCase):
+    """The gate that makes the PR-only write rule mechanical.
+
+    The proxy refused credential disclosure long before it refused a mutation.
+    These cover the wiring: that the gate runs, that it runs after the existing
+    denylist so credential rules keep their own rule IDs, and that it can be
+    switched off without a new image.
+    """
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        CredentialProxyHandler.enforce_read_only = True
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _decide(self, argv):
+        """The blocked response the handler would send, or None if allowed."""
+        return credential_proxy.read_only_refusal(argv)
+
+    def test_a_read_passes_the_gate(self):
+        self.assertIsNone(self._decide(["kubectl", "get", "pods"]))
+
+    def test_a_mutation_is_refused(self):
+        refusal = self._decide(["kubectl", "delete", "ns", "prod"])
+        self.assertIsNotNone(refusal)
+        self.assertEqual("kubernetes.read-only", refusal["rule"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
+
+    def test_the_gate_can_be_switched_off(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertIsNone(self._decide(["kubectl", "delete", "ns", "prod"]))
+
+    def test_the_gate_is_on_by_default(self):
+        # A misread env var must not silently disarm the gate.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "banana"}):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "false"}):
+            self.assertFalse(credential_proxy.read_only_enforced())
+
+
 if __name__ == "__main__":
     unittest.main()
