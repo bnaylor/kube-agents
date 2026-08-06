@@ -1203,10 +1203,16 @@ def read_only_enforced() -> bool:
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
 
 
-def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], tuple[str, ...] | None] | None:
+def _sanitize_for_logging(s: str) -> str:
+    """Strip control characters to prevent log forgery."""
+    return ''.join(c for c in s if c >= ' ' and c != '\x7f')
+
+
+def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
     """The blocked-response body for `argv`, or None if it may run.
 
-    Returns (response_dict, verb_tuple) for logging, or None if allowed.
+    Returns (response_dict, log_hint) for logging, or None if allowed.
+    log_hint is either verb_tuple or offending_flag, safe to log.
     Split out from the handler so the decision is testable without standing up
     a socket, and so the gate reads the class attribute rather than the
     environment on every request.
@@ -1216,6 +1222,14 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], tuple[str, ...] 
     decision = command_policy.evaluate(argv)
     if decision.allowed:
         return None
+
+    # Choose what to log: resolved verb/command path, or the offending flag
+    log_hint = None
+    if decision.verb_tuple:
+        log_hint = ".".join(decision.verb_tuple)
+    elif decision.offending_flag:
+        log_hint = decision.offending_flag
+
     return (
         {
             "status": "blocked",
@@ -1223,7 +1237,7 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], tuple[str, ...] 
             "rule": decision.rule_id,
             "message": decision.message,
         },
-        decision.verb_tuple,
+        log_hint,
     )
 
 
@@ -1374,10 +1388,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # would refuse as `kubernetes.read-only`, losing the specific rule.
         refusal_result = read_only_refusal(argv)
         if refusal_result is not None:
-            refusal, verb_tuple = refusal_result
-            verb_str = ".".join(verb_tuple) if verb_tuple else "unknown"
+            refusal, log_hint = refusal_result
+            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
             LOGGER.warning(
-                "command refused request_id=%s rule=%s verb=%s", request_id, refusal["rule"], verb_str
+                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
             )
             self._json(HTTPStatus.FORBIDDEN, refusal)
             return

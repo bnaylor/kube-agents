@@ -1410,6 +1410,18 @@ class ReadOnlyGateTest(unittest.TestCase):
                              {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "false"}):
             self.assertFalse(credential_proxy.read_only_enforced())
 
+    def test_credentials_do_not_leak_to_logs(self):
+        # Verify that a token in argv does not get logged
+        result = credential_proxy.read_only_refusal(
+            ["kubectl", "--token=eyJhbGci.SECRET", "--as=admin", "get", "pods"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The log hint should be the --as flag, not a secret-containing argv element
+        self.assertEqual("--as", log_hint)
+        self.assertNotIn("SECRET", log_hint)
+        self.assertNotIn("eyJhbGci", log_hint)
+
 
 if __name__ == "__main__":
     unittest.main()

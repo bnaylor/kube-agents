@@ -44,6 +44,7 @@ class Decision:
     rule_id: str
     message: str
     verb_tuple: tuple[str, ...] | None = None  # Resolved kubectl/gcloud verb path, safe to log
+    offending_flag: str | None = None  # Flag name (before =) that triggered refusal, safe to log
 
 
 _ALLOWED = Decision(allowed=True, rule_id="", message="")
@@ -155,7 +156,14 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "get"),
         ("config", "get-value"),
         ("config", "list"),
+        ("compute", "addresses", "describe"),
+        ("compute", "addresses", "list"),
+        ("compute", "disks", "describe"),
+        ("compute", "disks", "list"),
+        ("compute", "forwarding-rules", "list"),
         ("compute", "regions", "list"),
+        ("compute", "snapshots", "list"),
+        ("container", "ai", "profiles", "models", "list"),
         ("container", "clusters", "describe"),
         ("container", "clusters", "list"),
         # Writes a kubeconfig in the sidecar and nothing in the cloud. It is
@@ -165,6 +173,7 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("container", "get-server-config"),
         ("container", "node-pools", "describe"),
         ("container", "node-pools", "list"),
+        ("container", "operations", "list"),
         ("info",),
         ("logging", "read"),
         ("projects", "describe"),
@@ -186,6 +195,7 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--location", "--account", "--configuration", "--verbosity",
         "--billing-project", "--sort-by", "--limit", "--trace-token",
         "--flatten", "--access-token-file", "-z", "--page-size", "--freshness",
+        "--cluster",
     }
 )
 
@@ -203,8 +213,8 @@ _GCLOUD_BOOLEAN_FLAGS = frozenset(
 )
 
 
-def _gcloud_has_flags_file(argv: list[str]) -> bool:
-    """Check if argv contains --flags-file without reading its contents.
+def _gcloud_has_flags_file(argv: list[str]) -> str | None:
+    """Return '--flags-file' if found in argv, or None otherwise.
 
     --flags-file reads flags from a YAML file, so flags in that file (like
     --impersonate-service-account) never appear in argv and cannot be checked
@@ -216,15 +226,15 @@ def _gcloud_has_flags_file(argv: list[str]) -> bool:
     for token in argv[1:]:
         name, _, _ = token.partition("=")
         if name == "--flags-file":
-            return True
-    return False
+            return "--flags-file"
+    return None
 
 
-def _gcloud_words(argv: list[str]) -> list[str] | None:
-    """The bare words of a gcloud argv, with flags and their values removed.
+def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | None]:
+    """The bare words of a gcloud argv, and the offending unknown flag if any.
 
-    Returns None if the command is unreadable (e.g., contains an unknown flag
-    that could hide the command path). A flag we do not recognize could have
+    Returns (words, None) on success, or (None, flag_name) if the command is
+    unreadable due to an unknown flag. A flag we do not recognize could have
     arbitrary arity; claim the command is unreadable, fail-closed.
     """
     words: list[str] = []
@@ -247,9 +257,20 @@ def _gcloud_words(argv: list[str]) -> list[str] | None:
             # Unknown flags are rejected so that a new gcloud release with a
             # flag we don't know the arity of does not silently bypass this
             # gate. The flag could take a value and hide the command path.
-            return None
+            return None, name
         words.append(token)
         index += 1
+    return words, None
+
+
+def _gcloud_words(argv: list[str]) -> list[str] | None:
+    """The bare words of a gcloud argv, with flags and their values removed.
+
+    Returns None if the command is unreadable (e.g., contains an unknown flag
+    that could hide the command path). Use _gcloud_words_and_flag to also get
+    the offending flag name for logging.
+    """
+    words, _ = _gcloud_words_and_flag(argv)
     return words
 
 
@@ -271,11 +292,12 @@ def _gcloud_is_read_only(words: list[str]) -> bool:
                for length in range(1, len(words) + 1))
 
 
-def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
-    """The leading verb sequence in a kubectl argv, or None if unreadable.
+def _kubectl_verb_and_flag(argv: list[str]) -> tuple[tuple[str, ...] | None, str | None]:
+    """The kubectl verb sequence, and the offending unknown flag if any.
 
-    None is a refusal rather than a shrug: an argv whose verb cannot be found
-    is an argv whose effect is unknown, and the caller denies on it.
+    Returns (verb, None) on success, or (None, flag_name) if the verb cannot be
+    read due to an unknown flag. None is a refusal rather than a shrug: an argv
+    whose verb cannot be found is an argv whose effect is unknown, and we deny it.
 
     This function applies the strict unknown-flag rule only to global flags
     (which come before the verb). Command-specific flags (which come after)
@@ -293,7 +315,7 @@ def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
             # silently bypass this gate. A flag we don't recognize could be
             # anything; claim the verb is unreadable.
             if name not in _KUBECTL_FLAGS_WITH_VALUE and name not in _KUBECTL_BOOLEAN_FLAGS:
-                return None
+                return None, name
             if name in _KUBECTL_FLAGS_WITH_VALUE and not separator:
                 index += 1
             index += 1
@@ -304,7 +326,7 @@ def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
         break
     else:
         # Reached end of argv without finding a bare word.
-        return None
+        return None, None
 
     # Phase 2: Look for a second bare word. Skip flags of known arity (we can
     # correctly consume their values), but stop dead on anything unrecognized.
@@ -327,21 +349,31 @@ def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
             continue
         # Found a bare word (the subcommand).
         word2 = token
-        return (word1, word2)
+        return (word1, word2), None
 
-    return (word1,)
+    return (word1,), None
 
 
-def _refuses_impersonation(argv: list[str]) -> bool:
+def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
+    """The leading verb sequence in a kubectl argv, or None if unreadable.
+
+    Use _kubectl_verb_and_flag to also get the offending flag name for logging.
+    """
+    verb, _ = _kubectl_verb_and_flag(argv)
+    return verb
+
+
+def _refuses_impersonation(argv: list[str]) -> str | None:
+    """Return the offending impersonation flag name, or None if no impersonation found."""
     for token in argv[1:]:
         name, _, _ = token.partition("=")
         if name in _IMPERSONATION_FLAGS:
-            return True
-    return False
+            return name
+    return None
 
 
-def _gcloud_refuses_identity_change(argv: list[str]) -> bool:
-    """Check if gcloud argv contains identity-changing flags.
+def _gcloud_refuses_identity_change(argv: list[str]) -> str | None:
+    """Return the offending identity-changing flag name, or None if none found.
 
     --access-token-file, --configuration, and --account all change the
     identity that gcloud uses, which inverts the model. Checked by exact
@@ -350,8 +382,8 @@ def _gcloud_refuses_identity_change(argv: list[str]) -> bool:
     for token in argv[1:]:
         name, _, _ = token.partition("=")
         if name in _GCLOUD_IDENTITY_FLAGS:
-            return True
-    return False
+            return name
+    return None
 
 
 def evaluate(argv: list[str]) -> Decision:
@@ -362,7 +394,8 @@ def evaluate(argv: list[str]) -> Decision:
     if not argv or argv[0] not in _GOVERNED_TOOLS:
         return _ALLOWED
 
-    if _refuses_impersonation(argv):
+    impersonation_flag = _refuses_impersonation(argv)
+    if impersonation_flag:
         return Decision(
             allowed=False,
             rule_id="identity.caller-supplied-impersonation",
@@ -370,17 +403,17 @@ def evaluate(argv: list[str]) -> Decision:
                 "Impersonation is set by the credential proxy, not by the "
                 "caller. Remove --as/--as-group/--impersonate-service-account."
             ),
-            verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
+            offending_flag=impersonation_flag,
         )
 
     if argv[0] == "kubectl":
-        verb = _kubectl_verb(argv)
+        verb, unknown_flag = _kubectl_verb_and_flag(argv)
         if verb is None:
             return Decision(
                 allowed=False,
                 rule_id="kubernetes.unreadable-command",
                 message="Could not identify a kubectl verb, so the command was refused.",
-                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
+                offending_flag=unknown_flag,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
             return _ALLOWED
@@ -395,7 +428,8 @@ def evaluate(argv: list[str]) -> Decision:
         )
 
     if argv[0] == "gcloud":
-        if _gcloud_has_flags_file(argv):
+        flags_file = _gcloud_has_flags_file(argv)
+        if flags_file:
             return Decision(
                 allowed=False,
                 rule_id="gcp.flags-file-forbidden",
@@ -404,10 +438,11 @@ def evaluate(argv: list[str]) -> Decision:
                     "We cannot read that file without a race condition, so we refuse "
                     "it outright. Expand flags manually instead of using a file."
                 ),
-                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
+                offending_flag=flags_file,
             )
 
-        if _gcloud_refuses_identity_change(argv):
+        identity_flag = _gcloud_refuses_identity_change(argv)
+        if identity_flag:
             return Decision(
                 allowed=False,
                 rule_id="gcp.identity-change-forbidden",
@@ -415,10 +450,10 @@ def evaluate(argv: list[str]) -> Decision:
                     "Identity belongs to the broker. Remove --access-token-file, "
                     "--configuration, and --account to use the default identity."
                 ),
-                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
+                offending_flag=identity_flag,
             )
 
-        words = _gcloud_words(argv)
+        words, unknown_flag = _gcloud_words_and_flag(argv)
         if words is None:
             return Decision(
                 allowed=False,
@@ -428,7 +463,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "command path cannot be read. Report a new gcloud global flag to "
                     "your infrastructure team."
                 ),
-                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
+                offending_flag=unknown_flag,
             )
 
         if not _gcloud_is_read_only(words):
