@@ -113,6 +113,76 @@ _IMPERSONATION_FLAGS = frozenset(
     {"--as", "--as-group", "--as-uid", "--as-user-extra", "--impersonate-service-account"}
 )
 
+# gcloud's grammar is `gcloud GROUP... VERB [POSITIONAL...]`, so the verb is
+# neither first nor last: `gcloud container clusters get-credentials prod` ends
+# in a cluster name. Finding it by position would mean encoding gcloud's whole
+# command tree, so the allowed paths are listed instead and everything else is
+# refused. The list is meant to grow, and growing it should be a reviewable act
+# rather than a regex someone widens in a hurry.
+GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("auth", "list"),
+        ("config", "get"),
+        ("config", "list"),
+        ("container", "clusters", "describe"),
+        ("container", "clusters", "list"),
+        # Writes a kubeconfig in the sidecar and nothing in the cloud. It is
+        # also how a Cluster Agent points itself at its target cluster, so
+        # refusing it would break the read path this module is protecting.
+        ("container", "clusters", "get-credentials"),
+        ("container", "get-server-config"),
+        ("container", "node-pools", "describe"),
+        ("container", "node-pools", "list"),
+        ("info",),
+        ("logging", "read"),
+        ("projects", "describe"),
+        ("projects", "get-iam-policy"),
+        ("projects", "list"),
+        ("version",),
+    }
+)
+
+# gcloud flags that consume the following argument. Without these,
+# `gcloud --project my-proj container clusters list` reads `my-proj` as the
+# first word of the command path and matches nothing.
+_GCLOUD_FLAGS_WITH_VALUE = frozenset(
+    {
+        "--project", "--format", "--filter", "--region", "--zone",
+        "--location", "--account", "--configuration", "--verbosity",
+        "--billing-project", "--flags-file", "--sort-by", "--limit",
+        "--impersonate-service-account",
+    }
+)
+
+
+def _gcloud_words(argv: list[str]) -> list[str]:
+    """The bare words of a gcloud argv, with flags and their values removed."""
+    words: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("-"):
+            name, separator, _ = token.partition("=")
+            if name in _GCLOUD_FLAGS_WITH_VALUE and not separator:
+                index += 1
+            index += 1
+            continue
+        words.append(token)
+        index += 1
+    return words
+
+
+def _gcloud_is_read_only(argv: list[str]) -> bool:
+    """Does any prefix of the command path name a listed read command?
+
+    A prefix rather than the whole word list, because positional arguments
+    follow the verb: `container clusters get-credentials prod-usc1` matches on
+    its first three words.
+    """
+    words = _gcloud_words(argv)
+    return any(tuple(words[:length]) in GCLOUD_READ_COMMANDS
+               for length in range(1, len(words) + 1))
+
 
 def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
     """The leading verb sequence in a kubectl argv, or None if unreadable.
@@ -219,5 +289,17 @@ def evaluate(argv: list[str]) -> Decision:
                 "as a pull request instead."
             ),
         )
+
+    if argv[0] == "gcloud":
+        if not _gcloud_is_read_only(argv):
+            return Decision(
+                allowed=False,
+                rule_id="gcp.read-only",
+                message=(
+                    "Agents hold read-only access to Google Cloud. Propose this "
+                    "change as a pull request instead."
+                ),
+            )
+        return _ALLOWED
 
     return _ALLOWED

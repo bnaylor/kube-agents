@@ -153,5 +153,74 @@ class KubectlReadOnlyTest(unittest.TestCase):
         self.assertTrue(evaluate(["gh", "pr", "create", "--fill"]).allowed)
 
 
+class GcloudReadOnlyTest(unittest.TestCase):
+    """gcloud has no fixed verb position, so allowed command paths are listed."""
+
+    def test_a_listed_read_command_is_allowed(self):
+        self.assertTrue(evaluate(["gcloud", "container", "clusters", "list"]).allowed)
+
+    def test_a_positional_argument_does_not_hide_the_command(self):
+        argv = ["gcloud", "container", "clusters", "get-credentials", "prod-usc1"]
+        self.assertTrue(evaluate(argv).allowed)
+
+    def test_an_unlisted_command_is_refused(self):
+        decision = evaluate(["gcloud", "container", "clusters", "delete", "prod-usc1"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_a_flag_value_is_not_mistaken_for_a_command_word(self):
+        # `--project delete` must not contribute `delete` to the command path,
+        # and `--project` must not swallow `container` either.
+        argv = ["gcloud", "--project", "my-proj", "container", "clusters", "list"]
+        self.assertTrue(evaluate(argv).allowed)
+
+    def test_an_unlisted_group_alone_is_refused(self):
+        self.assertFalse(evaluate(["gcloud", "compute", "instances", "list"]).allowed)
+
+    def test_bare_gcloud_is_refused(self):
+        decision = evaluate(["gcloud"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_service_account_impersonation_is_refused(self):
+        argv = ["gcloud", "--impersonate-service-account", "x@y.iam.gserviceaccount.com",
+                "container", "clusters", "list"]
+        decision = evaluate(argv)
+        self.assertFalse(decision.allowed)
+        self.assertEqual("identity.caller-supplied-impersonation", decision.rule_id)
+
+    def test_flag_with_equals_syntax_is_handled(self):
+        # Flags using = syntax should not consume the next token.
+        argv = ["gcloud", "--project=my-proj", "container", "clusters", "list"]
+        self.assertTrue(evaluate(argv).allowed)
+
+    def test_unknown_flag_does_not_swallow_command_path(self):
+        # Unlike kubectl, gcloud allows unknown flags. But we should not
+        # let an unknown flag hide the command path -- the flag value
+        # should not be treated as a command word.
+        argv = ["gcloud", "--unknown-flag", "container", "clusters", "list"]
+        self.assertTrue(evaluate(argv).allowed)
+
+    def test_multiple_flags_before_command(self):
+        # Multiple flags should be correctly skipped.
+        argv = ["gcloud", "--project", "proj1", "--region", "us-central1",
+                "container", "clusters", "list"]
+        self.assertTrue(evaluate(argv).allowed)
+
+    def test_config_list_is_allowed(self):
+        # Test individual listed commands from GCLOUD_READ_COMMANDS.
+        self.assertTrue(evaluate(["gcloud", "config", "list"]).allowed)
+
+    def test_config_set_is_refused(self):
+        # `config set` is not in GCLOUD_READ_COMMANDS, so it should be refused.
+        decision = evaluate(["gcloud", "config", "set", "core.project", "my-proj"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_version_command_is_allowed(self):
+        # `version` is a single-word command in GCLOUD_READ_COMMANDS.
+        self.assertTrue(evaluate(["gcloud", "version"]).allowed)
+
+
 if __name__ == "__main__":
     unittest.main()
