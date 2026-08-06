@@ -3,11 +3,23 @@ ARG HERMES_AGENT_TAG
 ARG ENVOY_VERSION=v1.38.0
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 
-FROM golang:1.25-alpine AS watcher-builder
+# Runs natively on the builder and cross-compiles, rather than running the Go
+# toolchain under emulation. TARGETOS/TARGETARCH are filled in by BuildKit from
+# the target platform.
+#
+# Without them `go build` targets the *builder's* architecture, and a cross-build
+# silently produces an unusable image: an arm64 workstation building for amd64
+# yields an aarch64 k8s-event-watcher inside an image whose metadata still reports
+# amd64, so the container crashloops on "exec format error" while `docker inspect`
+# and every other container in the Pod look fine.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS watcher-builder
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
-RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
