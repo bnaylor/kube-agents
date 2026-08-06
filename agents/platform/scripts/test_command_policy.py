@@ -152,6 +152,51 @@ class KubectlReadOnlyTest(unittest.TestCase):
         self.assertTrue(evaluate(["git", "push", "--force-with-lease"]).allowed)
         self.assertTrue(evaluate(["gh", "pr", "create", "--fill"]).allowed)
 
+    def test_all_kubectl_read_verbs_are_reachable(self):
+        # Literal list of all single and multi-word verbs allowed for kubectl.
+        # This test is independent of KUBECTL_READ_VERBS, so deleting a verb
+        # breaks this test.
+        allowed_verbs = [
+            (["kubectl", "api-resources"], "api-resources"),
+            (["kubectl", "api-versions"], "api-versions"),
+            (["kubectl", "cluster-info"], "cluster-info"),
+            (["kubectl", "describe", "node", "mynode"], "describe"),
+            (["kubectl", "events"], "events"),
+            (["kubectl", "explain", "pods"], "explain"),
+            (["kubectl", "get", "pods"], "get"),
+            (["kubectl", "logs", "mypod"], "logs"),
+            (["kubectl", "top", "nodes"], "top"),
+            (["kubectl", "version"], "version"),
+            (["kubectl", "wait", "--for=condition=Ready", "pod/mypod"], "wait"),
+            (["kubectl", "auth", "can-i", "get", "pods"], "auth can-i"),
+            (["kubectl", "auth", "whoami"], "auth whoami"),
+            (["kubectl", "config", "current-context"], "config current-context"),
+            (["kubectl", "config", "get-contexts"], "config get-contexts"),
+            (["kubectl", "config", "view"], "config view"),
+            (["kubectl", "rollout", "history", "deploy/api"], "rollout history"),
+            (["kubectl", "rollout", "status", "deploy/api"], "rollout status"),
+        ]
+        for argv, desc in allowed_verbs:
+            with self.subTest(verb=desc):
+                self.assertTrue(evaluate(argv).allowed, f"{desc} should be allowed")
+
+    def test_all_kubectl_impersonation_flags_are_refused(self):
+        # Literal list of all kubectl impersonation flags. This test is
+        # independent of _IMPERSONATION_FLAGS, so deleting a flag breaks this test.
+        impersonation_flags = [
+            (["kubectl", "--as", "admin@corp.com", "get", "secrets"], "--as"),
+            (["kubectl", "--as=admin@corp.com", "get", "secrets"], "--as="),
+            (["kubectl", "--as-group=system:masters", "get", "secrets"], "--as-group="),
+            (["kubectl", "--as-user-extra=scopes=admin", "get", "secrets"], "--as-user-extra="),
+            (["kubectl", "--impersonate-service-account", "sa@proj.iam.gserviceaccount.com", "get", "secrets"], "--impersonate-service-account"),
+            (["kubectl", "--impersonate-service-account=sa@proj.iam.gserviceaccount.com", "get", "secrets"], "--impersonate-service-account="),
+        ]
+        for argv, flag_desc in impersonation_flags:
+            with self.subTest(flag=flag_desc):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual("identity.caller-supplied-impersonation", decision.rule_id)
+
 
 class GcloudReadOnlyTest(unittest.TestCase):
     """gcloud has no fixed verb position, so allowed command paths are listed."""
@@ -367,8 +412,10 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 self.assertEqual(evaluate(argv).allowed, expected_allowed)
 
     def test_gcloud_identity_flags_are_refused(self):
-        # --access-token-file, --configuration, and --account change the
-        # identity that gcloud uses. These should be refused outright.
+        # All identity-changing flags should be refused outright:
+        # - --access-token-file, --configuration, --account (documented)
+        # - --credential-file-override, --authorization-token-file, --authority-selector
+        #   (undocumented but accepted by gcloud, carry refreshable credentials)
         test_cases = [
             (["gcloud", "--access-token-file", "/tmp/tok.txt", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
             (["gcloud", "--access-token-file=/tmp/tok.txt", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
@@ -376,6 +423,13 @@ class GcloudReadOnlyTest(unittest.TestCase):
             (["gcloud", "--configuration=evil", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
             (["gcloud", "--account", "evil@corp.com", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
             (["gcloud", "--account=evil@corp.com", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            # Hidden flags from calliope/cli.py (undocumented but real)
+            (["gcloud", "--credential-file-override", "/tmp/key.json", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--credential-file-override=/tmp/key.json", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--authorization-token-file", "/tmp/tok", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--authorization-token-file=/tmp/tok", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--authority-selector", "x", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--authority-selector=x", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
         ]
         for argv, expected_rule_id in test_cases:
             with self.subTest(argv=argv):

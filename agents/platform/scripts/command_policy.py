@@ -130,8 +130,16 @@ _IMPERSONATION_FLAGS = frozenset(
 #   credentials through a different door)
 # - --configuration: names a gcloud config file which can carry impersonate settings
 # - --account: selects a different already-credentialed principal
+# - --credential-file-override, --authorization-token-file, --authority-selector:
+#   undocumented flags from calliope/cli.py. credential-file-override takes a
+#   service-account key file (refreshable credentials, strictly worse than short-lived
+#   tokens). Listed here despite being undocumented so that future arity edits
+#   don't accidentally grant them.
 _GCLOUD_IDENTITY_FLAGS = frozenset(
-    {"--access-token-file", "--configuration", "--account"}
+    {
+        "--access-token-file", "--configuration", "--account",
+        "--credential-file-override", "--authorization-token-file", "--authority-selector",
+    }
 )
 
 # gcloud's grammar is `gcloud GROUP... VERB [POSITIONAL...]`, so the verb is
@@ -242,20 +250,17 @@ def _gcloud_words(argv: list[str]) -> list[str] | None:
     return words
 
 
-def _gcloud_is_read_only(words: list[str] | None) -> bool:
+def _gcloud_is_read_only(words: list[str]) -> bool:
     """Is the command a listed read-only gcloud command?
 
     Args:
-        words: The result of _gcloud_words(), which may be None if the command
-               was unreadable. Returns False if words is None.
+        words: The result of _gcloud_words(). The caller ensures this is not None.
 
     The command path must match exactly a tuple in GCLOUD_READ_COMMANDS.
     Positional arguments after the verb are allowed: `container clusters
     get-credentials my-cluster` matches the path `(container, clusters,
     get-credentials)` and ignores the cluster name.
     """
-    if words is None:
-        return False
     # A prefix of the words must exactly match a listed command. This allows
     # positional arguments after the command: get-credentials my-cluster matches
     # (container, clusters, get-credentials).
