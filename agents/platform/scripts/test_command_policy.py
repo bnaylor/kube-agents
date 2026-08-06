@@ -175,7 +175,9 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertTrue(evaluate(argv).allowed)
 
     def test_an_unlisted_group_alone_is_refused(self):
-        self.assertFalse(evaluate(["gcloud", "compute", "instances", "list"]).allowed)
+        decision = evaluate(["gcloud", "compute", "instances", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
 
     def test_bare_gcloud_is_refused(self):
         decision = evaluate(["gcloud"])
@@ -194,12 +196,13 @@ class GcloudReadOnlyTest(unittest.TestCase):
         argv = ["gcloud", "--project=my-proj", "container", "clusters", "list"]
         self.assertTrue(evaluate(argv).allowed)
 
-    def test_unknown_flag_does_not_swallow_command_path(self):
-        # Unlike kubectl, gcloud allows unknown flags. But we should not
-        # let an unknown flag hide the command path -- the flag value
-        # should not be treated as a command word.
-        argv = ["gcloud", "--unknown-flag", "container", "clusters", "list"]
-        self.assertTrue(evaluate(argv).allowed)
+    def test_unknown_flag_is_refused_as_unreadable(self):
+        # An unknown global flag could take a value and hide the command path.
+        # Without knowing its arity, we cannot safely read the argv, so we refuse
+        # it as unreadable. This is fail-closed, consistent with kubectl.
+        decision = evaluate(["gcloud", "--unknown-flag", "container", "clusters", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
 
     def test_multiple_flags_before_command(self):
         # Multiple flags should be correctly skipped.
@@ -220,6 +223,71 @@ class GcloudReadOnlyTest(unittest.TestCase):
     def test_version_command_is_allowed(self):
         # `version` is a single-word command in GCLOUD_READ_COMMANDS.
         self.assertTrue(evaluate(["gcloud", "version"]).allowed)
+
+    def test_unknown_flag_hides_command_path(self):
+        # A real gcloud flag that's not in our enumeration should cause an
+        # unreadable refusal. This is the exploit: --trace-token list delete
+        # would otherwise read as container.clusters.list but the unknown flag
+        # could hide other words.
+        decision = evaluate(["gcloud", "container", "clusters", "--trace-token", "list", "delete", "my-cluster"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_trace_token_and_delete_exploit(self):
+        # Regression test for exploit with --trace-token and delete.
+        decision = evaluate(["gcloud", "projects", "--trace-token", "list", "delete", "my-project"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_flags_file_is_refused_outright(self):
+        # --flags-file reads from a file under the agent's control. We cannot
+        # safely scan that file (race condition), and it could contain hidden
+        # flags like --impersonate-service-account, so refuse it outright.
+        decision = evaluate(["gcloud", "--flags-file", "/tmp/ff.yaml", "container", "clusters", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.flags-file-forbidden", decision.rule_id)
+
+    def test_flags_file_with_equals_syntax_is_refused(self):
+        # --flags-file=/path/to/file should also be refused.
+        decision = evaluate(["gcloud", "--flags-file=/tmp/ff.yaml", "container", "clusters", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.flags-file-forbidden", decision.rule_id)
+
+    def test_flags_file_between_command_words_is_refused(self):
+        # Even if --flags-file appears deep in the argv, it must be refused.
+        decision = evaluate(["gcloud", "container", "--flags-file", "/tmp/ff.yaml", "clusters", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.flags-file-forbidden", decision.rule_id)
+
+    def test_each_gcloud_command_in_allowlist_is_reachable(self):
+        # Regression test: each tuple in GCLOUD_READ_COMMANDS should be
+        # reachable with a realistic argv. This catches mutations that empty
+        # the allowlist or break the matching logic.
+        from command_policy import GCLOUD_READ_COMMANDS
+        for cmd_tuple in sorted(GCLOUD_READ_COMMANDS):
+            argv = ["gcloud"] + list(cmd_tuple) + ["extra-arg"]
+            with self.subTest(cmd=cmd_tuple):
+                self.assertTrue(evaluate(argv).allowed,
+                                f"Command {cmd_tuple} should be allowed")
+
+    def test_each_gcloud_flag_with_value_consumes_its_value(self):
+        # Regression test: each flag in _GCLOUD_FLAGS_WITH_VALUE should
+        # consume the next token. If a flag is removed or its entry is broken,
+        # the flag value gets treated as a command word and breaks the parsing.
+        from command_policy import _GCLOUD_FLAGS_WITH_VALUE, _gcloud_words
+        for flag in sorted(_GCLOUD_FLAGS_WITH_VALUE):
+            if flag == "--impersonate-service-account":
+                # Skip this one - it's also in _IMPERSONATION_FLAGS and gets
+                # rejected early. We just need to check that it's in the flag
+                # set for the sake of the enumeration.
+                continue
+            argv = ["gcloud", flag, "flagvalue", "container", "clusters", "list"]
+            with self.subTest(flag=flag):
+                words = _gcloud_words(argv)
+                self.assertIsNotNone(words, f"Flag {flag} should be recognized")
+                # The flag and its value should be skipped, leaving container onwards
+                self.assertEqual(words, ["container", "clusters", "list"],
+                                f"Flag {flag} should consume its value, got {words}")
 
 
 if __name__ == "__main__":

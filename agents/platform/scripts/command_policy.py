@@ -144,25 +144,54 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
 
 # gcloud flags that consume the following argument. Without these,
 # `gcloud --project my-proj container clusters list` reads `my-proj` as the
-# first word of the command path and matches nothing.
+# first word of the command path and matches nothing. This is enumerated from
+# gcloud help, so new flags in future releases that take values will not be
+# recognized and will cause a refusal (fail-closed). An unknown flag means the
+# command is unreadable and is refused.
 _GCLOUD_FLAGS_WITH_VALUE = frozenset(
     {
         "--project", "--format", "--filter", "--region", "--zone",
         "--location", "--account", "--configuration", "--verbosity",
-        "--billing-project", "--flags-file", "--sort-by", "--limit",
-        "--impersonate-service-account",
+        "--billing-project", "--sort-by", "--limit",
     }
 )
 
 
-def _gcloud_words(argv: list[str]) -> list[str]:
-    """The bare words of a gcloud argv, with flags and their values removed."""
+def _gcloud_has_flags_file(argv: list[str]) -> bool:
+    """Check if argv contains --flags-file without reading its contents.
+
+    --flags-file reads flags from a YAML file, so flags in that file (like
+    --impersonate-service-account) never appear in argv and cannot be checked
+    by _refuses_impersonation. The file itself is under the agent's control,
+    so we cannot safely scan it: the agent could rewrite it between our check
+    and gcloud's read, a race we cannot win. Refusing it outright is the only
+    safe option, consistent with how credential_proxy.py handles kubeconfigs.
+    """
+    for token in argv[1:]:
+        name, _, _ = token.partition("=")
+        if name == "--flags-file":
+            return True
+    return False
+
+
+def _gcloud_words(argv: list[str]) -> list[str] | None:
+    """The bare words of a gcloud argv, with flags and their values removed.
+
+    Returns None if the command is unreadable (e.g., contains an unknown flag
+    that could hide the command path). A flag we do not recognize could have
+    arbitrary arity; claim the command is unreadable, fail-closed.
+    """
     words: list[str] = []
     index = 1
     while index < len(argv):
         token = argv[index]
         if token.startswith("-"):
             name, separator, _ = token.partition("=")
+            # Unknown flags are rejected so that a new gcloud release with a
+            # flag we don't know the arity of does not silently bypass this
+            # gate. The flag could take a value and hide the command path.
+            if name not in _GCLOUD_FLAGS_WITH_VALUE:
+                return None
             if name in _GCLOUD_FLAGS_WITH_VALUE and not separator:
                 index += 1
             index += 1
@@ -172,14 +201,23 @@ def _gcloud_words(argv: list[str]) -> list[str]:
     return words
 
 
-def _gcloud_is_read_only(argv: list[str]) -> bool:
-    """Does any prefix of the command path name a listed read command?
+def _gcloud_is_read_only(words: list[str] | None) -> bool:
+    """Is the command a listed read-only gcloud command?
 
-    A prefix rather than the whole word list, because positional arguments
-    follow the verb: `container clusters get-credentials prod-usc1` matches on
-    its first three words.
+    Args:
+        words: The result of _gcloud_words(), which may be None if the command
+               was unreadable. Returns False if words is None.
+
+    The command path must match exactly a tuple in GCLOUD_READ_COMMANDS.
+    Positional arguments after the verb are allowed: `container clusters
+    get-credentials my-cluster` matches the path `(container, clusters,
+    get-credentials)` and ignores the cluster name.
     """
-    words = _gcloud_words(argv)
+    if words is None:
+        return False
+    # A prefix of the words must exactly match a listed command. This allows
+    # positional arguments after the command: get-credentials my-cluster matches
+    # (container, clusters, get-credentials).
     return any(tuple(words[:length]) in GCLOUD_READ_COMMANDS
                for length in range(1, len(words) + 1))
 
@@ -291,7 +329,30 @@ def evaluate(argv: list[str]) -> Decision:
         )
 
     if argv[0] == "gcloud":
-        if not _gcloud_is_read_only(argv):
+        if _gcloud_has_flags_file(argv):
+            return Decision(
+                allowed=False,
+                rule_id="gcp.flags-file-forbidden",
+                message=(
+                    "--flags-file reads from a file under the agent's control. "
+                    "We cannot read that file without a race condition, so we refuse "
+                    "it outright. Expand flags manually instead of using a file."
+                ),
+            )
+
+        words = _gcloud_words(argv)
+        if words is None:
+            return Decision(
+                allowed=False,
+                rule_id="gcp.unreadable-command",
+                message=(
+                    "gcloud used a flag whose arity is unknown to this module, so the "
+                    "command path cannot be read. Report a new gcloud global flag to "
+                    "your infrastructure team."
+                ),
+            )
+
+        if not _gcloud_is_read_only(words):
             return Decision(
                 allowed=False,
                 rule_id="gcp.read-only",
