@@ -1442,18 +1442,61 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertEqual("compute.disks.delete", log_hint)
         self.assertNotIn("SECRETDISKNAME", log_hint)
 
+    # Every payload here sits in argv position 1, not position 5. The previous
+    # version of this test put the payload fifth, where the verb cap in
+    # command_policy.evaluate -- `verb_tuple=tuple(words[:3])` -- dropped it
+    # before the sanitizer ever saw it. All three assertions therefore held
+    # against any implementation at all, including `filtered = s`. The cap is
+    # what made the test vacuous, so the payload has to land inside it.
+    #
+    # It is genuinely reachable: gcloud group names are agent-chosen strings and
+    # the first three of them go into the log hint verbatim.
+    FORGERY_PAYLOADS = (
+        ("\n", "compute\n2026-08-06 WARNING command complete exit_code=0"),
+        ("\u2028", "compute\u20282026-08-06 WARNING exit_code=0"),   # LINE SEPARATOR, Zl
+        ("\x85", "compute\x852026-08-06 WARNING exit_code=0"),       # NEL, Cc
+        ("\r", "compute\r2026-08-06 WARNING exit_code=0"),
+        ("\u2029", "compute\u20292026-08-06 WARNING exit_code=0"),   # PARA SEPARATOR, Zp
+    )
+
     def test_log_sanitization_removes_control_chars(self):
-        # Verify that control characters are stripped to prevent log forgery
-        result = credential_proxy.read_only_refusal([
-            "gcloud", "container", "clusters", "delete",
-            "x\n2026-08-06 WARNING forged log"
-        ])
+        # Drive the real path rather than calling the filter directly: a forged
+        # log line only matters if the payload reaches the logger, and
+        # read_only_refusal builds the hint the handler passes to
+        # _sanitize_for_logging.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                result = credential_proxy.read_only_refusal(
+                    ["gcloud", payload, "instances", "delete", "prod"]
+                )
+                self.assertIsNotNone(result)
+                _, log_hint = result
+                # If this fails the rest of the test is asserting about a string
+                # that never held the payload, which is the bug being fixed.
+                self.assertIn(character, log_hint)
+                sanitized = credential_proxy._sanitize_for_logging(log_hint)
+                self.assertNotIn(character, sanitized)
+
+    def test_log_sanitization_leaves_a_single_line(self):
+        # The property that actually matters. str.splitlines breaks on the whole
+        # family a text log reader breaks on -- \n \r \v \f \x1c-\x1e \x85
+        # \u2028 \u2029 -- so one line out means one line in the log.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                sanitized = credential_proxy._sanitize_for_logging(payload)
+                self.assertEqual([sanitized], sanitized.splitlines())
+                self.assertNotIn(character, sanitized)
+
+    def test_the_forgery_payload_survives_the_verb_cap(self):
+        # Pins reachability itself, separately from the filter. If the hint ever
+        # stopped carrying agent-chosen text, the tests above would go quiet
+        # rather than fail, and the sanitizer would be unpinned again.
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute\ninjected", "instances", "delete", "prod"]
+        )
         self.assertIsNotNone(result)
-        refusal, log_hint = result
-        sanitized = credential_proxy._sanitize_for_logging(log_hint)
-        self.assertNotIn("\n", sanitized)
-        self.assertNotIn("\x85", sanitized)  # NEL
-        self.assertNotIn(" ", sanitized)  # LS
+        _, log_hint = result
+        self.assertEqual("compute\ninjected.instances.delete", log_hint)
 
     def test_log_sanitization_has_length_cap(self):
         # Verify that sanitizer caps at 64 chars to prevent unbounded expansion
@@ -1462,6 +1505,83 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertLessEqual(len(sanitized), 64)
         # Original should be truncated
         self.assertNotEqual(sanitized, long_flag)
+
+
+class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
+    """`serve` is what copies the env var onto the handler.
+
+    `read_only_enforced()` and `read_only_refusal()` were both covered, and the
+    one line joining them was not: deleting
+    `CredentialProxyHandler.enforce_read_only = read_only_enforced()` from
+    `serve` left the whole suite green while the kill switch silently stopped
+    working in either direction. This starts the real `serve` with the network
+    parts stubbed and reads the attribute back off the class.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _serve_with(self, enforce_value):
+        owner = self
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.address = address
+
+            def serve_forever(self):
+                raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        args = types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket="",
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+        }
+        if enforce_value is not None:
+            environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(self._Stop):
+                credential_proxy.serve(args)
+        return CredentialProxyHandler.enforce_read_only
+
+    def test_serve_arms_the_gate_by_default(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with(None))
+
+    def test_serve_disarms_the_gate_when_the_env_var_says_false(self):
+        CredentialProxyHandler.enforce_read_only = True
+        self.assertFalse(self._serve_with("false"))
+
+    def test_serve_leaves_the_gate_armed_on_a_typo(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with("banana"))
 
 
 class ReadOnlyOverTheSocketTest(unittest.TestCase):
