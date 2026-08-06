@@ -51,6 +51,8 @@ Naming a cluster is not extra authority — `get-credentials` is bound by the sa
 
 This is a floor, not an ownership check: the wrapper sends an argument array and a working directory, never a caller identity, so the sidecar can tell that a push is happening inside _some_ lease but not whose. Whether the lease is the caller's own is checked in the sandbox by the skill that holds it. [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) is canonical for the layout and the reaper.
 
+**`kubectl` and `gcloud` are read-only by default.** The proxy enforces that `kubectl` may not run mutating verbs like `delete`, `create`, `patch`, or `rollout restart`, and that `gcloud` may not run commands that change cloud resources. This is a second layer under Kubernetes impersonation: the API server authorizes each request as the service account (never the agent), so a mistake in the allowlist loses only this redundant check. A first deployment in a live environment will find read-only commands nobody anticipated. Set `CREDENTIAL_PROXY_ENFORCE_READ_ONLY=false` to unblock them faster than a new image; change is accepted only for the exact string `false`, so a typo in a ConfigMap leaves the gate on.
+
 ## Credential placement
 
 | Data                            | Sandbox     | Credential sidecar        |

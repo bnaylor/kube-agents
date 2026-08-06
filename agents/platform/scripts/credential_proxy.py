@@ -1203,9 +1203,10 @@ def read_only_enforced() -> bool:
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
 
 
-def read_only_refusal(argv: list[str]) -> dict[str, str] | None:
+def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], tuple[str, ...] | None] | None:
     """The blocked-response body for `argv`, or None if it may run.
 
+    Returns (response_dict, verb_tuple) for logging, or None if allowed.
     Split out from the handler so the decision is testable without standing up
     a socket, and so the gate reads the class attribute rather than the
     environment on every request.
@@ -1215,12 +1216,15 @@ def read_only_refusal(argv: list[str]) -> dict[str, str] | None:
     decision = command_policy.evaluate(argv)
     if decision.allowed:
         return None
-    return {
-        "status": "blocked",
-        "code": "SECURITY_POLICY_BLOCKED",
-        "rule": decision.rule_id,
-        "message": decision.message,
-    }
+    return (
+        {
+            "status": "blocked",
+            "code": "SECURITY_POLICY_BLOCKED",
+            "rule": decision.rule_id,
+            "message": decision.message,
+        },
+        decision.verb_tuple,
+    )
 
 
 class CredentialProxyHandler(BaseHTTPRequestHandler):
@@ -1362,15 +1366,18 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Runs after the credential denylist above, so a rule like
-        # `kubernetes.token-disclosure` keeps its own id and message rather
-        # than being reported as a read-only refusal. Ordering also means the
-        # denylist still catches `kubectl config view --raw`, which the
-        # allowlist would otherwise permit as a bare `config view`.
-        refusal = read_only_refusal(argv)
-        if refusal is not None:
+        # Runs after the credential denylist above, so rules like
+        # `kubernetes.token-disclosure` keep their own ids and messages rather
+        # than being reported as read-only refusals. For example, `kubectl create
+        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+        # be refused by the denylist with that rule id. If the gate ran first, it
+        # would refuse as `kubernetes.read-only`, losing the specific rule.
+        refusal_result = read_only_refusal(argv)
+        if refusal_result is not None:
+            refusal, verb_tuple = refusal_result
+            verb_str = ".".join(verb_tuple) if verb_tuple else "unknown"
             LOGGER.warning(
-                "command refused request_id=%s rule=%s", request_id, refusal["rule"]
+                "command refused request_id=%s rule=%s verb=%s", request_id, refusal["rule"], verb_str
             )
             self._json(HTTPStatus.FORBIDDEN, refusal)
             return

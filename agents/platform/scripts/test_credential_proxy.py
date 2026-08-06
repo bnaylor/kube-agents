@@ -1383,7 +1383,8 @@ class ReadOnlyGateTest(unittest.TestCase):
 
     def _decide(self, argv):
         """The blocked response the handler would send, or None if allowed."""
-        return credential_proxy.read_only_refusal(argv)
+        result = credential_proxy.read_only_refusal(argv)
+        return result[0] if result is not None else None
 
     def test_a_read_passes_the_gate(self):
         self.assertIsNone(self._decide(["kubectl", "get", "pods"]))

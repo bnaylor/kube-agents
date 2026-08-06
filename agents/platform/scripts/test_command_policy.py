@@ -319,7 +319,9 @@ class GcloudReadOnlyTest(unittest.TestCase):
         allowed_commands = [
             (["gcloud", "auth", "list"], "auth list"),
             (["gcloud", "config", "get"], "config get"),
+            (["gcloud", "config", "get-value", "project"], "config get-value"),
             (["gcloud", "config", "list"], "config list"),
+            (["gcloud", "compute", "regions", "list"], "compute regions list"),
             (["gcloud", "container", "clusters", "describe", "mycluster"], "container clusters describe"),
             (["gcloud", "container", "clusters", "list"], "container clusters list"),
             (["gcloud", "container", "clusters", "get-credentials", "prod-usc1"], "container clusters get-credentials"),
@@ -359,6 +361,7 @@ class GcloudReadOnlyTest(unittest.TestCase):
             ("--flatten", "name[]"),
             ("--access-token-file", "/path/to/token"),
             ("--page-size", "50"),
+            ("--freshness", "7d"),
         ]
         for flag, value in flags_with_value:
             argv = ["gcloud", flag, value, "container", "clusters", "list"]

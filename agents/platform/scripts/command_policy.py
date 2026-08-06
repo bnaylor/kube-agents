@@ -43,6 +43,7 @@ class Decision:
     allowed: bool
     rule_id: str
     message: str
+    verb_tuple: tuple[str, ...] | None = None  # Resolved kubectl/gcloud verb path, safe to log
 
 
 _ALLOWED = Decision(allowed=True, rule_id="", message="")
@@ -152,7 +153,9 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
     {
         ("auth", "list"),
         ("config", "get"),
+        ("config", "get-value"),
         ("config", "list"),
+        ("compute", "regions", "list"),
         ("container", "clusters", "describe"),
         ("container", "clusters", "list"),
         # Writes a kubeconfig in the sidecar and nothing in the cloud. It is
@@ -182,7 +185,7 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--project", "--format", "--filter", "--region", "--zone",
         "--location", "--account", "--configuration", "--verbosity",
         "--billing-project", "--sort-by", "--limit", "--trace-token",
-        "--flatten", "--access-token-file", "-z", "--page-size",
+        "--flatten", "--access-token-file", "-z", "--page-size", "--freshness",
     }
 )
 
@@ -367,6 +370,7 @@ def evaluate(argv: list[str]) -> Decision:
                 "Impersonation is set by the credential proxy, not by the "
                 "caller. Remove --as/--as-group/--impersonate-service-account."
             ),
+            verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
         )
 
     if argv[0] == "kubectl":
@@ -376,6 +380,7 @@ def evaluate(argv: list[str]) -> Decision:
                 allowed=False,
                 rule_id="kubernetes.unreadable-command",
                 message="Could not identify a kubectl verb, so the command was refused.",
+                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
             return _ALLOWED
@@ -386,6 +391,7 @@ def evaluate(argv: list[str]) -> Decision:
                 "Agents hold read-only access to Kubernetes. Propose this change "
                 "as a pull request instead."
             ),
+            verb_tuple=verb,
         )
 
     if argv[0] == "gcloud":
@@ -398,6 +404,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "We cannot read that file without a race condition, so we refuse "
                     "it outright. Expand flags manually instead of using a file."
                 ),
+                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
             )
 
         if _gcloud_refuses_identity_change(argv):
@@ -408,6 +415,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "Identity belongs to the broker. Remove --access-token-file, "
                     "--configuration, and --account to use the default identity."
                 ),
+                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
             )
 
         words = _gcloud_words(argv)
@@ -420,6 +428,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "command path cannot be read. Report a new gcloud global flag to "
                     "your infrastructure team."
                 ),
+                verb_tuple=tuple(argv[1:2]) if len(argv) > 1 else None,
             )
 
         if not _gcloud_is_read_only(words):
@@ -430,6 +439,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "Agents hold read-only access to Google Cloud. Propose this "
                     "change as a pull request instead."
                 ),
+                verb_tuple=tuple(words),
             )
         return _ALLOWED
 
