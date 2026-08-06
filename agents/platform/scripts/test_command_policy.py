@@ -1,6 +1,6 @@
 import unittest
 
-from command_policy import evaluate
+from command_policy import evaluate, _gcloud_words
 
 
 class KubectlReadOnlyTest(unittest.TestCase):
@@ -264,35 +264,61 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.flags-file-forbidden", decision.rule_id)
 
-    def test_each_gcloud_command_in_allowlist_is_reachable(self):
-        # Regression test: each tuple in GCLOUD_READ_COMMANDS should be
-        # reachable with a realistic argv. This catches mutations that empty
-        # the allowlist or break the matching logic.
-        from command_policy import GCLOUD_READ_COMMANDS
-        for cmd_tuple in sorted(GCLOUD_READ_COMMANDS):
-            argv = ["gcloud"] + list(cmd_tuple) + ["extra-arg"]
-            with self.subTest(cmd=cmd_tuple):
-                self.assertTrue(evaluate(argv).allowed,
-                                f"Command {cmd_tuple} should be allowed")
+    def test_all_gcloud_commands_in_allowlist_are_reachable(self):
+        # Literal list of all commands that should be allowed. This test is
+        # independent of GCLOUD_READ_COMMANDS, so deleting a command breaks
+        # this test. Each command is tested with a realistic positional argument.
+        allowed_commands = [
+            (["gcloud", "auth", "list"], "auth list"),
+            (["gcloud", "config", "get"], "config get"),
+            (["gcloud", "config", "list"], "config list"),
+            (["gcloud", "container", "clusters", "describe", "mycluster"], "container clusters describe"),
+            (["gcloud", "container", "clusters", "list"], "container clusters list"),
+            (["gcloud", "container", "clusters", "get-credentials", "prod-usc1"], "container clusters get-credentials"),
+            (["gcloud", "container", "get-server-config"], "container get-server-config"),
+            (["gcloud", "container", "node-pools", "describe", "default"], "container node-pools describe"),
+            (["gcloud", "container", "node-pools", "list"], "container node-pools list"),
+            (["gcloud", "info"], "info"),
+            (["gcloud", "logging", "read"], "logging read"),
+            (["gcloud", "projects", "describe", "myproj"], "projects describe"),
+            (["gcloud", "projects", "get-iam-policy", "myproj"], "projects get-iam-policy"),
+            (["gcloud", "projects", "list"], "projects list"),
+            (["gcloud", "version"], "version"),
+        ]
+        for argv, desc in allowed_commands:
+            with self.subTest(cmd=desc):
+                self.assertTrue(evaluate(argv).allowed, f"{desc} should be allowed")
 
-    def test_each_gcloud_flag_with_value_consumes_its_value(self):
-        # Regression test: each flag in _GCLOUD_FLAGS_WITH_VALUE should
-        # consume the next token. If a flag is removed or its entry is broken,
-        # the flag value gets treated as a command word and breaks the parsing.
-        from command_policy import _GCLOUD_FLAGS_WITH_VALUE, _gcloud_words
-        for flag in sorted(_GCLOUD_FLAGS_WITH_VALUE):
-            if flag == "--impersonate-service-account":
-                # Skip this one - it's also in _IMPERSONATION_FLAGS and gets
-                # rejected early. We just need to check that it's in the flag
-                # set for the sake of the enumeration.
-                continue
-            argv = ["gcloud", flag, "flagvalue", "container", "clusters", "list"]
+    def test_all_gcloud_flags_with_value_consume_their_values(self):
+        # Literal list of all value-taking flags. This test is independent of
+        # _GCLOUD_FLAGS_WITH_VALUE, so deleting a flag breaks this test. Each
+        # flag is tested to ensure it skips the next token correctly.
+        flags_with_value = [
+            ("--project", "proj1"),
+            ("--format", "json"),
+            ("--filter", "name:foo"),
+            ("--region", "us-central1"),
+            ("--zone", "us-central1-a"),
+            ("-z", "us-central1-a"),
+            ("--location", "us-central1"),
+            ("--account", "user@domain.com"),
+            ("--configuration", "myconfig"),
+            ("--verbosity", "debug"),
+            ("--billing-project", "billingproj"),
+            ("--sort-by", "name"),
+            ("--limit", "10"),
+            ("--trace-token", "token123"),
+            ("--flatten", "name[]"),
+            ("--access-token-file", "/path/to/token"),
+            ("--page-size", "50"),
+        ]
+        for flag, value in flags_with_value:
+            argv = ["gcloud", flag, value, "container", "clusters", "list"]
             with self.subTest(flag=flag):
                 words = _gcloud_words(argv)
                 self.assertIsNotNone(words, f"Flag {flag} should be recognized")
-                # The flag and its value should be skipped, leaving container onwards
                 self.assertEqual(words, ["container", "clusters", "list"],
-                                f"Flag {flag} should consume its value, got {words}")
+                                f"Flag {flag} should consume '{value}', got {words}")
 
     def test_new_flags_trace_token_zone_etc(self):
         # Regression test for the five newly added flags: --trace-token,
@@ -302,8 +328,7 @@ class GcloudReadOnlyTest(unittest.TestCase):
             (["gcloud", "container", "clusters", "describe", "-z", "us-central1-a", "mycluster"], True),
             (["gcloud", "container", "clusters", "--trace-token", "tok", "list"], True),
             (["gcloud", "container", "clusters", "--flatten", "x", "list"], True),
-            (["gcloud", "container", "clusters", "--access-token-file", "f", "list"], True),
-            (["gcloud", "container", "clusters", "--page-size", "100", "list"], True),
+            (["gcloud", "container", "clusters", "list", "--page-size", "100"], True),
         ]
         for argv, expected_allowed in test_cases:
             with self.subTest(argv=argv):
@@ -340,6 +365,23 @@ class GcloudReadOnlyTest(unittest.TestCase):
         for argv, expected_allowed in test_cases:
             with self.subTest(argv=argv):
                 self.assertEqual(evaluate(argv).allowed, expected_allowed)
+
+    def test_gcloud_identity_flags_are_refused(self):
+        # --access-token-file, --configuration, and --account change the
+        # identity that gcloud uses. These should be refused outright.
+        test_cases = [
+            (["gcloud", "--access-token-file", "/tmp/tok.txt", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--access-token-file=/tmp/tok.txt", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--configuration", "evil", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--configuration=evil", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--account", "evil@corp.com", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+            (["gcloud", "--account=evil@corp.com", "container", "clusters", "list"], "gcp.identity-change-forbidden"),
+        ]
+        for argv, expected_rule_id in test_cases:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(expected_rule_id, decision.rule_id)
 
 
 if __name__ == "__main__":

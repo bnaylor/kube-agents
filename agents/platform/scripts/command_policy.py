@@ -23,6 +23,14 @@ keeps its denylist and defaults to permitting, and this defaults to refusing.
 `git` and `gh` are out of scope on purpose. Writing to the artifact plane is how
 the agent is meant to act -- it opens a pull request and CI applies it -- and
 the git workspace lease already governs those verbs.
+
+## Structural limitations
+
+This module cannot cover `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` environment
+variable or impersonation set in the default gcloud configuration file. Both
+arrive without appearing in argv and cannot be detected here. The control is
+the credential proxy owning `CLOUDSDK_CONFIG` and the process environment.
+This is a gate on argv, not the impersonation boundary.
 """
 
 from __future__ import annotations
@@ -105,12 +113,25 @@ _KUBECTL_BOOLEAN_FLAGS = frozenset(
     }
 )
 
-# Impersonation belongs to the broker. An agent that supplies its own `--as`
-# chooses its own principal, which inverts the model, so these are refused
-# before the verb is even read. Checked by exact membership on the flag name
-# (before the `=` separator) so `--as=x` and `--as x` are both caught.
+# Impersonation and identity-changing flags belong to the broker, not the caller.
+# An agent that supplies its own principal chooses its own identity, which inverts
+# the model, so these are refused before the verb is even read. Checked by exact
+# membership on the flag name (before the `=` separator) so both `--flag=value`
+# and `--flag value` forms are caught.
+#
+# kubectl impersonation flags:
 _IMPERSONATION_FLAGS = frozenset(
     {"--as", "--as-group", "--as-uid", "--as-user-extra", "--impersonate-service-account"}
+)
+
+# gcloud identity-changing flags (in addition to --impersonate-service-account above):
+# - --access-token-file: authenticates with the file's contents instead of the
+#   active account (agent controls the filesystem, so this is caller-supplied
+#   credentials through a different door)
+# - --configuration: names a gcloud config file which can carry impersonate settings
+# - --account: selects a different already-credentialed principal
+_GCLOUD_IDENTITY_FLAGS = frozenset(
+    {"--access-token-file", "--configuration", "--account"}
 )
 
 # gcloud's grammar is `gcloud GROUP... VERB [POSITIONAL...]`, so the verb is
@@ -158,8 +179,12 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
 )
 
 # gcloud boolean global flags that do not consume the following argument.
-# These are enumerated from gcloud help. An unknown flag is still rejected
-# as unreadable, but known boolean flags do not hide the command path.
+# These are enumerated from gcloud help and are boolean **at the global parser
+# level only**. -v and --version are value-taking in some subcommands like
+# `gcloud app` or `gcloud firebase test`, so if those trees are ever added to
+# the allowlist, the boolean assumption reopens the hole. An unknown flag is
+# still rejected as unreadable, but known boolean flags do not hide the
+# command path.
 _GCLOUD_BOOLEAN_FLAGS = frozenset(
     {
         "--quiet", "-q", "--version", "-v", "--help", "-h",
@@ -307,6 +332,20 @@ def _refuses_impersonation(argv: list[str]) -> bool:
     return False
 
 
+def _gcloud_refuses_identity_change(argv: list[str]) -> bool:
+    """Check if gcloud argv contains identity-changing flags.
+
+    --access-token-file, --configuration, and --account all change the
+    identity that gcloud uses, which inverts the model. Checked by exact
+    membership on the flag name (before the `=` separator).
+    """
+    for token in argv[1:]:
+        name, _, _ = token.partition("=")
+        if name in _GCLOUD_IDENTITY_FLAGS:
+            return True
+    return False
+
+
 def evaluate(argv: list[str]) -> Decision:
     """Allow or refuse a command on read-only grounds.
 
@@ -353,6 +392,16 @@ def evaluate(argv: list[str]) -> Decision:
                     "--flags-file reads from a file under the agent's control. "
                     "We cannot read that file without a race condition, so we refuse "
                     "it outright. Expand flags manually instead of using a file."
+                ),
+            )
+
+        if _gcloud_refuses_identity_change(argv):
+            return Decision(
+                allowed=False,
+                rule_id="gcp.identity-change-forbidden",
+                message=(
+                    "Identity belongs to the broker. Remove --access-token-file, "
+                    "--configuration, and --account to use the default identity."
                 ),
             )
 
