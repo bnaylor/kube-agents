@@ -182,11 +182,14 @@ class KubectlReadOnlyTest(unittest.TestCase):
 
     def test_all_kubectl_impersonation_flags_are_refused(self):
         # Literal list of all kubectl impersonation flags. This test is
-        # independent of _IMPERSONATION_FLAGS, so deleting a flag breaks this test.
+        # independent of _IMPERSONATION_FLAGS, so deleting any flag breaks this test.
         impersonation_flags = [
             (["kubectl", "--as", "admin@corp.com", "get", "secrets"], "--as"),
             (["kubectl", "--as=admin@corp.com", "get", "secrets"], "--as="),
+            (["kubectl", "--as-group", "system:masters", "get", "secrets"], "--as-group"),
             (["kubectl", "--as-group=system:masters", "get", "secrets"], "--as-group="),
+            (["kubectl", "--as-uid", "1234", "get", "secrets"], "--as-uid"),
+            (["kubectl", "--as-uid=1234", "get", "secrets"], "--as-uid="),
             (["kubectl", "--as-user-extra=scopes=admin", "get", "secrets"], "--as-user-extra="),
             (["kubectl", "--impersonate-service-account", "sa@proj.iam.gserviceaccount.com", "get", "secrets"], "--impersonate-service-account"),
             (["kubectl", "--impersonate-service-account=sa@proj.iam.gserviceaccount.com", "get", "secrets"], "--impersonate-service-account="),
