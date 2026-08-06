@@ -158,11 +158,16 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "list"),
         ("compute", "addresses", "describe"),
         ("compute", "addresses", "list"),
+        ("compute", "backend-services", "list"),
         ("compute", "disks", "describe"),
         ("compute", "disks", "list"),
+        ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
         ("compute", "regions", "list"),
+        ("compute", "snapshots", "describe"),
         ("compute", "snapshots", "list"),
+        ("compute", "target-pools", "list"),
+        ("container", "ai", "profiles", "list"),
         ("container", "ai", "profiles", "models", "list"),
         ("container", "clusters", "describe"),
         ("container", "clusters", "list"),
@@ -195,7 +200,7 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--location", "--account", "--configuration", "--verbosity",
         "--billing-project", "--sort-by", "--limit", "--trace-token",
         "--flatten", "--access-token-file", "-z", "--page-size", "--freshness",
-        "--cluster",
+        "--cluster", "--model",
     }
 )
 
@@ -474,7 +479,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "Agents hold read-only access to Google Cloud. Propose this "
                     "change as a pull request instead."
                 ),
-                verb_tuple=tuple(words),
+                verb_tuple=tuple(words[:3]),  # Cap at 3 words to exclude positionals
             )
         return _ALLOWED
 

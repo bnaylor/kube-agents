@@ -1204,8 +1204,20 @@ def read_only_enforced() -> bool:
 
 
 def _sanitize_for_logging(s: str) -> str:
-    """Strip control characters to prevent log forgery."""
-    return ''.join(c for c in s if c >= ' ' and c != '\x7f')
+    """Strip control characters to prevent log forgery, with 64-char length cap.
+
+    Removes C0/C1 control characters, line/paragraph separators (Unicode), and
+    all characters that could be interpreted as line boundaries by consumers
+    (Python splitlines, JS /m, JSON parsers, etc). Also caps length to prevent
+    unbounded agent-controlled hint expansion.
+    """
+    import unicodedata
+
+    # Characters in Cc (control), Cf (format), Zl (line sep), Zp (para sep)
+    # will forge log lines in text-mode consumers.
+    filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))
+    # Cap at 64 chars (no real flag name exceeds this)
+    return filtered[:64]
 
 
 def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:

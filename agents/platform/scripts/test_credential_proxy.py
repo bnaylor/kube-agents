@@ -1422,6 +1422,47 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertNotIn("SECRET", log_hint)
         self.assertNotIn("eyJhbGci", log_hint)
 
+    def test_gcloud_positionals_do_not_leak_to_logs(self):
+        # Verify that positionals in gcloud don't get logged when capped at 3 words
+        # "compute disks describe" is allowlisted, but it accepts a disk name positional
+        # which should not appear in the log hint (capped at first 3 words)
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "describe", "SECRETDISKNAME", "--zone=us-central1-a"]
+        )
+        # This is allowed, so no refusal
+        self.assertIsNone(result)
+
+        # Test a mutation that WOULD refuse and check the hint cap
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The hint should cap at 3 words, excluding the credential positional
+        self.assertEqual("compute.disks.delete", log_hint)
+        self.assertNotIn("SECRETDISKNAME", log_hint)
+
+    def test_log_sanitization_removes_control_chars(self):
+        # Verify that control characters are stripped to prevent log forgery
+        result = credential_proxy.read_only_refusal([
+            "gcloud", "container", "clusters", "delete",
+            "x\n2026-08-06 WARNING forged log"
+        ])
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        sanitized = credential_proxy._sanitize_for_logging(log_hint)
+        self.assertNotIn("\n", sanitized)
+        self.assertNotIn("\x85", sanitized)  # NEL
+        self.assertNotIn(" ", sanitized)  # LS
+
+    def test_log_sanitization_has_length_cap(self):
+        # Verify that sanitizer caps at 64 chars to prevent unbounded expansion
+        long_flag = "--verylongflagname" + "x" * 100
+        sanitized = credential_proxy._sanitize_for_logging(long_flag)
+        self.assertLessEqual(len(sanitized), 64)
+        # Original should be truncated
+        self.assertNotEqual(sanitized, long_flag)
+
 
 if __name__ == "__main__":
     unittest.main()
