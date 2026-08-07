@@ -813,6 +813,23 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertNotIn("SLACK_BOT_TOKEN", executor.environment)
         self.assertEqual(str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"])
 
+    def test_kuberc_is_disabled_for_proxied_commands(self):
+        # command_policy refuses the --kuberc flag, but kubectl v1.36.3 also
+        # reads $HOME/.kube/kuberc with no flag present, and a kuberc can carry
+        # an `as` default -- verified to set Impersonate-User on an argv holding
+        # nothing to refuse. HOME points at the sidecar-only state dir, so the
+        # agent cannot write that path today, but that is deployment geometry
+        # and it is not what this asserts. This asserts the feature is off, so
+        # the property survives someone rearranging the mounts.
+        executor = self.executor()
+        # .get rather than [] so removing the variable reads as a failure with
+        # the expected value in the diff, not as a KeyError in the error column.
+        self.assertEqual("false", executor.environment.get("KUBECTL_KUBERC"))
+        # And the geometry, separately, so a change to either is visible.
+        self.assertEqual(
+            str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"]
+        )
+
     def test_git_commands_carry_a_commit_identity(self):
         # The remediation Pull Request path commits through the proxy, and the
         # commit runs here, in the sidecar. With no identity `git commit` exits

@@ -244,9 +244,27 @@ _KUBECTL_IDENTITY_FLAGS = frozenset(
 # file truncation inside the trusted container. --cache-dir is milder but the
 # same shape: it creates directories and writes discovery and HTTP cache files
 # under any path given.
+#
+# --output-directory is the odd one out: it belongs to `cluster-info dump`
+# rather than to kubectl globally, and it is here because it is the only guard
+# on that command that does not depend on the verb parse succeeding. Cobra's
+# stripFlags finds `dump` whatever sits between the two words, but phase 2 of
+# _kubectl_verb_and_flag stops at the first flag it does not know, so
+# `kubectl cluster-info --output-directory=/tmp/x dump` reads as the bare,
+# allowed `cluster-info` -- and it was verified to write the full dump tree on
+# v1.36.3. Making the two-word match skip over intervening flags would reopen
+# the hole phase 2 exists to close, so the flag is refused directly instead.
+# This check runs before the verb is parsed, so it holds in any argv order.
+# `("cluster-info", "dump")` stays in KUBECTL_REFUSED_SUBCOMMANDS as the second
+# of the two guards.
+#
+# Deliberately not added to _KUBECTL_FLAGS_WITH_VALUE: that table is for
+# kubectl's *global* flags, and teaching the parser to consume the value of a
+# command-specific flag is how an unknown flag gets to swallow a subcommand.
+# The refusal above makes its arity moot.
 _KUBECTL_FILE_WRITE_FLAGS = frozenset(
     {
-        "--profile", "--profile-output", "--cache-dir",
+        "--profile", "--profile-output", "--cache-dir", "--output-directory",
     }
 )
 
@@ -501,6 +519,18 @@ def _kubectl_has_kuberc(argv: list[str]) -> str | None:
     read and kubectl's, a race we cannot win and should not try to. The only
     safe answer is to refuse the flag outright, which is what gcloud's
     --flags-file already does.
+
+    This covers the flag and only the flag. kubectl also reads
+    `$HOME/.kube/kuberc` with no flag present at all -- verified on v1.36.3, a
+    default-path kuberc set `Impersonate-User` on a command whose argv this
+    function sees nothing wrong with. Nothing in argv can express that, so it
+    cannot be closed here. It is closed twice over in credential_proxy.py: the
+    subprocess `HOME` is the sidecar-only state dir rather than the shared PVC,
+    so the agent cannot write the default path, and `KUBECTL_KUBERC=false` is
+    set in `CommandExecutor.environment` so the feature is off regardless of
+    what appears there. The second of those exists because the first is
+    deployment geometry, and geometry changes without anyone thinking to
+    re-check this file.
     """
     for token in argv[1:]:
         name, _, _ = token.partition("=")
@@ -516,11 +546,40 @@ def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
     membership on the flag name (before the `=` separator), so both `--flag
     value` and `--flag=value` are caught, and checked over the whole argv rather
     than only the leading global flags -- kubectl accepts these anywhere.
+
+    Exact membership is not sufficient on its own, because pflag also accepts a
+    shorthand with its value attached: `-shttp://host` is `--server http://host`
+    with no separator to partition on, so the token's "name" is the whole
+    `-shttp://host` and it matches nothing. `kubectl get pods -shttps://…` was
+    honoured by v1.36.3 and delivered the bearer token to that address, which is
+    the credential-exfiltration Critical again through a different spelling.
+
+    `-s` is the only shorthand among the refused flags, so this is one instance
+    rather than a class: `-v` takes its own value and is not refused, and `-h`
+    dead-ends in help output. Any `-s`-prefixed token is the server flag --
+    pflag only groups shorthands that take no value, and `--server` does take
+    one -- so there is no `-sX` that means something else.
     """
     for token in argv[1:]:
         name, _, _ = token.partition("=")
         if name in _KUBECTL_IDENTITY_FLAGS:
             return name
+        # Attached shorthand: `-sVALUE`. A bare `-s` and `-s=VALUE` both
+        # partition to `-s` and are caught by the exact match above, so the only
+        # token this adds is the attached form.
+        #
+        # No `not token.startswith("--")` guard: a token cannot begin with both
+        # `-s` and `--`, so such a clause would never evaluate false and would
+        # imply long flags are handled here when they are handled by the exact
+        # match. `--sort-by`, `--since` and `--selector` are unaffected for that
+        # reason, which is worth knowing because the obvious looser spelling of
+        # this rule -- stripping dashes before testing for `s` -- would refuse
+        # all three.
+        #
+        # The flag name is returned rather than the token, so the address the
+        # agent chose never reaches a log line.
+        if token.startswith("-s") and token != "-s":
+            return "-s"
     return None
 
 

@@ -761,6 +761,16 @@ class CommandExecutor:
             "GH_CONFIG_DIR": str(self.config_dir / "gh"),
             "KUBECONFIG": str(self.home_dir / ".kube" / "config"),
             "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
+            # kuberc carries per-command default options, including `as`, and it
+            # is on by default in kubectl v1.36.3. command_policy refuses the
+            # `--kuberc` flag, but kubectl also reads `$HOME/.kube/kuberc` with
+            # no flag at all -- verified to set Impersonate-User on an argv that
+            # contains nothing to refuse. That path is out of the agent's reach
+            # only because HOME points at the sidecar-only state dir rather than
+            # the shared PVC, which is deployment geometry and not a control.
+            # This turns the feature off outright so the property survives
+            # someone rearranging the mounts. Nothing here needs kuberc.
+            "KUBECTL_KUBERC": "false",
         }
         # Forward only variables required by supported credential clients. Chat
         # tokens and proxy control variables must never enter an agent-selected
