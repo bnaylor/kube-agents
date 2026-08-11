@@ -58,16 +58,17 @@ status: ## Show the working tree status.
 	git status
 
 # Prefer an installed `prettier` over `npx prettier`, falling back to npx where
-# there is none (CI, which runs `npm install prettier` first). npx re-resolves
-# the package against the npm registry on every invocation, so on a machine
-# whose registry is an authenticated mirror these targets failed with an auth
-# error even though prettier was installed and on PATH -- which is how the
+# there is none (CI installs a pinned version first). npx re-resolves the
+# package against the npm registry on every invocation, so on a machine whose
+# registry is an authenticated mirror these targets failed with an auth error
+# even though prettier was installed and on PATH -- which is how the
 # formatting check came to be skipped by hand rather than run.
 #
-# Install it with `brew install prettier` or `npm install -g prettier`. Match
-# the major version CI resolves (prettier.yml installs the latest 3.x);
-# formatting differs across majors, so a mismatch shows up as a check that
-# passes locally and fails in CI.
+# Install the version CI pins (see the Install Prettier step in
+# .github/workflows/prettier.yml), e.g. `npm install -g prettier@<that
+# version>`. The k8s-operator manifests gate asserts byte-equality against
+# that version's output, so a version skew shows up as a check that passes
+# locally and fails in CI, or the reverse.
 PRETTIER := $(shell command -v prettier 2>/dev/null || echo npx prettier)
 
 prettier-check: ## Check Markdown/YAML formatting (CI runs this).

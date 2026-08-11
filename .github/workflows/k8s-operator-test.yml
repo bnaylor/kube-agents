@@ -63,7 +63,7 @@ jobs:
           make -C k8s-operator manifests
           git add --intent-to-add -A -- k8s-operator/config
           if ! git diff --exit-code -- k8s-operator/config; then
-            echo "::error::Committed manifests are out of date. Run 'make -C k8s-operator manifests' and commit the result."
+            echo "::error::Committed manifests are out of date, or your local prettier differs from the version this gate pins above. Run 'make -C k8s-operator manifests' with that prettier version and commit the result."
             exit 1
           fi
           make -C k8s-operator generate
