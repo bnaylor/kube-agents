@@ -103,27 +103,11 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Executing Provisioning Pipeline Scr
 echo "✓ Provisioning scripts finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
+# Stage 13 owns the rollout gate (creation wait, rollout status, and failure
+# diagnostics), so this stays a single copy rather than a hand-rolled twin.
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Waiting for deployment/platform-agent-gateway to be created by operator ==="
-MAX_WAIT_SECONDS=300
-ELAPSED=0
-FOUND=0
-
-while [ "$ELAPSED" -lt "$MAX_WAIT_SECONDS" ]; do
-  if kubectl get deployment/platform-agent-gateway -n "${NAMESPACE}" &>/dev/null; then
-    FOUND=1
-    break
-  fi
-  sleep 2
-  ELAPSED=$((ELAPSED + 2))
-done
-
-if [ "$FOUND" -ne 1 ]; then
-  echo "ERROR: Operator failed to create deployment/platform-agent-gateway within ${MAX_WAIT_SECONDS}s!"
-  exit 1
-fi
-
-kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" --timeout=600s
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
+./k8s-operator/scripts/provision_13_verify_agent_rollout.sh --non-interactive
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────

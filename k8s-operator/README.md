@@ -59,6 +59,7 @@ graph TD
     A --> K[provision_10_deploy_github_minter.sh]
     A --> L[provision_11_deploy_inference_replay.sh]
     A --> M[provision_12_gke_backup_plan.sh]
+    A --> N[provision_13_verify_agent_rollout.sh]
 ```
 
 Every step is documented once, in **[scripts/README.md](scripts/README.md)** — the canonical

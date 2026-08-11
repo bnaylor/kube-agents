@@ -268,6 +268,11 @@ gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disa
 	@chmod +x scripts/*.sh
 	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
 
+.PHONY: gcp-provision-13-verify-rollout
+gcp-provision-13-verify-rollout: ## Step 13: Verify the PlatformAgent Deployment rollout.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_13_verify_agent_rollout.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true

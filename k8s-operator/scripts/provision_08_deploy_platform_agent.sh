@@ -3,9 +3,10 @@
 # 🤖 Step 8: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
 # Idempotent script that connects to GKE, renders the platform-agent.yaml
-# template, deploys it to the cluster, and waits for the agent Deployment to
-# finish rolling out (override the timeout with AGENT_READY_TIMEOUT, default
-# 600s).
+# template, deploys it to the cluster, and fails unless the operator reconciles
+# the change into the agent Deployment (override the wait budget with
+# AGENT_READY_TIMEOUT, default 600s). Whether the Deployment then rolls out is
+# verified by step 13, after the agent's dependencies exist.
 # ==============================================================================
 
 set -e
@@ -48,6 +49,7 @@ warn_on_registry_prefix_mismatch "AGENT_IMAGE"
 init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
 init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"
+init_agent_ready_timeout
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -146,57 +148,58 @@ execute_custom_resource() {
 
   local deploy_name="platform-agent-gateway"
 
-  # Remember the workload generation before applying, so we can tell whether the
-  # operator has translated this apply into a Deployment change yet.
-  local prev_generation=""
-  if [ "${DRY_RUN:-0}" -ne 1 ]; then
-    prev_generation=$(kubectl get "deployment/${deploy_name}" -n "${NAMESPACE}" \
-        -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "")
-  fi
+  # Remember both generations before applying. The PlatformAgent CRD has the
+  # status subresource, so kubectl apply bumps the CR's metadata.generation iff
+  # the spec actually changed — which tells us whether the operator has a new
+  # spec to reconcile, or this apply was a genuine no-op.
+  local prev_deploy_generation prev_cr_generation
+  prev_deploy_generation=$(kubectl get "deployment/${deploy_name}" -n "${NAMESPACE}" \
+      -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "")
+  prev_cr_generation=$(kubectl get platformagent platform-agent -n "${NAMESPACE}" \
+      -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "")
 
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."
   kubectl apply -f "$CR_MANIFEST" || return 1
 
-  # Applying the CR only tells us the operator accepted it. Without a wait, a Pod
-  # that never comes up — crashlooping sidecar, unschedulable, unpullable image —
-  # still reports a clean install.
-  #
-  # Gate on the Deployment rollout rather than the CR's Ready condition. That
-  # condition is derived from the live replica count and PlatformAgentStatus
-  # carries no observedGeneration, so on a re-apply (verify_custom_resource
+  # Applying the CR only tells us the operator accepted it; gate on the operator
+  # having *reconciled* it. The CR's own Ready condition cannot carry that
+  # information: it is derived from the live replica count and AgentStatus has
+  # no observedGeneration (#534), so on a re-apply (verify_custom_resource
   # always returns 1, so this is the normal path) it can still describe the
-  # previous generation and pass instantly. kubectl rollout status compares the
-  # Deployment's own observedGeneration against metadata.generation, so it will
-  # not accept a stale success.
-  ensure_k8s_resource_exists "deployment/${deploy_name}" "${NAMESPACE}" 30 || return 1
+  # previous spec. Whether the reconciled Deployment then rolls out healthy is
+  # deliberately NOT checked here — the agent's model backend (the litellm
+  # Service) is deployed by stage 09, after this one, so a fresh install cannot
+  # become Ready yet. Step 13 verifies the rollout once the pipeline has
+  # deployed everything the agent needs.
+  ensure_k8s_resource_exists "deployment/${deploy_name}" "${NAMESPACE}" \
+      "$(( AGENT_READY_TIMEOUT_SECONDS / 2 ))" || return 1
 
-  # A CR change that alters the workload bumps the Deployment generation. Wait
-  # briefly for that, so the rollout we gate on is the new one rather than the
-  # one already running. A re-apply that changes nothing never bumps it, and
-  # falls through to confirm the running Deployment is still healthy.
-  if [ -n "$prev_generation" ] && [ "${DRY_RUN:-0}" -ne 1 ]; then
+  local new_cr_generation
+  new_cr_generation=$(kubectl get platformagent platform-agent -n "${NAMESPACE}" \
+      -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "")
+
+  # If this apply changed the CR spec of an already-running install, the
+  # operator must translate it into a Deployment update; a Deployment whose
+  # generation never moves means the change was silently not delivered.
+  # ConfigMap-only changes still count: the operator stamps config hashes into
+  # the pod template annotations, so they too bump the Deployment generation.
+  if [ -n "$prev_deploy_generation" ] && [ -n "$new_cr_generation" ] && \
+     [ "$new_cr_generation" != "$prev_cr_generation" ]; then
+    print_info "CR spec changed (generation ${prev_cr_generation:-none} -> ${new_cr_generation}); waiting for the operator to update the Deployment..."
     local waited=0 current_generation=""
-    while [ "$waited" -lt 30 ]; do
+    while [ "$waited" -lt "$AGENT_READY_TIMEOUT_SECONDS" ]; do
       current_generation=$(kubectl get "deployment/${deploy_name}" -n "${NAMESPACE}" \
           -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "")
-      [ -n "$current_generation" ] && [ "$current_generation" != "$prev_generation" ] && break
+      [ -n "$current_generation" ] && [ "$current_generation" != "$prev_deploy_generation" ] && break
       sleep 3
       waited=$((waited + 3))
     done
-  fi
-
-  if [ "${DRY_RUN:-0}" -ne 1 ]; then
-    print_info "Waiting for ${deploy_name} rollout to complete..."
-    kubectl rollout status "deployment/${deploy_name}" -n "${NAMESPACE}" \
-        --timeout="${AGENT_READY_TIMEOUT:-600s}" || {
-      print_error "PlatformAgent workload '${deploy_name}' did not roll out successfully."
+    if [ "$current_generation" = "$prev_deploy_generation" ] || [ -z "$current_generation" ]; then
+      print_error "Operator did not reconcile the changed PlatformAgent spec into deployment/${deploy_name} within ${AGENT_READY_TIMEOUT}."
       kubectl get platformagent platform-agent -n "${NAMESPACE}" \
           -o jsonpath='{.status.phase}{"\n"}{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}' 2>/dev/null || true
-      print_info "Container states:"
-      kubectl get pods -n "${NAMESPACE}" -l "app=${deploy_name}" \
-          -o jsonpath='{range .items[*].status.containerStatuses[*]}  {.name}: ready={.ready} restarts={.restartCount}{"\n"}{end}' 2>/dev/null || true
       return 1
-    }
+    fi
   fi
 }
 
@@ -205,4 +208,5 @@ run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_step "2. Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
-echo -e "\n${C_GREEN}${C_BOLD}✓ PlatformAgent Custom Resource applied successfully to GKE!${C_RESET}"
+echo -e "\n${C_GREEN}${C_BOLD}✓ PlatformAgent Custom Resource applied and reconciled by the operator!${C_RESET}"
+echo -e "  ${C_CYAN}The workload rollout is verified by step 13, after the agent's dependencies are deployed.${C_RESET}"
