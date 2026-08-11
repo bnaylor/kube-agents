@@ -18,6 +18,13 @@ endif
 # CONTAINER_TOOL defines the container tool to be used for building images.
 CONTAINER_TOOL ?= docker
 
+# Prefer an installed `prettier` over `npx prettier`, same as the root
+# Makefile: npx re-resolves the package against the npm registry on every
+# invocation, so behind an authenticated mirror it can fail even though
+# prettier is installed and on PATH. CI installs the pinned version before
+# running the manifests gate (see .github/workflows/k8s-operator-test.yml).
+PRETTIER := $(shell command -v prettier 2>/dev/null || echo npx prettier)
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -37,8 +44,8 @@ help: ## Display this help.
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	@npx prettier --write "config/crd/bases/*.yaml" "config/rbac/*.yaml" "config/webhook/*.yaml" \
-		|| echo "WARNING: prettier did not run (no npm registry reachable?). The regenerated YAML is left unformatted, which CI's prettier check will reject. Re-run 'npx prettier --write' over config/ once npm is available."
+	@$(PRETTIER) --write "config/crd/bases/*.yaml" "config/rbac/*.yaml" "config/webhook/*.yaml" \
+		|| echo "WARNING: prettier did not run (not installed, or npm registry unreachable?). The regenerated YAML is left unformatted, which CI's prettier check will reject. Re-run prettier --write over config/ once prettier is available." >&2
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -352,7 +359,7 @@ gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local config
 ##@ Formatting
 
 prettier-check: ## Check Markdown/YAML formatting.
-	npx prettier --check "**/*.{md,yaml,yml}"
+	$(PRETTIER) --check "**/*.{md,yaml,yml}"
 
 prettier-write: ## Apply Markdown/YAML formatting.
-	npx prettier --write "**/*.{md,yaml,yml}"
+	$(PRETTIER) --write "**/*.{md,yaml,yml}"

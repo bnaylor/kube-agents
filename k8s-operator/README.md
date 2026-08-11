@@ -173,7 +173,7 @@ make install
 ```
 
 > [!NOTE]
-> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. `make build`, `make run` and `make test` still regenerate first, and CI fails if the committed manifests are stale.
+> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. How the build targets and CI keep generated output in sync is covered in the [operator development guide](../docs/site/src/content/docs/operator/development.md).
 
 ### Step 3: Run the Operator Locally
 
