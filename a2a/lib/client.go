@@ -101,9 +101,14 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 // existing connection objects, so the rebuild path (NR-2) can call it against
 // a dead predecessor.
 func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
-	base := []nats.Option{
+	// Order matters: overridable defaults, then the caller's options, then the
+	// four connection callbacks — last, so nothing can displace them (NR-3).
+	opts := []nats.Option{
 		nats.Name(c.opts.name),
 		nats.MaxReconnects(-1),
+	}
+	opts = append(opts, c.opts.natsOpts...)
+	opts = append(opts,
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			// Transient (NR-1): nats.go reconnects; tear nothing down.
 			c.log.Warn("nats disconnected", "err", err)
@@ -125,8 +130,8 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 				go c.rebuild()
 			}
 		}),
-	}
-	nc, err := nats.Connect(c.url, append(base, c.opts.natsOpts...)...)
+	)
+	nc, err := nats.Connect(c.url, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("nats connect: %w", err)
 	}

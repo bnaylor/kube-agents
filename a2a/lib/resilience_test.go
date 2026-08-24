@@ -1,0 +1,241 @@
+package lib
+
+// The client resilience contract from the NATS deployment spec: NR-1
+// (terminal vs transient), NR-2 (rebuild, never retry into a dead context),
+// NR-3 (all four connection callbacks registered and logged), and the
+// incident's conformance assertion, number 19 in the payload spec's suite:
+// the client survives a NATS server restart and resumes delivery without a
+// process restart. The server is killed at the transport level — Shutdown
+// drops every client connection with no drain and no lame-duck period.
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
+)
+
+// logCapture is a slog.Handler that records formatted lines for assertions.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *logCapture) Handle(_ context.Context, r slog.Record) error {
+	var sb strings.Builder
+	sb.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		sb.WriteString(" ")
+		sb.WriteString(a.Key)
+		sb.WriteString("=")
+		sb.WriteString(a.Value.String())
+		return true
+	})
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, sb.String())
+	return nil
+}
+
+func (l *logCapture) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *logCapture) WithGroup(string) slog.Handler      { return l }
+
+func (l *logCapture) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// Assertion 19: the client survives a NATS server restart and resumes
+// delivery without a process restart. The reconnect here is nats.go's
+// transient path (NR-1): the same client object rides it out, nothing is
+// rebuilt. NR-3's log evidence is asserted on the way.
+func TestAssertion19_SurvivesServerRestart(t *testing.T) {
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+	url := clientURL(s1)
+	provisionTasksStream(t, url)
+
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	c, err := Connect(ctx, url, WithName("survivor"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	col := &collector{}
+	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream:  "TASKS",
+		Subject: "a2a.tasks.task-r19.in",
+		Durable: "r19-consumer",
+		Session: "chatops",
+	}, col.handle)
+	if err != nil {
+		t.Fatalf("SubscribeDurable: %v", err)
+	}
+
+	pub := func(id string) {
+		env, err := NewMessageEnvelope(Party{Session: "w"}, "task-r19", "ctx-1", "corr-1",
+			validMessagePayload(), WithEnvelopeID(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Publish(ctx, TaskInSubject("task-r19"), env); err != nil {
+			t.Fatalf("publish %s: %v", id, err)
+		}
+	}
+	pub("env-r19-before")
+	waitFor(t, 5e9, "pre-restart delivery", func() bool { return col.count() == 1 })
+
+	// Transport-level kill: no drain, no lame duck; every connection drops.
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	waitFor(t, 10e9, "disconnect logged", func() bool { return capture.contains("nats disconnected") })
+
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+
+	waitFor(t, 15e9, "reconnect logged", func() bool { return capture.contains("nats reconnected") })
+	pub("env-r19-after")
+	waitFor(t, 15e9, "post-restart delivery", func() bool { return col.count() == 2 })
+
+	if got := c.rebuilds.Load(); got != 0 {
+		t.Errorf("rebuilds = %d; a routine restart is the transient path, nothing is torn down (NR-1)", got)
+	}
+}
+
+// NR-1 terminal half and NR-2: when nats.go gives up (terminal close), the
+// library rebuilds — fresh connection, fresh JetStream, durables re-subscribed
+// from their specs — and never issues a call against the dead connection's
+// objects.
+func TestNR2_TerminalCloseRebuild(t *testing.T) {
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+	url := clientURL(s1)
+	provisionTasksStream(t, url)
+
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	// MaxReconnects(1) with a short wait forces the terminal path quickly.
+	c, err := Connect(ctx, url, WithName("terminal"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.MaxReconnects(1), nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	col := &collector{}
+	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream:  "TASKS",
+		Subject: "a2a.tasks.task-nr2.in",
+		Durable: "nr2-consumer",
+		Session: "chatops",
+	}, col.handle)
+	if err != nil {
+		t.Fatalf("SubscribeDurable: %v", err)
+	}
+
+	oldConn, _ := c.conn()
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	// One reconnect attempt fails against a dead port; the connection flips to
+	// terminal closed and the rebuild loop starts retrying.
+	waitFor(t, 10e9, "terminal close logged", func() bool { return capture.contains("nats connection closed") })
+
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+	waitFor(t, 15e9, "rebuild completes", func() bool { return c.rebuilds.Load() == 1 })
+
+	newConn, _ := c.conn()
+	if newConn == oldConn {
+		t.Fatal("rebuild reused the dead connection object (NR-2 violation)")
+	}
+	if !oldConn.IsClosed() {
+		t.Error("old connection still open after rebuild")
+	}
+
+	// Delivery resumes on the rebuilt connection through the re-subscribed
+	// durable, publishing via a separate connection.
+	pubC, err := Connect(ctx, clientURL(s2), WithName("nr2-pub"))
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	defer pubC.Close()
+	env, err := NewMessageEnvelope(Party{Session: "w"}, "task-nr2", "ctx-1", "corr-1", validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pubC.Publish(ctx, TaskInSubject("task-nr2"), env); err != nil {
+		t.Fatalf("publish after rebuild: %v", err)
+	}
+	waitFor(t, 15e9, "delivery after rebuild", func() bool { return col.count() == 1 })
+
+	if !capture.contains("nats rebuild complete") {
+		t.Error("rebuild path not logged")
+	}
+}
+
+// NR-3: all four connection callbacks — disconnected, reconnected, closed,
+// error — are registered at construction, and a forced disconnect produces
+// the log line carrying the server error.
+func TestNR3_CallbacksRegisteredAndLogged(t *testing.T) {
+	s := startServer(t)
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("nr3"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	nc, _ := c.conn()
+	_ = nc
+	if nc.Opts.DisconnectedErrCB == nil {
+		t.Error("DisconnectedErrCB not registered")
+	}
+	if nc.Opts.ReconnectedCB == nil {
+		t.Error("ReconnectedCB not registered")
+	}
+	if nc.Opts.ClosedCB == nil {
+		t.Error("ClosedCB not registered")
+	}
+	if nc.Opts.AsyncErrorCB == nil {
+		t.Error("AsyncErrorCB not registered")
+	}
+
+	// A user option cannot displace the library's callbacks (they are
+	// appended after, so ours must still win... the other way around: base
+	// first, user opts after would override). Assert override is impossible.
+	c2, err := Connect(ctx, clientURL(s), WithName("nr3-override"),
+		WithNATSOptions(nats.ClosedHandler(nil), nats.DisconnectErrHandler(nil)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c2.Close()
+	nc2, _ := c2.conn()
+	if nc2.Opts.ClosedCB == nil || nc2.Opts.DisconnectedErrCB == nil {
+		t.Error("user-supplied nats options displaced the library's connection callbacks")
+	}
+
+	// Forced disconnect produces the log line.
+	s.Shutdown()
+	s.WaitForShutdown()
+	waitFor(t, 10e9, "disconnect log line", func() bool { return capture.contains("nats disconnected") })
+}
