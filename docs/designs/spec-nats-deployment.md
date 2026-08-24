@@ -1,0 +1,226 @@
+# NATS deployment spec
+
+- **Author:** [@bnaylor]
+- **Date:** 2026-08-24
+- **Status:** draft, for review
+- **Companion:** the A2A payload spec (`spec-a2a-payloads.md`) - owns subjects and message shape
+
+## Purpose
+
+This spec covers the NATS deployment for the A2A fabric: JetStream stream and retention
+layout, accounts and connection-time authorization, how the durable stream surfaces as the
+audit substrate, and the client resilience contract the stage 1 client library must satisfy.
+
+Subject taxonomy and message shape belong to the A2A payload spec.  Both docs landed the
+same day, so the launch card's whoever-finishes-first rule never fired; the call (8/24) is
+that the payload spec's layout wins and this doc binds to its subjects and topic classes.
+
+## What we deploy
+
+NATS 2.10 or later (auth callout requires it), JetStream enabled, file storage on a PV.
+The operator renders the whole deployment from the mode switch: `mode: next` gets a NATS
+cluster, the default gets nothing.  Dark until promoted.
+
+Production guidance is a 3-node cluster with stream replicas R3.  Dev and CI run a single
+node with R1 under the same config surface - the conformance suite runs against `kind`, so
+nothing here may depend on a managed control plane.
+
+**The customer operates this.**  Server restarts - rollouts, node drains, PV failover - are
+routine operations, not incidents.  That fact drives the resilience contract below more than
+any other input.
+
+## Streams and retention
+
+**One retention rule before any layout: acknowledgement must not delete.**  The durable
+stream is the audit substrate for inter-agent traffic, so a message's lifetime is the audit
+window, not the delivery lifecycle.  Concretely:
+
+- All message streams use **limits-based retention** with an age window.  Interest and
+  workqueue retention are ruled out - both delete on ack, which destroys replay exactly when
+  you want it (after the interaction completed and something looks wrong.)
+- Consumers are **durable push with explicit ack** - the downstream can ack, so
+  server-tracked delivery is correct.  `MaxAckPending` is the back-pressure valve, set per
+  stream class.
+- Replay is a read, never a consume.  Nothing an auditor does can change delivery state.
+
+Streams bind to the payload spec's subjects and topic classes:
+
+| Stream | Subjects | Retention | Consumers |
+| :--- | :--- | :--- | :--- |
+| `TASKS` | `a2a.tasks.>` | Age window W (72h placeholder), R3 | One durable per executor on `…in`, `MaxAckPending` ~50.  `tasks/get` is an ephemeral replay of `…events`, never a consume. |
+| `DIRECTORY` | `a2a.agents.>` | `max_msgs_per_subject: 1`, R3 | Last-value; the tombstone replaces the card |
+| `TOPICS-STATE` | state-class topics | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject |
+| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3 | |
+
+State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
+lists are rendered per topic from the provisioned registry - which topics exist is already
+config, and the retention class lives there too.  Shared fan-out (blueprints, config
+availability) is the shared topics; recipients that must confirm receipt get durable
+consumers on the topic streams.  Heartbeats (`agents.hb.>`) are core NATS, outside
+JetStream, per the payload spec.
+
+Everything is R3 in production.  Status and artifact events are the bulk of the volume and
+the tempting place for a cheaper R1 class, but they are also the replay and audit record,
+and R1 loses them to a single node failure.  Audit wins.  The cost knob is W, not replicas.
+
+W is TBD - see Open questions.  It is not just a cost knob; see the audit section.
+
+Two KV buckets ride the same JetStream deployment:
+
+- `runtime-state` - which agents are alive, what is in flight.  Runtime state does not
+  belong in git, and this is where it goes instead.
+- A bucket reserved for capability entries, if the envelope design lands on KV-backed
+  capabilities.  Reserved here so the account layout allows for it; the envelope design
+  owns whether it exists.
+
+## Accounts and connection-time authorization
+
+The property this section exists to preserve: **the bus decides who may say what before a
+message is read.**  Publish and subscribe permissions are checked when the connection is
+established.  A compromised or prompt-injected agent cannot emit on a subject it has no
+claim to, because the connection has no such right - no application code is consulted.
+
+**Authentication is auth callout, not decentralized JWT.**  We hold no signing keys.  The
+callout service validates the client's KSA token against the cluster's OIDC issuer
+(audience-bound, short-lived, kubelet-rotated) and returns the account and the permission
+set.  Revocation is the issuer's problem, and it already solved it.  This works on stock
+Kubernetes; there is no GKE dependency.
+
+Layout:
+
+- **`$SYS`** - human operators and monitoring only.  No agent ever authenticates into it.
+- **One application account per scope.**  The account is the tenant boundary and the blast
+  radius container.  Stage 1 exercises exactly one; the multi-scope split (and any
+  cross-account exports) is designed but deliberately unexercised until a second scope
+  exists.
+- **One user per agent identity** inside the account.  Permissions are exact subject lists,
+  deny by default: publish only to the subjects its role emits on, subscribe only to its own
+  directed-task subject plus the shared fan-out subjects.
+- **Per-user inbox prefixes.**  Push delivery uses inbox subjects, so each user gets its own
+  prefix (`_INBOX.<user>.>`) and permission to subscribe only to that.  Without this, any
+  agent can subscribe to any inbox and the whole property above leaks through the reply
+  path.
+
+The callout reads an identity-to-permissions map rendered by the operator (**amended
+8/24** for the subagent framework): one entry per `AgentProfile`, rendered from the CR's
+bus grants, plus static entries for the system users - gateway, audit exporter, janitor.
+Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
+are the declarative source and admission bounds what a profile may grant.  The agents
+never read the map - the constrained party does not see its own ceiling, it just hits it.
+The callout logs the map version it actually loaded at startup and exposes it at runtime,
+so "the map says X" is checkable against the running system rather than against the
+rendered ConfigMap.
+
+The callout service runs in the system account, 2 replicas.  It is on the connection path:
+if it is down, no *new* connection succeeds, while established connections continue.  That
+is an acceptable failure mode and the resilience contract below is what makes it
+acceptable - clients that reconnect correctly ride out a callout outage the same way they
+ride out a server restart.
+
+## Observability and audit
+
+**Audit.**  The retained stream is the audit substrate, not an audit log - a replayable
+stream nobody can query is evidence in the same sense that a disk image is evidence.  The
+deployment's job is to keep the substrate intact and reachable:
+
+- The stream is the **buffer and replay window, not the archive.**  Nothing accumulates on
+  NATS forever: W bounds what the bus holds, and long-term audit lives in the customer's
+  log sink.
+- An **audit exporter** binds a reserved durable `audit` consumer on each message stream
+  and writes envelopes to the sink - Cloud Logging on GKE, pluggable elsewhere (stock
+  Kubernetes stays a hard requirement).  Its acks track its own progress and delete
+  nothing; limits retention means cleanup is W's job, not the exporter's.  Deliberately no
+  purge-on-export: the window is what everyone else replays, and an exporter that deletes
+  is an exporter that can destroy evidence.
+- **Exporter lag is the data-loss horizon.**  If the exporter's backlog ages past W before
+  export, audit records die on the bus.  Lag is a first-class alert, firing well before
+  backlog age approaches W.
+- The audit path is read-only by construction: the exporter's user may subscribe and may
+  not publish, enforced at connect like everything else.
+- W stays a tenancy decision as well as a cost one - the bus holds labelled content at rest
+  for the whole window.
+
+**Tracing.**  Trace context and the correlation identifier travel in the message envelope,
+next to the capability identifier - the payload spec owns those fields.  What this layer
+owes: the client library creates publish and consume spans carrying that context, so one
+trace spans chat ingress, every hop, and whatever the hop did.  The server does not
+participate in traces and does not need to.
+
+**Metrics.**  Standard server metrics via the Prometheus exporter.  Beyond that, per-consumer
+health is a first-class signal: `num_pending`, ack-pending depth, and delivery-binding
+freshness, per stream, exported.  A connection can be perfectly healthy at the TCP level
+while its consumer is deaf (see the next section), and the metrics have to be able to say
+so.
+
+## Client resilience contract
+
+These are **requirements on the stage 1 client library, not advice.**  The motivating
+incident: a client wrapper in a lab deployment mishandled a routine server restart and
+spent two days silently unable to receive directed tasks, with the process up and
+TCP-level health checks green.  The customer restarts NATS as a routine operation,
+so a client that deadlocks on restart is a support ticket generator that scales with the
+number of installs.
+
+The requirements are stated as properties.  The evidence behind them is nats-py-specific;
+whatever language the stage 1 library lands in, the error taxonomy maps per client library
+and the property is what conformance tests.
+
+- **NR-1: Distinguish terminal from transient.**  The library MUST branch on
+  terminal connection close (rebuild the client and re-subscribe) vs transient reconnect
+  (wait for the underlying library, tear nothing down).  Test: induce each state; assert
+  the two paths are taken.
+- **NR-2: Rebuild, never retry into a dead context.**  On terminal close the library MUST
+  construct a fresh client, re-establish JetStream, and re-subscribe to the durable.  It
+  MUST NOT retry subscribe or consumer-delete calls on objects bound to the dead
+  connection.  Test: force terminal close; assert no call is issued against the old client
+  object after the state is entered.
+- **NR-3: Connection callbacks registered and logged.**  Closed, disconnected, reconnected
+  and error callbacks MUST all be registered, and each event logged with the server error
+  that triggered it.  In the worked example none were registered, so the error that flipped
+  the client to terminal close was never captured and the root cause is unrecoverable.
+  Test: assert all four are registered at construction; assert a forced disconnect produces
+  the log line.
+- **NR-4: Recreate-or-bind is an explicit decision.**  After reconnect the library MUST
+  explicitly either bind to the stored delivery subject or recreate the consumer with a
+  fresh inbox.  Relying on the client library's undocumented drift behavior is forbidden.
+  Test: code inspection plus a restart test asserting the chosen path executes.
+- **NR-5: Consumer health beyond TCP.**  The library MUST expose consumer binding state and
+  pending-message depth as metrics, and the component's health check MUST incorporate them.
+  "TCP is up" is not health.  Test: orphan the consumer; assert the health check fails
+  while TCP remains connected.
+
+## Conformance
+
+The incident's conformance assertion, carried verbatim, goes into the stage 1 library's
+test suite:
+
+> **"a NATS client survives a server restart and resumes delivery without process restart."**
+
+Per the negative-test discipline, the test proves the property, not the wording: kill the
+connection at the transport level (not a clean drain), then assert the wrapper
+re-establishes, the durable consumer is re-bound and delivering within a timeout, and the
+reconnect event was logged.  A test that would pass against "uses nats-py" is the wrong
+test.
+
+Two deployment-side assertions belong in the same suite:
+
+1. A connection whose user lacks publish permission on subject S is refused by the server
+   at connect/publish time.  The message is never readable by any consumer.
+2. A message that has been delivered and acked is still replayable from the stream within
+   the retention window.
+
+Both run against `kind`.
+
+## Open questions
+
+- ~~**Retention window W.**~~  Decided 8/24: the placeholders are the dev defaults - 72h
+  task events, 30d journals, no age limit on state.  The GA number goes to the
+  product-decisions list; it is a tenancy call, not ours to guess.
+- ~~**Who owns the audit exporter.**~~  Decided 8/24: stage 2, landing with the parity
+  suite - that is when there is evidence worth archiving.  Stage 1 ships the reserved
+  consumer only.  Owner assigned when stage 2 staffs.
+- **Which server error flips a client to terminal close** rather than transient reconnect is
+  unconfirmed - the worked example never logged it.  NR-3 closes this for the future and the
+  uncertainty does not change NR-1 or NR-2.
+- **Sizing.**  TBD: message rates per stream class once the payload spec settles, and PV
+  sizing from W times those rates.
