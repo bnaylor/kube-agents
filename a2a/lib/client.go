@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -28,6 +29,10 @@ func TaskEventsSubject(taskID string) string {
 func AgentSubject(session string) string {
 	return fmt.Sprintf("a2a.agents.%s", session)
 }
+
+// rebuildRetryWait paces the terminal-close rebuild loop while the server is
+// unreachable.
+const rebuildRetryWait = 500 * time.Millisecond
 
 // Client is the a2a-jetstream client: validated publish, durable subscribe
 // with dedup, and the NR resilience contract on top of nats.go.
@@ -144,6 +149,7 @@ func (c *Client) rebuild() {
 			return
 		}
 		c.log.Error("nats rebuild dial failed; retrying", "err", err)
+		time.Sleep(rebuildRetryWait)
 		nc, js, err = c.dial()
 	}
 	c.mu.Lock()
