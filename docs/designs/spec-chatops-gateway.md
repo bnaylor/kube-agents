@@ -167,8 +167,8 @@ the bus - the same posture the shipped attribution path applies before writing s
 metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds labelled
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
-gateway resolves plaintext at the boundaries that need it - `openDirect` now, RBAC
-intersection when the authority work lands. The salt is one shared Secret per install:
+gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
+lowest-common-denominator grant computation when the authority work lands. The salt is one shared Secret per install:
 every gateway replica reads the same one, or hashes diverge between turns of the same
 conversation and `openDirect` routing and audit joins silently corrupt.
 
@@ -225,9 +225,9 @@ later. What the gateway builds now is the substrate those need:
 One property worth stating because it falls out of the session model: a group session's
 context is labeled for the room. Everyone in the thread shares the pod, so anything the
 harness reads into context is readable by the whole roster - which is exactly as leaky as
-the chat window itself, no more. When per-user authority lands, the intersection for a
-group session computes against the audience, not just the requester. That is the LCD
-question, parked with its tool.
+the chat window itself, no more. When per-user authority lands, the
+lowest-common-denominator grants for a group session compute against the audience, not
+just the requester. That is the LCD question, parked with its tool.
 
 ## The test backend
 

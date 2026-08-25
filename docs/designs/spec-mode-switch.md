@@ -78,6 +78,13 @@ The operator also writes the mode into the managed settings it already renders
 (`reconcileSettingsConfigMap`), as a single key: `KUBEAGENTS_MODE`. That is the only way
 the mode reaches the agent runtime.
 
+A mode change is a rollout, not a hot reload. Kubernetes does not restart running pods
+when a ConfigMap changes, so the operator stamps the settings checksum onto the agent
+pod template (`checksum/config` annotation) - flipping the mode rolls the Deployment,
+and no agent keeps running in a mode the spec no longer asks for. Without the stamp,
+`mode: next` would produce a silent split-brain: NATS up, the running fleet still on
+today's path until something happens to kill its pods.
+
 ## Agent-side rule
 
 Agent-side code asks one helper in the shared settings module - `runtime_mode.is_next()`

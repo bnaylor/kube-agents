@@ -198,6 +198,9 @@ profile's dispatch. Notes on the mechanics:
   no in-memory delegation map to lose.
 - `concurrency` is enforced here: submissions beyond a profile's cap are redelivered
   with backoff until a slot frees. Nothing is dropped; the stream holds the backlog.
+- A new profile's first dispatch waits on its `BusCredentialsReady` status condition -
+  the deployment spec owns why (auth-callout propagation). Submissions queue on the
+  stream meanwhile.
 - The demo created the pod first and published the task second, and papered over the race
   with a stream lookup. This ordering is the fix: the pod exists _because_ the message
   is already durable, so the worker's task fetch cannot miss.

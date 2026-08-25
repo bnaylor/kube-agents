@@ -114,6 +114,13 @@ Layout:
   prefix (`_INBOX.<user>.>`) and permission to subscribe only to that. Without this, any
   agent can subscribe to any inbox and the whole property above leaks through the reply
   path.
+- **Bucket access is subject access.** KV and the Object Store ride internal subjects -
+  `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
+  their streams - and the deny-by-default map grants them explicitly per role: the
+  gateway gets `session-state`, workers get the artifact bucket, nobody gets a bucket
+  their role doesn't name. Miss this and the first oversized artifact dies with an
+  Authorization Violation. Within the artifact bucket, visibility is bucket-wide;
+  per-task artifact scoping is parked with the per-task credentials tightening.
 
 The callout reads an identity-to-permissions map rendered by the operator (**amended
 8/24** for the subagent framework): one entry per `AgentProfile`, rendered from the CR's
@@ -121,9 +128,15 @@ bus grants, plus static entries for the system users - gateway, audit exporter, 
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
 never read the map - the constrained party does not see its own ceiling, it just hits it.
-The callout logs the map version it actually loaded at startup and exposes it at runtime,
-so "the map says X" is checkable against the running system rather than against the
-rendered ConfigMap.
+The callout reads the map through an API informer, not a volume mount: kubelet ConfigMap
+sync lags up to a minute, and the dispatcher can spawn a Job seconds after a profile
+lands - a race that ends in an Authorization Violation for a legitimate worker. The
+ordering is enforced, not hoped for: the operator sets `BusCredentialsReady` on an
+`AgentProfile`'s status only after the callout reports serving the profile's user, and
+the dispatcher does not dispatch before that condition is true. Submissions queue on
+the stream meanwhile; nothing is lost. The callout logs the map version it is serving
+and exposes it at runtime, so "the map says X" is checkable against the running system
+rather than against the rendered object.
 
 The callout service runs in the system account, 2 replicas. It is on the connection
 path: if it is down, no _new_ connection succeeds, while established connections
