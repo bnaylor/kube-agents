@@ -170,7 +170,12 @@ the requester needs zero Kubernetes permissions to delegate. (The demo's delegat
 carried a Role with pod create/delete/watch; that goes away.)
 
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
-binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. Only a
+binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. The
+dispatcher and the janitor run under the operator manager's leader election - the
+`--leader-elect` machinery the operator already ships, required on under `mode: next` -
+so "one dispatcher" and "exactly one final event" are elected properties, not deployment
+accidents. Scaling the operator for HA changes nothing here: followers hold no
+consumers. Only a
 task-starting submission renders a Job: before creating, the dispatcher checks the
 task's `…events` subject, and empty means new task. A task with events already is not
 the dispatcher's business - follow-ups, steers, and cancels for a live task belong to
@@ -217,14 +222,23 @@ Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`. Everything else - prompt, corr
 context - is in the task message the adapter fetches from the stream by subject.
 
 **The adapter.** Inside the pod, a thin adapter sits between the bus and the harness.
-It fetches the task message, publishes `submitted`, drives the harness over the headless
-contract (`-p`, stream-json in/out), maps the harness's output stream onto A2A events
-(next section), forwards cancels and follow-up input onto the harness stdin, publishes
-the terminal event, and exits with a matching code. The adapter is stage 3 code. The
+It fetches the task message, opens its own ephemeral consumer on the task's `…in`
+subject positioned just after that message - this is where live input arrives, because
+the `…in` subject has two reader roles by design: the dispatcher for new tasks, the
+executor for everything after the submission - publishes `submitted`, drives the harness
+over the headless contract (`-p`, stream-json in/out), maps the harness's output stream
+onto A2A events (next section), forwards cancels, steers, and follow-up input onto the
+harness stdin, publishes the terminal event, and exits with a matching code. Ephemeral,
+deliberately: a rehydrated session's fresh pod opens a fresh consumer with no durable
+name to collide with its predecessor's. The adapter is stage 3 code. The
 client library under it (envelopes, dedup, resilience contract) is stage 1's.
 
 **Discovery.** The operator publishes an agent card to `a2a.agents.{profile}` when a
-profile lands and a tombstone when it is deleted, rendered from `description`. The chat
+profile lands and a tombstone when it is deleted, rendered from `description`. Deletion
+is finalizer-ordered: the tombstone publish precedes finalizer removal, and reconcile
+republishes the card whenever a live CR's directory entry is missing or tombstoned -
+level-triggered, so a crash on either side of a delete converges instead of leaving a
+stale card routing traffic to a profile that no longer exists. The chat
 front door's roster becomes a read of the directory stream instead of a listing of
 profile directories. Same information, but it exists whether or not any worker is
 running.

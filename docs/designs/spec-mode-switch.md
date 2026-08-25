@@ -69,6 +69,11 @@ today's stack, and requeues. (Same pattern as `RuntimeClassNotFound`.)
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
   additive - today's path keeps running until stage 4 starts retiring pieces.
 
+One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
+the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
+section describes the design, not what this toggle turns on. Dev posture; don't run
+traffic that matters on it and expect audit to exist.
+
 The operator also writes the mode into the managed settings it already renders
 (`reconcileSettingsConfigMap`), as a single key: `KUBEAGENTS_MODE`. That is the only way
 the mode reaches the agent runtime.

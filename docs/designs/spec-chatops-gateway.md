@@ -44,7 +44,9 @@ pod at a time.** Concretely:
   group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
   space is not a session; a conversation in it is.
 - `contextId` is minted at first contact with a conversation and never changes. It is
-  the durable name of the conversation on the bus.
+  the durable name of the conversation on the bus. Minting is a KV `Create` -
+  create-only, compare-and-swap semantics - so two replicas or a rehydrate racing first
+  contact cannot fork a conversation: the loser reads and adopts the winner's value.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
   and the bus session name; `contextId` persists across every incarnation.
 - In a group thread, everyone in the room shares the one session. Attribution is per

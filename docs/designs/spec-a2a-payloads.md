@@ -145,6 +145,13 @@ lacked.
 | `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
+One rule spanning three fields: `correlationId`, `taskId`, and `contextId` are minted as
+opaque random tokens and MUST NOT embed backend identifiers, thread titles, emails, or
+any user content. They are the identifier class that escapes the pseudonymization rule
+(they ride every subject and every envelope in the clear), and they stay clean by
+construction, not by redaction - a `corr-{threadTitle}` would quietly put labelled
+content on the bus.
+
 ### Reserved fields: `identity` and `authority`
 
 The security work is parked, but adding these fields later is a protocol rev and reserving
@@ -199,12 +206,12 @@ starting it.
 
 ### Subjects
 
-| Subject                                   | Carries                                                                                                                                                                                                                              |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `a2a.tasks.{addressee}.{taskId}.in`       | `message` (submission and follow-up input) and `cancel`, requester to executor                                                                                                                                                       |
-| `a2a.tasks.{addressee}.{taskId}.events`   | `status-update` and `artifact-update`, executor to anyone                                                                                                                                                                            |
-| `a2a.agents.{profile}`                    | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card. |
-| `agents.hb.{agentType}.{owner}.{session}` | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                              |
+| Subject                                   | Carries                                                                                                                                                                                                                                                              |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `a2a.tasks.{addressee}.{taskId}.in`       | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels). |
+| `a2a.tasks.{addressee}.{taskId}.events`   | `status-update` and `artifact-update`, executor to anyone                                                                                                                                                                                                            |
+| `a2a.agents.{profile}`                    | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                 |
+| `agents.hb.{agentType}.{owner}.{session}` | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                              |
 
 **The addressee token (added in 0.4) is the authorization seam.** `{addressee}` is the
 executor's name - a profile, or a chat session. With it in the subject, connection-time

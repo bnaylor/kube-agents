@@ -125,11 +125,13 @@ The callout logs the map version it actually loaded at startup and exposes it at
 so "the map says X" is checkable against the running system rather than against the
 rendered ConfigMap.
 
-The callout service runs in the system account, 2 replicas. It is on the connection path:
-if it is down, no _new_ connection succeeds, while established connections continue. That
-is an acceptable failure mode and the resilience contract below is what makes it
-acceptable - clients that reconnect correctly ride out a callout outage the same way they
-ride out a server restart.
+The callout service runs in the system account, 2 replicas. It is on the connection
+path: if it is down, no _new_ connection succeeds, while established connections
+continue. The blast radius, named honestly: during a callout outage nothing new
+connects, which means no new tasks and no new workers - the fabric is dark to new work,
+not gracefully degraded. Established sessions and the resilience contract below are
+what make that acceptable at this stage; a hardened HA callout is production posture,
+not part of the dev toggle.
 
 ## Observability and audit
 
