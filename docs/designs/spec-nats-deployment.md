@@ -92,7 +92,10 @@ that analysis; the callout service inherits its hardening requirements. The call
 validates the client's KSA token against the cluster's OIDC issuer (audience-bound,
 short-lived, kubelet-rotated) and returns the account and the permission set. Revocation
 is the issuer's problem, and it already solved it. This works on stock Kubernetes; there
-is no GKE dependency.
+is no GKE dependency. Concretely, validation is a `TokenReview` call against the local
+API server - zero key handling, works on any conformant cluster - with local JWT
+verification against the API server's `openid/v1/jwks` endpoint as the offline
+alternative.
 
 Layout:
 
@@ -148,6 +151,9 @@ deployment's job is to keep the substrate intact and reachable:
   backlog age approaches W.
 - The audit path is read-only by construction: the exporter's user may subscribe and may
   not publish, enforced at connect like everything else.
+- The attribution salt the gateway hashes identifiers with is one shared Secret per
+  install, provisioned with this deployment - replicas must agree or the pseudonyms on
+  the stream stop joining.
 - W stays a tenancy decision as well as a cost one - the bus holds labelled content at rest
   for the whole window.
 

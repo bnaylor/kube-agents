@@ -166,7 +166,9 @@ metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds label
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
 gateway resolves plaintext at the boundaries that need it - `openDirect` now, RBAC
-intersection when the authority work lands.
+intersection when the authority work lands. The salt is one shared Secret per install:
+every gateway replica reads the same one, or hashes diverge between turns of the same
+conversation and `openDirect` routing and audit joins silently corrupt.
 
 - `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
   resolves it to the RBAC string at the boundary that needs one. `subject` is the
