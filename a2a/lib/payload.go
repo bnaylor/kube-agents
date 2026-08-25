@@ -1,7 +1,6 @@
 package lib
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -155,6 +154,11 @@ func validatePayload(kind Kind, payload json.RawMessage) error {
 		if s.Final && !s.Status.State.Terminal() {
 			return protocolErrf("kind status-update: final=true with non-terminal state %q", s.Status.State)
 		}
+		if s.Status.Message != nil {
+			if err := validateParts(s.Status.Message.Parts, "status-update message"); err != nil {
+				return err
+			}
+		}
 	case KindArtifactUpdate:
 		var a ArtifactUpdate
 		if err := json.Unmarshal(payload, &a); err != nil {
@@ -237,6 +241,15 @@ func checkInlineFileParts(kind Kind, payload json.RawMessage) error {
 			return nil // shape already validated; nothing to scan
 		}
 		parts = m.Parts
+	case KindStatusUpdate:
+		var s StatusUpdate
+		if err := json.Unmarshal(payload, &s); err != nil {
+			return nil
+		}
+		if s.Status.Message == nil {
+			return nil
+		}
+		parts = s.Status.Message.Parts
 	case KindArtifactUpdate:
 		var a ArtifactUpdate
 		if err := json.Unmarshal(payload, &a); err != nil {
@@ -254,9 +267,9 @@ func checkInlineFileParts(kind Kind, payload json.RawMessage) error {
 	}
 	for i, p := range parts {
 		if p.Kind == "file" && p.File != nil && p.File.Bytes != "" {
-			if base64.StdEncoding.DecodedLen(len(p.File.Bytes)) > InlineFileThreshold {
+			if base64DecodedSize(p.File.Bytes) > InlineFileThreshold {
 				return &A2AError{
-					Code: CodeContentTooLarge,
+					Code: CodeInvalidParams,
 					Message: fmt.Sprintf("part %d: inline FilePart exceeds %d-byte threshold; use uri via the object store",
 						i, InlineFileThreshold),
 				}
@@ -264,4 +277,17 @@ func checkInlineFileParts(kind Kind, payload json.RawMessage) error {
 		}
 	}
 	return nil
+}
+
+// base64DecodedSize is the exact decoded size of a padded std-base64 string —
+// DecodedLen overestimates by up to two bytes, which would refuse a file of
+// exactly the threshold (the spec bans only files above it).
+func base64DecodedSize(s string) int {
+	n := len(s) / 4 * 3
+	if strings.HasSuffix(s, "==") {
+		n -= 2
+	} else if strings.HasSuffix(s, "=") {
+		n--
+	}
+	return n
 }

@@ -34,6 +34,10 @@ func AgentSubject(session string) string {
 // unreachable.
 const rebuildRetryWait = 500 * time.Millisecond
 
+// msgIDHeaderOverhead is the wire cost of the Nats-Msg-Id header beyond the
+// id itself: "NATS/1.0\r\n" + "Nats-Msg-Id: " + "\r\n\r\n".
+var msgIDHeaderOverhead = len("NATS/1.0\r\n") + len(nats.MsgIdHdr) + len(": ") + len("\r\n\r\n")
+
 // Client is the a2a-jetstream client: validated publish, durable subscribe
 // with dedup, and the NR resilience contract on top of nats.go.
 type Client struct {
@@ -46,6 +50,10 @@ type Client struct {
 	js      jetstream.JetStream
 	subs    []*durableSub
 	closing atomic.Bool
+
+	// rebuildMu serializes terminal-close rebuilds so a flapping server can
+	// never leave a stale rebuild storing a dead connection last.
+	rebuildMu sync.Mutex
 
 	// rebuilds counts terminal-close recoveries (NR-2); exposed for tests and
 	// health.
@@ -106,11 +114,15 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	opts := []nats.Option{
 		nats.Name(c.opts.name),
 		nats.MaxReconnects(-1),
+		nats.Timeout(10 * time.Second),
 	}
 	opts = append(opts, c.opts.natsOpts...)
 	opts = append(opts,
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			// Transient (NR-1): nats.go reconnects; tear nothing down.
+			if c.closing.Load() {
+				return
+			}
 			c.log.Warn("nats disconnected", "err", err)
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
@@ -124,9 +136,18 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 			c.log.Error("nats async error", "err", err, "subject", subject)
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
+			if c.closing.Load() {
+				c.log.Info("nats connection closed", "reason", "client shutdown")
+				return
+			}
 			// Terminal (NR-1): the connection will never come back on its own.
 			c.log.Error("nats connection closed", "err", nc.LastError())
-			if !c.closing.Load() {
+			// Only the client's current connection triggers a rebuild; an
+			// abandoned connection dying late must not schedule another one.
+			c.mu.RLock()
+			current := c.nc == nc
+			c.mu.RUnlock()
+			if current {
 				go c.rebuild()
 			}
 		}),
@@ -146,33 +167,80 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 // rebuild is the terminal-close path (NR-2): construct a fresh client
 // connection, re-establish JetStream, and re-subscribe every durable from its
 // spec. Nothing is retried against objects bound to the dead connection.
+// Rebuilds are serialized, and a rebuild does not declare success until every
+// durable is re-subscribed and the new connection is still alive — a
+// connection that is up while its consumers are dead is the motivating
+// incident, not a recovery.
 func (c *Client) rebuild() {
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
 	c.log.Warn("nats terminal close: rebuilding connection")
-	nc, js, err := c.dial()
-	for err != nil {
+	for {
 		if c.closing.Load() {
 			return
 		}
-		c.log.Error("nats rebuild dial failed; retrying", "err", err)
-		time.Sleep(rebuildRetryWait)
-		nc, js, err = c.dial()
-	}
-	c.mu.Lock()
-	c.nc, c.js = nc, js
-	subs := append([]*durableSub(nil), c.subs...)
-	c.mu.Unlock()
-	for _, s := range subs {
-		if s.stopped.Load() {
+		nc, js, err := c.dial()
+		if err != nil {
+			c.log.Error("nats rebuild dial failed; retrying", "err", err)
+			time.Sleep(rebuildRetryWait)
 			continue
 		}
-		if err := s.start(context.Background(), js); err != nil {
-			c.log.Error("nats rebuild re-subscribe failed", "durable", s.cfg.Durable, "err", err)
-		} else {
-			c.log.Info("nats rebuild re-subscribed", "durable", s.cfg.Durable)
+		c.mu.Lock()
+		if c.closing.Load() {
+			// Close won the race; do not leak the fresh connection.
+			c.mu.Unlock()
+			nc.Close()
+			return
 		}
+		c.nc, c.js = nc, js
+		subs := append([]*durableSub(nil), c.subs...)
+		c.mu.Unlock()
+
+		if c.resubscribe(subs, js, nc) {
+			c.rebuilds.Add(1)
+			c.log.Info("nats rebuild complete")
+			return
+		}
+		// The new connection died or its ClosedHandler fired mid-rebuild;
+		// that handler saw itself as current and could not schedule (this
+		// rebuild holds the lock), so go around and dial again.
+		c.log.Warn("nats rebuild connection died mid-rebuild; dialing again")
 	}
-	c.rebuilds.Add(1)
-	c.log.Info("nats rebuild complete")
+}
+
+// resubscribe re-establishes every durable on js, retrying failures — after a
+// server restart JetStream stream recovery can lag connection acceptance, and
+// abandoning a durable then would leave the process up, TCP green, and the
+// consumer silently deaf. Returns false if nc dies before every durable is
+// re-subscribed.
+func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nats.Conn) bool {
+	pending := subs
+	for len(pending) > 0 {
+		if c.closing.Load() {
+			return false
+		}
+		if nc.IsClosed() {
+			return false
+		}
+		var failed []*durableSub
+		for _, s := range pending {
+			if s.stopped.Load() {
+				continue
+			}
+			if err := s.start(context.Background(), js); err != nil {
+				c.log.Error("nats rebuild re-subscribe failed; will retry", "durable", s.cfg.Durable, "err", err)
+				failed = append(failed, s)
+			} else {
+				c.log.Info("nats rebuild re-subscribed", "durable", s.cfg.Durable)
+			}
+		}
+		if len(failed) == 0 {
+			break
+		}
+		pending = failed
+		time.Sleep(rebuildRetryWait)
+	}
+	return !nc.IsClosed()
 }
 
 // Close shuts the client down deliberately; no rebuild follows.
@@ -209,10 +277,14 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 		return fmt.Errorf("marshal envelope: %w", err)
 	}
 	nc, js := c.conn()
-	if max := nc.MaxPayload(); int64(len(data)) > max {
+	// The server counts headers against max message size, so the gate must
+	// too, or an envelope inside the header-width window would pass here and
+	// fail inside nats.go with a non-A2A error.
+	wire := len(data) + msgIDHeaderOverhead + len(env.EnvelopeID)
+	if max := nc.MaxPayload(); int64(wire) > max {
 		return &A2AError{
-			Code:    CodeContentTooLarge,
-			Message: fmt.Sprintf("envelope is %d bytes; bus max message size is %d", len(data), max),
+			Code:    CodeInvalidParams,
+			Message: fmt.Sprintf("envelope is %d bytes on the wire; bus max message size is %d", wire, max),
 		}
 	}
 	_, err = js.Publish(ctx, subject, data, jetstream.WithMsgID(env.EnvelopeID))
@@ -242,14 +314,29 @@ type Subscription interface {
 // subscription survives connection rebuilds: its spec, not its JetStream
 // objects, is what the client retains.
 func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, handler func(*Envelope)) (Subscription, error) {
-	s := &durableSub{c: c, cfg: cfg, handler: handler, seen: newDedupSet(dedupWindow)}
-	_, js := c.conn()
-	if err := s.start(ctx, js); err != nil {
-		return nil, err
+	switch {
+	case cfg.Stream == "":
+		return nil, fmt.Errorf("SubscribeConfig.Stream is required")
+	case cfg.Subject == "":
+		return nil, fmt.Errorf("SubscribeConfig.Subject is required")
+	case cfg.Durable == "":
+		return nil, fmt.Errorf("SubscribeConfig.Durable is required")
+	case cfg.Session == "":
+		// Without a session name the to-filter (assertion 4) cannot run, and
+		// silently delivering other sessions' envelopes is non-conforming.
+		return nil, fmt.Errorf("SubscribeConfig.Session is required")
 	}
+	s := &durableSub{c: c, cfg: cfg, handler: handler, seen: newDedupSet(dedupWindow)}
+	// Register before starting so a rebuild racing this call cannot snapshot
+	// c.subs without it and leave its consumer bound to a dead connection.
 	c.mu.Lock()
 	c.subs = append(c.subs, s)
+	js := c.js
 	c.mu.Unlock()
+	if err := s.start(ctx, js); err != nil {
+		s.Stop()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -284,7 +371,11 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 	old := s.cc
 	s.cc = cc
 	s.mu.Unlock()
-	_ = old // the old context died with its connection; never called again
+	if old != nil {
+		// Usually already dead with its connection; stopping is a no-op then,
+		// and prevents double delivery if a start ever displaces a live one.
+		old.Stop()
+	}
 	return nil
 }
 

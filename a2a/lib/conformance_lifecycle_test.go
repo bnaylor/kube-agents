@@ -210,6 +210,16 @@ func TestAssertion13_CancelTerminal(t *testing.T) {
 		if err := h.requester.Publish(h.ctx, TaskInSubject(h.taskID), cancel); err != nil {
 			t.Fatalf("publish cancel: %v", err)
 		}
+		// The cancel still reaches the executor - losing the race means the
+		// terminal event wins, not that the cancel was silently dropped.
+		waitFor(t, 5e9, "late cancel delivery", func() bool {
+			for _, e := range h.inbox.all() {
+				if e.Kind == KindCancel {
+					return true
+				}
+			}
+			return false
+		})
 
 		task := h.get()
 		if task.State != StateCompleted || !task.Final {

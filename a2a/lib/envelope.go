@@ -177,8 +177,10 @@ func (e *Envelope) ValidateEmit() error {
 	if e.Protocol == "" {
 		return &ProtocolError{Msg: "missing protocol"}
 	}
-	if err := checkProtocol(e.Protocol); err != nil {
-		return err
+	// Emit is pinned to the exact version this library speaks; same-major
+	// tolerance is an inbound rule only.
+	if e.Protocol != Protocol {
+		return &ProtocolError{Msg: fmt.Sprintf("emitting protocol %q; this library emits only %s", e.Protocol, Protocol)}
 	}
 	if err := e.validateCommon(); err != nil {
 		return err

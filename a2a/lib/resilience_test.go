@@ -220,9 +220,8 @@ func TestNR3_CallbacksRegisteredAndLogged(t *testing.T) {
 		t.Error("AsyncErrorCB not registered")
 	}
 
-	// A user option cannot displace the library's callbacks (they are
-	// appended after, so ours must still win... the other way around: base
-	// first, user opts after would override). Assert override is impossible.
+	// The library's callbacks are appended after caller-supplied options, so
+	// a WithNATSOptions handler cannot displace them.
 	c2, err := Connect(ctx, clientURL(s), WithName("nr3-override"),
 		WithNATSOptions(nats.ClosedHandler(nil), nats.DisconnectErrHandler(nil)))
 	if err != nil {
@@ -238,4 +237,68 @@ func TestNR3_CallbacksRegisteredAndLogged(t *testing.T) {
 	s.Shutdown()
 	s.WaitForShutdown()
 	waitFor(t, 10e9, "disconnect log line", func() bool { return capture.contains("nats disconnected") })
+}
+
+// A rebuild must not declare success while a durable failed to re-subscribe:
+// after a restart the server can accept connections before streams recover,
+// and abandoning the durable then is the silently-deaf-consumer incident. The
+// restarted server here comes up with an empty store - no TASKS stream - so
+// re-subscribe fails until the stream is provisioned again.
+func TestNR2_RebuildRetriesSubscribe(t *testing.T) {
+	s1 := runJetStreamServer(t, -1, t.TempDir(), nil)
+	port := serverPort(s1)
+	url := clientURL(s1)
+	provisionTasksStream(t, url)
+
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	c, err := Connect(ctx, url, WithName("retry-sub"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.MaxReconnects(1), nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	col := &collector{}
+	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream:  "TASKS",
+		Subject: "a2a.tasks.task-rr.in",
+		Durable: "rr-consumer",
+		Session: "chatops",
+	}, col.handle)
+	if err != nil {
+		t.Fatalf("SubscribeDurable: %v", err)
+	}
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	waitFor(t, 10e9, "terminal close logged", func() bool { return capture.contains("nats connection closed") })
+
+	// Same port, fresh store: the connection dial succeeds but the TASKS
+	// stream does not exist, so the durable cannot come back yet.
+	s2 := runJetStreamServer(t, port, t.TempDir(), nil)
+	t.Cleanup(s2.Shutdown)
+	waitFor(t, 10e9, "re-subscribe failure logged", func() bool {
+		return capture.contains("re-subscribe failed")
+	})
+	if got := c.rebuilds.Load(); got != 0 {
+		t.Fatalf("rebuild declared complete (%d) while its durable is dead", got)
+	}
+
+	provisionTasksStream(t, clientURL(s2))
+	waitFor(t, 15e9, "rebuild completes after stream returns", func() bool { return c.rebuilds.Load() == 1 })
+
+	pubC, err := Connect(ctx, clientURL(s2), WithName("rr-pub"))
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	defer pubC.Close()
+	env, err := NewMessageEnvelope(Party{Session: "w"}, "task-rr", "ctx-1", "corr-1", validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pubC.Publish(ctx, TaskInSubject("task-rr"), env); err != nil {
+		t.Fatalf("publish after recovery: %v", err)
+	}
+	waitFor(t, 15e9, "delivery after recovery", func() bool { return col.count() == 1 })
 }

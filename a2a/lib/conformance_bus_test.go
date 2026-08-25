@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -230,5 +231,85 @@ func TestAssertion08_MaxMessageSize(t *testing.T) {
 	// Client-side means the server never saw it.
 	if n := streamMsgCount(t, clientURL(s), "TASKS"); n != 0 {
 		t.Errorf("stream holds %d messages; oversize envelope must fail before publish", n)
+	}
+}
+
+// Assertion 8, size half continued: the client-side gate must count the
+// Nats-Msg-Id header the way the server does, so an envelope inside the
+// header-width window under the max still fails with an A2A error, not a raw
+// nats.go one.
+func TestAssertion08_HeaderWidthWindow(t *testing.T) {
+	const maxPayload = 4096
+	s := runJetStreamServer(t, -1, t.TempDir(), func(o *natsserver.Options) {
+		o.MaxPayload = maxPayload
+	})
+	t.Cleanup(s.Shutdown)
+	provisionTasksStream(t, clientURL(s))
+	ctx := testCtx(t)
+
+	c, err := Connect(ctx, clientURL(s), WithName("test-pub"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	// Two passes: measure, then pad the text so the marshaled envelope alone
+	// is exactly maxPayload bytes - inside the gate if headers are ignored,
+	// over the wire limit once the Nats-Msg-Id header is counted.
+	build := func(fill int) (*Envelope, int) {
+		payload := `{"role": "user", "parts": [{"kind": "text", "text": "` + strings.Repeat("x", fill) + `"}], "messageId": "m-w", "taskId": "task-win", "contextId": "ctx-1"}`
+		env, err := NewMessageEnvelope(Party{Session: "w"}, "task-win", "ctx-1", "corr-1",
+			json.RawMessage(payload), WithEnvelopeID("env-window-fixed"))
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env, len(data)
+	}
+	// The ts field marshals at variable width (RFC3339Nano trims zeros), so
+	// converge on the target and then assert we landed inside the window:
+	// data alone within the max, data plus the Nats-Msg-Id header over it.
+	fill := 1000
+	env, size := build(fill)
+	for i := 0; i < 10 && size != maxPayload; i++ {
+		fill += maxPayload - size
+		env, size = build(fill)
+	}
+	overhead := msgIDHeaderOverhead + len("env-window-fixed")
+	if size > maxPayload || size+overhead <= maxPayload {
+		t.Fatalf("sizing pass built %d bytes; need within (%d, %d]", size, maxPayload-overhead, maxPayload)
+	}
+
+	err = c.Publish(ctx, TaskInSubject("task-win"), env)
+	var a2aErr *A2AError
+	if !errors.As(err, &a2aErr) {
+		t.Fatalf("in-window oversize publish: want A2AError, got %v", err)
+	}
+	if n := streamMsgCount(t, clientURL(s), "TASKS"); n != 0 {
+		t.Errorf("stream holds %d messages; the gate must fire before publish", n)
+	}
+}
+
+// The to-filter cannot run without knowing our own session, so an anonymous
+// durable subscription is refused rather than silently non-conforming.
+func TestSubscribeDurable_RequiresSession(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("test-consumer"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream:  "TASKS",
+		Subject: "a2a.tasks.task-ns.in",
+		Durable: "ns-consumer",
+	}, func(*Envelope) {})
+	if err == nil {
+		t.Fatal("SubscribeDurable accepted a config without Session")
 	}
 }

@@ -8,6 +8,7 @@ package lib
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -362,4 +363,91 @@ func TestAssertion08_InlineFilePartThreshold(t *testing.T) {
 			t.Fatalf("ValidateEmit: %v", err)
 		}
 	})
+}
+
+// Assertion 7, continued: an A2A Message riding inside a status-update (the
+// input-required prompt) is validated like any other Message.
+func TestAssertion07_StatusUpdateMessageParts(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  string
+		wantErr bool
+	}{
+		{"input_required_with_valid_message",
+			`{"taskId": "task-1", "contextId": "ctx-1", "status": {"state": "input-required", "message": {"role": "agent", "parts": [{"kind": "text", "text": "which cluster?"}], "messageId": "m-q"}}, "final": false}`,
+			false},
+		{"input_required_with_unknown_part_kind",
+			`{"taskId": "task-1", "contextId": "ctx-1", "status": {"state": "input-required", "message": {"role": "agent", "parts": [{"kind": "hologram"}], "messageId": "m-q"}}, "final": false}`,
+			true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := validEnvelopeJSON(func(m map[string]any) {
+				m["kind"] = "status-update"
+				var p any
+				if err := json.Unmarshal([]byte(tc.status), &p); err != nil {
+					panic(err)
+				}
+				m["payload"] = p
+			})
+			_, err := ParseEnvelope(raw)
+			if tc.wantErr {
+				var perr *ProtocolError
+				if !errors.As(err, &perr) {
+					t.Fatalf("want ProtocolError, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("ParseEnvelope: %v", err)
+			}
+		})
+	}
+}
+
+// Assertion 8, continued: the inline threshold also covers FileParts inside a
+// status-update's message, and the boundary is exact - 128KiB inline is legal,
+// one byte more is not.
+func TestAssertion08_ThresholdEdges(t *testing.T) {
+	from := Party{Session: "test-session"}
+
+	t.Run("status_update_message_over_threshold", func(t *testing.T) {
+		big := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAB}, InlineFileThreshold+1))
+		payload := `{"taskId": "task-1", "contextId": "ctx-1", "status": {"state": "input-required", "message": {"role": "agent", "parts": [{"kind": "file", "file": {"name": "b.bin", "bytes": "` + big + `"}}], "messageId": "m-f"}}, "final": false}`
+		_, err := NewStatusUpdateEnvelope(from, "task-1", "ctx-1", "corr-1", json.RawMessage(payload))
+		var a2aErr *A2AError
+		if !errors.As(err, &a2aErr) {
+			t.Fatalf("want A2AError, got %v", err)
+		}
+	})
+
+	t.Run("exactly_at_threshold_accepted", func(t *testing.T) {
+		exact := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAB}, InlineFileThreshold))
+		payload := `{"role": "user", "parts": [{"kind": "file", "file": {"name": "b.bin", "bytes": "` + exact + `"}}], "messageId": "m-e", "taskId": "task-1", "contextId": "ctx-1"}`
+		if _, err := NewMessageEnvelope(from, "task-1", "ctx-1", "corr-1", json.RawMessage(payload)); err != nil {
+			t.Fatalf("a FilePart of exactly the threshold is legal (spec: only above must use uri): %v", err)
+		}
+	})
+
+	t.Run("one_byte_over_refused", func(t *testing.T) {
+		over := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAB}, InlineFileThreshold+1))
+		payload := `{"role": "user", "parts": [{"kind": "file", "file": {"name": "b.bin", "bytes": "` + over + `"}}], "messageId": "m-o", "taskId": "task-1", "contextId": "ctx-1"}`
+		_, err := NewMessageEnvelope(from, "task-1", "ctx-1", "corr-1", json.RawMessage(payload))
+		var a2aErr *A2AError
+		if !errors.As(err, &a2aErr) {
+			t.Fatalf("want A2AError one byte over the threshold, got %v", err)
+		}
+	})
+}
+
+// The library emits only the protocol version it speaks - a hand-built
+// envelope claiming a different minor within the major is refused at emit
+// (inbound tolerance for same-major minors is assertion 1's job).
+func TestValidateEmit_PinnedProtocol(t *testing.T) {
+	env, err := NewMessageEnvelope(Party{Session: "s"}, "task-1", "ctx-1", "corr-1", validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Protocol = "a2a-jetstream/0.9"
+	if err := env.ValidateEmit(); err == nil {
+		t.Fatal("ValidateEmit accepted a protocol version the library does not speak")
+	}
 }

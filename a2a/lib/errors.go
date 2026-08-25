@@ -23,8 +23,9 @@ func (e *A2AError) Error() string {
 	return fmt.Sprintf("a2a error %d: %s", e.Code, e.Message)
 }
 
-// A2A / JSON-RPC error codes used by the library.
+// A2A / JSON-RPC error codes used by the library. Size refusals are
+// InvalidParams — A2A 1.0 defines no content-too-large code of its own.
 const (
-	CodeInvalidParams   = -32602
-	CodeContentTooLarge = -32011
+	CodeInvalidParams = -32602
+	CodeTaskNotFound  = -32001
 )
