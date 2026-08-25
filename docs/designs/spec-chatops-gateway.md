@@ -44,9 +44,7 @@ pod at a time.** Concretely:
   group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
   space is not a session; a conversation in it is.
 - `contextId` is minted at first contact with a conversation and never changes. It is
-  the durable name of the conversation on the bus. Minting is a KV `Create` -
-  create-only, compare-and-swap semantics - so two replicas or a rehydrate racing first
-  contact cannot fork a conversation: the loser reads and adopts the winner's value.
+  the durable name of the conversation on the bus.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
   and the bus session name; `contextId` persists across every incarnation.
 - In a group thread, everyone in the room shares the one session. Attribution is per
@@ -167,10 +165,8 @@ the bus - the same posture the shipped attribution path applies before writing s
 metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds labelled
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
-gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
-lowest-common-denominator grant computation when the authority work lands. The salt is one shared Secret per install:
-every gateway replica reads the same one, or hashes diverge between turns of the same
-conversation and `openDirect` routing and audit joins silently corrupt.
+gateway resolves plaintext at the boundaries that need it - `openDirect` now, RBAC
+intersection when the authority work lands.
 
 - `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
   resolves it to the RBAC string at the boundary that needs one. `subject` is the
@@ -225,9 +221,9 @@ later. What the gateway builds now is the substrate those need:
 One property worth stating because it falls out of the session model: a group session's
 context is labeled for the room. Everyone in the thread shares the pod, so anything the
 harness reads into context is readable by the whole roster - which is exactly as leaky as
-the chat window itself, no more. When per-user authority lands, the
-lowest-common-denominator grants for a group session compute against the audience, not
-just the requester. That is the LCD question, parked with its tool.
+the chat window itself, no more. When per-user authority lands, the intersection for a
+group session computes against the audience, not just the requester. That is the LCD
+question, parked with its tool.
 
 ## The test backend
 

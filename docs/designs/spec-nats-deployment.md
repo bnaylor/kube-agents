@@ -63,6 +63,15 @@ Everything is R3 in production. Status and artifact events are the bulk of the v
 the tempting place for a cheaper R1 class, but they are also the replay and audit record,
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
+Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
+limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
+and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
+`session-state`, and discovery down with it. The honest cost: under byte pressure,
+replay completeness degrades oldest-first - a running task's early events can age out of
+a flooded stream - and the byte-headroom alert below exists so that state is paged on
+before it is reached.
+
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
 Three KV buckets ride the same JetStream deployment:
@@ -161,9 +170,12 @@ deployment's job is to keep the substrate intact and reachable:
   nothing; limits retention means cleanup is W's job, not the exporter's. Deliberately no
   purge-on-export: the window is what everyone else replays, and an exporter that deletes
   is an exporter that can destroy evidence.
-- **Exporter lag is the data-loss horizon.** If the exporter's backlog ages past W before
-  export, audit records die on the bus. Lag is a first-class alert, firing well before
-  backlog age approaches W.
+- **Exporter lag has two data-loss horizons, and the alert watches both.** The age
+  horizon: backlog older than W dies by retention. The byte horizon: under a flood,
+  `discard: old` deletes by byte pressure _before_ age - so an operator must never be
+  told W is the only thing that can delete evidence. Lag is a first-class alert on
+  whichever horizon is nearer: backlog age approaching W, or stream bytes approaching
+  `max_bytes`.
 - The audit path is read-only by construction: the exporter's user may subscribe and may
   not publish, enforced at connect like everything else.
 - The attribution salt the gateway hashes identifiers with is one shared Secret per
@@ -183,6 +195,17 @@ health is a first-class signal: `num_pending`, ack-pending depth, and delivery-b
 freshness, per stream, exported. A connection can be perfectly healthy at the TCP level
 while its consumer is deaf (see the next section), and the metrics have to be able to say
 so.
+
+The starting alert set, so 3 AM triage has named invariants rather than vibes (dev
+defaults; the numbers are tunable, the invariants are not):
+
+| Alert                    | Threshold                             | Severity |
+| :----------------------- | :------------------------------------ | :------- |
+| `AuditExporterLagAge`    | backlog age > 4h (vs W=72h)           | Critical |
+| `AuditExporterLagBytes`  | stream bytes > 80% of `max_bytes`     | Critical |
+| `ProfileDispatchBacklog` | > 20 pending for > 15m on one profile | Warning  |
+| `ConsumerUnackedStalled` | > 0 stalled for > 10m                 | Warning  |
+| `AuthCalloutErrorRate`   | > 1%                                  | Critical |
 
 ## Client resilience contract
 
@@ -220,6 +243,12 @@ and the property is what conformance tests.
   pending-message depth as metrics, and the component's health check MUST incorporate them.
   "TCP is up" is not health. Test: orphan the consumer; assert the health check fails
   while TCP remains connected.
+- **NR-6: Jittered backoff on every connection attempt.** The library MUST apply
+  randomized exponential backoff with full jitter to connection and reconnection
+  attempts. A NATS or callout restart otherwise turns every client into one synchronized
+  thundering herd against the callout service and the API server behind its TokenReviews.
+  Test: force a reconnect storm across N clients; assert attempt timestamps spread rather
+  than align.
 
 ## Conformance
 
