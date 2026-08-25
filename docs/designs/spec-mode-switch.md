@@ -26,26 +26,38 @@ Mode *string `json:"mode,omitempty"`
 
 `mode: next` is a dev toggle, not a supported configuration. Same shape as the other
 opt-in toggles on this CRD: optional pointer field, nil-safe helper, deliberately not
-surfaced in the Helm chart.
+surfaced in the Helm chart. Naming note: the CRD already has a `mode` field on the
+Google Chat integration spec (display verbosity, `spec.integration.googleChat.mode`).
+Different path, no schema collision - named here so nobody conflates them.
 
 ## The helper
 
-All reads go through one function. Nothing touches `Spec.Mode` directly - not the rest of
-the operator, and especially not agent-side code (below).
+All reads go through one module. Nothing touches `Spec.Mode` outside it - not the rest
+of the operator, and especially not agent-side code (below). The module exposes a pair:
 
 ```go
+// resolveMode validates the spec's mode.  Absent is (ModeToday, nil).  A value
+// this binary does not recognize returns an error - the reconciler's cue to go
+// Degraded rather than silently render something else.
+func resolveMode(agent *agentv1alpha1.PlatformAgent) (Mode, error)
+
 // renderMode reports the mode for one component.  Nil-safe and fail-closed:
-// absent, or any value this binary does not recognize, is ModeToday.
+// absent or unrecognized is ModeToday.  For call sites past the reconciler's
+// validation gate, which only need the answer.
 func renderMode(agent *agentv1alpha1.PlatformAgent, component string) Mode
 ```
 
-Fail-closed here means the dark stack stays dark. The `component` argument is ignored
-today - `renderMode` returns the global mode regardless. It exists so that per-feature
-graduation (sketched below) changes the helper and not the call sites.
+The reconciler calls `resolveMode` once at the top and handles the error (below);
+everything downstream uses `renderMode`. Without the pair, fail-closed and
+Degraded-on-skew are mutually exclusive - a single helper that maps unrecognized to
+`ModeToday` leaves the reconciler no way to notice the skew without reading `Spec.Mode`
+itself. Fail-closed here means the dark stack stays dark. The `component` argument is
+ignored today - `renderMode` returns the global mode regardless. It exists so that
+per-feature graduation (sketched below) changes the helper and not the call sites.
 
-**An unrecognized value is refused, not swallowed.** Enum validation rejects bad values at
-admission, so the only way the helper sees one is version skew - a newer CRD adds a third
-mode, an older operator binary reads it. Silently rendering `today` at that point means
+**An unrecognized value is refused, not swallowed.** Enum validation rejects bad values
+at admission, so the only way `resolveMode` sees one is version skew - a newer CRD adds a
+third mode, an older operator binary reads it. Silently rendering `today` at that point means
 the cluster runs something other than what the spec asks, with nothing in
 `kubectl describe` to say so. Instead the reconciler goes Degraded through the existing
 `updateStatusDegraded` path with a named reason, `ModeNotRecognized`, keeps rendering

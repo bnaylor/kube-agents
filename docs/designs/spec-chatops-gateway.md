@@ -68,10 +68,13 @@ One user turn is one A2A task. On each inbound chat message the gateway:
 
 1. Verifies the sender against the backend's identity mechanism (below) and drops the
    message if it can't.
-2. Mints a fresh `correlationId` - this is the originating user interaction the payload
-   spec names, so minting happens here and nowhere else - plus a `taskId`.
-3. Publishes `kind: message` to `a2a.tasks.{taskId}.in`, addressed to the session, with
-   the conversation's `contextId` and the authority block below.
+2. For a message that starts a task: mints a fresh `correlationId` - this is the
+   originating user interaction the payload spec names, so minting happens here and
+   nowhere else - plus a `taskId`. A follow-up or steer to a running task reuses that
+   task's `taskId` and `correlationId`, and is attributed by its own envelope and
+   `authority` block.
+3. Publishes `kind: message` to `a2a.tasks.{session}.{taskId}.in` - the session is the
+   addressee - with the conversation's `contextId` and the authority block below.
 4. Subscribes to the task's events subject and relays status and artifact updates back
    into the conversation.
 
@@ -121,20 +124,19 @@ that suddenly remembers June. If review disagrees, the fix is a compacted transc
 topic, not longer task retention.
 
 **Sweep**, as in the demo: a pod in a terminal phase whose task never emitted a final
-event gets a terminal `failed` published by the gateway, then deleted. This partially
-answers the payload spec's orphaned-task question - the gateway is the janitor for
-sessions it spawned, because it is their supervisor and already holds that authority.
-Orphans in agent-to-agent tasks the gateway never touched remain that doc's open
-question.
+event gets a terminal `failed` published by the gateway, then deleted. This is the
+gateway's half of the payload spec's orphaned-task answer - it is the supervisor for
+sessions it spawned; the dispatcher's janitor is the other half (settled 8/24).
 
 ## Requester identity on the bus
 
 The payload spec reserves two envelope fields and this doc names what goes in them.
 
 **`identity` stays empty.** It is the link-level field - the verified identity of the
-_publisher_, bound to the authenticated NATS connection. Whether that's a server-stamped
-header or a signed claim is the payload spec's open question, and the answer belongs to
-the deployment spec's account design. The gateway has no business writing it.
+_publisher_, bound to the authenticated NATS connection. A server-stamped header was
+ruled out empirically (8/24); the remaining choice - signed claim vs subject-derived
+identity - belongs with the deployment spec's account design and the authority work.
+The gateway has no business writing it.
 
 **`authority` is the request-level field, and the gateway populates it.** Who asked,
 verified how, in front of whom:
@@ -142,24 +144,34 @@ verified how, in front of whom:
 ```json
 "authority": {
   "requester": {
-    "principal": "alice@example.com",
+    "principal": "hmac:9f4c21…",
     "backend": "gchat",
-    "subject": "users/103984267",
+    "subject": "hmac:b8813a…",
     "verifiedBy": "chat-signed-token"
   },
   "audience": {
     "conversation": "gchat:spaces/AAA/threads/BBB",
     "kind": "group",
-    "roster": ["alice@example.com", "bob@example.com"],
+    "roster": ["hmac:9f4c21…", "hmac:77d0e2…"],
     "rosterComplete": true
   },
   "grants": null
 }
 ```
 
-- `requester.principal` is the identity in _our_ trust domain - the string RBAC will
-  eventually see. `subject` is the backend-native immutable id, kept for audit.
-  `verifiedBy` names the mechanism that checked it at ingress.
+**Identifiers in `authority` are pseudonymous (decided 8/24).** Principals, subjects,
+and roster entries are HMAC-SHA256 with the install's salt before anything is written to
+the bus - the same posture the shipped attribution path applies before writing session
+metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds labelled
+content at rest for the whole retention window, so it gets the same treatment as the
+session KV. The plaintext join lives in the gateway's local ingress log, and the
+gateway resolves plaintext at the boundaries that need it - `openDirect` now, RBAC
+intersection when the authority work lands.
+
+- `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
+  resolves it to the RBAC string at the boundary that needs one. `subject` is the
+  backend-native immutable id, hashed likewise, kept for audit joins. `verifiedBy`
+  names the mechanism that checked it at ingress.
 - `audience` is a snapshot of the room at the moment of the ask (see group chats below).
 - `grants` is reserved for the attenuating capability token when the authority work
   lands. Until then it is null and the field is advisory.
@@ -183,10 +195,8 @@ authorize on it yet. It is carried now for the audit trail and for parity testin
 it becomes decision-grade only when `identity` arms and the deployment spec's accounts
 pin who may publish to the task subjects.
 
-This needs a one-line amendment to the payload spec, which currently says producers
-MUST NOT populate either reserved field: `authority` becomes populate-by-gateway-only,
-consumers still forbidden from deciding on it, libraries still pass it through untouched.
-Minor rev, same major. Flagged in Open Questions rather than silently assumed.
+The payload spec has carried this rule since 0.3: `authority` is populate-by-gateway-only,
+consumers forbidden from deciding on it, libraries pass it through untouched.
 
 ## Group chats: who is in the room
 
@@ -197,7 +207,7 @@ later. What the gateway builds now is the substrate those need:
 
 - **Roster.** The adapter tracks membership per conversation from the backend's
   membership API and events. The roster is mapped principals where the mapping exists,
-  backend subjects where it doesn't.
+  backend subjects where it doesn't - pseudonymized like every identifier in `authority`.
 - **Audience in every envelope.** Each turn's `authority.audience` snapshots the roster
   at ask time. Snapshots, deliberately: when the classifier later asks "who could have
   read this," the answer is in the envelope for that turn, not reconstructed from
@@ -276,8 +286,8 @@ retirement (stage 3), on the gateway built in stage 2:
 
 Calls for [@bnaylor]:
 
-- ~~**Payload spec amendment.**~~ Ratified 8/24; the payload spec carries it as
-  `a2a-jetstream/0.3`.
+- ~~**Payload spec amendment.**~~ Ratified 8/24; the payload spec has carried it since
+  0.3.
 - ~~**Idle TTL.**~~ Decided 8/24: 30 minutes, config-backed.
 - ~~**Rehydration horizon.**~~ Decided 8/24: retention is the horizon. The compacted
   transcript topic stays the named fix if real users disagree.
