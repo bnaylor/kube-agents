@@ -341,9 +341,10 @@ Long-term audit archival is the deployment spec's exporter.
 
 ## Conformance assertions
 
-The stage 1 client library ships with a suite that asserts all of the following. Resilience
-assertions (server restart, reconnect behavior) live in the NATS deployment spec's
-requirements. The last two are repeated here because the suite is one suite.
+The stage 1 client library ships with a suite that asserts all of the following.
+Resilience assertions (server restart, reconnect behavior) live in the NATS deployment
+spec's requirements; 19 and 20 are repeated here because the suite is one suite. Where
+an assertion needs more than the library to prove (21), it names its home.
 
 Envelope:
 
@@ -405,6 +406,15 @@ Resilience (shared with the deployment spec's requirements):
 19. The client survives a NATS server restart and resumes delivery without a process
     restart.
 20. After a reconnect, the consumer resumes with no gap, and assertion 5 still holds.
+
+Steering delivery (added 8/25, with the dual-reader rule):
+
+21. A steering message published to a running task reaches the executor's harness stdin
+    exactly once, including under JetStream redelivery. No dispatcher path consumes a
+    steer without delivering it - a steer to a live task is delivered to the executor,
+    never dropped. The executable test lands with the worker adapter, asserting against
+    a stub harness that echoes its stdin - proving "reached the harness stdin" needs the
+    adapter, not the library alone.
 
 ## Open Questions
 
