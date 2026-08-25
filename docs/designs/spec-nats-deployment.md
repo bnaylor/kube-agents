@@ -12,8 +12,8 @@ layout, accounts and connection-time authorization, how the durable stream surfa
 audit substrate, and the client resilience contract the stage 1 client library must satisfy.
 
 Subject taxonomy and message shape belong to the A2A payload spec. Both docs landed the
-same day, so the launch card's whoever-finishes-first rule never fired; the call (8/24) is
-that the payload spec's layout wins and this doc binds to its subjects and topic classes.
+same day, so the planned tie-break rule never fired; the call (8/24) is that the payload
+spec's layout wins and this doc binds to its subjects and topic classes.
 
 ## What we deploy
 
@@ -45,12 +45,12 @@ window, not the delivery lifecycle. Concretely:
 
 Streams bind to the payload spec's subjects and topic classes:
 
-| Stream           | Subjects             | Retention                                   | Consumers                                                                                                                 |
-| :--------------- | :------------------- | :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------ |
-| `TASKS`          | `a2a.tasks.>`        | Age window W (72h placeholder), R3          | One durable per executor on `…in`, `MaxAckPending` ~50. `tasks/get` is an ephemeral replay of `…events`, never a consume. |
-| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3               | Last-value; the tombstone replaces the card                                                                               |
-| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject                                                                                                   |
-| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                          |                                                                                                                           |
+| Stream           | Subjects             | Retention                                   | Consumers                                                                                                                                                                                                                                                                                                                |
+| :--------------- | :------------------- | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), R3          | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events`, never a consume. |
+| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3               | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                              |
+| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject                                                                                                                                                                                                                                                                                                  |
+| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                          |                                                                                                                                                                                                                                                                                                                          |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -65,13 +65,16 @@ and R1 loses them to a single node failure. Audit wins. The cost knob is W, not 
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Two KV buckets ride the same JetStream deployment:
+Three KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
-- A bucket reserved for capability entries, if the envelope design lands on KV-backed
-  capabilities. Reserved here so the account layout allows for it; the envelope design
-  owns whether it exists.
+- `session-state` - the gateway's session registry (session key, `contextId`, current
+  pod, roster). The gateway's user is the only writer.
+- A bucket reserved for capability entries per the capability envelope design
+  (`docs/architecture/09-capability-envelope.md`), which landed on KV-backed
+  capabilities. Reserved so the account layout allows for it; it arms with the
+  authority work.
 
 ## Accounts and connection-time authorization
 
@@ -80,11 +83,16 @@ message is read.** Publish and subscribe permissions are checked when the connec
 established. A compromised or prompt-injected agent cannot emit on a subject it has no
 claim to, because the connection has no such right - no application code is consulted.
 
-**Authentication is auth callout, not decentralized JWT.** We hold no signing keys. The
-callout service validates the client's KSA token against the cluster's OIDC issuer
-(audience-bound, short-lived, kubelet-rotated) and returns the account and the permission
-set. Revocation is the issuer's problem, and it already solved it. This works on stock
-Kubernetes; there is no GKE dependency.
+**Authentication is auth callout, not decentralized JWT** - no operator/account key
+hierarchy to manage. One signing key does exist, and it is the most powerful thing in
+this deployment: the callout issuer key that signs each authorization response, whose
+holder can mint arbitrary bus users. The capability envelope design
+(`docs/architecture/09-capability-envelope.md`, "one cryptographic key does exist") owns
+that analysis; the callout service inherits its hardening requirements. The callout
+validates the client's KSA token against the cluster's OIDC issuer (audience-bound,
+short-lived, kubelet-rotated) and returns the account and the permission set. Revocation
+is the issuer's problem, and it already solved it. This works on stock Kubernetes; there
+is no GKE dependency.
 
 Layout:
 
@@ -93,9 +101,12 @@ Layout:
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
   exists.
-- **One user per agent identity** inside the account. Permissions are exact subject lists,
-  deny by default: publish only to the subjects its role emits on, subscribe only to its own
-  directed-task subject plus the shared fan-out subjects.
+- **One user per agent identity** inside the account. Permissions are exact subject
+  lists, deny by default: publish only to the subjects its role emits on, subscribe only
+  to its own addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the
+  shared topics it is granted. The addressee token in the task subjects (payload spec
+  0.4) is what makes these grants expressible - executor-granularity at connect time,
+  with per-task scoping the parked tightening under the authority work.
 - **Per-user inbox prefixes.** Push delivery uses inbox subjects, so each user gets its own
   prefix (`_INBOX.<user>.>`) and permission to subscribe only to that. Without this, any
   agent can subscribe to any inbox and the whole property above leaks through the reply
@@ -214,8 +225,8 @@ Both run against `kind`.
 ## Open questions
 
 - ~~**Retention window W.**~~ Decided 8/24: the placeholders are the dev defaults - 72h
-  task events, 30d journals, no age limit on state. The GA number goes to the
-  product-decisions list; it is a tenancy call, not ours to guess.
+  task events, 30d journals, no age limit on state. The GA number is escalated to
+  product; it is a tenancy call, not ours to guess.
 - ~~**Who owns the audit exporter.**~~ Decided 8/24: stage 2, landing with the parity
   suite - that is when there is evidence worth archiving. Stage 1 ships the reserved
   consumer only. Owner assigned when stage 2 staffs.

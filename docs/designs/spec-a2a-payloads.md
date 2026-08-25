@@ -1,10 +1,12 @@
-# A2A payload spec (a2a-jetstream/0.3)
+# A2A payload spec (a2a-jetstream/0.4)
 
 - **Author:** @bnaylor
 - **Date:** 2026-08-24
 - **Status:** draft for review
 - **Supersedes:** the demo protocol (`a2a-jetstream/0.1`). 0.2 was this doc's
-  pre-amendment draft, never implemented; 0.3 adds the ratified `authority` rules.
+  pre-amendment draft, never implemented; 0.3 added the ratified `authority` rules; 0.4
+  moves the addressee into the task subjects, which is what makes connection-time
+  authorization expressible on the task plane.
 
 ## Purpose
 
@@ -104,7 +106,7 @@ Every message on the A2A subjects is one JSON envelope.
 
 ```json
 {
-  "protocol": "a2a-jetstream/0.3",
+  "protocol": "a2a-jetstream/0.4",
   "envelopeId": "env-8f3a…",
   "correlationId": "corr-2b91…",
   "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
@@ -128,20 +130,20 @@ lacked.
 
 ### Field rules
 
-| Field                  | Rules                                                                                                                                                                                                                                                                                                                     |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `protocol`             | Required. Major.minor; bump major on breaking change. Consumers MUST reject unknown majors and MUST ignore unknown envelope fields within a major.                                                                                                                                                                        |
-| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once.                                                                                                                                  |
-| `correlationId`        | Required. Minted once by the gateway at the originating user interaction. Copied verbatim on every hop; never re-minted by an intermediary. A task spawned in service of another task inherits its parent's value. This is the identifier that spans question, hops, and resulting change.                                |
-| `traceparent`          | Optional. W3C trace context, for OTel tooling. `correlationId` is authoritative; `traceparent` is a convenience and may be re-parented per span.                                                                                                                                                                          |
-| `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                              |
-| `ts`                   | Required. ISO-8601 UTC.                                                                                                                                                                                                                                                                                                   |
-| `from`                 | Required. Routing and display only. `from.profile` (optional, added 8/24) names the AgentProfile a worker runs as, so renderers don't parse session names. Until the identity work lands the whole field is publisher-asserted and MUST NOT be used for authorization - a compromised publisher can claim any value here. |
-| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere.                                                                                                                                                                                                    |
-| `identity`             | **Reserved.** See below.                                                                                                                                                                                                                                                                                                  |
-| `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                 |
-| `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                           |
-| `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                 |
+| Field                  | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `protocol`             | Required. Major.minor; bump major on breaking change. Consumers MUST reject unknown majors and MUST ignore unknown envelope fields within a major.                                                                                                                                                                                                                                                                                                                            |
+| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once.                                                                                                                                                                                                                                                                                      |
+| `correlationId`        | Required. Minted once by the gateway at the user interaction that starts a task. Copied verbatim on every hop; never re-minted by an intermediary. A task spawned in service of another task inherits its parent's value, and a follow-up or steer to a running task carries the task's original value - the steer is attributed by its own envelope and `authority` block, not by a new correlation. This is the identifier that spans question, hops, and resulting change. |
+| `traceparent`          | Optional. W3C trace context, for OTel tooling. `correlationId` is authoritative; `traceparent` is a convenience and may be re-parented per span.                                                                                                                                                                                                                                                                                                                              |
+| `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                  |
+| `ts`                   | Required. ISO-8601 UTC.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `from`                 | Required. Routing and display only. `from.profile` (optional, added 8/24) names the AgentProfile a worker runs as, so renderers don't parse session names. Until the identity work lands the whole field is publisher-asserted and MUST NOT be used for authorization - a compromised publisher can claim any value here.                                                                                                                                                     |
+| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere.                                                                                                                                                                                                                                                                                                                                                        |
+| `identity`             | **Reserved.** See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 ### Reserved fields: `identity` and `authority`
 
@@ -150,9 +152,12 @@ them now is two names. So they are reserved now.
 
 - `identity` will carry the verified identity of the publisher - the real one, bound to the
   authenticated connection, as opposed to the advisory `from`.
-- `authority` will carry an attenuating capability token: who originally asked, what scope
-  they hold, what this hop is permitted to do, with each further hop a strict subset. The
-  A2A `auth-required` task state is reserved alongside it.
+- `authority` will carry a _reference_ to an attenuating capability held in KV - who
+  originally asked, what scope they hold, what this hop is permitted to do, each further
+  hop a strict subset - per the capability envelope design
+  (`docs/architecture/09-capability-envelope.md`): no token format, nothing signed in the
+  envelope, the message carries a lookup id. The A2A `auth-required` task state is
+  reserved alongside it.
 
 Rules until then (**amended 8/24**, ratified from the gateway design): `identity` MUST NOT
 be populated by anyone. `authority` is populated by the chatops gateway at ingress and by
@@ -171,32 +176,44 @@ this doc.
 | `status-update`   | A2A `TaskStatusUpdateEvent`   | State transitions. Terminal events set `final: true`.                                                                             |
 | `artifact-update` | A2A `TaskArtifactUpdateEvent` | Streamed output, including incremental chunks per A2A chunking rules.                                                             |
 | `cancel`          | empty object                  | A2A models cancel as an RPC method, not an object, so the envelope kind is the method. `taskId` in the envelope names the target. |
-| `agent-card`      | A2A `AgentCard`               | Published once on startup.                                                                                                        |
-| `agent-closed`    | empty object                  | Tombstone on shutdown; replaces the card.                                                                                         |
+| `agent-card`      | A2A `AgentCard`               | Published by the profile's owner when the profile is created, not by workers.                                                     |
+| `agent-closed`    | empty object                  | Tombstone on profile deletion; replaces the card.                                                                                 |
 | `topic-update`    | A2A `Artifact`                | See Topics.                                                                                                                       |
 
 A kind/payload mismatch is a protocol error, not something to pass through.
 
-Payload size: the library enforces the bus's max message size client-side and fails with an
-A2A error before publishing, because the alternative is a silent drop at the server.
+Payload size: the library enforces the bus's max message size client-side and fails with
+an A2A error before publishing - the server refuses an oversized publish with a protocol
+error and a closed connection, and the failure should be a typed error at the source, not
+a transport failure downstream.
 FileParts above the inline threshold - 128KiB dev default - MUST use `uri` rather than
 `bytes`, backed by the JetStream Object Store (decided 8/24; see Open Questions).
 
 ## Task lifecycle on JetStream
 
 Task states are A2A's: `submitted`, `working`, `input-required`, `completed`, `failed`,
-`canceled`, plus `rejected` for an executor that refuses work before starting it.
+`canceled`, and `rejected` (native in A2A 1.0) for an executor that refuses work before
+starting it.
 (`auth-required` is reserved with the authority field.) Terminal states are `completed`,
 `failed`, `canceled`, `rejected`.
 
 ### Subjects
 
-| Subject                                   | Carries                                                                        |
-| ----------------------------------------- | ------------------------------------------------------------------------------ |
-| `a2a.tasks.{taskId}.in`                   | `message` (submission and follow-up input) and `cancel`, requester to executor |
-| `a2a.tasks.{taskId}.events`               | `status-update` and `artifact-update`, executor to anyone                      |
-| `a2a.agents.{session}`                    | `agent-card` on startup, `agent-closed` tombstone on shutdown                  |
-| `agents.hb.{agentType}.{owner}.{session}` | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream   |
+| Subject                                   | Carries                                                                                                                                                                                                                              |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `a2a.tasks.{addressee}.{taskId}.in`       | `message` (submission and follow-up input) and `cancel`, requester to executor                                                                                                                                                       |
+| `a2a.tasks.{addressee}.{taskId}.events`   | `status-update` and `artifact-update`, executor to anyone                                                                                                                                                                            |
+| `a2a.agents.{profile}`                    | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card. |
+| `agents.hb.{agentType}.{owner}.{session}` | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                              |
+
+**The addressee token (added in 0.4) is the authorization seam.** `{addressee}` is the
+executor's name - a profile, or a chat session. With it in the subject, connection-time
+grants become exact: who may delegate to which profiles, who may emit events as which
+executor, each a per-user subject-prefix grant. Without it (0.3 and earlier), every
+grant collapsed to `a2a.tasks.>` and the deployment spec's connect-time property was
+unimplementable on the task plane. The envelope's `to` MUST agree with the subject's
+addressee token; a mismatch is a protocol error. Per-task (rather than per-executor)
+scoping stays the parked tightening with the authority work.
 
 (0.1's `.request` becomes `.in` because it now carries follow-up input and cancel, not just
 the one submission.)
@@ -206,14 +223,14 @@ the one submission.)
 A2A 1.0 defines its operations as JSON-RPC methods. On a bus, most of them stop being
 calls and become properties of the stream:
 
-| A2A operation                    | On the bus                                                                                                                                                                                            |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it. |
-| `message/stream`                 | The same publish, plus subscribe to the `events` subject. Streaming is not an optional capability here; it is how the bus works.                                                                      |
-| `tasks/get`                      | Replay the `events` subject from sequence 1 and fold the events into a `Task`. No live executor required - this is the durability payoff.                                                             |
-| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.      |
-| `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                 |
-| push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                |
+| A2A operation                    | On the bus                                                                                                                                                                                                        |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it. |
+| `message/stream`                 | The same publish, plus subscribe to the `events` subject. Streaming is not an optional capability here; it is how the bus works.                                                                                  |
+| `tasks/get`                      | Replay the `events` subject from sequence 1 and fold the events into a `Task`. No live executor required - this is the durability payoff.                                                                         |
+| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                  |
+| `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                             |
+| push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                            |
 
 ### Event ordering rules
 
@@ -254,7 +271,9 @@ four carry reserved semantics.
 
 Tasks are conversations. Topics are the blackboard: durable, named subjects where agents
 publish what they currently know, so the next question starts from standing state instead
-of a cold diagnosis.
+of a cold diagnosis. (The file-based blackboard this replaces at stage 3 is
+`docs/designs/agent-communication.md`, today's design of record for platform-to-cluster
+exchange.)
 
 ### Namespace
 
@@ -301,9 +320,9 @@ the class does.
 
 Task subjects (`a2a.tasks.>`) get their own limits-retention stream with `max_age: 72h`,
 and the directory (`a2a.agents.>`) is last-value (`max_msgs_per_subject: 1`, so the
-tombstone replaces the card). All the numbers in this section are placeholders pending
-deployment-spec sizing. Long-term audit archival (mirror streams) is that doc's problem
-too.
+tombstone replaces the card). The numbers in this section were ratified 8/24 as dev
+defaults; the GA window is a product and tenancy decision, escalated to product.
+Long-term audit archival is the deployment spec's exporter.
 
 ## Conformance assertions
 
@@ -321,7 +340,9 @@ Envelope:
 3. The library never populates `identity`. It populates `authority` only on the gateway's
    ingress path; every other producer emits it null. Inbound values are passed through
    byte-identical and are not consulted for any decision.
-4. A consumer on a wildcard ignores envelopes whose `to` names another session.
+4. A consumer on a wildcard ignores envelopes whose `to` names another session, and an
+   envelope whose `to` disagrees with its subject's addressee token is surfaced as a
+   protocol error.
 5. A redelivered envelope (same `envelopeId`) reaches the application at most once.
 
 Payloads:
@@ -384,7 +405,8 @@ Calls for @bnaylor, not silently resolved here:
   one exception (`Nats-Request-Info`, unforgeable but only on cross-account service
   imports, and stripped on JetStream ingest) doesn't apply to our single-account stage 1.
   Remaining choice: signed claim in the envelope vs subject-derived identity where
-  publish permissions are exclusive.
+  publish permissions are exclusive - and the 0.4 addressee-scoped subjects widen
+  exactly that exclusive surface, which strengthens the subject-derived option.
 - ~~**Large artifact storage.**~~ Decided 8/24: JetStream Object Store, object TTL
   tracking W for task artifacts, 128KiB inline threshold as the dev default. An external
   bucket is a stage 2 pluggable alongside the audit exporter - an option, never a
@@ -394,10 +416,12 @@ Calls for @bnaylor, not silently resolved here:
   experiment.
 - ~~**Orphaned tasks.**~~ Settled 8/24, in two ratified halves: every task has a
   supervisor, and the supervisor is the janitor - the gateway for chat sessions it
-  spawned, the dispatcher for profile-addressed tasks. The janitor's bus user may
-  publish `status-update` on task event subjects and nothing else, and its synthesized
-  events carry its own identity in `from`, so replay always distinguishes "the worker
-  said failed" from "the janitor declared it dead."
+  spawned, the dispatcher for profile-addressed tasks. A supervisor's grant is publish
+  on its own addressees' `…events` subjects - subject-level, since NATS permissions
+  cannot see the envelope `kind`; that a supervisor emits only terminal `status-update`
+  is a conformance assertion, not a connect-time control. Its synthesized events carry
+  its own identity in `from`, so replay always distinguishes "the worker said failed"
+  from "the supervisor declared it dead."
 - ~~**`contextId` scope.**~~ Settled by the gateway design, 8/24: one per backend
   conversation (thread or DM), minted at first contact, persistent across pod
   incarnations.

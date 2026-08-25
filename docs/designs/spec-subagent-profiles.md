@@ -29,7 +29,7 @@ profile: a directory under `$HERMES_HOME/profiles/<name>` on the shared data PVC
 Cluster agent profiles are scaffolded at runtime, one per managed cluster
 (`agents/platform/scripts/cluster_agent_profile.py:66-78`), with names sanitized and
 truncated to fit - which is why recovering a cluster's identity from its agent name is
-already documented as unreliable.
+already documented as unreliable (`docs/designs/agent-communication.md`).
 
 A subagent invocation is a fresh OS subprocess in the same container: an orchestrator
 files a kanban card, and the dispatcher spawns
@@ -40,8 +40,9 @@ and the network identity. Concurrency is capped board-wide at 2
 (`k8s-operator/api/v1alpha1/common_types.go:218-249`) because each worker is a few
 hundred MiB inside one pod's memory budget.
 
-The A2A demo already ran the target shape: a delegator builds a `V1Pod` in code
-(`agents/chatops/src/k8s.ts:52-101` in the demo tree), the worker learns its task id from
+The A2A demo already ran the target shape: a delegator builds a `V1Pod` in application
+code (the demo's chatops delegator; the demo repo is not part of this repository), the
+worker learns its task id from
 env and pulls the task itself off JetStream, output streams back over the bus, and the pod
 is deleted when done. It worked, and it also accumulated exactly the hacks this spec is
 here to remove: pod specs assembled in application code, a `[thinking]` string prefix
@@ -90,11 +91,18 @@ per-cluster case is the reconciler stamping out one CR per cluster, exactly as i
 out profile directories today. The scaffolder is the template engine. We don't need a
 second one.
 
+Relationship to the architecture set: `docs/architecture/06-api-and-data-contracts.md`
+defines `kind: Agent` and 08 reconciles it into one isolated pod per agent.
+`AgentProfile` is the concrete stage-3 resource on that road - profile-shaped identity,
+pod-per-task execution. Whether the two objects merge or `AgentProfile` supersedes
+`Agent` is settled in the 01-08 revision, which this design feeds; nothing here forecloses
+either answer.
+
 ### What the CRD deliberately does not hold: task state
 
-There is no `AgentTask` CR and no task status mirrored into the API server. Tasks live on
-the bus: submission on `a2a.tasks.{taskId}.in`, every event on `a2a.tasks.{taskId}.events`,
-status answered by replay. Mirroring that into etcd would create a second source of truth
+There is no `AgentTask` CR and no task status mirrored into the API server. Tasks live
+on the bus: submission on `a2a.tasks.{profile}.{taskId}.in`, every event on
+`a2a.tasks.{profile}.{taskId}.events`, status answered by replay. Mirroring that into etcd would create a second source of truth
 that is guaranteed to lag the first, plus an API-server write per status event. The
 kanban board is a task database bolted to the side of the harness. The durable stream is
 the task database now, and it comes with the audit story attached. The only Kubernetes
@@ -154,21 +162,27 @@ the mode switch says `next`.
 ## How a profile becomes a pod
 
 **Submission is a message, not an API call.** An orchestrator delegates by publishing a
-`kind: message` envelope to `a2a.tasks.{taskId}.in` with `to` naming the profile. Profile
-names are reserved addressees in the directory. That is the entire client-side surface -
+`kind: message` envelope to `a2a.tasks.{profile}.{taskId}.in` - the profile is the
+addressee token, and `to` agrees with it. Profile names are reserved addressees in the
+directory, and "who may delegate to which profiles" is a connect-time publish grant on
+exactly these subjects. That is the entire client-side surface -
 the requester needs zero Kubernetes permissions to delegate. (The demo's delegator
 carried a Role with pod create/delete/watch; that goes away.)
 
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
-binary holds the durable consumer on the `TASKS` stream's `…in` subjects. For each
-envelope addressed to a profile it manages, it renders a Job from the `AgentProfile`.
-Envelopes addressed to live sessions it ignores, per the envelope rules. Notes on the
-mechanics:
+binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. For each
+envelope it renders a Job from the `AgentProfile`. Session-addressed subjects are not in
+its grants at all. Per-profile consumers also isolate backlogs: a capped or
+crash-looping profile's unacked redeliveries cannot head-of-line block another profile's
+dispatch. Notes on the mechanics:
 
 - The Job name derives from the taskId, so Job creation is idempotent - a JetStream
   redelivery hits `AlreadyExists` and acks. Combined with envelope dedup this is the
   claim/lease story: there is one dispatcher, and creates are idempotent, so
-  double-execution needs no lock table.
+  double-execution needs no lock table. (One window: a redelivery arriving after
+  `ttlSecondsAfterFinished` has GC'd the finished Job would re-create it; the ack
+  normally lands seconds after create, so the trigger requires durable-consumer state
+  loss. Noted, not defended against.)
 - The dispatcher acks _after_ the Job is created. A dispatcher restart replays
   unacked submissions from the durable consumer - the queue is the stream, and there is
   no in-memory delegation map to lose.
@@ -216,7 +230,8 @@ dispatch poll anyway.
 
 ## Thinking and status, back over the bus
 
-Everything a worker emits rides `a2a.tasks.{taskId}.events` as the payload spec's two
+Everything a worker emits rides `a2a.tasks.{profile}.{taskId}.events` as the payload
+spec's two
 event kinds. The originating session is already subscribed - streaming is how the bus
 works. Correlation is `taskId` for the task and `correlationId` for the thread. A child
 task inherits its parent's `correlationId`, so one identifier still spans the user's
@@ -289,13 +304,14 @@ event, it publishes terminal `failed` with a reason naming the evidence
 did exactly this and it worked. The janitor inherits the pattern with the Job as the
 source of truth instead of a poll over pods.
 
-This answers the payload spec's open question - _who may write `failed` for a dead
-executor_ - with: the janitor, and only the janitor. Its bus user may publish
-`status-update` on task event subjects and nothing else, the grant is in the
-identity-to-permissions map like every other, and its synthesized events carry its own
-identity in `from`, so replay always distinguishes "the worker said failed" from "the
-janitor declared it dead." Flagged for sign-off in Open Questions, since that doc asked
-for an explicit authority decision rather than a convenience.
+This is the dispatcher's half of the payload spec's orphaned-task answer; the gateway
+sweeps its own chat sessions the same way (the ratified 8/24 split - every task's
+supervisor is its janitor). The janitor's grant is publish on its own profiles'
+`…events` subjects - subject-level, since NATS permissions cannot see the envelope
+`kind`; that a janitor emits only terminal `status-update` is a conformance assertion,
+not a connect-time control. The grant is in the identity-to-permissions map like every
+other, and synthesized events carry the janitor's own identity in `from`, so replay
+always distinguishes "the worker said failed" from "the janitor declared it dead."
 
 **What is deliberately absent: automatic retry.** Today the board charges a retry
 budget, forgives infrastructure deaths, and trips a breaker on repeat offenders. This
@@ -326,7 +342,7 @@ spec:
     lifecycle and acting on cluster agents' proposed fixes.
   persona:
     image: <registry>/kube-agents/persona-platform:2026.08
-    # SOUL.md, AGENTS.md, governance SOPs, the 38 platform skills, persona config
+    # SOUL.md, AGENTS.md, governance SOPs, the platform skills, persona config
     # (toolsets: mcp-platform_control, mcp-gke, mcp-developer_knowledge, memory read-only)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
@@ -389,7 +405,7 @@ spec:
     location: us-east1
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
-    # SOUL.md, AGENTS.md, the six gke-* debugging skills, persona config
+    # SOUL.md, AGENTS.md, the gke-* debugging skills, persona config
     # (read-only gke MCP + developer_knowledge; platform_control deliberately absent)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
@@ -447,7 +463,8 @@ The two gaps, plainly:
 **DAG scheduling.** The board is a small workflow engine: children unclaimable until
 parents settle, fan-in cards that aggregate parent metadata, and plan state that survives
 an orchestrator crash. This framework replaces it with "the orchestrator sequences."
-The design of record already treats delegation as an optimization the platform _chooses_,
+The design of record (`docs/designs/agent-communication.md`) already treats delegation as
+an optimization the platform _chooses_,
 not a requirement, which is most of why I think we can live without an engine at stage 3 -
 the fan-out patterns in use are one level deep. What is genuinely lost is crash-safe
 plan state: an orchestrator that dies mid-fan-out must reconstruct its plan from task
