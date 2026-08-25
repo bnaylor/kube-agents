@@ -13,16 +13,25 @@ import (
 type TaskExecution struct {
 	c             *Client
 	from          Party
+	addressee     string
 	taskID        string
 	contextID     string
 	correlationID string
 }
 
 // NewTaskExecution derives an execution from the originating kind:message
-// envelope.
-func (c *Client) NewTaskExecution(origin *Envelope, from Party) (*TaskExecution, error) {
+// envelope. addressee is the executor's own name — the profile or session
+// token its task subjects carry (0.4); the worker gets it from its PROFILE
+// env, the gateway from the session it spawned.
+func (c *Client) NewTaskExecution(origin *Envelope, from Party, addressee string) (*TaskExecution, error) {
 	if origin == nil {
 		return nil, &ProtocolError{Msg: "nil originating envelope"}
+	}
+	if addressee == "" {
+		return nil, &ProtocolError{Msg: "task execution requires the executor's addressee token"}
+	}
+	if origin.To != nil && origin.To.Session != addressee {
+		return nil, &ProtocolError{Msg: fmt.Sprintf("originating message addressed to %q, executor is %q", origin.To.Session, addressee)}
 	}
 	if origin.Kind != KindMessage {
 		return nil, &ProtocolError{Msg: fmt.Sprintf("task execution originates from a kind:message envelope, got %q", origin.Kind)}
@@ -33,6 +42,7 @@ func (c *Client) NewTaskExecution(origin *Envelope, from Party) (*TaskExecution,
 	return &TaskExecution{
 		c:             c,
 		from:          from,
+		addressee:     addressee,
 		taskID:        origin.TaskID,
 		contextID:     origin.ContextID,
 		correlationID: origin.CorrelationID,
@@ -73,7 +83,7 @@ func (x *TaskExecution) PublishStatus(ctx context.Context, state TaskState, fina
 	if err != nil {
 		return err
 	}
-	return x.c.Publish(ctx, TaskEventsSubject(x.taskID), env)
+	return x.c.Publish(ctx, TaskEventsSubject(x.addressee, x.taskID), env)
 }
 
 // PublishArtifact builds and publishes an artifact-update on the task's
@@ -83,5 +93,5 @@ func (x *TaskExecution) PublishArtifact(ctx context.Context, a Artifact, opts ..
 	if err != nil {
 		return err
 	}
-	return x.c.Publish(ctx, TaskEventsSubject(x.taskID), env)
+	return x.c.Publish(ctx, TaskEventsSubject(x.addressee, x.taskID), env)
 }

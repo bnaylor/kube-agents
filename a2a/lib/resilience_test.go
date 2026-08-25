@@ -80,7 +80,7 @@ func TestAssertion19_SurvivesServerRestart(t *testing.T) {
 	col := &collector{}
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.task-r19.in",
+		Subject: TaskInSubject("chatops", "task-r19"),
 		Durable: "r19-consumer",
 		Session: "chatops",
 	}, col.handle)
@@ -94,7 +94,7 @@ func TestAssertion19_SurvivesServerRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Publish(ctx, TaskInSubject("task-r19"), env); err != nil {
+		if err := c.Publish(ctx, TaskInSubject("chatops", "task-r19"), env); err != nil {
 			t.Fatalf("publish %s: %v", id, err)
 		}
 	}
@@ -142,7 +142,7 @@ func TestNR2_TerminalCloseRebuild(t *testing.T) {
 	col := &collector{}
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.task-nr2.in",
+		Subject: TaskInSubject("chatops", "task-nr2"),
 		Durable: "nr2-consumer",
 		Session: "chatops",
 	}, col.handle)
@@ -181,7 +181,7 @@ func TestNR2_TerminalCloseRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pubC.Publish(ctx, TaskInSubject("task-nr2"), env); err != nil {
+	if err := pubC.Publish(ctx, TaskInSubject("chatops", "task-nr2"), env); err != nil {
 		t.Fatalf("publish after rebuild: %v", err)
 	}
 	waitFor(t, 15e9, "delivery after rebuild", func() bool { return col.count() == 1 })
@@ -262,7 +262,7 @@ func TestNR2_RebuildRetriesSubscribe(t *testing.T) {
 	col := &collector{}
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.task-rr.in",
+		Subject: TaskInSubject("chatops", "task-rr"),
 		Durable: "rr-consumer",
 		Session: "chatops",
 	}, col.handle)
@@ -297,7 +297,7 @@ func TestNR2_RebuildRetriesSubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pubC.Publish(ctx, TaskInSubject("task-rr"), env); err != nil {
+	if err := pubC.Publish(ctx, TaskInSubject("chatops", "task-rr"), env); err != nil {
 		t.Fatalf("publish after recovery: %v", err)
 	}
 	waitFor(t, 15e9, "delivery after recovery", func() bool { return col.count() == 1 })

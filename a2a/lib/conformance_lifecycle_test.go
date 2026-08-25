@@ -21,8 +21,10 @@ type taskHarness struct {
 	requester *Client
 	executor  *Client
 	taskID    string
+	addressee string     // the executor's name: the subject token (0.4)
 	inbox     *collector // what the executor received on .in
 	exec      *TaskExecution
+	origin    *Envelope
 }
 
 func newTaskHarness(t *testing.T, url, taskID string) *taskHarness {
@@ -39,12 +41,13 @@ func newTaskHarness(t *testing.T, url, taskID string) *taskHarness {
 	}
 	t.Cleanup(ex.Close)
 
-	h := &taskHarness{t: t, ctx: ctx, requester: req, executor: ex, taskID: taskID, inbox: &collector{}}
+	h := &taskHarness{t: t, ctx: ctx, requester: req, executor: ex, taskID: taskID,
+		addressee: "worker-" + taskID, inbox: &collector{}}
 	_, err = ex.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: TaskInSubject(taskID),
+		Subject: TaskInSubject(h.addressee, taskID),
 		Durable: "exec-" + taskID,
-		Session: "worker-" + taskID,
+		Session: h.addressee,
 	}, h.inbox.handle)
 	if err != nil {
 		t.Fatalf("executor subscribe: %v", err)
@@ -56,21 +59,24 @@ func newTaskHarness(t *testing.T, url, taskID string) *taskHarness {
 // TaskExecution from the received origin envelope.
 func (h *taskHarness) submit(correlationID string) {
 	h.t.Helper()
+	// The submission is addressed: to must agree with the subject's addressee
+	// token (0.4).
 	env, err := NewMessageEnvelope(Party{Session: "chatops"}, h.taskID, "ctx-"+h.taskID, correlationID,
-		validMessagePayload())
+		validMessagePayload(), WithTo(Party{Session: h.addressee}))
 	if err != nil {
 		h.t.Fatalf("build submission: %v", err)
 	}
-	if err := h.requester.Publish(h.ctx, TaskInSubject(h.taskID), env); err != nil {
+	if err := h.requester.Publish(h.ctx, TaskInSubject(h.addressee, h.taskID), env); err != nil {
 		h.t.Fatalf("publish submission: %v", err)
 	}
 	waitFor(h.t, 5e9, "submission delivery", func() bool { return h.inbox.count() >= 1 })
 	origin := h.inbox.all()[0]
-	exec, err := h.executor.NewTaskExecution(origin, Party{Session: "worker-" + h.taskID, AgentType: "claude-code"})
+	exec, err := h.executor.NewTaskExecution(origin, Party{Session: h.addressee, AgentType: "claude-code"}, h.addressee)
 	if err != nil {
 		h.t.Fatalf("NewTaskExecution: %v", err)
 	}
 	h.exec = exec
+	h.origin = origin
 }
 
 // followUp publishes a follow-up message on the same taskId and waits for the
@@ -79,12 +85,16 @@ func (h *taskHarness) followUp(text string) {
 	h.t.Helper()
 	before := h.inbox.count()
 	payload := fmt.Sprintf(`{"role": "user", "parts": [{"kind": "text", "text": %q}], "messageId": "m-%d"}`, text, before)
-	env, err := NewMessageEnvelope(Party{Session: "chatops"}, h.taskID, "ctx-"+h.taskID, "corr-lc",
-		json.RawMessage(payload))
+	// Follow-ups and steers reuse the task's original correlationId (0.4
+	// field rule); the helper encodes it.
+	env, err := NewFollowUpEnvelope(h.origin, Party{Session: "chatops"}, json.RawMessage(payload))
 	if err != nil {
 		h.t.Fatalf("build follow-up: %v", err)
 	}
-	if err := h.requester.Publish(h.ctx, TaskInSubject(h.taskID), env); err != nil {
+	if env.CorrelationID != h.origin.CorrelationID {
+		h.t.Fatalf("follow-up correlationId = %q, want the task's original %q", env.CorrelationID, h.origin.CorrelationID)
+	}
+	if err := h.requester.Publish(h.ctx, TaskInSubject(h.addressee, h.taskID), env); err != nil {
 		h.t.Fatalf("publish follow-up: %v", err)
 	}
 	waitFor(h.t, 5e9, "follow-up delivery", func() bool { return h.inbox.count() > before })
@@ -111,7 +121,7 @@ func (h *taskHarness) artifact(name, text string) {
 
 func (h *taskHarness) get() *Task {
 	h.t.Helper()
-	task, err := h.requester.TasksGet(h.ctx, h.taskID)
+	task, err := h.requester.TasksGet(h.ctx, h.addressee, h.taskID)
 	if err != nil {
 		h.t.Fatalf("TasksGet: %v", err)
 	}
@@ -176,7 +186,7 @@ func TestAssertion13_CancelTerminal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := h.requester.Publish(h.ctx, TaskInSubject(h.taskID), cancel); err != nil {
+		if err := h.requester.Publish(h.ctx, TaskInSubject(h.addressee, h.taskID), cancel); err != nil {
 			t.Fatalf("publish cancel: %v", err)
 		}
 		waitFor(t, 5e9, "cancel delivery", func() bool {
@@ -207,7 +217,7 @@ func TestAssertion13_CancelTerminal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := h.requester.Publish(h.ctx, TaskInSubject(h.taskID), cancel); err != nil {
+		if err := h.requester.Publish(h.ctx, TaskInSubject(h.addressee, h.taskID), cancel); err != nil {
 			t.Fatalf("publish cancel: %v", err)
 		}
 		// The cancel still reaches the executor - losing the race means the
@@ -238,7 +248,7 @@ func TestAssertion14_CorrelationPreserved(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a14"})
+	exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a14"}, "worker-a14")
 	if err != nil {
 		t.Fatalf("NewTaskExecution: %v", err)
 	}
@@ -259,6 +269,19 @@ func TestAssertion14_CorrelationPreserved(t *testing.T) {
 	if child.CorrelationID != origin.CorrelationID {
 		t.Errorf("child correlationId = %q, want parent's %q", child.CorrelationID, origin.CorrelationID)
 	}
+
+	// 0.4 tightening: a follow-up or steer reuses the task's original
+	// correlationId, never a re-mint.
+	followUp, err := NewFollowUpEnvelope(origin, Party{Session: "chatops"}, validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if followUp.CorrelationID != origin.CorrelationID {
+		t.Errorf("follow-up correlationId = %q, want the task's original %q", followUp.CorrelationID, origin.CorrelationID)
+	}
+	if followUp.TaskID != origin.TaskID || followUp.ContextID != origin.ContextID {
+		t.Errorf("follow-up ids = %q/%q, want origin's %q/%q", followUp.TaskID, followUp.ContextID, origin.TaskID, origin.ContextID)
+	}
 }
 
 // Assertion 15: every event a task emits carries the taskId and correlationId
@@ -269,7 +292,7 @@ func TestAssertion15_EventsCarryIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a15"})
+	exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a15"}, "worker-a15")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +330,7 @@ func TestAssertion18_ReservedArtifacts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a18"})
+		exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a18"}, "worker-a18")
 		if err != nil {
 			t.Fatal(err)
 		}

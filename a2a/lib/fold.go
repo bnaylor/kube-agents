@@ -109,9 +109,9 @@ func (t *Task) mergeArtifact(u ArtifactUpdate) {
 // TasksGet replays the task's events subject from sequence 1 on an ephemeral
 // ordered consumer and folds the result — the durability payoff: no live
 // executor required.
-func (c *Client) TasksGet(ctx context.Context, taskID string) (*Task, error) {
+func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task, error) {
 	_, js := c.conn()
-	subject := TaskEventsSubject(taskID)
+	subject := TaskEventsSubject(addressee, taskID)
 	stream, err := js.Stream(ctx, TasksStream)
 	if err != nil {
 		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
@@ -165,6 +165,8 @@ func (c *Client) TasksGet(ctx context.Context, taskID string) (*Task, error) {
 			c.log.Error("a2a replay skipping unparseable event", "subject", subject, "err", err)
 		} else if env.Kind != KindStatusUpdate && env.Kind != KindArtifactUpdate {
 			c.log.Error("a2a replay skipping non-event kind", "subject", subject, "kind", env.Kind)
+		} else if env.To != nil && env.To.Session != addressee {
+			c.log.Error("a2a replay skipping to/addressee mismatch", "subject", subject, "to", env.To.Session)
 		} else {
 			events = append(events, env)
 		}

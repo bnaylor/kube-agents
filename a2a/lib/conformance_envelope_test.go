@@ -28,7 +28,7 @@ func validMessagePayload() json.RawMessage {
 
 func validEnvelopeJSON(mutate func(map[string]any)) []byte {
 	m := map[string]any{
-		"protocol":      "a2a-jetstream/0.3",
+		"protocol":      "a2a-jetstream/0.4",
 		"envelopeId":    "env-1",
 		"correlationId": "corr-1",
 		"taskId":        "task-1",

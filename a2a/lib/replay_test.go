@@ -17,6 +17,8 @@ import (
 )
 
 // replayFixture publishes n status events for taskID and returns the client.
+func replayAddressee(taskID string) string { return "worker-" + taskID }
+
 func replayFixture(t *testing.T, url, taskID string, states []TaskState) *Client {
 	t.Helper()
 	ctx := testCtx(t)
@@ -30,7 +32,7 @@ func replayFixture(t *testing.T, url, taskID string, states []TaskState) *Client
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec, err := c.NewTaskExecution(origin, Party{Session: "worker-" + taskID})
+	exec, err := c.NewTaskExecution(origin, Party{Session: "worker-" + taskID}, replayAddressee(taskID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +82,7 @@ func TestTasksGet_HorizonDeleted(t *testing.T) {
 
 	// TasksGet snapshots the horizon from the stream itself, so delete the
 	// last event first: the replay must then finish on pending-exhaustion.
-	deleteLastMsg(t, clientURL(s), TasksStream, TaskEventsSubject("task-hd"))
+	deleteLastMsg(t, clientURL(s), TasksStream, TaskEventsSubject(replayAddressee("task-hd"), "task-hd"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -88,7 +90,7 @@ func TestTasksGet_HorizonDeleted(t *testing.T) {
 	var task *Task
 	var err error
 	go func() {
-		task, err = c.TasksGet(ctx, "task-hd")
+		task, err = c.TasksGet(ctx, replayAddressee("task-hd"), "task-hd")
 		close(done)
 	}()
 	select {
@@ -115,7 +117,7 @@ func TestTasksGet_ContextCanceled(t *testing.T) {
 	cancel() // already canceled: replay must not deliver anything or hang
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.TasksGet(ctx, "task-cc")
+		_, err := c.TasksGet(ctx, replayAddressee("task-cc"), "task-cc")
 		done <- err
 	}()
 	select {
@@ -138,7 +140,7 @@ func TestTasksGet_SkipsPoisonEvents(t *testing.T) {
 	provisionTasksStream(t, clientURL(s))
 	c := replayFixture(t, clientURL(s), "task-po", []TaskState{StateSubmitted, StateWorking})
 
-	events := TaskEventsSubject("task-po")
+	events := TaskEventsSubject(replayAddressee("task-po"), "task-po")
 	publishRaw(t, clientURL(s), events, []byte(`this is not json`))
 	// A validly-enveloped kind that does not belong on an events subject.
 	stray, err := NewMessageEnvelope(Party{Session: "intruder"}, "task-po", "ctx-task-po", "corr-x",
@@ -155,7 +157,7 @@ func TestTasksGet_SkipsPoisonEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec, err := c.NewTaskExecution(origin, Party{Session: "worker-task-po"})
+	exec, err := c.NewTaskExecution(origin, Party{Session: "worker-task-po"}, replayAddressee("task-po"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +170,7 @@ func TestTasksGet_SkipsPoisonEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	task, err := c.TasksGet(ctx, "task-po")
+	task, err := c.TasksGet(ctx, replayAddressee("task-po"), "task-po")
 	if err != nil {
 		t.Fatalf("TasksGet with poison on the subject: %v", err)
 	}
@@ -190,7 +192,7 @@ func TestTasksGet_UnknownTask(t *testing.T) {
 	}
 	defer c.Close()
 
-	_, err = c.TasksGet(ctx, "task-never-existed")
+	_, err = c.TasksGet(ctx, "nobody", "task-never-existed")
 	var a2aErr *A2AError
 	if !errors.As(err, &a2aErr) || a2aErr.Code != CodeTaskNotFound {
 		t.Fatalf("want A2AError TaskNotFound(%d), got %v", CodeTaskNotFound, err)
@@ -205,7 +207,7 @@ func TestFoldTask_PayloadTaskIDMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "w"})
+	exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "w"}, "worker-mm")
 	if err != nil {
 		t.Fatal(err)
 	}

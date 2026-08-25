@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,20 +15,41 @@ import (
 )
 
 // TaskInSubject is where a requester publishes message and cancel envelopes
-// for a task.
-func TaskInSubject(taskID string) string {
-	return fmt.Sprintf("a2a.tasks.%s.in", taskID)
+// for a task. The addressee token — the executor's profile or session name,
+// added in 0.4 — is the authorization seam: it is what makes connection-time
+// grants expressible on the task plane.
+func TaskInSubject(addressee, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.in", addressee, taskID)
 }
 
 // TaskEventsSubject is where the executor publishes status and artifact
 // updates for a task.
-func TaskEventsSubject(taskID string) string {
-	return fmt.Sprintf("a2a.tasks.%s.events", taskID)
+func TaskEventsSubject(addressee, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.events", addressee, taskID)
 }
 
-// AgentSubject carries an agent's card and its shutdown tombstone.
-func AgentSubject(session string) string {
-	return fmt.Sprintf("a2a.agents.%s", session)
+// AgentSubject carries a profile's agent-card, published by the profile's
+// owner when the profile is created (not by workers), and the agent-closed
+// tombstone on profile deletion. Chat sessions publish no card.
+func AgentSubject(profile string) string {
+	return fmt.Sprintf("a2a.agents.%s", profile)
+}
+
+// ParseTaskSubject splits a task subject into its addressee, taskId, and
+// class ("in" or "events"). ok is false for any other subject shape.
+func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool) {
+	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
+	if !found {
+		return "", "", "", false
+	}
+	parts := strings.Split(rest, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return "", "", "", false
+	}
+	if parts[2] != "in" && parts[2] != "events" {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
 }
 
 // rebuildRetryWait paces the terminal-close rebuild loop while the server is
@@ -272,6 +294,11 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	if err := env.ValidateEmit(); err != nil {
 		return err
 	}
+	// 0.4: the envelope's to MUST agree with the subject's addressee token; a
+	// mismatch is a protocol error, refused at the source.
+	if addressee, _, _, ok := ParseTaskSubject(subject); ok && env.To != nil && env.To.Session != addressee {
+		return &ProtocolError{Msg: fmt.Sprintf("envelope to %q disagrees with subject addressee %q", env.To.Session, addressee)}
+	}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
@@ -387,8 +414,17 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		_ = msg.Term()
 		return
 	}
+	// Assertion 4 (0.4 clause): an envelope whose to disagrees with its
+	// subject's addressee token is a protocol error — surfaced and terminated
+	// like any poison, never passed through to the application.
+	if addressee, _, _, ok := ParseTaskSubject(msg.Subject()); ok && env.To != nil && env.To.Session != addressee {
+		s.c.log.Error("a2a envelope rejected", "subject", msg.Subject(),
+			"err", fmt.Sprintf("to %q disagrees with subject addressee %q", env.To.Session, addressee))
+		_ = msg.Term()
+		return
+	}
 	// Assertion 4: a wildcard consumer ignores envelopes addressed elsewhere.
-	if env.To != nil && s.cfg.Session != "" && env.To.Session != s.cfg.Session {
+	if env.To != nil && env.To.Session != s.cfg.Session {
 		_ = msg.Ack()
 		return
 	}

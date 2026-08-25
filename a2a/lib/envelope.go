@@ -1,4 +1,4 @@
-// Package lib implements the a2a-jetstream/0.3 client library: the envelope,
+// Package lib implements the a2a-jetstream/0.4 client library: the envelope,
 // the A2A payload layer, and the JetStream transport with the NR resilience
 // contract. Spec: docs/designs/spec-a2a-payloads.md and the client-resilience
 // section of docs/designs/spec-nats-deployment.md.
@@ -16,7 +16,7 @@ import (
 )
 
 // Protocol is the wire protocol this library speaks.
-const Protocol = "a2a-jetstream/0.3"
+const Protocol = "a2a-jetstream/0.4"
 
 // protocolMajor is the one major this library accepts. Consumers MUST reject
 // unknown majors and ignore unknown envelope fields within a major.
@@ -256,4 +256,12 @@ func NewTopicUpdateEnvelope(from Party, taskID, contextID, correlationID string,
 // verbatim — never re-minted by an intermediary.
 func NewChildTaskEnvelope(parent *Envelope, from Party, taskID, contextID string, payload json.RawMessage, opts ...EnvelopeOption) (*Envelope, error) {
 	return NewMessageEnvelope(from, taskID, contextID, parent.CorrelationID, payload, opts...)
+}
+
+// NewFollowUpEnvelope builds a follow-up or steering message for a running
+// task: same taskId and contextId, and the task's original correlationId —
+// a steer is attributed by its own envelope and authority block, never by a
+// new correlation (0.4 field rule).
+func NewFollowUpEnvelope(origin *Envelope, from Party, payload json.RawMessage, opts ...EnvelopeOption) (*Envelope, error) {
+	return NewMessageEnvelope(from, origin.TaskID, origin.ContextID, origin.CorrelationID, payload, opts...)
 }

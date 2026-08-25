@@ -55,7 +55,7 @@ func TestAssertion03_PassthroughBus(t *testing.T) {
 	col := &collector{}
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.task-pt.in",
+		Subject: TaskInSubject("chatops", "task-pt"),
 		Durable: "pt-consumer",
 		Session: "chatops",
 	}, col.handle)
@@ -73,7 +73,7 @@ func TestAssertion03_PassthroughBus(t *testing.T) {
 	// Splice raw identity/authority bytes in without normalizing them.
 	raw = bytes.Replace(raw, []byte(`"identity":null`), []byte(`"identity":`+identity), 1)
 	raw = bytes.Replace(raw, []byte(`"authority":null`), []byte(`"authority":`+authority), 1)
-	publishRaw(t, clientURL(s), "a2a.tasks.task-pt.in", raw)
+	publishRaw(t, clientURL(s), TaskInSubject("chatops", "task-pt"), raw)
 
 	waitFor(t, 5e9, "envelope delivery", func() bool { return col.count() == 1 })
 	env := col.all()[0]
@@ -101,7 +101,7 @@ func TestAssertion04_ToFiltering(t *testing.T) {
 	col := &collector{}
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.*.in",
+		Subject: "a2a.tasks.*.*.in",
 		Durable: "to-consumer",
 		Session: "chatops",
 	}, col.handle)
@@ -110,18 +110,18 @@ func TestAssertion04_ToFiltering(t *testing.T) {
 	}
 
 	from := Party{Session: "worker-brisk-otter"}
-	pub := func(taskID string, opts ...EnvelopeOption) {
+	pub := func(addressee, taskID string, opts ...EnvelopeOption) {
 		env, err := NewMessageEnvelope(from, taskID, "ctx-1", "corr-1", validMessagePayload(), opts...)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
-		if err := c.Publish(ctx, TaskInSubject(taskID), env); err != nil {
+		if err := c.Publish(ctx, TaskInSubject(addressee, taskID), env); err != nil {
 			t.Fatalf("publish: %v", err)
 		}
 	}
-	pub("t-broadcast")                                        // no to: delivered
-	pub("t-elsewhere", WithTo(Party{Session: "other-place"})) // ignored
-	pub("t-mine", WithTo(Party{Session: "chatops"}))          // delivered
+	pub("somebody", "t-broadcast")                                           // no to: delivered
+	pub("other-place", "t-elsewhere", WithTo(Party{Session: "other-place"})) // to agrees with subject, names another session: ignored
+	pub("chatops", "t-mine", WithTo(Party{Session: "chatops"}))              // delivered
 
 	waitFor(t, 5e9, "two deliveries", func() bool { return col.count() >= 2 })
 	got := map[string]bool{}
@@ -152,7 +152,7 @@ func TestAssertion05_Dedup(t *testing.T) {
 	col := &collector{}
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.task-dd.in",
+		Subject: TaskInSubject("chatops", "task-dd"),
 		Durable: "dd-consumer",
 		Session: "chatops",
 	}, col.handle)
@@ -171,8 +171,8 @@ func TestAssertion05_Dedup(t *testing.T) {
 	}
 	// The same envelope hitting the subject twice is what JetStream redelivery
 	// looks like to the application layer.
-	publishRaw(t, clientURL(s), "a2a.tasks.task-dd.in", raw)
-	publishRaw(t, clientURL(s), "a2a.tasks.task-dd.in", raw)
+	publishRaw(t, clientURL(s), TaskInSubject("chatops", "task-dd"), raw)
+	publishRaw(t, clientURL(s), TaskInSubject("chatops", "task-dd"), raw)
 	// A distinct envelope proves delivery still flows after the duplicate.
 	env2, err := NewMessageEnvelope(Party{Session: "w"}, "task-dd", "ctx-1", "corr-1",
 		validMessagePayload(), WithEnvelopeID("env-dup-2"))
@@ -180,7 +180,7 @@ func TestAssertion05_Dedup(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw2, _ := json.Marshal(env2)
-	publishRaw(t, clientURL(s), "a2a.tasks.task-dd.in", raw2)
+	publishRaw(t, clientURL(s), TaskInSubject("chatops", "task-dd"), raw2)
 
 	waitFor(t, 5e9, "post-duplicate delivery", func() bool {
 		for _, e := range col.all() {
@@ -223,7 +223,7 @@ func TestAssertion08_MaxMessageSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	err = c.Publish(ctx, TaskInSubject("task-big"), env)
+	err = c.Publish(ctx, TaskInSubject("w-exec", "task-big"), env)
 	var a2aErr *A2AError
 	if !errors.As(err, &a2aErr) {
 		t.Fatalf("oversize publish: want A2AError, got %v", err)
@@ -283,7 +283,7 @@ func TestAssertion08_HeaderWidthWindow(t *testing.T) {
 		t.Fatalf("sizing pass built %d bytes; need within (%d, %d]", size, maxPayload-overhead, maxPayload)
 	}
 
-	err = c.Publish(ctx, TaskInSubject("task-win"), env)
+	err = c.Publish(ctx, TaskInSubject("w-exec", "task-win"), env)
 	var a2aErr *A2AError
 	if !errors.As(err, &a2aErr) {
 		t.Fatalf("in-window oversize publish: want A2AError, got %v", err)
@@ -306,10 +306,80 @@ func TestSubscribeDurable_RequiresSession(t *testing.T) {
 	defer c.Close()
 	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
 		Stream:  "TASKS",
-		Subject: "a2a.tasks.task-ns.in",
+		Subject: TaskInSubject("w-exec", "task-ns"),
 		Durable: "ns-consumer",
 	}, func(*Envelope) {})
 	if err == nil {
 		t.Fatal("SubscribeDurable accepted a config without Session")
 	}
+}
+
+// Assertion 4 (0.4 clause): an envelope whose to disagrees with its subject's
+// addressee token is a protocol error, surfaced not passed through - refused
+// at emit on the library's publish path, and terminated (never delivered) when
+// a foreign publisher injects it.
+func TestAssertion04_ToAddresseeAgreement(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	ctx := testCtx(t)
+
+	c, err := Connect(ctx, clientURL(s), WithName("test-agree"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	t.Run("emit_mismatch_refused", func(t *testing.T) {
+		env, err := NewMessageEnvelope(Party{Session: "chatops"}, "task-agree", "ctx-1", "corr-1",
+			validMessagePayload(), WithTo(Party{Session: "worker-a"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = c.Publish(ctx, TaskInSubject("worker-b", "task-agree"), env)
+		var perr *ProtocolError
+		if !errors.As(err, &perr) {
+			t.Fatalf("mismatched publish: want ProtocolError, got %v", err)
+		}
+		if n := streamMsgCount(t, clientURL(s), "TASKS"); n != 0 {
+			t.Errorf("stream holds %d messages; the mismatch must be refused before publish", n)
+		}
+	})
+
+	t.Run("inbound_mismatch_surfaced_not_delivered", func(t *testing.T) {
+		col := &collector{}
+		_, err := c.SubscribeDurable(ctx, SubscribeConfig{
+			Stream:  "TASKS",
+			Subject: TaskInSubject("worker-x", "task-agr2"),
+			Durable: "agree-consumer",
+			Session: "worker-x",
+		}, col.handle)
+		if err != nil {
+			t.Fatalf("SubscribeDurable: %v", err)
+		}
+		// A foreign publisher forges to naming another executor on worker-x's
+		// subject.
+		forged, err := NewMessageEnvelope(Party{Session: "intruder"}, "task-agr2", "ctx-1", "corr-1",
+			validMessagePayload(), WithTo(Party{Session: "somewhere-else"}), WithEnvelopeID("env-forged"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		forgedRaw, _ := json.Marshal(forged)
+		publishRaw(t, clientURL(s), TaskInSubject("worker-x", "task-agr2"), forgedRaw)
+		// A clean envelope after it proves the consumer is alive and the
+		// forged one was terminated, not queued.
+		clean, err := NewMessageEnvelope(Party{Session: "chatops"}, "task-agr2", "ctx-1", "corr-1",
+			validMessagePayload(), WithTo(Party{Session: "worker-x"}), WithEnvelopeID("env-clean"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Publish(ctx, TaskInSubject("worker-x", "task-agr2"), clean); err != nil {
+			t.Fatalf("publish clean: %v", err)
+		}
+		waitFor(t, 5e9, "clean delivery", func() bool { return col.count() >= 1 })
+		for _, e := range col.all() {
+			if e.EnvelopeID == "env-forged" {
+				t.Error("forged to/addressee mismatch reached the application")
+			}
+		}
+	})
 }
