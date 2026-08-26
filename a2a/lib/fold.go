@@ -23,6 +23,11 @@ type Task struct {
 	Final         bool
 	StatusHistory []TaskState
 	Artifacts     []Artifact
+	// PostFinalDropped counts events that arrived after the final event and
+	// were dropped from the fold (assertion 10): surfaced as a warning and a
+	// metric by the caller, never allowed to disturb the terminal state or
+	// kill the fold.
+	PostFinalDropped int
 }
 
 // Artifact returns the merged artifact with the given name, or nil.
@@ -36,8 +41,9 @@ func (t *Task) Artifact(name string) *Artifact {
 }
 
 // FoldTask folds a task's events (status-update and artifact-update
-// envelopes, in stream order) into a Task. An event after the final one is a
-// protocol error, surfaced, not ignored.
+// envelopes, in stream order) into a Task. Events after the final one are
+// dropped and counted in PostFinalDropped (assertion 10) — the caller
+// surfaces them as a warning and a metric; the fold survives.
 func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 	task := &Task{ID: taskID}
 	for _, env := range events {
@@ -45,7 +51,12 @@ func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 			return nil, &ProtocolError{Msg: fmt.Sprintf("event for task %q on task %q's stream", env.TaskID, taskID)}
 		}
 		if task.Final {
-			return nil, &ProtocolError{Msg: fmt.Sprintf("event %s after final event on task %q", env.EnvelopeID, taskID)}
+			// Assertion 10: nothing follows the final event. The violation is
+			// surfaced (warning + metric, by the caller) and the event
+			// dropped; the fold survives - a hostile post-final write must
+			// not revoke tasks/get.
+			task.PostFinalDropped++
+			continue
 		}
 		if task.CorrelationID == "" {
 			task.CorrelationID = env.CorrelationID
@@ -177,7 +188,16 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			break
 		}
 	}
-	return FoldTask(taskID, events)
+	task, err := FoldTask(taskID, events)
+	if err != nil {
+		return nil, err
+	}
+	if task.PostFinalDropped > 0 {
+		c.protocolViolations.Add(int64(task.PostFinalDropped))
+		c.log.Warn("a2a events after final dropped from fold",
+			"task", taskID, "dropped", task.PostFinalDropped)
+	}
+	return task, nil
 }
 
 // ValidateArtifacts enforces assertion 18: a completed task carries at least

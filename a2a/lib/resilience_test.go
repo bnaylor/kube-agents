@@ -302,3 +302,48 @@ func TestNR2_RebuildRetriesSubscribe(t *testing.T) {
 	}
 	waitFor(t, 15e9, "delivery after recovery", func() bool { return col.count() == 1 })
 }
+
+// NR-6: randomized exponential backoff with full jitter on all connection and
+// reconnection attempts - a restart must not turn every client into one
+// synchronized thundering herd.
+func TestNR6_JitteredBackoff(t *testing.T) {
+	t.Run("registered_on_connection", func(t *testing.T) {
+		s := startServer(t)
+		ctx := testCtx(t)
+		c, err := Connect(ctx, clientURL(s), WithName("nr6"))
+		if err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer c.Close()
+		nc, _ := c.conn()
+		if nc.Opts.CustomReconnectDelayCB == nil {
+			t.Error("custom reconnect delay (jittered backoff) not registered")
+		}
+	})
+
+	t.Run("attempts_spread_not_aligned", func(t *testing.T) {
+		const attempt = 4
+		seen := map[time.Duration]int{}
+		for i := 0; i < 64; i++ {
+			d := fullJitterBackoff(attempt)
+			if d < 0 || d >= backoffCap {
+				t.Fatalf("backoff(%d) = %v, outside [0, %v)", attempt, d, backoffCap)
+			}
+			if ceil := backoffBase << (attempt - 1); d >= ceil && ceil < backoffCap {
+				t.Fatalf("backoff(%d) = %v, above the exponential ceiling %v", attempt, d, ceil)
+			}
+			seen[d]++
+		}
+		if len(seen) < 8 {
+			t.Errorf("64 samples produced only %d distinct delays; full jitter must spread, not align", len(seen))
+		}
+	})
+
+	t.Run("large_attempt_capped_no_overflow", func(t *testing.T) {
+		for i := 0; i < 32; i++ {
+			if d := fullJitterBackoff(200); d < 0 || d >= backoffCap {
+				t.Fatalf("backoff(200) = %v, outside [0, %v)", d, backoffCap)
+			}
+		}
+	})
+}

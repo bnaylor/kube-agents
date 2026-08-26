@@ -407,3 +407,78 @@ func TestAssertion18_ReservedArtifacts(t *testing.T) {
 		})
 	}
 }
+
+// Assertion 10: exactly one event has final: true and its state is terminal;
+// an event after it is surfaced - structured warning plus a metric, event
+// dropped - and the consumer loop survives. A hostile post-final write must
+// not brick tasks/get (the fold keeps the real terminal state).
+func TestAssertion10_FinalIsFinal(t *testing.T) {
+	t.Run("post_final_events_dropped_from_fold", func(t *testing.T) {
+		origin, err := NewMessageEnvelope(Party{Session: "chatops"}, "task-a10", "ctx-a10", "corr-a10",
+			validMessagePayload())
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec, err := (&Client{}).NewTaskExecution(origin, Party{Session: "worker-a10"}, "worker-a10")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mk := func(state TaskState, final bool) *Envelope {
+			e, err := exec.StatusEnvelope(state, final)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return e
+		}
+		art, err := exec.ArtifactEnvelope(Artifact{ArtifactID: "r", Name: ArtifactResult,
+			Parts: []Part{{Kind: "text", Text: "the real result"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		late, err := exec.ArtifactEnvelope(Artifact{ArtifactID: "x", Name: "late-noise",
+			Parts: []Part{{Kind: "text", Text: "after final"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := []*Envelope{
+			mk(StateSubmitted, false), mk(StateWorking, false), art,
+			mk(StateCompleted, true),
+			mk(StateWorking, false), late, // both arrive after final
+		}
+		task, err := FoldTask("task-a10", events)
+		if err != nil {
+			t.Fatalf("FoldTask must survive post-final events: %v", err)
+		}
+		if task.State != StateCompleted || !task.Final {
+			t.Errorf("task = %s final=%v; post-final events must not disturb the terminal state", task.State, task.Final)
+		}
+		if task.PostFinalDropped != 2 {
+			t.Errorf("PostFinalDropped = %d, want 2", task.PostFinalDropped)
+		}
+		if task.Artifact("late-noise") != nil {
+			t.Error("post-final artifact folded in; it must be dropped")
+		}
+	})
+
+	t.Run("live_replay_survives_and_counts", func(t *testing.T) {
+		s := startServer(t)
+		provisionTasksStream(t, clientURL(s))
+		h := newTaskHarness(t, clientURL(s), "task-a10b")
+		h.submit("corr-a10b")
+		h.status(StateSubmitted, false)
+		h.artifact(ArtifactResult, "done")
+		h.status(StateCompleted, true)
+		h.status(StateWorking, false) // hostile or buggy post-final write
+
+		task := h.get()
+		if task.State != StateCompleted || !task.Final {
+			t.Errorf("task = %s final=%v, want completed final=true", task.State, task.Final)
+		}
+		if task.PostFinalDropped != 1 {
+			t.Errorf("PostFinalDropped = %d, want 1", task.PostFinalDropped)
+		}
+		if h.requester.ProtocolViolations() == 0 {
+			t.Error("post-final drop must increment the protocol-violations metric")
+		}
+	})
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,9 +53,27 @@ func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool)
 	return parts[0], parts[1], parts[2], true
 }
 
-// rebuildRetryWait paces the terminal-close rebuild loop while the server is
-// unreachable.
-const rebuildRetryWait = 500 * time.Millisecond
+// NR-6 backoff shape: full jitter over an exponential ceiling. Dev defaults;
+// a restart must spread the herd, not synchronize it.
+const (
+	backoffBase = 200 * time.Millisecond
+	backoffCap  = 5 * time.Second
+)
+
+// fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
+// base*2^(attempt-1))) - AWS-style full jitter (NR-6).
+func fullJitterBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	ceil := backoffCap
+	if attempt-1 < 30 {
+		if d := backoffBase << (attempt - 1); d < backoffCap {
+			ceil = d
+		}
+	}
+	return rand.N(ceil)
+}
 
 // msgIDHeaderOverhead is the wire cost of the Nats-Msg-Id header beyond the
 // id itself: "NATS/1.0\r\n" + "Nats-Msg-Id: " + "\r\n\r\n".
@@ -80,6 +99,15 @@ type Client struct {
 	// rebuilds counts terminal-close recoveries (NR-2); exposed for tests and
 	// health.
 	rebuilds atomic.Int64
+	// protocolViolations counts surfaced-and-dropped protocol errors (poison
+	// envelopes, to/addressee mismatches, post-final events).
+	protocolViolations atomic.Int64
+}
+
+// ProtocolViolations reports how many protocol errors this client has
+// surfaced and dropped - the assertion-10 metric.
+func (c *Client) ProtocolViolations() int64 {
+	return c.protocolViolations.Load()
 }
 
 // ClientOption configures Connect.
@@ -140,6 +168,11 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	}
 	opts = append(opts, c.opts.natsOpts...)
 	opts = append(opts,
+		// NR-6: jittered backoff on every reconnection attempt, library-owned
+		// like the callbacks below.
+		nats.CustomReconnectDelay(func(attempts int) time.Duration {
+			return fullJitterBackoff(attempts)
+		}),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			// Transient (NR-1): nats.go reconnects; tear nothing down.
 			if c.closing.Load() {
@@ -197,14 +230,16 @@ func (c *Client) rebuild() {
 	c.rebuildMu.Lock()
 	defer c.rebuildMu.Unlock()
 	c.log.Warn("nats terminal close: rebuilding connection")
+	dialAttempt := 0
 	for {
 		if c.closing.Load() {
 			return
 		}
 		nc, js, err := c.dial()
 		if err != nil {
+			dialAttempt++
 			c.log.Error("nats rebuild dial failed; retrying", "err", err)
-			time.Sleep(rebuildRetryWait)
+			time.Sleep(fullJitterBackoff(dialAttempt))
 			continue
 		}
 		c.mu.Lock()
@@ -237,6 +272,7 @@ func (c *Client) rebuild() {
 // re-subscribed.
 func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nats.Conn) bool {
 	pending := subs
+	attempt := 0
 	for len(pending) > 0 {
 		if c.closing.Load() {
 			return false
@@ -260,7 +296,8 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 			break
 		}
 		pending = failed
-		time.Sleep(rebuildRetryWait)
+		attempt++
+		time.Sleep(fullJitterBackoff(attempt))
 	}
 	return !nc.IsClosed()
 }
@@ -295,9 +332,16 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 		return err
 	}
 	// 0.4: the envelope's to MUST agree with the subject's addressee token; a
-	// mismatch is a protocol error, refused at the source.
-	if addressee, _, _, ok := ParseTaskSubject(subject); ok && env.To != nil && env.To.Session != addressee {
-		return &ProtocolError{Msg: fmt.Sprintf("envelope to %q disagrees with subject addressee %q", env.To.Session, addressee)}
+	// mismatch is a protocol error, refused at the source. Task-subject tokens
+	// must also be dot-free DNS-1123 labels - dots change the token count.
+	if strings.HasPrefix(subject, "a2a.tasks.") {
+		addressee, taskID, _, ok := ParseTaskSubject(subject)
+		if !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
+			return &ProtocolError{Msg: fmt.Sprintf("malformed task subject %q: addressee and taskId must be dot-free DNS-1123 labels", subject)}
+		}
+		if env.To != nil && env.To.Session != addressee {
+			return &ProtocolError{Msg: fmt.Sprintf("envelope to %q disagrees with subject addressee %q", env.To.Session, addressee)}
+		}
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
@@ -410,6 +454,7 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 	env, err := ParseEnvelope(msg.Data())
 	if err != nil {
 		// Poison messages are surfaced and terminated, not redelivered forever.
+		s.c.protocolViolations.Add(1)
 		s.c.log.Error("a2a envelope rejected", "subject", msg.Subject(), "err", err)
 		_ = msg.Term()
 		return
@@ -418,6 +463,7 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 	// subject's addressee token is a protocol error — surfaced and terminated
 	// like any poison, never passed through to the application.
 	if addressee, _, _, ok := ParseTaskSubject(msg.Subject()); ok && env.To != nil && env.To.Session != addressee {
+		s.c.protocolViolations.Add(1)
 		s.c.log.Error("a2a envelope rejected", "subject", msg.Subject(),
 			"err", fmt.Sprintf("to %q disagrees with subject addressee %q", env.To.Session, addressee))
 		_ = msg.Term()

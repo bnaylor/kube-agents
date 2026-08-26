@@ -113,6 +113,29 @@ func isJSONNull(raw json.RawMessage) bool {
 	return raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
+// validDNS1123Label reports whether s is a legal subject token: DNS-1123
+// label shape - lowercase alphanumerics and '-', alphanumeric at both ends,
+// at most 63 bytes. Dots are NATS token separators, so a dotted addressee or
+// taskId changes the subject's token count under every wildcard filter.
+func validDNS1123Label(s string) bool {
+	if len(s) == 0 || len(s) > 63 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-':
+			if i == 0 || i == len(s)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // taskScoped reports whether taskId/contextId are required for the kind.
 func taskScoped(k Kind) bool {
 	switch k {
@@ -157,6 +180,9 @@ func (e *Envelope) validateCommon() error {
 	if taskScoped(e.Kind) {
 		if e.TaskID == "" {
 			return &ProtocolError{Msg: fmt.Sprintf("kind %q requires taskId", e.Kind)}
+		}
+		if !validDNS1123Label(e.TaskID) {
+			return &ProtocolError{Msg: fmt.Sprintf("taskId %q is not a dot-free DNS-1123 label; it is a subject token", e.TaskID)}
 		}
 		if e.ContextID == "" {
 			return &ProtocolError{Msg: fmt.Sprintf("kind %q requires contextId", e.Kind)}

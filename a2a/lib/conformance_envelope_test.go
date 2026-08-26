@@ -147,6 +147,10 @@ func TestAssertion02_RequiredFields(t *testing.T) {
 		{"missing_kind", func(e *Envelope) { e.Kind = "" }},
 		{"message_missing_taskId", func(e *Envelope) { e.TaskID = "" }},
 		{"message_missing_contextId", func(e *Envelope) { e.ContextID = "" }},
+		// Dot-free clause: taskId is a subject token; a dot changes the
+		// subject's token count under every wildcard filter.
+		{"dotted_taskId", func(e *Envelope) { e.TaskID = "task.7" }},
+		{"non_dns1123_taskId", func(e *Envelope) { e.TaskID = "Task_7" }},
 	}
 	for _, tc := range missing {
 		t.Run(tc.name, func(t *testing.T) {
