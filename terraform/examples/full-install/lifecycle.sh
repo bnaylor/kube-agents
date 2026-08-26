@@ -221,6 +221,10 @@ adopt_kms() {
     )
   fi
 
+  # Both KMS features off leaves targets empty, and macOS's bash 3.2 treats an
+  # empty array expansion as unbound under `set -u` — return before it does.
+  [[ ${#targets[@]} -eq 0 ]] && return 0
+
   local adopted=0 address kind id
   for target in "${targets[@]}"; do
     IFS=$'\t' read -r address kind id <<<"$target"
