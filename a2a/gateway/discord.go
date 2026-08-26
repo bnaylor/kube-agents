@@ -73,7 +73,12 @@ func (d *DiscordAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 	if err := d.s.Open(); err != nil {
 		return fmt.Errorf("discord open: %w", err)
 	}
-	d.log.Info("discord connected", "user", d.s.State.User.Username)
+	// Open can succeed without a READY packet, leaving State.User nil.
+	user := "(identity pending)"
+	if d.s.State.User != nil {
+		user = d.s.State.User.Username
+	}
+	d.log.Info("discord connected", "user", user)
 	<-ctx.Done()
 	return d.s.Close()
 }
@@ -81,10 +86,15 @@ func (d *DiscordAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 // inbound normalizes one MessageCreate. The sender id is whatever Discord's
 // authenticated websocket delivered — the backend's own identity mechanism;
 // mapping it to a principal (or dropping it) is the session manager's job.
-// Scope: DMs and threads carry every message; a non-thread guild channel
-// only listens when the bot is mentioned, so a busy channel doesn't become
-// an accidental session.
+// Scope: DMs and threads carry every message. A non-thread guild channel is
+// NOT a session — "a channel or space is not a session; a conversation in
+// it is" — so a bot mention there starts a thread from that message and the
+// session binds to the thread. Two people mentioning the bot in one channel
+// get two conversations, never one shared task they steer by accident.
 func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreate) (InboundMessage, bool) {
+	if s.State.User == nil {
+		return InboundMessage{}, false // no READY yet; we can't even self-filter
+	}
 	if m.Author == nil || m.Author.Bot || m.Author.ID == s.State.User.ID {
 		return InboundMessage{}, false
 	}
@@ -94,6 +104,7 @@ func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreat
 		kind = "dm"
 	}
 	text := strings.TrimSpace(m.Content)
+	channelID := m.ChannelID
 	if !isDM {
 		ch, err := s.State.Channel(m.ChannelID)
 		if err != nil || ch == nil {
@@ -115,18 +126,37 @@ func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreat
 				return InboundMessage{}, false
 			}
 			text = stripMention(text, s.State.User.ID)
+			thread, err := s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{
+				Name:                threadName(text),
+				AutoArchiveDuration: 1440,
+			})
+			if err != nil {
+				d.log.Error("thread start failed; channel messages cannot become sessions", "channel", m.ChannelID, "err", err)
+				_, _ = s.ChannelMessageSend(m.ChannelID, "I work in threads — start one (or grant me Create Public Threads) and ask there.")
+				return InboundMessage{}, false
+			}
+			channelID = thread.ID
 		}
 	}
 	if text == "" {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
-		Conversation: conversationID(m.GuildID, m.ChannelID),
+		Conversation: conversationID(m.GuildID, channelID),
 		Kind:         kind,
 		AuthorID:     m.Author.ID,
 		MessageID:    m.ID,
 		Text:         text,
 	}, true
+}
+
+// threadName derives a thread title from the ask; Discord caps names at 100.
+func threadName(text string) string {
+	name := strings.TrimSpace(text)
+	if name == "" {
+		name = "a2a session"
+	}
+	return truncateRunes(name, 80)
 }
 
 func stripMention(text, botID string) string {

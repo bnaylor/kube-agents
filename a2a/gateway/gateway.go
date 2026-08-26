@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -29,13 +30,22 @@ type Gateway struct {
 	log     *slog.Logger
 	spawner spawner // nil until SpawnSessions arms (W4)
 
+	// runCtx is Run's context; queue workers derive their timeouts from it.
+	runCtx context.Context
+
+	// inbox orders inbound messages per conversation (the backend delivers
+	// events on unordered goroutines) and events orders relay work per
+	// session, so no conversation can block another.
+	inbox  *keyedQueue[InboundMessage]
+	events *keyedQueue[*lib.Envelope]
+
 	mu sync.Mutex
 	// sessionLocks serializes work per conversation; tasks serialize per
 	// session by construction (a message during a running task is a steer,
 	// never a second task).
 	sessionLocks map[string]*sync.Mutex
 	// taskSessions caches taskId -> session key; the KV task index is the
-	// durable copy a restart falls back to.
+	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
@@ -82,11 +92,18 @@ func New(o Options) (*Gateway, error) {
 		pm:           pm,
 		ps:           NewPseudonymizer(o.Config.AttributionSalt),
 		log:          log,
+		runCtx:       context.Background(),
 		sessionLocks: map[string]*sync.Mutex{},
 		taskSessions: map[string]string{},
 		relays:       map[string]*relayState{},
 		backend:      backend,
 	}
+	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
+		for _, msg := range batch {
+			g.handleInbound(msg)
+		}
+	})
+	g.events = newKeyedQueue(g.relayBatch)
 	if o.Config.SpawnSessions {
 		s, err := newPodSpawner(o.Config, log)
 		if err != nil {
@@ -94,12 +111,16 @@ func New(o Options) (*Gateway, error) {
 		}
 		g.spawner = s
 	}
+	if o.Config.DefaultAddressee == RouteSession && g.spawner == nil {
+		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE=%s requires A2A_SPAWN_SESSIONS=true: without a spawner the sentinel would publish tasks to a literal %q addressee no executor owns", RouteSession, RouteSession)
+	}
 	return g, nil
 }
 
 // Run subscribes the event relay, starts the reap and sweep loops, and runs
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
+	g.runCtx = ctx
 	sub, err := g.client.SubscribeDurable(ctx, lib.SubscribeConfig{
 		Stream:  lib.TasksStream,
 		Subject: "a2a.tasks.*.*.events",
@@ -116,7 +137,9 @@ func (g *Gateway) Run(ctx context.Context) error {
 		go g.sweepLoop(ctx)
 	}
 
-	return g.adapter.Run(ctx, func(msg InboundMessage) { g.handleInbound(ctx, msg) })
+	// The adapter's delivery goroutines only enqueue; per-conversation order
+	// is the queue's job, not the backend's.
+	return g.adapter.Run(ctx, func(msg InboundMessage) { g.inbox.enqueue(msg.Conversation, msg) })
 }
 
 // lockSession returns the per-conversation mutex, minting it on first use.
@@ -133,8 +156,8 @@ func (g *Gateway) lockSession(key string) *sync.Mutex {
 
 // handleInbound is one user turn: verify the sender, resolve the session,
 // and route the message — status query by replay, stop, steer, or a new
-// task.
-func (g *Gateway) handleInbound(ctx context.Context, msg InboundMessage) {
+// task. Runs on the conversation's inbox worker, in arrival order.
+func (g *Gateway) handleInbound(msg InboundMessage) {
 	// Verify against the backend's identity mechanism — for Discord, the
 	// test mapping table — and drop the message if we can't (gateway design,
 	// turns-and-tasks step 1).
@@ -149,7 +172,7 @@ func (g *Gateway) handleInbound(ctx context.Context, msg InboundMessage) {
 	l.Lock()
 	defer l.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(g.runCtx, 60*time.Second)
 	defer cancel()
 
 	rec, err := g.reg.Get(ctx, msg.Conversation)
@@ -168,12 +191,13 @@ func (g *Gateway) handleInbound(ctx context.Context, msg InboundMessage) {
 			Kind:      msg.Kind,
 		}
 		// The W4 switch: with spawning armed and the route set to "session",
-		// the conversation gets its own executor and the addressee is the
-		// session's bus name. The pod is an incarnation; this name and the
-		// contextId are the identity.
+		// the conversation gets its own executor. The bus session name is
+		// minted per incarnation (spawn time), not here — reaping and
+		// respawning changes the pod and the bus session name; contextId
+		// persists (gateway design).
 		if g.spawner != nil && rec.Addressee == RouteSession {
-			rec.BusSession = mintSessionName("chat")
-			rec.Addressee = rec.BusSession
+			rec.SessionRouted = true
+			rec.Profile = "chat"
 		}
 	}
 	rec.LastActivity = time.Now().UTC()
@@ -182,11 +206,31 @@ func (g *Gateway) handleInbound(ctx context.Context, msg InboundMessage) {
 	if err != nil {
 		g.log.Warn("roster read failed; snapshotting requester only",
 			"conversation", msg.Conversation, "err", err)
-		rosterIDs, rosterComplete = []string{msg.AuthorID}, false
+		rosterIDs, rosterComplete = nil, false
+	}
+	// The audience snapshot always contains at least the requester — an
+	// empty roster would erase exactly the person the classifier's "who
+	// could have read this" starts from.
+	if !slices.Contains(rosterIDs, msg.AuthorID) {
+		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
 	authority := BuildAuthority(g.ps, g.pm, principal, g.backend, msg.AuthorID,
 		"principal-map", msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
 	rec.Roster = hashRoster(g.ps, g.pm, rosterIDs)
+
+	// Heal a stale ActiveTask before routing: if the task is already
+	// terminal on the stream (the relay's ack raced a transient failure, or
+	// the gateway was down when the terminal fired and the redelivery
+	// hasn't landed), release the serialization instead of steering the
+	// user into a finished task. Only the serialization: the task index
+	// stays until the relay retires it, so a queued terminal event still
+	// posts its result.
+	if active := rec.ActiveTask; active != nil && !active.Detached {
+		if task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID); err == nil && task.Final {
+			g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
+			rec.ActiveTask = nil
+		}
+	}
 
 	active := rec.ActiveTask
 	switch {
@@ -197,10 +241,16 @@ func (g *Gateway) handleInbound(ctx context.Context, msg InboundMessage) {
 	case active != nil && !active.Detached:
 		g.steerTask(ctx, rec, msg, authority)
 	default:
+		// A session-routed conversation with no live incarnation gets a
+		// fresh bus session name before the task's addressee is chosen.
+		if rec.SessionRouted && rec.PodName == "" {
+			rec.BusSession = mintSessionName(rec.Profile)
+			rec.Addressee = rec.BusSession
+		}
 		g.startTask(ctx, rec, msg, principal, authority)
 	}
 
-	if err := g.reg.Put(ctx, rec); err != nil {
+	if err := withRetry(3, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 	}
 }
@@ -248,9 +298,9 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID}
-	rec.TaskIDs = append(rec.TaskIDs, taskID)
-	if len(rec.TaskIDs) > taskHistoryCap {
-		rec.TaskIDs = rec.TaskIDs[len(rec.TaskIDs)-taskHistoryCap:]
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee})
+	if len(rec.Tasks) > taskHistoryCap {
+		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 	}
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
@@ -278,7 +328,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 
 	// Session-addressed routes get an incarnation; fixed addressees (the
 	// Hermes-first "platform") have their own executor and spawn nothing.
-	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
+	if g.spawner != nil && rec.SessionRouted {
 		g.ensureSessionPod(ctx, rec, taskID)
 	}
 }
@@ -326,9 +376,7 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 		return
 	}
 	active.Detached = true
-	if _, err := g.adapter.Post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms"); err != nil {
-		g.log.Warn("cancel ack post failed", "err", err)
-	}
+	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
 }
 
 // answerStatusByReplay answers "what is it doing" from the stream, not from
@@ -339,14 +387,14 @@ func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) 
 	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
 	if err != nil {
 		if _, ok := err.(*lib.A2AError); ok {
-			_, _ = g.adapter.Post(rec.Key, "📭 no events on the stream yet — the task was just submitted")
+			g.post(rec.Key, "📭 no events on the stream yet — the task was just submitted")
 			return
 		}
 		g.log.Error("status replay failed", "taskId", active.TaskID, "err", err)
-		_, _ = g.adapter.Post(rec.Key, "⚠️ replay failed; see gateway logs")
+		g.post(rec.Key, "⚠️ replay failed; see gateway logs")
 		return
 	}
-	_, _ = g.adapter.Post(rec.Key, formatTaskStatus(task))
+	g.post(rec.Key, formatTaskStatus(task))
 }
 
 // messagePayload builds the A2A Message for one chat turn.

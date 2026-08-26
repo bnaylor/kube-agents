@@ -46,8 +46,14 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 		}
 		l := g.lockSession(rec.Key)
 		l.Lock()
+		// Re-run every predicate on the fresh record under the lock: a
+		// message that arrived between scan and lock may have started a task
+		// or reset the idle clock, and reap must never delete a pod out from
+		// under either.
 		fresh, err := g.reg.Get(ctx, rec.Key)
-		if err != nil || fresh == nil || fresh.PodName == "" {
+		if err != nil || fresh == nil || fresh.PodName == "" ||
+			(fresh.ActiveTask != nil && !fresh.ActiveTask.Detached) ||
+			time.Since(fresh.LastActivity) < g.cfg.IdleTTL {
 			l.Unlock()
 			continue
 		}
@@ -78,8 +84,8 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 	var b strings.Builder
 	b.WriteString("Transcript primer, replayed from the task stream for this conversation:\n")
 	found := 0
-	for _, taskID := range rec.TaskIDs {
-		task, err := g.client.TasksGet(ctx, rec.Addressee, taskID)
+	for _, ref := range rec.Tasks {
+		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
 		if err != nil {
 			continue // aged out of retention, or never produced events
 		}

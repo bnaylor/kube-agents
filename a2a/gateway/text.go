@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -61,21 +62,32 @@ func isStop(text string) bool {
 	return stopWords[normalize(text)]
 }
 
+// statusHistoryCap bounds the rendered transition history — a long-running
+// task accumulates one state per event and the answer must stay one chat
+// message.
+const statusHistoryCap = 12
+
 // formatTaskStatus renders a replayed Task for chat: current state, the
 // transition history, and the latest progress line.
 func formatTaskStatus(t *lib.Task) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔎 task `%s` is **%s**", t.ID, t.State)
 	if len(t.StatusHistory) > 0 {
-		states := make([]string, len(t.StatusHistory))
-		for i, s := range t.StatusHistory {
+		history := t.StatusHistory
+		prefix := ""
+		if len(history) > statusHistoryCap {
+			history = history[len(history)-statusHistoryCap:]
+			prefix = "… → "
+		}
+		states := make([]string, len(history))
+		for i, s := range history {
 			states[i] = string(s)
 		}
-		fmt.Fprintf(&b, " (history: %s)", strings.Join(states, " → "))
+		fmt.Fprintf(&b, " (history: %s%s)", prefix, strings.Join(states, " → "))
 	}
 	if p := t.Artifact(lib.ArtifactProgress); p != nil {
 		if text := lastTextPart(p.Parts); text != "" {
-			fmt.Fprintf(&b, "\n📋 latest progress: %s", text)
+			fmt.Fprintf(&b, "\n📋 latest progress: %s", truncateRunes(text, progressCap))
 		}
 	}
 	if r := t.Artifact(lib.ArtifactResult); r != nil {
@@ -105,7 +117,9 @@ func joinTextParts(parts []lib.Part) string {
 }
 
 // chatChunks splits text for backends with a message size cap (Discord:
-// 2000); the chunk size leaves headroom for decoration.
+// 2000); the chunk size leaves headroom for decoration. Cuts land on line
+// breaks where possible and never inside a UTF-8 sequence — a split rune is
+// an invalid payload the backend may refuse outright.
 func chatChunks(text string, size int) []string {
 	if text == "" {
 		return nil
@@ -115,11 +129,27 @@ func chatChunks(text string, size int) []string {
 		cut := strings.LastIndex(text[:size], "\n")
 		if cut < size/2 {
 			cut = size
+			for cut > 0 && !utf8.RuneStart(text[cut]) {
+				cut--
+			}
 		}
 		chunks = append(chunks, text[:cut])
 		text = text[cut:]
 	}
 	return append(chunks, text)
+}
+
+// truncateRunes bounds s to n bytes at a rune boundary, with an ellipsis
+// marking the loss.
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 func marshalMessage(m lib.Message) ([]byte, error) {

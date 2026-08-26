@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -601,5 +602,104 @@ func TestNormalizePhrases(t *testing.T) {
 	}
 	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
 		t.Error("isStop misclassifies")
+	}
+}
+
+func TestStaleActiveTaskHealsInsteadOfSteering(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread7"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "done"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "terminal relayed", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == "done" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Fake the relay having missed the terminal: restore ActiveTask in KV,
+	// the exact state a transient KV failure on the final event leaves.
+	reg := NewRegistry(r.client)
+	rec, err := reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID}
+	if err := reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	// The next message must start a NEW task, not steer the finished one.
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: "next question"}
+	waitFor(t, "healed into a new task", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+			if e.Kind == lib.KindMessage && e.TaskID != origin.TaskID {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread8"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+
+	longReason := strings.Repeat("stack frame käsemesser\n", 300) // ~7KB, multibyte
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateFailed, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-fail",
+			Parts: []lib.Part{{Kind: "text", Text: longReason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: "platform"}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskEventsSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "chunked failure posts", func() bool {
+		joined := ""
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "failed") || strings.Contains(p, "stack frame") {
+				joined += p
+			}
+		}
+		return strings.Count(joined, "käsemesser") == 300
+	})
+	for _, p := range r.adapter.postTexts() {
+		if len(p) > discordChunk {
+			t.Fatalf("post over the cap: %d bytes", len(p))
+		}
+		if !utf8.ValidString(p) {
+			t.Fatal("post is invalid UTF-8 (rune split at a chunk boundary)")
+		}
 	}
 }

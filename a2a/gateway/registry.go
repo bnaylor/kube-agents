@@ -42,9 +42,22 @@ type SessionRecord struct {
 	LastActivity time.Time   `json:"lastActivity"`
 	Roster       []string    `json:"roster,omitempty"`
 	ActiveTask   *ActiveTask `json:"activeTask,omitempty"`
-	// TaskIDs is the context's task history, newest last — what rehydration
-	// replays. Bounded; the stream's retention is the real horizon.
-	TaskIDs []string `json:"taskIds,omitempty"`
+	// SessionRouted marks a conversation on the session-pod route: the
+	// addressee is a bus session name minted fresh per incarnation, and
+	// Profile names the AgentProfile the incarnations run as.
+	SessionRouted bool   `json:"sessionRouted,omitempty"`
+	Profile       string `json:"profile,omitempty"`
+	// Tasks is the context's task history, newest last — what rehydration
+	// replays. Each entry keeps the addressee its subjects carried, because
+	// session-routed addressees rotate per incarnation. Bounded; the
+	// stream's retention is the real horizon.
+	Tasks []TaskRef `json:"tasks,omitempty"`
+}
+
+// TaskRef names one historical task and the addressee it ran under.
+type TaskRef struct {
+	ID        string `json:"id"`
+	Addressee string `json:"addressee"`
 }
 
 const taskHistoryCap = 50
@@ -135,6 +148,17 @@ func (r *Registry) IndexTask(ctx context.Context, taskID, sessionKey string) err
 		return fmt.Errorf("task index %s: %w", taskID, err)
 	}
 	return nil
+}
+
+// DropTask retires a task's index entry once its terminal event has been
+// rendered — the stream is the durable record; the index only routes live
+// events, and one key per task forever is unbounded growth.
+func (r *Registry) DropTask(ctx context.Context, taskID string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	return kv.Delete(ctx, taskKey(taskID))
 }
 
 // SessionForTask resolves the task index, or "" if the task is unknown.

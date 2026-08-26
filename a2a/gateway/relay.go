@@ -13,6 +13,10 @@ import (
 // discordChunk leaves headroom under Discord's 2000-char message cap.
 const discordChunk = 1900
 
+// progressCap bounds the progress text embedded in rolling lines and status
+// answers, so one artifact can't blow a chat edit past the backend cap.
+const progressCap = 300
+
 // relayState is the in-memory render state for one task's rolling line. It
 // is cache: a gateway restart loses it, and the terminal path falls back to
 // a stream replay to recover the result — the stream is the record.
@@ -22,9 +26,10 @@ type relayState struct {
 	result   []lib.Part
 }
 
-// relayEvent relays one status or artifact update into the conversation.
-// The gateway never parses harness output — executors already mapped it onto
-// A2A events; this renders those events and nothing else.
+// relayEvent routes one event to its conversation's queue. Runs on the
+// durable consumer's dispatch goroutine, so it must not block: the actual
+// rendering — session lock, KV, chat REST calls — happens on the per-session
+// worker, where one slow conversation stalls only itself.
 func (g *Gateway) relayEvent(ctx context.Context, env *lib.Envelope) {
 	if env.Kind != lib.KindStatusUpdate && env.Kind != lib.KindArtifactUpdate {
 		return
@@ -32,23 +37,57 @@ func (g *Gateway) relayEvent(ctx context.Context, env *lib.Envelope) {
 	sessionKey := g.sessionForTask(ctx, env.TaskID)
 	if sessionKey == "" {
 		// Not a task this gateway submitted (another requester's traffic on
-		// the shared events wildcard); not ours to render.
+		// the shared events wildcard, or a post-terminal straggler whose
+		// index was already retired); not ours to render.
 		return
 	}
+	g.events.enqueue(sessionKey, env)
+}
 
+// relayBatch renders a session's queued events in order. Rolling-line edits
+// are coalesced: only the last event of the batch renders the line, so a
+// backlog of progress artifacts becomes one edit instead of a rate-limited
+// stampede. Posts (results, failures, input asks) always render.
+func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(g.runCtx, 60*time.Second)
 	defer cancel()
 
-	rec, err := g.reg.Get(ctx, sessionKey)
+	var rec *SessionRecord
+	err := withRetry(3, func() error {
+		var e error
+		rec, e = g.reg.Get(ctx, sessionKey)
+		return e
+	})
 	if err != nil || rec == nil {
-		g.log.Error("relay: session record missing", "session", sessionKey, "err", err)
+		// The events stay unrendered but the stream keeps them; requeue the
+		// batch so a transient KV failure on a terminal event cannot wedge
+		// the conversation with the result never posted.
+		g.log.Error("relay: session record unavailable; requeueing batch", "session", sessionKey, "err", err)
+		go func() {
+			time.Sleep(2 * time.Second)
+			for _, env := range batch {
+				g.events.enqueue(sessionKey, env)
+			}
+		}()
 		return
 	}
 
+	for i, env := range batch {
+		g.applyEvent(ctx, rec, env, i == len(batch)-1)
+	}
+
+	if err := withRetry(3, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+		g.log.Error("relay: session record write failed", "session", rec.Key, "err", err)
+	}
+}
+
+// applyEvent folds one event into the render state. render gates only the
+// rolling-line edit; posts always happen.
+func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, env *lib.Envelope, render bool) {
 	g.mu.Lock()
 	rs, ok := g.relays[env.TaskID]
 	if !ok {
@@ -64,22 +103,18 @@ func (g *Gateway) relayEvent(ctx context.Context, env *lib.Envelope) {
 			g.log.Error("relay: malformed status-update", "taskId", env.TaskID, "err", err)
 			return
 		}
-		g.relayStatus(ctx, rec, rs, env.TaskID, s)
+		g.applyStatus(ctx, rec, rs, env.TaskID, s, render)
 	case lib.KindArtifactUpdate:
 		var a lib.ArtifactUpdate
 		if err := json.Unmarshal(env.Payload, &a); err != nil {
 			g.log.Error("relay: malformed artifact-update", "taskId", env.TaskID, "err", err)
 			return
 		}
-		g.relayArtifact(ctx, rec, rs, env.TaskID, a)
-	}
-
-	if err := g.reg.Put(ctx, rec); err != nil {
-		g.log.Error("relay: session record write failed", "session", rec.Key, "err", err)
+		g.applyArtifact(rec, rs, env.TaskID, a, render)
 	}
 }
 
-func (g *Gateway) relayStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate) {
+func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, render bool) {
 	rs.state = s.Status.State
 	switch {
 	case s.Final:
@@ -102,19 +137,23 @@ func (g *Gateway) relayStatus(ctx context.Context, rec *SessionRecord, rs *relay
 				g.post(rec.Key, "ℹ️ "+note)
 			}
 		}
-		g.updateRollingLine(rec, taskID, rs)
+		if render {
+			g.updateRollingLine(rec, taskID, rs)
+		}
 	}
 }
 
-func (g *Gateway) relayArtifact(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, a lib.ArtifactUpdate) {
+func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID string, a lib.ArtifactUpdate, render bool) {
 	switch a.Artifact.Name {
 	case lib.ArtifactProgress:
 		// The rolling progress line: one edited chat message as progress
 		// artifacts arrive — no model calls, zero marginal cost.
 		if text := lastTextPart(a.Artifact.Parts); text != "" {
-			rs.progress = text
+			rs.progress = truncateRunes(text, progressCap)
 		}
-		g.updateRollingLine(rec, taskID, rs)
+		if render {
+			g.updateRollingLine(rec, taskID, rs)
+		}
 	case lib.ArtifactResult:
 		if a.Append {
 			rs.result = append(rs.result, a.Artifact.Parts...)
@@ -126,8 +165,9 @@ func (g *Gateway) relayArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 	}
 }
 
-// relayTerminal posts the deliverable (or the failure) and releases the
-// session's serialization.
+// relayTerminal posts the deliverable (or the failure), releases the
+// session's serialization, and retires the task's index — the stream is
+// the durable record; the index only exists to route live events.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate) {
 	result := joinTextParts(rs.result)
 	if result == "" && s.Status.State == lib.StateCompleted {
@@ -147,9 +187,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if result == "" {
 			result = "(completed with a non-text result; see the stream)"
 		}
-		for _, chunk := range chatChunks(result, discordChunk) {
-			g.post(rec.Key, chunk)
-		}
+		g.post(rec.Key, result)
 	case lib.StateFailed:
 		reason := ""
 		if s.Status.Message != nil {
@@ -168,13 +206,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
-			_ = g.adapter.Edit(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, rs.progress))
+			g.editLine(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, rs.progress))
 		}
 		rec.ActiveTask = nil
 	}
+	// Retire the routing state. A post-final straggler then finds no route
+	// and is dropped rather than re-rendered (assertion 10 lives in the lib
+	// and the fold; the gateway's job is only to never replay the result at
+	// the room).
 	g.mu.Lock()
 	delete(g.relays, taskID)
+	delete(g.taskSessions, taskID)
 	g.mu.Unlock()
+	if err := g.reg.DropTask(ctx, taskID); err != nil {
+		g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
+	}
 }
 
 // updateRollingLine edits the task's single status message in place.
@@ -183,9 +229,12 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
 		return
 	}
-	line := statusLine(rs.state, rs.progress)
-	if err := g.adapter.Edit(rec.Key, active.StatusMsgID, line); err != nil {
-		g.log.Warn("rolling line edit failed", "taskId", taskID, "err", err)
+	g.editLine(rec.Key, active.StatusMsgID, statusLine(rs.state, rs.progress))
+}
+
+func (g *Gateway) editLine(conversation, messageID, line string) {
+	if err := g.adapter.Edit(conversation, messageID, truncateRunes(line, discordChunk)); err != nil {
+		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 	}
 }
 
@@ -223,14 +272,18 @@ func terminalLine(state lib.TaskState, progress string) string {
 	return line
 }
 
-// post writes to the conversation, logging rather than failing the relay —
-// chat delivery is best-effort; the stream is the record.
+// post writes to the conversation, chunked under the backend cap, logging
+// rather than failing the relay — chat delivery is best-effort; the stream
+// is the record.
 func (g *Gateway) post(conversation, text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	if _, err := g.adapter.Post(conversation, text); err != nil {
-		g.log.Error("post failed", "conversation", conversation, "err", err)
+	for _, chunk := range chatChunks(text, discordChunk) {
+		if _, err := g.adapter.Post(conversation, chunk); err != nil {
+			g.log.Error("post failed", "conversation", conversation, "err", err)
+			return
+		}
 	}
 }
 
@@ -254,4 +307,17 @@ func (g *Gateway) sessionForTask(ctx context.Context, taskID string) string {
 		g.mu.Unlock()
 	}
 	return key
+}
+
+// withRetry runs f up to n times with a short pause — enough to ride out a
+// connection rebuild window without inventing a second resilience layer.
+func withRetry(n int, f func() error) error {
+	var err error
+	for i := 0; i < n; i++ {
+		if err = f(); err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(i+1) * 200 * time.Millisecond)
+	}
+	return err
 }

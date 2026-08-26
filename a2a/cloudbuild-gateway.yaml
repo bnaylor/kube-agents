@@ -1,0 +1,22 @@
+# Cloud Build config for the gateway image. Submit from the a2a/ directory:
+#   gcloud builds submit --config cloudbuild-gateway.yaml \
+#     --substitutions _TAG=w3-YYYYMMDD --async .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.gateway
+      - -t
+      - ${_REGISTRY}/gateway:${_TAG}
+      - -t
+      - ${_REGISTRY}/gateway:latest
+      - .
+images:
+  - ${_REGISTRY}/gateway:${_TAG}
+  - ${_REGISTRY}/gateway:latest
+substitutions:
+  _REGISTRY: northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo
+  _TAG: dev
+options:
+  logging: CLOUD_LOGGING_ONLY

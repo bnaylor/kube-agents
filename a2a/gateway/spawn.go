@@ -39,6 +39,7 @@ type spawner interface {
 
 type orphanPod struct {
 	PodName       string
+	SessionKey    string
 	Addressee     string
 	TaskID        string
 	ContextID     string
@@ -46,12 +47,15 @@ type orphanPod struct {
 }
 
 // mintSessionName gives an incarnation its bus session name,
-// <profile>-<animal> per the house ruling. W5 owns the canonical animal
-// list (stolen from the demo); this short one keeps the dark path honest
-// until integration.
+// <profile>-<animal> per the house ruling, minted FRESH per incarnation —
+// reaping and respawning changes the pod and the bus session name;
+// contextId is what persists (gateway design). The suffix is wide enough
+// that two conversations can't plausibly collide onto one addressee. W5
+// owns the canonical animal list (stolen from the demo); this short one
+// keeps the dark path honest until integration.
 func mintSessionName(profile string) string {
 	animals := []string{"otter", "badger", "heron", "lynx", "marten", "puffin", "stoat", "vole"}
-	return fmt.Sprintf("%s-%s-%s", profile, animals[int(time.Now().UnixNano())%len(animals)], randHex(2))
+	return fmt.Sprintf("%s-%s-%s", profile, animals[int(time.Now().UnixNano())%len(animals)], randHex(4))
 }
 
 const (
@@ -64,6 +68,7 @@ const (
 	annoCorr    = "a2a.kubeagents.dev/correlation-id"
 	annoAddr    = "a2a.kubeagents.dev/addressee"
 	annoConvo   = "a2a.kubeagents.dev/session-key"
+	annoPrimer  = "a2a.kubeagents.dev/rehydration-primer"
 )
 
 func activeCorrelation(rec *SessionRecord) string {
@@ -112,6 +117,10 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				annoCorr:    activeCorrelation(rec),
 				annoAddr:    rec.Addressee,
 				annoConvo:   rec.Key,
+				// The rehydration primer rides the pod until W4's adapter
+				// grows a first-input path for it; bounded well under the
+				// object annotation budget.
+				annoPrimer: truncateRunes(primer, 8192),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -125,10 +134,20 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				Name:  "worker",
 				Image: s.cfg.WorkerImage,
 				Env: []corev1.EnvVar{
-					// The worker env contract (launch-card constants).
+					// The worker env contract (launch-card constants):
+					// TASK_ID/PROFILE/NATS_URL. PROFILE names the
+					// AgentProfile — the addressee is the bus session name,
+					// which is not a profile. Bus creds ride alongside; how
+					// W4 wants them delivered is its call to revise.
 					{Name: "TASK_ID", Value: taskID},
-					{Name: "PROFILE", Value: rec.Addressee},
+					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
+					{Name: "NATS_USER", Value: "worker"},
+					{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.NATSCredsSecret},
+						Key:                  "worker-password",
+					}}},
+					{Name: "A2A_SESSION", Value: rec.BusSession},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -149,16 +168,12 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		},
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		return name, nil
-	}
 	if err != nil {
+		// AlreadyExists included: session names are minted per incarnation,
+		// so a name collision means the mint raced a terminating predecessor
+		// — surface it rather than adopt a pod that is about to vanish.
 		return "", err
 	}
-	// The rehydration primer travels as the pod's first input once W4's
-	// adapter consumes it; recording it on the pod keeps the seam visible
-	// until then.
-	_ = primer
 	return created.Name, nil
 }
 
@@ -184,6 +199,7 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 		}
 		out = append(out, orphanPod{
 			PodName:       p.Name,
+			SessionKey:    p.Annotations[annoConvo],
 			Addressee:     p.Annotations[annoAddr],
 			TaskID:        p.Annotations[annoTask],
 			ContextID:     p.Annotations[annoContext],
@@ -241,11 +257,13 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		if o.TaskID == "" || o.Addressee == "" {
 			g.log.Warn("sweep: terminal pod without task annotations; deleting", "pod", o.PodName)
 			_ = g.spawner.Delete(ctx, o.PodName)
+			g.releaseIncarnation(ctx, o)
 			continue
 		}
 		task, err := g.client.TasksGet(ctx, o.Addressee, o.TaskID)
 		if err == nil && task.Final {
 			_ = g.spawner.Delete(ctx, o.PodName) // clean exit; nothing owed
+			g.releaseIncarnation(ctx, o)
 			continue
 		}
 		if err := g.publishSupervisorFailed(ctx, o); err != nil {
@@ -254,6 +272,28 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		}
 		g.log.Warn("sweep: declared orphaned task failed", "task", o.TaskID, "pod", o.PodName)
 		_ = g.spawner.Delete(ctx, o.PodName)
+		g.releaseIncarnation(ctx, o)
+	}
+}
+
+// releaseIncarnation clears the session record's pod binding after sweep
+// removes a dead pod — otherwise ensureSessionPod sees a PodName forever
+// and an active conversation (which keeps resetting the idle clock, so reap
+// never fires) has no executor and no way to get one.
+func (g *Gateway) releaseIncarnation(ctx context.Context, o orphanPod) {
+	if o.SessionKey == "" {
+		return
+	}
+	l := g.lockSession(o.SessionKey)
+	l.Lock()
+	defer l.Unlock()
+	rec, err := g.reg.Get(ctx, o.SessionKey)
+	if err != nil || rec == nil || rec.PodName != o.PodName {
+		return
+	}
+	rec.PodName = ""
+	if err := g.reg.Put(ctx, rec); err != nil {
+		g.log.Error("sweep: record release failed", "session", o.SessionKey, "err", err)
 	}
 }
 

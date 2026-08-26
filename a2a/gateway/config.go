@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // Config is the gateway's runtime configuration. The env contract matches
@@ -44,9 +46,11 @@ type Config struct {
 	// the provisioned Secret.
 	AttributionSalt []byte
 
-	// Namespace and WorkerImage configure the dark spawn path.
-	Namespace   string
-	WorkerImage string
+	// Namespace, WorkerImage, and NATSCredsSecret configure the dark spawn
+	// path; the secret holds the worker user's password for spawned pods.
+	Namespace       string
+	WorkerImage     string
+	NATSCredsSecret string
 }
 
 // FromEnv loads the config from the environment.
@@ -61,6 +65,7 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
@@ -68,15 +73,30 @@ func FromEnv() (*Config, error) {
 	if cfg.DiscordToken == "" {
 		return nil, fmt.Errorf("DISCORD_TOKEN is required (W0's discord-bot Secret)")
 	}
+	// The addressee is a subject token; validate at boot, not per-message.
+	// The "session" sentinel passes by construction; whether a spawner backs
+	// it is checked where the spawner is built (gateway.New).
+	if !lib.ValidSubjectToken(cfg.DefaultAddressee) {
+		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE %q is not a dot-free DNS-1123 label", cfg.DefaultAddressee)
+	}
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {
 		return nil, fmt.Errorf("A2A_IDLE_TTL %q: %w", ttl, err)
 	}
+	if d < time.Minute {
+		return nil, fmt.Errorf("A2A_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", ttl)
+	}
 	cfg.IdleTTL = d
 	if salt := os.Getenv("A2A_ATTRIBUTION_SALT"); salt != "" {
 		cfg.AttributionSalt = []byte(salt)
 	} else {
+		// Derived fallback while the install has no provisioned salt Secret.
+		// An empty password would make this a public constant and the
+		// pseudonyms an offline dictionary away from plaintext — refuse.
+		if cfg.NATSPassword == "" {
+			return nil, fmt.Errorf("A2A_ATTRIBUTION_SALT is required when NATS_PASSWORD is empty: the derived fallback would be a public constant")
+		}
 		derived := sha256.Sum256([]byte("a2a-attribution-salt:" + cfg.NATSPassword))
 		cfg.AttributionSalt = derived[:]
 	}
