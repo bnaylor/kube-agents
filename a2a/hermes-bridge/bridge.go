@@ -61,7 +61,9 @@ func (c *Config) defaults() {
 		c.Profile = "platform"
 	}
 	if len(c.Command) == 0 {
-		c.Command = []string{"hermes", "-p", c.Profile, "chat", "-q"}
+		// -Q is hermes's programmatic mode: no banner, no spinner, no TUI
+		// box around the answer - stdout is the response.
+		c.Command = []string{"hermes", "-p", c.Profile, "chat", "-Q", "-q"}
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
@@ -304,6 +306,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.mu.Lock()
 	b.tasks[env.TaskID] = run
 	b.mu.Unlock()
+	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
 	select {
 	case b.queue <- run:
 	default:
@@ -482,6 +485,7 @@ func (b *Bridge) terminalAndClear(ctx context.Context, run *taskRun, state lib.T
 	b.mu.Lock()
 	delete(b.tasks, run.origin.TaskID)
 	b.mu.Unlock()
+	b.cfg.Logger.Info("task finished", "task", run.origin.TaskID, "state", state)
 }
 
 func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.TaskState, msg string) error {

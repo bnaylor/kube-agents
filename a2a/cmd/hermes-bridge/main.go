@@ -39,7 +39,7 @@ func main() {
 		Logger:       log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
-		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-q"}
+		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
 	}
 	if user := os.Getenv("NATS_USER"); user != "" {
 		cfg.NATSOptions = append(cfg.NATSOptions, nats.UserInfo(user, os.Getenv("NATS_PASSWORD")))
