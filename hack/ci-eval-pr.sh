@@ -13,15 +13,187 @@
 
 set -euo pipefail
 
+# ─── Step timing profiler ────────────────────────────────────────────────────
+# Contiguous named spans: each profile_begin closes the previous span and opens
+# the next, so the report's percentages always sum to 100% of the wall clock
+# between script start and the report. python3 is already a hard dependency of
+# the gate below, so it is what supplies millisecond epochs.
+PROFILE_ROWS=()
+PROFILE_CURRENT=""
+_now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+PROFILE_T0="$(_now_ms)"
+PROFILE_LAST="${PROFILE_T0}"
+
+profile_begin() {
+  local now
+  now="$(_now_ms)"
+  if [ -n "${PROFILE_CURRENT}" ]; then
+    PROFILE_ROWS+=("${PROFILE_CURRENT}|$((PROFILE_LAST - PROFILE_T0))|$((now - PROFILE_LAST))")
+  fi
+  PROFILE_CURRENT="$1"
+  PROFILE_LAST="${now}"
+  echo "--- [PROFILE $(date -u +'%Y-%m-%dT%H:%M:%SZ')] step: $1 ---"
+}
+
+profile_report() {
+  local exit_code="$1" now
+  now="$(_now_ms)"
+  if [ -n "${PROFILE_CURRENT}" ]; then
+    PROFILE_ROWS+=("${PROFILE_CURRENT}|$((PROFILE_LAST - PROFILE_T0))|$((now - PROFILE_LAST))")
+    PROFILE_CURRENT=""
+  fi
+  PROFILE_DATA="$(printf '%s\n' ${PROFILE_ROWS[@]+"${PROFILE_ROWS[@]}"})" \
+  PROFILE_EXIT_CODE="${exit_code}" python3 <<'PY' || true
+import os
+
+rows = []
+for line in os.environ.get("PROFILE_DATA", "").splitlines():
+    if not line.strip():
+        continue
+    name, start_ms, dur_ms = line.rsplit("|", 2)
+    rows.append((name, int(start_ms), int(dur_ms)))
+total = sum(d for _, _, d in rows)
+print(f"\n=== Step timing profile (exit code {os.environ['PROFILE_EXIT_CODE']}) ===")
+if not rows or total <= 0:
+    print("no profiled spans recorded")
+else:
+    # Largest-remainder rounding in tenths of a percent, so the printed
+    # column sums to exactly 100.0 instead of drifting with row count.
+    tenths, rems = [], []
+    for _, _, d in rows:
+        q, r = divmod(d * 1000, total)
+        tenths.append(q)
+        rems.append(r)
+    for i in sorted(range(len(rows)), key=lambda i: rems[i], reverse=True)[: 1000 - sum(tenths)]:
+        tenths[i] += 1
+    print(f"{'start(s)':>10} {'dur(s)':>10} {'%':>7}  step")
+    for (name, start_ms, dur_ms), t in zip(rows, tenths):
+        print(f"{start_ms / 1000:10.1f} {dur_ms / 1000:10.1f} {t / 10:6.1f}%  {name}")
+    print(f"{'':>10} {total / 1000:10.1f} {'100.0':>6}%  TOTAL")
+PY
+}
+
+# Prefix every line flowing through with "[TS <epoch.ms>]". devops-bench's own
+# logger is never configured by its CLI (NullHandler swallows the INFO phase
+# lines), so the wrapper stamps wall-clock time onto the subprocess's output
+# itself and the phase analyzer below keys on content markers instead.
+_ts_lines() {
+  python3 -u -c 'import sys, time
+for line in iter(sys.stdin.readline, ""):
+    sys.stdout.write("[TS %.3f] " % time.time() + line)
+    sys.stdout.flush()'
+}
+
+# Per-task deep dive: split one devops-bench invocation into phases using the
+# [TS ...] stamps and the phase-boundary text the run actually prints (tofu
+# apply/destroy, the first DeepEval judge banner), plus the agent latency the
+# results.json record carries. Informational — the top-level profile table is
+# the one whose steps sum to 100% of the script's span; this table sums to
+# 100% of the single task's devops-bench run.
+analyze_eval_phases() {
+  EVAL_PHASE_LOG="$1" EVAL_PHASE_START_MS="$2" EVAL_PHASE_END_MS="$3" \
+  EVAL_PHASE_TASK="$4" EVAL_PHASE_RESULT="${5:-}" python3 <<'PY' || true
+import json
+import os
+import re
+
+log = os.environ["EVAL_PHASE_LOG"]
+start = int(os.environ["EVAL_PHASE_START_MS"]) / 1000.0
+end = int(os.environ["EVAL_PHASE_END_MS"]) / 1000.0
+task = os.environ["EVAL_PHASE_TASK"]
+result = os.environ.get("EVAL_PHASE_RESULT", "")
+
+latency = None
+if result and os.path.exists(result):
+    try:
+        data = json.load(open(result))
+        rec = data[0] if isinstance(data, list) else data
+        latency = float(rec.get("latency") or 0) or None
+    except Exception:
+        pass
+
+# Ordered phase-opening markers; a match is only accepted at or after the
+# last matched position, so a stray earlier occurrence cannot reorder phases.
+# Markers absent from a run (noop deployer, crash) collapse their phase into
+# the neighbour's.
+MARKERS = [
+    ("Initializing the backend", "provision (tofu init + apply)"),
+    ("Apply complete!", "scenario setup + agent execution"),
+    (": Destroying...", "teardown (tofu destroy)"),
+    ("You're running DeepEval", "scoring (LLM judge) + persist"),
+]
+ts_re = re.compile(r"^\[TS (\d+(?:\.\d+)?)\] (.*)$")
+found = []
+idx = 0
+try:
+    with open(log, errors="replace") as fh:
+        for line in fh:
+            if idx >= len(MARKERS):
+                break
+            m = ts_re.match(line)
+            if not m:
+                continue
+            t, content = float(m.group(1)), m.group(2)
+            for j in range(idx, len(MARKERS)):
+                if MARKERS[j][0] in content:
+                    found.append((MARKERS[j][1], min(max(t, start), end)))
+                    idx = j + 1
+                    break
+except OSError as exc:
+    print(f"    phase breakdown unavailable: {exc}")
+    raise SystemExit(0)
+
+# The agent's own span is recorded, not logged: results.json carries its
+# latency. With infrastructure, anchor it forward from "Apply complete!" and
+# split what follows into the drain; without (noop deployer), work backward
+# from where scoring begins — the agent runs immediately before it.
+labels = [label for label, _ in found]
+if latency:
+    if "scenario setup + agent execution" in labels:
+        i = labels.index("scenario setup + agent execution")
+        nxt = found[i + 1][1] if i + 1 < len(found) else end
+        cut = min(found[i][1] + latency, nxt)
+        if cut < nxt:
+            found.insert(i + 1, ("post-agent drain (verify/metrics, record)", cut))
+    elif "scoring (LLM judge) + persist" in labels:
+        i = labels.index("scoring (LLM judge) + persist")
+        found.insert(i, ("agent execution", max(found[i][1] - latency, start)))
+
+print(f"    ── devops-bench phase breakdown for {task} ──")
+if not found:
+    print("    no phase markers found in the log; cannot split the run")
+else:
+    bounds = [("harness startup (uv sync, imports, task load)", start)] + found + [("(end)", end)]
+    total = max(end - start, 1e-9)
+    for (label, t0), (_, t1) in zip(bounds, bounds[1:]):
+        d = max(t1 - t0, 0.0)
+        print(f"    {d:9.1f}s {100 * d / total:6.1f}%  {label}")
+    print(f"    {total:9.1f}s  100.0%  total devops-bench run")
+    if latency:
+        print(f"    (agent latency from results.json: {latency:.1f}s)")
+PY
+}
+
 # 1. Target Cluster Context
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
-trap dump_prow_artifacts_on_failure EXIT
+
+# Print the profile on every exit — success, gate failure, or a set -e death —
+# then hand the original exit code to the artifact dumper ci-env.sh provides.
+profile_and_dump_on_exit() {
+  local exit_code=$?
+  profile_report "${exit_code}"
+  (exit "${exit_code}")
+  dump_prow_artifacts_on_failure
+}
+trap profile_and_dump_on_exit EXIT
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
+profile_begin "cluster-auth: gcloud get-credentials"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
 gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
@@ -31,7 +203,48 @@ gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION
   $GKE_DNS_ENDPOINT_FLAG
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
+# 2b. Seeded-fleet credentials, one kubeconfig per fixture ROLE.
+#
+# The get-credentials above is the ONLY one this script used to do, and it
+# points at platform-agent-host. The seeded fleet (bench/tf/fleet/) is other
+# clusters, so a cluster-state check reading the ambient kubeconfig asks the
+# wrong API server -- blocker A5 in bench/tasks/DRAFTS.md. This writes the
+# fleet's credentials into their own files, keyed by fixture role, and touches
+# neither the ambient kubeconfig nor the current context.
+#
+# Clusters are found by label rather than by name, so this does not need to
+# know the leased project's cluster prefix or region.
+#
+# Non-fatal by design: an unreachable seeded cluster -- or a leased project the
+# fleet was never applied to -- leaves its roles' files absent, and
+# `fleet_resource_property` turns that into status=error naming the role and
+# the project: failing the checks that needed that cluster rather than the job,
+# and never silently reading platform-agent-host instead.
+#
+# It runs on every presubmit even though every task that consumes it is still
+# commented out of TASKS below, and that is deliberate rather than an oversight.
+# The six fleet tasks cannot be switched on until this step is known to work in
+# whichever project Boskos leases, and the only way to know that is to run it:
+# its per-project warnings ("carries no clusters labelled environment=seeded")
+# are the signal that a pool project still needs bench/tf/fleet applied, and
+# they are wanted BEFORE those tasks start gating PRs, not after. It costs one
+# clusters.list, one get-credentials per seeded cluster, and one namespace read
+# per probe -- seconds, against a job measured in tens of minutes.
+#
+# The `||` catches a REPOSITORY bug only: a missing or malformed
+# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
+# environmental failure -- no fleet in this project, a cluster that will not
+# answer, a fixture that was never planted -- returns 0 with a warning of its
+# own and leaves the affected roles' files absent, which is the whole design.
+profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
+STEP_START=$SECONDS
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
+
 # 3. Agent & Harness Configuration
+profile_begin "config: env, platform-agent token fetch, prereqs"
 # Configures devops-bench runner to target deployed platform-agent service
 export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
@@ -82,8 +295,88 @@ fi
 export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
 export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
 export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
-echo "Task cluster for this run: ${EVAL_CLUSTER_NAME}"
+echo "Per-run task cluster name (used unless a task reuses the seeded fleet, section 3b): ${EVAL_CLUSTER_NAME}"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
+# The per-run defaults above are what every task gets unless its stack opts
+# into seeded-cluster reuse below; the loop re-exports one set or the other
+# per task, and this is the value it restores.
+EVAL_DEFAULT_LOCATION="${GCP_LOCATION}"
+
+# 3b. Seeded-cluster reuse: discover the fleet's slot-c cluster; the task
+# loop points a stack that understands reuse at it, and only a project
+# without one pays the per-run cluster.
+#
+# The gpu-stress-test stack's cluster hosts no workloads at all (its main.tf
+# says why it exists: TFDeployer.get_cluster_info() needs a real cluster to
+# hand get-credentials). The incident it plants is two Cloud Logging entries
+# that merely NAME a cluster -- so when the leased project carries the seeded
+# fleet (bench/tf/fleet), an existing fleet cluster serves as that name and
+# the run pays neither the ~6-minute provision nor the ~8-minute teardown.
+# The discovery filter is the fleet's documented address (both labels from
+# `local.cluster_labels` in bench/tf/fleet/main.tf), the same one
+# hack/fleet-kubeconfigs.sh uses. This block is the one sanctioned addresser
+# of a seeded cluster outside that catalog chain, and the catalog's own
+# description (bench/tf/fleet/fixtures.json) names it as the exception.
+#
+# ONLY slot c, never another slot. Slot a carries the planted namespace
+# defects -- including a real, live HPA at max replicas (fixture
+# hpa-saturated) that an agent investigating this task's *synthetic* HPA
+# incident could stumble into and report instead, turning a correct fixture
+# into a wrong answer. Slot b's held-back control plane is upgrade bait of
+# the same kind. Slot c's only defect (no master authorized networks) is
+# invisible to a log-analysis task. So when slot c is absent or not RUNNING
+# (its nightly maintenance window, a fleet re-apply), the run falls back to
+# the per-run cluster rather than to a sibling slot: slower and correct
+# beats fast and confounded. Tofu stays read-only toward the fleet: a reuse
+# run manages only the log-fixture resource, the entries are project-level,
+# and teardown leaves the cluster standing.
+SEEDED_TASK_CLUSTER=""
+SEEDED_TASK_LOCATION=""
+SEEDED_C_LINES="$(gcloud container clusters list --project "${PROJECT_ID}" \
+  --filter="resourceLabels.managed-by=kube-agents-seeded-fleet AND resourceLabels.environment=seeded AND status=RUNNING" \
+  --format="value(name,location)" 2>/dev/null | sort | awk '$1 ~ /-c$/' || true)"
+if [ "$(printf '%s\n' "${SEEDED_C_LINES}" | grep -c .)" -gt 1 ]; then
+  # Same rule as hack/fleet-kubeconfigs.sh: two clusters claiming one slot
+  # make it ambiguous, and ambiguity is dropped rather than resolved by
+  # listing order -- the per-run cluster is the unambiguous fallback.
+  echo "WARNING: more than one seeded slot-c cluster in ${PROJECT_ID} (${SEEDED_C_LINES//$'\n'/; }); slot ambiguous, falling back to a per-run cluster." >&2
+elif [ -n "${SEEDED_C_LINES}" ]; then
+  SEEDED_TASK_CLUSTER="$(printf '%s' "${SEEDED_C_LINES}" | awk '{ print $1 }')"
+  SEEDED_TASK_LOCATION="$(printf '%s' "${SEEDED_C_LINES}" | awk '{ print $2 }')"
+fi
+
+# Fail-safe before trusting the shared cluster: the agent under test holds a
+# write-capable credential, and one misbehaving run that deploys into the
+# seeded cluster's default namespace would otherwise trip the gpu task's
+# catastrophic safeguard ("no Deployments in default") on every LATER pull
+# request, persistently and misattributed -- a per-run cluster took that
+# damage to the grave, a standing one keeps it. Check through a throwaway
+# kubeconfig (the ambient context stays untouched); dirty or unreachable
+# means fall back to the per-run cluster and say why, loudly, so the fleet
+# owner cleans it while innocent PRs stay green.
+if [ -n "${SEEDED_TASK_CLUSTER}" ]; then
+  SEEDED_KUBECONFIG="$(mktemp)"
+  SEEDED_LEFTOVER=""
+  if KUBECONFIG="${SEEDED_KUBECONFIG}" gcloud container clusters get-credentials \
+    "${SEEDED_TASK_CLUSTER}" --location "${SEEDED_TASK_LOCATION}" --project "${PROJECT_ID}" --quiet >/dev/null 2>&1 \
+    && SEEDED_LEFTOVER="$(KUBECONFIG="${SEEDED_KUBECONFIG}" kubectl get deployments -n default -o name --request-timeout=30s 2>/dev/null)"; then
+    if [ -n "${SEEDED_LEFTOVER}" ]; then
+      echo "WARNING: seeded cluster ${SEEDED_TASK_CLUSTER} default namespace holds ${SEEDED_LEFTOVER//$'\n'/, } -- a previous run's agent left it dirty. Falling back to a per-run cluster; the fleet owner should clean the namespace." >&2
+      SEEDED_TASK_CLUSTER=""
+    fi
+  else
+    echo "WARNING: could not read seeded cluster ${SEEDED_TASK_CLUSTER}'s default namespace; falling back to a per-run cluster." >&2
+    SEEDED_TASK_CLUSTER=""
+  fi
+  rm -f "${SEEDED_KUBECONFIG}"
+fi
+
+if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${SEEDED_TASK_LOCATION}" ]; then
+  echo "Seeded fleet found: tasks whose stack declares reuse_existing_cluster will target ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}) instead of a per-run cluster"
+else
+  SEEDED_TASK_CLUSTER=""
+  echo "No reusable seeded slot-c cluster in ${PROJECT_ID}; infra tasks provision per-run cluster ${EVAL_CLUSTER_NAME}"
+fi
 
 # Stamp the run onto every labelable GCP resource the stacks create, alongside
 # the fixed managed-by label the cluster module applies. These say *which* run
@@ -136,13 +429,27 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # The ten domain scenarios, registered here but commented out. Uncommenting
-  # is the LAST step of activation, not the only one: bench/tasks/DRAFTS.md
-  # carries an activation-blockers section and a per-scenario status column,
-  # and every entry below is blocked on at least one of them today. The
-  # task-registration lint counts a commented entry as registered.
+  # The ten domain scenarios. ONE is active -- cluster-agent-crashloop-debug,
+  # immediately below -- and nine are registered here commented out.
+  # Uncommenting is the LAST step of activation, not the only one:
+  # bench/tasks/DRAFTS.md carries an activation-blockers section and a
+  # per-scenario status column, and every commented entry is blocked on at
+  # least one of them today. The task-registration lint counts a commented
+  # entry as registered; the domain-coverage lint counts only an uncommented
+  # one, so activating a scenario also deletes its domain from the allowlist
+  # in docs/designs/domains.yaml.
   #
-  # Summarised, so a reader here does not have to guess:
+  # cluster-agent-crashloop-debug went first because it was blocked on A5 and
+  # nothing else -- no GitHub write, so no A1 and no A4 -- and because it
+  # exercises the whole of step 2b end to end: label discovery, slot-to-role
+  # resolution, the .confirmed probe, and fleet_resource_property binding the
+  # role to a kubeconfig. Proving that chain in a real Prow run against a
+  # randomly leased project, before six ledger-writing scenarios are stacked
+  # on it, is worth one round trip.
+  "./tasks/cluster-agent-crashloop-debug/task.yaml"
+  #
+  # The nine still off, and the blockers holding them, summarised so a reader
+  # here does not have to guess:
   #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
   #       every fleet-audit stream mints a GitHub token and writes a ledger
   #       issue. ci-deploy.sh installs the PR's agent on every run but never
@@ -153,26 +460,45 @@ TASKS=(
   #       throwaway eval GitOps repos) and the minter scoped to it -- the
   #       token has exactly one source and no inherited GITHUB_TOKEN is
   #       honoured, so the value alone only moves the failure to the clone.
-  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
-  #       (2026-08-28 for the pool, 2026-09-20 for the disks).
+  #       Both repository halves are on main; what is left is the Prow job
+  #       exporting EVAL_GITHUB_APP_ID, which is
+  #       GoogleCloudPlatform/oss-test-infra#2661 -- approved, not merged.
+  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules.
+  #       Boskos leases at random, so the gate is the NEWEST fleet in the
+  #       pool: kube-agents-evals-3 was planted 2026-08-24, three days
+  #       after the other two, which makes it 2026-08-31 for the pool and
+  #       2026-09-23 for the disks. A replant in any pool project moves
+  #       them.
   #   A4  cleared in the code, open on one credential. The six audit
   #       scenarios' objectives no longer read the final message (which the
   #       SOPs keep to one line); they use ledger_issue_contains, which reads
   #       the GitHub ledger issue the run published and proves it is THIS
   #       run's by the generated-at stamp audit_report.py renders into it.
   #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
-  #       issues:read on the eval GitOps repos, which this script does not
-  #       export and Prow does not supply -- provision it with A1's minter
-  #       work. Until then those checks return status=error, which drops
+  #       issues:read on the eval GitOps repos. The secret now exists
+  #       (kube-agents-bench-github-token, namespace test-pods); mounting it
+  #       is the same oss-test-infra#2661, approved and not merged. Until it
+  #       lands those checks return status=error, which drops
   #       VerificationCoverage below the gate's 1.0 floor by design.
-  #   A5  every resource_property safeguard in the corpus (six scenarios,
-  #       cluster-agent-crashloop-debug included) reads the ambient
-  #       kubeconfig, and the only get-credentials above is for
-  #       platform-agent-host. The seeded namespaces are on seeded cluster A,
-  #       so those catastrophic safeguards error and red the presubmit for
-  #       every PR in the repo. Needs the runner to fetch the seeded
-  #       clusters' credentials and each check to name one via the
-  #       verifier's `kubeconfig` field.
+  #   A5  CLEARED, and that is what the active entry above rests on. Step 2b
+  #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
+  #       fleet safeguards use `fleet_resource_property` with a
+  #       `fixture_role:` instead of reading the ambient kubeconfig (which
+  #       is platform-agent-host and carries no seeded namespace). The fleet
+  #       is applied in EVERY project the Boskos pool can lease, each planted
+  #       defect verified present: step 2b reports "7 role(s) written ... 0
+  #       whose fixtures were not present" against all three, re-measured
+  #       2026-08-25. The five other fleet scenarios were never held by A5
+  #       alone -- each also carries A1, A3 or A4 -- so they stay commented
+  #       out on those, and DRAFTS.md's status column no longer names A5 at
+  #       all. One residual, which is hardening rather than a gate: with
+  #       FLEET_READONLY_SA unset the role kubeconfigs carry the runner's own
+  #       identity, which can write to the shared fleet
+  #       (roles/container.admin via the GKE IAM webhook, nothing to narrow
+  #       in-cluster). The checks read correctly either way; the safeguard
+  #       above is in fact what would DETECT such a write.
+  #       bench/tf/fleet/README.md, "A read-only credential for
+  #       evaluations", has the closing steps.
   #
   # Two entries are not activatable by uncommenting at all:
   #   autoops-warning-event-triage -- its prompt is a meta-note and nothing
@@ -190,7 +516,6 @@ TASKS=(
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
   # "./tasks/rca-remediation-pr/task.yaml"
-  # "./tasks/cluster-agent-crashloop-debug/task.yaml"
   # "./tasks/autoops-warning-event-triage/task.yaml"
 )
 
@@ -212,6 +537,18 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
+# Reads infrastructure.stack out of a task file, same parsing posture as
+# task_deployer. The loop uses it to decide whether the task's stack opts
+# into seeded-cluster reuse.
+task_stack() {
+  python3 -c "
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r'^\s*stack:\s*(.+?)\s*\$', text, re.M)
+print(m.group(1).strip('\'\"') if m else '')
+" "$1" 2>/dev/null || echo ""
+}
+
 # Does the task declare a verification_spec? Same parsing posture as
 # task_deployer: a regex over the raw file, erring toward "1" (spec present)
 # is the fail-closed direction -- a spec task whose deterministic keys never
@@ -229,6 +566,7 @@ INFRA_FAILED_TASKS=()
 
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
+  profile_begin "task ${TASK_NAME}: devops-bench run"
   TASK_START=$SECONDS
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) <<<"
 
@@ -244,11 +582,40 @@ for TASK in "${TASKS[@]}"; do
   export BENCH_NO_INFRA="false"
   echo "Executing with deployer=${DEPLOYER:-unknown} BENCH_NO_INFRA=${BENCH_NO_INFRA}"
 
+  # Seeded-cluster reuse is per task, opted into by the task's own stack:
+  # only a stack that declares `variable "reuse_existing_cluster"` knows to
+  # plan nothing when handed an existing cluster's name. Handing that name
+  # to any other tofu stack would make it try to CREATE the seeded cluster
+  # and 409 on every run in every fleet-carrying project -- so a task whose
+  # stack has not opted in gets the per-run name and location restored, and
+  # so do the {{GKE_CLUSTER_NAME}}/{{CLUSTER_NAME}} placeholders its prompt
+  # and checks resolve against.
+  TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
+  if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
+    && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
+    export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+    export CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+    export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}"
+    export GCP_LOCATION="${SEEDED_TASK_LOCATION}"
+    export TF_VAR_reuse_existing_cluster="true"
+    echo "Task ${TASK_NAME}: reusing seeded cluster ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}); no per-run task cluster will be created"
+  else
+    export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+    export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+    export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
+    export GCP_LOCATION="${EVAL_DEFAULT_LOCATION}"
+    unset TF_VAR_reuse_existing_cluster
+  fi
+
   # Snapshot existing result directories before running to prevent stale score leakage
   PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
   EVAL_LOG="/tmp/eval_${TASK_NAME}.log"
 
-  (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | tee "${EVAL_LOG}") || true
+  RUN_START_MS="$(_now_ms)"
+  (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | _ts_lines | tee "${EVAL_LOG}") || true
+  RUN_END_MS="$(_now_ms)"
+
+  profile_begin "task ${TASK_NAME}: classify + gate"
 
   # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS task run.
   # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
@@ -257,6 +624,8 @@ for TASK in "${TASKS[@]}"; do
   LATEST_RESULT=""
   [ -n "${NEW_RUN_DIR}" ] && LATEST_RESULT="${NEW_RUN_DIR}/results.json"
 
+  analyze_eval_phases "${EVAL_LOG}" "${RUN_START_MS}" "${RUN_END_MS}" "${TASK_NAME}" "${LATEST_RESULT}"
+
   # Classify the run. Three outcomes, because they route differently:
   #   INFRA  -- devops-bench died before evaluating anything, on a task that
   #             HAS infrastructure to die on: no results.json, or the
@@ -264,11 +633,27 @@ for TASK in "${TASKS[@]}"; do
   #             for the infra owner. A noop-deployer task prepares nothing,
   #             so its pre-record death is never weather -- it is a harness
   #             or agent crash and classifies BROKEN instead.
+  #             Also: a scored record the harness marked with
+  #             KUBE_AGENTS_INFRA_FAILURE -- see below.
   #   BROKEN -- the run died somewhere no infrastructure excuse exists: a
   #             record with no scores (the scoring pass crashed), or any
   #             pre-record death on a noop task. BLOCKS -- treating these as
   #             infra would let a crash turn the whole gate green.
   #   OK     -- a record with scores; the gate below decides.
+  #
+  # KUBE_AGENTS_INFRA_FAILURE is the marker kube_agents_bench.harness puts on
+  # errors[0] when the agent endpoint failed in transport on every attempt, so
+  # no turn ever reached the agent. The record IS scored -- the judge grades
+  # the empty output and returns 0.0 -- but there is no answer in it to grade,
+  # and gating on that score reds the PR for a pod restart. The harness raises
+  # this only after exhausting its retries on a gateway status or a dropped
+  # connection; a 4xx, a 500, or any answer the agent actually returned stays
+  # OK and is graded normally.
+  #
+  # No noop carve-out here, unlike the two branches above: those infer infra
+  # from an absent record, which a noop task cannot honestly claim, whereas
+  # this marker is the harness stating what happened. An unreachable agent
+  # endpoint is infrastructure whatever the task's deployer provisions.
   RUN_CLASS=$(python3 -c "
 import json, os
 path = '${LATEST_RESULT}'
@@ -288,7 +673,13 @@ else:
             print('BROKEN' if deployer == 'noop' else 'INFRA')
         else:
             rec = data[0] if isinstance(data, list) else data
-            print('OK' if rec and isinstance(rec, dict) and rec.get('scores') else 'BROKEN')
+            rec = rec if isinstance(rec, dict) else {}
+            errors = rec.get('errors') or []
+            # Before the scores test: the record carries both.
+            if any('KUBE_AGENTS_INFRA_FAILURE' in str(e) for e in errors):
+                print('INFRA')
+            else:
+                print('OK' if rec.get('scores') else 'BROKEN')
     except Exception:
         print('BROKEN')
 " 2>/dev/null || echo "BROKEN")
@@ -306,15 +697,19 @@ else:
     fi
     FAILED_TASKS+=("${TASK_NAME} (run produced no scored record)")
   elif [ "${RUN_CLASS}" = "INFRA" ]; then
-    echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation or teardown failed! (The evaluation is skipped)"
+    # RESOURCE_PREPARATION_FAILED is kept verbatim as the grep token even
+    # though the class now also covers an unreachable agent endpoint; the
+    # artifact below says which of the two it was.
+    echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation, teardown, or agent transport failed! (The evaluation is skipped)"
     ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
     mkdir -p "${ARTIFACT_DIR}"
     cp "${EVAL_LOG}" "${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log" 2>/dev/null || true
     [ -n "${NEW_RUN_DIR}" ] && cp "${EVAL_LOG}" "${NEW_RUN_DIR}/resource_prep_failure.log" 2>/dev/null || true
     echo "Saved resource preparation log to artifact: ${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log"
-    echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown error (Duration: ${TASK_DURATION}s)"
-    # Deliberately NOT appended to FAILED_TASKS: an OpenTofu stockout or a
-    # teardown race says nothing about the pull request under test, and
+    echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown or agent transport error (Duration: ${TASK_DURATION}s)"
+    # Deliberately NOT appended to FAILED_TASKS: an OpenTofu stockout, a
+    # teardown race, or an agent pod that went away mid-task says nothing
+    # about the pull request under test, and
     # redding the job for it teaches people to ignore the job. The log line
     # above and the artifact are the record; whoever owns the eval
     # infrastructure greps for RESOURCE_PREPARATION_FAILED, not the PR author.
@@ -424,6 +819,7 @@ else:
   fi
 done
 
+profile_begin "final gate + summary"
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if [ "${#INFRA_FAILED_TASKS[@]}" -gt 0 ]; then
   echo "⚠️ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Infrastructure failed for tasks (not counted against the PR): ${INFRA_FAILED_TASKS[*]}"
