@@ -186,3 +186,83 @@ func findLatestLiveTask(workerPass, url string) (*lib.Envelope, error) {
 	}
 	return lib.ParseEnvelope(resp.Message.Data)
 }
+
+// TestLiveEndToEndThroughBridge is the W3 DoD's bus path with no stand-ins:
+// the gateway (fake chat adapter in Discord's place) submits to platform on
+// the real install, W7's bridge drives the real platform agent, and the
+// real answer relays back — plus "what is it doing" answered by replay
+// while the task runs. Requires the same env as TestLiveAgainstInstallNATS
+// (worker password unused here but kept for the shared gate).
+func TestLiveEndToEndThroughBridge(t *testing.T) {
+	url := os.Getenv("A2A_LIVE_NATS_URL")
+	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
+	if url == "" || gwPass == "" || os.Getenv("A2A_LIVE_BRIDGE") != "true" {
+		t.Skip("live bridge env not set (A2A_LIVE_BRIDGE=true)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-gateway-livee2e"),
+		lib.WithNATSOptions(nats.UserInfo("gateway", gwPass), nats.CustomInboxPrefix("_INBOX.gateway")))
+	if err != nil {
+		t.Fatalf("gateway connect: %v", err)
+	}
+	defer client.Close()
+
+	mapFile := t.TempDir() + "/principal-map"
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := newFakeAdapter()
+	cfg := &Config{
+		NATSURL:          url,
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("live-test-salt"),
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = g.Run(ctx) }()
+	time.Sleep(2 * time.Second)
+
+	conv := "discord:live/e2e-" + time.Now().UTC().Format("150405")
+	adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "e2e-1",
+		Text: "What is the upgrade readiness of the fleet? Answer from the upgrade-readiness topic.",
+	}
+
+	// Beat 2 while it runs: status by replay, never forwarded to the bridge.
+	time.Sleep(8 * time.Second)
+	adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "e2e-2",
+		Text: "what is it doing",
+	}
+	waitFor(t, "status answered by replay", func() bool {
+		for _, p := range adapter.postTexts() {
+			if strings.Contains(p, "replay") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Beat 1: the real platform agent's answer, relayed back. Hermes takes
+	// its time; give it the full window.
+	deadline := time.Now().Add(4 * time.Minute)
+	for time.Now().Before(deadline) {
+		for _, p := range adapter.postTexts() {
+			low := strings.ToLower(p)
+			if strings.Contains(low, "readiness") && !strings.Contains(p, "replay") && !strings.HasPrefix(p, "⏳") {
+				t.Logf("real answer relayed (%d chars): %.200s", len(p), p)
+				return
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("no real answer relayed; posts so far: %q", adapter.postTexts())
+}
