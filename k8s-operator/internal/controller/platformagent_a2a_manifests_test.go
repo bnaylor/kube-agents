@@ -101,6 +101,11 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 		"a2a.topics.agent.platform.upgrade-readiness",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
+		// The delivery path's reply subjects: without $JS.ACK.> an explicit
+		// ack is a permissions violation and every consumer redelivers
+		// forever while TCP health stays green (the NR-5 incident class).
+		"$JS.ACK.>",
+		"$JS.FC.>",
 	} {
 		if !strings.Contains(conf, grant) {
 			t.Errorf("nats.conf missing grant %q", grant)
@@ -170,8 +175,12 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
 		// max_bytes discipline
 		"1073741824", "--discard=old",
-		// KV buckets
-		"runtime-state", "session-state",
+		// KV buckets, capped like the streams
+		"runtime-state", "session-state", "--max-bucket-size",
+		// Every stream/kv call is a $JS.API request answered on an inbox, and
+		// seed may only subscribe under _INBOX.seed.> — without the prefix
+		// override every CLI call times out and the Job can never succeed.
+		"--inbox-prefix=_INBOX.seed",
 		// posture
 		"PLAYGROUND POSTURE",
 	} {
@@ -273,5 +282,92 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	// Today's own stack is untouched by the cleanup.
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, &appsv1.Deployment{}); err != nil {
 		t.Errorf("today's Deployment missing after A2A cleanup: %v", err)
+	}
+}
+
+// Version skew must not touch the A2A branch in either direction: renderMode
+// fails closed to today, and letting that reach cleanupA2A would have a
+// one-version operator rollback tear down a live bus a newer CRD legitimately
+// rendered. Skew is a status problem, not a rendering instruction.
+func TestUnrecognizedModePreservesRunningNextStack(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// Render the next stack first.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}, sts); err != nil {
+		t.Fatalf("next stack did not render: %v", err)
+	}
+
+	// Now the skew: a mode this binary does not know.
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	fresh.Spec.Mode = ptr.To("next2")
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}, sts); err != nil {
+		t.Errorf("skew tore down the running NATS StatefulSet: %v", err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
+		t.Errorf("skew tore down the running A2A gateway: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if fresh.Status.Phase != "Degraded" {
+		t.Errorf("skew must still be reported: phase %q, want Degraded", fresh.Status.Phase)
+	}
+}
+
+// A creds Secret missing a key would render `password: ""` into nats.conf — a
+// user anyone can log in as — so the shape is repaired, while intact keys are
+// never re-rolled.
+func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	partial := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
+		Data:       map[string][]byte{"gateway-password": []byte("keep-this-value-intact-1234")},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, partial).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	got, err := r.ensureA2ACredsSecret(context.Background(), agent)
+	if err != nil {
+		t.Fatalf("ensureA2ACredsSecret failed: %v", err)
+	}
+	if string(got.Data["gateway-password"]) != "keep-this-value-intact-1234" {
+		t.Error("an intact key was re-rolled")
+	}
+	for _, key := range a2aCredsKeys {
+		if len(got.Data[key]) == 0 {
+			t.Errorf("key %q was not repaired", key)
+		}
 	}
 }

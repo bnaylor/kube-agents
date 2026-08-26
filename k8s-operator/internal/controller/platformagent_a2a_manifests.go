@@ -129,16 +129,55 @@ func randomA2APassword() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+// a2aCredsKeys is every key the creds Secret must carry; an absent or empty
+// key would render `password: ""` into nats.conf — a user anyone can log in
+// as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
+var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "sys-password"}
+
+// a2aReader returns the reader for A2A bookkeeping objects. Straight from the
+// API server on purpose: the cached client's first Get against a kind starts
+// a cluster-wide informer for it, and this path runs on every reconcile of
+// every agent — including today-mode installs that will never render the A2A
+// stack. Caching every Secret and Job in the cluster to serve that is the
+// same trade APIReader already refuses for collector discovery.
+func (r *PlatformAgentReconciler) a2aReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 // ensureA2ACredsSecret creates the per-user credential Secret once and then
 // leaves it alone: regenerating on reconcile would invalidate every connected
 // client every few seconds. It survives a flip back to `today` on purpose —
 // it is inert data, and re-enabling `next` must not re-roll credentials the
-// gateway image may have cached in a still-running pod.
+// gateway image may have cached in a still-running pod. The one thing it
+// changes on an existing Secret is a missing or empty key, which it fills.
 func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*corev1.Secret, error) {
 	name := types.NamespacedName{Name: a2aNATSName(agent) + "-creds", Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
-	err := r.Get(ctx, name, existing)
+	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
+		repaired := false
+		if existing.Data == nil {
+			existing.Data = map[string][]byte{}
+		}
+		for _, key := range a2aCredsKeys {
+			if len(existing.Data[key]) > 0 {
+				continue
+			}
+			pw, err := randomA2APassword()
+			if err != nil {
+				return nil, err
+			}
+			existing.Data[key] = []byte(pw)
+			repaired = true
+		}
+		if repaired {
+			if err := r.Update(ctx, existing); err != nil {
+				return nil, err
+			}
+		}
 		return existing, nil
 	}
 	if !errors.IsNotFound(err) {
@@ -146,7 +185,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 	}
 
 	data := map[string][]byte{}
-	for _, key := range []string{"gateway-password", "worker-password", "seed-password", "sys-password"} {
+	for _, key := range a2aCredsKeys {
 		pw, err := randomA2APassword()
 		if err != nil {
 			return nil, err
@@ -202,11 +241,17 @@ accounts {
         user: gateway
         password: "` + pw("gateway-password") + `"
         permissions {
+          # $JS.ACK.> / $JS.FC.> are the delivery path's reply subjects: an
+          # explicit ack is a publish to $JS.ACK.<stream>.<consumer>..., and
+          # push flow control answers on $JS.FC.>. Without them a consumer
+          # redelivers forever while TCP health stays green (NR-5's incident).
           publish { allow = [
             "a2a.tasks.*.*.in",
             "a2a.tasks.*.*.events",
             "$KV.session-state.>",
             "$JS.API.>",
+            "$JS.ACK.>",
+            "$JS.FC.>",
             "_INBOX.gateway.>"
           ] }
           subscribe { allow = [
@@ -224,14 +269,21 @@ accounts {
         user: worker
         password: "` + pw("worker-password") + `"
         permissions {
+          # Topic grants name the provisioned registry exactly (payload spec:
+          # topics are provisioned-only). A wildcard here would let a publish
+          # to an unprovisioned topic vanish into core NATS; the exact list
+          # turns that into a connect-time refusal instead of silent loss.
           publish { allow = [
             "a2a.tasks.*.*.events",
-            "a2a.topics.agent.platform.>",
-            "a2a.topics.shared.>",
+            "a2a.topics.agent.platform.upgrade-readiness",
+            "a2a.topics.shared.blueprint",
+            "a2a.topics.shared.annotations",
             "a2a.agents.>",
             "agents.hb.>",
             "$KV.runtime-state.>",
             "$JS.API.>",
+            "$JS.ACK.>",
+            "$JS.FC.>",
             "_INBOX.worker.>"
           ] }
           subscribe { allow = [
@@ -243,9 +295,10 @@ accounts {
         }
       }
       {
-        # seed: writes the three starter topic entries and reads them back to
-        # verify. Nothing else — a seed that can publish tasks is a seed that
-        # can impersonate the fabric.
+        # seed: provisions the streams and buckets (the $JS.API grant is what
+        # the provision Job runs under) and writes the starter topic entries
+        # (W5's seed Job). Nothing on the task plane — a seed that can publish
+        # tasks is a seed that can impersonate the fabric.
         user: seed
         password: "` + pw("seed-password") + `"
         permissions {
@@ -254,6 +307,7 @@ accounts {
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
             "$JS.API.>",
+            "$JS.ACK.>",
             "_INBOX.seed.>"
           ] }
           subscribe { allow = [
@@ -376,7 +430,10 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	server := fmt.Sprintf("nats://seed:${SEED_PASSWORD}@%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)
 	return a2aPostureComment + `
 set -euo pipefail
-NATS="nats --server ` + server + `"
+# --inbox-prefix: every stream/kv call here is a $JS.API request whose reply
+# lands on an inbox, and seed may only subscribe under _INBOX.seed.> — the
+# CLI's default _INBOX.<nuid> would be refused and every call would time out.
+NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
 
 # Retention rule (deployment spec): acknowledgement must not delete — all
 # message streams are limits-based with an age window; replay is a read.
@@ -411,10 +468,12 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 # KV buckets: runtime-state (who is alive), session-state (the gateway's
 # registry; its user is the only writer), cap (reserved for capability
 # entries per docs/architecture/09-capability-envelope.md — arms with the
-# authority work).
-$NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file
-$NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file
-$NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file
+# authority work). Capped at 256MiB each: the streams' max_bytes discipline
+# applies to KV too, or unbounded bucket growth eats the file store's
+# headroom and stalls every JetStream write.
+$NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+$NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+$NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 
 echo "a2a provisioning complete"
 `
@@ -423,6 +482,12 @@ echo "a2a provisioning complete"
 // buildA2AProvisionJob runs the provisioning script against the rendered NATS.
 // The name carries a hash of the script so a changed payload is a new Job —
 // Jobs are immutable — and completed runs clean themselves up via TTL.
+//
+// Creation is create-only convergence: the script's `info || add` lines make
+// re-runs clean but do NOT edit a stream that already exists, so a retention
+// or subject change in a later payload reaches fresh installs only. Migrating
+// an existing install is a manual `nats stream edit` — stage 1 accepts that
+// and says it here rather than implying the hash-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 	script := a2aProvisionScript(agent)
 	sum := sha256.Sum256([]byte(script))
@@ -526,64 +591,93 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	}
 }
 
+// a2aProvisionState reports where the provision Job stands, because nothing
+// watches Jobs (a Job watch would mean a cluster-wide informer every install
+// pays for; see a2aReader). Pending drives a requeue so completion — or the
+// TTL removing a finished Job — is noticed without an unrelated event; failed
+// drives a Degraded status so a dead bus is visible in `kubectl describe`
+// rather than sitting behind a Ready phase.
+type a2aProvisionState struct {
+	done    bool
+	failed  bool
+	message string
+}
+
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
 // function assumes the answer was ModeNext.
-func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
+	state := a2aProvisionState{}
+
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
 	if err != nil {
-		return fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
+		return state, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
 	}
 
 	config := buildA2ANATSConfigSecret(agent, creds)
 	if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
-		return err
+		return state, err
 	}
 	if err := r.applyManaged(ctx, agent, config); err != nil {
-		return fmt.Errorf("failed to apply A2A NATS config: %w", err)
+		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
 	sts := buildA2ANATSStatefulSet(agent)
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
-		return err
+		return state, err
 	}
 	if err := r.applyManaged(ctx, agent, sts); err != nil {
-		return fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+		return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
 	}
 
 	svc := buildA2ANATSService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
-		return err
+		return state, err
 	}
 	if err := r.applyManaged(ctx, agent, svc); err != nil {
-		return fmt.Errorf("failed to apply A2A NATS Service: %w", err)
+		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
 	// content-hashed name; a payload change is a new name and a fresh run.
 	job := buildA2AProvisionJob(agent)
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
-		return err
+		return state, err
 	}
 	withCommonLabels(job, agent)
 	existing := &batchv1.Job{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(job), existing); err != nil {
+	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(job), existing); err != nil {
 		if !errors.IsNotFound(err) {
-			return err
+			return state, err
 		}
 		if err := r.Create(ctx, job); err != nil {
-			return fmt.Errorf("failed to create A2A provision Job: %w", err)
+			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
+		}
+	} else {
+		for _, cond := range existing.Status.Conditions {
+			if cond.Status != corev1.ConditionTrue {
+				continue
+			}
+			switch cond.Type {
+			case batchv1.JobComplete:
+				state.done = true
+			case batchv1.JobFailed:
+				state.failed = true
+				state.message = fmt.Sprintf(
+					"A2A provision Job %s failed (%s: %s); the bus has no streams until it succeeds. Inspect its pod logs; deleting the Job retries.",
+					existing.Name, cond.Reason, cond.Message)
+			}
 		}
 	}
 
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
-		return err
+		return state, err
 	}
 	if err := r.applyManaged(ctx, agent, dep); err != nil {
-		return fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
+		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
-	return nil
+	return state, nil
 }
 
 // cleanupA2A returns the dark stack to dark when the mode is not next. The
@@ -591,14 +685,22 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 // and so does the StatefulSet's PVC (JetStream's file store is the audit
 // substrate — flipping a mode is not license to destroy evidence).
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	named := []client.Object{
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}},
-		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}},
+	// Deployment/StatefulSet/Service reads come from the cache — those kinds
+	// are already watched (Owns) so the reads are free. Secret and Job reads
+	// go through a2aReader: a cached read would start a cluster-wide informer
+	// for a kind this controller otherwise never watches, on every install.
+	named := []struct {
+		obj    client.Object
+		reader client.Reader
+	}{
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
 	}
-	for _, obj := range named {
-		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+	for _, entry := range named {
+		obj := entry.obj
+		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			if client.IgnoreNotFound(err) != nil {
 				return err
 			}
@@ -614,7 +716,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 
 	// Provision Jobs carry a content hash in the name; find them by label.
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
+	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
 		a2aComponentLabel: "provision",
 		labelInstance:     instanceLabel(agent.Namespace, agent.Name),
 	}); err != nil {

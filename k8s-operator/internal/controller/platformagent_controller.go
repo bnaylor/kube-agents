@@ -301,15 +301,23 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// The mode gate: `next` additionally renders the NATS component and the
-	// A2A gateway; anything else keeps the dark stack dark — including tearing
-	// it back down after a flip, so `mode` absent renders exactly today's
-	// stack rather than today's stack plus leftovers.
-	if renderMode(instance, "nats") == ModeNext {
-		if err := r.reconcileA2A(ctx, instance); err != nil {
+	// A2A gateway; `today` keeps the dark stack dark — including tearing it
+	// back down after a flip, so `mode` absent renders exactly today's stack
+	// rather than today's stack plus leftovers. Version skew touches NEITHER
+	// branch: renderMode fails closed to today, and letting that reach
+	// cleanupA2A would have a one-version operator rollback tear down a live
+	// bus that a newer CRD's mode legitimately rendered. Skew is a status
+	// problem (below), not a rendering instruction.
+	var a2aState a2aProvisionState
+	a2aNext := modeErr == nil && renderMode(instance, "nats") == ModeNext
+	if a2aNext {
+		if a2aState, err = r.reconcileA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
-	} else if err := r.cleanupA2A(ctx, instance); err != nil {
-		return ctrl.Result{}, err
+	} else if modeErr == nil {
+		if err := r.cleanupA2A(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 9. Update status phase. While the mode is unrecognized the phase is
@@ -325,6 +333,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	if a2aState.failed {
+		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -334,6 +348,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// A2A provisioning still running — Jobs are not watched (see a2aReader),
+	// so completion, failure, and the TTL removing a finished Job are all
+	// invisible without a requeue.
+	if a2aNext && !a2aState.done {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -373,6 +394,16 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
+		// reference (nothing from a template does), so without this a
+		// deleted next-mode agent leaks its 40Gi JetStream volume.
+		a2aPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: "data-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace,
+		}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
 			return ctrl.Result{}, err
 		}
 

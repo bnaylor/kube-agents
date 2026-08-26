@@ -69,9 +69,12 @@ today's stack, and requeues. (Same pattern as `RuntimeClassNotFound`.)
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
   additive - today's path keeps running until stage 4 starts retiring pieces.
 
-The operator also writes the mode into the managed settings it already renders
-(`reconcileSettingsConfigMap`), as a single key: `KUBEAGENTS_MODE`. That is the only way
-the mode reaches the agent runtime.
+The operator also writes the mode into the managed settings it already renders, as a
+single key: `KUBEAGENTS_MODE`. (Amended by W6, delta memo #1: the draft said
+`reconcileSettingsConfigMap`, but the surface with env semantics and agent-write
+protection is the managed `.env` — `renderManagedEnv`, applied last, refused by
+`save_env_value` — so the key rides that and the config-hash rollout annotation.) That
+is the only way the mode reaches the agent runtime.
 
 ## Agent-side rule
 
