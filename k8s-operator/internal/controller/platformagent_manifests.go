@@ -346,6 +346,14 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// the several-parties-must-agree problem this closes.
 	add("API_SERVER_KEY", loopbackAgentAPIKey)
 
+	// The mode pin, also unconditional and also not about chat. The managed key
+	// is the only way the mode reaches the agent runtime, and pinning it is what
+	// keeps the agent from writing a competing answer into the PVC .env — which
+	// stack the install runs is not the agent's to decide. Deliberately absent
+	// from the container env: one delivery path means one answer
+	// (docs/designs/spec-mode-switch.md).
+	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
+
 	integration := agent.Spec.Integration
 	if integration == nil {
 		return strings.Join(lines, "\n") + "\n"
@@ -565,6 +573,14 @@ const (
 	// volume into the agent container so skills can read managed repositories directly from disk.
 	gitopsStateVolumeName = "gitops-state-volume"
 	gitopsStateDir        = "/etc/gitops"
+
+	// kubeagentsModeEnvKey carries the mode switch into the managed .env — the
+	// only way the mode reaches the agent runtime (docs/designs/spec-mode-switch.md).
+	// Agent-side, exactly one reader exists: agents/platform/scripts/runtime_mode.py.
+	// The spec's grep rule holds the pair to that: a third code site naming this
+	// key is a review comment, so new readers go through runtime_mode, and any
+	// operator-side use goes through this constant.
+	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
 )
 
 // loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
