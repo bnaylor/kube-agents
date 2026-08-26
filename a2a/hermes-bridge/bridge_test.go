@@ -96,10 +96,16 @@ func script(t *testing.T, body string) []string {
 // consumer, so a submission published right after cannot race the subscribe.
 func startBridge(t *testing.T, url string, command []string) {
 	t.Helper()
+	startBridgeN(t, url, command, 0)
+}
+
+func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	b, err := New(ctx, Config{
 		NATSURL:      url,
 		Command:      command,
+		Concurrency:  concurrency,
 		TaskDeadline: 20 * time.Second,
 		KillGrace:    500 * time.Millisecond,
 	})
@@ -516,6 +522,67 @@ func TestLifecycle_TerminalTaskTrafficIgnored(t *testing.T) {
 	time.Sleep(1 * time.Second)
 	if after := len(replayEvents(t, url, "task-done")); after != before {
 		t.Fatalf("post-terminal follow-up grew events %d -> %d", before, after)
+	}
+}
+
+// Assertion 12 for a QUEUED task: a steer arriving while the run waits for
+// a worker slot answers with the task's actual state (submitted), not
+// working - a follow-up must not change folded state by itself.
+func TestLifecycle_SteerToQueuedTaskAnswersSubmitted(t *testing.T) {
+	_, url := startServer(t)
+	marker := filepath.Join(t.TempDir(), "started")
+	startBridgeN(t, url, script(t, fmt.Sprintf(`touch %s.$1
+sleep 3
+echo done`, marker)), 1)
+	c := gatewayClient(t, url)
+
+	// First task occupies the single worker slot; second stays queued.
+	submit(t, c, "task-slot", "hold-the-slot")
+	waitFor(t, 10*time.Second, "first subprocess start", func() bool {
+		_, err := os.Stat(marker + ".hold-the-slot")
+		return err == nil
+	})
+	queued := submit(t, c, "task-queued", "wait-your-turn")
+	waitFor(t, 10*time.Second, "queued task submitted", func() bool {
+		task, err := c.TasksGet(testCtx(t), "platform", "task-queued")
+		return err == nil && task.State == lib.StateSubmitted
+	})
+
+	steer, err := lib.NewFollowUpEnvelope(queued, gatewayParty,
+		messagePayload(t, queued.TaskID, queued.ContextID, "hurry up"),
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", queued.TaskID), steer); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 10*time.Second, "steer refusal on queued task", func() bool {
+		for _, env := range replayEvents(t, url, queued.TaskID) {
+			if env.Kind != lib.KindStatusUpdate {
+				continue
+			}
+			var s lib.StatusUpdate
+			if json.Unmarshal(env.Payload, &s) != nil {
+				continue
+			}
+			if s.Status.Message != nil && strings.Contains(s.Status.Message.Parts[0].Text, "cannot accept mid-run input") {
+				if s.Status.State != lib.StateSubmitted {
+					t.Fatalf("refusal state = %s, want submitted for a queued task", s.Status.State)
+				}
+				return true
+			}
+		}
+		return false
+	})
+	task := fold(t, c, queued.TaskID)
+	if task.State != lib.StateSubmitted {
+		t.Fatalf("folded state after steer = %s, want still submitted", task.State)
+	}
+	// Both tasks still finish clean.
+	if got := waitTerminal(t, c, "task-queued"); got.State != lib.StateCompleted {
+		t.Fatalf("queued task ended %s, want completed", got.State)
 	}
 }
 

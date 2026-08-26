@@ -98,10 +98,20 @@ subprocess's flush racing the sweep wins cleanly, the CAS is rejected, and the s
 re-reads instead of double-finalizing.  Whichever writer loses lands in the
 warn-and-drop path like any other post-final event.
 
-Two honest gaps, accepted for the playground: no queue-staleness guard (the lib's
-subscribe path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
-dispatcher's job when it exists), and no heartbeats on `agents.hb.>`.  Both retire with
-the bridge.
+The sweep assumes incarnations are serial.  That assumption is real on this install -
+the kubelet restarts the sidecar container in place, and the operator renders the agent
+Deployment with strategy `Recreate`, so two bridges never run at once.  It is an
+assumption, not a mechanism: an overlapping incarnation could sweep-fail a task its
+predecessor is still running.  Real executor fencing belongs to the stage-3 dispatcher,
+not to scaffolding with a demolition date.
+
+Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
+path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
+dispatcher's job when it exists), no heartbeats on `agents.hb.>`, and a submission whose
+events lookup fails transiently is dropped with a log line rather than redelivered (the
+lib acks unconditionally after the handler; a nak path is a lib delta if it ever bites).
+All retire with the bridge.  Zombie reaping is the pod's problem, not ours - the agent
+pod shares its process namespace, so the pause container reaps what group kills orphan.
 
 ## Definition of done
 

@@ -98,9 +98,13 @@ type taskRun struct {
 	origin *lib.Envelope
 	exec   *lib.TaskExecution
 
-	mu    sync.Mutex
-	state runState
-	proc  *exec.Cmd
+	// mu guards state, proc, and killTimers - and is held across the
+	// finalize publish, so a steer refusal can never land after the final
+	// event: whoever holds the lock sees the true state before publishing.
+	mu         sync.Mutex
+	state      runState
+	proc       *exec.Cmd
+	killTimers []*time.Timer
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -123,6 +127,10 @@ type Bridge struct {
 	tasks map[string]*taskRun
 	queue chan *taskRun
 	wg    sync.WaitGroup
+
+	// closing marks shutdown, so a worker whose subprocess died to the
+	// shutdown SIGKILL reports bridge-shutdown, not a bogus exit code.
+	closing atomic.Bool
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -195,15 +203,20 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile)
 	<-ctx.Done()
+	b.closing.Store(true)
 	sub.Stop()
-	close(b.queue)
+	// The queue is never closed: Stop does not join an in-flight handler
+	// callback, and a handler mid-accept sending into a closed channel would
+	// panic the whole shutdown. Workers exit on ctx instead; anything still
+	// queued is finalized by shutdownTasks below.
 	b.shutdownTasks()
 	b.wg.Wait()
 	return nil
 }
 
-// shutdownTasks kills running subprocesses and writes terminal failed for
-// every non-done task.
+// shutdownTasks kills running subprocesses and finalizes every task still
+// open. A worker unblocked by the kill may finalize with the real outcome
+// first - finalize is idempotent and whoever wins writes exactly once.
 func (b *Bridge) shutdownTasks() {
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -211,31 +224,17 @@ func (b *Bridge) shutdownTasks() {
 		runs = append(runs, r)
 	}
 	b.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	for _, r := range runs {
 		r.mu.Lock()
-		wasRunning := r.state == stateRunning
-		if r.state != stateDone {
-			r.state = stateDone
-		} else {
-			r.mu.Unlock()
-			continue
+		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
+			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
 		}
-		proc := r.proc
 		r.mu.Unlock()
-		if wasRunning && proc != nil && proc.Process != nil {
-			_ = syscall.Kill(-proc.Process.Pid, syscall.SIGKILL)
-			// The runner goroutine sees stateDone and leaves the terminal
-			// event to us.
-		}
-		if err := b.publishTerminal(ctx, r, lib.StateFailed, "reason: bridge-shutdown - the bridge was terminated while this task was in flight"); err != nil {
-			b.cfg.Logger.Error("shutdown terminal publish failed", "task", r.origin.TaskID, "err", err)
-			continue
-		}
-		b.clearInFlight(ctx, r.origin.TaskID)
+		b.finalize(r, lib.StateFailed, shutdownReason, nil)
 	}
 }
+
+const shutdownReason = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
 
 // handle dispatches one envelope from the in subject. Anything it publishes
 // happens before returning, ie before the consumer ack - a bridge death in
@@ -311,7 +310,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	case b.queue <- run:
 	default:
 		// 1024 queued tasks on a playground bridge is a fault, not load.
-		b.finishRun(ctx, run, lib.StateFailed, "reason: bridge-queue-overflow")
+		b.finalize(run, lib.StateFailed, "reason: bridge-queue-overflow", nil)
 	}
 }
 
@@ -325,20 +324,16 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	}
 	run.canceled.Store(true)
 	run.mu.Lock()
-	if run.state == statePending {
-		// Not yet spawned: terminal now; the worker skips done runs.
-		run.state = stateDone
-		run.mu.Unlock()
-		b.terminalAndClear(ctx, run, lib.StateCanceled, "reason: canceled-before-start")
-		return
+	pending := run.state == statePending
+	if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {
+		b.killGroup(run, run.proc.Process.Pid)
 	}
-	proc := run.proc
-	running := run.state == stateRunning
 	run.mu.Unlock()
-	if running && proc != nil && proc.Process != nil {
-		b.killGroup(proc.Process.Pid)
+	if pending {
+		// Not yet spawned: terminal now; the worker skips done runs.
+		b.finalize(run, lib.StateCanceled, "reason: canceled-before-start", nil)
 	}
-	// The runner goroutine publishes terminal canceled when the process exits.
+	// For a running task the runner publishes terminal canceled on exit.
 }
 
 // cancelOrphan handles cancel for a task the bridge is not running: if its
@@ -355,7 +350,7 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 	case task.Final:
 		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
 	default:
-		if err := b.synthesizeTerminal(ctx, env.TaskID, task, lib.StateCanceled,
+		if err := b.synthesizeTerminal(ctx, env.TaskID, lib.StateCanceled,
 			"reason: canceled-while-orphaned - no live executor held this task"); err != nil {
 			b.cfg.Logger.Error("orphan cancel synthesis failed", "task", env.TaskID, "err", err)
 		}
@@ -363,19 +358,38 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 }
 
 // refuseSteer answers a mid-run follow-up honestly: hermes chat -q is
-// one-shot, there is no stdin to inject into. Non-final working status, no
-// state change (payload spec assertion 12's steering half).
+// one-shot, there is no stdin to inject into. The refusal is a non-final
+// status carrying the task's CURRENT state - a follow-up must not change
+// folded state by itself (assertion 12), so a queued task answers
+// submitted, a spawned one working. Published under run.mu, so it can
+// never land after the final event finalize writes under the same lock.
 func (b *Bridge) refuseSteer(ctx context.Context, run *taskRun, steer *lib.Envelope) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state == stateDone {
+		b.cfg.Logger.Warn("message for a task with a terminal event; ignoring", "task", steer.TaskID)
+		return
+	}
+	state := lib.StateWorking
+	if run.state == statePending {
+		state = lib.StateSubmitted
+	}
 	msg := "steering received but not absorbed: the Hermes CLI runs one-shot and cannot " +
 		"accept mid-run input. The task continues on its original instruction; cancel if that is wrong."
-	if err := b.publishStatusMessage(ctx, run, lib.StateWorking, false, msg); err != nil {
+	if err := b.publishStatusMessage(ctx, run, state, false, msg); err != nil {
 		b.cfg.Logger.Error("steer refusal publish failed", "task", steer.TaskID, "err", err)
 	}
 }
 
 func (b *Bridge) worker(ctx context.Context) {
 	defer b.wg.Done()
-	for run := range b.queue {
+	for {
+		var run *taskRun
+		select {
+		case <-ctx.Done():
+			return
+		case run = <-b.queue:
+		}
 		run.mu.Lock()
 		if run.state != statePending {
 			run.mu.Unlock()
@@ -391,13 +405,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	taskID := run.origin.TaskID
 	prompt, ok := promptFromMessage(run.origin.Payload)
 	if !ok {
-		b.finishRun(ctx, run, lib.StateRejected,
-			"reason: no-text-parts - the submission message carries nothing the hermes CLI can be asked")
+		b.finalize(run, lib.StateRejected,
+			"reason: no-text-parts - the submission message carries nothing the hermes CLI can be asked", nil)
 		return
 	}
 	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
-		b.finishRun(ctx, run, lib.StateFailed, "reason: bus-publish-failed at working")
+		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return
 	}
 
@@ -411,77 +425,96 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 
 	run.mu.Lock()
 	if run.state != stateRunning {
-		// Shutdown or cancel got here first.
+		// Shutdown or cancel finalized first.
 		run.mu.Unlock()
 		return
 	}
 	if err := cmd.Start(); err != nil {
 		run.mu.Unlock()
-		b.finishRun(ctx, run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err))
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
 		return
 	}
 	run.proc = cmd
+	// Cancel may have raced the spawn: its kill saw no process, so re-check
+	// under the same lock its kill path takes.
+	if run.canceled.Load() {
+		b.killGroup(run, cmd.Process.Pid)
+	}
 	run.mu.Unlock()
 
-	// Cancel may have raced the spawn: its kill saw no process, so re-check.
-	if run.canceled.Load() {
-		b.killGroup(cmd.Process.Pid)
-	}
 	deadline := time.AfterFunc(b.cfg.TaskDeadline, func() {
 		run.deadlineHit.Store(true)
-		b.killGroup(cmd.Process.Pid)
+		run.mu.Lock()
+		if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {
+			b.killGroup(run, run.proc.Process.Pid)
+		}
+		run.mu.Unlock()
 	})
 	err := cmd.Wait()
 	deadline.Stop()
-
+	// The group is gone; stop any armed grace-period SIGKILLs before the
+	// pgid can be recycled onto an innocent process.
 	run.mu.Lock()
-	if run.state != stateRunning {
-		// Shutdown owns the terminal event.
-		run.mu.Unlock()
-		return
+	for _, t := range run.killTimers {
+		t.Stop()
 	}
-	run.state = stateDone
+	run.killTimers = nil
 	run.mu.Unlock()
 
 	switch {
 	case err == nil:
 		// A canceled task that finished anyway won the race: completed wins,
 		// per the payload spec's cancel mapping.
-		if perr := b.publishResult(ctx, run, stdout.String()); perr != nil {
-			b.cfg.Logger.Error("result publish failed", "task", taskID, "err", perr)
-			b.terminalAndClear(ctx, run, lib.StateFailed, "reason: bus-publish-failed at result")
-			return
-		}
-		b.terminalAndClear(ctx, run, lib.StateCompleted, "")
+		out := stdout.String()
+		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
-		b.terminalAndClear(ctx, run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline))
+		b.finalize(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), nil)
 	case run.canceled.Load():
-		b.terminalAndClear(ctx, run, lib.StateCanceled, "reason: canceled-by-request")
+		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
+	case b.closing.Load():
+		// Killed by shutdownTasks; name the real cause, not the exit code.
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
-		b.terminalAndClear(ctx, run, lib.StateFailed,
-			fmt.Sprintf("reason: hermes-exited-nonzero - %v; stderr tail: %s", err, stderr.String()))
+		b.finalize(run, lib.StateFailed,
+			fmt.Sprintf("reason: hermes-exited-nonzero - %v; stderr tail: %s", err, stderr.String()), nil)
 	}
 }
 
-// finishRun marks the run done (if a worker still owns it) and writes the
-// terminal event.
-func (b *Bridge) finishRun(ctx context.Context, run *taskRun, state lib.TaskState, msg string) {
+// finalize is the single writer of a task's terminal event, idempotent: the
+// first caller wins, later callers see stateDone and leave. A non-nil
+// resultOutput publishes the result artifact ahead of the terminal event
+// inside the same critical section, so a racing finalizer cannot slip its
+// final in between. Publishes ride a fresh bounded context, never the
+// caller's - the terminal event must go out even when the caller's context
+// is already canceled, which is exactly what shutdown looks like.
+func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultOutput *string) {
 	run.mu.Lock()
+	if run.state == stateDone {
+		run.mu.Unlock()
+		return
+	}
 	run.state = stateDone
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	if resultOutput != nil {
+		if err := b.publishResult(ctx, run, *resultOutput); err != nil {
+			b.cfg.Logger.Error("result publish failed", "task", run.origin.TaskID, "err", err)
+			state, msg = lib.StateFailed, "reason: bus-publish-failed at result"
+		}
+	}
+	err := b.publishTerminal(ctx, run, state, msg)
+	cancel()
 	run.mu.Unlock()
-	b.terminalAndClear(ctx, run, state, msg)
-}
-
-func (b *Bridge) terminalAndClear(ctx context.Context, run *taskRun, state lib.TaskState, msg string) {
-	if err := b.publishTerminal(ctx, run, state, msg); err != nil {
+	if err != nil {
 		// The task stays in the KV registry, so a restart's sweep writes the
 		// terminal event this publish could not.
 		b.cfg.Logger.Error("terminal publish failed; sweep will finalize",
 			"task", run.origin.TaskID, "state", state, "err", err)
 		return
 	}
-	b.clearInFlight(ctx, run.origin.TaskID)
+	cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	b.clearInFlight(cctx, run.origin.TaskID)
+	ccancel()
 	b.mu.Lock()
 	delete(b.tasks, run.origin.TaskID)
 	b.mu.Unlock()
@@ -555,11 +588,16 @@ func (b *Bridge) publishResult(ctx context.Context, run *taskRun, output string)
 	return nil
 }
 
-func (b *Bridge) killGroup(pid int) {
+// killGroup SIGTERMs the subprocess group and arms a SIGKILL for the grace
+// period. Caller holds run.mu. The timer is remembered so the reaper stops
+// it once the group is gone - an unstopped timer could SIGKILL a recycled
+// pgid belonging to somebody else.
+func (b *Bridge) killGroup(run *taskRun, pid int) {
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	time.AfterFunc(b.cfg.KillGrace, func() {
+	t := time.AfterFunc(b.cfg.KillGrace, func() {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	})
+	run.killTimers = append(run.killTimers, t)
 }
 
 // chunkString splits s into size-byte pieces on byte boundaries; an empty s
