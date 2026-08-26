@@ -21,7 +21,9 @@ ALLOWED = {
     "agents/platform/scripts/runtime_mode.py",  # the reader
 }
 
-SKIP_DIRS = {".git", ".worktrees", "docs", "node_modules", "bin", "vendor", "__pycache__"}
+# testdata is excluded with the test files: golden fixtures are captured
+# renders of the one legitimate writer, not code sites of their own.
+SKIP_DIRS = {".git", ".worktrees", "docs", "node_modules", "bin", "vendor", "__pycache__", "testdata"}
 
 
 def _is_test_file(path: pathlib.Path) -> bool:

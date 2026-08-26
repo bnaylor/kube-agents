@@ -150,6 +150,10 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
+// `secrets` and full `jobs` verbs exist for the mode-next A2A stack: the
+// generated NATS credentials/config Secrets and the provisioning Job.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;resourcequotas;limitranges;endpoints;pods/log,verbs=get;list;watch
@@ -293,6 +297,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// The mode gate: `next` additionally renders the NATS component and the
+	// A2A gateway; anything else keeps the dark stack dark — including tearing
+	// it back down after a flip, so `mode` absent renders exactly today's
+	// stack rather than today's stack plus leftovers.
+	if renderMode(instance, "nats") == ModeNext {
+		if err := r.reconcileA2A(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if err := r.cleanupA2A(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
