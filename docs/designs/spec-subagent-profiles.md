@@ -142,19 +142,20 @@ spec:
     limits: { cpu: "1", memory: 2Gi }
 ```
 
-| Field                                   | What it is                                                                                                                                                                                                                                                   |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `description`                           | The routing blurb - today's `CAPABILITIES.md` first line. Rendered into the A2A agent card.                                                                                                                                                                  |
-| `persona.image`                         | OCI artifact holding the persona: `SOUL.md`, `AGENTS.md`, skills, persona config. Mounted read-only via image volume, the `AgentPlugin` mechanism. (Decided 8/24: OCI-only, no `configMapRef` variant.)                                                      |
-| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below). The harness is a container image choice, nothing more.                                                                                                   |
-| `harness.model`, `maxTurns`             | Model routing and the turn budget, as in profile config today.                                                                                                                                                                                               |
-| `bus.publishTopics` / `subscribeTopics` | Topic grants beyond the task subjects every executor gets. The operator renders these into the auth callout's identity-to-permissions map; the deny-by-default posture is the deployment spec's.                                                             |
-| `identity.serviceAccountName`           | The KSA the pod runs as. Optional. Absent means the operator creates a KSA with **zero** RBAC bindings, which is the default posture - the token exists to authenticate to NATS, not to talk to the API server.                                              |
-| `clusterRef`                            | (Cluster agents only.) `{projectId, cluster, location}` as structured fields. The operator renders the scoped read-only kubeconfig from it. This also ends the parse-the-sanitized-name problem: the cluster identity is spec data, not a naming convention. |
-| `lifecycle.activeDeadlineSeconds`       | Hard ceiling on one task's wall clock, enforced by Kubernetes.                                                                                                                                                                                               |
-| `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                          |
-| `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                            |
-| `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                      |
+| Field                                   | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `description`                           | The routing blurb - today's `CAPABILITIES.md` first line. Rendered into the A2A agent card.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `persona.image`                         | OCI artifact holding the persona: `SOUL.md`, `AGENTS.md`, skills, persona config. Mounted read-only via image volume, the `AgentPlugin` mechanism - and it inherits that mechanism's availability gate: the operator already skips image-volume mounts below Kubernetes 1.35 and logs it (`platformagent_manifests.go`), so no new fallback is invented here. (Decided 8/24: OCI-only, no `configMapRef` variant.)                                                                                                                                        |
+| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below). The harness is a container image choice, nothing more.                                                                                                                                                                                                                                                                                                                                                                                                |
+| `harness.model`, `maxTurns`             | Model routing and the turn budget, as in profile config today.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `bus.publishTopics` / `subscribeTopics` | Topic grants beyond the task subjects every executor gets. The operator renders these into the auth callout's identity-to-permissions map; the deny-by-default posture is the deployment spec's.                                                                                                                                                                                                                                                                                                                                                          |
+| `identity.serviceAccountName`           | The KSA the pod runs as. Optional. Absent means the operator creates a KSA with **zero** RBAC bindings, which is the default posture - the token exists to authenticate to NATS, not to talk to the API server.                                                                                                                                                                                                                                                                                                                                           |
+| `clusterRef`                            | (Cluster agents only.) `{projectId, cluster, location}` as structured fields. The operator renders the scoped read-only kubeconfig from it. This also ends the parse-the-sanitized-name problem: the cluster identity is spec data, not a naming convention.                                                                                                                                                                                                                                                                                              |
+| `lifecycle.activeDeadlineSeconds`       | Hard ceiling on one task's wall clock, enforced by Kubernetes. The clock starts at Job spawn - queue time is bounded separately by `queueTimeoutSeconds`.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `queueTimeoutSeconds`                   | Optional, default 3600. How stale a queued submission may be before the dispatcher refuses to run it: at dequeue, if the message's JetStream server ingest timestamp is older than this, the dispatcher acks and publishes terminal `failed` (`reason: queue-deadline-exceeded`) instead of spawning a Job. A burst past `concurrency` cannot silently execute hours-stale diagnostics. The arbiter is the server ingest time, deliberately - the envelope's `ts` is publisher-asserted, and a freshness guard keyed to a spoofable field is not a guard. |
+| `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 Everything here is dark content: the dispatcher and the profile CRD render nothing unless
 the mode switch says `next`.
@@ -170,24 +171,40 @@ the requester needs zero Kubernetes permissions to delegate. (The demo's delegat
 carried a Role with pod create/delete/watch; that goes away.)
 
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
-binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. For each
-envelope it renders a Job from the `AgentProfile`. Session-addressed subjects are not in
-its grants at all. Per-profile consumers also isolate backlogs: a capped or
-crash-looping profile's unacked redeliveries cannot head-of-line block another profile's
-dispatch. Notes on the mechanics:
+binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. The
+dispatcher and the janitor run under the operator manager's leader election - the
+`--leader-elect` machinery the operator already ships, required on under `mode: next` -
+so "one dispatcher" and "exactly one final event" are elected properties, not deployment
+accidents. Scaling the operator for HA changes nothing here: followers hold no
+consumers. Only a
+task-starting submission renders a Job: before creating, the dispatcher checks the
+task's `…events` subject, and empty means new task. A task with events already is not
+the dispatcher's business - follow-ups, steers, and cancels for a live task belong to
+the in-pod adapter, and `…in` traffic for a task with a terminal event is acked with a
+warning and no Job. Without that check, a follow-up or cancel arriving after
+`ttlSecondsAfterFinished` GC'd the Job would resurrect a completed task, and every steer
+against a running Job would burn an API-server create on a 409. Session-addressed
+subjects are not in its grants at all. Per-profile consumers also isolate backlogs: a
+capped or crash-looping profile's unacked redeliveries cannot head-of-line block another
+profile's dispatch. Notes on the mechanics:
 
 - The Job name derives from the taskId, so Job creation is idempotent - a JetStream
   redelivery hits `AlreadyExists` and acks. Combined with envelope dedup this is the
   claim/lease story: there is one dispatcher, and creates are idempotent, so
-  double-execution needs no lock table. (One window: a redelivery arriving after
-  `ttlSecondsAfterFinished` has GC'd the finished Job would re-create it; the ack
-  normally lands seconds after create, so the trigger requires durable-consumer state
-  loss. Noted, not defended against.)
+  double-execution needs no lock table. The events-check above also closes the GC
+  window: a redelivery arriving after `ttlSecondsAfterFinished` reaped the finished Job
+  finds the terminal event on the stream and does not re-create.
 - The dispatcher acks _after_ the Job is created. A dispatcher restart replays
   unacked submissions from the durable consumer - the queue is the stream, and there is
   no in-memory delegation map to lose.
 - `concurrency` is enforced here: submissions beyond a profile's cap are redelivered
   with backoff until a slot frees. Nothing is dropped; the stream holds the backlog.
+- A new profile's first dispatch waits on its `BusCredentialsReady` status condition -
+  the deployment spec owns why (auth-callout propagation). Submissions queue on the
+  stream meanwhile.
+- At dequeue the dispatcher checks queue staleness against `queueTimeoutSeconds` using
+  the message's server ingest timestamp (see the field table for why not `ts`), and
+  refuses stale work with a terminal `failed` rather than running it late.
 - The demo created the pod first and published the task second, and papered over the race
   with a stream lookup. This ordering is the fix: the pod exists _because_ the message
   is already durable, so the worker's task fetch cannot miss.
@@ -212,14 +229,23 @@ Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`. Everything else - prompt, corr
 context - is in the task message the adapter fetches from the stream by subject.
 
 **The adapter.** Inside the pod, a thin adapter sits between the bus and the harness.
-It fetches the task message, publishes `submitted`, drives the harness over the headless
-contract (`-p`, stream-json in/out), maps the harness's output stream onto A2A events
-(next section), forwards cancels and follow-up input onto the harness stdin, publishes
-the terminal event, and exits with a matching code. The adapter is stage 3 code. The
+It fetches the task message, opens its own ephemeral consumer on the task's `…in`
+subject positioned just after that message - this is where live input arrives, because
+the `…in` subject has two reader roles by design: the dispatcher for new tasks, the
+executor for everything after the submission - publishes `submitted`, drives the harness
+over the headless contract (`-p`, stream-json in/out), maps the harness's output stream
+onto A2A events (next section), forwards cancels, steers, and follow-up input onto the
+harness stdin, publishes the terminal event, and exits with a matching code. Ephemeral,
+deliberately: a rehydrated session's fresh pod opens a fresh consumer with no durable
+name to collide with its predecessor's. The adapter is stage 3 code. The
 client library under it (envelopes, dedup, resilience contract) is stage 1's.
 
 **Discovery.** The operator publishes an agent card to `a2a.agents.{profile}` when a
-profile lands and a tombstone when it is deleted, rendered from `description`. The chat
+profile lands and a tombstone when it is deleted, rendered from `description`. Deletion
+is finalizer-ordered: the tombstone publish precedes finalizer removal, and reconcile
+republishes the card whenever a live CR's directory entry is missing or tombstoned -
+level-triggered, so a crash on either side of a delete converges instead of leaving a
+stale card routing traffic to a profile that no longer exists. The chat
 front door's roster becomes a read of the directory stream instead of a listing of
 profile directories. Same information, but it exists whether or not any worker is
 running.
@@ -296,6 +322,13 @@ GC - replay is not tied to the pod's existence.
   implement. The janitor (below) writes the terminal event on the dead task's behalf.
   `activeDeadlineSeconds` is the same path triggered by the clock.
 
+**Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
+grace period, and the adapter MUST trap it: flush the pending output buffer, publish
+terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure
+eviction distinguishable from an agent crash in the audit trail and in the breaker's
+failure classes - the same infra-vs-agent distinction the kanban board's forgiveness
+classes draw today.
+
 **Orphaned.** A worker can die without a terminal event - OOM, node loss, image bug.
 The dispatcher doubles as the janitor: it watches the Jobs it created, and when a Job
 reaches a terminal phase (or vanishes) while the task's event stream has no `final`
@@ -303,6 +336,13 @@ event, it publishes terminal `failed` with a reason naming the evidence
 (`pod-failed-without-final-event`, `deadline-exceeded`, `job-deleted`). The demo's sweep
 did exactly this and it worked. The janitor inherits the pattern with the Job as the
 source of truth instead of a poll over pods.
+
+The synthesize is a compare-and-swap, not a read-then-write: the janitor publishes its
+terminal event with the expected last subject sequence it observed when it found no
+terminal - so a dying pod's SIGTERM flush racing the sweep wins cleanly, the janitor's
+publish is rejected, and it re-reads instead of double-finalizing. "Exactly one final
+event" is arbitrated by the write, not by the check before it; whichever writer loses
+lands in the warn-and-drop path like any other post-final event.
 
 This is the dispatcher's half of the payload spec's orphaned-task answer; the gateway
 sweeps its own chat sessions the same way (the ratified 8/24 split - every task's

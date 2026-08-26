@@ -63,6 +63,15 @@ Everything is R3 in production. Status and artifact events are the bulk of the v
 the tempting place for a cheaper R1 class, but they are also the replay and audit record,
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
+Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
+limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
+and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
+`session-state`, and discovery down with it. The honest cost: under byte pressure,
+replay completeness degrades oldest-first - a running task's early events can age out of
+a flooded stream - and the byte-headroom alert below exists so that state is paged on
+before it is reached.
+
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
 Three KV buckets ride the same JetStream deployment:
@@ -92,7 +101,10 @@ that analysis; the callout service inherits its hardening requirements. The call
 validates the client's KSA token against the cluster's OIDC issuer (audience-bound,
 short-lived, kubelet-rotated) and returns the account and the permission set. Revocation
 is the issuer's problem, and it already solved it. This works on stock Kubernetes; there
-is no GKE dependency.
+is no GKE dependency. Concretely, validation is a `TokenReview` call against the local
+API server - zero key handling, works on any conformant cluster - with local JWT
+verification against the API server's `openid/v1/jwks` endpoint as the offline
+alternative.
 
 Layout:
 
@@ -111,6 +123,13 @@ Layout:
   prefix (`_INBOX.<user>.>`) and permission to subscribe only to that. Without this, any
   agent can subscribe to any inbox and the whole property above leaks through the reply
   path.
+- **Bucket access is subject access.** KV and the Object Store ride internal subjects -
+  `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
+  their streams - and the deny-by-default map grants them explicitly per role: the
+  gateway gets `session-state`, workers get the artifact bucket, nobody gets a bucket
+  their role doesn't name. Miss this and the first oversized artifact dies with an
+  Authorization Violation. Within the artifact bucket, visibility is bucket-wide;
+  per-task artifact scoping is parked with the per-task credentials tightening.
 
 The callout reads an identity-to-permissions map rendered by the operator (**amended
 8/24** for the subagent framework): one entry per `AgentProfile`, rendered from the CR's
@@ -118,15 +137,23 @@ bus grants, plus static entries for the system users - gateway, audit exporter, 
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
 never read the map - the constrained party does not see its own ceiling, it just hits it.
-The callout logs the map version it actually loaded at startup and exposes it at runtime,
-so "the map says X" is checkable against the running system rather than against the
-rendered ConfigMap.
+The callout reads the map through an API informer, not a volume mount: kubelet ConfigMap
+sync lags up to a minute, and the dispatcher can spawn a Job seconds after a profile
+lands - a race that ends in an Authorization Violation for a legitimate worker. The
+ordering is enforced, not hoped for: the operator sets `BusCredentialsReady` on an
+`AgentProfile`'s status only after the callout reports serving the profile's user, and
+the dispatcher does not dispatch before that condition is true. Submissions queue on
+the stream meanwhile; nothing is lost. The callout logs the map version it is serving
+and exposes it at runtime, so "the map says X" is checkable against the running system
+rather than against the rendered object.
 
-The callout service runs in the system account, 2 replicas. It is on the connection path:
-if it is down, no _new_ connection succeeds, while established connections continue. That
-is an acceptable failure mode and the resilience contract below is what makes it
-acceptable - clients that reconnect correctly ride out a callout outage the same way they
-ride out a server restart.
+The callout service runs in the system account, 2 replicas. It is on the connection
+path: if it is down, no _new_ connection succeeds, while established connections
+continue. The blast radius, named honestly: during a callout outage nothing new
+connects, which means no new tasks and no new workers - the fabric is dark to new work,
+not gracefully degraded. Established sessions and the resilience contract below are
+what make that acceptable at this stage; a hardened HA callout is production posture,
+not part of the dev toggle.
 
 ## Observability and audit
 
@@ -143,11 +170,17 @@ deployment's job is to keep the substrate intact and reachable:
   nothing; limits retention means cleanup is W's job, not the exporter's. Deliberately no
   purge-on-export: the window is what everyone else replays, and an exporter that deletes
   is an exporter that can destroy evidence.
-- **Exporter lag is the data-loss horizon.** If the exporter's backlog ages past W before
-  export, audit records die on the bus. Lag is a first-class alert, firing well before
-  backlog age approaches W.
+- **Exporter lag has two data-loss horizons, and the alert watches both.** The age
+  horizon: backlog older than W dies by retention. The byte horizon: under a flood,
+  `discard: old` deletes by byte pressure _before_ age - so an operator must never be
+  told W is the only thing that can delete evidence. Lag is a first-class alert on
+  whichever horizon is nearer: backlog age approaching W, or stream bytes approaching
+  `max_bytes`.
 - The audit path is read-only by construction: the exporter's user may subscribe and may
   not publish, enforced at connect like everything else.
+- The attribution salt the gateway hashes identifiers with is one shared Secret per
+  install, provisioned with this deployment - replicas must agree or the pseudonyms on
+  the stream stop joining.
 - W stays a tenancy decision as well as a cost one - the bus holds labelled content at rest
   for the whole window.
 
@@ -162,6 +195,17 @@ health is a first-class signal: `num_pending`, ack-pending depth, and delivery-b
 freshness, per stream, exported. A connection can be perfectly healthy at the TCP level
 while its consumer is deaf (see the next section), and the metrics have to be able to say
 so.
+
+The starting alert set, so 3 AM triage has named invariants rather than vibes (dev
+defaults; the numbers are tunable, the invariants are not):
+
+| Alert                    | Threshold                             | Severity |
+| :----------------------- | :------------------------------------ | :------- |
+| `AuditExporterLagAge`    | backlog age > 4h (vs W=72h)           | Critical |
+| `AuditExporterLagBytes`  | stream bytes > 80% of `max_bytes`     | Critical |
+| `ProfileDispatchBacklog` | > 20 pending for > 15m on one profile | Warning  |
+| `ConsumerUnackedStalled` | > 0 stalled for > 10m                 | Warning  |
+| `AuthCalloutErrorRate`   | > 1%                                  | Critical |
 
 ## Client resilience contract
 
@@ -199,6 +243,12 @@ and the property is what conformance tests.
   pending-message depth as metrics, and the component's health check MUST incorporate them.
   "TCP is up" is not health. Test: orphan the consumer; assert the health check fails
   while TCP remains connected.
+- **NR-6: Jittered backoff on every connection attempt.** The library MUST apply
+  randomized exponential backoff with full jitter to connection and reconnection
+  attempts. A NATS or callout restart otherwise turns every client into one synchronized
+  thundering herd against the callout service and the API server behind its TokenReviews.
+  Test: force a reconnect storm across N clients; assert attempt timestamps spread rather
+  than align.
 
 ## Conformance
 
