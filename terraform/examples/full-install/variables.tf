@@ -107,6 +107,12 @@ variable "project_roles" {
   default     = null
 }
 
+variable "agent_service_account_id" {
+  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the first apply. Null selects the module default."
+  type        = string
+  default     = null
+}
+
 variable "image_tag" {
   description = "Image tag for both the operator and the platform agent. Required because a checkout's Chart.yaml carries an appVersion placeholder that never matches a published image tag, so the chart's tag defaulting cannot work from a checkout. `latest` is fine for evaluation; set an `X.Y.Z` release tag for production."
   type        = string
