@@ -7,6 +7,7 @@ NetworkPolicy enablement sequence install.sh runs against adopted clusters.
 
 import os
 import pathlib
+import re
 import stat
 import subprocess
 import tempfile
@@ -22,6 +23,12 @@ from tests.testing.common import (
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
+_INSTALLER_COMMON = _REPO_ROOT / "k8s-operator" / "scripts" / "installer_common.sh"
+
+# install.sh sources the shared helpers from the acquired workspace partway
+# through main(), so a validator that leans on one is unreachable from a bare
+# KUBE_AGENTS_SOURCE_ONLY source. Prepend this to reach it.
+_SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -89,12 +96,153 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"MODE={MOCK_GOOGLE_CHAT_MODE}", proc.stdout)
 
+    def test_parse_args_cluster_mode(self):
+        """Verifies parse_args captures --cluster-mode."""
+        cmd = 'parse_args --cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODE=autopilot", proc.stdout)
+
+    def test_cluster_mode_defaults_to_unset(self):
+        """An unpassed --cluster-mode leaves the interview free to ask."""
+        proc = self._run_install_func('echo "MODE=[$PARAM_CLUSTER_MODE]"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODE=[]", proc.stdout)
+
+    def test_require_creatable_cluster_mode_accepts_both_shapes(self):
+        for mode in ("autopilot", "standard"):
+            with self.subTest(mode=mode):
+                proc = self._run_install_func(
+                    f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode "{mode}" us-central1'
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_require_creatable_cluster_mode_rejects_an_unknown_shape(self):
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode autopiloot us-central1'
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        # install.sh's print_error writes to stdout.
+        self.assertIn("autopiloot", proc.stdout)
+
+    def test_require_creatable_cluster_mode_rejects_a_zone_for_autopilot(self):
+        """Autopilot clusters are regional; the module rejects a zone at plan
+        time, which is after the whole interview has been paid for."""
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode autopilot us-central1-a'
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("us-central1-a", proc.stdout)
+        # Standard clusters are zonal-capable, so the same location is fine.
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode standard us-central1-a'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _run_persist(self, requested, effective, starting_line):
+        """persist_effective_cluster_mode against a throwaway vars.sh."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vars_file = pathlib.Path(tmp) / "vars.sh"
+            vars_file.write_text(starting_line)
+            call = (
+                f'{_SOURCE_INSTALLER_COMMON}'
+                f'VARS_FILE="{vars_file}"; TFVARS_CLUSTER_MODE="{effective}"; '
+                f'persist_effective_cluster_mode "{requested}"'
+            )
+            proc = self._run_install_func(call)
+            return proc, vars_file.read_text()
+
+    def test_persist_effective_cluster_mode_records_the_probed_shape(self):
+        """vars.sh must record what the install HAS, not what was asked for.
+
+        The generator's probe overrules --cluster-mode on any cluster that
+        already exists. Leaving the request on disk is how the value that
+        rebuilds a deleted cluster — and that uninstall.sh and upgrade.sh
+        regenerate from — comes to name the wrong shape.
+        """
+        for requested, effective in (
+            ("autopilot", "standard"),
+            ("standard", "autopilot"),
+        ):
+            with self.subTest(requested=requested, effective=effective):
+                proc, content = self._run_persist(
+                    requested, effective, f"export CLUSTER_MODE={requested}\n"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout)
+                self.assertIn(f"export CLUSTER_MODE={effective}", content)
+                self.assertNotIn(f"export CLUSTER_MODE={requested}", content)
+
+    def test_persist_effective_cluster_mode_leaves_an_agreeing_file_alone(self):
+        proc, content = self._run_persist(
+            "autopilot", "autopilot", "export CLUSTER_MODE=autopilot\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(content, "export CLUSTER_MODE=autopilot\n")
+
+    def test_persist_effective_cluster_mode_without_a_generator_answer(self):
+        """No TFVARS_CLUSTER_MODE means the generator never ran; do not guess."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vars_file = pathlib.Path(tmp) / "vars.sh"
+            vars_file.write_text("export CLUSTER_MODE=autopilot\n")
+            proc = self._run_install_func(
+                f'{_SOURCE_INSTALLER_COMMON}VARS_FILE="{vars_file}"; '
+                'persist_effective_cluster_mode standard'
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertEqual(vars_file.read_text(), "export CLUSTER_MODE=autopilot\n")
+
     def test_parse_args_enable_google_chat(self):
         """Verifies parse_args captures --enable-google-chat."""
         cmd = 'parse_args --enable-google-chat; echo "CHAT=$PARAM_ENABLE_GOOGLE_CHAT"'
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("CHAT=true", proc.stdout)
+
+    def test_parse_args_vertex_location_overrides_the_default(self):
+        """An explicit --vertex-location still wins over DEFAULT_VERTEX_LOCATION."""
+        cmd = (
+            "parse_args --vertex-location=us-east4; "
+            'echo "LOC=$PARAM_VERTEX_LOCATION"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("LOC=us-east4", proc.stdout)
+
+    def test_default_vertex_location_is_in_scope_for_install_sh(self):
+        """install.sh resolves $DEFAULT_VERTEX_LOCATION at its own runtime.
+
+        Both default sites live in run_menu_system/main, which a unit test
+        cannot call, so this covers the half that can silently break: whether
+        sourcing the helpers actually puts the constant in scope. Under
+        `set -u` an unsourced constant would abort rather than expand empty.
+        """
+        cmd = (
+            'source_provisioning_helpers "$PWD" >/dev/null; '
+            'echo "LOC=$DEFAULT_VERTEX_LOCATION"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("LOC=global", proc.stdout)
+
+    def test_vertex_location_defaults_never_fall_back_to_the_region(self):
+        """Every vertex_location default in install.sh uses the shared constant.
+
+        Defaulting the Vertex location to the cluster region is the bug: the
+        vertex_ai default model is not served from DEFAULT_REGION, and on a
+        zonal cluster the region variable is not even a valid Vertex location.
+        There are two such sites -- the main install path and the --menu
+        reconfigure path -- and missing either leaves the broken value reachable.
+        """
+        defaults = [
+            line.strip()
+            for line in _INSTALL_SH.read_text().splitlines()
+            if re.match(r"^\s*local vertex_location=", line)
+        ]
+        self.assertEqual(len(defaults), 2, f"unexpected vertex_location sites: {defaults}")
+        for line in defaults:
+            with self.subTest(line=line):
+                self.assertIn("DEFAULT_VERTEX_LOCATION", line)
+                self.assertNotIn("$region", line)
 
 
 class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
