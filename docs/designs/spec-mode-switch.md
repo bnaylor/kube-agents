@@ -60,8 +60,12 @@ at admission, so the only way `resolveMode` sees one is version skew - a newer C
 third mode, an older operator binary reads it. Silently rendering `today` at that point means
 the cluster runs something other than what the spec asks, with nothing in
 `kubectl describe` to say so. Instead the reconciler goes Degraded through the existing
-`updateStatusDegraded` path with a named reason, `ModeNotRecognized`, keeps rendering
-today's stack, and requeues. (Same pattern as `RuntimeClassNotFound`.)
+`updateStatusDegraded` path with a named reason, `ModeNotRecognized`, freezes - it
+renders nothing new and tears nothing down, in either branch - and requeues. (Same
+Degraded pattern as `RuntimeClassNotFound`.) The freeze matters most on the `next` side: "fail closed to today" must not mean "clean up next," or a one-version operator
+rollback against a live `next` install kills the bus while dutifully reporting
+Degraded. Found live (W6); regression-tested
+(`TestUnrecognizedModePreservesNextStack`).
 
 ## What the operator renders
 

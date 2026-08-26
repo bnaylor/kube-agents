@@ -119,6 +119,22 @@ Layout:
   shared topics it is granted. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
+- **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
+  grants are part of being a JetStream client at all: the `$JS.API.>` surface a role's
+  streams and buckets need; `$JS.ACK.<its streams>.>` for explicit acks - an ack is a
+  publish, and missing this grant means every consumer redelivers forever while TCP
+  health stays green, the NR-5 incident class created at connect time; and `$JS.FC.>`
+  for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
+  is `_INBOX.<user>.>` MUST configure its inbox prefix to match - the client library's
+  default random inbox is refused by the user's own grant and every API call times out.
+  Both halves were found live (W6): the provision Job could never succeed and no
+  consumer could ever ack until these landed.
+- **Topic grants are exact, never namespace wildcards.** Grants match the provisioned
+  topic list subject-for-subject. A wildcard over a topic namespace turns
+  provisioned-only into silent loss - a publish to an unprovisioned topic sails into
+  core NATS and vanishes; an exact grant makes it a connect-time refusal. The corollary
+  is operational: adding a topic is two edits that must travel together, the stream's
+  subject list and the writer's grant.
 - **Per-user inbox prefixes.** Push delivery uses inbox subjects, so each user gets its own
   prefix (`_INBOX.<user>.>`) and permission to subscribe only to that. Without this, any
   agent can subscribe to any inbox and the whole property above leaks through the reply
