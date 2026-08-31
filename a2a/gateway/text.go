@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -90,9 +91,18 @@ const statusHistoryCap = 12
 
 // formatTaskStatus renders a replayed Task for chat: current state, the
 // transition history, and the latest progress line.
-func formatTaskStatus(t *lib.Task) string {
+// askCap bounds the instruction echo in status answers and in the session KV.
+const askCap = 140
+
+func formatTaskStatus(t *lib.Task, ask string, since time.Time) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔎 task `%s` is **%s**", t.ID, t.State)
+	if !since.IsZero() && !t.Final {
+		fmt.Fprintf(&b, " (%s so far)", time.Since(since).Round(time.Second))
+	}
+	if ask != "" {
+		fmt.Fprintf(&b, "\n🎯 on: “%s”", ask)
+	}
 	if len(t.StatusHistory) > 0 {
 		history := t.StatusHistory
 		prefix := ""

@@ -297,7 +297,8 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
-	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID}
+	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
+		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now()}
 	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee})
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -394,7 +395,7 @@ func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) 
 		g.post(rec.Key, "⚠️ replay failed; see gateway logs")
 		return
 	}
-	g.post(rec.Key, formatTaskStatus(task))
+	g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
 }
 
 // messagePayload builds the A2A Message for one chat turn.

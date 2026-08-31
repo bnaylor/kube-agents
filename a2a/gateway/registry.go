@@ -19,6 +19,13 @@ import (
 type ActiveTask struct {
 	TaskID        string `json:"taskId"`
 	CorrelationID string `json:"correlationId"`
+	// Ask is the task's instruction, truncated, for status rendering only -
+	// "working on: <ask>" beats "it's working" and the fold cannot supply it
+	// (the submission is a message part, not folded status). Plaintext lives
+	// in the session KV only, same posture as the ingress log.
+	Ask string `json:"ask,omitempty"`
+	// SubmittedAt feeds the elapsed clock in status answers.
+	SubmittedAt time.Time `json:"submittedAt,omitempty"`
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
