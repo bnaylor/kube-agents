@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -369,5 +370,104 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 		if len(got.Data[key]) == 0 {
 			t.Errorf("key %q was not repaired", key)
 		}
+	}
+}
+
+// W6.1, ask 1 of W5's delta memo: under next the operator's own agent
+// NetworkPolicy carries the bus egress rule — TCP 4222 to the NATS pods by
+// label, never CIDR (a pod IP does not survive a restart) — and a today
+// render carries no trace of it. The gate is the point: the memo's interim
+// standalone policy is deleted with this change, so this rule is the only
+// way the agent reaches the bus, and its absence under today is what keeps
+// the mode switch's "a normal install cannot tell" promise.
+func TestBuildNetworkPolicyBusEgressGatedOnMode(t *testing.T) {
+	findBusRule := func(np *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
+		for i := range np.Spec.Egress {
+			for _, p := range np.Spec.Egress[i].Ports {
+				if p.Port != nil && p.Port.IntVal == 4222 {
+					return &np.Spec.Egress[i]
+				}
+			}
+		}
+		return nil
+	}
+
+	today := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+	if rule := findBusRule(buildNetworkPolicy(today, nil, defaultTestNetpolProfile(), false, "", false)); rule != nil {
+		t.Errorf("mode absent rendered a bus egress rule: %+v", rule)
+	}
+
+	rule := findBusRule(buildNetworkPolicy(a2aTestAgent(), nil, defaultTestNetpolProfile(), false, "", false))
+	if rule == nil {
+		t.Fatal("mode next rendered no 4222 egress rule to the NATS pods")
+	}
+	if len(rule.To) != 1 {
+		t.Fatalf("expected exactly one peer on the bus egress rule, got %d", len(rule.To))
+	}
+	peer := rule.To[0]
+	if peer.IPBlock != nil {
+		t.Error("bus egress peer is an IPBlock; the rule must select the NATS pods by label")
+	}
+	if peer.PodSelector == nil || peer.PodSelector.MatchLabels[a2aComponentLabel] != "nats" {
+		t.Errorf("bus egress peer does not select %s=nats: %+v", a2aComponentLabel, peer)
+	}
+	if peer.PodSelector.MatchLabels[labelPartOf] != a2aPartOf {
+		t.Errorf("bus egress peer does not pin %s=%s: %+v", labelPartOf, a2aPartOf, peer)
+	}
+	if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("bus egress rule is not exactly TCP 4222: %+v", rule.Ports)
+	}
+}
+
+// W6.1, ask 2: the agent container gets NATS_URL / NATS_USER / NATS_PASSWORD
+// under next — from the same creds Secret the gateway reads, as the worker
+// user, never on the PVC or in a profile .env (a second place to rotate and a
+// first place to leak). Today's render has none of the three.
+func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
+	agentEnv := func(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+		pt := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
+		for _, c := range pt.Spec.Containers {
+			if c.Name == "platform-agent" {
+				return c.Env
+			}
+		}
+		t.Fatal("no platform-agent container in the pod template")
+		return nil
+	}
+	find := func(env []corev1.EnvVar, name string) *corev1.EnvVar {
+		for i := range env {
+			if env[i].Name == name {
+				return &env[i]
+			}
+		}
+		return nil
+	}
+
+	today := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+	todayEnv := agentEnv(today)
+	for _, name := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+		if v := find(todayEnv, name); v != nil {
+			t.Errorf("mode absent rendered %s onto the agent container", name)
+		}
+	}
+
+	nextEnv := agentEnv(a2aTestAgent())
+	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+		t.Errorf("NATS_URL = %+v, want the rendered NATS Service address", v)
+	}
+	if v := find(nextEnv, "NATS_USER"); v == nil || v.Value != "worker" {
+		t.Errorf("NATS_USER = %+v, want the worker user", v)
+	}
+	v := find(nextEnv, "NATS_PASSWORD")
+	if v == nil || v.ValueFrom == nil || v.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("NATS_PASSWORD = %+v, want a SecretKeyRef — the literal must never render into the pod spec", v)
+	}
+	if v.ValueFrom.SecretKeyRef.Name != "test-agent-a2a-nats-creds" || v.ValueFrom.SecretKeyRef.Key != "worker-password" {
+		t.Errorf("NATS_PASSWORD reads %s/%s, want test-agent-a2a-nats-creds/worker-password",
+			v.ValueFrom.SecretKeyRef.Name, v.ValueFrom.SecretKeyRef.Key)
 	}
 }
