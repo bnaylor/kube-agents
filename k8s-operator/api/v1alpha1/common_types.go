@@ -256,6 +256,46 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
+
+	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
+	// It only means something under mode: next - a today install renders neither
+	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
+	// creation user-triggerable from chat and threads are free, so the principal
+	// map bounds WHO can spawn and this bounds HOW MANY.
+	//
+	// Unset means 10, the operator's default - the harness spike's "busy day"
+	// sizing: at the session-pod shape (250m CPU / 512Mi requests) ten
+	// concurrent sessions hold 2.5 CPU / 5Gi, which a small dev cluster absorbs
+	// without preemption.
+	//
+	// The number lands in two places that deliberately differ. The gateway's
+	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
+	// delegation is refused with a chat reply naming the numbers, never queued,
+	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
+	// ABOVE it as the enforcement control: a compromised or buggy gateway
+	// ignores its own cap and cannot ignore the quota, and keeping the quota
+	// above the cap is what makes users hit the honest refusal rather than an
+	// opaque admission failure. The quota is namespace-wide - the only shape a
+	// hostile pod-creator cannot dodge - so its headroom above the cap also
+	// bounds everything else in the namespace: an install whose namespace
+	// carries many non-session pods can see unrelated pod creation refused at
+	// admission before sessions reach this cap, and the headroom is an
+	// operator constant, not a CR field.
+	//
+	// Raising it buys concurrent delegations at the per-pod price plus model
+	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
+	// Lowering it turns busy-hour delegations into refusals sooner - a lower
+	// cap never reaps in-flight sessions, it only blocks new spawns until they
+	// finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+	// concurrency is MaxInProgress above, a different lane.
+	//
+	// The Maximum exists because the quota render adds its headroom to this
+	// number: an absurd but API-legal value would wrap the arithmetic into a
+	// negative quota and wedge the A2A reconcile.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10000
+	// +optional
+	MaxSessions *int `json:"maxSessions,omitempty"`
 }
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same

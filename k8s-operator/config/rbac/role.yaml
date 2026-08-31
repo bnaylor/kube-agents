@@ -10,6 +10,7 @@ rules:
       - configmaps
       - persistentvolumeclaims
       - pods
+      - resourcequotas
       - secrets
       - serviceaccounts
       - services
@@ -31,7 +32,6 @@ rules:
       - nodes
       - persistentvolumes
       - pods/log
-      - resourcequotas
     verbs:
       - get
       - list

@@ -1068,3 +1068,113 @@ func TestA2ANetworkPoliciesGatedByMode(t *testing.T) {
 		t.Errorf("the agent's own NetworkPolicy vanished with the A2A cleanup: %v", err)
 	}
 }
+
+// The quota is the enforcement half of the session-pod bound (the gateway's
+// cap is the usability half): a namespace-wide pod count a compromised or
+// buggy gateway cannot ignore, sized above the gateway's cap so users hit
+// the honest chat refusal before anything hits an opaque admission failure.
+func TestBuildA2ASessionQuota(t *testing.T) {
+	agent := a2aTestAgent()
+	quota := buildA2ASessionQuota(agent)
+	if quota.Name != "test-agent-a2a-session-quota" {
+		t.Fatalf("quota name %q", quota.Name)
+	}
+	if quota.Namespace != "test-ns" {
+		t.Fatalf("quota namespace %q", quota.Namespace)
+	}
+
+	// `pods` counts non-terminal pods only - a finished worker awaiting
+	// sweep must not hold a slot - and it is the ONLY key: a compute-resource
+	// key (requests.*) would force requests onto every pod in the namespace,
+	// which is not this bound's mandate.
+	hard := quota.Spec.Hard
+	if len(hard) != 1 {
+		t.Fatalf("quota bounds %d resources, want exactly pods: %v", len(hard), hard)
+	}
+	pods, ok := hard[corev1.ResourcePods]
+	if !ok {
+		t.Fatalf("quota does not bound pods: %v", hard)
+	}
+	// Default gateway cap 10 + the fixed headroom for the rest of the
+	// namespace (base stack, rollout surge, race overshoot).
+	if pods.Value() != 25 {
+		t.Fatalf("default quota = %d, want 25 (cap 10 + headroom 15)", pods.Value())
+	}
+
+	two := 2
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
+	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+	if pods.Value() != 17 {
+		t.Fatalf("tuned quota = %d, want 17 (cap 2 + headroom 15)", pods.Value())
+	}
+}
+
+// The CR field reaches the gateway as an explicit env value even when unset:
+// the rendered number is the one a `kubectl describe` reader and the quota
+// sizing both see, so the two halves cannot drift apart silently.
+func TestGatewayDeploymentRendersMaxSessions(t *testing.T) {
+	find := func(dep *appsv1.Deployment) string {
+		for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "A2A_MAX_SESSIONS" {
+				return env.Value
+			}
+		}
+		return ""
+	}
+	agent := a2aTestAgent()
+	if got := find(buildA2AGatewayDeployment(agent)); got != "10" {
+		t.Fatalf("default A2A_MAX_SESSIONS = %q, want \"10\"", got)
+	}
+	two := 2
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
+	if got := find(buildA2AGatewayDeployment(agent)); got != "2" {
+		t.Fatalf("tuned A2A_MAX_SESSIONS = %q, want \"2\"", got)
+	}
+}
+
+// The quota rides the mode switch like every other next-stack object: a
+// today install must not carry a pod quota it never asked for.
+func TestA2ASessionQuotaGatedByMode(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// finalizer pass, then the real one
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	quota := &corev1.ResourceQuota{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-quota", Namespace: "test-ns"}, quota); err != nil {
+		t.Errorf("session quota not rendered under next: %v", err)
+	}
+
+	// Flip to today: the quota goes back to dark with the stack it bounds.
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-quota", Namespace: "test-ns"}, quota); !errors.IsNotFound(err) {
+		t.Errorf("session quota still present under today (err=%v)", err)
+	}
+}

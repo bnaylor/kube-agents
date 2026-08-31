@@ -38,6 +38,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -824,6 +825,67 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 // The gateway's session-pod RBAC (W4): spawning a worker per delegated task
 // is the gateway's job, so its ServiceAccount carries exactly the pod verbs
 // the spawner and its sweep use, namespace-scoped, and nothing else.
+// defaultA2AMaxSessions is spec.harness.tuning.maxSessions when unset; the
+// CRD field's comment carries the sizing rationale. Keep it in step with
+// defaultMaxSessions in a2a/gateway/config.go - the operator renders the
+// value explicitly onto A2A_MAX_SESSIONS, so the gateway's own constant only
+// governs runs outside the operator (the playground path).
+const defaultA2AMaxSessions = 10
+
+// a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's
+// cap. The quota is namespace-wide because that is the only shape a hostile
+// pod-creator cannot dodge (ResourceQuota scopes select on fields the
+// creator writes), so it must leave room for everything else that
+// legitimately runs here: the rendered stack and its neighbors (operator,
+// agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
+// rollout surge doubling a Deployment for a moment, and the gateway's
+// count-then-create overshoot. Fifteen covers roughly ten standing pods plus
+// surge; if the base install grows past that, raise this before anything
+// user-visible starts failing admission.
+const a2aQuotaHeadroom = 15
+
+func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
+	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
+		return *limits.MaxSessions
+	}
+	return defaultA2AMaxSessions
+}
+
+func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-session-quota"
+}
+
+// buildA2ASessionQuota is the enforcement half of the session-pod bound; the
+// gateway's A2A_MAX_SESSIONS cap is the usability half. The distinction is
+// the point: the gateway counts and refuses so users get an honest chat
+// reply, but the thing being bounded is the gateway itself - a compromised
+// or buggy gateway ignores its own cap and cannot ignore this quota, whose
+// admission check the API server runs and whose object the gateway's
+// pods-only Role cannot touch. Sized above the cap so the gateway hits its
+// own limit first and nobody legitimate ever sees the admission failure.
+//
+// `pods` (not count/pods) is deliberate: it counts non-terminal pods only,
+// matching the gateway's LiveSessions denominator, so a finished worker
+// awaiting sweep does not hold a slot. It is also the only key - a
+// compute-resource key (requests.*) would force resource requests onto
+// every pod in the namespace, which is not this bound's mandate.
+func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
+	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	return &corev1.ResourceQuota{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aSessionQuotaName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "session-quota"),
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourcePods: *resource.NewQuantity(limit, resource.DecimalSI),
+			},
+		},
+	}
+}
+
 func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
@@ -903,6 +965,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// stays the fixed addressee; only a "delegate"
 							// turn spawns a worker.
 							{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+							// Rendered explicitly even when the CR is silent:
+							// the number a `kubectl describe` reader sees is
+							// the same one the session quota was sized above,
+							// so the two halves cannot drift apart silently.
+							{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
 							// W3's ask: the namespace from the downward API,
 							// not a baked default.
 							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
@@ -992,6 +1059,17 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		if err := r.applyManaged(ctx, agent, np); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
 		}
+	}
+
+	// The session-pod quota, the enforcement half of the bound whose
+	// usability half is the gateway's own cap (see buildA2ASessionQuota for
+	// why both exist and why the quota sits above the cap).
+	quota := buildA2ASessionQuota(agent)
+	if err := ctrl.SetControllerReference(agent, quota, r.Scheme); err != nil {
+		return state, err
+	}
+	if err := r.applyManaged(ctx, agent, quota); err != nil {
+		return state, fmt.Errorf("failed to apply A2A session ResourceQuota: %w", err)
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
@@ -1085,6 +1163,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
+		// ResourceQuota is not a watched kind, so the read goes through
+		// a2aReader like the Secrets. Deleting it here is safe even with
+		// session pods still draining (see the function comment): a quota
+		// only gates admission, never running pods.
+		{&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionQuotaName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}
 	for _, entry := range named {
 		obj := entry.obj
