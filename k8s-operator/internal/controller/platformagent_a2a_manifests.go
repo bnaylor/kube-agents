@@ -236,15 +236,27 @@ http: 8222
 # fronts it with an ingress policy; neither is a toggle that exists yet, so
 # "turn it off in production" would be a promise this render cannot keep.
 #
-# same_origin is the one thing that is not posture. WebSockets are exempt from
-# CORS, and the documented demo transport is a kubectl port-forward to 9222 on
-# a workstation — for as long as that runs, every page the operator's browser
-# visits can open a socket to localhost:9222, and W8's credential lives in
-# browser JS by construction. Origin-checking costs the demo nothing.
+# The origin allow-list is the one thing here that is not posture. WebSockets
+# are exempt from CORS, and the demo transport is a kubectl port-forward to
+# 9222 on a workstation — for as long as that runs, every page the operator's
+# browser visits can open a socket to localhost:9222, with a credential that
+# lives in browser JS by construction.
+#
+# allowed_origins, NOT same_origin: same_origin compares the browser's Origin
+# against this listener's own host:port, and the UI is always a page on a
+# different port than the bus (vite on 5173, or an nginx port), so it can never
+# match. Measured by W8 in a real browser: same_origin gives every W8
+# deployment a 403 at the handshake. A CLI or Node client sends no Origin
+# header at all, which both settings permit — which is exactly why this needed
+# a browser to find.
+#
+# This is defense in depth and not a boundary: Origin is browser-asserted, so
+# anything that is not a browser simply omits it. The boundary is the web
+# user's grant list below.
 websocket {
   port: 9222
   no_tls: true
-  same_origin: true
+  allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]
 }
 
 jetstream {
