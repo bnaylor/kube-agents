@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -507,20 +508,59 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	if !strings.Contains(rest, "pw-web") {
 		t.Error("web's password does not come from the creds Secret")
 	}
-	for _, want := range []string{"a2a.>", "_INBOX.web.>", "$JS.API.CONSUMER.MSG.NEXT.*.*", "$JS.API.STREAM.INFO.*", "$JS.ACK.>"} {
-		if !strings.Contains(rest, want) {
-			t.Errorf("web user missing grant %q", want)
+
+	// The publish list is pinned EXACTLY, not scanned for banned words. The
+	// first version of this test used a banned-substring loop and passed
+	// against a grant that let web read the session-state KV bucket and
+	// destroy another principal's in-flight delivery: `CONSUMER.CREATE.>`
+	// contains none of the words a blocklist would think to name, because the
+	// reach lives in request bodies and in wildcards matching other
+	// principals' resources. An exact list means any widening is a review
+	// conversation, which is the only control that actually holds here.
+	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	var got []string
+	for _, line := range strings.Split(pub, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimSuffix(line, ",")
+		if strings.HasPrefix(line, `"`) {
+			got = append(got, strings.Trim(line, `"`))
 		}
 	}
-	// Read-only means the write side simply is not there: no task/topic/KV
-	// publish, and none of the mutating JetStream API — the full $JS.API.>
-	// wildcard the app users carry as playground posture is exactly what web,
-	// the one user meant to face a browser, does not get.
-	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
-	for _, banned := range []string{"a2a.", "$KV.", "$JS.API.>", "DELETE", "PURGE", "agents.hb"} {
-		if strings.Contains(pub, banned) {
-			t.Errorf("web publish allow contains %q; the user must not write", banned)
+	want := []string{
+		"$JS.API.INFO",
+		"$JS.API.STREAM.INFO.TASKS",
+		"$JS.API.STREAM.INFO.DIRECTORY",
+		"$JS.API.STREAM.INFO.TOPICS-STATE",
+		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.CONSUMER.CREATE.TASKS.>",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.INFO.TASKS.*",
+		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"_INBOX.web.>",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("web publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// The three that were live findings, named so a regression reads as the
+	// thing it is rather than as a diff in a long list.
+	for _, gone := range []string{"$JS.ACK.", "$JS.FC.", "$JS.API.CONSUMER.CREATE.>", "STREAM.NAMES", "STREAM.LIST", "CONSUMER.NAMES", "CONSUMER.LIST", "$JS.API.>"} {
+		if strings.Contains(pub, gone) {
+			t.Errorf("web regained %q — see the web user's comment for what each one costs", gone)
 		}
+	}
+	// No KV bucket is reachable: the consumer-create grants name the four a2a
+	// message streams, and a KV bucket is a stream called KV_<bucket>.
+	if strings.Contains(pub, "KV_") || strings.Contains(pub, "$KV.") {
+		t.Error("web can address a KV bucket stream")
 	}
 }
 

@@ -223,14 +223,27 @@ server_name: ` + a2aNATSName(agent) + `
 port: 4222
 http: 8222
 
-# Websocket listener for the read-only web user (W8's UI reads the bus over
-# this). Plain ws IS the playground posture, stated rather than implied:
-# production terminates TLS in front of the bus or keeps this listener off.
-# The Service stays ClusterIP and the demo transport is kubectl port-forward,
-# so nothing off-cluster reaches the listener in the meantime.
+# Websocket listener for the web user (W8's UI reads the bus over this).
+#
+# Plain ws IS the playground posture, stated rather than implied, and stated
+# accurately: the CONNECT frame carries the web password in cleartext across
+# the pod network. The Service is ClusterIP, so nothing OUTSIDE the cluster
+# reaches this listener — but nothing inside it is stopped either, because no
+# NetworkPolicy governs ingress to the NATS pod (this file renders none; the
+# W6.1 agent rule is egress, from the agent). Every pod in every namespace can
+# reach 4222, 8222 and 9222. Production terminates TLS in front of the bus and
+# fronts it with an ingress policy; neither is a toggle that exists yet, so
+# "turn it off in production" would be a promise this render cannot keep.
+#
+# same_origin is the one thing that is not posture. WebSockets are exempt from
+# CORS, and the documented demo transport is a kubectl port-forward to 9222 on
+# a workstation — for as long as that runs, every page the operator's browser
+# visits can open a socket to localhost:9222, and W8's credential lives in
+# browser JS by construction. Origin-checking costs the demo nothing.
 websocket {
   port: 9222
   no_tls: true
+  same_origin: true
 }
 
 jetstream {
@@ -327,32 +340,66 @@ accounts {
         }
       }
       {
-        # web: W8's read surface, the one user meant to face a browser.
-        # Subscribe-everything, publish-nothing: the publish list is only
-        # what a JetStream READER has to send — ephemeral consumer
-        # create/read calls, acks, flow-control replies, its own inbox.
-        # Deliberately NOT $JS.API.> (the app users' playground wildcard
-        # would hand a browser stream deletion) and no DURABLE.CREATE, so
-        # web's consumers are ephemeral and self-cleaning. Known residue,
-        # accepted for the playground: a consumer's deliver subject is the
-        # creator's choice, so a hostile web client could aim redelivery of
-        # STORED messages at an a2a.* subject; the auth callout closes that
-        # class when it arms.
+        # web: W8's read surface, the one user meant to face a browser, and
+        # the only user whose credential is published to one by design.
+        #
+        # "Read-only" is not expressible as a subject list, and the first
+        # version of this user proved it the hard way. Subject permissions
+        # cannot see a request BODY, and JetStream puts the reach there: a
+        # consumer's target stream, its durability, and its delivery subject
+        # are all fields, not subjects. Every grant below is therefore
+        # enumerated per stream rather than wildcarded, because the wildcard
+        # is what turned "may read a2a.>" into the three findings the W6.1
+        # review reproduced live:
+        #
+        #   $JS.API.CONSUMER.CREATE.>  — a push consumer on KV_session-state
+        #     with deliver_subject set to web's OWN inbox read the session
+        #     registry out of a bucket web has no $KV grant for, on either
+        #     side. Subscribe permissions are not consulted when a consumer
+        #     is created; the deliver subject is.
+        #   $JS.ACK.>                  — an ack subject names a stream and a
+        #     CONSUMER, not the caller, so web could publish +TERM onto the
+        #     gateway's in-flight delivery and destroy it. W8 uses ack-none
+        #     ordered consumers, so the grant is simply gone.
+        #   CONSUMER.MSG.NEXT.*.*      — web could pull messages off the
+        #     gateway's own durable and retune its config through
+        #     CONSUMER.CREATE, which is create-OR-UPDATE by name.
+        #
+        # The list is now exactly what W8 needs, confirmed against its live
+        # conformance suite: the four a2a message streams, no KV buckets, no
+        # enumeration (NAMES/LIST), no ACK, no FC, no DELETE.
+        #
+        # Residues that remain, because a static permission map cannot hold
+        # them, both closed by the auth callout when it arms:
+        #  - Durability is a body field. Withholding the legacy
+        #    DURABLE.CREATE subject does NOT prevent a durable; the modern
+        #    CREATE carries durable_name. max_consumers on each stream bounds
+        #    what that can cost.
+        #  - Within these four streams, consumer names are the caller's
+        #    choice, so web can still address another principal's consumer.
+        #    Dropping ACK removed the destructive half; what is left is
+        #    stealing a delivery of data web may already read.
         user: web
         password: "` + pw("web-password") + `"
         permissions {
           publish { allow = [
             "$JS.API.INFO",
-            "$JS.API.STREAM.NAMES",
-            "$JS.API.STREAM.LIST",
-            "$JS.API.STREAM.INFO.*",
-            "$JS.API.CONSUMER.CREATE.>",
-            "$JS.API.CONSUMER.INFO.*.*",
-            "$JS.API.CONSUMER.NAMES.*",
-            "$JS.API.CONSUMER.LIST.*",
-            "$JS.API.CONSUMER.MSG.NEXT.*.*",
-            "$JS.ACK.>",
-            "$JS.FC.>",
+            "$JS.API.STREAM.INFO.TASKS",
+            "$JS.API.STREAM.INFO.DIRECTORY",
+            "$JS.API.STREAM.INFO.TOPICS-STATE",
+            "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+            "$JS.API.CONSUMER.CREATE.TASKS.>",
+            "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+            "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+            "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+            "$JS.API.CONSUMER.INFO.TASKS.*",
+            "$JS.API.CONSUMER.INFO.DIRECTORY.*",
+            "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+            "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+            "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+            "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+            "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+            "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
             "_INBOX.web.>"
           ] }
           subscribe { allow = [
@@ -493,6 +540,15 @@ set -euo pipefail
 # CLI's default _INBOX.<nuid> would be refused and every call would time out.
 NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
 
+# max_consumers caps each stream at 64. Consumer durability is a request-body
+# field, so no permission list can hold web to ephemeral ones (see the web user
+# in nats.conf); the cap is what stops an unreapable durable per page-load from
+# growing the file store without bound. The failure it converts to is loud — a
+# refused create — rather than silent disk growth. Note the trade: a client that
+# burns the cap can also deny a legitimate consumer, which is the right way
+# round for a playground and the wrong one for production, where the callout
+# mints per-identity users and this becomes a per-user limit instead.
+
 # Retention rule (deployment spec): acknowledgement must not delete — all
 # message streams are limits-based with an age window; replay is a read.
 # Every stream carries a hard max_bytes with discard old so a flood degrades
@@ -501,25 +557,25 @@ NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
 # TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 --defaults
+  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
-  --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --defaults
+  --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
 # State-class topics (provisioned registry): upgrade-readiness, blueprint.
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE \
   --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint' \
   --storage=file --retention=limits \
-  --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --defaults
+  --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
 # Journal-class topics: annotations.
 $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
-  --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --defaults
+  --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
