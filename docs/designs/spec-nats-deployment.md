@@ -214,9 +214,12 @@ Layout:
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and through nothing else in-cluster. The enumeration is today's client
-  list, and it must grow with the components this spec designs: the audit exporter,
-  the janitor, and the metrics scrape (the alert set above is scraped series) each
-  add a peer when they arm, and the NATS pods themselves join the enumeration on
+  list, and it must grow with the components this spec designs: the auth callout
+  service first of all - it is itself a bus client (a system-account subscriber on
+  the connection path), so arming it against the fence as-enumerated refuses the one
+  peer every new connection depends on and takes the fabric dark to new work - then
+  the audit exporter, the janitor, and the metrics scrape (the alert set above is
+  scraped series) each add a peer when they arm, and the NATS pods themselves join the enumeration on
   their route port the moment the deployment leaves the single-node dev shape - a
   3-node cluster's servers dial each other, and a fence without the route peer
   prevents the cluster from ever forming. The topic-grant corollary that two edits

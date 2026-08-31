@@ -115,6 +115,10 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   live claim about the executor. It never reaches the executor.
 - **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
   the cancel affordance above; a backend-native gesture stays adapter polish, later.
+  A stopped task whose terminal event has not yet arrived DETACHES: it stops
+  serializing the conversation - new turns start new tasks - while its events, if
+  they ever arrive, still relay. "Detached" and "non-detached" below mean exactly
+  this state and its absence.
 - **Delegate.** A prefix, not a phrase, and recognized only when no live task
   serializes the conversation; its own section below.
 
@@ -208,10 +212,17 @@ that translation lives in the shim, next to the process it translates for.
 deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
 The KV entry stays, holding the `contextId`. Reap never deletes a pod out from under a
-live task: an active, non-detached task exempts the session from the idle TTL however
-long it runs - the executor's own task deadline and Sweep own that pod's end, and the
-terminal event they guarantee is also what deletes the active-task record (and the
-`ask` copy riding it).
+live task: an active task that has not detached (see Stop above) exempts the session
+from the idle TTL. The exemption is safe because the pod's end has owners. The session
+worker's adapter enforces a task deadline (30 minutes default, config-backed): at the
+deadline it kills the harness process group and publishes the terminal event itself,
+and a pod that dies wedged reaches a terminal phase where Sweep takes over. The
+spawner owes the pod-level `activeDeadlineSeconds` mirroring that deadline - the
+adapter's contract is written assuming it - so a wedged adapter also lands in Sweep's
+domain instead of holding its bus credential indefinitely; until that field ships, a
+wedged adapter is the one unowned end, named here rather than papered over. The
+terminal event this chain guarantees is also what deletes the active-task record (and
+the `ask` copy riding it).
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream, folds them into a transcript primer,
