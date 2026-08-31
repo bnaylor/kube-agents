@@ -777,21 +777,75 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 }
 
+// subjectMatches implements NATS subject matching so the probe test asks the
+// question the server would ask, rather than the question a substring scan can
+// answer. `*` matches exactly one token; `>` matches one or more trailing
+// tokens and may only be last.
+func subjectMatches(pattern, subject string) bool {
+	p := strings.Split(pattern, ".")
+	s := strings.Split(subject, ".")
+	for i, tok := range p {
+		if tok == ">" {
+			return i < len(s)
+		}
+		if i >= len(s) {
+			return false
+		}
+		if tok != "*" && tok != s[i] {
+			return false
+		}
+	}
+	return len(p) == len(s)
+}
+
+func TestSubjectMatches(t *testing.T) {
+	cases := []struct {
+		pattern, subject string
+		want             bool
+	}{
+		{"a2a.topics.shared.probe", "a2a.topics.shared.probe", true},
+		{"a2a.topics.>", "a2a.topics.shared.probe", true},
+		{"a2a.>", "a2a.topics.shared.probe", true},
+		{"a2a.topics.shared.*", "a2a.topics.shared.probe", true},
+		{"a2a.topics.*.probe", "a2a.topics.shared.probe", true},
+		{"a2a.topics.shared.blueprint", "a2a.topics.shared.probe", false},
+		{"a2a.tasks.>", "a2a.topics.shared.probe", false},
+		{"a2a.topics.shared", "a2a.topics.shared.probe", false},
+		{"a2a.topics.shared.probe.x", "a2a.topics.shared.probe", false},
+		// The trap the literal-substring version of this test fell into: a
+		// wildcard grants the subject without ever naming it.
+		{"a2a.topics.shared.pro*", "a2a.topics.shared.probe", false}, // NATS has no partial-token globbing
+	}
+	for _, c := range cases {
+		if got := subjectMatches(c.pattern, c.subject); got != c.want {
+			t.Errorf("subjectMatches(%q, %q) = %v, want %v", c.pattern, c.subject, got, c.want)
+		}
+	}
+}
+
 // The probe subject is provisioned so an authorization refusal has a real
 // subject to land on, and it has NO writer on purpose — the one deliberate
 // exception to "a topic's subject list and its writer's grant travel
 // together". If any user ever gains publish on it, the probe stops being a
 // refusal test and becomes a way to write a state-class topic.
+//
+// Asked by SUBJECT MATCHING, not by substring: W8 hit exactly this on their
+// dev bus, where a seed user holding `a2a.>` as a convenience covered the
+// probe subject without naming it. Nothing here holds such a wildcard today
+// (W6 finding #7 narrowed worker's topic grants to the exact provisioned
+// list), and this test is what keeps that true — re-widening any publish
+// grant to `a2a.topics.>` fails here rather than silently making the probe
+// writable.
 func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
+	const probe = "a2a.topics.shared.probe"
 	agent := a2aTestAgent()
 
 	script := strings.Join(buildA2AProvisionJob(agent).Spec.Template.Spec.Containers[0].Command, "\n")
-	if !strings.Contains(script, "a2a.topics.shared.probe") {
+	if !strings.Contains(script, probe) {
 		t.Error("probe subject is not provisioned; a refusal against it would only prove the subject is missing")
 	}
 
 	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds()).Data["nats.conf"])
-	// Walk each user's publish block and assert none of them names the probe.
 	for _, user := range []string{"gateway", "worker", "seed", "web"} {
 		start := strings.Index(conf, "user: "+user)
 		if start < 0 {
@@ -802,8 +856,14 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 			entry = entry[:next+1]
 		}
 		pub := entry[strings.Index(entry, "publish"):strings.Index(entry, "subscribe")]
-		if strings.Contains(pub, "a2a.topics.shared.probe") {
-			t.Errorf("user %q can publish the probe subject; it must have no writer", user)
+		for _, line := range strings.Split(pub, "\n") {
+			line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
+			if !strings.HasPrefix(line, `"`) {
+				continue
+			}
+			if grant := strings.Trim(line, `"`); subjectMatches(grant, probe) {
+				t.Errorf("user %q can publish the probe subject via grant %q; it must have no writer", user, grant)
+			}
 		}
 	}
 }
