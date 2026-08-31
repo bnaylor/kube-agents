@@ -369,8 +369,8 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 			if err != nil || rec == nil {
 				continue
 			}
-			if rec.ActiveTask != nil {
-				_ = g.reg.DropTask(cctx, rec.ActiveTask.TaskID)
+			for _, tr := range rec.Tasks {
+				_ = g.reg.DropTask(cctx, tr.ID)
 			}
 			if rec.PodName != "" {
 				_ = sp.Delete(cctx, rec.PodName)
@@ -378,8 +378,25 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 		}
 	})
 
+	// Task identity comes from rec.Tasks, captured right after the turn:
+	// the deployed gateway drains this test's events off the shared relay
+	// durable and retires ActiveTask in the shared KV as terminals land, so
+	// ActiveTask is not ours to read later - the Tasks history is.
+	type liveTask struct{ id, addressee string }
+	taskFor := func(conv string) liveTask {
+		t.Helper()
+		rec, err := g.reg.Get(ctx, conv)
+		if err != nil || rec == nil || len(rec.Tasks) == 0 {
+			t.Fatalf("no task recorded for %s: %+v (err=%v)", conv, rec, err)
+		}
+		tr := rec.Tasks[len(rec.Tasks)-1]
+		return liveTask{id: tr.ID, addressee: tr.Addressee}
+	}
+
 	turn(convA, "s8-live-1", "Delegate: write a haiku about pod quotas")
+	taskA := taskFor(convA)
 	turn(convB, "s8-live-2", "Delegate: write a haiku about resource limits")
+	taskB := taskFor(convB)
 	waitLive(t, "two live session pods on the install", 2*time.Minute, func() bool {
 		n, err := sp.LiveSessions(ctx)
 		return err == nil && n == 2
@@ -406,14 +423,9 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 
 	// The first two keep running to completion on the real bus — the path
 	// being capped still works end to end (worker pod -> LiteLLM -> result).
-	for _, conv := range []string{convA, convB} {
-		rec, err := g.reg.Get(ctx, conv)
-		if err != nil || rec == nil || rec.ActiveTask == nil {
-			t.Fatalf("no active task for %s: %+v (err=%v)", conv, rec, err)
-		}
-		taskID, addressee := rec.ActiveTask.TaskID, rec.Addressee
+	for conv, lt := range map[string]liveTask{convA: taskA, convB: taskB} {
 		waitLive(t, conv+" completes", 5*time.Minute, func() bool {
-			task, err := g.client.TasksGet(ctx, addressee, taskID)
+			task, err := g.client.TasksGet(ctx, lt.addressee, lt.id)
 			return err == nil && task.Final && task.State == lib.StateCompleted
 		})
 	}
