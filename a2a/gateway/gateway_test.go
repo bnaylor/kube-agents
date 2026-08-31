@@ -457,6 +457,16 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	if auth.Requester.Principal == originAuth.Requester.Principal {
 		t.Fatal("steer must be attributed to its own sender")
 	}
+	// The steer is acknowledged in-channel - silent absorption looked like
+	// a dropped message live.
+	waitFor(t, "steer acknowledgement", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "steering sent") {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestStatusQueryAnsweredByReplayNotForwarded(t *testing.T) {
@@ -489,7 +499,11 @@ func TestStatusQueryAnsweredByReplayNotForwarded(t *testing.T) {
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: "What is it doing?"}
 	waitFor(t, "replayed status post", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "working") && strings.Contains(p, "step 2 of 5") && strings.Contains(p, "replay") {
+			// The card carries the state, the progress line, the replay
+			// notice, the echoed ask, and the elapsed clock.
+			if strings.Contains(p, "working") && strings.Contains(p, "step 2 of 5") &&
+				strings.Contains(p, "replay") && strings.Contains(p, "🎯 on: “start”") &&
+				strings.Contains(p, "so far") {
 				return true
 			}
 		}
@@ -596,8 +610,10 @@ func TestNormalizePhrases(t *testing.T) {
 		"status update pls": false,
 		"do the thing":      false,
 	} {
-		if got := isStatusQuery(phrase); got != want {
-			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
+		// Narrow mode: these phrases exercise normalization through the
+		// exact set and classify the same way in both modes.
+		if got := isStatusQuery(phrase, false); got != want {
+			t.Errorf("isStatusQuery(%q, false) = %v, want %v", phrase, got, want)
 		}
 	}
 	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
@@ -707,8 +723,9 @@ func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
 // fakeSpawner records spawn calls; the delegate flow's pod machinery without
 // a cluster.
 type fakeSpawner struct {
-	mu     sync.Mutex
-	spawns []fakeSpawn
+	mu      sync.Mutex
+	spawns  []fakeSpawn
+	deletes []string
 }
 
 type fakeSpawn struct {
@@ -723,7 +740,18 @@ func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ str
 	return rec.BusSession, nil
 }
 
-func (s *fakeSpawner) Delete(context.Context, string) error { return nil }
+func (s *fakeSpawner) Delete(_ context.Context, podName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletes = append(s.deletes, podName)
+	return nil
+}
+
+func (s *fakeSpawner) deleted() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.deletes...)
+}
 
 func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) { return nil, nil }
 
@@ -736,6 +764,13 @@ func (s *fakeSpawner) calls() []fakeSpawn {
 // startRigWithSpawner is startRig with the session-pod path armed through a
 // fake spawner.
 func startRigWithSpawner(t *testing.T) (*rig, *fakeSpawner) {
+	t.Helper()
+	return startRigWithSpawnerRoute(t, "platform")
+}
+
+// startRigWithSpawnerRoute arms the spawner with a chosen default addressee
+// - RouteSession is the post-flip W4 configuration.
+func startRigWithSpawnerRoute(t *testing.T, defaultAddressee string) (*rig, *fakeSpawner) {
 	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
@@ -765,7 +800,7 @@ func startRigWithSpawner(t *testing.T) (*rig, *fakeSpawner) {
 	cfg := &Config{
 		NATSURL:          url,
 		PrincipalMapPath: mapFile,
-		DefaultAddressee: "platform",
+		DefaultAddressee: defaultAddressee,
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
 	}
@@ -883,5 +918,148 @@ func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
 	}
 	if got := joinTextParts(m.Parts); got != "Delegate: write a haiku" {
 		t.Fatalf("text mangled without a spawner: %q", got)
+	}
+}
+
+// TestDelegatedTaskStatusShapeSteers: the width bias inverts for executors
+// that absorb steers. During a delegated task a wide interrogative shape
+// must reach the worker as a steer - only the exact phrases stay status
+// affordances, or a correction is stolen and answered by replay.
+func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-d3"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "d-120", Text: "Delegate: tune the haiku",
+	}
+	waitFor(t, "session pod spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// A wide status shape on a fixed route; a steer here.
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "d-121", Text: "what are you doing with the meter",
+	}
+	waitFor(t, "steer on the session in subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+			var sm lib.Message
+			if e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID &&
+				json.Unmarshal(e.Payload, &sm) == nil &&
+				joinTextParts(sm.Parts) == "what are you doing with the meter" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// The exact phrase is still the status affordance, answered by replay.
+	before := len(inSubjectEnvelopes(t, r.url, call.Session))
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "d-122", Text: "status",
+	}
+	waitFor(t, "replayed status post", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "replay") {
+				return true
+			}
+		}
+		return false
+	})
+	if after := len(inSubjectEnvelopes(t, r.url, call.Session)); after != before {
+		t.Fatalf("exact status phrase was forwarded: %d -> %d envelopes", before, after)
+	}
+}
+
+// TestPreFlipRecordUpgradesToSessionRoute: a record minted before the W4
+// flip keeps SessionRouted=false forever, so the re-home branch must upgrade
+// it rather than write the literal RouteSession sentinel into Addressee -
+// that would publish the task to an addressee no executor owns.
+func TestPreFlipRecordUpgradesToSessionRoute(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-preflip"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-preflip", Addressee: "platform", Kind: "group"}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "d-130", Text: "check the fleet",
+	}
+	waitFor(t, "spawn for the upgraded record", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	if call.Session == RouteSession || !strings.HasPrefix(call.Session, "chat-") {
+		t.Fatalf("upgraded record's session: %q", call.Session)
+	}
+	origin := r.awaitTask(t, call.Session)
+	if origin.To == nil || origin.To.Session != call.Session {
+		t.Fatalf("task addressed to %+v, want the minted session %s", origin.To, call.Session)
+	}
+}
+
+// TestDelegateDeletesPreviousIncarnationPod: re-delegating must not orphan
+// the previous incarnation's pod - once PodName is cleared, reap can never
+// find it again, so the gateway deletes it instead.
+func TestDelegateDeletesPreviousIncarnationPod(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-d4"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "d-140", Text: "Delegate: first task",
+	}
+	waitFor(t, "first spawn", func() bool { return len(spawn.calls()) == 1 })
+	first := spawn.calls()[0]
+	origin := r.awaitTask(t, first.Session)
+	exec := r.execFor(t, origin, first.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "terminal relayed", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "non-text result") {
+				return true
+			}
+		}
+		return false
+	})
+
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "d-141", Text: "Delegate: second task",
+	}
+	waitFor(t, "second spawn", func() bool { return len(spawn.calls()) == 2 })
+	waitFor(t, "previous incarnation deleted", func() bool {
+		deleted := spawn.deleted()
+		return len(deleted) == 1 && deleted[0] == first.Session
+	})
+}
+
+func TestAddresseeForStragglerTask(t *testing.T) {
+	rec := &SessionRecord{
+		Addressee: "platform",
+		Tasks: []TaskRef{
+			{ID: "task-old", Addressee: "chat-otter-abcd"},
+			{ID: "task-new", Addressee: "platform"},
+		},
+	}
+	if got := rec.AddresseeFor("task-old"); got != "chat-otter-abcd" {
+		t.Fatalf("straggler addressee = %q, want the one its subjects carried", got)
+	}
+	if got := rec.AddresseeFor("task-unknown"); got != "platform" {
+		t.Fatalf("unknown task falls back to the record's addressee, got %q", got)
 	}
 }

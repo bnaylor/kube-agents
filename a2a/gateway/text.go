@@ -42,27 +42,34 @@ var statusQueries = map[string]bool{
 	"what are you doing": true,
 	"whats happening":    true,
 	"what is happening":  true,
+	"whats going on":     true,
+	"what is going on":   true,
 	"status":             true,
 	"progress":           true,
+	"any progress":       true,
+	"any update":         true,
+	"any updates":        true,
 	"where are we":       true,
 	"hows it going":      true,
+	"how is it going":    true,
 }
 
-// isStatusQuery reports whether the turn is the "what is it doing" ask,
-// answered by stream replay rather than forwarded as steering.
 // isStatusQuery reports whether a mid-task message asks what the task is
 // doing rather than telling it something. Deterministic by design - the
 // gateway holds no model - so this is a phrase set plus a narrow
-// interrogative rule, not understanding. Width bias: while Hermes is the
-// only executor, a false positive costs nothing (a real steer would be
-// refused anyway), so match generously; revisit when W4 lands executors
-// that actually absorb steers.
-func isStatusQuery(text string) bool {
+// interrogative rule, not understanding. The interrogative rule is the wide
+// half and it misfires ("any update to the config should be reverted" is a
+// steer), so it only applies when wide is true. The caller sets wide by
+// executor: a fixed-route executor (Hermes) refuses steers, so a stolen
+// false positive costs nothing; a session worker absorbs steers, so a
+// stolen one is a dropped correction and only the exact phrases match -
+// a status-shaped steer there is a question the worker can answer itself.
+func isStatusQuery(text string, wide bool) bool {
 	n := normalize(text)
 	if statusQueries[n] {
 		return true
 	}
-	if len(n) > 48 {
+	if !wide || len(n) > 48 {
 		return false
 	}
 	statusish := strings.Contains(n, "doing") || strings.Contains(n, "happening") ||
@@ -119,11 +126,12 @@ func isStop(text string) bool {
 // message.
 const statusHistoryCap = 12
 
-// formatTaskStatus renders a replayed Task for chat: current state, the
-// transition history, and the latest progress line.
 // askCap bounds the instruction echo in status answers and in the session KV.
 const askCap = 140
 
+// formatTaskStatus renders a replayed Task for chat: current state, the
+// echoed ask and elapsed clock, the transition history, and the latest
+// progress line.
 func formatTaskStatus(t *lib.Task, ask string, since time.Time) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔎 task `%s` is **%s**", t.ID, t.State)

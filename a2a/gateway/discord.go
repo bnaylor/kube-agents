@@ -175,6 +175,13 @@ func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreat
 			for _, r := range mentionedRoles {
 				text = strings.TrimSpace(strings.ReplaceAll(text, "<@&"+r+">", ""))
 			}
+			if text == "" {
+				// A bare mention has nothing to run. Bail before the thread
+				// spawns - an empty session thread that never gets a reply
+				// is the "dropped message" shape this adapter exists to
+				// avoid.
+				return InboundMessage{}, false
+			}
 			thread, err := s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{
 				Name:                threadName(text),
 				AutoArchiveDuration: 1440,

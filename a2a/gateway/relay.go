@@ -172,8 +172,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	result := joinTextParts(rs.result)
 	if result == "" && s.Status.State == lib.StateCompleted {
 		// Render state is cache; if a restart lost it, the stream still has
-		// everything.
-		if task, err := g.client.TasksGet(ctx, rec.Addressee, taskID); err == nil {
+		// everything. Replay against the addressee the task's own subjects
+		// carried - after a Delegate re-home, rec.Addressee is not it.
+		if task, err := g.client.TasksGet(ctx, rec.AddresseeFor(taskID), taskID); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
 				result = joinTextParts(art.Parts)
 			}

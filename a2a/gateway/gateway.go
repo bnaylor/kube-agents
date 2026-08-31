@@ -237,8 +237,13 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	}
 
 	active := rec.ActiveTask
+	// The status matcher's wide interrogative rule is only safe where a
+	// stolen steer costs nothing: a fixed-route executor (Hermes) refuses
+	// steers, a session worker absorbs them - so a session-addressed task
+	// gets the exact phrases only (see isStatusQuery).
+	wideStatus := !(rec.BusSession != "" && rec.Addressee == rec.BusSession)
 	switch {
-	case active != nil && isStatusQuery(msg.Text):
+	case active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case active != nil && !active.Detached && isStop(msg.Text):
 		g.cancelTask(ctx, rec, authority)
@@ -248,17 +253,29 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {
 			// The Delegate flow (W4 amendment): this ONE task goes to a
 			// freshly spawned session worker - the addressee is the new
-			// session name, the rest of the text is the task. The
-			// conversation's route is untouched: the next plain ask below
-			// re-homes to the default addressee.
+			// session name, the rest of the text is the task. On a
+			// fixed-route conversation the next plain ask below re-homes to
+			// the default addressee; on a session-routed one the delegate
+			// incarnation becomes the next standing incarnation, which is
+			// inside the session route's contract (incarnations rotate).
 			if rec.Profile == "" {
 				rec.Profile = "chat"
 			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
-			// A lingering previous incarnation is not this task's executor;
-			// the sweep deletes its terminal pod regardless of tracking.
-			rec.PodName = ""
+			// A lingering previous incarnation is not this task's executor,
+			// and its task is already closed (healed or detached). Delete
+			// the pod rather than just untrack it: once PodName clears,
+			// reap can never find it again, and sweep only sees terminal
+			// phases - a wedged Running pod would hold its bus credential
+			// forever.
+			if rec.PodName != "" {
+				if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+					g.log.Warn("previous incarnation delete failed; pod may linger",
+						"pod", rec.PodName, "err", err)
+				}
+				rec.PodName = ""
+			}
 			msg.Text = rest
 		} else if rec.SessionRouted && rec.PodName == "" {
 			// A session-routed conversation with no live incarnation gets a
@@ -270,6 +287,17 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			// conversation always goes to the configured addressee, never
 			// to a dead delegate session.
 			rec.Addressee = g.cfg.DefaultAddressee
+			if g.spawner != nil && rec.Addressee == RouteSession {
+				// A record minted before the W4 flip: upgrade it the way
+				// first contact would. The sentinel is a route, never an
+				// addressee - written literally it publishes the task to a
+				// subject no executor owns (the exact failure New()'s
+				// config guard describes).
+				rec.SessionRouted = true
+				rec.Profile = "chat"
+				rec.BusSession = mintSessionName(rec.Profile)
+				rec.Addressee = rec.BusSession
+			}
 		}
 		g.startTask(ctx, rec, msg, principal, authority)
 	}

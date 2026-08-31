@@ -21,8 +21,13 @@ type ActiveTask struct {
 	CorrelationID string `json:"correlationId"`
 	// Ask is the task's instruction, truncated, for status rendering only -
 	// "working on: <ask>" beats "it's working" and the fold cannot supply it
-	// (the submission is a message part, not folded status). Plaintext lives
-	// in the session KV only, same posture as the ingress log.
+	// (the submission is a message part, not folded status). This is user
+	// CONTENT at rest on the bus, deliberately: the same text already rides
+	// the TASKS stream in the submission envelope for the whole retention
+	// window, the gateway is the only user granted $KV.session-state.>, the
+	// bucket keeps one revision, and the copy dies with ActiveTask at the
+	// terminal event. The pseudonymization rule covers identifiers, not
+	// content - the spec should state that distinction (amendment pending).
 	Ask string `json:"ask,omitempty"`
 	// SubmittedAt feeds the elapsed clock in status answers.
 	SubmittedAt time.Time `json:"submittedAt,omitempty"`
@@ -65,6 +70,20 @@ type SessionRecord struct {
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
+}
+
+// AddresseeFor returns the addressee a task was published to. Session
+// addressees rotate per incarnation and Delegate re-homes the record, so
+// rec.Addressee only says where the LATEST task went; a straggler's replay
+// must use the addressee its own subjects carried. Unknown tasks fall back
+// to the record's current addressee.
+func (rec *SessionRecord) AddresseeFor(taskID string) string {
+	for _, ref := range rec.Tasks {
+		if ref.ID == taskID {
+			return ref.Addressee
+		}
+	}
+	return rec.Addressee
 }
 
 const taskHistoryCap = 50
