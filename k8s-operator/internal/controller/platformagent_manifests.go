@@ -317,6 +317,17 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
 	add := func(key, value string) {
+		// One line per key, enforced rather than assumed. Most values here come
+		// from CR strings with no pattern or maxLength on the field (chat user
+		// lists, project and subscription names), and this file is line-oriented
+		// to every reader it has. A newline in one of them appends a line the
+		// render never intended — and since the entrypoint's mode probe now
+		// parses this file as a gate, a smuggled `KUBEAGENTS_MODE=next` past the
+		// operator's own pin is a mode flip written by whoever can edit the CR's
+		// chat settings. Stripped, not escaped: nothing downstream reads a
+		// multi-line value, so there is nothing to preserve.
+		value = strings.ReplaceAll(value, "\n", "")
+		value = strings.ReplaceAll(value, "\r", "")
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
@@ -1878,33 +1889,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 
-	// The A2A bus, under `next` only (W5 delta memo #1, ask 2): address and
-	// credentials for the worker user, whose grants already fit an agent-side
-	// reader — subscribe on a2a.topics.>, publish on the provisioned topics.
-	// From the same Secret the A2A gateway reads, and container env only: a
-	// copy in a profile .env on the PVC would be a second place to rotate and
-	// a first place to leak. W7's bridge sidecar shares the pod and needs the
-	// same three, so this is one seam, not two.
-	if renderMode(agent, "nats") == ModeNext {
-		envVars = append(envVars,
-			corev1.EnvVar{
-				Name:  "NATS_URL",
-				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
-			},
-			corev1.EnvVar{
-				Name:  "NATS_USER",
-				Value: "worker",
-			},
-			corev1.EnvVar{
-				Name: "NATS_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-					Key:                  "worker-password",
-				}},
-			},
-		)
-	}
-
 	if replicas > 1 {
 		envVars = append(envVars,
 			corev1.EnvVar{
@@ -1950,6 +1934,44 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_URL",
 		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
 	})
+
+	// The A2A bus, under `next` only (W5 delta memo #1, ask 2): address and
+	// credentials for the worker user, whose grants already fit an agent-side
+	// reader — subscribe on a2a.topics.>, publish on the provisioned topics.
+	// From the same Secret the A2A gateway reads, and container env only: a
+	// copy in a profile .env on the PVC would be a second place to rotate and
+	// a first place to leak. W7's bridge sidecar shares the pod and needs the
+	// same three, so this is one seam, not two.
+	//
+	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
+	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
+	// lands in the container whatever the address says; a plugin that replaced
+	// NATS_URL (spec.env is copied verbatim, mergeEnvVars replaces in place)
+	// would have the client hand the worker password to an address of the
+	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
+	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
+	// cluster. Found by the W6.1 adversarial review; the same names are in
+	// SensitiveEnvVars so the CR's own spec.deployment.env cannot reach them
+	// either.
+	if a2aAgentSurface(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name:  "NATS_URL",
+				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+			},
+			corev1.EnvVar{
+				Name:  "NATS_USER",
+				Value: "worker",
+			},
+			corev1.EnvVar{
+				Name: "NATS_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
+					Key:                  "worker-password",
+				}},
+			},
+		)
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -4126,7 +4148,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// and a policy pinned to an address silently stops matching. Egress here
 	// is deny-by-default, and a missing rule does not refuse the dial — it
 	// hangs it to the timeout, the least diagnosable shape this failure has.
-	if renderMode(agent, "nats") == ModeNext {
+	if a2aAgentSurface(agent) {
 		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
