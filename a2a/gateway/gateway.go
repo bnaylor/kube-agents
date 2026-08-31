@@ -380,7 +380,14 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("steer publish failed", "taskId", active.TaskID, "err", err)
+		g.post(rec.Key, "⚠️ could not send that to the running task; it is still working on the original instruction")
+		return
 	}
+	// Say what we know and no more: the steer is on the stream. Whether the
+	// executor absorbs it is the executor's answer - a session worker takes
+	// it at its next turn boundary and says nothing, Hermes publishes its
+	// refusal. Both arrive after this line.
+	g.post(rec.Key, "✏️ steering sent — the executor picks it up at its next turn boundary")
 }
 
 // cancelTask publishes kind:cancel — the hard interrupt — and detaches the
