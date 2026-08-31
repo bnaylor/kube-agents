@@ -79,7 +79,15 @@ export interface TaskView {
   lastEventAt: number;
 }
 
-export type ChatKind = "user" | "steer" | "answer" | "progress" | "status" | "topic" | "cancel";
+export type ChatKind =
+  | "user"
+  | "steer"
+  | "answer"
+  | "progress"
+  | "status"
+  | "topic"
+  | "cancel"
+  | "anomaly";
 
 export interface ChatEntry {
   id: string;
@@ -122,7 +130,8 @@ export interface UiState {
 }
 
 export type BusEvent =
-  | { type: "envelope"; env: Envelope; subject: SubjectInfo; live: boolean }
+  /** `at` is the browser-clock receive time; `env.ts` is the publisher's. */
+  | { type: "envelope"; env: Envelope; subject: SubjectInfo; live: boolean; at: number }
   | { type: "tick"; now: number }
   | { type: "connection"; state: ConnectionState }
   | { type: "streams"; up: number; total: number }
@@ -173,8 +182,13 @@ function withAgent(
   return next;
 }
 
-/** Every session heard from is a tap on the rail; traffic alone earns one. */
-function touchAgent(state: UiState, env: Envelope): Map<string, AgentView> {
+/**
+ * Every session heard from is a tap on the rail; traffic alone earns one.
+ * Liveness uses the browser's receive clock for live traffic — a publisher
+ * whose clock runs behind must not read as idle while it is streaming — and
+ * the envelope's own ts for replayed history, which really is old.
+ */
+function touchAgent(state: UiState, env: Envelope, live: boolean, at: number): Map<string, AgentView> {
   const session = env.from.session;
   if (session === "") return state.agents;
   const prev = state.agents.get(session);
@@ -186,7 +200,7 @@ function touchAgent(state: UiState, env: Envelope): Map<string, AgentView> {
     statusLine: prev?.statusLine,
     perTask: prev?.perTask,
     status: prev?.status === "closed" ? "closed" : "active",
-    lastActivity: Math.max(prev?.lastActivity ?? 0, tsMs(env)),
+    lastActivity: Math.max(prev?.lastActivity ?? 0, live ? at : tsMs(env)),
   });
   return agents;
 }
@@ -221,20 +235,37 @@ function upsertTask(
   return next;
 }
 
-function pushChat(state: UiState, entry: Omit<ChatEntry, "id">): ChatEntry[] {
-  return [...state.chat, { id: `chat-${state.streamMsgCount + 1}`, ...entry }];
+/**
+ * Chat ids key React's list, so they must be unique for the life of the
+ * transcript. They are derived from the envelope that produced the entry,
+ * not from a running counter: branches here pass different state objects
+ * (some pre-increment, some post), and a counter made two envelopes collide
+ * on the same id — React then drops one entry from the render.
+ */
+function pushChat(state: UiState, env: Envelope, entry: Omit<ChatEntry, "id">): ChatEntry[] {
+  return [...state.chat, { id: `${env.envelopeId}#${state.chat.length}`, ...entry }];
 }
 
-/** Streaming chunks of one artifact merge into a single transcript entry. */
-function appendChunk(state: UiState, entry: Omit<ChatEntry, "id">): ChatEntry[] {
+/**
+ * Streaming chunks of one artifact merge into a single transcript entry.
+ * Only when the producer said `append`: a full re-publish of `result` is a
+ * legal A2A replacement, and concatenating it would show the answer twice.
+ */
+function appendChunk(
+  state: UiState,
+  env: Envelope,
+  entry: Omit<ChatEntry, "id">,
+  append: boolean,
+): ChatEntry[] {
   const last = state.chat[state.chat.length - 1];
   const mergeable =
+    append &&
     last !== undefined &&
     last.kind === entry.kind &&
     last.session === entry.session &&
     last.taskId !== undefined &&
     last.taskId === entry.taskId;
-  if (!mergeable) return pushChat(state, entry);
+  if (!mergeable) return pushChat(state, env, entry);
   const merged = [...state.chat];
   merged[merged.length - 1] = { ...last, text: last.text + entry.text };
   return merged;
@@ -249,7 +280,7 @@ function reduceMessage(next: UiState, state: UiState, env: Envelope, subject: Su
   // later message on the same task is steering or follow-up input.
   const isSubmission = known === undefined;
   next.tasks = upsertTask(state.tasks, env, subject, isSubmission ? {} : undefined);
-  next.chat = pushChat(state, {
+  next.chat = pushChat(state, env, {
     kind: isSubmission ? "user" : "steer",
     session: env.from.session,
     text,
@@ -277,7 +308,7 @@ function reduceStatusUpdate(
   // reason) belongs in the transcript.
   const note = partsText(payload.status?.message?.parts);
   if (note !== "") {
-    next.chat = pushChat(state, {
+    next.chat = pushChat(state, env, {
       kind: "status",
       session: env.from.session,
       text: note,
@@ -324,15 +355,20 @@ function reduceArtifactUpdate(
   });
 
   if (name === ARTIFACT_RESULT) {
-    next.chat = appendChunk(state, {
-      kind: "answer",
-      session: env.from.session,
-      text,
-      correlationId: env.correlationId,
-      taskId: env.taskId,
-    });
+    next.chat = appendChunk(
+      state,
+      env,
+      {
+        kind: "answer",
+        session: env.from.session,
+        text,
+        correlationId: env.correlationId,
+        taskId: env.taskId,
+      },
+      payload.append === true,
+    );
   } else if (name === ARTIFACT_PROGRESS) {
-    next.chat = pushChat(state, {
+    next.chat = pushChat(state, env, {
       kind: "progress",
       session: env.from.session,
       text,
@@ -345,13 +381,37 @@ function reduceArtifactUpdate(
   // and count on the task for replay.
 }
 
+/**
+ * Bus anomalies the spec calls protocol errors. An instrument panel exists to
+ * show these, so they go in the transcript rather than being folded in as
+ * normal traffic or dropped: a `to` that disagrees with the subject's
+ * addressee (assertion 4), and any event after the task's `final` one
+ * (assertion 10).
+ */
+function anomalyOf(state: UiState, env: Envelope, subject: SubjectInfo): string | null {
+  if (
+    subject.plane === "tasks" &&
+    env.to?.session !== undefined &&
+    env.to.session !== subject.addressee
+  ) {
+    return `envelope addressed to "${env.to.session}" on ${subject.addressee}'s subject`;
+  }
+  const task = env.taskId ? state.tasks.get(env.taskId) : undefined;
+  if (task?.final && (env.kind === "status-update" || env.kind === "artifact-update")) {
+    return `${env.kind} after the task's final event`;
+  }
+  return null;
+}
+
 function reduceEnvelope(
   state: UiState,
   env: Envelope,
   subject: SubjectInfo,
   live: boolean,
+  at: number,
 ): UiState {
   const next: UiState = { ...state, streamMsgCount: state.streamMsgCount + 1 };
+  const anomaly = anomalyOf(state, env, subject);
 
   if (live) {
     const pulse: Pulse = {
@@ -365,7 +425,20 @@ function reduceEnvelope(
     next.pulses = pulses.length > MAX_PULSES ? pulses.slice(pulses.length - MAX_PULSES) : pulses;
   }
 
-  next.agents = touchAgent(state, env);
+  // An anomalous envelope is reported and not folded: it must not revive a
+  // retired agent, retune a finished task, or append to an answer.
+  if (anomaly !== null) {
+    next.chat = pushChat(state, env, {
+      kind: "anomaly",
+      session: env.from.session,
+      text: `${anomaly} (${env.kind}, ${env.envelopeId})`,
+      correlationId: env.correlationId,
+      taskId: env.taskId,
+    });
+    return next;
+  }
+
+  next.agents = touchAgent(state, env, live, at);
   const touched: UiState = { ...next };
 
   switch (env.kind) {
@@ -383,7 +456,7 @@ function reduceEnvelope(
 
     case "cancel": {
       next.tasks = upsertTask(touched.tasks, env, subject);
-      next.chat = pushChat(touched, {
+      next.chat = pushChat(touched, env, {
         kind: "cancel",
         session: env.from.session,
         text: "cancel requested",
@@ -426,7 +499,7 @@ function reduceEnvelope(
       const artifact = env.payload as Artifact;
       const topic = subject.plane === "topics" ? subject.topic : (artifact.name ?? "topic");
       const summary = partsText(artifact.parts);
-      next.chat = pushChat(touched, {
+      next.chat = pushChat(touched, env, {
         kind: "topic",
         session: env.from.session,
         text: summary !== "" ? `${topic}: ${summary}` : `updated ${topic}`,
@@ -443,7 +516,7 @@ function reduceEnvelope(
 export function reduce(state: UiState, event: BusEvent): UiState {
   switch (event.type) {
     case "envelope":
-      return reduceEnvelope(state, event.env, event.subject, event.live);
+      return reduceEnvelope(state, event.env, event.subject, event.live, event.at);
 
     case "tick": {
       let agents: Map<string, AgentView> | undefined;

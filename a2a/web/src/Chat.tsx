@@ -16,6 +16,7 @@ import { corrColor } from "./model.ts";
 interface ChatProps {
   entries: ChatEntry[];
   probe?: ProbeResult;
+  probePending?: boolean;
   onProbe: () => void;
 }
 
@@ -27,6 +28,7 @@ const GLYPH: Record<ChatEntry["kind"], string> = {
   status: "⋯",
   topic: "⊙",
   cancel: "✕",
+  anomaly: "⚠",
 };
 
 function probeText(probe: ProbeResult): string {
@@ -40,7 +42,7 @@ function probeText(probe: ProbeResult): string {
   }
 }
 
-export default function Chat({ entries, probe, onProbe }: ChatProps) {
+export default function Chat({ entries, probe, probePending, onProbe }: ChatProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
 
@@ -75,9 +77,8 @@ export default function Chat({ entries, probe, onProbe }: ChatProps) {
         {corrChip}
         <div className={`chat-entry chat-${entry.kind}`}>
           {glyph !== "" && <span className="chat-glyph">{glyph}</span>}
-          {(entry.kind === "progress" || entry.kind === "topic") && entry.session && (
-            <span className="chat-session">[{entry.session}]</span>
-          )}
+          {(entry.kind === "progress" || entry.kind === "topic" || entry.kind === "anomaly") &&
+            entry.session && <span className="chat-session">[{entry.session}]</span>}
           <span className="chat-text">{entry.text}</span>
         </div>
       </div>
@@ -101,8 +102,13 @@ export default function Chat({ entries, probe, onProbe }: ChatProps) {
         <span className="probe-label">
           connected as <code>web</code> · read-only
         </span>
-        <button type="button" className="probe-button" onClick={onProbe}>
-          verify
+        <button
+          type="button"
+          className="probe-button"
+          onClick={onProbe}
+          disabled={probePending}
+        >
+          {probePending ? "verifying…" : "verify"}
         </button>
         {probe && (
           <span className={`probe-result probe-${probe.outcome}`}>{probeText(probe)}</span>

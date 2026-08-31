@@ -72,6 +72,41 @@ describe("parseEnvelope", () => {
     expect(() => parseEnvelope("not json {{{")).toThrow(ProtocolError);
     expect(() => parseEnvelope(encode([1, 2]))).toThrow(ProtocolError);
   });
+
+  // A shell-valid envelope whose payload is missing or the wrong type used to
+  // reach the reducer and take the whole page down — durably, since the
+  // stream replays it on every reload. It is a protocol error (assertion 7).
+  it("rejects a missing, null, or non-object payload", () => {
+    const noPayload: Record<string, unknown> = { ...valid };
+    delete noPayload.payload;
+    expect(() => parseEnvelope(encode(noPayload))).toThrow(ProtocolError);
+    expect(() => parseEnvelope(encode({ ...valid, payload: null }))).toThrow(ProtocolError);
+    expect(() => parseEnvelope(encode({ ...valid, payload: "text" }))).toThrow(ProtocolError);
+    expect(() => parseEnvelope(encode({ ...valid, payload: [] }))).toThrow(ProtocolError);
+  });
+
+  it("rejects a payload whose kind-specific fields are the wrong type", () => {
+    const task = { taskId: "task-1", contextId: "ctx-1" };
+    expect(() =>
+      parseEnvelope(encode({ ...valid, ...task, kind: "message", payload: { parts: "nope" } })),
+    ).toThrow(ProtocolError);
+    expect(() =>
+      parseEnvelope(
+        encode({ ...valid, ...task, kind: "status-update", payload: { status: "working" } }),
+      ),
+    ).toThrow(ProtocolError);
+    expect(() =>
+      parseEnvelope(
+        encode({ ...valid, ...task, kind: "artifact-update", payload: { artifact: 7 } }),
+      ),
+    ).toThrow(ProtocolError);
+  });
+
+  it("accepts the legitimately empty payloads", () => {
+    const task = { taskId: "task-1", contextId: "ctx-1" };
+    expect(() => parseEnvelope(encode({ ...valid, ...task, kind: "cancel", payload: {} }))).not.toThrow();
+    expect(() => parseEnvelope(encode({ ...valid, kind: "agent-closed", payload: {} }))).not.toThrow();
+  });
 });
 
 describe("parseSubject", () => {

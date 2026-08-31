@@ -25,8 +25,16 @@ function env(partial: Partial<Envelope> & { kind: Kind }): Envelope {
   };
 }
 
-function onSubject(state: UiState, subject: string, e: Envelope, live = true): UiState {
-  const event: BusEvent = { type: "envelope", env: e, subject: parseSubject(subject), live };
+const RECEIVED_AT = Date.parse("2026-08-31T12:00:00Z");
+
+function onSubject(
+  state: UiState,
+  subject: string,
+  e: Envelope,
+  live = true,
+  at = RECEIVED_AT,
+): UiState {
+  const event: BusEvent = { type: "envelope", env: e, subject: parseSubject(subject), live, at };
   return reduce(state, event);
 }
 
@@ -211,6 +219,16 @@ describe("artifact-update", () => {
     });
   });
 
+  it("does not concatenate a non-append re-publish of result", () => {
+    let state = submission();
+    state = artifact(state, "result", "first answer");
+    state = artifact(state, "result", "corrected answer"); // append absent: a replacement
+    const answers = state.chat.filter((c) => c.kind === "answer");
+    expect(answers).toHaveLength(2);
+    expect(answers[1].text).toBe("corrected answer");
+    expect(state.tasks.get("task-1")?.artifacts.get("result")?.text).toBe("corrected answer");
+  });
+
   it("shows progress in the transcript and on the agent's tap", () => {
     let state = submission();
     state = artifact(state, "progress", "reading the topic");
@@ -286,6 +304,162 @@ describe("pulses and liveness", () => {
       env({ kind: "cancel", taskId: "task-1", contextId: "ctx-1" }),
     );
     expect(state.agents.get(GATEWAY_SESSION)?.status).toBe("active");
+  });
+});
+
+describe("protocol anomalies are surfaced, not folded", () => {
+  it("flags an envelope whose `to` disagrees with the subject's addressee", () => {
+    const state = onSubject(
+      initialState,
+      "a2a.tasks.platform.task-1.in",
+      env({
+        kind: "message",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        to: { session: "someone-else" },
+        payload: { role: "user", parts: [{ text: "misaddressed" }] },
+      }),
+    );
+    expect(state.chat[0].kind).toBe("anomaly");
+    expect(state.chat[0].text).toContain('addressed to "someone-else"');
+    // Not folded: no task created, no transcript line for the content.
+    expect(state.tasks.size).toBe(0);
+    expect(state.chat.filter((c) => c.kind === "user")).toHaveLength(0);
+  });
+
+  it("flags an event after the task's final event and leaves the task alone", () => {
+    let state = submission();
+    const terminal = (s: string, final: boolean) =>
+      env({
+        kind: "status-update",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        from: bridge,
+        payload: { taskId: "task-1", contextId: "ctx-1", status: { state: s }, final },
+      });
+    state = onSubject(state, "a2a.tasks.platform.task-1.events", terminal("completed", true));
+    state = onSubject(state, "a2a.tasks.platform.task-1.events", terminal("working", false));
+    expect(state.chat[state.chat.length - 1].kind).toBe("anomaly");
+    expect(state.tasks.get("task-1")?.state).toBe("completed");
+  });
+
+  it("a post-final event does not revive a retired per-session worker", () => {
+    let state = onSubject(
+      initialState,
+      "a2a.tasks.chat-otter.task-2.in",
+      env({
+        kind: "message",
+        taskId: "task-2",
+        contextId: "ctx-2",
+        payload: { role: "user", parts: [] },
+      }),
+    );
+    const otter = { session: "chat-otter", agentType: "claude-code" };
+    state = onSubject(
+      state,
+      "a2a.tasks.chat-otter.task-2.events",
+      env({
+        kind: "status-update",
+        taskId: "task-2",
+        contextId: "ctx-2",
+        from: otter,
+        payload: {
+          taskId: "task-2",
+          contextId: "ctx-2",
+          status: { state: "completed" },
+          final: true,
+        },
+      }),
+    );
+    expect(state.agents.get("chat-otter")?.status).toBe("done");
+    state = onSubject(
+      state,
+      "a2a.tasks.chat-otter.task-2.events",
+      env({
+        kind: "artifact-update",
+        taskId: "task-2",
+        contextId: "ctx-2",
+        from: otter,
+        payload: {
+          taskId: "task-2",
+          contextId: "ctx-2",
+          artifact: { name: "result", parts: [{ text: "late" }] },
+        },
+      }),
+    );
+    expect(state.agents.get("chat-otter")?.status).toBe("done");
+  });
+});
+
+describe("chat ids", () => {
+  // Ids key React's list. A counter-derived id collided across envelopes
+  // (branches pass pre- and post-increment state), and React silently
+  // dropped one of the colliding entries from the transcript.
+  it("are unique across every branch that writes a line", () => {
+    let state = submission();
+    state = onSubject(
+      state,
+      "a2a.tasks.platform.task-1.events",
+      env({
+        kind: "status-update",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        from: bridge,
+        payload: {
+          taskId: "task-1",
+          contextId: "ctx-1",
+          status: {
+            state: "input-required",
+            message: { role: "agent", parts: [{ text: "which cluster?" }] },
+          },
+        },
+      }),
+    );
+    state = onSubject(
+      state,
+      "a2a.topics.shared.blueprint",
+      env({ kind: "topic-update", payload: { name: "blueprint", parts: [{ text: "v2" }] } }),
+    );
+    state = onSubject(
+      state,
+      "a2a.tasks.platform.task-1.in",
+      env({ kind: "cancel", taskId: "task-1", contextId: "ctx-1" }),
+    );
+    state = onSubject(
+      state,
+      "a2a.tasks.platform.task-9.in",
+      env({
+        kind: "message",
+        taskId: "task-9",
+        contextId: "ctx-9",
+        to: { session: "elsewhere" },
+        payload: { role: "user", parts: [] },
+      }),
+    );
+    const ids = state.chat.map((c) => c.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("liveness uses the receive clock for live traffic", () => {
+  it("a live envelope from a lagging publisher does not read as idle", () => {
+    const now = Date.parse("2026-08-31T18:00:00Z");
+    // Publisher's clock is hours behind; the envelope arrives right now.
+    const state = onSubject(
+      initialState,
+      "a2a.tasks.platform.task-3.in",
+      env({
+        kind: "message",
+        taskId: "task-3",
+        contextId: "ctx-3",
+        ts: "2026-08-31T12:00:00Z",
+        payload: { role: "user", parts: [] },
+      }),
+      true,
+      now,
+    );
+    const ticked = reduce(state, { type: "tick", now: now + 1000 });
+    expect(ticked.agents.get(GATEWAY_SESSION)?.status).toBe("active");
   });
 });
 

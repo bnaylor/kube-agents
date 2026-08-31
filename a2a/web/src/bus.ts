@@ -37,6 +37,11 @@ export interface BusHandle {
    * Attempts a publish the `web` user must not be allowed to make and
    * reports what the server did. `refused` is the correct answer; `sent`
    * means the grant is broken and the UI says so just as loudly.
+   *
+   * Serialized: a second call while one is in flight joins the first rather
+   * than starting a race. Two racing probes could otherwise resolve out of
+   * order and leave the false "the grant is broken" as the last word, which
+   * is the one lie this button exists to prevent.
    */
   probeReadOnly(): Promise<ProbeResult>;
   close(): Promise<void>;
@@ -74,14 +79,14 @@ export async function startBus(
       if (s.type === "reconnect") dispatch({ type: "connection", state: "up" });
       if (s.type === "error") {
         // A publish violation surfaces as data "PERMISSIONS_VIOLATION" with a
-        // permissionContext naming the operation and subject.
+        // permissionContext naming the operation and subject. Only the probe's
+        // own subject counts: nats.ws's ordered-consumer reset publishes
+        // CONSUMER.DELETE, which these grants deny by design, and that
+        // refusal must never be shown as the probe's evidence.
         const perm = (s as { permissionContext?: { operation: string; subject: string } })
           .permissionContext;
-        const message = String(s.data ?? "");
-        if (perm?.operation === "publish") {
+        if (perm?.operation === "publish" && perm.subject === PROBE_SUBJECT) {
           violation.notify?.(`Permissions Violation for publish to "${perm.subject}"`);
-        } else if (/permissions[ _]violation/i.test(message)) {
-          violation.notify?.(message);
         }
       }
     }
@@ -115,7 +120,17 @@ export async function startBus(
     dispatch({ type: "streams", up: up.size, total: STREAMS.length });
   reportStreams();
 
-  const stoppers: (() => void)[] = [];
+  // One stopper slot per stream, replaced on re-attach: pushing a closure per
+  // attempt would grow without bound in a kiosk session left up for days.
+  const stoppers = new Map<string, () => void>();
+  /**
+   * Highest stream sequence handed to the reducer per stream. A re-attach
+   * replays the stream from the start, and the envelopeId set is capped, so
+   * on a long-running view the id set alone would let evicted envelopes back
+   * in — duplicating transcript lines and re-appending artifact chunks. The
+   * sequence is monotonic per stream and cannot be evicted.
+   */
+  const delivered = new Map<string, number>();
 
   for (const stream of STREAMS) {
     void (async () => {
@@ -129,6 +144,16 @@ export async function startBus(
           const info = await jsm.streams.info(stream);
           const lastSeqAtConnect = info.state.last_seq;
 
+          // A stream deleted and re-provisioned restarts its sequences at 1.
+          // Our watermark would then swallow the whole new stream in silence,
+          // so a regression resets it — the tap reports the new stream rather
+          // than sitting live-but-empty.
+          const mark = delivered.get(stream) ?? 0;
+          if (lastSeqAtConnect < mark) {
+            console.warn(`${stream} sequence regressed (${mark} → ${lastSeqAtConnect}); re-reading`);
+            delivered.set(stream, 0);
+          }
+
           // Ephemeral ordered pull consumer — the exact surface the web
           // user's grants describe. It self-heals across server restarts.
           const consumer = await js.consumers.get(stream);
@@ -137,11 +162,13 @@ export async function startBus(
             void messages.close();
             return;
           }
-          stoppers.push(() => void messages.close());
+          stoppers.set(stream, () => void messages.close());
           up.add(stream);
           reportStreams();
           complained = false;
           for await (const m of messages) {
+            if (m.seq <= (delivered.get(stream) ?? 0)) continue;
+            delivered.set(stream, m.seq);
             let env: Envelope;
             try {
               env = parseEnvelope(m.data);
@@ -154,6 +181,7 @@ export async function startBus(
               env,
               subject: parseSubject(m.subject),
               live: m.seq > lastSeqAtConnect,
+              at: Date.now(),
             });
           }
           // Iterator ended: closed() path or a consume the server tore down.
@@ -174,40 +202,70 @@ export async function startBus(
     })();
   }
 
-  return {
-    async probeReadOnly(): Promise<ProbeResult> {
-      const refusal = new Promise<string>((resolve) => {
-        violation.notify = resolve;
-      });
-      const at = Date.now();
-      try {
-        nc.publish(
-          PROBE_SUBJECT,
-          new TextEncoder().encode(JSON.stringify({ probe: "a2a-web read-only check" })),
-        );
-        await nc.flush();
-      } catch (error) {
-        violation.notify = null;
-        return { outcome: "error", detail: String(error), at };
-      }
-      const verdict = await Promise.race([
-        refusal.then((detail): ProbeResult => ({ outcome: "refused", detail, at })),
-        sleep(PROBE_WAIT_MS).then(
-          (): ProbeResult => ({
-            outcome: "sent",
-            detail: `no refusal within ${PROBE_WAIT_MS / 1000}s — the publish went through; the web grant is broken`,
-            at,
-          }),
-        ),
+  let probeInFlight: Promise<ProbeResult> | null = null;
+
+  async function runProbe(): Promise<ProbeResult> {
+    const refusal = new Promise<string>((resolve) => {
+      violation.notify = resolve;
+    });
+    const at = Date.now();
+    try {
+      nc.publish(
+        PROBE_SUBJECT,
+        new TextEncoder().encode(JSON.stringify({ probe: "a2a-web read-only check" })),
+      );
+      // The flush is raced too: clicked during a reconnect it would otherwise
+      // hang with the UI saying nothing at all.
+      const flushed = await Promise.race([
+        nc.flush().then(() => true),
+        sleep(PROBE_WAIT_MS).then(() => false),
       ]);
+      if (!flushed) {
+        violation.notify = null;
+        return {
+          outcome: "error",
+          detail: "the link did not flush — not connected, so the server never saw the publish",
+          at,
+        };
+      }
+    } catch (error) {
       violation.notify = null;
-      dispatch({ type: "probe", result: verdict });
-      return verdict;
+      return { outcome: "error", detail: String(error), at };
+    }
+    const verdict = await Promise.race([
+      refusal.then((detail): ProbeResult => ({ outcome: "refused", detail, at })),
+      sleep(PROBE_WAIT_MS).then(
+        (): ProbeResult => ({
+          outcome: "sent",
+          detail: `no refusal within ${PROBE_WAIT_MS / 1000}s — the publish went through; the web grant is broken`,
+          at,
+        }),
+      ),
+    ]);
+    violation.notify = null;
+    return verdict;
+  }
+
+  return {
+    probeReadOnly(): Promise<ProbeResult> {
+      // Serialized: a second click joins the probe already running rather
+      // than racing it. Two in flight could resolve out of order and leave
+      // the false "grant is broken" as the last word.
+      if (probeInFlight) return probeInFlight;
+      probeInFlight = runProbe()
+        .then((verdict) => {
+          dispatch({ type: "probe", result: verdict });
+          return verdict;
+        })
+        .finally(() => {
+          probeInFlight = null;
+        });
+      return probeInFlight;
     },
     async close() {
       closed = true;
       clearInterval(timer);
-      for (const stop of stoppers) stop();
+      for (const stop of stoppers.values()) stop();
       await nc.close();
     },
   };

@@ -7,6 +7,7 @@ import {
   DEFAULT_WS_URL,
   loadConfig,
   saveConfig,
+  scrubPasswordFromUrl,
   type BusConfig,
 } from "./config.ts";
 import Chat from "./Chat.tsx";
@@ -66,7 +67,12 @@ export default function App() {
   const [state, dispatch] = useReducer(reduce, initialState);
   const [config, setConfig] = useState<BusConfig | null>(loadConfig);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [probePending, setProbePending] = useState(false);
   const busHandleRef = useRef<BusHandle | null>(null);
+
+  // Effect, not the state initializer: this mutates history, and StrictMode
+  // double-invokes initializers.
+  useEffect(scrubPasswordFromUrl, []);
 
   useEffect(() => {
     if (!config) return;
@@ -105,11 +111,16 @@ export default function App() {
   }, [config]);
 
   const handleProbe = useCallback(() => {
+    if (!busHandleRef.current || probePending) return;
+    setProbePending(true);
     // Result arrives through the reducer as a probe event; errors land there too.
-    void busHandleRef.current?.probeReadOnly().catch((error) => {
-      console.error("Probe failed:", error);
-    });
-  }, []);
+    void busHandleRef.current
+      .probeReadOnly()
+      .catch((error) => {
+        console.error("Probe failed:", error);
+      })
+      .finally(() => setProbePending(false));
+  }, [probePending]);
 
   if (!config) {
     return <ConnectForm error={connectError} onConnect={setConfig} />;
@@ -121,7 +132,12 @@ export default function App() {
         <Rail state={state} />
       </div>
       <div className="app-chat">
-        <Chat entries={state.chat} probe={state.probe} onProbe={handleProbe} />
+        <Chat
+          entries={state.chat}
+          probe={state.probe}
+          probePending={probePending}
+          onProbe={handleProbe}
+        />
       </div>
     </div>
   );

@@ -173,6 +173,33 @@ export function parseEnvelope(data: Uint8Array | string): Envelope {
       throw new ProtocolError(`kind ${env.kind} requires contextId`);
     }
   }
+
+  // A kind/payload mismatch is a protocol error, never passed through
+  // (assertion 7). Every kind's payload is a JSON object — cancel and
+  // agent-closed carry the empty one — and the shape fields the renderer
+  // dereferences must be the right JSON type when present.
+  const payload = env.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new ProtocolError(`kind ${env.kind} payload is not an object`);
+  }
+  const p = payload as Record<string, unknown>;
+  if (env.kind === "message" && p.parts !== undefined && !Array.isArray(p.parts)) {
+    throw new ProtocolError("message payload parts is not an array");
+  }
+  if (
+    env.kind === "status-update" &&
+    p.status !== undefined &&
+    (typeof p.status !== "object" || p.status === null || Array.isArray(p.status))
+  ) {
+    throw new ProtocolError("status-update payload status is not an object");
+  }
+  if (
+    env.kind === "artifact-update" &&
+    p.artifact !== undefined &&
+    (typeof p.artifact !== "object" || p.artifact === null || Array.isArray(p.artifact))
+  ) {
+    throw new ProtocolError("artifact-update payload artifact is not an object");
+  }
   return raw as Envelope;
 }
 
@@ -201,7 +228,9 @@ export function parseSubject(subject: string): SubjectInfo {
   return { plane: "other" };
 }
 
-/** Concatenates the text parts of a Message or Artifact. */
+/** Concatenates the text parts of a Message or Artifact. Never throws: the
+ * elements are bus-controlled and a null part must not take the page down. */
 export function partsText(parts: Part[] | undefined): string {
-  return (parts ?? []).map((p) => p.text ?? "").join("");
+  if (!Array.isArray(parts)) return "";
+  return parts.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("");
 }
