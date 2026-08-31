@@ -172,6 +172,15 @@ Layout:
   else - measured, not assumed. The real closes are the callout or a separate account
   with an export/import.
 
+  **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`
+  with **no writer in any user's publish list** - the single deliberate exception to the
+  rule above that a topic's subject list and its writer's grant travel together. It
+  exists so an authorization probe has a real provisioned subject to be refused on: a
+  refusal against an unprovisioned subject proves only that the subject is missing, while
+  a refusal here proves the grant. Aiming such a probe at a topic the fleet reads means
+  that the one time the grant is wrong, the probe writes junk into standing state; a
+  writerless subject makes that failure land nowhere.
+
   Posture, stated accurately: plain ws puts the credential on the pod network in
   cleartext, and while the Service is ClusterIP - so nothing outside the cluster reaches
   it - **no NetworkPolicy governs ingress to the NATS pod**, so every pod in the cluster
