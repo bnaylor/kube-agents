@@ -11,9 +11,12 @@ live instead of asserting it.
 
 PLAYGROUND POSTURE, stated out loud: static `web` credential from the creds
 Secret, plain ws, no TLS, no ingress — the listener is ClusterIP and
-`kubectl port-forward` is the only transport. Production terminates TLS in
-front of the bus or keeps the listener off (spec-nats-deployment.md, web
-read surface).
+`kubectl port-forward` is the only transport. Since W6.2 that is an
+enforced property, not a convention: the NATS pod's ingress policy refuses
+in-cluster 9222 outright, and the port-forward still works because it
+enters from the node, which NetworkPolicy does not govern. Production
+terminates TLS in front of the bus or keeps the listener off
+(spec-nats-deployment.md, web read surface).
 
 ## Against the install
 
@@ -79,6 +82,23 @@ history replays as non-live, a fresh publish arrives exactly once through
 the dedup, and the read-only probe comes back `refused`. Against the
 install, set `A2A_SKIP_SEED=1` (no seed user in hand) and the same suite
 checks everything but the live-publish leg.
+
+`livesequence` is the headless rail: it attaches the same way the page
+does, waits for a NEW task to run somewhere on the install, and asserts
+the event sequence the rail would draw — submission first, `working`
+before terminal, exactly one `final` with nothing after it, a non-empty
+`result` — then folds everything through the real reducer and asserts the
+UI model agrees. It cannot create the task (the web user cannot publish;
+that is the point), so drive one from the other side while it waits: ask
+kage in Discord, or run W4's live worker test over a 4222 port-forward.
+
+```sh
+A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=... npm test -- livesequence
+```
+
+Proven against a2a-next-dev 2026-08-31: W4's `HappyPathWithSteer` drove a
+real worker pod while this watched as the web user — 60s end to end
+(round_2/w81-findings.md in the vamp repo has the run).
 
 ## Shape notes, for whoever touches this next
 
