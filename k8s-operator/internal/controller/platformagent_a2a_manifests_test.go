@@ -685,3 +685,54 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
 	}
 }
+
+// The W4 switch: the gateway runs as its own ServiceAccount carrying exactly
+// the session-pod verbs, with spawning armed and the namespace from the
+// downward API. The Role's rules are the whole grant - anything more here is
+// a finding.
+func TestBuildA2AGatewaySpawnArming(t *testing.T) {
+	agent := a2aTestAgent()
+
+	dep := buildA2AGatewayDeployment(agent)
+	pod := dep.Spec.Template.Spec
+	if pod.ServiceAccountName != "test-agent-a2a-gateway" {
+		t.Errorf("ServiceAccountName = %q", pod.ServiceAccountName)
+	}
+	if pod.AutomountServiceAccountToken == nil || !*pod.AutomountServiceAccountToken {
+		t.Error("spawner needs the ServiceAccount token automounted")
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range pod.Containers[0].Env {
+		env[e.Name] = e
+	}
+	if env["A2A_SPAWN_SESSIONS"].Value != "true" {
+		t.Errorf("A2A_SPAWN_SESSIONS = %+v", env["A2A_SPAWN_SESSIONS"])
+	}
+	ns := env["POD_NAMESPACE"]
+	if ns.ValueFrom == nil || ns.ValueFrom.FieldRef == nil || ns.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+		t.Errorf("POD_NAMESPACE = %+v", ns)
+	}
+
+	role := buildA2AGatewayRole(agent)
+	if len(role.Rules) != 1 {
+		t.Fatalf("gateway Role has %d rules, want exactly the pod rule", len(role.Rules))
+	}
+	rule := role.Rules[0]
+	if len(rule.Resources) != 1 || rule.Resources[0] != "pods" {
+		t.Errorf("Role resources = %v", rule.Resources)
+	}
+	wantVerbs := map[string]bool{"create": true, "get": true, "list": true, "watch": true, "delete": true}
+	if len(rule.Verbs) != len(wantVerbs) {
+		t.Errorf("Role verbs = %v", rule.Verbs)
+	}
+	for _, v := range rule.Verbs {
+		if !wantVerbs[v] {
+			t.Errorf("unexpected verb %q", v)
+		}
+	}
+
+	rb := buildA2AGatewayRoleBinding(agent)
+	if rb.RoleRef.Name != "test-agent-a2a-gateway" || rb.Subjects[0].Name != "test-agent-a2a-gateway" {
+		t.Errorf("RoleBinding wiring: roleRef=%q subject=%q", rb.RoleRef.Name, rb.Subjects[0].Name)
+	}
+}

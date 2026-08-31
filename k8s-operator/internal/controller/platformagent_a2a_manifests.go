@@ -42,6 +42,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -584,6 +585,38 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 // Discord adapter and session manager). It is expected to crash-loop until
 // the gateway image exists and W0's discord-bot Secret is created — both are
 // optional references so the render never blocks the rest of the stack.
+// The gateway's session-pod RBAC (W4): spawning a worker per delegated task
+// is the gateway's job, so its ServiceAccount carries exactly the pod verbs
+// the spawner and its sweep use, namespace-scoped, and nothing else.
+func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
+	}
+}
+
+func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"create", "get", "list", "watch", "delete"},
+		}},
+	}
+}
+
+func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.RoleBinding {
+	name := a2aGatewayName(agent)
+	return &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: name},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: agent.Namespace}},
+	}
+}
+
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")
@@ -602,10 +635,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
-					// No k8s API use until W3 arms the session-pod spawn path
-					// (which is behind its per-conversation addressee config);
-					// the token arrives with that change, not before.
-					AutomountServiceAccountToken: ptr.To(false),
+					// W4 armed the session-pod path (the Delegate flow), so
+					// the gateway now runs as its own ServiceAccount with the
+					// pod-lifecycle Role above - the token this automounts is
+					// exactly that grant, nothing ambient.
+					ServiceAccountName:           a2aGatewayName(agent),
+					AutomountServiceAccountToken: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: ptr.To(true),
 						RunAsUser:    ptr.To(int64(1000)),
@@ -626,6 +661,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								LocalObjectReference: corev1.LocalObjectReference{Name: "discord-bot"},
 								Key:                  "token",
 								Optional:             ptr.To(true),
+							}}},
+							// The W4 switch, flipped: session-pod spawning is
+							// live for the Delegate flow. The default route
+							// stays the fixed addressee; only a "delegate"
+							// turn spawns a worker.
+							{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+							// W3's ask: the namespace from the downward API,
+							// not a baked default.
+							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.namespace",
 							}}},
 						},
 						VolumeMounts: []corev1.VolumeMount{{
@@ -728,6 +773,21 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		}
 	}
 
+	// Identity before workload: the gateway pod must not start before the
+	// ServiceAccount its pod spec names exists.
+	for _, obj := range []client.Object{
+		buildA2AGatewayServiceAccount(agent),
+		buildA2AGatewayRole(agent),
+		buildA2AGatewayRoleBinding(agent),
+	} {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return state, fmt.Errorf("failed to apply A2A gateway %T: %w", obj, err)
+		}
+	}
+
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
@@ -753,6 +813,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		reader client.Reader
 	}{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
