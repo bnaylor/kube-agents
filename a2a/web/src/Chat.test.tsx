@@ -48,13 +48,13 @@ describe("Chat", () => {
         entries={[]}
         probe={{
           outcome: "refused",
-          detail: 'Permissions Violation for Publish to "a2a.topics.shared.blueprint"',
+          detail: 'Permissions Violation for publish to "a2a.topics.shared.probe"',
           at: 1,
         }}
         onProbe={() => {}}
       />,
     );
-    expect(screen.getByText(/Permissions Violation for Publish/)).toBeTruthy();
+    expect(screen.getByText(/Permissions Violation for publish/)).toBeTruthy();
 
     rerender(
       <Chat

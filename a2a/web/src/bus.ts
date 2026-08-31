@@ -27,8 +27,21 @@ const TICK_MS = 5_000;
 const STREAM_RETRY_MS = 3_000;
 /** How long the probe waits for the server's refusal before giving up. */
 const PROBE_WAIT_MS = 2_000;
-/** A provisioned, real subject: the refusal must be authorization, not a typo. */
-const PROBE_SUBJECT = "a2a.topics.shared.blueprint";
+/**
+ * A provisioned, real subject, so a refusal proves authorization rather than
+ * a typo — and one with NO writer in any user's grant, so that on the day the
+ * web grant is wrong the probe's write lands nowhere instead of putting junk
+ * in a state-class topic the fleet reads. Provisioned into TOPICS-STATE by
+ * the operator (W6.1, `46dd23d`); the writerless property is asserted there
+ * by `TestProbeTopicIsProvisionedAndWriterless`, not here.
+ *
+ * Note for the existing a2a-next-dev install: the provision script is
+ * `info || add`, so its TOPICS-STATE will not list this subject until someone
+ * runs `nats stream edit`. The probe still behaves correctly — the refusal is
+ * enforced at connect time by the grant, not by stream membership — the only
+ * thing not yet true there is where a broken-grant write would land.
+ */
+const PROBE_SUBJECT = "a2a.topics.shared.probe";
 /** Redelivery and tap restarts both repeat envelopes; this caps the dedup set. */
 const DEDUP_MAX = 8_192;
 
