@@ -19,8 +19,11 @@ Companion docs: the payload spec owns the envelope and the task lifecycle, and r
 the `identity` and `authority` fields this doc names. The execution shape is settled -
 pod per session, gateway coded to the headless CLI contract - and this design assumes
 it. The NATS deployment spec owns accounts and connection-time authz.
-The declarative subagent framework (its own doc) owns what happens when a session
-delegates work; this doc stops at the session boundary.
+The declarative subagent framework (its own doc) owns profile-addressed delegation -
+the dispatcher, Jobs, `AgentProfile`s. This doc stops at the session boundary, with one
+amendment (8/31): the Delegate flow below hands a single task to a fresh
+gateway-spawned session worker, which stays inside the session model - the worker is an
+incarnation of the conversation's own session, not a profile executor.
 
 ## The gateway holds no model
 
@@ -44,7 +47,12 @@ pod at a time.** Concretely:
   group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
   space is not a session; a conversation in it is.
 - `contextId` is minted at first contact with a conversation and never changes. It is
-  the durable name of the conversation on the bus.
+  the durable name of the conversation on the bus. Minting MUST be create-only (a KV
+  `Create`, compare-and-swap semantics), so that two replicas or a rehydrate racing
+  first contact cannot fork a conversation - the loser reads and adopts the winner's
+  value. The stage 1 gateway runs a single replica and serializes per conversation
+  in-process, which narrows the race without closing it (a plain `Put` persists the
+  record today); the `Create` is owed before a second replica is.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
   and the bus session name; `contextId` persists across every incarnation.
 - In a group thread, everyone in the room shares the one session. Attribution is per
@@ -57,8 +65,13 @@ mix unrelated conversations into one context and make the room the unit of histo
 which nobody wants from a busy channel.
 
 Session state lives in a NATS KV bucket, keyed by session key: `contextId`, current pod
-name, bus session name, last-activity timestamp, roster. Runtime state is not git and
-not pod annotations; KV is the house answer. A gateway restart rediscovers its sessions
+name, bus session name, last-activity timestamp, roster, the task history with each
+task's own addressee (session addressees rotate per incarnation, so a straggler's
+replay must use the addressee its subjects carried, not the record's current one), and
+the active task's serialization record - `taskId`, `correlationId`, the echoed `ask`
+(truncated) and its `submittedAt`, which feed the status card below; the `ask` copy is
+user content, governed by the content rule in the identity section. Runtime state is
+not git and not pod annotations; KV is the house answer. A gateway restart rediscovers its sessions
 from KV plus pod labels, so a gateway crash strands nothing - the pods keep running and
 the transcript is on the stream.
 
@@ -91,17 +104,92 @@ each steer carries its own `authority` block, so group-room attribution stays cl
 cancel affordance ("stop") maps to `kind: cancel` and stays the hard interrupt; wiring it
 to a chat gesture is adapter polish, later.
 
+**The deterministic interceptors (amended 8/31).** The gateway holds no model, so its
+affordances are literal: a small set of normalized phrases and prefixes, deterministic
+by construction. Three interceptors run on each turn, ahead of the routing above:
+
+- **Status ask.** While a task is active, a message matching the status set ("status",
+  "what is it doing", …) is answered by stream replay - a status card carrying the
+  task's state, the echoed ask, an elapsed clock since submission, the transition
+  history, and the latest `progress` line, labeled as replay so nobody reads it as a
+  live claim about the executor. It never reaches the executor.
+- **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
+  the cancel affordance above; a backend-native gesture stays adapter polish, later.
+- **Delegate.** A prefix, not a phrase; its own section below.
+
+Two routes exist, and the terms recur below: a conversation is **fixed-routed** when
+its tasks address the standing executor configured at deploy time (the platform front
+door), and **session-routed** when they address the conversation's own spawned worker.
+The two differ on steers: a session worker absorbs them at its next turn boundary,
+while the standing front door refuses them with an honest status reply - the refusal
+posture the payload spec's steering rule records.
+
+The status matcher's width bias inverts per executor, and the inversion is the
+contract, not a tuning detail. Beyond the exact phrase set there is a wide
+interrogative rule (status-shaped words in an interrogative frame), and it applies only
+where the executor refuses steers - the fixed-route front door - because there a stolen
+false positive costs nothing. Where the executor absorbs steers, a session worker, only
+the exact phrases match: a stolen steer there is a dropped correction, and a
+status-shaped steer is a question the worker can answer itself. Anything no interceptor
+claims during a `working` task is a steer, per the 8/24 decision above.
+
+**Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
+not the whole output story: the gateway authors a small set of posts of its own. The
+placeholder that opens a task ("submitted…", which becomes the rolling line the relay
+edits), the status card, the steer acknowledgement, and failure notices (a submission
+or steer that never reached the bus). All are deterministic templates over facts the
+gateway itself owns - its own publishes, its own registry, stream replay - which is
+what keeps them inside the no-model rule. They also say only what the gateway knows:
+the steer acknowledgement reports that the steer is on the stream and the executor
+picks it up at its next turn boundary, not that it was absorbed, which the gateway
+cannot know.
+
+## The Delegate flow (added 8/31)
+
+A turn starting with the word "delegate" plus a separator routes that one task to a
+freshly spawned session worker. The prefix is stripped; the rest of the original text,
+casing and punctuation intact, is the task. The gateway mints a fresh bus session name,
+publishes the task with the new session as its addressee, and spawns the worker through
+the same machinery that serves session-routed conversations - a delegate is an
+incarnation, not a new kind of executor, and everything above about incarnations
+(minted bus session name per spawn, `contextId` persisting) applies. A bare "delegate"
+with nothing after it is not a delegation, and while the spawner is dark the prefix is
+not an affordance at all: the text passes through as an ordinary turn.
+
+Two rules keep the conversation's route coherent:
+
+- **One task.** The delegation covers exactly the prefixed task. On a fixed-route
+  conversation, the next plain ask re-homes to the configured default addressee - never
+  to a dead delegate session. On a session-routed conversation, the delegate
+  incarnation becomes the next standing incarnation, which is inside the session
+  route's contract: incarnations rotate anyway.
+- **The previous incarnation dies at delegation, deliberately.** A lingering pod from
+  an earlier incarnation is deleted, not merely untracked: reap walks session records
+  and sweep sees only terminal pod phases, so an untracked Running pod would hold its
+  bus credential with nothing able to reclaim it. Its task is already closed (healed or
+  detached) by the time the delegate routes, so the delete is what reap or sweep would
+  have done anyway.
+
 ## Session lifecycle
 
 The session manager is the demo's chatops code generalized from one-shot workers to
 long-lived sessions. Four operations:
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
-shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests), running the
-headless harness behind a thin shim that bridges bus envelopes to the CLI's stream-json
-stdin/stdout. Model auth is Workload Identity against the Vertex backend - no per-pod API keys. Cold
-start is 5-10s; the adapter posts
-a placeholder to the conversation while the pod comes up, which the demo already does.
+shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egress
+fenced (8/31) to DNS, the bus, and LiteLLM - the deployment spec owns the policy),
+running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
+stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
+the install's own LiteLLM, in-namespace, with no per-pod credential at all - the
+spawned pod carries no ServiceAccount and no Workload Identity. Its bus credential is
+the static worker user, injected as env, until the deployment spec's auth callout
+arms; arming it is what gives a session pod a KSA and a projected token, per the
+subagent framework's worker posture. Direct Vertex via WI
+stays the target, and arming it is a policy change as well as an IAM one: the session
+egress fence encodes the shipped path (no 443, no metadata route), which is where a
+piecemeal flip fails loudly instead of silently widening. Cold start is 5-10s; the
+adapter posts a placeholder to the conversation while the pod comes up, which the demo
+already does.
 
 **Stream.** The shim consumes envelopes addressed to its session, feeds them to the
 harness, and maps the stream-json output to `status-update` and `artifact-update` events.
@@ -165,8 +253,28 @@ the bus - the same posture the shipped attribution path applies before writing s
 metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds labelled
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
-gateway resolves plaintext at the boundaries that need it - `openDirect` now, RBAC
-intersection when the authority work lands.
+gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
+lowest-common-denominator grant computation when the authority work lands. The salt
+must be one value per install, shared by every replica - or hashes diverge between
+turns of the same conversation and `openDirect` routing and audit joins silently
+corrupt. A dedicated salt Secret is the target shape; stage 1 derives the salt from
+the shared bus credential when none is configured, which keeps replicas agreeing but
+couples the pseudonyms to a password rotation - rotate the NATS password and every
+pseudonym on the stream stops joining to its history. Named here so the rotation
+hazard is a known cost, not a surprise.
+
+**The rule covers identifiers, not content (stated explicitly 8/31; it was always the
+design, never written down).** Task content cannot be pseudonymized without destroying
+it - the executor has to read the ask - so the submission message rides the TASKS
+stream in the clear for the whole retention window, which is exactly why the deployment
+spec calls W a tenancy decision. What the rule forbids is identifiers that carry
+content; the payload spec's opaque-token rule is the same rule seen from the other
+side. Within that posture, the gateway may hold a bounded copy of the active task's ask
+in the session KV - truncated, one revision, deleted with the active-task record at the
+terminal event - for status rendering. The copy adds no new audience (the gateway is
+the bucket's only reader and writer) and has a shorter horizon than the stream copy it
+duplicates. What would breach the posture is content anywhere with a wider audience or
+a longer life than the stream already grants it.
 
 - `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
   resolves it to the RBAC string at the boundary that needs one. `subject` is the
@@ -221,9 +329,9 @@ later. What the gateway builds now is the substrate those need:
 One property worth stating because it falls out of the session model: a group session's
 context is labeled for the room. Everyone in the thread shares the pod, so anything the
 harness reads into context is readable by the whole roster - which is exactly as leaky as
-the chat window itself, no more. When per-user authority lands, the intersection for a
-group session computes against the audience, not just the requester. That is the LCD
-question, parked with its tool.
+the chat window itself, no more. When per-user authority lands, the
+lowest-common-denominator grants for a group session compute against the audience, not
+just the requester. That is the LCD question, parked with its tool.
 
 ## The test backend
 

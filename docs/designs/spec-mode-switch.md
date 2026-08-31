@@ -61,7 +61,12 @@ third mode, an older operator binary reads it. Silently rendering `today` at tha
 the cluster runs something other than what the spec asks, with nothing in
 `kubectl describe` to say so. Instead the reconciler goes Degraded through the existing
 `updateStatusDegraded` path with a named reason, `ModeNotRecognized`, keeps rendering
-today's stack, and requeues. (Same pattern as `RuntimeClassNotFound`.)
+today's stack, preserves whatever A2A surface already exists - it tears nothing down,
+and the agent's bus env and egress rule survive the skew too - and requeues. (Same
+Degraded pattern as `RuntimeClassNotFound`.) The preservation matters most on the
+`next` side: "fail closed to today" must not mean "clean up next," or a one-version
+operator rollback against a live `next` install kills the bus while dutifully
+reporting Degraded. Found live during stage 1 bring-up (8/26).
 
 ## What the operator renders
 
@@ -69,9 +74,26 @@ today's stack, and requeues. (Same pattern as `RuntimeClassNotFound`.)
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
   additive - today's path keeps running until stage 4 starts retiring pieces.
 
-The operator also writes the mode into the managed settings it already renders
-(`reconcileSettingsConfigMap`), as a single key: `KUBEAGENTS_MODE`. That is the only way
-the mode reaches the agent runtime.
+One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
+the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
+section describes the design, not what this toggle turns on. Dev posture; don't run
+traffic that matters on it and expect audit to exist.
+
+The operator also writes the mode into the managed settings it already renders, as a
+single key: `KUBEAGENTS_MODE`. (Amended 8/26: the draft said
+`reconcileSettingsConfigMap`, but the surface with env semantics and agent-write
+protection is the managed `.env` - `renderManagedEnv`, applied last, refused by
+`save_env_value` - so the key rides that and the config-hash rollout annotation. The
+agent cannot fake its own mode, which the draft's route would not have given.) That is
+the only way the mode reaches the agent runtime.
+
+A mode change is a rollout, not a hot reload. Kubernetes does not restart running pods
+when a ConfigMap changes, so the operator stamps the rendered config's hash onto the
+agent pod template (the `kubeagents.x-k8s.io/config-hash` annotation, which already
+covers the ConfigMap carrying the managed `.env`) - flipping the mode rolls the Deployment,
+and no agent keeps running in a mode the spec no longer asks for. Without the stamp,
+`mode: next` would produce a silent split-brain: NATS up, the running fleet still on
+today's path until something happens to kill its pods.
 
 ## Agent-side rule
 
