@@ -48,7 +48,10 @@ func renderMode(agent *agentv1alpha1.PlatformAgent, component string) Mode
 ```
 
 The reconciler calls `resolveMode` once at the top and handles the error (below);
-everything downstream uses `renderMode`. Without the pair, fail-closed and
+everything downstream uses `renderMode`, with one deliberate carve-out defined with
+the skew behavior below: the agent's A2A surface takes its skew answer from the
+reconciler's error handling, not from `renderMode` - fail-closed rendering at those
+call sites would tear down a live bus. Without the pair, fail-closed and
 Degraded-on-skew are mutually exclusive - a single helper that maps unrecognized to
 `ModeToday` leaves the reconciler no way to notice the skew without reading `Spec.Mode`
 itself. Fail-closed here means the dark stack stays dark. The `component` argument is
@@ -65,14 +68,18 @@ today's stack, and requeues (same Degraded pattern as `RuntimeClassNotFound`) - 
 two layers the mode touches are split deliberately on skew. The mode DELIVERED to the
 agent fails closed: the managed `.env` pins `today`, the config hash moves, and the
 fleet rolls to today's behavior - the skill is withdrawn, which is what fail-closed
-means. The RENDERED surface is preserved: the A2A objects and the agent's bus surface
-are not torn down - the bus credentials are container env and the egress rule its own
-object, neither a managed-`.env` key, so pinning the mode removes neither. The
-preservation matters most on the `next` side: "fail closed to today" must not mean
-"clean up next," or a one-version operator rollback against a live `next` install
-kills the bus while dutifully reporting Degraded - established connections and sidecar
-dials survive precisely because the env and the egress rule do. Found live during
-stage 1 bring-up (8/26).
+means. The RENDERED surface is preserved, and not by accident of the helper contract:
+`renderMode`'s fail-closed answer would stop emitting the bus env and the egress
+rule, and this operator deletes policies it stops rendering - so the reconciler, the
+one place that sees the skew through `resolveMode`'s error, arms the preservation
+carve-out named in the helper section, and the A2A objects and the agent's bus
+surface (container-env credentials, the 4222 egress rule) render through the skew
+rather than drop. The preservation matters most on the `next` side: "fail closed to
+today" must not mean "clean up next," or a one-version operator rollback against a
+live `next` install kills the bus while dutifully reporting Degraded. The behavior
+rollout does replace the agent pods; what preservation guarantees is that the
+replacements keep the credential and the route, so the bridge reconnects instead of
+hanging at the dial. Found live during stage 1 bring-up (8/26).
 
 ## What the operator renders
 

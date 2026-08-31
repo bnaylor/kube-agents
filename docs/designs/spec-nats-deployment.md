@@ -171,17 +171,21 @@ Layout:
   creation; the deliver subject is); `$JS.ACK.>` let it publish `+TERM` onto the
   gateway's in-flight delivery, because an ack subject names a stream and a consumer and
   never the caller. The consumer-create escape is closed by the enumeration; the ack
-  escape is closed by deleting the grant outright - web consumers are ack-none by
-  design, so no ack grant is owed, and the JetStream-tax bullet's redelivery failure
-  (which needs an ack-expecting consumer) does not arise. There is deliberately no
-  `$JS.FC.>` for web either, for the same reason. The lesson generalises past this
+  escape by deleting the grant outright - web consumers are ack-none by design, so a
+  well-behaved client needs no ack grant (and no `$JS.FC.>`: ack-none push takes no
+  flow control), while granting either would reopen what the deletion closed. Ack
+  policy is a body field, so ack-none is a design intent the grant list cannot
+  enforce - the residue is recorded below with its siblings. The lesson generalises past this
   user: **for JetStream, a grant list is a capability surface, not a read/write
   distinction** - enumerate the streams, and never hand a browser-facing user
   `$JS.API.>`.
 
   Residues, all closed by the auth callout and none of them "can read what it shouldn't":
   durability is a body field, so withholding the legacy `DURABLE.CREATE` subject does not
-  prevent a durable - `max_consumers` per stream bounds the cost instead; within the four
+  prevent a durable - `max_consumers` per stream bounds the cost instead; ack policy is
+  the same class of body field, so a hostile holder can create an explicit-ack consumer
+  it holds no grant to ack - endless redeliveries, churn against the server, and an
+  amplifier for the deliver-subject write below; within the four
   granted streams consumer names are the caller's choice, so `web` can pull a delivery
   off another reader's consumer or retune it through create-as-update; and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
