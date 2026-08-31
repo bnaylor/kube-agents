@@ -27,3 +27,33 @@ func TestIsStatusQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestIsDelegate(t *testing.T) {
+	yes := map[string]string{
+		"Delegate: write a haiku about message buses": "write a haiku about message buses",
+		"delegate write a haiku":                      "write a haiku",
+		"DELEGATE - check the fleet, then report":     "check the fleet, then report",
+		"  delegate,  summarize #930  ":               "summarize #930",
+		"Delegate:\nmultiline task":                   "multiline task",
+	}
+	for in, want := range yes {
+		got, ok := isDelegate(in)
+		if !ok || got != want {
+			t.Errorf("isDelegate(%q) = (%q, %v), want (%q, true)", in, got, ok, want)
+		}
+	}
+	no := []string{
+		"delegate",
+		"delegate:",
+		"Delegated tasks are neat",
+		"can you delegate this",
+		"delegation is the demo",
+		"what is it doing",
+		"",
+	}
+	for _, in := range no {
+		if got, ok := isDelegate(in); ok {
+			t.Errorf("isDelegate(%q) = (%q, true), want false", in, got)
+		}
+	}
+}

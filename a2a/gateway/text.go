@@ -72,6 +72,36 @@ func isStatusQuery(text string) bool {
 	return statusish && interrogative
 }
 
+// isDelegate reports whether the turn asks for a delegated session worker -
+// the demo's "Delegate" flow, W4 amendment. Deterministic prefix, no model,
+// same shape as isStatusQuery: the normalized text must START with
+// "delegate" as a whole word, and the rest of the ORIGINAL text (which
+// keeps its punctuation and casing - it is the task) is returned. A bare
+// "delegate" with nothing to do is not a delegation.
+func isDelegate(text string) (string, bool) {
+	const word = "delegate"
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < len(word) || !strings.EqualFold(trimmed[:len(word)], word) {
+		return "", false
+	}
+	rest := trimmed[len(word):]
+	if rest == "" {
+		return "", false
+	}
+	// A separator keeps "delegated tasks are neat" out: whitespace or light
+	// punctuation right after the word, nothing else.
+	switch r, _ := utf8.DecodeRuneInString(rest); {
+	case r == ' ', r == '\t', r == '\n', r == ':', r == ',', r == '-', r == '—':
+	default:
+		return "", false
+	}
+	rest = strings.TrimSpace(strings.TrimLeft(rest, ":,-— \t\n"))
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
 var stopWords = map[string]bool{
 	"stop":   true,
 	"cancel": true,

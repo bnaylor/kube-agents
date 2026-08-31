@@ -61,6 +61,8 @@ type Options struct {
 	Config  *Config
 	Logger  *slog.Logger
 	Backend string
+	// Spawner overrides the k8s-backed pod spawner - test injection only.
+	Spawner spawner
 }
 
 // New assembles a gateway.
@@ -104,7 +106,9 @@ func New(o Options) (*Gateway, error) {
 		}
 	})
 	g.events = newKeyedQueue(g.relayBatch)
-	if o.Config.SpawnSessions {
+	if o.Spawner != nil {
+		g.spawner = o.Spawner
+	} else if o.Config.SpawnSessions {
 		s, err := newPodSpawner(o.Config, log)
 		if err != nil {
 			return nil, fmt.Errorf("session-pod spawning is enabled but the k8s client failed: %w", err)
@@ -241,11 +245,31 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	case active != nil && !active.Detached:
 		g.steerTask(ctx, rec, msg, authority)
 	default:
-		// A session-routed conversation with no live incarnation gets a
-		// fresh bus session name before the task's addressee is chosen.
-		if rec.SessionRouted && rec.PodName == "" {
+		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {
+			// The Delegate flow (W4 amendment): this ONE task goes to a
+			// freshly spawned session worker - the addressee is the new
+			// session name, the rest of the text is the task. The
+			// conversation's route is untouched: the next plain ask below
+			// re-homes to the default addressee.
+			if rec.Profile == "" {
+				rec.Profile = "chat"
+			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
+			// A lingering previous incarnation is not this task's executor;
+			// the sweep deletes its terminal pod regardless of tracking.
+			rec.PodName = ""
+			msg.Text = rest
+		} else if rec.SessionRouted && rec.PodName == "" {
+			// A session-routed conversation with no live incarnation gets a
+			// fresh bus session name before the task's addressee is chosen.
+			rec.BusSession = mintSessionName(rec.Profile)
+			rec.Addressee = rec.BusSession
+		} else if !rec.SessionRouted {
+			// Re-home after a delegated task: a plain ask on a fixed-route
+			// conversation always goes to the configured addressee, never
+			// to a dead delegate session.
+			rec.Addressee = g.cfg.DefaultAddressee
 		}
 		g.startTask(ctx, rec, msg, principal, authority)
 	}
@@ -329,7 +353,9 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 
 	// Session-addressed routes get an incarnation; fixed addressees (the
 	// Hermes-first "platform") have their own executor and spawn nothing.
-	if g.spawner != nil && rec.SessionRouted {
+	// A task addressed to the conversation's own bus session - the standing
+	// session route or a one-shot Delegate - is what needs a pod.
+	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
 		g.ensureSessionPod(ctx, rec, taskID)
 	}
 }

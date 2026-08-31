@@ -703,3 +703,185 @@ func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
 		}
 	}
 }
+
+// fakeSpawner records spawn calls; the delegate flow's pod machinery without
+// a cluster.
+type fakeSpawner struct {
+	mu     sync.Mutex
+	spawns []fakeSpawn
+}
+
+type fakeSpawn struct {
+	Session string
+	TaskID  string
+}
+
+func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID})
+	return rec.BusSession, nil
+}
+
+func (s *fakeSpawner) Delete(context.Context, string) error { return nil }
+
+func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) { return nil, nil }
+
+func (s *fakeSpawner) calls() []fakeSpawn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]fakeSpawn(nil), s.spawns...)
+}
+
+// startRigWithSpawner is startRig with the session-pod path armed through a
+// fake spawner.
+func startRigWithSpawner(t *testing.T) (*rig, *fakeSpawner) {
+	t.Helper()
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n1002 test:adam\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	if err != nil {
+		t.Fatalf("executor client: %v", err)
+	}
+	t.Cleanup(bus.Close)
+
+	adapter := newFakeAdapter()
+	spawn := &fakeSpawner{}
+	cfg := &Config{
+		NATSURL:          url,
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: spawn})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = g.Run(ctx) }()
+
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}, spawn
+}
+
+// TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
+// "delegate" turn mints a session, addresses that one task to it with the
+// prefix stripped, and spawns the pod; steers follow the delegated task; the
+// next plain ask re-homes to the default addressee.
+func TestDelegatePrefixSpawnsSessionWorker(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/thread-d1", Kind: "group",
+		AuthorID: "1001", MessageID: "d-100", Text: "Delegate: write a haiku about message buses",
+	}
+
+	waitFor(t, "session pod spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	if !strings.HasPrefix(call.Session, "chat-") {
+		t.Fatalf("session name %q not <profile>-<animal>", call.Session)
+	}
+
+	origin := r.awaitTask(t, call.Session)
+	if origin.To == nil || origin.To.Session != call.Session {
+		t.Fatalf("to = %+v, want %s", origin.To, call.Session)
+	}
+	if origin.TaskID != call.TaskID {
+		t.Fatalf("spawned for %s, task is %s", call.TaskID, origin.TaskID)
+	}
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "write a haiku about message buses" {
+		t.Fatalf("prefix not stripped: %q", got)
+	}
+
+	// A message while the delegated task runs steers THAT task on the
+	// session's in subject.
+	exec := r.execFor(t, origin, call.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/thread-d1", Kind: "group",
+		AuthorID: "1001", MessageID: "d-101", Text: "make it about NATS",
+	}
+	waitFor(t, "steer on the session in subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+			var sm lib.Message
+			if e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID &&
+				json.Unmarshal(e.Payload, &sm) == nil && joinTextParts(sm.Parts) == "make it about NATS" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Finish the delegated task; the next plain ask re-homes to platform.
+	if err := exec.PublishArtifact(ctx, lib.Artifact{
+		ArtifactID: "artifact-" + origin.TaskID + "-result", Name: lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "buses hum softly"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "result relayed", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "buses hum softly") {
+				return true
+			}
+		}
+		return false
+	})
+
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/thread-d1", Kind: "group",
+		AuthorID: "1001", MessageID: "d-102", Text: "how is the fleet?",
+	}
+	rehomed := r.awaitTask(t, "platform")
+	if rehomed.To == nil || rehomed.To.Session != "platform" {
+		t.Fatalf("re-home failed: %+v", rehomed.To)
+	}
+	if got := len(spawn.calls()); got != 1 {
+		t.Fatalf("plain ask spawned a pod: %d spawns", got)
+	}
+}
+
+// TestDelegateWithoutSpawnerRoutesDefault: with the spawner dark, "delegate"
+// is not an affordance - the turn routes to the default addressee with its
+// text intact (stripping the prefix without an executor would lie).
+func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
+	r := startRig(t)
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/thread-d2", Kind: "group",
+		AuthorID: "1001", MessageID: "d-110", Text: "Delegate: write a haiku",
+	}
+	origin := r.awaitTask(t, "platform")
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "Delegate: write a haiku" {
+		t.Fatalf("text mangled without a spawner: %q", got)
+	}
+}
