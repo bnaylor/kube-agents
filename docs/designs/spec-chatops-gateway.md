@@ -115,7 +115,8 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   live claim about the executor. It never reaches the executor.
 - **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
   the cancel affordance above; a backend-native gesture stays adapter polish, later.
-- **Delegate.** A prefix, not a phrase; its own section below.
+- **Delegate.** A prefix, not a phrase, and recognized only when no live task
+  serializes the conversation; its own section below.
 
 Two routes exist, and the terms recur below: a conversation is **fixed-routed** when
 its tasks address the standing executor configured at deploy time (the platform front
@@ -152,9 +153,14 @@ casing and punctuation intact, is the task. The gateway mints a fresh bus sessio
 publishes the task with the new session as its addressee, and spawns the worker through
 the same machinery that serves session-routed conversations - a delegate is an
 incarnation, not a new kind of executor, and everything above about incarnations
-(minted bus session name per spawn, `contextId` persisting) applies. A bare "delegate"
-with nothing after it is not a delegation, and while the spawner is dark the prefix is
-not an affordance at all: the text passes through as an ordinary turn.
+(minted bus session name per spawn, `contextId` persisting) applies. The guard,
+stated because the delete rule below depends on it: a delegation is recognized only
+when no live task serializes the conversation. While a task is `working`,
+"delegate: …" is a steer like any other text - the routing above claims status asks
+and stops first and steers everything else, and the delegate prefix is consulted
+only when the turn would start a task. A bare "delegate" with nothing after it is
+not a delegation, and while the spawner is dark the prefix is not an affordance at
+all: the text passes through as an ordinary turn.
 
 Two rules keep the conversation's route coherent:
 
@@ -166,9 +172,10 @@ Two rules keep the conversation's route coherent:
 - **The previous incarnation dies at delegation, deliberately.** A lingering pod from
   an earlier incarnation is deleted, not merely untracked: reap walks session records
   and sweep sees only terminal pod phases, so an untracked Running pod would hold its
-  bus credential with nothing able to reclaim it. Its task is already closed (healed or
-  detached) by the time the delegate routes, so the delete is what reap or sweep would
-  have done anyway.
+  bus credential with nothing able to reclaim it. The active-task guard above is what
+  makes this safe - a delegation is only recognized with no live task in flight, so
+  the previous task is already closed (healed or detached) and the delete is what
+  reap or sweep would have done anyway.
 
 ## Session lifecycle
 

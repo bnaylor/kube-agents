@@ -170,7 +170,11 @@ Layout:
   bucket it has no `$KV` grant for (subscribe permissions are not consulted at consumer
   creation; the deliver subject is); `$JS.ACK.>` let it publish `+TERM` onto the
   gateway's in-flight delivery, because an ack subject names a stream and a consumer and
-  never the caller. Both are closed by the enumeration. The lesson generalises past this
+  never the caller. The consumer-create escape is closed by the enumeration; the ack
+  escape is closed by deleting the grant outright - web consumers are ack-none by
+  design, so no ack grant is owed, and the JetStream-tax bullet's redelivery failure
+  (which needs an ack-expecting consumer) does not arise. There is deliberately no
+  `$JS.FC.>` for web either, for the same reason. The lesson generalises past this
   user: **for JetStream, a grant list is a capability surface, not a read/write
   distinction** - enumerate the streams, and never hand a browser-facing user
   `$JS.API.>`.
@@ -205,7 +209,11 @@ Layout:
   hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
-  kubectl and through nothing else in-cluster. A second policy in the same amendment
+  kubectl and through nothing else in-cluster. The enumeration is today's client
+  list, and it must grow with the components this spec designs: the audit exporter,
+  the janitor, and the metrics scrape (the alert set above is scraped series) each
+  add a peer when they arm - the topic-grant corollary that two edits travel
+  together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has
   no other legitimate destination, carrying no ServiceAccount and no Workload
   Identity; its bus credential is the static worker user until the callout arms). The origin
@@ -269,9 +277,12 @@ deployment's job is to keep the substrate intact and reachable:
   `max_bytes`.
 - The audit path is read-only by construction: the exporter's user may subscribe and may
   not publish, enforced at connect like everything else.
-- The attribution salt the gateway hashes identifiers with is one shared Secret per
-  install, provisioned with this deployment - replicas must agree or the pseudonyms on
-  the stream stop joining.
+- The attribution salt the gateway hashes identifiers with must be one value per
+  install - replicas must agree or the pseudonyms on the stream stop joining. A
+  dedicated salt Secret provisioned with this deployment is the target shape; stage 1
+  derives the salt from the shared bus credential when none is configured. The gateway
+  design owns that rule and its rotation hazard; this deployment owes the Secret when
+  it lands.
 - W stays a tenancy decision as well as a cost one - the bus holds labelled content at rest
   for the whole window.
 
