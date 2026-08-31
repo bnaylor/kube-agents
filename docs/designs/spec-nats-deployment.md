@@ -139,17 +139,46 @@ Layout:
   prefix (`_INBOX.<user>.>`) and permission to subscribe only to that. Without this, any
   agent can subscribe to any inbox and the whole property above leaks through the reply
   path.
-- **The web read surface (amended 8/31, W6.1 addendum).** One `web` user for W8's UI:
-  subscribe on `a2a.>` and its own inbox, publish only the JetStream read API
-  (stream/consumer info and names, ephemeral `CONSUMER.CREATE`, `MSG.NEXT`, acks, flow
-  control) - never `$JS.API.>`, never `DURABLE.CREATE`, so a browser-facing credential
-  cannot delete a stream and its consumers self-clean. It rides a websocket listener on
-  9222 rendered plain (`no_tls: true`) as stated playground posture: the Service is
-  ClusterIP, `kubectl port-forward` is the demo transport, and production terminates TLS
-  in front of the bus or keeps the listener off. Known residue, accepted for the
-  playground and closed by the callout when it arms: a consumer's deliver subject is the
-  creator's choice, so a hostile web client could aim redelivery of stored messages at an
-  `a2a.*` subject.
+- **The web read surface (amended 8/31, W6.1 addendum; rewritten the same day after
+  review).** One `web` user for W8's UI, and the only bus credential that is published to
+  a browser by design. Subscribe on `a2a.>` and its own inbox; publish only the JetStream
+  read API, **enumerated per stream** over the four message streams - `STREAM.INFO`,
+  `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT`, plus its own inbox. It rides a
+  websocket listener on 9222 rendered plain (`no_tls: true`) with `same_origin: true`.
+
+  **"Read-only" is not expressible as a subject list, and the first version of this user
+  proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
+  reach there - a consumer's target stream, its durability and its delivery subject are
+  all fields. Reproduced live against the rendered config before the narrowing:
+  `$JS.API.CONSUMER.CREATE.>` let `web` build a push consumer on
+  `KV_session-state` delivering into its own inbox and read the session registry out of a
+  bucket it has no `$KV` grant for (subscribe permissions are not consulted at consumer
+  creation; the deliver subject is); `$JS.ACK.>` let it publish `+TERM` onto the
+  gateway's in-flight delivery, because an ack subject names a stream and a consumer and
+  never the caller. Both are closed by the enumeration. The lesson generalises past this
+  user: **for JetStream, a grant list is a capability surface, not a read/write
+  distinction** - enumerate the streams, and never hand a browser-facing user
+  `$JS.API.>`.
+
+  Residues, all closed by the auth callout and none of them "can read what it shouldn't":
+  durability is a body field, so withholding the legacy `DURABLE.CREATE` subject does not
+  prevent a durable - `max_consumers` per stream bounds the cost instead; within the four
+  granted streams consumer names are the caller's choice, so `web` can pull a delivery
+  off another reader's consumer or retune it through create-as-update; and a consumer's
+  deliver subject can aim replay of stored messages at another stream's subject, which is
+  a persisted write, reaching `a2a.agents.>` (the identity plane) as easily as
+  annotations. Per-name scoping is **not** available as a mitigation: NATS wildcards match
+  whole tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing
+  else - measured, not assumed. The real closes are the callout or a separate account
+  with an export/import.
+
+  Posture, stated accurately: plain ws puts the credential on the pod network in
+  cleartext, and while the Service is ClusterIP - so nothing outside the cluster reaches
+  it - **no NetworkPolicy governs ingress to the NATS pod**, so every pod in the cluster
+  can reach 4222, 8222 and 9222. `same_origin` is the one control here that is not
+  posture: WebSockets are exempt from CORS and the demo transport is a `kubectl
+  port-forward` to localhost, so without it any page the operator's browser visits can
+  drive this surface. An ingress policy for the NATS pod is the recommended follow-up.
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
