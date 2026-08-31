@@ -42,6 +42,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -229,12 +230,13 @@ http: 8222
 # Plain ws IS the playground posture, stated rather than implied, and stated
 # accurately: the CONNECT frame carries the web password in cleartext across
 # the pod network. The Service is ClusterIP, so nothing OUTSIDE the cluster
-# reaches this listener — but nothing inside it is stopped either, because no
-# NetworkPolicy governs ingress to the NATS pod (this file renders none; the
-# W6.1 agent rule is egress, from the agent). Every pod in every namespace can
-# reach 4222, 8222 and 9222. Production terminates TLS in front of the bus and
-# fronts it with an ingress policy; neither is a toggle that exists yet, so
-# "turn it off in production" would be a promise this render cannot keep.
+# reaches this listener — and since W6.2 an ingress NetworkPolicy fences the
+# pod network too: 4222 from the enumerated bus clients only, and NO
+# pod-network peer for 8222 or 9222. The port-forward the demo uses and the
+# kubelet's readiness probe both enter from the node, which the policy does
+# not govern, so the ws surface is reachable through kubectl and through
+# nothing else. Production still terminates TLS in front of the bus, which is
+# not a toggle that exists yet.
 #
 # The origin allow-list is the one thing here that is not posture. WebSockets
 # are exempt from CORS, and the demo transport is a kubectl port-forward to
@@ -540,6 +542,158 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	}
 }
 
+// a2aSessionComponentLabel is the label pair the gateway spawner stamps on
+// every session pod (a2a/gateway/spawn.go, the source of truth): part-of is
+// a2aPartOf, and app.kubernetes.io/component carries this value.
+const a2aSessionComponent = "a2a-session"
+
+func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-session-netpol"
+}
+func a2aNATSNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-nats-netpol"
+}
+
+// buildA2ASessionNetworkPolicy fences the pods the gateway spawns (W6.2,
+// closing W4 finding #6: the agent pod was fenced while the workers it
+// delegates to had open egress). Deny-by-default with exactly three
+// destinations, which is everything a worker's job description needs:
+//
+//	DNS      — name resolution for the two peers below.
+//	NATS 4222 — the bus, by pod label, never CIDR (a pod IP does not survive
+//	            a restart, and a policy pinned to one silently stops matching).
+//	LiteLLM  — the model path. Session pods carry no ServiceAccount and no
+//	            Workload Identity (W4's model-auth decision), so there is no
+//	            metadata-server rule, no API-server rule, and no 443 — a
+//	            worker that needs the internet is a design change, not a
+//	            policy widening.
+//
+// PolicyTypes includes Ingress with no rules on purpose: nothing dials a
+// session pod — a listener in a worker would be an accident, and an accident
+// should be unreachable. kubectl exec/logs ride the kubelet API, not the pod
+// network, so debugging is unaffected.
+func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpolProfile) *networkingv1.NetworkPolicy {
+	udp := corev1.ProtocolUDP
+	tcp := corev1.ProtocolTCP
+
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aSessionNetpolName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "session-netpol"),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					labelPartOf:                   a2aPartOf,
+					"app.kubernetes.io/component": a2aSessionComponent,
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: &udp, Port: ptr.To(intstr.FromInt32(53))},
+						{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(53))},
+					},
+					To: dnsEgressPeers(profile),
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+					},
+					To: []networkingv1.NetworkPolicyPeer{{
+						PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+							labelPartOf:       a2aPartOf,
+							a2aComponentLabel: "nats",
+						}},
+					}},
+				},
+				{
+					// The shared port set (litellmEgressPorts owns why each
+					// port is granted — the short version: policy matches
+					// the POST-DNAT container port, which is 8080 everywhere
+					// this repo renders LiteLLM, measured live after an
+					// 80/4000 first cut hung every worker model call).
+					Ports: litellmEgressPorts(),
+					To: []networkingv1.NetworkPolicyPeer{{
+						PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "litellm"}},
+					}},
+				},
+			},
+		},
+	}
+}
+
+// buildA2ANATSNetworkPolicy governs ingress to the NATS pod (W6.2, closing
+// the W6.1 review's finding W6: every pod in the cluster could reach
+// 4222/8222/9222 while the deny-by-default bus grants did the real refusing).
+// The network layer now agrees with the grants: 4222 from exactly the
+// enumerated bus clients, nothing else.
+//
+// 8222 (monitor) and 9222 (ws) get no pod-network peer at all, decided rather
+// than forgotten. Both surfaces are node-path consumers: the kubelet's
+// readiness probe on 8222 and the demo's kubectl port-forward on 9222 enter
+// from the node, which NetworkPolicy does not govern (Dataplane V2 exempts
+// host-local traffic), so denying every pod costs neither. An in-cluster ws
+// client would be W8's UI deployed into the cluster — a peer to add to this
+// list when it exists, not a reason to leave the port open to every pod now.
+func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	tcp := corev1.ProtocolTCP
+
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aNATSNetpolName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "nats-netpol"),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": a2aNATSName(agent)},
+			},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				Ports: []networkingv1.NetworkPolicyPort{
+					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+				},
+				From: []networkingv1.NetworkPolicyPeer{
+					// The agent pod — W7's bridge is a sidecar in it, so the
+					// bridge rides this selector.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": agent.Name + "-gateway",
+					}}},
+					// The A2A gateway.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aGatewayName(agent),
+					}}},
+					// Session pods, by the spawner's labels.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						labelPartOf:                   a2aPartOf,
+						"app.kubernetes.io/component": a2aSessionComponent,
+					}}},
+					// The provision Job's pods.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						labelPartOf:       a2aPartOf,
+						a2aComponentLabel: "provision",
+					}}},
+					// W5's seed Job (a2a/deploy/seed.yaml). Hand-applied, not
+					// a render, but a legitimate bus client whose re-run must
+					// refuse at auth if anything, not hang at the dial.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						labelPartOf:       a2aPartOf,
+						a2aComponentLabel: "seed",
+					}}},
+				},
+			}},
+		},
+	}
+}
+
 // a2aProvisionScript is what was W2's provisioning payload: the four streams,
 // three KV buckets, and three starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
@@ -823,6 +977,23 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
+	// The W6.2 fences: ingress to the bus and egress from session pods. Both
+	// ride this function so they appear and disappear with the stack they
+	// fence — including the skew freeze, where tearing down the ingress
+	// policy would not break the bus but tearing down the session policy
+	// mid-task would unfence a running worker.
+	for _, np := range []*networkingv1.NetworkPolicy{
+		buildA2ANATSNetworkPolicy(agent),
+		buildA2ASessionNetworkPolicy(agent, r.resolveNetpolProfile(ctx, agent)),
+	} {
+		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, np); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
+		}
+	}
+
 	// Jobs are immutable, so the provision Job is create-if-absent under its
 	// content-hashed name; a payload change is a new name and a fresh run.
 	job := buildA2AProvisionJob(agent)
@@ -885,6 +1056,15 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 // creds Secret stays (inert data; re-enabling must not re-roll credentials)
 // and so does the StatefulSet's PVC (JetStream's file store is the audit
 // substrate — flipping a mode is not license to destroy evidence).
+//
+// Session pods are the gateway's, not the operator's, so a flip mid-task
+// leaves a running worker behind after its egress fence is deleted here —
+// unfenced with the worker credential in its env, but bounded: the adapter
+// self-terminates at its task deadline (default 1800s), the bus it would
+// dial is being torn down in the same pass, and pre-W6.2 these pods were
+// never fenced at all. Reaping unowned pods from the operator would need a
+// deliberate exception to the IsControlledBy refusal below; until someone
+// makes that call, the window is documented rather than closed.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// Deployment/StatefulSet/Service reads come from the cache — those kinds
 	// are already watched (Owns) so the reads are free. Secret and Job reads
@@ -900,6 +1080,10 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
+		// cached reads are free.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
 	}
 	for _, entry := range named {

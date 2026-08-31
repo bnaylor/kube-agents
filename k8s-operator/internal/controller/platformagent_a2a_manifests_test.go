@@ -867,3 +867,204 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 		}
 	}
 }
+
+// W6.2, hole 1 (W4 finding #6): nothing selected the pods the gateway spawns,
+// so a delegated worker's egress was wide open — the agent pod was fenced
+// while the workers it delegates to were not. The session policy is
+// deny-by-default with exactly three destinations: DNS, the bus, LiteLLM.
+// The shape is pinned exactly, not scanned for banned peers, for the same
+// reason the web user's publish list is: any widening must fail this test
+// and become a review conversation.
+func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
+	np := buildA2ASessionNetworkPolicy(a2aTestAgent(), defaultTestNetpolProfile())
+
+	if np.Name != "test-agent-a2a-session-netpol" {
+		t.Errorf("unexpected name %q", np.Name)
+	}
+	// Selects exactly the labels the spawner stamps on session pods
+	// (a2a/gateway/spawn.go): part-of=a2a-next, component=a2a-session.
+	wantSel := map[string]string{
+		labelPartOf:                   a2aPartOf,
+		"app.kubernetes.io/component": "a2a-session",
+	}
+	if !reflect.DeepEqual(np.Spec.PodSelector.MatchLabels, wantSel) {
+		t.Errorf("pod selector = %v, want %v", np.Spec.PodSelector.MatchLabels, wantSel)
+	}
+
+	// Both policy types: the egress fence is the ask, and the empty ingress
+	// list rides along because nothing dials a session pod — a worker's only
+	// listener would be an accident, and an accident should be unreachable.
+	wantTypes := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
+	if !reflect.DeepEqual(np.Spec.PolicyTypes, wantTypes) {
+		t.Errorf("policy types = %v, want %v", np.Spec.PolicyTypes, wantTypes)
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("session policy grants ingress: %+v", np.Spec.Ingress)
+	}
+
+	if len(np.Spec.Egress) != 3 {
+		t.Fatalf("expected exactly 3 egress rules (DNS, bus, LiteLLM), got %d: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	}
+
+	// Rule 1: DNS, both protocols, port 53 only, and the destinations pinned
+	// to the shared peer set — a DNS rule with a nil or widened To is port-53
+	// egress to anywhere, which is a tunnel, not name resolution.
+	dns := np.Spec.Egress[0]
+	if len(dns.Ports) != 2 ||
+		*dns.Ports[0].Protocol != corev1.ProtocolUDP || dns.Ports[0].Port.IntVal != 53 ||
+		*dns.Ports[1].Protocol != corev1.ProtocolTCP || dns.Ports[1].Port.IntVal != 53 {
+		t.Errorf("DNS rule ports = %+v, want udp+tcp 53", dns.Ports)
+	}
+	if !reflect.DeepEqual(dns.To, dnsEgressPeers(defaultTestNetpolProfile())) {
+		t.Errorf("DNS rule peers = %+v, want exactly dnsEgressPeers(profile)", dns.To)
+	}
+
+	// Rule 2: the bus, TCP 4222 to the NATS pods by label — never an IPBlock,
+	// which would silently stop matching on the first pod restart.
+	bus := np.Spec.Egress[1]
+	if len(bus.Ports) != 1 || bus.Ports[0].Port.IntVal != 4222 || *bus.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("bus rule is not exactly TCP 4222: %+v", bus.Ports)
+	}
+	if len(bus.To) != 1 || bus.To[0].PodSelector == nil ||
+		bus.To[0].PodSelector.MatchLabels[a2aComponentLabel] != "nats" ||
+		bus.To[0].PodSelector.MatchLabels[labelPartOf] != a2aPartOf {
+		t.Errorf("bus peer does not select the NATS pods by label: %+v", bus.To)
+	}
+
+	// Rule 3: LiteLLM (the workers' model path per W4 — no per-pod
+	// credential, no direct 443). The shared port set: litellmEgressPorts
+	// owns the reasoning, this pin owns the drift.
+	llm := np.Spec.Egress[2]
+	if len(llm.Ports) != 3 || llm.Ports[0].Port.IntVal != 80 || llm.Ports[1].Port.IntVal != 4000 || llm.Ports[2].Port.IntVal != 8080 {
+		t.Errorf("LiteLLM rule ports = %+v, want tcp 80+4000+8080", llm.Ports)
+	}
+	if len(llm.To) != 1 || llm.To[0].PodSelector == nil || llm.To[0].PodSelector.MatchLabels["app"] != "litellm" {
+		t.Errorf("LiteLLM peer = %+v, want app=litellm", llm.To)
+	}
+
+	// No rule reaches the internet, the API server, or the metadata server:
+	// session pods carry no ServiceAccount and no Workload Identity, so any
+	// IPBlock or namespace-crossing peer here is a widening.
+	for i, rule := range np.Spec.Egress {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && i != 0 {
+				t.Errorf("egress rule %d carries an IPBlock peer: %+v", i, peer)
+			}
+			if peer.NamespaceSelector != nil && i != 0 {
+				t.Errorf("egress rule %d crosses namespaces: %+v", i, peer)
+			}
+		}
+	}
+}
+
+// W6.2, hole 2 (W6.1 review finding W6): no NetworkPolicy governed ingress to
+// the NATS pod, so every pod in the cluster reached 4222/8222/9222 while the
+// bus grants did the real refusing. The network layer now agrees with them:
+// 4222 from exactly the enumerated bus clients, and no pod-network peer at
+// all for 8222 (monitor) or 9222 (ws) — the demo port-forward and the kubelet
+// readiness probe both enter via the node, which NetworkPolicy does not
+// govern, and that is the decided posture rather than an accident.
+func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
+	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
+
+	if np.Name != "test-agent-a2a-nats-netpol" {
+		t.Errorf("unexpected name %q", np.Name)
+	}
+	if np.Spec.PodSelector.MatchLabels["app"] != "test-agent-a2a-nats" {
+		t.Errorf("pod selector = %v, want app=test-agent-a2a-nats", np.Spec.PodSelector.MatchLabels)
+	}
+	if !reflect.DeepEqual(np.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}) {
+		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
+	}
+
+	if len(np.Spec.Ingress) != 1 {
+		t.Fatalf("expected exactly one ingress rule, got %d: %+v", len(np.Spec.Ingress), np.Spec.Ingress)
+	}
+	rule := np.Spec.Ingress[0]
+	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 4222 || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("ingress rule is not exactly TCP 4222: %+v", rule.Ports)
+	}
+
+	// The client list, pinned exactly: the agent pod (whose sidecars, W7's
+	// bridge included, share its labels), the A2A gateway, session pods, the
+	// provision Job, and W5's hand-applied seed Job. All same-namespace pod
+	// selectors — no namespace-crossing, no IPBlock.
+	wantPeers := []map[string]string{
+		{"app": "test-agent-gateway"},
+		{"app": "test-agent-a2a-gateway"},
+		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
+		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
+		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
+	}
+	if len(rule.From) != len(wantPeers) {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers), len(rule.From), rule.From)
+	}
+	for i, want := range wantPeers {
+		peer := rule.From[i]
+		if peer.IPBlock != nil || peer.NamespaceSelector != nil {
+			t.Errorf("peer %d is not a same-namespace pod selector: %+v", i, peer)
+			continue
+		}
+		if peer.PodSelector == nil || !reflect.DeepEqual(peer.PodSelector.MatchLabels, want) {
+			t.Errorf("peer %d = %+v, want %v", i, peer.PodSelector, want)
+		}
+	}
+}
+
+// Both W6.2 policies ride the mode switch exactly like the rest of the next
+// stack: rendered by reconcileA2A under next, torn down by cleanupA2A on the
+// flip back, absent from a today render entirely.
+func TestA2ANetworkPoliciesGatedByMode(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// finalizer pass, then the real one
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	session := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-netpol", Namespace: "test-ns"}, session); err != nil {
+		t.Errorf("session NetworkPolicy not rendered under next: %v", err)
+	}
+	nats := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-netpol", Namespace: "test-ns"}, nats); err != nil {
+		t.Errorf("NATS NetworkPolicy not rendered under next: %v", err)
+	}
+
+	// Flip to today: both go back to dark, and the agent's own netpol stays.
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-netpol", Namespace: "test-ns"}, session); !errors.IsNotFound(err) {
+		t.Errorf("session NetworkPolicy still present under today (err=%v)", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-netpol", Namespace: "test-ns"}, nats); !errors.IsNotFound(err) {
+		t.Errorf("NATS NetworkPolicy still present under today (err=%v)", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, &networkingv1.NetworkPolicy{}); err != nil {
+		t.Errorf("the agent's own NetworkPolicy vanished with the A2A cleanup: %v", err)
+	}
+}

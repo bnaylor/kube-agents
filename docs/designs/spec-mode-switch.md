@@ -75,8 +75,10 @@ Degraded. Found live (W6); regression-tested
   NATS pods on the agent NetworkPolicy, worker-user credentials in the agent container's
   env, and the a2a-topics skill overlaid into the platform profile by the entrypoint —
   the skill ships in the image outside the profile template precisely so a `today`
-  render carries no trace of it. Next is additive - today's path keeps running until
-  stage 4 starts retiring pieces.
+  render carries no trace of it. W6.2 adds two NetworkPolicies to the same gated set:
+  ingress to the NATS pod (4222 from the enumerated bus clients, no pod-network peer
+  for 8222/9222) and egress from session pods (DNS, the bus, LiteLLM). Next is
+  additive - today's path keeps running until stage 4 starts retiring pieces.
 
 The operator also writes the mode into the managed settings it already renders, as a
 single key: `KUBEAGENTS_MODE`. (Amended by W6, delta memo #1: the draft said

@@ -3898,15 +3898,11 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 	return peers
 }
 
-// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
-// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-//
-// otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
-// collector, so there is no export to allow and the collector egress rule is left out.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string, otlpDisabled bool) *networkingv1.NetworkPolicy {
-	udp := corev1.ProtocolUDP
-	tcp := corev1.ProtocolTCP
-
+// dnsEgressPeers returns the cluster-DNS peer set for an egress rule: kube-dns
+// and node-local-dns by label, the node-local link-local address, and the
+// resolved (or default) DNS Service ClusterIP. Shared by the agent's policy
+// and the A2A session-pod policy so the two cannot drift on what "DNS" means.
+func dnsEgressPeers(profile netpolProfile) []networkingv1.NetworkPolicyPeer {
 	dnsClusterIP := strings.Trim(profile.DNSClusterIP, "[]")
 	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
 		dnsClusterIP = defaultDNSClusterIP
@@ -3915,6 +3911,71 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	if strings.Contains(dnsClusterIP, ":") {
 		dnsCidr = dnsClusterIP + "/128"
 	}
+	return []networkingv1.NetworkPolicyPeer{
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "kube-dns",
+				},
+			},
+		},
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "node-local-dns",
+				},
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: "169.254.20.10/32",
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: dnsCidr,
+			},
+		},
+	}
+}
+
+// litellmEgressPorts is the LiteLLM port set, shared by the agent policy and
+// the A2A session-pod policy so a port correction cannot land in one and not
+// the other. Policy is evaluated AFTER the Service DNAT (Dataplane V2), so
+// the port that must be granted is the CONTAINER's: every LiteLLM this repo
+// renders listens on 8080 (charts/kube-agents/templates/litellm.yaml and
+// config/integrations/litellm both set --port 8080), and the a2a-next-dev
+// install was measured at 8080 live. 80 covers an endpoint listening on the
+// Service port directly; 4000 is legacy lineage from the kustomize policy,
+// kept for continuity with installs that predate the 8080 move — remove it
+// from here, not from one call site.
+func litellmEgressPorts() []networkingv1.NetworkPolicyPort {
+	tcp := corev1.ProtocolTCP
+	return []networkingv1.NetworkPolicyPort{
+		{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+		{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
+		{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+	}
+}
+
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
+// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+//
+// otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
+// collector, so there is no export to allow and the collector egress rule is left out.
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string, otlpDisabled bool) *networkingv1.NetworkPolicy {
+	udp := corev1.ProtocolUDP
+	tcp := corev1.ProtocolTCP
 
 	apiPeers := formatCIDRPeers(apiCIDRs, true)
 	if len(apiPeers) == 0 {
@@ -3962,42 +4023,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		})
 	}
 
-	dnsPeers := []networkingv1.NetworkPolicyPeer{
-		{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": "kube-system",
-				},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"k8s-app": "kube-dns",
-				},
-			},
-		},
-		{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": "kube-system",
-				},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"k8s-app": "node-local-dns",
-				},
-			},
-		},
-		{
-			IPBlock: &networkingv1.IPBlock{
-				CIDR: "169.254.20.10/32",
-			},
-		},
-		{
-			IPBlock: &networkingv1.IPBlock{
-				CIDR: dnsCidr,
-			},
-		},
-	}
+	dnsPeers := dnsEgressPeers(profile)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
@@ -4027,13 +4053,10 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: metadataDaemonPeers,
 		},
-		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
+		// 4. LiteLLM Gateway and standalone-replay in the agent namespace
+		// (ports: litellmEgressPorts, which owns why each one is granted)
 		{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
-			},
+			Ports: litellmEgressPorts(),
 			To: []networkingv1.NetworkPolicyPeer{
 				{
 					PodSelector: &metav1.LabelSelector{

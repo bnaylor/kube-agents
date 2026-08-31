@@ -144,7 +144,8 @@ Layout:
   a browser by design. Subscribe on `a2a.>` and its own inbox; publish only the JetStream
   read API, **enumerated per stream** over the four message streams - `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT`, plus its own inbox. It rides a
-  websocket listener on 9222 rendered plain (`no_tls: true`) with `same_origin: true`.
+  websocket listener on 9222 rendered plain (`no_tls: true`) with an `allowed_origins`
+  allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -182,12 +183,22 @@ Layout:
   writerless subject makes that failure land nowhere.
 
   Posture, stated accurately: plain ws puts the credential on the pod network in
-  cleartext, and while the Service is ClusterIP - so nothing outside the cluster reaches
-  it - **no NetworkPolicy governs ingress to the NATS pod**, so every pod in the cluster
-  can reach 4222, 8222 and 9222. `same_origin` is the one control here that is not
-  posture: WebSockets are exempt from CORS and the demo transport is a `kubectl
-  port-forward` to localhost, so without it any page the operator's browser visits can
-  drive this surface. An ingress policy for the NATS pod is the recommended follow-up.
+  cleartext, and the Service is ClusterIP, so nothing outside the cluster reaches it.
+  Since W6.2 the pod network is fenced too: the operator renders an ingress
+  NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
+  (the agent pod - whose sidecars, the Hermes bridge included, share its labels - the
+  A2A gateway, session pods by the spawner's labels, the provision Job, and the
+  hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
+  `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
+  which NetworkPolicy does not govern, so the ws surface stays reachable through
+  kubectl and through nothing else in-cluster. A second W6.2 policy fences the session
+  pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no other legitimate
+  destination, carrying no ServiceAccount and no Workload Identity). The origin
+  allow-list (`allowed_origins`, not `same_origin`, which can never match a UI on a
+  different port) remains the browser-side control: WebSockets are exempt from CORS,
+  so for as long as a port-forward runs, any page the operator's browser visits could
+  otherwise drive this surface.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
