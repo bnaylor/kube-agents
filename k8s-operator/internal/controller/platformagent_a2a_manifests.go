@@ -578,9 +578,23 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY \
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
-# State-class topics (provisioned registry): upgrade-readiness, blueprint.
+# State-class topics (provisioned registry): upgrade-readiness, blueprint, probe.
+#
+# The probe subject is the one here with NO writer, deliberately, and it is the
+# single exception to the rule that a topic's subject list and its writer's
+# grant travel together. It exists so that an authorization probe has a real
+# provisioned subject to be refused ON: a refusal against an unprovisioned
+# subject proves only that the subject does not exist, while a refusal here
+# proves the grant. W8's UI ships that probe as a button, so it is pressed in
+# front of an audience rather than living in a test file.
+#
+# It was aimed at the blueprint topic first. That works right up until the
+# grant is wrong, at which point the probe writes junk into a state-class
+# topic the fleet actually reads - and "it cannot happen while the grants
+# hold" is the assumption the web user already broke once. A writerless
+# subject makes the failure mode land nowhere.
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE \
-  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint' \
+  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 

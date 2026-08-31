@@ -776,3 +776,34 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 		t.Errorf("RoleBinding wiring: roleRef=%q subject=%q", rb.RoleRef.Name, rb.Subjects[0].Name)
 	}
 }
+
+// The probe subject is provisioned so an authorization refusal has a real
+// subject to land on, and it has NO writer on purpose — the one deliberate
+// exception to "a topic's subject list and its writer's grant travel
+// together". If any user ever gains publish on it, the probe stops being a
+// refusal test and becomes a way to write a state-class topic.
+func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
+	agent := a2aTestAgent()
+
+	script := strings.Join(buildA2AProvisionJob(agent).Spec.Template.Spec.Containers[0].Command, "\n")
+	if !strings.Contains(script, "a2a.topics.shared.probe") {
+		t.Error("probe subject is not provisioned; a refusal against it would only prove the subject is missing")
+	}
+
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds()).Data["nats.conf"])
+	// Walk each user's publish block and assert none of them names the probe.
+	for _, user := range []string{"gateway", "worker", "seed", "web"} {
+		start := strings.Index(conf, "user: "+user)
+		if start < 0 {
+			t.Fatalf("no %s user in nats.conf", user)
+		}
+		entry := conf[start:]
+		if next := strings.Index(entry[1:], "user: "); next >= 0 {
+			entry = entry[:next+1]
+		}
+		pub := entry[strings.Index(entry, "publish"):strings.Index(entry, "subscribe")]
+		if strings.Contains(pub, "a2a.topics.shared.probe") {
+			t.Errorf("user %q can publish the probe subject; it must have no writer", user)
+		}
+	}
+}
