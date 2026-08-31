@@ -141,9 +141,10 @@ edits), the status card, the steer acknowledgement, and failure notices (a submi
 or steer that never reached the bus). All are deterministic templates over facts the
 gateway itself owns - its own publishes, its own registry, stream replay - which is
 what keeps them inside the no-model rule. They also say only what the gateway knows:
-the steer acknowledgement reports that the steer is on the stream and the executor
-picks it up at its next turn boundary, not that it was absorbed, which the gateway
-cannot know.
+the steer acknowledgement reports that the steer is on the stream and that, if the
+task is still running when it lands, the executor picks it up at its next turn
+boundary - not that it was absorbed, which the gateway cannot know. The payload
+spec's race-window refusal is what closes that loop on the stream.
 
 ## The Delegate flow (added 8/31)
 
@@ -206,7 +207,11 @@ that translation lives in the shim, next to the process it translates for.
 **Reap.** Idle TTL since the last user message (30 minutes, config-backed). Reaping is
 deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
-The KV entry stays, holding the `contextId`.
+The KV entry stays, holding the `contextId`. Reap never deletes a pod out from under a
+live task: an active, non-detached task exempts the session from the idle TTL however
+long it runs - the executor's own task deadline and Sweep own that pod's end, and the
+terminal event they guarantee is also what deletes the active-task record (and the
+`ask` copy riding it).
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream, folds them into a transcript primer,

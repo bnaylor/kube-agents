@@ -271,10 +271,16 @@ calls and become properties of the stream:
   exist, "the harness produced a result" no longer means "the task is done." The
   executor's adapter counts turns - the opening prompt is one, each absorbed steer adds
   one, each harness `result` settles one - and the result that settles the count is the
-  task's deliverable. Racing steers are drained before that decision; a steer that
-  arrives after the deliverable is chosen is warn-and-drop, the same rule as an event
-  after `final`. Without this rule, the first result after a steer would terminate the
-  task with the pre-steer answer and the correction would be silently lost.
+  task's deliverable. Racing steers are drained before that decision. A steer that
+  still arrives after the deliverable is chosen is answered with the refusal shape
+  above - a non-final `status-update` carrying the task's current state, published
+  before the terminal event - so the requester learns the correction missed on the
+  stream, not from silence; nothing stream-visible marks this window otherwise, since
+  the choice of deliverable is adapter-internal. The stage 1 adapter logs and counts
+  the drop without publishing the refusal yet - a recorded deviation, closed with the
+  rest of the adapter work. Without this rule, the first result after a steer would
+  terminate the task with the pre-steer answer and the correction would be silently
+  lost.
 - There is deliberately no protocol-level inactivity timeout. Liveness is judged from
   heartbeats and consumer health, which the deployment spec owns. A task whose executor
   died without a terminal event gets terminal `failed` written by its supervisor - the

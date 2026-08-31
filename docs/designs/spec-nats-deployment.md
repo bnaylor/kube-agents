@@ -212,8 +212,11 @@ Layout:
   kubectl and through nothing else in-cluster. The enumeration is today's client
   list, and it must grow with the components this spec designs: the audit exporter,
   the janitor, and the metrics scrape (the alert set above is scraped series) each
-  add a peer when they arm - the topic-grant corollary that two edits travel
-  together, applied to the fence. A second policy in the same amendment
+  add a peer when they arm, and the NATS pods themselves join the enumeration on
+  their route port the moment the deployment leaves the single-node dev shape - a
+  3-node cluster's servers dial each other, and a fence without the route peer
+  prevents the cluster from ever forming. The topic-grant corollary that two edits
+  travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has
   no other legitimate destination, carrying no ServiceAccount and no Workload
   Identity; its bus credential is the static worker user until the callout arms). The origin

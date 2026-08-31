@@ -61,12 +61,18 @@ third mode, an older operator binary reads it. Silently rendering `today` at tha
 the cluster runs something other than what the spec asks, with nothing in
 `kubectl describe` to say so. Instead the reconciler goes Degraded through the existing
 `updateStatusDegraded` path with a named reason, `ModeNotRecognized`, keeps rendering
-today's stack, preserves whatever A2A surface already exists - it tears nothing down,
-and the agent's bus env and egress rule survive the skew too - and requeues. (Same
-Degraded pattern as `RuntimeClassNotFound`.) The preservation matters most on the
-`next` side: "fail closed to today" must not mean "clean up next," or a one-version
-operator rollback against a live `next` install kills the bus while dutifully
-reporting Degraded. Found live during stage 1 bring-up (8/26).
+today's stack, and requeues (same Degraded pattern as `RuntimeClassNotFound`) - and the
+two layers the mode touches are split deliberately on skew. The mode DELIVERED to the
+agent fails closed: the managed `.env` pins `today`, the config hash moves, and the
+fleet rolls to today's behavior - the skill is withdrawn, which is what fail-closed
+means. The RENDERED surface is preserved: the A2A objects and the agent's bus surface
+are not torn down - the bus credentials are container env and the egress rule its own
+object, neither a managed-`.env` key, so pinning the mode removes neither. The
+preservation matters most on the `next` side: "fail closed to today" must not mean
+"clean up next," or a one-version operator rollback against a live `next` install
+kills the bus while dutifully reporting Degraded - established connections and sidecar
+dials survive precisely because the env and the egress rule do. Found live during
+stage 1 bring-up (8/26).
 
 ## What the operator renders
 
