@@ -36,10 +36,28 @@ npm install && npm run dev
 Ask kage something in Discord; the rail lights, events tick, and clicking a
 tap replays that session's events from the stream — no live executor asked.
 
+## Serve it from localhost:5173, not another port
+
+The bus's websocket listener renders
+`allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]`, so a
+page served from any other origin is refused at the handshake with a 403 —
+the connect form with a `WebSocket ... 403` in the console, not a hang.
+Vite is pinned with `strictPort`, so it fails loudly rather than drifting to
+5174 and leaving that failure to be diagnosed live.
+
+Use `http://localhost:5173`. The `127.0.0.1` entry on the allow-list is
+harmless but not reachable: vite binds localhost only, and it should stay
+that way — `server.host` would put the dev server on every interface.
+
+Origin is browser-asserted and non-browser clients omit it entirely, so the
+allow-list is defense in depth. The boundary is the grant list.
+
 ## Local dev (no cluster)
 
 `dev/nats.conf` mirrors the operator's rendered config on the points that
-matter: the ws listener and the `web` user's exact grant list.
+matter: the ws listener and the `web` user's exact grant list. Mirrored from
+`5ce2be9` on `a2a/w6-mode-switch` — re-mirror if that render moves, and
+re-run the live suite against it.
 
 ```sh
 nats-server -c dev/nats.conf     # terminal 1
