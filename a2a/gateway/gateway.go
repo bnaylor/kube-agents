@@ -86,6 +86,11 @@ func New(o Options) (*Gateway, error) {
 	if backend == "" {
 		backend = "discord"
 	}
+	// Tests and embedders build Config directly, bypassing FromEnv's
+	// parse-and-validate; an unset cap means the default there too.
+	if o.Config.MaxSessions <= 0 {
+		o.Config.MaxSessions = defaultMaxSessions
+	}
 	g := &Gateway{
 		cfg:          o.Config,
 		client:       o.Client,
@@ -258,6 +263,14 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			// the default addressee; on a session-routed one the delegate
 			// incarnation becomes the next standing incarnation, which is
 			// inside the session route's contract (incarnations rotate).
+			//
+			// The cap check precedes every route mutation, so a refused turn
+			// leaves the record exactly as it was (the early return also
+			// skips the Put below - nothing to persist for a turn that
+			// changed nothing).
+			if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
+				return
+			}
 			if rec.Profile == "" {
 				rec.Profile = "chat"
 			}
@@ -279,7 +292,12 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			msg.Text = rest
 		} else if rec.SessionRouted && rec.PodName == "" {
 			// A session-routed conversation with no live incarnation gets a
-			// fresh bus session name before the task's addressee is chosen.
+			// fresh bus session name before the task's addressee is chosen -
+			// a spawn, so the cap holds here too, or Delegate refusals just
+			// push the flood one affordance over.
+			if g.refuseAtSessionCap(ctx, rec, false) {
+				return
+			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 		} else if !rec.SessionRouted {
@@ -292,7 +310,11 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 				// first contact would. The sentinel is a route, never an
 				// addressee - written literally it publishes the task to a
 				// subject no executor owns (the exact failure New()'s
-				// config guard describes).
+				// config guard describes). The upgrade spawns, so it pays
+				// the same cap toll as first contact.
+				if g.refuseAtSessionCap(ctx, rec, false) {
+					return
+				}
 				rec.SessionRouted = true
 				rec.Profile = "chat"
 				rec.BusSession = mintSessionName(rec.Profile)

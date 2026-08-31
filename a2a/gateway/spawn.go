@@ -35,6 +35,9 @@ type spawner interface {
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
 	// their annotations carry (sweep's scan).
 	TerminalOrphans(ctx context.Context) ([]orphanPod, error)
+	// LiveSessions counts session pods not yet in a terminal phase - the
+	// session cap's denominator.
+	LiveSessions(ctx context.Context) (int, error)
 }
 
 type orphanPod struct {
@@ -185,6 +188,28 @@ func (s *podSpawner) Delete(ctx context.Context, podName string) error {
 	return err
 }
 
+// LiveSessions counts through the k8s API rather than the gateway's own
+// registry: the API is authoritative, survives a gateway restart, and sees
+// orphans the registry has forgotten. Terminal pods are sweep's inventory,
+// not load, so they don't count - matching what a `pods` ResourceQuota
+// counts, which is the layer that backstops this number.
+func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
+	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
+	})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
@@ -207,6 +232,45 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 		})
 	}
 	return out, nil
+}
+
+// refuseAtSessionCap is the usability half of the session-pod bound, checked
+// before any route mutation that will need a fresh pod. At the cap the turn
+// is refused with a reply naming the numbers - never silently queued, never
+// dropped. replacing marks a Delegate that retires its previous incarnation
+// in the same turn: the doomed pod is still live at count time, so it hands
+// its slot to its successor rather than double-counting.
+//
+// The count-then-create race is real: two conversations can pass this check
+// together and overshoot the cap by one. It is bounded by the namespace
+// ResourceQuota the operator renders above this number, not by a lock here -
+// a lock would only serialize this process while the quota also holds
+// against a gateway that has stopped honoring its own cap.
+func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, replacing bool) bool {
+	live, err := g.spawner.LiveSessions(ctx)
+	if err != nil {
+		// Proceeding blind would make the cap advisory exactly when the API
+		// is misbehaving; say so instead of dropping the turn silently.
+		g.log.Error("session cap: live count failed", "conversation", rec.Key, "err", err)
+		g.post(rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment")
+		return true
+	}
+	limit := g.cfg.MaxSessions
+	if replacing {
+		limit++
+	}
+	if live < limit {
+		return false
+	}
+	workers := fmt.Sprintf("%d session workers are", live)
+	if live == 1 {
+		workers = "1 session worker is"
+	}
+	g.log.Warn("session cap: delegation refused", "conversation", rec.Key, "live", live, "cap", g.cfg.MaxSessions)
+	g.post(rec.Key, fmt.Sprintf(
+		"🚦 not started: %s already running (cap %d). Wait for one to finish or `stop` one you started; an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
+		workers, g.cfg.MaxSessions))
+	return true
 }
 
 // ensureSessionPod spawns (or rehydrates) the session's incarnation for a

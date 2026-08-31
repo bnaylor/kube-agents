@@ -726,6 +726,8 @@ type fakeSpawner struct {
 	mu      sync.Mutex
 	spawns  []fakeSpawn
 	deletes []string
+	live    int
+	liveErr error
 }
 
 type fakeSpawn struct {
@@ -772,6 +774,13 @@ func startRigWithSpawner(t *testing.T) (*rig, *fakeSpawner) {
 // - RouteSession is the post-flip W4 configuration.
 func startRigWithSpawnerRoute(t *testing.T, defaultAddressee string) (*rig, *fakeSpawner) {
 	t.Helper()
+	return startRigWithSpawnerCap(t, defaultAddressee, 0)
+}
+
+// startRigWithSpawnerCap additionally pins the session-pod cap; 0 keeps the
+// default (New normalizes it), which is what every pre-cap test wants.
+func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions int) (*rig, *fakeSpawner) {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -801,6 +810,7 @@ func startRigWithSpawnerRoute(t *testing.T, defaultAddressee string) (*rig, *fak
 		NATSURL:          url,
 		PrincipalMapPath: mapFile,
 		DefaultAddressee: defaultAddressee,
+		MaxSessions:      maxSessions,
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
 	}
