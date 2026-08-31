@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -17,6 +18,35 @@ import (
 type DiscordAdapter struct {
 	s   *discordgo.Session
 	log *slog.Logger
+
+	mu       sync.Mutex
+	botRoles map[string][]string // guildID -> role ids the bot holds
+}
+
+// botRoleIDs returns the bot's own role ids in guildID, cached for the life
+// of the process (a pod roll refreshes it). Discord's mention picker offers
+// the bot's managed role under the same name as the bot, and the two render
+// identically in chat - so a mention of a role the bot holds addresses the
+// bot. A failed lookup is not cached; the next message retries.
+func (d *DiscordAdapter) botRoleIDs(s *discordgo.Session, guildID string) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if ids, ok := d.botRoles[guildID]; ok {
+		return ids
+	}
+	member, err := s.State.Member(guildID, s.State.User.ID)
+	if err != nil || member == nil {
+		member, err = s.GuildMember(guildID, s.State.User.ID)
+		if err != nil {
+			d.log.Warn("bot member lookup failed; role mentions will not resolve", "guild", guildID, "err", err)
+			return nil
+		}
+	}
+	if d.botRoles == nil {
+		d.botRoles = map[string][]string{}
+	}
+	d.botRoles[guildID] = member.Roles
+	return member.Roles
 }
 
 // NewDiscordAdapter dials the Discord gateway websocket.
@@ -122,10 +152,29 @@ func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreat
 					break
 				}
 			}
+			// A role mention counts when the role is one the bot holds:
+			// "@kage" via the picker frequently resolves to the managed
+			// role, not the user, and both render identically.
+			var mentionedRoles []string
+			if len(m.MentionRoles) > 0 {
+				for _, held := range d.botRoleIDs(s, m.GuildID) {
+					for _, r := range m.MentionRoles {
+						if r == held {
+							mentionedRoles = append(mentionedRoles, r)
+						}
+					}
+				}
+			}
+			if len(mentionedRoles) > 0 {
+				mentioned = true
+			}
 			if !mentioned {
 				return InboundMessage{}, false
 			}
 			text = stripMention(text, s.State.User.ID)
+			for _, r := range mentionedRoles {
+				text = strings.TrimSpace(strings.ReplaceAll(text, "<@&"+r+">", ""))
+			}
 			thread, err := s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{
 				Name:                threadName(text),
 				AutoArchiveDuration: 1440,
