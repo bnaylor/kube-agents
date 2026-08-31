@@ -1,0 +1,22 @@
+# Build the a2a topics CLI image. Context is the a2a/ module directory.
+#
+#   gcloud builds submit --config cloudbuild-cli.yaml \
+#     --substitutions _IMAGE=northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/a2a-cli:w5-20260826 .
+#
+# Cloud Build rather than a local docker: deployment targets are amd64 GKE
+# nodes, and the multi-arch bases otherwise resolve to the build host.
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_IMAGE"
+      - "-f"
+      - "Dockerfile.cli"
+      - "."
+images:
+  - "$_IMAGE"
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -1,0 +1,23 @@
+# The a2a topics CLI: the reader beat 3 needs, and the seed Job's whole payload.
+#
+# Alpine rather than distroless/static because the seed Job drives two writes
+# from one `sh -c`, and because this image is also what a human exec's into to
+# look at the bus. Playground posture; a shipping image would be static.
+#
+# Build context is the a2a/ module directory:
+#   docker build -f Dockerfile.cli -t <registry>/a2a-cli:<tag> .
+
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY lib/ lib/
+COPY profiles/ profiles/
+COPY cmd/ cmd/
+RUN CGO_ENABLED=0 go build -trimpath -o /out/a2a ./cmd/a2a
+
+FROM alpine:3.22
+RUN adduser -D -u 65532 a2a
+COPY --from=build /out/a2a /usr/local/bin/a2a
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/a2a"]

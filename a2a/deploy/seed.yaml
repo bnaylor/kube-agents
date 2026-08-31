@@ -1,0 +1,191 @@
+# Seed content for the topic blackboard, and the Job that writes it.
+#
+# ---------------------------------------------------------------------------
+# PLAYGROUND POSTURE - read this before copying anything here into a product
+# path. This install runs static per-component NATS users instead of the auth
+# callout, a bot token as a plain Secret, no audit exporter, no failure
+# breaker, and the gateway's sweep as the only janitor. Each of those has a
+# decided design in docs/designs/spec-*.md; none of them gates "Adam can
+# play." Static credentials are the playground, not the product.
+#
+# This Job specifically: it authenticates as the static `seed` user, whose
+# publish grant is exactly the three provisioned topic subjects, and it writes
+# entries no agent has produced yet so that the read path has something true
+# to read. Under the product posture, standing state is written by the agent
+# that owns the topic, and `seed` does not exist.
+# ---------------------------------------------------------------------------
+#
+# Apply against the W6 install:
+#   kubectl --context gke_bnaylor-kagents-dev_northamerica-northeast1_a2a-next-dev \
+#     -n kubeagents-system apply -f a2a/deploy/seed.yaml
+#
+# The Job is idempotent in the sense that matters: a state-class topic keeps
+# the last 8 entries per subject and readers take the newest, so re-running it
+# refreshes the answer rather than duplicating it. Delete the Job before
+# re-applying (a completed Job's pod template is immutable).
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a2a-seed-content
+  labels:
+    app.kubernetes.io/part-of: a2a-next
+data:
+  upgrade-readiness.json: |
+    {
+      "assessedAt": "2026-08-26T09:00:00Z",
+      "releaseChannel": "regular",
+      "fleetVerdict": "not-ready",
+      "summary": "2 of 3 clusters clear to upgrade to 1.35. prod-a is blocked on a removed API still in use.",
+      "clusters": [
+        {
+          "cluster": "a2a-next-dev",
+          "projectId": "bnaylor-kagents-dev",
+          "location": "northamerica-northeast1",
+          "currentVersion": "1.34.4-gke.1012000",
+          "targetVersion": "1.35.2-gke.1044000",
+          "verdict": "ready",
+          "blockers": [],
+          "notes": "Autopilot regional. No deprecated API usage in the last 30d of audit logs; all workloads have PDBs that permit a drain."
+        },
+        {
+          "cluster": "prod-a",
+          "projectId": "acme-prod",
+          "location": "us-east1",
+          "currentVersion": "1.33.9-gke.1278000",
+          "targetVersion": "1.35.2-gke.1044000",
+          "verdict": "blocked",
+          "blockers": [
+            {
+              "kind": "removed-api",
+              "detail": "policy/v1beta1 PodDisruptionBudget served 412 requests in the last 7d from the checkout and ledger namespaces; removed in 1.35.",
+              "owner": "payments-platform"
+            }
+          ],
+          "notes": "Two minor versions behind. The API migration is the long pole, not the upgrade window."
+        },
+        {
+          "cluster": "prod-b",
+          "projectId": "acme-prod",
+          "location": "europe-west4",
+          "currentVersion": "1.34.4-gke.1012000",
+          "targetVersion": "1.35.2-gke.1044000",
+          "verdict": "needs-attention",
+          "blockers": [
+            {
+              "kind": "drain-risk",
+              "detail": "search-index StatefulSet has a PDB with maxUnavailable: 0 and 3 replicas on 3 nodes; a node upgrade cannot make progress without an operator decision.",
+              "owner": "search"
+            }
+          ],
+          "notes": "Not blocked on compatibility. Blocked on someone agreeing to let search lose a replica for ten minutes."
+        }
+      ]
+    }
+  blueprint.json: |
+    {
+      "revision": 14,
+      "updatedAt": "2026-08-26T09:00:00Z",
+      "environments": [
+        {
+          "name": "dev",
+          "projectId": "bnaylor-kagents-dev",
+          "clusters": ["a2a-next-dev"],
+          "gitopsRepo": "bnaylor/kagents-dev-config",
+          "promotesTo": "staging"
+        },
+        {
+          "name": "staging",
+          "projectId": "acme-staging",
+          "clusters": ["stage-a"],
+          "gitopsRepo": "acme/platform-config",
+          "promotesTo": "prod"
+        },
+        {
+          "name": "prod",
+          "projectId": "acme-prod",
+          "clusters": ["prod-a", "prod-b"],
+          "gitopsRepo": "acme/platform-config",
+          "promotesTo": null
+        }
+      ],
+      "conventions": {
+        "tenantIsolation": "one namespace per team, default-deny NetworkPolicy, no shared service accounts",
+        "changeMechanism": "every cluster change is a pull request into the environment's gitops repo; nothing is applied by hand",
+        "releaseChannel": "regular on prod, rapid on dev"
+      },
+      "knownDebt": [
+        "prod-a is two minor versions behind and holds the fleet's upgrade verdict at not-ready",
+        "the search StatefulSet's PDB makes prod-b node upgrades a manual decision"
+      ]
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: a2a-seed-topics
+  labels:
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: seed
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: seed
+    spec:
+      restartPolicy: OnFailure
+      # Nothing here talks to the API server: the bus is the only thing this
+      # pod reaches, and it authenticates to it with a password.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: seed
+          image: northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/a2a-cli:w5-20260826b
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              a2a topics list
+              a2a topics write upgrade-readiness \
+                --text "2 of 3 clusters clear for 1.35. prod-a is blocked on policy/v1beta1 PodDisruptionBudget still being served; prod-b needs a drain decision on search." \
+                --data @/etc/a2a-seed/upgrade-readiness.json
+              a2a topics write blueprint \
+                --text "Three environments (dev, staging, prod) across two projects. Every change is a PR into the environment's gitops repo." \
+                --data @/etc/a2a-seed/blueprint.json
+              a2a topics read upgrade-readiness
+          env:
+            - name: NATS_URL
+              value: nats://platform-agent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_USER
+              value: seed
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-a2a-nats-creds
+                  key: seed-password
+            # from.session on what this Job writes. Routing and display only -
+            # the envelope spec is explicit that from is publisher-asserted and
+            # is not an authorization input. What actually constrains this pod
+            # is the seed user's publish grant.
+            - name: A2A_SESSION
+              value: seed
+          volumeMounts:
+            - name: content
+              mountPath: /etc/a2a-seed
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: content
+          configMap:
+            name: a2a-seed-content

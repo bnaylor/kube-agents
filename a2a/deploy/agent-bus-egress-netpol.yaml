@@ -1,0 +1,50 @@
+# Let the platform agent pod reach the bus.
+#
+# ---------------------------------------------------------------------------
+# PLAYGROUND POSTURE - this manifest is a stand-in for an operator change, and
+# it should stop existing when that change lands.
+#
+# The agent pod's egress is deny-by-default: `platform-agent-gateway-netpol`,
+# rendered by the operator, allows DNS, the metadata server, LiteLLM, the
+# API server, and 443 to the internet, and nothing else. NATS on 4222 is not
+# on that list, so under `mode: next` the agent cannot reach the bus the same
+# install just stood up - the connection does not fail, it hangs until the
+# dial timeout, which is the least diagnosable shape this failure has.
+#
+# The right fix is one more egress rule in the operator's own policy, rendered
+# under `next` alongside the NATS component (W6's file). This separate policy
+# is the interim: NetworkPolicies are additive, so it grants the port without
+# touching an operator-managed object that reconcile would revert anyway.
+#
+# W7 inherits this: the Hermes bridge is proposed as a sidecar in this pod, so
+# it sits behind this same policy. One rule, two consumers.
+# ---------------------------------------------------------------------------
+#
+#   kubectl --context gke_bnaylor-kagents-dev_northamerica-northeast1_a2a-next-dev \
+#     -n kubeagents-system apply -f a2a/deploy/agent-bus-egress-netpol.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: a2a-agent-bus-egress
+  labels:
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: netpol
+spec:
+  podSelector:
+    matchLabels:
+      app: platform-agent-gateway
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 4222
+          protocol: TCP
+      to:
+        # The NATS pod by label, not by CIDR: the ClusterIP is stable but the
+        # pod IP is not, and a policy pinned to an address is a policy that
+        # silently stops matching after a restart.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: nats

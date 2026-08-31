@@ -1,0 +1,66 @@
+# cluster-a2a-next-dev - the specialist the chat profile delegates to.
+#
+# The AgentProfile spec block from docs/designs/spec-subagent-profiles.md,
+# verbatim, minus the CRD wrapping; the profile name is the file name. One CR
+# per managed cluster is stamped out by the operator at stage 3 - this file is
+# what one of them looks like, pinned to the install we are actually running
+# on, so `clusterRef` is real data rather than a placeholder.
+#
+# Read-only is the point. Under this profile "read-only" stops being a property
+# of a kubeconfig on a shared volume and becomes a property of a principal with
+# no write grants anywhere: its own KSA with no RoleBindings, a scoped
+# read-only kubeconfig the operator renders from clusterRef, and bus grants
+# that let it record an observation but not restate the fleet's standing view.
+#
+# Playground posture: the persona image is not built yet (session pods are W4).
+
+description: >-
+  Read-only SRE scoped to exactly one GKE cluster.  Live runtime state and
+  workload debugging: crash loops, OOMKills, unschedulable pods, autoscaling
+  behavior, storage binding.  Returns a grounded RCA and a proposed manifest
+  patch; never mutates, never opens PRs.
+
+clusterRef:
+  projectId: bnaylor-kagents-dev
+  cluster: a2a-next-dev
+  location: northamerica-northeast1
+
+persona:
+  # SOUL.md, AGENTS.md, the gke-* debugging skills, persona config: read-only
+  # gke MCP plus developer_knowledge, platform_control deliberately absent.
+  image: northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/persona-cluster:2026.08
+
+harness:
+  image: northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:2026.08
+  model: model-default
+  maxTurns: 50
+
+bus:
+  # The spec's worked cluster agent takes no topic grants at all. This one
+  # takes two, and both are deliberate: it reads the shared environment model
+  # so an RCA starts from what the fleet already knows, and it may append a
+  # dated observation to the journal - annotations is journal class, whose
+  # writer set is "any agent". It still cannot write a state-class topic, so
+  # it can record what it saw and cannot restate what the fleet believes.
+  publishTopics:
+    - shared.annotations
+  subscribeTopics:
+    - shared.blueprint
+
+identity: {}
+  # Operator-created KSA, zero RoleBindings. The cluster read path is the
+  # scoped kubeconfig rendered from clusterRef, not an ambient credential.
+
+lifecycle:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 600
+
+# A stale diagnosis is worse than a late one: a submission that has sat behind
+# the concurrency cap for an hour is describing a cluster that has moved on.
+queueTimeoutSeconds: 900
+
+concurrency: 2
+
+resources:
+  requests: { cpu: 250m, memory: 512Mi }
+  limits: { cpu: "1", memory: 2Gi }
