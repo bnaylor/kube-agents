@@ -9,25 +9,26 @@ ones where the bus does not exist. "A normal install cannot tell this feature
 exists" is the mode switch's promise, and a skill file is the easiest way to
 break it.
 
-## The three pieces, and where each one belongs
+This directory is the SOURCE the agent image builds from: the Dockerfile
+copies `platform/skills/` to `/opt/a2a-template/skills/`, deliberately outside
+`/opt/platform-template`, and the entrypoint overlays it into the platform
+profile only on a `next` install (below).
 
-The skill needs three things present in the agent pod. Today all three are
-placed by hand; each has a product home, and none of the product homes is W5's
-to build.
+## The three pieces, and where each one lives
 
-| Piece | Playground placement | Where it belongs |
-| ----- | -------------------- | ---------------- |
-| The `a2a` client binary | copied to `/opt/data/scripts/a2a` on the data PVC | built into the agent image from `a2a/cmd/a2a`, the way `k8s-event-watcher` is built from `k8s-operator/cmd` — one builder stage and one `COPY`, the pattern is already in `deploy/docker/Dockerfile` |
-| `SKILL.md` | copied to `/opt/data/profiles/platform/skills/a2a-topics/`, and **gone at the next pod start** — see below | shipped in the image outside `/opt/platform-template`, overlaid into the profile only when the mode is `next`. The gate reads `KUBEAGENTS_MODE` through `agents/platform/scripts/runtime_mode.py`, which lives on the W6 branch — W5 does not fork it |
-| `NATS_URL` / `NATS_USER` / `NATS_PASSWORD` | exported into the shell that invokes the agent | rendered by the operator into the agent Deployment's env under `next`, from the `<agent>-a2a-nats-creds` Secret the gateway already reads. W7's bridge needs the same env in the same pod, so this is one seam, not two |
+W5 placed all three by hand to prove the reader; W6.1 landed the product home
+for each. Nothing is hand-placed anymore.
 
-`/opt/data/scripts` is the right playground home for the binary rather than an
-arbitrary path: it is the shared executable directory every profile reaches,
-`profiles/<name>/scripts` is a symlink to it, and `profile_scaffold.py` states
-outright that executables are not part of a profile template. The skill spells
-its path from `$HERMES_HOME` for the reason `github-issue-resolver` does — a
-delegated task starts the agent in the task workspace, not the profile
-directory.
+| Piece | Playground placement (W5, retired) | Product home (W6.1) |
+| ----- | ---------------------------------- | ------------------- |
+| The `a2a` client binary | copied to `/opt/data/scripts/a2a` on the data PVC | built from `a2a/cmd/a2a` in the image's `a2a-builder` stage and `COPY`d to `/usr/local/bin/a2a` — the `k8s-event-watcher` pattern. Ungated: a binary is inert until something invokes it, and the thing that invokes it is what ships dark |
+| `SKILL.md` | copied to `/opt/data/profiles/platform/skills/a2a-topics/`, and **gone at the next pod start** — see below | shipped at `/opt/a2a-template/skills/`, overlaid into the profile by `docker-entrypoint.sh` step 2.6a-bis only when `runtime_mode.is_next()`. The overlay runs after 2.6a's replace-from-image, which is what makes it stick — and what cleans it off on the first boot after a flip back to `today` |
+| `NATS_URL` / `NATS_USER` / `NATS_PASSWORD` | exported into the shell that invoked the agent | rendered by the operator into the agent container's env under `next`, as the `worker` user, from the `<agent>-a2a-nats-creds` Secret the gateway already reads. W7's bridge sidecar shares the pod, so this is one seam, not two |
+
+The skill invokes the client as plain `a2a` — `/usr/local/bin` is on the
+agent's rendered `PATH` from a chat turn and from a delegated task alike, so
+there is no profile-relative path to spell and nothing for a task-workspace
+dispatch to miss.
 
 ## The skill copy does not survive a restart, and that is by design
 
@@ -39,39 +40,17 @@ a merge — deliberately, so that an image roll cannot leave a profile running
 stale skills. A skill that exists only on the PVC is therefore deleted by the
 next restart, silently, and the agent simply stops knowing how to read a topic.
 
-The binary is unaffected: `scripts/` is synced additively and keeps what is
-already there.
-
 So there is no supported way to add a skill to a running agent without going
-through the image. The copy above is good for a demonstration and nothing
-longer, and the mode-gated overlay is not a nicety — it is the only route.
+through the image. That constraint is why the mode-gated overlay exists: it is
+not a nicety, it is the only route — and it is also what makes the gate honest,
+since the same replace that would delete a hand-copied skill is what removes
+the overlaid one the first boot after the mode leaves `next`.
 
-## Installing it on a running install
+## Nothing to install by hand
 
-Reading the bus needs a bus user. `worker` is the right role: its grants cover
-subscribing to every topic and publishing the ones a worker owns. Its password
-is in the `<agent>-a2a-nats-creds` Secret alongside the gateway's.
-
-```bash
-ctx=gke_bnaylor-kagents-dev_northamerica-northeast1_a2a-next-dev
-ns=kubeagents-system
-pod=$(kubectl --context $ctx -n $ns get pods -o name |
-        grep platform-agent-gateway | head -1 | cut -d/ -f2)
-
-# 1. the client, cross-compiled for the amd64 nodes
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/a2a ./cmd/a2a
-kubectl --context $ctx -n $ns cp /tmp/a2a $pod:/opt/data/scripts/a2a -c platform-agent
-kubectl --context $ctx -n $ns exec $pod -c platform-agent -- chmod 0755 /opt/data/scripts/a2a
-
-# 2. the skill
-kubectl --context $ctx -n $ns exec $pod -c platform-agent -- \
-  mkdir -p /opt/data/profiles/platform/skills/a2a-topics
-kubectl --context $ctx -n $ns cp persona/platform/skills/a2a-topics/SKILL.md \
-  $pod:/opt/data/profiles/platform/skills/a2a-topics/SKILL.md -c platform-agent
-```
-
-Then supply the three environment variables to whatever invokes the agent,
-taking `NATS_PASSWORD` from the `worker-password` key of the creds Secret. Do
-not write the password onto the data volume: the operator injecting it into the
-pod's env is a small change on W6's branch, and it is the answer, so a copy on
-the PVC would be a second place to rotate and a first place to leak.
+On a `next` install the operator and the image do all three placements; a
+fresh pod roll is the whole procedure. The old hand-install recipe that used
+to live here (kubectl cp of the binary and the skill, env on the exec line)
+was the W5 demo path and died with W6.1 — if you find yourself copying
+anything onto the PVC to make the reader work, the install is not actually
+running `mode: next`, and that is the thing to fix.

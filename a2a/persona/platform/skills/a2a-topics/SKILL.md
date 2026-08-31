@@ -32,18 +32,18 @@ The bus address and credentials come from the environment: `NATS_URL`,
 the A2A bus — say so plainly and answer the question another way. Do not
 attempt to guess an address.
 
-The client is `"$HERMES_HOME"/scripts/a2a`. The path is spelled out from
-`$HERMES_HOME` rather than as `./scripts/…` because you reach this skill from
-a delegated task as well as from a chat turn, and a task dispatch starts you in
-the task's workspace, not the profile directory. `$HERMES_HOME` is the profile
-root in both.
+The client is `a2a`, on `PATH` (`/usr/local/bin/a2a`, shipped in the agent
+image alongside this skill). Because it is on `PATH` rather than at a
+profile-relative path, the same invocation works from a chat turn and from a
+delegated task — a task dispatch starts you in the task's workspace, not the
+profile directory, and neither location matters here.
 
 ## Workflows
 
 ### 1. Find out what exists
 
 ```bash
-"$HERMES_HOME"/scripts/a2a topics list
+a2a topics list
 ```
 
 Topics are provisioned configuration — the set is rendered by the operator, and
@@ -62,7 +62,7 @@ The `CLASS` column matters when you read:
 ### 2. Read a topic
 
 ```bash
-"$HERMES_HOME"/scripts/a2a topics read upgrade-readiness
+a2a topics read upgrade-readiness
 ```
 
 The output leads with provenance — who wrote it, when, and under what
@@ -90,7 +90,7 @@ the bus at publish time, not by this skill — the permission lives on the
 connection, and hitting it is a hard error, not a warning.
 
 ```bash
-"$HERMES_HOME"/scripts/a2a topics write upgrade-readiness \
+a2a topics write upgrade-readiness \
   --text "One-line summary a human reads first." \
   --data @/tmp/readiness.json
 ```
@@ -104,7 +104,7 @@ something asked you to go find out — carry the task's identifiers so the audit
 trail joins the question to the state it changed:
 
 ```bash
-"$HERMES_HOME"/scripts/a2a topics write upgrade-readiness \
+a2a topics write upgrade-readiness \
   --text "..." --data @/tmp/readiness.json \
   --task-id "$TASK_ID" --context-id "$CONTEXT_ID" --correlation-id "$CORRELATION_ID"
 ```
@@ -119,7 +119,7 @@ right place for a dated finding that other agents should know but that does not
 restate the fleet's standing view:
 
 ```bash
-"$HERMES_HOME"/scripts/a2a topics write annotations \
+a2a topics write annotations \
   --text "prod-b search StatefulSet PDB blocks node drain; owner notified 2026-08-26."
 ```
 

@@ -70,8 +70,13 @@ Degraded. Found live (W6); regression-tested
 ## What the operator renders
 
 - `today`: exactly what it renders now. A normal install cannot tell this feature exists.
-- `next`: everything above, plus the NATS component and the gateway skeleton. Next is
-  additive - today's path keeps running until stage 4 starts retiring pieces.
+- `next`: everything above, plus the NATS component and the gateway skeleton, plus the
+  agent pod's own bus wiring (W6.1, from W5's delta memo #1): a 4222 egress rule to the
+  NATS pods on the agent NetworkPolicy, worker-user credentials in the agent container's
+  env, and the a2a-topics skill overlaid into the platform profile by the entrypoint —
+  the skill ships in the image outside the profile template precisely so a `today`
+  render carries no trace of it. Next is additive - today's path keeps running until
+  stage 4 starts retiring pieces.
 
 The operator also writes the mode into the managed settings it already renders, as a
 single key: `KUBEAGENTS_MODE`. (Amended by W6, delta memo #1: the draft said

@@ -1094,6 +1094,71 @@ sync_profile_skills() {
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
     sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform"
 fi
+
+# 2.6a-bis Overlay the A2A topics skill into the platform profile, only when
+# this install runs the next stack. The skill ships OUTSIDE the platform
+# template (/opt/a2a-template, see the Dockerfile) so that the replace in
+# 2.6a — which just ran — never installs it on a today install: the mode
+# switch's promise is that a normal install cannot tell the feature exists,
+# and a skill file in the template would break it on day one. Running AFTER
+# the replace is also what makes a flip back to today self-clean: the next
+# boot rebuilds skills/ from the template and this overlay simply does not
+# re-apply.
+#
+# The gate asks runtime_mode.py, the one agent-side reader the mode spec
+# allows. The mode rides the managed .env, which Hermes applies at load time
+# — it is NOT in this shell's environment — so the helper hands the managed
+# file to Python and lets it populate os.environ before runtime_mode reads.
+# Parsed as the strict KEY=value lines renderManagedEnv writes, not sourced:
+# `.` in a shell would execute anything a value with a space grew, and this
+# script is pid 1. Deliberately not `set -a` + dotenv semantics — the file
+# has exactly one writer and this parse matches it.
+#
+# Exit meanings: 0 next, 1 today, 2 no readable managed env. Only 0 overlays;
+# 2 also warns, because on an operator-managed install a missing managed env
+# at this point is a real fault the skill's absence would otherwise hide.
+# Guarded like 2.6a: nothing here ever kills the boot.
+a2a_mode_probe() {
+    [ -n "${HERMES_MANAGED_DIR:-}" ] || return 1
+    "$INSTALL_DIR/.venv/bin/python3" - "$HERMES_MANAGED_DIR/.env" <<'A2A_PYEOF'
+import os, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ[key.strip()] = value.strip()
+except OSError:
+    sys.exit(2)
+
+sys.path.insert(0, "/opt/defaults/scripts")
+import runtime_mode
+
+sys.exit(0 if runtime_mode.is_next() else 1)
+A2A_PYEOF
+}
+if [ -d "$TARGET_DIR/profiles/platform/skills" ] && [ -d /opt/a2a-template/skills ]; then
+    # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
+    # is a return value here, not a failure.
+    a2a_probe_rc=0
+    a2a_mode_probe || a2a_probe_rc=$?
+    case $a2a_probe_rc in
+        0)
+            if cp -a /opt/a2a-template/skills/. "$TARGET_DIR/profiles/platform/skills/" 2>/dev/null; then
+                echo "Overlaid the A2A topics skill into the platform profile (next stack)"
+            else
+                echo "WARN: could not overlay the A2A skills into the platform profile; the agent starts without them" >&2
+            fi
+            ;;
+        2)
+            echo "WARN: no readable managed .env under HERMES_MANAGED_DIR; treating the mode as today and skipping the A2A skill overlay" >&2
+            ;;
+    esac
+fi
+
 # 2.6 (continued), for the cluster profiles: personas from the template, skills through
 # the helper defined just above, and one targeted config repair. Kept after 2.6a only
 # because it is the caller — everything here belongs to 2.6's force-sync, not to it.
