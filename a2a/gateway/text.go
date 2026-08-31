@@ -42,12 +42,33 @@ var statusQueries = map[string]bool{
 	"whats happening":    true,
 	"what is happening":  true,
 	"status":             true,
+	"progress":           true,
+	"where are we":       true,
+	"hows it going":      true,
 }
 
 // isStatusQuery reports whether the turn is the "what is it doing" ask,
 // answered by stream replay rather than forwarded as steering.
+// isStatusQuery reports whether a mid-task message asks what the task is
+// doing rather than telling it something. Deterministic by design - the
+// gateway holds no model - so this is a phrase set plus a narrow
+// interrogative rule, not understanding. Width bias: while Hermes is the
+// only executor, a false positive costs nothing (a real steer would be
+// refused anyway), so match generously; revisit when W4 lands executors
+// that actually absorb steers.
 func isStatusQuery(text string) bool {
-	return statusQueries[normalize(text)]
+	n := normalize(text)
+	if statusQueries[n] {
+		return true
+	}
+	if len(n) > 48 {
+		return false
+	}
+	statusish := strings.Contains(n, "doing") || strings.Contains(n, "happening") ||
+		strings.Contains(n, "going on") || strings.Contains(n, "update")
+	interrogative := strings.HasPrefix(n, "what") || strings.HasPrefix(n, "how") ||
+		strings.HasPrefix(n, "any") || strings.HasPrefix(n, "is ") || strings.HasPrefix(n, "are ")
+	return statusish && interrogative
 }
 
 var stopWords = map[string]bool{
