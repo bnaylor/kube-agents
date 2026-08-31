@@ -9,6 +9,8 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
+- `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
+- `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
@@ -91,7 +93,7 @@ AGENT_CLUSTER_CONTEXT=gke_<project>_<location>_<agent-cluster> \
   BENCH_TF_ROOT=./tf uv run devops-bench ./tasks --agent-type kubeagents
 ```
 
-`PROJECT_ID` and `CLUSTER_NAME` are required once infrastructure is on; without them the run exits before provisioning. Set `AGENT_CLUSTER_CONTEXT` for these too. Provisioning a task cluster runs `gcloud container clusters get-credentials`, which repoints kubectl's current context at it; without the pin, the harness port-forwards into the task cluster, where the agent does not run.
+`PROJECT_ID` and `CLUSTER_NAME` are required once infrastructure is on; without them the run exits before provisioning. Set `AGENT_CLUSTER_CONTEXT` for these too. Bringing up a task cluster — provisioned per run, or an existing one reused via a stack's `reuse_existing_cluster` — runs `gcloud container clusters get-credentials`, which repoints kubectl's current context at it; without the pin, the harness port-forwards into the task cluster, where the agent does not run.
 
 A stack under `tf/` does not have to vendor the upstream OpenTofu modules — reference them over git, pinned to a SHA:
 
