@@ -10,7 +10,9 @@ package lib
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -115,6 +117,109 @@ func TestAssertion19_SurvivesServerRestart(t *testing.T) {
 
 	if got := c.rebuilds.Load(); got != 0 {
 		t.Errorf("rebuilds = %d; a routine restart is the transient path, nothing is torn down (NR-1)", got)
+	}
+}
+
+// Assertion 20: after a reconnect the consumer resumes with no gap, and
+// assertion 5 (dedup) still holds. The reconnect is real - the server is
+// killed at the transport level and restarted on the same port and store.
+// The gap risk is a message published while the consumer is still
+// disconnected, so env-a20-4 is published from a fresh connection the moment
+// the restarted server accepts it, racing the consumer's reconnect; whichever
+// side wins the race, the consumer must deliver it.
+func TestAssertion20_ReconnectNoGapDedupHolds(t *testing.T) {
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+	url := clientURL(s1)
+	provisionTasksStream(t, url)
+
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	c, err := Connect(ctx, url, WithName("a20"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	subject := TaskInSubject("chatops", "task-a20")
+	col := &collector{}
+	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream:  "TASKS",
+		Subject: subject,
+		Durable: "a20-consumer",
+		Session: "chatops",
+	}, col.handle)
+	if err != nil {
+		t.Fatalf("SubscribeDurable: %v", err)
+	}
+
+	build := func(id string) *Envelope {
+		env, err := NewMessageEnvelope(Party{Session: "w"}, "task-a20", "ctx-1", "corr-1",
+			validMessagePayload(), WithEnvelopeID(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env
+	}
+	pub := func(via *Client, id string) {
+		if err := via.Publish(ctx, subject, build(id)); err != nil {
+			t.Fatalf("publish %s: %v", id, err)
+		}
+	}
+	pub(c, "env-a20-1")
+	pub(c, "env-a20-2")
+	pub(c, "env-a20-3")
+	waitFor(t, 5e9, "pre-restart delivery", func() bool { return col.count() == 3 })
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	waitFor(t, 10e9, "disconnect logged", func() bool { return capture.contains("nats disconnected") })
+
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+
+	// Published before waiting for the consumer's reconnect: the no-gap half.
+	pubC, err := Connect(ctx, clientURL(s2), WithName("a20-pub"))
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	defer pubC.Close()
+	pub(pubC, "env-a20-4")
+
+	waitFor(t, 15e9, "reconnect logged", func() bool { return capture.contains("nats reconnected") })
+
+	// Assertion 5 across the reconnect: the same envelopeId hitting the
+	// subject again is what a redelivery looks like to the application.
+	// publishRaw carries no Nats-Msg-Id, so the server's dedup window cannot
+	// swallow it first - the client's own set is what is under test.
+	dup, err := json.Marshal(build("env-a20-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishRaw(t, clientURL(s2), subject, dup)
+	pub(pubC, "env-a20-5")
+
+	waitFor(t, 15e9, "post-reconnect delivery", func() bool {
+		for _, e := range col.all() {
+			if e.EnvelopeID == "env-a20-5" {
+				return true
+			}
+		}
+		return false
+	})
+
+	var got []string
+	for _, e := range col.all() {
+		got = append(got, e.EnvelopeID)
+	}
+	want := []string{"env-a20-1", "env-a20-2", "env-a20-3", "env-a20-4", "env-a20-5"}
+	if !slices.Equal(got, want) {
+		t.Errorf("delivered %v\nwant      %v (every envelope once, in stream order: no gap, no duplicate)", got, want)
+	}
+	if got := c.rebuilds.Load(); got != 0 {
+		t.Errorf("rebuilds = %d; a routine restart rides the transient path (NR-1)", got)
 	}
 }
 

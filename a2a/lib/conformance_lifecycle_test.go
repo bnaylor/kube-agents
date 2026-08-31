@@ -1,6 +1,6 @@
 package lib
 
-// Lifecycle and correlation conformance assertions 12-15 and 18. The
+// Lifecycle and correlation conformance assertions 10-15 and 18. The
 // executor side is played by the library's own TaskExecution helpers — the
 // same code path W4's worker adapter will use.
 
@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -317,6 +318,95 @@ func TestAssertion15_EventsCarryIDs(t *testing.T) {
 		if env.ContextID != "ctx-a15" {
 			t.Errorf("%s contextId = %q, want ctx-a15", env.Kind, env.ContextID)
 		}
+	}
+}
+
+// Assertion 11: a tasks/get materialized by replay yields the same terminal
+// state and artifact set a live subscriber saw. The live side is a durable on
+// the events subject folding what it watched arrive; the replay side is a
+// fresh client that watched nothing and folds the stream after the fact. The
+// result artifact is delivered in two chunks (append) so the two folds have a
+// real merge to agree on, not just a pass-through.
+func TestAssertion11_ReplayMatchesLive(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	h := newTaskHarness(t, clientURL(s), "task-a11")
+	events := TaskEventsSubject(h.addressee, "task-a11")
+
+	// The live subscriber is watching before the task emits anything.
+	obs, err := Connect(h.ctx, clientURL(s), WithName("live-observer"))
+	if err != nil {
+		t.Fatalf("Connect observer: %v", err)
+	}
+	defer obs.Close()
+	live := &collector{}
+	_, err = obs.SubscribeDurable(h.ctx, SubscribeConfig{
+		Stream:  "TASKS",
+		Subject: events,
+		Durable: "a11-live",
+		Session: "live-observer",
+	}, live.handle)
+	if err != nil {
+		t.Fatalf("observer subscribe: %v", err)
+	}
+
+	h.submit("corr-a11")
+	h.status(StateSubmitted, false)
+	h.status(StateWorking, false)
+	h.artifact(ArtifactProgress, "halfway")
+	h.artifact(ArtifactResult, "part one")
+	// Second chunk of the result artifact: same artifactId, append: true.
+	appendPayload, err := json.Marshal(ArtifactUpdate{
+		TaskID:    h.origin.TaskID,
+		ContextID: h.origin.ContextID,
+		Artifact: Artifact{ArtifactID: "art-" + ArtifactResult, Name: ArtifactResult,
+			Parts: []Part{{Kind: "text", Text: " part two"}}},
+		Append:    true,
+		LastChunk: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := NewArtifactUpdateEnvelope(Party{Session: h.addressee}, h.origin.TaskID,
+		h.origin.ContextID, h.origin.CorrelationID, appendPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.executor.Publish(h.ctx, events, chunk); err != nil {
+		t.Fatalf("publish append chunk: %v", err)
+	}
+	h.status(StateCompleted, true)
+
+	// submitted, working, progress, result, append chunk, completed.
+	waitFor(t, 5e9, "live subscriber sees all six events", func() bool { return live.count() == 6 })
+	liveTask, err := FoldTask("task-a11", live.all())
+	if err != nil {
+		t.Fatalf("fold of the live view: %v", err)
+	}
+
+	// The replay side: a client that subscribed to nothing.
+	reader, err := Connect(h.ctx, clientURL(s), WithName("late-reader"))
+	if err != nil {
+		t.Fatalf("Connect reader: %v", err)
+	}
+	defer reader.Close()
+	replayTask, err := reader.TasksGet(h.ctx, h.addressee, "task-a11")
+	if err != nil {
+		t.Fatalf("TasksGet: %v", err)
+	}
+
+	if liveTask.State != StateCompleted || !liveTask.Final {
+		t.Fatalf("live view folded to %s final=%v, want completed final=true", liveTask.State, liveTask.Final)
+	}
+	if !reflect.DeepEqual(replayTask, liveTask) {
+		t.Errorf("replay and live views disagree:\nreplay: %+v\n  live: %+v", replayTask, liveTask)
+	}
+	// Both sides must hold the merged artifact, not just agree on something
+	// degenerate: two chunks, in order.
+	result := replayTask.Artifact(ArtifactResult)
+	if result == nil || len(result.Parts) != 2 ||
+		result.Parts[0].Text != "part one" || result.Parts[1].Text != " part two" {
+		t.Errorf("replayed result artifact = %+v, want the two appended chunks in order", result)
 	}
 }
 
