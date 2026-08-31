@@ -196,6 +196,9 @@ func TestFromEnvMaxSessions(t *testing.T) {
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
+	// Pin against the invoking shell: envOr treats empty as unset, so this
+	// asserts the default even if the developer exports a real value.
+	t.Setenv("A2A_MAX_SESSIONS", "")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -219,5 +222,67 @@ func TestFromEnvMaxSessions(t *testing.T) {
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_MAX_SESSIONS=%q accepted", bad)
 		}
+	}
+}
+
+// TestSessionRoutedRecordWithoutSpawnerDoesNotPanic: SessionRouted persists
+// in the KV record; the spawner is a setting (A2A_SPAWN_SESSIONS). A W4
+// rollback therefore leaves session-routed records behind with no spawner
+// to count against - the turn must degrade the way it always did (publish
+// toward an addressee nothing owns), not kill the gateway on the nil
+// spawner inside the cap check.
+func TestSessionRoutedRecordWithoutSpawnerDoesNotPanic(t *testing.T) {
+	r := startRig(t) // spawner dark
+	conv := "discord:g1/thread-rollback"
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-rollback", Kind: "group",
+		Addressee: "chat-otter-dead", BusSession: "chat-otter-dead",
+		SessionRouted: true, Profile: "chat",
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "c-140", Text: "hello again",
+	}
+	waitFor(t, "task still starts after a rollback", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "submitted") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestPreFlipUpgradeRetiresLingeringPod: the W4-upgrade branch must apply
+// the Delegate branch's delete-and-clear to a lingering incarnation before
+// minting the next one. Left set, the stale PodName makes ensureSessionPod
+// a no-op - the task publishes to an addressee with no executor (the
+// dropped-message shape) - and a wedged Running pod holds a cap slot
+// forever, since the active conversation keeps resetting the reap clock and
+// sweep only sees terminal phases.
+func TestPreFlipUpgradeRetiresLingeringPod(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-upgrade-pod"
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-upgrade", Kind: "group",
+		Addressee: "platform", // pre-flip fixed route
+		BusSession: "chat-otter-stale", PodName: "chat-otter-stale",
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "c-150", Text: "check the fleet",
+	}
+	waitFor(t, "fresh incarnation for the upgraded record", func() bool { return len(spawn.calls()) == 1 })
+	if call := spawn.calls()[0]; call.Session == "chat-otter-stale" {
+		t.Fatalf("upgrade reused the stale incarnation %q", call.Session)
+	}
+	if deleted := spawn.deleted(); len(deleted) != 1 || deleted[0] != "chat-otter-stale" {
+		t.Fatalf("stale incarnation not retired: %v", deleted)
 	}
 }

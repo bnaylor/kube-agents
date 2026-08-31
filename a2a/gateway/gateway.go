@@ -312,8 +312,20 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 				// subject no executor owns (the exact failure New()'s
 				// config guard describes). The upgrade spawns, so it pays
 				// the same cap toll as first contact.
-				if g.refuseAtSessionCap(ctx, rec, false) {
+				if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
 					return
+				}
+				// A lingering pre-flip incarnation gets the Delegate
+				// branch's delete-and-clear: left set, the stale PodName
+				// turns ensureSessionPod into a no-op and the task
+				// publishes to an addressee with no executor, while the
+				// old pod holds a cap slot sweep can never reclaim.
+				if rec.PodName != "" {
+					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+						g.log.Warn("pre-flip incarnation delete failed; pod may linger",
+							"pod", rec.PodName, "err", err)
+					}
+					rec.PodName = ""
 				}
 				rec.SessionRouted = true
 				rec.Profile = "chat"

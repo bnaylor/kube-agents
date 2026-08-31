@@ -277,9 +277,11 @@ func TestLiveEndToEndThroughBridge(t *testing.T) {
 // end to end. The gateway here is in-process (fake chat adapter in Discord's
 // place, the W3 convention) with the REAL pod spawner pointed at the install
 // through a pinned kube context. It never calls Run, so the deployed gateway
-// keeps the shared relay durable and Discord service is undisturbed;
-// completion is asserted by replay (TasksGet), which rides an ephemeral
-// ordered consumer of its own.
+// keeps the shared relay durable and Discord delivery keeps working - though
+// that gateway will drain this test's task events and log routing errors for
+// the synthetic conversations (noise, not damage; the records also age out
+// through its reaper). Completion is asserted by replay (TasksGet), which
+// rides an ephemeral ordered consumer of its own.
 //
 //	kubectl --context "$CTX" -n kubeagents-system port-forward svc/platform-agent-a2a-nats 14222:4222 &
 //	A2A_LIVE_NATS_URL=nats://127.0.0.1:14222 \

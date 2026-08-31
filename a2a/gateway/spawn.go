@@ -237,16 +237,27 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 // refuseAtSessionCap is the usability half of the session-pod bound, checked
 // before any route mutation that will need a fresh pod. At the cap the turn
 // is refused with a reply naming the numbers - never silently queued, never
-// dropped. replacing marks a Delegate that retires its previous incarnation
-// in the same turn: the doomed pod is still live at count time, so it hands
-// its slot to its successor rather than double-counting.
+// dropped. replacing marks a turn that retires its previous incarnation in
+// the same breath: the doomed pod is usually still live at count time, so
+// it hands its slot to its successor rather than double-counting - and if
+// it already went terminal, the extra slot is a transient overshoot the
+// quota headroom absorbs.
 //
-// The count-then-create race is real: two conversations can pass this check
-// together and overshoot the cap by one. It is bounded by the namespace
-// ResourceQuota the operator renders above this number, not by a lock here -
-// a lock would only serialize this process while the quota also holds
-// against a gateway that has stopped honoring its own cap.
+// The count-then-create race is real, and wider than one: conversations run
+// on distinct queue workers, so every delegation in flight inside the
+// count-to-create window can pass this check together - the true bound on
+// the overshoot is the namespace ResourceQuota the operator renders above
+// this number, not cap+1 and not a lock here. A lock would only serialize
+// this process, while the quota also holds against a gateway that has
+// stopped honoring its own cap.
 func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, replacing bool) bool {
+	// SessionRouted persists in the KV record; the spawner is a setting. A
+	// W4 rollback leaves session-routed records this check still reaches -
+	// with nothing to cap, let the turn degrade the way it always did
+	// (publish toward an addressee nothing owns) rather than panic.
+	if g.spawner == nil {
+		return false
+	}
 	live, err := g.spawner.LiveSessions(ctx)
 	if err != nil {
 		// Proceeding blind would make the cap advisory exactly when the API
