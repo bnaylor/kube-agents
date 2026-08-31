@@ -132,7 +132,7 @@ func randomA2APassword() (string, error) {
 // a2aCredsKeys is every key the creds Secret must carry; an absent or empty
 // key would render `password: ""` into nats.conf — a user anyone can log in
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
-var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "sys-password"}
+var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
 
 // a2aReader returns the reader for A2A bookkeeping objects. Straight from the
 // API server on purpose: the cached client's first Get against a kind starts
@@ -222,6 +222,16 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 server_name: ` + a2aNATSName(agent) + `
 port: 4222
 http: 8222
+
+# Websocket listener for the read-only web user (W8's UI reads the bus over
+# this). Plain ws IS the playground posture, stated rather than implied:
+# production terminates TLS in front of the bus or keeps this listener off.
+# The Service stays ClusterIP and the demo transport is kubectl port-forward,
+# so nothing off-cluster reaches the listener in the meantime.
+websocket {
+  port: 9222
+  no_tls: true
+}
 
 jetstream {
   store_dir: /data
@@ -316,6 +326,41 @@ accounts {
           ] }
         }
       }
+      {
+        # web: W8's read surface, the one user meant to face a browser.
+        # Subscribe-everything, publish-nothing: the publish list is only
+        # what a JetStream READER has to send — ephemeral consumer
+        # create/read calls, acks, flow-control replies, its own inbox.
+        # Deliberately NOT $JS.API.> (the app users' playground wildcard
+        # would hand a browser stream deletion) and no DURABLE.CREATE, so
+        # web's consumers are ephemeral and self-cleaning. Known residue,
+        # accepted for the playground: a consumer's deliver subject is the
+        # creator's choice, so a hostile web client could aim redelivery of
+        # STORED messages at an a2a.* subject; the auth callout closes that
+        # class when it arms.
+        user: web
+        password: "` + pw("web-password") + `"
+        permissions {
+          publish { allow = [
+            "$JS.API.INFO",
+            "$JS.API.STREAM.NAMES",
+            "$JS.API.STREAM.LIST",
+            "$JS.API.STREAM.INFO.*",
+            "$JS.API.CONSUMER.CREATE.>",
+            "$JS.API.CONSUMER.INFO.*.*",
+            "$JS.API.CONSUMER.NAMES.*",
+            "$JS.API.CONSUMER.LIST.*",
+            "$JS.API.CONSUMER.MSG.NEXT.*.*",
+            "$JS.ACK.>",
+            "$JS.FC.>",
+            "_INBOX.web.>"
+          ] }
+          subscribe { allow = [
+            "a2a.>",
+            "_INBOX.web.>"
+          ] }
+        }
+      }
     ]
   }
   # $SYS: human operators and monitoring only; no agent authenticates here.
@@ -337,7 +382,12 @@ system_account: SYS
 	}
 }
 
-func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent) *appsv1.StatefulSet {
+// buildA2ANATSStatefulSet renders the bus. confHash is a digest of the
+// rendered nats.conf: the config Secret updates in place but the nats
+// container only reads it at boot, so the hash rides the pod template — the
+// agent Deployment's config-hash mechanism — and a changed render rolls the
+// server instead of silently diverging from it.
+func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string) *appsv1.StatefulSet {
 	name := a2aNATSName(agent)
 	labels := a2aLabels(agent, "nats")
 	selector := map[string]string{"app": name}
@@ -356,7 +406,10 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent) *appsv1.Statefu
 			Replicas: ptr.To(int32(1)),
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      podLabels,
+					Annotations: map[string]string{"kubeagents.x-k8s.io/a2a-config-hash": confHash},
+				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
@@ -371,6 +424,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent) *appsv1.Statefu
 						Ports: []corev1.ContainerPort{
 							{Name: "client", ContainerPort: 4222},
 							{Name: "monitor", ContainerPort: 8222},
+							{Name: "websocket", ContainerPort: 9222},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
@@ -417,6 +471,10 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			Ports: []corev1.ServicePort{
 				{Name: "client", Port: 4222},
 				{Name: "monitor", Port: 8222},
+				// The web user's transport (W8). ClusterIP on purpose: the
+				// demo reaches it with kubectl port-forward, and plain ws
+				// must not be reachable any other way.
+				{Name: "websocket", Port: 9222},
 			},
 		},
 	}
@@ -621,7 +679,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	sts := buildA2ANATSStatefulSet(agent)
+	confSum := sha256.Sum256(config.Data["nats.conf"])
+	sts := buildA2ANATSStatefulSet(agent, hex.EncodeToString(confSum[:])[:16])
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}

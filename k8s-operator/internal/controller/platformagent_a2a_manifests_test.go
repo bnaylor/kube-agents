@@ -49,6 +49,7 @@ func a2aTestCreds() *corev1.Secret {
 			"gateway-password": []byte("pw-gateway"),
 			"worker-password":  []byte("pw-worker"),
 			"seed-password":    []byte("pw-seed"),
+			"web-password":     []byte("pw-web"),
 		},
 	}
 }
@@ -121,7 +122,7 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 
 func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	agent := a2aTestAgent()
-	sts := buildA2ANATSStatefulSet(agent)
+	sts := buildA2ANATSStatefulSet(agent, "conf-hash")
 
 	if sts.Name != "test-agent-a2a-nats" {
 		t.Errorf("statefulset name = %q", sts.Name)
@@ -140,7 +141,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 
 	t.Setenv(a2aNATSImageEnvVar, "example.com/nats:pinned")
-	if got := buildA2ANATSStatefulSet(agent).Spec.Template.Spec.Containers[0].Image; got != "example.com/nats:pinned" {
+	if got := buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec.Containers[0].Image; got != "example.com/nats:pinned" {
 		t.Errorf("env override ignored, image = %q", got)
 	}
 }
@@ -469,5 +470,92 @@ func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
 	if v.ValueFrom.SecretKeyRef.Name != "test-agent-a2a-nats-creds" || v.ValueFrom.SecretKeyRef.Key != "worker-password" {
 		t.Errorf("NATS_PASSWORD reads %s/%s, want test-agent-a2a-nats-creds/worker-password",
 			v.ValueFrom.SecretKeyRef.Name, v.ValueFrom.SecretKeyRef.Key)
+	}
+}
+
+// W6.1 addendum: the web read surface. A websocket listener (plain ws is the
+// stated playground posture; production terminates TLS in front), a ClusterIP
+// port for it, and a `web` user that can watch everything and say nothing —
+// subscribe on a2a.>, the JetStream read API, its own inbox, and no publish
+// reach beyond those. W8's UI is the consumer; kubectl port-forward is the
+// demo transport, which is why ClusterIP is enough.
+func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	if !strings.Contains(conf, "websocket {") {
+		t.Fatal("nats.conf has no websocket block")
+	}
+	if !strings.Contains(conf, "no_tls: true") {
+		t.Error("websocket block does not state plain ws (no_tls: true)")
+	}
+	if !strings.Contains(conf, "port: 9222") {
+		t.Error("websocket listener is not on 9222")
+	}
+
+	// Slice out the web user's entry so the assertions below cannot pass off
+	// another user's grants as web's. The entry runs from `user: web` to the
+	// next user or the end of the users list.
+	start := strings.Index(conf, "user: web")
+	if start < 0 {
+		t.Fatal("nats.conf has no web user")
+	}
+	rest := conf[start:]
+	if next := strings.Index(rest[1:], "user: "); next >= 0 {
+		rest = rest[:next+1]
+	}
+
+	if !strings.Contains(rest, "pw-web") {
+		t.Error("web's password does not come from the creds Secret")
+	}
+	for _, want := range []string{"a2a.>", "_INBOX.web.>", "$JS.API.CONSUMER.MSG.NEXT.*.*", "$JS.API.STREAM.INFO.*", "$JS.ACK.>"} {
+		if !strings.Contains(rest, want) {
+			t.Errorf("web user missing grant %q", want)
+		}
+	}
+	// Read-only means the write side simply is not there: no task/topic/KV
+	// publish, and none of the mutating JetStream API — the full $JS.API.>
+	// wildcard the app users carry as playground posture is exactly what web,
+	// the one user meant to face a browser, does not get.
+	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	for _, banned := range []string{"a2a.", "$KV.", "$JS.API.>", "DELETE", "PURGE", "agents.hb"} {
+		if strings.Contains(pub, banned) {
+			t.Errorf("web publish allow contains %q; the user must not write", banned)
+		}
+	}
+}
+
+func TestBuildA2ANATSServiceExposesWebsocket(t *testing.T) {
+	svc := buildA2ANATSService(a2aTestAgent())
+	ports := map[string]int32{}
+	for _, p := range svc.Spec.Ports {
+		ports[p.Name] = p.Port
+	}
+	if ports["client"] != 4222 || ports["websocket"] != 9222 {
+		t.Errorf("service ports = %v, want client 4222 and websocket 9222", ports)
+	}
+}
+
+// A nats.conf change must reach the running server. The Secret updates in
+// place but the nats container only reads it at boot, so the StatefulSet pod
+// template carries a hash of the rendered config — same mechanism as the
+// agent Deployment's config-hash — and a changed render rolls the pod.
+func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
+	agent := a2aTestAgent()
+	a := buildA2ANATSStatefulSet(agent, "hash-one")
+	b := buildA2ANATSStatefulSet(agent, "hash-two")
+	annA := a.Spec.Template.Annotations["kubeagents.x-k8s.io/a2a-config-hash"]
+	annB := b.Spec.Template.Annotations["kubeagents.x-k8s.io/a2a-config-hash"]
+	if annA == "" || annA == annB {
+		t.Errorf("config hash annotation missing or inert: %q vs %q", annA, annB)
+	}
+
+	var ws *corev1.ContainerPort
+	for i, p := range a.Spec.Template.Spec.Containers[0].Ports {
+		if p.Name == "websocket" {
+			ws = &a.Spec.Template.Spec.Containers[0].Ports[i]
+		}
+	}
+	if ws == nil || ws.ContainerPort != 9222 {
+		t.Errorf("nats container does not expose websocket 9222: %+v", a.Spec.Template.Spec.Containers[0].Ports)
 	}
 }
