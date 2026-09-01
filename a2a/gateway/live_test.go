@@ -95,7 +95,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	// from an earlier run can never satisfy this.
 	var origin *lib.Envelope
 	waitFor(t, "task on the real TASKS stream", func() bool {
-		task, err := findLatestLiveTask(wkPass, url)
+		task, err := findLatestLiveTask("worker", wkPass, url)
 		if err != nil || task == nil {
 			return false
 		}
@@ -162,10 +162,10 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 }
 
 // findLatestLiveTask fetches the newest message on the platform in subjects
-// using the worker user (stream msg-get by last_by_subj; wildcards are
-// legal there).
-func findLatestLiveTask(workerPass, url string) (*lib.Envelope, error) {
-	nc, err := nats.Connect(url, nats.UserInfo("worker", workerPass), nats.CustomInboxPrefix("_INBOX.worker"))
+// as the named bus user (stream msg-get by last_by_subj; wildcards are
+// legal there — both worker and gateway hold it).
+func findLatestLiveTask(user, pass, url string) (*lib.Envelope, error) {
+	nc, err := nats.Connect(url, nats.UserInfo(user, pass), nats.CustomInboxPrefix("_INBOX."+user))
 	if err != nil {
 		return nil, err
 	}
@@ -435,6 +435,89 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	}
 }
 
+// TestLiveSaltJoinsAcrossSurfaces proves the salt half of S9's DoD on the
+// real bus: a gateway configured with the install's SESSION_KV_SALT (passed
+// in as A2A_LIVE_SALT, read from platform-agent-secrets by the harness)
+// publishes an authority block whose requester principal is exactly
+// HMAC-SHA256(salt, principal) — the digest the shipped attribution path
+// produces for the same human with the same Secret, so the cross-surface
+// join resolves by digest prefix (the gateway truncates to 32 hex chars
+// behind the "hmac:" tag; session metadata carries the full digest).
+func TestLiveSaltJoinsAcrossSurfaces(t *testing.T) {
+	url := os.Getenv("A2A_LIVE_NATS_URL")
+	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
+	salt := os.Getenv("A2A_LIVE_SALT")
+	if url == "" || gwPass == "" || salt == "" {
+		t.Skip("live salt env not set (A2A_LIVE_NATS_URL, A2A_LIVE_GATEWAY_PASSWORD, A2A_LIVE_SALT)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-gateway-salttest"),
+		lib.WithNATSOptions(nats.UserInfo("gateway", gwPass), nats.CustomInboxPrefix("_INBOX.gateway")))
+	if err != nil {
+		t.Fatalf("gateway connect: %v", err)
+	}
+	defer client.Close()
+
+	mapFile := t.TempDir() + "/principal-map"
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := newFakeAdapter()
+	cfg := &Config{
+		NATSURL:          url,
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte(salt),
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conv := "discord:livesalt/s9-" + time.Now().UTC().Format("150405")
+	marker := "salt join check " + time.Now().UTC().Format(time.RFC3339)
+	g.handleInbound(InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "salt-1", Text: marker})
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if rec, err := g.reg.Get(cctx, conv); err == nil && rec != nil {
+			for _, tr := range rec.Tasks {
+				_ = g.reg.DropTask(cctx, tr.ID)
+			}
+		}
+	})
+
+	var env *lib.Envelope
+	waitLive(t, "submission with authority on the real stream", 30*time.Second, func() bool {
+		e, err := findLatestLiveTask("gateway", gwPass, url)
+		if err != nil || e == nil {
+			return false
+		}
+		var m lib.Message
+		if json.Unmarshal(e.Payload, &m) != nil || joinTextParts(m.Parts) != marker {
+			return false
+		}
+		env = e
+		return true
+	})
+
+	var a Authority
+	if err := json.Unmarshal(env.Authority, &a); err != nil {
+		t.Fatalf("authority block: %v", err)
+	}
+	want := NewPseudonymizer([]byte(salt)).Hash("test:bnaylor")
+	if a.Requester.Principal != want {
+		t.Fatalf("principal on the bus = %s, want %s (HMAC under the install salt)", a.Requester.Principal, want)
+	}
+	t.Logf("principal on the real stream: %s — joins the shipped attribution digest by prefix", a.Requester.Principal)
+}
+
 // TestLiveDetachedDelegateSupervisorTerminal proves S9's DoD against the
 // real install: a Delegate over a DETACHED task publishes that task's
 // terminal `canceled` on the real stream BEFORE deleting the pod — under
@@ -493,8 +576,16 @@ func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
 		WorkerImage:      envOr("A2A_LIVE_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
 		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
 	}
+	// With A2A_LIVE_OWNER_DEPLOYMENT set (the deployed gateway's own
+	// Deployment), the spawner resolves the real owner and every pod this
+	// test creates carries the ownerReference — asserted below against the
+	// real API, alongside the pod deadline.
+	cfg.OwnerDeployment = os.Getenv("A2A_LIVE_OWNER_DEPLOYMENT")
 	adapter := newFakeAdapter()
 	sp := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	if err := sp.resolveOwner(ctx); err != nil {
+		t.Fatalf("resolving owner on the install: %v", err)
+	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: sp})
 	if err != nil {
 		t.Fatal(err)
@@ -520,6 +611,24 @@ func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
 	rec.PodName = podName
 	if err := g.reg.Put(ctx, rec); err != nil {
 		t.Fatal(err)
+	}
+	// The spawned pod's spec, read back from the real API: the pod-level
+	// deadline exists (a wedged adapter has an owner), and when the owner
+	// is configured, the ownerReference points at the real Deployment.
+	seedPod, err := cs.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seedPod.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatal("live spawned pod has no activeDeadlineSeconds")
+	}
+	t.Logf("live pod activeDeadlineSeconds=%d", *seedPod.Spec.ActiveDeadlineSeconds)
+	if cfg.OwnerDeployment != "" {
+		if len(seedPod.OwnerReferences) != 1 || seedPod.OwnerReferences[0].Name != cfg.OwnerDeployment ||
+			seedPod.OwnerReferences[0].Kind != "Deployment" {
+			t.Fatalf("live pod ownerReferences = %+v", seedPod.OwnerReferences)
+		}
+		t.Logf("live pod owned by Deployment/%s uid=%s", seedPod.OwnerReferences[0].Name, seedPod.OwnerReferences[0].UID)
 	}
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
