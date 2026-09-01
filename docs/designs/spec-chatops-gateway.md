@@ -185,9 +185,9 @@ Two rules keep the conversation's route coherent:
   bus credential with nothing able to reclaim it. The active-task guard above bounds
   which pods this can reach: a delegation is only recognized when no task serializes
   the conversation, so the pod is either idle or running a DETACHED task - and
-  detached is not closed, so the deletion rule in Session lifecycle applies and the
-  terminal `failed` is published first. With that done, the delete is what reap or
-  sweep would have done anyway.
+  detached is not closed, so the deletion rule in Session lifecycle applies and that
+  task's terminal is published first. The state is that rule's to name, not this
+  section's. With that done, the delete is what reap or sweep would have done anyway.
 
 ## Session lifecycle
 
@@ -227,7 +227,13 @@ and a pod that dies wedged reaches a terminal phase where Sweep takes over. The
 spawner owes the pod-level `activeDeadlineSeconds` mirroring that deadline - the
 adapter's contract is written assuming it - so a wedged adapter also lands in Sweep's
 domain instead of holding its bus credential indefinitely; until that field ships, a
-wedged adapter is the one unowned end, named here rather than papered over. The
+wedged adapter is the one unowned end, named here rather than papered over. It costs
+two things, not one: the held bus credential, and the content posture below - with no
+terminal event the active-task record is never deleted, `session-state` has no age
+limit, and the `ask` copy outlives the stream copy its justification rests on. The
+same missing field closes both, and until it does the gateway owes the record an
+independent bound (a bucket TTL, or clearing an active task whose pod no longer
+exists) rather than a justification that assumes a terminal that may not come. The
 terminal event this chain guarantees is also what deletes the active-task record (and
 the `ask` copy riding it). A detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
@@ -329,9 +335,14 @@ content; the payload spec's opaque-token rule is the same rule seen from the oth
 side. Within that posture, the gateway may hold a bounded copy of the active task's ask
 in the session KV - truncated, one revision, deleted with the active-task record at the
 terminal event - for status rendering. The copy adds no new audience (the gateway is
-the bucket's only reader and writer) and has a shorter horizon than the stream copy it
+the bucket's only reader and writer, by grant - see the deployment spec's note on the
+one residual write route) and has a shorter horizon than the stream copy it
 duplicates. What would breach the posture is content anywhere with a wider audience or
-a longer life than the stream already grants it.
+a longer life than the stream already grants it - which makes the horizon a condition
+on the copy, not a property of it. The horizon holds only where a terminal event is
+guaranteed, so the one case Session lifecycle names as unowned (a wedged adapter,
+until the pod-level deadline ships) is a case where this justification does not hold
+and the record needs the independent bound named there.
 
 - `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
   resolves it to the RBAC string at the boundary that needs one. `subject` is the
