@@ -136,6 +136,10 @@ at and why — read it before changing the target.
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
 
+**A2A module code.** If you modify `a2a/`, run `go vet ./...` and `go test -race ./...` inside that
+directory — what the `A2A Module Tests` CI job runs. The conformance suite starts an embedded
+JetStream server, so no cluster or credentials are needed.
+
 ## The automated review
 
 `AGENTS.md`, "Automated Review After Opening a Pull Request", says what `kube-agents-bot` is, when

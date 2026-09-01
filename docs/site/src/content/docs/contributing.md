@@ -66,6 +66,12 @@ where a new one belongs, `docs/testing-map.md` maps the nine test homes to their
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
 
+- **A2A module** (if you touched `a2a/`):
+
+  ```bash
+  cd a2a && go vet ./... && go test -race ./...   # what the A2A Module Tests CI job runs; the conformance suite uses an embedded JetStream server, no cluster needed
+  ```
+
 - **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
 
   ```bash
