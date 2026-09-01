@@ -1195,9 +1195,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 // gateway stamps an ownerReference to its own Deployment on every pod it
 // spawns (A2A_OWNER_DEPLOYMENT above), so deleting the gateway here hands
 // the stragglers to Kubernetes GC — no operator exception to the
-// IsControlledBy refusal below. That arms when the S9 gateway half
-// (a2a/w3-gateway) is the running image; pods spawned by an older gateway
-// are unowned and keep the bounded window described above.
+// IsControlledBy refusal below. Narrowed rather than erased: GC is
+// asynchronous, so a worker still outlives its fence by GC latency
+// (seconds) instead of up to the task deadline. Arms when the S9 gateway
+// half (a2a/w3-gateway) is the running image; pods spawned by an older
+// gateway are unowned and keep the bounded window described above.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// Deployment/StatefulSet/Service reads come from the cache — those kinds
 	// are already watched (Owns) so the reads are free. Secret and Job reads

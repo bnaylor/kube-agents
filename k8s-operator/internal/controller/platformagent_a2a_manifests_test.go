@@ -850,6 +850,57 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 }
 
+// TestGatewaySaltRefFollowsTheAgents: the join property itself. A CR that
+// overrides sessionKVSaltSecretRef must steer BOTH renders — the agent pod
+// and the a2a gateway — to the identical selector, or one human hashes to
+// two values and the cross-surface audit join silently yields nothing.
+// Inlining the default into either render keeps every other test green and
+// breaks exactly this.
+func TestGatewaySaltRefFollowsTheAgents(t *testing.T) {
+	agent := a2aTestAgent()
+	override := &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "customer-salts"},
+		Key:                  "chat-hmac",
+	}
+	if agent.Spec.Harness == nil {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+	}
+	agent.Spec.Harness.Hermes = &agentv1alpha1.HermesSpec{SessionKVSaltSecretRef: override}
+
+	saltRef := func(envs []corev1.EnvVar, surface string) *corev1.SecretKeySelector {
+		t.Helper()
+		for _, e := range envs {
+			if e.Name == "SESSION_KV_SALT" {
+				if e.ValueFrom == nil || e.ValueFrom.SecretKeyRef == nil {
+					t.Fatalf("%s SESSION_KV_SALT is not secret-backed: %+v", surface, e)
+				}
+				return e.ValueFrom.SecretKeyRef
+			}
+		}
+		t.Fatalf("%s renders no SESSION_KV_SALT", surface)
+		return nil
+	}
+
+	gw := saltRef(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env, "gateway")
+
+	pt := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
+	var agentRef *corev1.SecretKeySelector
+	for _, c := range pt.Spec.Containers {
+		if c.Name == "platform-agent" {
+			agentRef = saltRef(c.Env, "agent pod")
+		}
+	}
+	if agentRef == nil {
+		t.Fatal("no platform-agent container in the pod template")
+	}
+
+	for surface, ref := range map[string]*corev1.SecretKeySelector{"gateway": gw, "agent pod": agentRef} {
+		if ref.Name != "customer-salts" || ref.Key != "chat-hmac" {
+			t.Errorf("%s salt ref did not follow the CR override: %+v", surface, ref)
+		}
+	}
+}
+
 // subjectMatches implements NATS subject matching so the probe test asks the
 // question the server would ask, rather than the question a substring scan can
 // answer. `*` matches exactly one token; `>` matches one or more trailing
