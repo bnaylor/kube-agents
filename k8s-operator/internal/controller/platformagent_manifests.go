@@ -316,6 +316,20 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
 	add := func(key, value string) {
+		// One line per key, enforced rather than assumed. Most values here come
+		// from CR strings with no pattern or maxLength on the field (chat user
+		// lists, project and subscription names), and this file is line-oriented
+		// to every reader it has. A newline in one of them appends a line the
+		// render never intended — and the mode this file delivers is read back
+		// through exactly that line shape (Hermes loads the file per-line into
+		// the environment with override semantics, last occurrence winning;
+		// agents/platform/scripts/runtime_mode.py answers from the result), so
+		// a smuggled `KUBEAGENTS_MODE=next` line rendered after the operator's
+		// own pin is a mode flip written by whoever can edit the CR's chat
+		// settings. Stripped, not escaped: nothing downstream reads a
+		// multi-line value, so there is nothing to preserve.
+		value = strings.ReplaceAll(value, "\n", "")
+		value = strings.ReplaceAll(value, "\r", "")
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 

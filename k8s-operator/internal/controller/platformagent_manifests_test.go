@@ -5484,3 +5484,35 @@ func TestManagedEnvPinsTheMode(t *testing.T) {
 		t.Error("flipping the mode does not move the config hash, so the pod never rolls and the running agent keeps the old mode")
 	}
 }
+
+func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:      ptr.To(true),
+					ProjectID:    "p",
+					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=next"},
+				},
+			},
+		},
+	}
+	rendered := renderManagedEnv(agent)
+	// The property is about LINES, which is how every reader of this file
+	// parses it: the smuggled text surviving inside another key's value is
+	// harmless (the parser splits on the first `=`, so it stays that key's
+	// data), but a line of its own would be a second pin.
+	modeLines := 0
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, "KUBEAGENTS_MODE=") {
+			modeLines++
+			if line != "KUBEAGENTS_MODE=today" {
+				t.Errorf("a CR value smuggled a mode line: %q", line)
+			}
+		}
+	}
+	if modeLines != 1 {
+		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
+	}
+}
