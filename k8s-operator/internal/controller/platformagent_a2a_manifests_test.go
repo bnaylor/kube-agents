@@ -104,10 +104,12 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 		"a2a.topics.agent.platform.upgrade-readiness",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
-		// The delivery path's reply subjects: without $JS.ACK.> an explicit
-		// ack is a permissions violation and every consumer redelivers
-		// forever while TCP health stays green (the NR-5 incident class).
-		"$JS.ACK.>",
+		// The delivery path's reply subjects: without an ack grant an
+		// explicit ack is a permissions violation and every consumer
+		// redelivers forever while TCP health stays green (the NR-5
+		// incident class). Scoped per stream — the exact surface is
+		// TestSystemUsersAckGrantsAreScopedPerStream's to pin.
+		"$JS.ACK.TASKS.>",
 		"$JS.FC.>",
 	} {
 		if !strings.Contains(conf, grant) {
@@ -118,6 +120,56 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 	// No app user authenticates into $SYS.
 	if strings.Contains(conf, "account: SYS") && !strings.Contains(conf, "system_account") {
 		t.Error("nats.conf wires an app user into $SYS")
+	}
+}
+
+// TestSystemUsersAckGrantsAreScopedPerStream pins each user's ack surface
+// exactly. An ack subject names a stream and a CONSUMER, never the caller,
+// so an unscoped $JS.ACK.> lets its holder publish +TERM onto another
+// principal's in-flight delivery and destroy it — the escape W6.1 deleted
+// from the web user, which sat in gateway/worker/seed as recorded debt
+// until S10 closed it. gateway and worker ack only the TASKS deliveries
+// they consume with explicit ack; seed and web create no acking consumer
+// and hold no ack grant at all. Within the shared TASKS stream the grant
+// cannot distinguish consumers (NATS wildcards match whole tokens), so any
+// widening of this list is a review conversation, not a diff.
+func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	want := map[string][]string{
+		"gateway": {"$JS.ACK.TASKS.>"},
+		"worker":  {"$JS.ACK.TASKS.>"},
+		"seed":    nil,
+		"web":     nil,
+	}
+	for user, wantAcks := range want {
+		start := strings.Index(conf, "user: "+user)
+		if start < 0 {
+			t.Fatalf("nats.conf has no %s user", user)
+		}
+		block := conf[start:]
+		if next := strings.Index(block[1:], "user: "); next >= 0 {
+			block = block[:next+1]
+		}
+		pubStart, subStart := strings.Index(block, "publish"), strings.Index(block, "subscribe")
+		if pubStart < 0 || subStart < 0 {
+			t.Fatalf("%s: could not slice the publish block", user)
+		}
+		var got []string
+		for _, line := range strings.Split(block[pubStart:subStart], "\n") {
+			entry := strings.Trim(strings.TrimSuffix(strings.TrimSpace(line), ","), `"`)
+			if strings.HasPrefix(entry, "$JS.ACK") {
+				got = append(got, entry)
+			}
+		}
+		if !reflect.DeepEqual(got, wantAcks) {
+			t.Errorf("%s ack grants = %q, want %q", user, got, wantAcks)
+		}
+	}
+
+	// The unscoped form is gone from the whole config, not just relocated.
+	if strings.Contains(conf, `"$JS.ACK.>"`) {
+		t.Error("nats.conf still grants unscoped $JS.ACK.> to someone")
 	}
 }
 

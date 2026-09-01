@@ -280,16 +280,28 @@ accounts {
         user: gateway
         password: "` + pw("gateway-password") + `"
         permissions {
-          # $JS.ACK.> / $JS.FC.> are the delivery path's reply subjects: an
+          # $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
           # explicit ack is a publish to $JS.ACK.<stream>.<consumer>..., and
           # push flow control answers on $JS.FC.>. Without them a consumer
           # redelivers forever while TCP health stays green (NR-5's incident).
+          #
+          # The ack grant is scoped to the streams this user actually
+          # consumes with explicit ack (the gateway-relay durable on TASKS;
+          # everything else it reads is ordered/ack-none). An ack subject
+          # names a stream and a CONSUMER, never the caller, so unscoped
+          # $JS.ACK.> would let this user +TERM another principal's
+          # in-flight delivery on ANY stream — the escape deleted from the
+          # web user (W6.1). What scoping cannot close: within a granted
+          # stream, consumer names are the caller's choice (NATS wildcards
+          # match whole tokens, so per-name scoping is not expressible), so
+          # gateway and worker can still address each other's TASKS
+          # deliveries. The auth callout closes that residue when it arms.
           publish { allow = [
             "a2a.tasks.*.*.in",
             "a2a.tasks.*.*.events",
             "$KV.session-state.>",
             "$JS.API.>",
-            "$JS.ACK.>",
+            "$JS.ACK.TASKS.>",
             "$JS.FC.>",
             "_INBOX.gateway.>"
           ] }
@@ -312,6 +324,12 @@ accounts {
           # topics are provisioned-only). A wildcard here would let a publish
           # to an unprovisioned topic vanish into core NATS; the exact list
           # turns that into a connect-time refusal instead of silent loss.
+          #
+          # Ack scope: TASKS only — the hermes bridge's durable task
+          # consumer rides this user; the worker adapter and every topic or
+          # state read are ordered/ack-none. See the gateway's comment for
+          # why unscoped $JS.ACK.> is a cross-principal +TERM and what
+          # scoping still cannot close inside a shared stream.
           publish { allow = [
             "a2a.tasks.*.*.events",
             "a2a.topics.agent.platform.upgrade-readiness",
@@ -321,7 +339,7 @@ accounts {
             "agents.hb.>",
             "$KV.runtime-state.>",
             "$JS.API.>",
-            "$JS.ACK.>",
+            "$JS.ACK.TASKS.>",
             "$JS.FC.>",
             "_INBOX.worker.>"
           ] }
@@ -341,12 +359,16 @@ accounts {
         user: seed
         password: "` + pw("seed-password") + `"
         permissions {
+          # No ack grant at all: seed creates no consumers. Provisioning is
+          # $JS.API requests, the starter topics are publishes, and the
+          # CLI's topic reads are stream API calls — nothing here ever acks,
+          # so an ack grant would be pure unused capability to +TERM other
+          # principals' deliveries (the same deletion the web user got).
           publish { allow = [
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
             "$JS.API.>",
-            "$JS.ACK.>",
             "_INBOX.seed.>"
           ] }
           subscribe { allow = [
