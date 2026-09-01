@@ -29,11 +29,14 @@ func TaskEventsSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.events", addressee, taskID)
 }
 
+// agentsPrefix is the directory plane: a2a.agents.{profile}.
+const agentsPrefix = "a2a.agents."
+
 // AgentSubject carries a profile's agent-card, published by the profile's
 // owner when the profile is created (not by workers), and the agent-closed
 // tombstone on profile deletion. Chat sessions publish no card.
 func AgentSubject(profile string) string {
-	return fmt.Sprintf("a2a.agents.%s", profile)
+	return agentsPrefix + profile
 }
 
 // ParseTaskSubject splits a task subject into its addressee, taskId, and
@@ -52,6 +55,10 @@ func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool)
 	}
 	return parts[0], parts[1], parts[2], true
 }
+
+// dialTimeout bounds one connection attempt's TCP and auth handshake;
+// reconnect pacing is the jittered backoff below, not this.
+const dialTimeout = 10 * time.Second
 
 // NR-6 backoff shape: full jitter over an exponential ceiling. Dev defaults;
 // a restart must spread the herd, not synchronize it.
@@ -164,7 +171,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	opts := []nats.Option{
 		nats.Name(c.opts.name),
 		nats.MaxReconnects(-1),
-		nats.Timeout(10 * time.Second),
+		nats.Timeout(dialTimeout),
 	}
 	opts = append(opts, c.opts.natsOpts...)
 	opts = append(opts,
@@ -348,6 +355,18 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	if strings.HasPrefix(subject, topicPrefix) {
 		if err := checkTopicPublish(subject, env); err != nil {
 			return err
+		}
+	}
+	// The directory plane too: one dot-free profile token, carrying only the
+	// two kinds the spec puts there - agent-card on create, the agent-closed
+	// tombstone on delete. The token grammar is library-enforced on every
+	// plane, not left to the caller.
+	if profile, ok := strings.CutPrefix(subject, agentsPrefix); ok {
+		if !validDNS1123Label(profile) {
+			return &ProtocolError{Msg: fmt.Sprintf("malformed agent subject %q: profile must be a dot-free DNS-1123 label", subject)}
+		}
+		if env.Kind != KindAgentCard && env.Kind != KindAgentClosed {
+			return &ProtocolError{Msg: fmt.Sprintf("kind %q on agent subject %q: the directory carries agent-card and agent-closed only", env.Kind, subject)}
 		}
 	}
 	data, err := json.Marshal(env)

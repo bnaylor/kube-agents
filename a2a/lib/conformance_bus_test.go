@@ -383,3 +383,42 @@ func TestAssertion04_ToAddresseeAgreement(t *testing.T) {
 		}
 	})
 }
+
+// The directory plane (a2a.agents.{profile}) gets the same emit-side gate as
+// the task and topic planes: the profile token must be a dot-free DNS-1123
+// label, and only agent-card and agent-closed ride there. The spec's token
+// grammar is library-enforced on every plane, not left to the caller.
+func TestDirectoryPlanePublishGate(t *testing.T) {
+	s := startServer(t)
+	ctx := testCtx(t)
+
+	c, err := Connect(ctx, clientURL(s), WithName("test-directory"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	t.Run("dotted_profile_refused", func(t *testing.T) {
+		card, err := NewAgentCardEnvelope(Party{Session: "operator"}, "corr-1", json.RawMessage(`{"name":"chat"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = c.Publish(ctx, AgentSubject("team.platform"), card)
+		var perr *ProtocolError
+		if !errors.As(err, &perr) {
+			t.Fatalf("dotted profile token: want ProtocolError, got %v", err)
+		}
+	})
+
+	t.Run("foreign_kind_refused", func(t *testing.T) {
+		msg, err := NewMessageEnvelope(Party{Session: "chatops"}, "task-dir", "ctx-1", "corr-1", validMessagePayload())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = c.Publish(ctx, AgentSubject("platform"), msg)
+		var perr *ProtocolError
+		if !errors.As(err, &perr) {
+			t.Fatalf("kind message on the directory: want ProtocolError, got %v", err)
+		}
+	})
+}

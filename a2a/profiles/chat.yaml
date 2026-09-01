@@ -1,7 +1,9 @@
 # chat - the session persona behind a conversation.
 #
-# This is the AgentProfile spec block from docs/designs/spec-subagent-profiles.md,
-# verbatim, minus the CRD wrapping. The profile name is the file name: stage 3
+# This is an AgentProfile spec block in the schema of
+# docs/designs/spec-subagent-profiles.md, minus the CRD wrapping (the loader's
+# tests hold the field set to the spec's table). The profile name is the file
+# name: stage 3
 # promotes this to `kind: AgentProfile` with `metadata.name: chat` and this
 # document under `spec:`, and nothing else changes.
 #

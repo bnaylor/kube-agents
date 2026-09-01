@@ -43,6 +43,9 @@ environment:
   A2A_PROFILE    from.profile on writes, when the writer runs as a profile
 `
 
+// cliTimeout bounds one CLI operation end to end, connect included.
+const cliTimeout = 30 * time.Second
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "a2a: %v\n", err)
@@ -104,7 +107,7 @@ func connect(ctx context.Context, name string) (*lib.Client, error) {
 }
 
 func cliContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 30*time.Second)
+	return context.WithTimeout(context.Background(), cliTimeout)
 }
 
 func topicsList(args []string) error {

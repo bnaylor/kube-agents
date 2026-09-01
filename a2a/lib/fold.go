@@ -175,6 +175,10 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			// skips it the same way rather than failing the whole fold.
 			c.log.Error("a2a replay skipping unparseable event", "subject", subject, "err", err)
 		} else if env.Kind != KindStatusUpdate && env.Kind != KindArtifactUpdate {
+			// Replay-only screen, not live parity: the live path delivers a
+			// foreign kind on .events to the handler, where FoldTask surfaces
+			// it as a ProtocolError. Replay's job is narrower - one foreign
+			// write must not revoke tasks/get for the task.
 			c.log.Error("a2a replay skipping non-event kind", "subject", subject, "kind", env.Kind)
 		} else if env.To != nil && env.To.Session != addressee {
 			c.log.Error("a2a replay skipping to/addressee mismatch", "subject", subject, "to", env.To.Session)
