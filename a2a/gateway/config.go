@@ -14,6 +14,15 @@ import (
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultTaskDeadline is what TaskDeadline means when unset — the worker
+// adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
+// 1800s), restated here because the two halves of one contract must agree.
+const defaultTaskDeadline = 30 * time.Minute
+
+// defaultAskTTL is what AskTTL means when unset; the field's comment carries
+// the horizon rationale.
+const defaultAskTTL = 24 * time.Hour
+
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
 // else has playground defaults.
@@ -43,13 +52,54 @@ type Config struct {
 	// 8/24: 30 minutes, config-backed).
 	IdleTTL time.Duration
 
-	// AttributionSalt keys the HMAC pseudonyms in authority blocks. One
-	// shared Secret per install once the deployment provisions it; this
-	// install's creds Secret carries no salt key yet, so absent the env var
-	// the gateway derives a stable per-install salt from the NATS password
-	// (HMAC never reveals its key). Playground posture — the product gets
-	// the provisioned Secret.
+	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
+	// salt is SESSION_KV_SALT, the one the install already provisions into
+	// platform-agent-secrets (settled 8/31, spec-chatops-gateway.md): the
+	// shipped attribution path hashes session metadata with it, so hashing
+	// with anything else silently breaks the cross-surface audit join this
+	// pseudonym exists to preserve — one human, one value, on the bus and
+	// in session metadata. The env-var fallbacks below are playground
+	// posture for installs without that Secret, and the derived one is a
+	// recorded deviation on two counts: the broken join, and a
+	// de-anonymization key handed to whoever holds the bus password.
 	AttributionSalt []byte
+
+	// TaskDeadline mirrors the worker adapter's task deadline — the SAME
+	// env the adapter reads (A2A_TASK_DEADLINE_SECONDS, integer seconds),
+	// because the spawner renders it onto the worker pod alongside the
+	// pod-level activeDeadlineSeconds it sizes above it, and two knobs for
+	// one contract would drift. Unset means 1800s, the adapter's own
+	// default. The adapter kills the harness and publishes the terminal at
+	// this deadline; the pod deadline (this plus a fixed grace) is the
+	// backstop that hands a wedged ADAPTER to Sweep instead of letting it
+	// hold its bus credential indefinitely. Raising it buys longer tasks at
+	// the price of how long a wedged worker can hold a cap slot; lowering
+	// it turns long-running asks into failed tasks sooner.
+	TaskDeadline time.Duration
+
+	// AskTTL bounds the active task's `ask` copy in session-state
+	// (A2A_ASK_TTL). The copy's stated justification — the same text rides
+	// the W-bounded stream and the copy dies at the terminal event — holds
+	// only where a terminal event is guaranteed, and the spec names the
+	// case where it is not (a wedged adapter, until every pod carries its
+	// deadline; fixed-route executors have no janitor until stage 3). So
+	// the record gets an independent bound: the reap scan clears an ask
+	// older than this, leaving the task record itself intact. Unset means
+	// 24h — far above any legitimate task's runtime, well under the
+	// stream's 72h retention, so the KV copy always has the shorter
+	// horizon the content posture claims. Raising it toward the stream
+	// retention erodes exactly that claim; lowering it only trims how long
+	// a status card can echo the ask.
+	AskTTL time.Duration
+
+	// OwnerDeployment names the gateway's own Deployment
+	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
+	// When set, every spawned session pod carries an ownerReference to it,
+	// so Kubernetes GC reaps sessions when the Deployment goes — cleanupA2A
+	// deleting the gateway, or any other deletion — with no operator
+	// exception to its IsControlledBy refusal. Empty (playground) spawns
+	// unowned pods, the pre-S9 posture.
+	OwnerDeployment string
 
 	// Namespace, WorkerImage, and NATSCredsSecret configure the dark spawn
 	// path; the secret holds the worker user's password for spawned pods.
@@ -124,14 +174,42 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", ttl)
 	}
 	cfg.IdleTTL = d
-	if salt := os.Getenv("A2A_ATTRIBUTION_SALT"); salt != "" {
-		cfg.AttributionSalt = []byte(salt)
-	} else {
+
+	// The adapter's deadline, in the adapter's own units (integer seconds) —
+	// see the field comment for why the env name is shared.
+	deadlineSecs := envOr("A2A_TASK_DEADLINE_SECONDS", strconv.Itoa(int(defaultTaskDeadline/time.Second)))
+	secs, err := strconv.Atoi(deadlineSecs)
+	if err != nil || secs < 60 {
+		return nil, fmt.Errorf("A2A_TASK_DEADLINE_SECONDS %q: need an integer >= 60; a sub-minute deadline kills pods mid-cold-start", deadlineSecs)
+	}
+	cfg.TaskDeadline = time.Duration(secs) * time.Second
+
+	askTTL := envOr("A2A_ASK_TTL", defaultAskTTL.String())
+	at, err := time.ParseDuration(askTTL)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_ASK_TTL %q: %w", askTTL, err)
+	}
+	if at < time.Minute {
+		return nil, fmt.Errorf("A2A_ASK_TTL %q is under the 1m floor; it would erase the ask from status cards while the task runs", askTTL)
+	}
+	cfg.AskTTL = at
+
+	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
+
+	// Salt precedence: the install's provisioned SESSION_KV_SALT is the
+	// salt (the spec's settled answer); the explicit override and the
+	// derived fallback are playground posture, in that order.
+	switch {
+	case os.Getenv("SESSION_KV_SALT") != "":
+		cfg.AttributionSalt = []byte(os.Getenv("SESSION_KV_SALT"))
+	case os.Getenv("A2A_ATTRIBUTION_SALT") != "":
+		cfg.AttributionSalt = []byte(os.Getenv("A2A_ATTRIBUTION_SALT"))
+	default:
 		// Derived fallback while the install has no provisioned salt Secret.
 		// An empty password would make this a public constant and the
 		// pseudonyms an offline dictionary away from plaintext — refuse.
 		if cfg.NATSPassword == "" {
-			return nil, fmt.Errorf("A2A_ATTRIBUTION_SALT is required when NATS_PASSWORD is empty: the derived fallback would be a public constant")
+			return nil, fmt.Errorf("SESSION_KV_SALT or A2A_ATTRIBUTION_SALT is required when NATS_PASSWORD is empty: the derived fallback would be a public constant")
 		}
 		derived := sha256.Sum256([]byte("a2a-attribution-salt:" + cfg.NATSPassword))
 		cfg.AttributionSalt = derived[:]

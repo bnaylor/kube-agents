@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -87,9 +88,15 @@ func New(o Options) (*Gateway, error) {
 		backend = "discord"
 	}
 	// Tests and embedders build Config directly, bypassing FromEnv's
-	// parse-and-validate; an unset cap means the default there too.
+	// parse-and-validate; unset means the default there too.
 	if o.Config.MaxSessions <= 0 {
 		o.Config.MaxSessions = defaultMaxSessions
+	}
+	if o.Config.TaskDeadline <= 0 {
+		o.Config.TaskDeadline = defaultTaskDeadline
+	}
+	if o.Config.AskTTL <= 0 {
+		o.Config.AskTTL = defaultAskTTL
 	}
 	g := &Gateway{
 		cfg:          o.Config,
@@ -190,23 +197,10 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		return
 	}
 	if rec == nil {
-		// First contact: contextId is minted here and never changes — the
-		// durable name of the conversation on the bus, across every pod
-		// incarnation.
-		rec = &SessionRecord{
-			Key:       msg.Conversation,
-			ContextID: "ctx-" + randHex(12),
-			Addressee: g.cfg.DefaultAddressee,
-			Kind:      msg.Kind,
-		}
-		// The W4 switch: with spawning armed and the route set to "session",
-		// the conversation gets its own executor. The bus session name is
-		// minted per incarnation (spawn time), not here — reaping and
-		// respawning changes the pod and the bus session name; contextId
-		// persists (gateway design).
-		if g.spawner != nil && rec.Addressee == RouteSession {
-			rec.SessionRouted = true
-			rec.Profile = "chat"
+		rec, err = g.mintSession(ctx, msg)
+		if err != nil {
+			g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			return
 		}
 	}
 	rec.LastActivity = time.Now().UTC()
@@ -265,30 +259,38 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			// inside the session route's contract (incarnations rotate).
 			//
 			// The cap check precedes every route mutation, so a refused turn
-			// leaves the record exactly as it was (the early return also
-			// skips the Put below - nothing to persist for a turn that
-			// changed nothing).
+			// leaves the record exactly as it was — on first contact that is
+			// the bare identity record the mint just Created (contextId,
+			// default route, no task): the early return skips the Put below,
+			// so nothing the refused turn did persists.
 			if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
 				return
 			}
-			if rec.Profile == "" {
-				rec.Profile = "chat"
-			}
-			rec.BusSession = mintSessionName(rec.Profile)
-			rec.Addressee = rec.BusSession
 			// A lingering previous incarnation is not this task's executor,
 			// and its task is already closed (healed or detached). Delete
 			// the pod rather than just untrack it: once PodName clears,
 			// reap can never find it again, and sweep only sees terminal
 			// phases - a wedged Running pod would hold its bus credential
-			// forever.
+			// forever. If the task is detached, the gateway is its
+			// supervisor and owes its terminal `canceled` BEFORE the delete
+			// (the one deletion rule in Session lifecycle); a refusal here
+			// precedes every route mutation, so the record is untouched.
 			if rec.PodName != "" {
+				if !g.closeDetachedBeforeDelete(ctx, rec) {
+					g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
+					return
+				}
 				if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
 					g.log.Warn("previous incarnation delete failed; pod may linger",
 						"pod", rec.PodName, "err", err)
 				}
 				rec.PodName = ""
 			}
+			if rec.Profile == "" {
+				rec.Profile = "chat"
+			}
+			rec.BusSession = mintSessionName(rec.Profile)
+			rec.Addressee = rec.BusSession
 			msg.Text = rest
 		} else if rec.SessionRouted && rec.PodName == "" {
 			// A session-routed conversation with no live incarnation gets a
@@ -319,8 +321,14 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 				// branch's delete-and-clear: left set, the stale PodName
 				// turns ensureSessionPod into a no-op and the task
 				// publishes to an addressee with no executor, while the
-				// old pod holds a cap slot sweep can never reclaim.
+				// old pod holds a cap slot sweep can never reclaim. Same
+				// supervisor rule as the Delegate branch: a detached
+				// task's terminal is published before its pod goes.
 				if rec.PodName != "" {
+					if !g.closeDetachedBeforeDelete(ctx, rec) {
+						g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
+						return
+					}
 					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
 						g.log.Warn("pre-flip incarnation delete failed; pod may linger",
 							"pod", rec.PodName, "err", err)
@@ -339,6 +347,43 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if err := withRetry(3, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 	}
+}
+
+// mintSession is first contact with a conversation: contextId is minted
+// here and never changes — the durable name of the conversation on the bus,
+// across every pod incarnation. The mint is create-only (KV Create,
+// compare-and-swap; the spec's MUST), so two replicas or a rehydrate racing
+// first contact cannot fork the conversation's identity: the loser reads
+// and adopts the winner's record before the contextId reaches any envelope.
+func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*SessionRecord, error) {
+	rec := &SessionRecord{
+		Key:          msg.Conversation,
+		ContextID:    "ctx-" + randHex(12),
+		Addressee:    g.cfg.DefaultAddressee,
+		Kind:         msg.Kind,
+		LastActivity: time.Now().UTC(),
+	}
+	// The W4 switch: with spawning armed and the route set to "session",
+	// the conversation gets its own executor. The bus session name is
+	// minted per incarnation (spawn time), not here — reaping and
+	// respawning changes the pod and the bus session name; contextId
+	// persists (gateway design).
+	if g.spawner != nil && rec.Addressee == RouteSession {
+		rec.SessionRouted = true
+		rec.Profile = "chat"
+	}
+	err := g.reg.Create(ctx, rec)
+	if err == nil {
+		return rec, nil
+	}
+	if !errors.Is(err, ErrSessionExists) {
+		return nil, err
+	}
+	winner, gerr := g.reg.Get(ctx, msg.Conversation)
+	if gerr != nil || winner == nil {
+		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %v", gerr)
+	}
+	return winner, nil
 }
 
 // startTask mints the identifiers, publishes the submission, and posts the
@@ -472,6 +517,10 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 		return
 	}
 	active.Detached = true
+	// Detached outlives ActiveTask (a new turn overwrites it), so the
+	// cancel is also recorded on the task's history entry — the durable
+	// evidence Sweep reads when it must choose `canceled` over `failed`.
+	rec.MarkCanceled(active.TaskID)
 	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
 }
 

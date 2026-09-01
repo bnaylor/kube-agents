@@ -27,7 +27,11 @@ type ActiveTask struct {
 	// window, the gateway is the only user granted $KV.session-state.>, the
 	// bucket keeps one revision, and the copy dies with ActiveTask at the
 	// terminal event. The pseudonymization rule covers identifiers, not
-	// content - the spec should state that distinction (amendment pending).
+	// content (spec-chatops-gateway.md states the distinction, ratified
+	// 8/31) — and because the terminal event is not guaranteed on every
+	// path, the copy also carries an independent age bound (AskTTL,
+	// enforced by the reap scan), so it can never outlive the stream copy
+	// its justification rests on.
 	Ask string `json:"ask,omitempty"`
 	// SubmittedAt feeds the elapsed clock in status answers.
 	SubmittedAt time.Time `json:"submittedAt,omitempty"`
@@ -70,6 +74,34 @@ type SessionRecord struct {
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
+	// Canceled records that the gateway published a cancel for this task —
+	// set only after the publish succeeded, so a true here means the cancel
+	// is on the stream. It is what lets a supervisor path reached long
+	// after ActiveTask moved on (Sweep, routinely) tell "finishing a cancel
+	// the requester asked for" (terminal `canceled`) from "the executor
+	// died mid-work" (terminal `failed`) — assertion 13's distinction.
+	Canceled bool `json:"canceled,omitempty"`
+}
+
+// MarkCanceled records a published cancel against the task's history entry.
+func (rec *SessionRecord) MarkCanceled(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// TaskCanceled reports whether a cancel for the task is on the stream (see
+// TaskRef.Canceled).
+func (rec *SessionRecord) TaskCanceled(taskID string) bool {
+	for _, ref := range rec.Tasks {
+		if ref.ID == taskID {
+			return ref.Canceled
+		}
+	}
+	return false
 }
 
 // AddresseeFor returns the addressee a task was published to. Session
@@ -145,6 +177,34 @@ func (r *Registry) Get(ctx context.Context, sessionKey string) (*SessionRecord, 
 		return nil, fmt.Errorf("session %s: %w", sessionKey, err)
 	}
 	return &rec, nil
+}
+
+// ErrSessionExists reports a Create that lost the first-contact race: a
+// record for the key already exists, and the caller adopts it.
+var ErrSessionExists = errors.New("session record already exists")
+
+// Create writes a record only if none exists for its key — KV Create,
+// compare-and-swap semantics. contextId minting MUST ride this rather than
+// Put (gateway design): two replicas or a rehydrate racing first contact
+// would otherwise each mint a contextId and the last Put would fork the
+// conversation's identity; with Create, the loser gets ErrSessionExists and
+// reads the winner's value.
+func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if _, err := kv.Create(ctx, kvKey(rec.Key), data); err != nil {
+		if errors.Is(err, jetstream.ErrKeyExists) {
+			return ErrSessionExists
+		}
+		return fmt.Errorf("session %s: %w", rec.Key, err)
+	}
+	return nil
 }
 
 // Put writes a record.

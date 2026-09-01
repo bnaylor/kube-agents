@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -86,6 +87,10 @@ type podSpawner struct {
 	cfg    *Config
 	client kubernetes.Interface
 	log    *slog.Logger
+	// owner is the ownerReference every spawned pod carries — the gateway's
+	// own Deployment, resolved once at construction. Nil when no owner is
+	// configured (playground).
+	owner *metav1.OwnerReference
 }
 
 func newPodSpawner(cfg *Config, log *slog.Logger) (*podSpawner, error) {
@@ -97,19 +102,80 @@ func newPodSpawner(cfg *Config, log *slog.Logger) (*podSpawner, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &podSpawner{cfg: cfg, client: cs, log: log}, nil
+	s := &podSpawner{cfg: cfg, client: cs, log: log}
+	if err := s.resolveOwner(context.Background()); err != nil {
+		// Refuse to boot rather than quietly spawn unowned pods: an owner
+		// was configured, so the orphaned-session window is supposed to be
+		// closed, and a GET that fails here is a misconfig (name, RBAC) the
+		// operator render owns.
+		return nil, fmt.Errorf("resolving owner deployment %q: %w", cfg.OwnerDeployment, err)
+	}
+	return s, nil
 }
+
+// resolveOwner fetches the configured Deployment's UID and builds the
+// ownerReference spawned pods carry. An ownerReference is name+UID, and the
+// UID exists only server-side, so this is a read the gateway's Role grants
+// on exactly this one Deployment (resourceNames).
+func (s *podSpawner) resolveOwner(ctx context.Context) error {
+	if s.cfg.OwnerDeployment == "" {
+		return nil
+	}
+	dep, err := s.client.AppsV1().Deployments(s.cfg.Namespace).Get(ctx, s.cfg.OwnerDeployment, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	s.owner = &metav1.OwnerReference{
+		APIVersion: "apps/v1",
+		Kind:       "Deployment",
+		Name:       dep.Name,
+		UID:        dep.UID,
+		// Controller marks this as the pod's managing owner for tooling
+		// ("Controlled By"); no other controller claims session pods, and
+		// the Deployment controller only manages ReplicaSets, so nothing
+		// competes. BlockOwnerDeletion stays unset: GC does not need it and
+		// setting it would require finalizer permissions on the owner.
+		Controller: ptr.To(true),
+	}
+	return nil
+}
+
+// podDeadlineGrace is what the pod-level activeDeadlineSeconds adds above
+// the adapter's task deadline. The adapter's contract is that its deadline
+// sits BELOW the pod's, so the failure is the adapter's to report — the pod
+// deadline only fires for a wedged adapter, handing it to Sweep instead of
+// letting it hold its bus credential indefinitely. The grace covers what
+// the adapter's clock does not: the image pull before the process starts
+// (activeDeadlineSeconds runs from pod start) plus the adapter's own
+// shutdown-and-publish window at its deadline.
+const podDeadlineGrace = 10 * time.Minute
 
 // Spawn creates the session pod: the demo's reference worker shape — no
 // ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests —
 // running the headless harness behind the worker adapter (W4's image).
-// Model auth is Workload Identity against Vertex; no per-pod API keys.
+// Model auth, as shipped (spec-chatops-gateway.md, amended 8/31): the
+// worker talks to the install's own LiteLLM, in-namespace, with no per-pod
+// credential at all — no ServiceAccount, no Workload Identity. Its bus
+// credential is the static worker user, injected as env, until the
+// deployment spec's auth callout arms; direct Vertex via WI stays the
+// target, and arming it is a policy change as well as an IAM one (the
+// session egress fence encodes the shipped path).
 func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string) (string, error) {
 	name := rec.BusSession
+	// The gateway Deployment owns its sessions: when it goes — cleanupA2A on
+	// a mode flip, or any other deletion — Kubernetes GC reaps the pods it
+	// spawned, closing the orphaned-session window without an operator
+	// exception to the IsControlledBy refusal. Empty on playground installs
+	// that never configured an owner.
+	var owners []metav1.OwnerReference
+	if s.owner != nil {
+		owners = []metav1.OwnerReference{*s.owner}
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: s.cfg.Namespace,
+			Name:            name,
+			Namespace:       s.cfg.Namespace,
+			OwnerReferences: owners,
 			Labels: map[string]string{
 				labelPartOf: partOfValue,
 				labelRole:   sessionRole,
@@ -129,6 +195,12 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
 			AutomountServiceAccountToken: ptr.To(false),
+			// The adapter's deadline sits below this by construction (its
+			// contract, and podDeadlineGrace's comment): a healthy adapter
+			// always publishes the terminal and exits first, so this fires
+			// only for a wedged adapter — the one end Session lifecycle
+			// used to name as unowned.
+			ActiveDeadlineSeconds: ptr.To(int64((s.cfg.TaskDeadline + podDeadlineGrace) / time.Second)),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: ptr.To(true),
 				RunAsUser:    ptr.To(int64(1000)),
@@ -151,6 +223,10 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 						Key:                  "worker-password",
 					}}},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
+					// The adapter's half of the deadline contract, rendered
+					// from the same config the pod deadline above is sized
+					// from — one number, two enforcement layers, no drift.
+					{Name: "A2A_TASK_DEADLINE_SECONDS", Value: strconv.Itoa(int(s.cfg.TaskDeadline / time.Second))},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -302,11 +378,15 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 
 // sweepLoop is the gateway's half of the orphaned-task answer: it is the
 // supervisor for sessions it spawned. A pod in a terminal phase whose task
-// never emitted a final event gets a terminal failed published by the
-// gateway, then the pod is deleted. The synthesized event carries the
-// gateway's identity in from, so replay always distinguishes "the worker
-// said failed" from "the supervisor declared it dead". (The dispatcher's
-// janitor is the other half, for profile-addressed tasks — stage 3.)
+// never emitted a final event gets a terminal event published by the
+// gateway, then the pod is deleted. The state follows the supervisor rule:
+// `failed` for an executor that died mid-work, `canceled` where the task
+// had detached — a worker that exits or wedges after a `stop` reaches here
+// routinely, and an unconditional `failed` would report broken for every
+// task a user stopped. The synthesized event carries the gateway's identity
+// in from, so replay always distinguishes "the worker said failed" from
+// "the supervisor declared it dead". (The dispatcher's janitor is the other
+// half, for profile-addressed tasks — stage 3.)
 func (g *Gateway) sweepLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -341,14 +421,60 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 			g.releaseIncarnation(ctx, o)
 			continue
 		}
-		if err := g.publishSupervisorFailed(ctx, o); err != nil {
-			g.log.Error("sweep: terminal failed publish failed", "task", o.TaskID, "err", err)
+		// The supervisor writes what happened: `canceled` if a cancel for
+		// this task is on the stream (the session record's task history
+		// carries that mark durably — ActiveTask may long since have moved
+		// on), `failed` otherwise. A record we cannot read right now is a
+		// reason to wait a cycle, not to guess a state.
+		state := lib.StateFailed
+		note := "session pod exited without a terminal event; declared failed by its supervisor"
+		if o.SessionKey != "" {
+			rec, err := g.reg.Get(ctx, o.SessionKey)
+			if err != nil {
+				g.log.Error("sweep: record read failed; retrying next cycle", "session", o.SessionKey, "err", err)
+				continue
+			}
+			if rec != nil && rec.TaskCanceled(o.TaskID) {
+				state = lib.StateCanceled
+				note = "the requester's stop, completed by the supervisor: the worker exited without publishing its terminal"
+			}
+		}
+		if err := g.publishSupervisorTerminal(ctx, o.Addressee, o.TaskID, o.ContextID, o.CorrelationID, state, note); err != nil {
+			g.log.Error("sweep: supervisor terminal publish failed", "task", o.TaskID, "err", err)
 			continue // keep the pod as evidence until the event lands
 		}
-		g.log.Warn("sweep: declared orphaned task failed", "task", o.TaskID, "pod", o.PodName)
+		g.log.Warn("sweep: closed orphaned task", "task", o.TaskID, "state", state, "pod", o.PodName)
 		_ = g.spawner.Delete(ctx, o.PodName)
 		g.releaseIncarnation(ctx, o)
 	}
+}
+
+// closeDetachedBeforeDelete is the one rule for every pod the gateway
+// deletes itself (Session lifecycle states it once; reap, Sweep, Delegate,
+// and the pre-flip retirement all reach it): a pod running a DETACHED task
+// gets that task's terminal event published before the delete — deleting
+// first would strand the task non-terminal for the whole retention window,
+// since the adapter's deadline dies with the process and a deleted pod
+// never reaches the phase Sweep watches. The state is `canceled`, not
+// `failed`: detached means a stop already published a cancel, so the
+// gateway is finishing the cancel the requester asked for (assertion 13's
+// enumeration). Returns false when the terminal could not be published; the
+// caller must keep the pod.
+func (g *Gateway) closeDetachedBeforeDelete(ctx context.Context, rec *SessionRecord) bool {
+	active := rec.ActiveTask
+	if active == nil || !active.Detached {
+		return true // idle pod, or a healed task: nothing owed
+	}
+	// The task ran under the addressee its own subjects carried — after a
+	// Delegate re-home rec.Addressee is already the successor's.
+	addressee := rec.AddresseeFor(active.TaskID)
+	err := g.publishSupervisorTerminal(ctx, addressee, active.TaskID, rec.ContextID, active.CorrelationID,
+		lib.StateCanceled, "the requester's stop, completed by the supervisor at pod retirement")
+	if err != nil {
+		g.log.Error("supervisor terminal before delete failed", "task", active.TaskID, "err", err)
+		return false
+	}
+	return true
 }
 
 // releaseIncarnation clears the session record's pod binding after sweep
@@ -372,24 +498,25 @@ func (g *Gateway) releaseIncarnation(ctx context.Context, o orphanPod) {
 	}
 }
 
-// publishSupervisorFailed writes the terminal failed for a task whose
-// executor died without one.
-func (g *Gateway) publishSupervisorFailed(ctx context.Context, o orphanPod) error {
-	corr := o.CorrelationID
-	if corr == "" {
-		// The annotation should always carry it; a missing one still gets a
+// publishSupervisorTerminal writes a task's terminal event on behalf of the
+// gateway as supervisor — `failed` for an executor that died mid-work,
+// `canceled` where the supervisor is finishing a cancel already on the
+// stream (the callers own that choice).
+func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, taskID, contextID, correlationID string, state lib.TaskState, note string) error {
+	if correlationID == "" {
+		// The record should always carry it; a missing one still gets a
 		// terminal event, honestly labeled.
-		corr = "corr-supervisor-" + randHex(6)
+		correlationID = "corr-supervisor-" + randHex(6)
 	}
 	payload, err := json.Marshal(lib.StatusUpdate{
-		TaskID:    o.TaskID,
-		ContextID: o.ContextID,
+		TaskID:    taskID,
+		ContextID: contextID,
 		Status: lib.TaskStatus{
-			State: lib.StateFailed,
+			State: state,
 			Message: &lib.Message{
 				Role:      "agent",
 				MessageID: "msg-" + randHex(8),
-				Parts:     []lib.Part{{Kind: "text", Text: "session pod exited without a terminal event; declared failed by its supervisor"}},
+				Parts:     []lib.Part{{Kind: "text", Text: note}},
 			},
 		},
 		Final: true,
@@ -397,9 +524,9 @@ func (g *Gateway) publishSupervisorFailed(ctx context.Context, o orphanPod) erro
 	if err != nil {
 		return err
 	}
-	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, o.TaskID, o.ContextID, corr, payload)
+	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, taskID, contextID, correlationID, payload)
 	if err != nil {
 		return err
 	}
-	return g.client.Publish(ctx, lib.TaskEventsSubject(o.Addressee, o.TaskID), env)
+	return g.client.Publish(ctx, lib.TaskEventsSubject(addressee, taskID), env)
 }

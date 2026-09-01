@@ -35,6 +35,7 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 		return
 	}
 	for _, rec := range recs {
+		g.boundAskCopy(ctx, rec)
 		if rec.PodName == "" {
 			continue // nothing incarnated (the Hermes-first world, or already reaped)
 		}
@@ -57,6 +58,16 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 			l.Unlock()
 			continue
 		}
+		// A detached task does not exempt the session, so reap may delete a
+		// pod whose harness is still working — the supervisor rule is what
+		// keeps that from being a silent stop: its terminal `canceled` goes
+		// on the stream before the pod goes. A publish failure keeps the
+		// pod (and the reap retries next cycle) rather than stranding the
+		// task non-terminal for the retention window.
+		if !g.closeDetachedBeforeDelete(ctx, fresh) {
+			l.Unlock()
+			continue
+		}
 		if g.spawner != nil {
 			if err := g.spawner.Delete(ctx, fresh.PodName); err != nil {
 				g.log.Error("reap: pod delete failed", "pod", fresh.PodName, "err", err)
@@ -72,6 +83,42 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 		}
 		l.Unlock()
 	}
+}
+
+// boundAskCopy is the independent bound the content posture owes the `ask`
+// copy in session-state. The copy's justification — same text on the
+// W-bounded stream, deleted with the active-task record at the terminal
+// event — holds only where a terminal is guaranteed, and the spec names the
+// cases where it is not (a wedged adapter until every pod carries its
+// deadline; fixed-route executors with no janitor until stage 3). So an ask
+// older than AskTTL is cleared here, in the same scan that reaps — content
+// only: the task record itself, its serialization, and its detach state are
+// untouched, because this bound is about the copy's horizon, not the
+// task's lifecycle.
+func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
+	active := rec.ActiveTask
+	if active == nil || active.Ask == "" || active.SubmittedAt.IsZero() ||
+		time.Since(active.SubmittedAt) < g.cfg.AskTTL {
+		return
+	}
+	l := g.lockSession(rec.Key)
+	l.Lock()
+	defer l.Unlock()
+	// Same discipline as the reap: re-check on the fresh record under the
+	// lock, and clear only the copy the scan saw expire.
+	fresh, err := g.reg.Get(ctx, rec.Key)
+	if err != nil || fresh == nil || fresh.ActiveTask == nil ||
+		fresh.ActiveTask.TaskID != active.TaskID || fresh.ActiveTask.Ask == "" ||
+		fresh.ActiveTask.SubmittedAt.IsZero() ||
+		time.Since(fresh.ActiveTask.SubmittedAt) < g.cfg.AskTTL {
+		return
+	}
+	fresh.ActiveTask.Ask = ""
+	if err := g.reg.Put(ctx, fresh); err != nil {
+		g.log.Error("ask bound: record write failed", "session", fresh.Key, "err", err)
+		return
+	}
+	g.log.Info("ask bound: cleared an ask copy past its TTL", "session", fresh.Key, "taskId", fresh.ActiveTask.TaskID)
 }
 
 // buildRehydrationPrimer folds the context's tasks from JetStream into a

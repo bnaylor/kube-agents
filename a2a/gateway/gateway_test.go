@@ -726,6 +726,7 @@ type fakeSpawner struct {
 	mu      sync.Mutex
 	spawns  []fakeSpawn
 	deletes []string
+	orphans []orphanPod
 	live    int
 	liveErr error
 }
@@ -755,7 +756,17 @@ func (s *fakeSpawner) deleted() []string {
 	return append([]string(nil), s.deletes...)
 }
 
-func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) { return nil, nil }
+func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]orphanPod(nil), s.orphans...), nil
+}
+
+func (s *fakeSpawner) setOrphans(o []orphanPod) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.orphans = o
+}
 
 func (s *fakeSpawner) calls() []fakeSpawn {
 	s.mu.Lock()

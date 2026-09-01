@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -415,10 +416,13 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	if n, err := sp.LiveSessions(ctx); err != nil || n != 2 {
 		t.Fatalf("third pod appeared past the cap (n=%d, err=%v)", n, err)
 	}
-	// A refused turn changes nothing: conversation C never got a record in
-	// the real session KV.
-	if rec, err := g.reg.Get(ctx, convC); err != nil || rec != nil {
-		t.Fatalf("refused conversation left a record: %+v (err=%v)", rec, err)
+	// A refused turn changes nothing the turn did: first contact Creates
+	// the bare identity record (contextId minting is create-only, per the
+	// gateway design), so conversation C has a record — but no task, no
+	// pod, and no route mutation.
+	if rec, err := g.reg.Get(ctx, convC); err != nil || rec == nil ||
+		rec.ActiveTask != nil || rec.PodName != "" || rec.BusSession != "" || len(rec.Tasks) != 0 {
+		t.Fatalf("refused conversation kept turn state: %+v (err=%v)", rec, err)
 	}
 
 	// The first two keep running to completion on the real bus — the path
@@ -429,6 +433,138 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 			return err == nil && task.Final && task.State == lib.StateCompleted
 		})
 	}
+}
+
+// TestLiveDetachedDelegateSupervisorTerminal proves S9's DoD against the
+// real install: a Delegate over a DETACHED task publishes that task's
+// terminal `canceled` on the real stream BEFORE deleting the pod — under
+// the real gateway user's grants, against the real k8s API — and the new
+// delegation then completes end to end. The detached state is seeded the
+// way a wedged worker leaves it (a real Running pod, a cancel already
+// recorded, no terminal), because a healthy worker confirms a cancel too
+// fast to hold the window open. Same env and conventions as
+// TestLiveSessionCapOnInstall.
+func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
+	url := os.Getenv("A2A_LIVE_NATS_URL")
+	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
+	kubeCtx := os.Getenv("A2A_LIVE_KUBECONTEXT")
+	if url == "" || gwPass == "" || kubeCtx == "" {
+		t.Skip("live env not set; see TestLiveSessionCapOnInstall")
+	}
+	ns := envOr("A2A_LIVE_NAMESPACE", "kubeagents-system")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-gateway-suptest"),
+		lib.WithNATSOptions(
+			nats.UserInfo("gateway", gwPass),
+			nats.CustomInboxPrefix("_INBOX.gateway"),
+		))
+	if err != nil {
+		t.Fatalf("gateway connect: %v", err)
+	}
+	defer client.Close()
+
+	rc, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{CurrentContext: kubeCtx},
+	).ClientConfig()
+	if err != nil {
+		t.Fatalf("kubeconfig for context %q: %v", kubeCtx, err)
+	}
+	cs, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mapFile := t.TempDir() + "/principal-map"
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		NATSURL:          envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("live-test-salt"),
+		Namespace:        ns,
+		WorkerImage:      envOr("A2A_LIVE_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
+	}
+	adapter := newFakeAdapter()
+	sp := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: sp})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conv := "discord:livesup/s9-a"
+	// Seed the detached shape: a real Running worker pod (its synthetic
+	// task never gets a submission, so the adapter idles and publishes
+	// nothing), a session record whose active task is detached with the
+	// cancel recorded — what a stop against a wedged worker leaves behind.
+	seedTask := "task-s9sup-" + time.Now().UTC().Format("150405")
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-s9sup", Kind: "group",
+		Addressee: "chat-s9sup-seed", BusSession: "chat-s9sup-seed",
+		LastActivity: time.Now().UTC(),
+		ActiveTask:   &ActiveTask{TaskID: seedTask, CorrelationID: "corr-s9sup", Detached: true},
+		Tasks:        []TaskRef{{ID: seedTask, Addressee: "chat-s9sup-seed", Canceled: true}},
+	}
+	podName, err := sp.Spawn(ctx, rec, seedTask, "")
+	if err != nil {
+		t.Fatalf("seed pod spawn on the install: %v", err)
+	}
+	rec.PodName = podName
+	if err := g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		if fresh, err := g.reg.Get(cctx, conv); err == nil && fresh != nil {
+			for _, tr := range fresh.Tasks {
+				_ = g.reg.DropTask(cctx, tr.ID)
+			}
+			if fresh.PodName != "" {
+				_ = sp.Delete(cctx, fresh.PodName)
+			}
+		}
+		_ = sp.Delete(cctx, podName)
+	})
+
+	// The Delegate over the detached task: terminal first, then the delete,
+	// then the new incarnation.
+	g.handleInbound(InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "s9-live-1", Text: "Delegate: write one sentence about supervisors"})
+
+	// The detached task's terminal is on the real stream, state canceled —
+	// replay through the real grants is the proof (assertion 13's
+	// enumeration for a cancel).
+	task, err := g.client.TasksGet(ctx, "chat-s9sup-seed", seedTask)
+	if err != nil {
+		t.Fatalf("replaying the detached task: %v", err)
+	}
+	if !task.Final || task.State != lib.StateCanceled {
+		t.Fatalf("detached task state = %s (final=%v), want terminal canceled before the delete", task.State, task.Final)
+	}
+	// The seeded pod is gone (or terminating) on the real API.
+	waitLive(t, "seed pod deleted", 2*time.Minute, func() bool {
+		p, err := cs.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+		return err != nil || p.DeletionTimestamp != nil
+	})
+	// And the delegation it made way for completes end to end.
+	fresh, err := g.reg.Get(ctx, conv)
+	if err != nil || fresh == nil || len(fresh.Tasks) < 2 {
+		t.Fatalf("no delegated task recorded: %+v (err=%v)", fresh, err)
+	}
+	newRef := fresh.Tasks[len(fresh.Tasks)-1]
+	waitLive(t, "delegated task completes", 5*time.Minute, func() bool {
+		task, err := g.client.TasksGet(ctx, newRef.Addressee, newRef.ID)
+		return err == nil && task.Final && task.State == lib.StateCompleted
+	})
 }
 
 // waitLive is waitFor with a live-install clock: pod pulls and model calls
