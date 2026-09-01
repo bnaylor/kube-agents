@@ -142,6 +142,7 @@ identifier appears, add its source here.
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |
 | RBAC bindings and KSA defaults laid down per agent | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | `app.kubernetes.io/*` label values on installed objects | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml` |
+| The mode switch's key, values, and skew reason (`KUBEAGENTS_MODE`, `today`/`next`, `ModeNotRecognized`) | `k8s-operator/internal/controller/mode.go` and `platformagent_manifests.go` (writer), `agents/platform/scripts/runtime_mode.py` (reader) |
 | Controller permissions | `k8s-operator/config/rbac/` |
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
 | Paths baked into the agent image (`/opt/defaults/...`) | `deploy/docker/Dockerfile` |
