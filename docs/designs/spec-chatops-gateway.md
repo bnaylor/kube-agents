@@ -145,10 +145,15 @@ edits), the status card, the steer acknowledgement, and failure notices (a submi
 or steer that never reached the bus). All are deterministic templates over facts the
 gateway itself owns - its own publishes, its own registry, stream replay - which is
 what keeps them inside the no-model rule. They also say only what the gateway knows:
-the steer acknowledgement reports that the steer is on the stream and that, if the
-task is still running when it lands, the executor picks it up at its next turn
-boundary - not that it was absorbed, which the gateway cannot know. The payload
-spec's race-window refusal is what closes that loop on the stream.
+the steer acknowledgement reports that the steer is on the stream, and what it says
+next is conditioned on the route the same way the width bias above is, because the
+gateway knows the route and the two executors do different things: on a
+session-routed conversation, that the worker picks it up at its next turn boundary
+if the task is still running; on a fixed-routed one, that the standing executor does
+not take mid-task input and the reply will say so. Neither claims the steer was
+absorbed, which the gateway cannot know. The payload spec's refusal posture - both
+the fixed-route refusal and the race-window one - is what closes the loop on the
+stream.
 
 ## The Delegate flow (added 8/31)
 

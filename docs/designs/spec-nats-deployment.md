@@ -293,8 +293,16 @@ deployment's job is to keep the substrate intact and reachable:
   told W is the only thing that can delete evidence. Lag is a first-class alert on
   whichever horizon is nearer: backlog age approaching W, or stream bytes approaching
   `max_bytes`.
-- The audit path is read-only by construction: the exporter's user may subscribe and may
-  not publish, enforced at connect like everything else.
+- The audit path is read-only by construction, and "read-only" means what the
+  JetStream tax above establishes it can mean: the exporter's user publishes nothing
+  onto the A2A subjects, and holds no grant that can destroy evidence - no purge, no
+  stream or message delete, no consumer delete beyond its own. It does hold the
+  client grants reading requires, because reading a stream is not a subscribe-only
+  act: the reserved durable `audit` consumer is created through `$JS.API`, and its
+  acks are publishes to `$JS.ACK`. A user rendered from a literal no-publish reading
+  cannot create its consumer, and would redeliver forever if it somehow had one -
+  its own lag alerts firing on a user structurally unable to make progress. Enforced
+  at connect like everything else.
 - The attribution salt the gateway hashes identifiers with is `SESSION_KV_SALT`, the
   per-install salt the chart already provisions into `platform-agent-secrets` for the
   shipped attribution path - not a new secret this deployment mints. Replicas must
