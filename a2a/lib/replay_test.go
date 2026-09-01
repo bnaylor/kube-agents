@@ -150,6 +150,24 @@ func TestTasksGet_SkipsPoisonEvents(t *testing.T) {
 	}
 	strayRaw, _ := json.Marshal(stray)
 	publishRaw(t, clientURL(s), events, strayRaw)
+	// A valid event for ANOTHER task, landed on this task's subject: the
+	// fourth poison class - FoldTask would hard-error on it, so the replay
+	// screen must drop it.
+	foreign, err := NewStatusUpdateEnvelope(Party{Session: "worker-other"}, "task-other", "ctx-other", "corr-f",
+		json.RawMessage(`{"taskId":"task-other","contextId":"ctx-other","status":{"state":"working"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignRaw, _ := json.Marshal(foreign)
+	publishRaw(t, clientURL(s), events, foreignRaw)
+	// An envelope for THIS task whose payload names another - refused at
+	// parse (assertion 7's taskId-agreement clause), so replay skips it as
+	// poison rather than letting the fold hard-error.
+	mismatched := `{"protocol":"` + Protocol + `","envelopeId":"env-mm-1","correlationId":"corr-mm",` +
+		`"ts":"2026-09-01T00:00:00Z","from":{"session":"intruder"},"identity":null,"authority":null,` +
+		`"kind":"status-update","taskId":"task-po","contextId":"ctx-task-po",` +
+		`"payload":{"taskId":"task-other","contextId":"ctx-task-po","status":{"state":"working"}}}`
+	publishRaw(t, clientURL(s), events, []byte(mismatched))
 
 	// The task keeps going after the garbage.
 	origin, err := NewMessageEnvelope(Party{Session: "chatops"}, "task-po", "ctx-task-po", "corr-rp",

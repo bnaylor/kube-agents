@@ -16,13 +16,15 @@ import (
 	"time"
 )
 
+// validMessagePayload is shared across test files under many different
+// envelope taskIds, so it leaves the payload's optional taskId/contextId
+// unset - assertion 7's agreement clause refuses a payload naming a task its
+// envelope does not carry.
 func validMessagePayload() json.RawMessage {
 	return json.RawMessage(`{
 		"role": "user",
 		"parts": [{"kind": "text", "text": "hello"}],
-		"messageId": "msg-1",
-		"taskId": "task-1",
-		"contextId": "ctx-1"
+		"messageId": "msg-1"
 	}`)
 }
 
@@ -453,5 +455,27 @@ func TestValidateEmit_PinnedProtocol(t *testing.T) {
 	env.Protocol = "a2a-jetstream/0.9"
 	if err := env.ValidateEmit(); err == nil {
 		t.Fatal("ValidateEmit accepted a protocol version the library does not speak")
+	}
+}
+
+// Assertion 7, taskId-agreement clause: a payload that names a different task
+// than its envelope is poison to the fold, so it is a protocol error at both
+// ends - the constructor/emit path refuses to build it, and ParseEnvelope
+// refuses it inbound, which is what lets the replay screen skip it.
+func TestAssertion07_PayloadTaskIDAgreement(t *testing.T) {
+	_, err := NewStatusUpdateEnvelope(Party{Session: "worker-a"}, "task-a", "ctx-1", "corr-1",
+		json.RawMessage(`{"taskId":"task-b","contextId":"ctx-1","status":{"state":"working"}}`))
+	var perr *ProtocolError
+	if !errors.As(err, &perr) {
+		t.Fatalf("emit with mismatched payload taskId: want ProtocolError, got %v", err)
+	}
+
+	raw := `{"protocol":"` + Protocol + `","envelopeId":"env-1","correlationId":"corr-1",` +
+		`"ts":"2026-09-01T00:00:00Z","from":{"session":"w"},"identity":null,"authority":null,` +
+		`"kind":"artifact-update","taskId":"task-a","contextId":"ctx-1",` +
+		`"payload":{"taskId":"task-b","contextId":"ctx-1","artifact":{"artifactId":"r","name":"result","parts":[{"kind":"text","text":"x"}]}}}`
+	_, err = ParseEnvelope([]byte(raw))
+	if !errors.As(err, &perr) {
+		t.Fatalf("parse with mismatched payload taskId: want ProtocolError, got %v", err)
 	}
 }

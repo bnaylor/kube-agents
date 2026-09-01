@@ -180,6 +180,12 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			// it as a ProtocolError. Replay's job is narrower - one foreign
 			// write must not revoke tasks/get for the task.
 			c.log.Error("a2a replay skipping non-event kind", "subject", subject, "kind", env.Kind)
+		} else if env.TaskID != taskID {
+			// The fourth poison class: a valid event for another task on this
+			// subject. FoldTask would hard-error on it; the screen drops it so
+			// one foreign write cannot revoke tasks/get (payload-level taskId
+			// mismatches never get this far - ParseEnvelope refuses them).
+			c.log.Error("a2a replay skipping event for another task", "subject", subject, "taskId", env.TaskID)
 		} else if env.To != nil && env.To.Session != addressee {
 			c.log.Error("a2a replay skipping to/addressee mismatch", "subject", subject, "to", env.To.Session)
 		} else {

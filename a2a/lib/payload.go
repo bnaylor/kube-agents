@@ -118,9 +118,12 @@ func protocolErrf(format string, args ...any) error {
 	return &ProtocolError{Msg: fmt.Sprintf(format, args...)}
 }
 
-// validatePayload enforces kind/payload agreement (assertion 7). A mismatch is
-// a protocol error, never passed through.
-func validatePayload(kind Kind, payload json.RawMessage) error {
+// validatePayload enforces kind/payload agreement (assertion 7), including
+// the payload's taskId agreeing with the envelope's: an event whose payload
+// names another task is poison to the fold, so it is refused at emit and at
+// parse rather than surviving to break tasks/get. A mismatch is a protocol
+// error, never passed through.
+func validatePayload(kind Kind, taskID string, payload json.RawMessage) error {
 	if isJSONNull(payload) && kind != KindCancel && kind != KindAgentClosed {
 		return protocolErrf("kind %q requires a payload", kind)
 	}
@@ -139,6 +142,9 @@ func validatePayload(kind Kind, payload json.RawMessage) error {
 		if len(m.Parts) == 0 {
 			return protocolErrf("kind message: payload has no parts")
 		}
+		if m.TaskID != "" && m.TaskID != taskID {
+			return protocolErrf("kind message: payload names task %q but the envelope carries taskId %q", m.TaskID, taskID)
+		}
 		return validateParts(m.Parts, "message")
 	case KindStatusUpdate:
 		var s StatusUpdate
@@ -154,6 +160,9 @@ func validatePayload(kind Kind, payload json.RawMessage) error {
 		if s.Final && !s.Status.State.Terminal() {
 			return protocolErrf("kind status-update: final=true with non-terminal state %q", s.Status.State)
 		}
+		if s.TaskID != "" && s.TaskID != taskID {
+			return protocolErrf("kind status-update: payload names task %q but the envelope carries taskId %q", s.TaskID, taskID)
+		}
 		if s.Status.Message != nil {
 			if err := validateParts(s.Status.Message.Parts, "status-update message"); err != nil {
 				return err
@@ -166,6 +175,9 @@ func validatePayload(kind Kind, payload json.RawMessage) error {
 		}
 		if len(a.Artifact.Parts) == 0 {
 			return protocolErrf("kind artifact-update: payload is not a TaskArtifactUpdateEvent (artifact has no parts)")
+		}
+		if a.TaskID != "" && a.TaskID != taskID {
+			return protocolErrf("kind artifact-update: payload names task %q but the envelope carries taskId %q", a.TaskID, taskID)
 		}
 		return validateParts(a.Artifact.Parts, "artifact-update")
 	case KindCancel, KindAgentClosed:

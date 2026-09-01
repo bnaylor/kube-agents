@@ -349,6 +349,12 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 		if env.To != nil && env.To.Session != addressee {
 			return &ProtocolError{Msg: fmt.Sprintf("envelope to %q disagrees with subject addressee %q", env.To.Session, addressee)}
 		}
+		// Same rule for the taskId: one event published onto another task's
+		// subject would fold into the wrong task's history, so the
+		// disagreement is refused at the source like the to/addressee one.
+		if env.TaskID != taskID {
+			return &ProtocolError{Msg: fmt.Sprintf("envelope taskId %q disagrees with subject taskId %q", env.TaskID, taskID)}
+		}
 	}
 	// The topic plane has the same shape of rule: dot-free tokens, and the
 	// artifact's name is the topic the subject names (assertion 16).

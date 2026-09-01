@@ -422,3 +422,29 @@ func TestDirectoryPlanePublishGate(t *testing.T) {
 		}
 	})
 }
+
+// The 0.4 subject-agreement rule covers the taskId token too: an envelope
+// published onto another task's subject would fold into the wrong task's
+// history, so the library refuses the disagreement at the source, like the
+// to/addressee one.
+func TestPublishTaskIDSubjectAgreement(t *testing.T) {
+	s := startServer(t)
+	ctx := testCtx(t)
+
+	c, err := Connect(ctx, clientURL(s), WithName("test-taskid-agree"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	env, err := NewStatusUpdateEnvelope(Party{Session: "worker-a"}, "task-a", "ctx-1", "corr-1",
+		json.RawMessage(`{"taskId":"task-a","contextId":"ctx-1","status":{"state":"working"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Publish(ctx, TaskEventsSubject("worker-a", "task-b"), env)
+	var perr *ProtocolError
+	if !errors.As(err, &perr) {
+		t.Fatalf("taskId/subject disagreement: want ProtocolError, got %v", err)
+	}
+}

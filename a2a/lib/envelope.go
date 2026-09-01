@@ -200,7 +200,7 @@ func (e *Envelope) validateCommon() error {
 			return &ProtocolError{Msg: fmt.Sprintf("kind %q carries no taskId/contextId", e.Kind)}
 		}
 	}
-	return validatePayload(e.Kind, e.Payload)
+	return validatePayload(e.Kind, e.TaskID, e.Payload)
 }
 
 // ValidateEmit checks an envelope is legal to publish: the common rules, plus
