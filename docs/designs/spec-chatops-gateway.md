@@ -235,12 +235,17 @@ the supervisor rule below is what keeps that from being a silent stop.
 
 **One rule for every pod the gateway deletes itself** (stated once here because three
 paths reach it - reap, Delegate, and any future one): if the pod is running a
-DETACHED task, the gateway publishes that task's terminal `failed` before deleting,
-as the supervisor of the sessions it spawns. Deleting first strands the task
+DETACHED task, the gateway publishes that task's terminal event before deleting, as
+the supervisor of the sessions it spawns. The state is `canceled`, not `failed`:
+every task this rule reaches is detached, and detached means a `stop` already
+published a cancel, so the gateway is finishing the cancel the requester asked for
+rather than reporting an error. That keeps assertion 13's enumeration intact
+(`canceled`, or `completed` if the race was lost) and keeps replay able to tell a
+stopped task from one that broke. Deleting first strands the task
 non-terminal for the whole retention window - the adapter's deadline dies with the
 process, and a deleted pod never reaches the terminal phase Sweep watches for - which
-would break the payload spec's every-task-has-a-supervisor rule and assertion 13,
-since a detached task got that way from a `stop` that published a cancel. Do not
+would break both that assertion and the payload spec's every-task-has-a-supervisor
+rule. Do not
 reason from the config defaults here: the adapter's deadline runs from task start and
 the idle TTL from the last user message, so which fires first is a property of two
 independently tunable numbers, not a guarantee.

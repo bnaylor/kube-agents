@@ -285,7 +285,11 @@ calls and become properties of the stream:
   heartbeats and consumer health, which the deployment spec owns. A task whose executor
   died without a terminal event gets terminal `failed` written by its supervisor - the
   gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed
-  tasks. Ratified 8/24.
+  tasks. Ratified 8/24. One refinement (8/31): `failed` is the state for an executor
+  that died mid-work, but where the supervisor is finishing a cancel the requester
+  already published - the executor is being torn down deliberately, on that cancel -
+  the terminal is `canceled`. The supervisor writes what happened, and assertion 13's
+  enumeration holds for every path a cancel can take.
 
 ### Reserved artifact names
 
