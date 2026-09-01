@@ -422,6 +422,138 @@ printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "
 	}
 }
 
+// TestSteerAfterDeliverableIsRefusedVisibly: a steer that loses the race with
+// the adapter's choice of deliverable cannot be absorbed, and the payload
+// spec requires that refusal be on the stream rather than in a log line -
+// nothing else marks this window, because the choice of deliverable is
+// adapter-internal. The refusal is a non-final status-update carrying the
+// task's current state, published before the terminal event.
+func TestSteerAfterDeliverableIsRefusedVisibly(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-ibis-g7h8", "task-late-steer-1"
+	const deliverable = "the pre-steer answer"
+	origin := submit(t, c, session, taskID, "opening prompt")
+
+	// The stub answers its one turn, touches a marker file so the test knows
+	// the deliverable is out, then lingers - holding the supervise loop open
+	// so the late steer lands while the adapter is still running.
+	marker := filepath.Join(t.TempDir(), "deliverable-emitted")
+	harness := stub(t, fmt.Sprintf(`
+echo '{"type":"system","subtype":"init","session_id":"stub-late-steer"}'
+read first || exit 1
+printf '{"type":"result","subtype":"success","result":"%s"}\n' %q
+: > %q
+sleep 10
+`, deliverable, deliverable, marker))
+	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
+	waitState(t, c, session, taskID, lib.StateWorking)
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("harness never emitted its deliverable")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The marker says the result is on the harness's stdout; give the adapter
+	// a beat to read it, so the steer below is genuinely late. If it were not
+	// late the harness would take another turn and the assertions fail - this
+	// test cannot pass by racing the wrong way.
+	time.Sleep(500 * time.Millisecond)
+
+	const steerText = "STEERWORD actually make it about NATS"
+	steerPayload, err := json.Marshal(lib.Message{
+		Role: "user", Parts: []lib.Part{{Kind: "text", Text: steerText}},
+		MessageID: "msg-late-steer-1", TaskID: taskID, ContextID: origin.ContextID,
+	})
+	if err != nil {
+		t.Fatalf("steer payload: %v", err)
+	}
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty, steerPayload,
+		lib.WithTo(lib.Party{Session: session}))
+	if err != nil {
+		t.Fatalf("steer envelope: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Publish(ctx, lib.TaskInSubject(session, taskID), steer); err != nil {
+		t.Fatalf("steer publish: %v", err)
+	}
+
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+
+	// The refusal is on the stream, before the terminal, and it is the only
+	// one: one refused message, one refusal.
+	events := replayEvents(t, url, session, taskID)
+	refusals, refusalAt, terminalAt := 0, -1, -1
+	for i, env := range events {
+		if env.Kind != lib.KindStatusUpdate {
+			continue
+		}
+		s := statusOf(t, env)
+		if s.Final {
+			terminalAt = i
+			continue
+		}
+		if s.Status.Message == nil {
+			continue
+		}
+		text := joinParts(s.Status.Message.Parts)
+		if !strings.Contains(text, "steer refused") {
+			continue
+		}
+		refusals++
+		refusalAt = i
+		if s.Status.State != lib.StateWorking {
+			t.Errorf("refusal carries state %q, want the task's current state %q",
+				s.Status.State, lib.StateWorking)
+		}
+		if !strings.Contains(text, steerText) {
+			t.Errorf("refusal does not identify the refused message: %q", text)
+		}
+	}
+	if refusals != 1 {
+		t.Fatalf("refusal events on the stream: %d, want 1", refusals)
+	}
+	if terminalAt < 0 {
+		t.Fatal("no terminal event")
+	}
+	if refusalAt > terminalAt {
+		t.Errorf("refusal published after the terminal (refusal %d, terminal %d)", refusalAt, terminalAt)
+	}
+
+	// The refusal did not steal the turn: the deliverable is still the answer
+	// the harness chose before the steer arrived.
+	task := foldTask(t, c, session, taskID)
+	if got := artifactText(task, lib.ArtifactResult); got != deliverable {
+		t.Errorf("result artifact %q, want %q", got, deliverable)
+	}
+	// Assertion 12: no state CHANGE came from the follow-up. The refusal
+	// re-states working, which is why it appears in the history twice.
+	want := []lib.TaskState{lib.StateSubmitted, lib.StateWorking, lib.StateWorking, lib.StateCompleted}
+	if fmt.Sprint(task.StatusHistory) != fmt.Sprint(want) {
+		t.Errorf("status history %v, want %v", task.StatusHistory, want)
+	}
+	if task.PostFinalDropped != 0 {
+		t.Errorf("post-final events: %d", task.PostFinalDropped)
+	}
+}
+
+func joinParts(parts []lib.Part) string {
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(p.Text)
+	}
+	return b.String()
+}
+
 // TestLifecycle_Cancel: assertion 13 - cancel produces terminal canceled and
 // the harness process is actually dead.
 func TestLifecycle_Cancel(t *testing.T) {

@@ -87,6 +87,18 @@ const resultChunkSize = 256 * 1024
 // terminal event is the one thing that must still go out.
 const terminalPublishTimeout = 20 * time.Second
 
+// steerRefusalPublishTimeout bounds the refusal publish. It is short because
+// it runs ON the supervise loop, ahead of the terminal event that is the
+// load-bearing publish: a refusal that cannot go out in this budget must not
+// be allowed to delay or displace the terminal.
+const steerRefusalPublishTimeout = 5 * time.Second
+
+// steerEchoCap bounds how much of the refused message the refusal quotes
+// back. The echo exists so a user with several corrections in flight can tell
+// WHICH one missed; the full text is already on the task's own `.in` subject,
+// so this is a pointer, not a second copy of the content.
+const steerEchoCap = 200
+
 // adapter is one task's run state.
 type adapter struct {
 	cfg  Config
@@ -314,10 +326,17 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 
 		case text := <-steerCh:
 			if sawResult || exited {
-				// Post-deliverable steer: the payload spec's post-final
-				// rule is warn-and-drop, and the terminal event is about
-				// to win the race.
-				log.Warn("steer after deliverable; dropped", "task", a.taskID)
+				// Post-deliverable steer: the deliverable is chosen and
+				// the harness is wrapping up, so this correction cannot be
+				// absorbed. The payload spec requires the refusal be
+				// VISIBLE - a non-final status-update carrying the task's
+				// current state, on the stream before the terminal event -
+				// because the alternative is that a message the user typed
+				// disappears with nothing anywhere saying so. Nothing else
+				// marks this window: the choice of deliverable is
+				// adapter-internal.
+				log.Warn("steer after deliverable; refusing visibly", "task", a.taskID)
+				a.publishSteerRefusal(text)
 				continue
 			}
 			if err := proc.writeUser(text); err != nil {
@@ -494,6 +513,69 @@ func (a *adapter) publishResult(text string) error {
 		}
 	}
 	return nil
+}
+
+// publishSteerRefusal answers one steer that arrived too late to absorb with
+// a non-final status-update carrying the task's CURRENT state - `working`,
+// because nothing terminal has been published yet and a refusal must not be
+// the thing that moves the task. One refusal per refused message: the
+// contract is that no message the user typed is dropped silently, so the
+// count matches rather than coalescing.
+//
+// Best-effort, like the other stream telemetry. A refusal that fails to
+// publish is logged loudly and the run continues to its terminal event; the
+// terminal is the load-bearing publish and must not be lost to this one.
+func (a *adapter) publishSteerRefusal(steer string) {
+	ctx, cancel := context.WithTimeout(context.Background(), steerRefusalPublishTimeout)
+	defer cancel()
+
+	text := "steer refused: this task's deliverable was already decided when the message arrived, so it was not applied. Send it as a new request."
+	if echo := truncateRunes(strings.TrimSpace(steer), steerEchoCap); echo != "" {
+		text += "\nrefused message: " + echo
+	}
+	update := lib.StatusUpdate{
+		TaskID:    a.taskID,
+		ContextID: a.contextID,
+		Status: lib.TaskStatus{
+			State: lib.StateWorking,
+			Message: &lib.Message{
+				Role:      "agent",
+				MessageID: "msg-" + nuid.Next(),
+				Parts:     []lib.Part{{Kind: "text", Text: text}},
+			},
+		},
+		Final: false,
+	}
+	payload, err := json.Marshal(update)
+	if err != nil {
+		a.log.Error("steer refusal marshal failed", "task", a.taskID, "err", err)
+		return
+	}
+	env, err := lib.NewStatusUpdateEnvelope(a.from, a.taskID, a.contextID, a.correlationID, payload)
+	if err != nil {
+		a.log.Error("steer refusal envelope failed", "task", a.taskID, "err", err)
+		return
+	}
+	if err := a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env); err != nil {
+		// Loud: the user's correction is now lost with nothing on the
+		// stream saying so, which is exactly the failure this publish
+		// exists to prevent.
+		a.log.Error("steer refusal publish failed; the refused message is now silent",
+			"task", a.taskID, "err", err)
+		return
+	}
+	a.log.Info("steer refusal published", "task", a.taskID)
+}
+
+// truncateRunes cuts on a rune boundary. The steer echo is user text and may
+// be any script; byte truncation would emit invalid UTF-8 that marshals to
+// replacement characters.
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // finalize publishes the one terminal event, exactly once per process, on a
