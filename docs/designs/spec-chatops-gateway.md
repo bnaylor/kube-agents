@@ -179,15 +179,10 @@ Two rules keep the conversation's route coherent:
   and sweep sees only terminal pod phases, so an untracked Running pod would hold its
   bus credential with nothing able to reclaim it. The active-task guard above bounds
   which pods this can reach: a delegation is only recognized when no task serializes
-  the conversation, so the pod is either idle or running a DETACHED task. Detached is
-  not closed, and that case is where the gateway's supervisor duty applies - a
-  detached task's pod deleted here would leave a task non-terminal on the stream for
-  the rest of the retention window, with the adapter's deadline dying alongside the
-  process and Sweep never seeing a terminal pod phase. So the gateway publishes the
-  terminal `failed` for a detached task before deleting its pod, as the supervisor of
-  the sessions it spawned (payload spec: every task has a supervisor; assertion 13: a
-  cancel always ends in a terminal event, never a silent stop). With that published,
-  the delete is what reap or sweep would have done anyway.
+  the conversation, so the pod is either idle or running a DETACHED task - and
+  detached is not closed, so the deletion rule in Session lifecycle applies and the
+  terminal `failed` is published first. With that done, the delete is what reap or
+  sweep would have done anyway.
 
 ## Session lifecycle
 
@@ -229,7 +224,21 @@ adapter's contract is written assuming it - so a wedged adapter also lands in Sw
 domain instead of holding its bus credential indefinitely; until that field ships, a
 wedged adapter is the one unowned end, named here rather than papered over. The
 terminal event this chain guarantees is also what deletes the active-task record (and
-the `ask` copy riding it).
+the `ask` copy riding it). A detached task is the exception on both counts: it does
+not exempt the session, so reap may delete a pod whose harness is still working, and
+the supervisor rule below is what keeps that from being a silent stop.
+
+**One rule for every pod the gateway deletes itself** (stated once here because three
+paths reach it - reap, Delegate, and any future one): if the pod is running a
+DETACHED task, the gateway publishes that task's terminal `failed` before deleting,
+as the supervisor of the sessions it spawns. Deleting first strands the task
+non-terminal for the whole retention window - the adapter's deadline dies with the
+process, and a deleted pod never reaches the terminal phase Sweep watches for - which
+would break the payload spec's every-task-has-a-supervisor rule and assertion 13,
+since a detached task got that way from a `stop` that published a cancel. Do not
+reason from the config defaults here: the adapter's deadline runs from task start and
+the idle TTL from the last user message, so which fires first is a property of two
+independently tunable numbers, not a guarantee.
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream, folds them into a transcript primer,
