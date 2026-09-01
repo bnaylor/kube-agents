@@ -239,8 +239,8 @@ the `ask` copy riding it). A detached task is the exception on both counts: it d
 not exempt the session, so reap may delete a pod whose harness is still working, and
 the supervisor rule below is what keeps that from being a silent stop.
 
-**One rule for every pod the gateway deletes itself** (stated once here because three
-paths reach it - reap, Delegate, and any future one): if the pod is running a
+**One rule for every pod the gateway deletes itself** (stated once here because four
+paths reach it - reap, Sweep, Delegate, and any future one): if the pod is running a
 DETACHED task, the gateway publishes that task's terminal event before deleting, as
 the supervisor of the sessions it spawns. The state is `canceled`, not `failed`:
 every task this rule reaches is detached, and detached means a `stop` already
@@ -267,9 +267,15 @@ that suddenly remembers June. If review disagrees, the fix is a compacted transc
 topic, not longer task retention.
 
 **Sweep**, as in the demo: a pod in a terminal phase whose task never emitted a final
-event gets a terminal `failed` published by the gateway, then deleted. This is the
+event gets a terminal event published by the gateway, then deleted. This is the
 gateway's half of the payload spec's orphaned-task answer - it is the supervisor for
-sessions it spawned; the dispatcher's janitor is the other half (settled 8/24).
+sessions it spawned; the dispatcher's janitor is the other half (settled 8/24). The
+state follows the same rule as every other supervisor publish below: `failed` for a
+task whose executor died mid-work, `canceled` where the task had already detached and
+the gateway is finishing a cancel the requester published. Sweep reaches detached
+tasks routinely - a worker that exits or wedges after a `stop` leaves exactly this
+shape - so an unconditional `failed` here would report broken for every task a user
+stopped, which is the distinction the rule exists to keep.
 
 ## Requester identity on the bus
 

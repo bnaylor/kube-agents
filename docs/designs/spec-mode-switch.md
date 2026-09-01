@@ -64,7 +64,13 @@ third mode, an older operator binary reads it. Silently rendering `today` at tha
 the cluster runs something other than what the spec asks, with nothing in
 `kubectl describe` to say so. Instead the reconciler goes Degraded through the existing
 `updateStatusDegraded` path with a named reason, `ModeNotRecognized`, keeps rendering
-today's stack, and requeues (same Degraded pattern as `RuntimeClassNotFound`) - and the
+today's stack, and requeues. It reaches Degraded by a different route from
+`RuntimeClassNotFound`, and the difference is the point: that check returns early, so
+nothing downstream of it renders, while the mode check is evaluated at the top and its
+error CARRIED - every render step still runs, including the workload, and Degraded is
+reported at the end instead of Ready. A skew that returned early would neither pin the
+managed `.env` nor move the config hash, leaving the running fleet on `next` behavior
+with only a status message to say otherwise. And the
 two layers the mode touches are split deliberately on skew. The mode DELIVERED to the
 agent fails closed: the managed `.env` pins `today`, the config hash moves, and the
 fleet rolls to today's behavior - the skill is withdrawn, which is what fail-closed
