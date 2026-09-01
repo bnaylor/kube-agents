@@ -1191,9 +1191,13 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 // unfenced with the worker credential in its env, but bounded: the adapter
 // self-terminates at its task deadline (default 1800s), the bus it would
 // dial is being torn down in the same pass, and pre-W6.2 these pods were
-// never fenced at all. Reaping unowned pods from the operator would need a
-// deliberate exception to the IsControlledBy refusal below; until someone
-// makes that call, the window is documented rather than closed.
+// never fenced at all. The close (S9, decided by the darkness audit): the
+// gateway stamps an ownerReference to its own Deployment on every pod it
+// spawns (A2A_OWNER_DEPLOYMENT above), so deleting the gateway here hands
+// the stragglers to Kubernetes GC — no operator exception to the
+// IsControlledBy refusal below. That arms when the S9 gateway half
+// (a2a/w3-gateway) is the running image; pods spawned by an older gateway
+// are unowned and keep the bounded window described above.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// Deployment/StatefulSet/Service reads come from the cache — those kinds
 	// are already watched (Owns) so the reads are free. Secret and Job reads
