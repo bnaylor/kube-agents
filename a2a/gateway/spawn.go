@@ -103,7 +103,11 @@ func newPodSpawner(cfg *Config, log *slog.Logger) (*podSpawner, error) {
 		return nil, err
 	}
 	s := &podSpawner{cfg: cfg, client: cs, log: log}
-	if err := s.resolveOwner(context.Background()); err != nil {
+	// Bounded, so a hung API server fails boot fast into the crashloop
+	// backoff instead of hanging it.
+	rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.resolveOwner(rctx); err != nil {
 		// Refuse to boot rather than quietly spawn unowned pods: an owner
 		// was configured, so the orphaned-session window is supposed to be
 		// closed, and a GET that fails here is a misconfig (name, RBAC) the
@@ -468,6 +472,15 @@ func (g *Gateway) closeDetachedBeforeDelete(ctx context.Context, rec *SessionRec
 	// The task ran under the addressee its own subjects carried — after a
 	// Delegate re-home rec.Addressee is already the successor's.
 	addressee := rec.AddresseeFor(active.TaskID)
+	// Sweep's guard, for the same reason: Detached means the terminal has
+	// not been RELAYED, not that it does not exist. A worker that confirmed
+	// the cancel before the relay clears the flag — relay lag, a restart
+	// with the delete already done — already put the one final on the
+	// stream, and a second would be the protocol error assertion 10 makes
+	// every consumer surface.
+	if task, err := g.client.TasksGet(ctx, addressee, active.TaskID); err == nil && task.Final {
+		return true
+	}
 	err := g.publishSupervisorTerminal(ctx, addressee, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.StateCanceled, "the requester's stop, completed by the supervisor at pod retirement")
 	if err != nil {

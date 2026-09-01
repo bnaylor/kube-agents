@@ -729,6 +729,10 @@ type fakeSpawner struct {
 	orphans []orphanPod
 	live    int
 	liveErr error
+	// onDelete, when set, observes the moment of deletion — the supervisor
+	// tests use it to assert the terminal was already on the stream when
+	// the pod went, which "terminal exists and pod deleted" alone cannot.
+	onDelete func(podName string)
 }
 
 type fakeSpawn struct {
@@ -745,8 +749,12 @@ func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ str
 
 func (s *fakeSpawner) Delete(_ context.Context, podName string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	hook := s.onDelete
 	s.deletes = append(s.deletes, podName)
+	s.mu.Unlock()
+	if hook != nil {
+		hook(podName)
+	}
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -198,10 +199,13 @@ func FromEnv() (*Config, error) {
 
 	// Salt precedence: the install's provisioned SESSION_KV_SALT is the
 	// salt (the spec's settled answer); the explicit override and the
-	// derived fallback are playground posture, in that order.
+	// derived fallback are playground posture, in that order. The trim is
+	// load-bearing: the shipped redactor does `.strip()` on this same env,
+	// and two readers of one Secret must agree byte-for-byte or a trailing
+	// newline in a hand-made Secret silently unjoins every pseudonym.
 	switch {
-	case os.Getenv("SESSION_KV_SALT") != "":
-		cfg.AttributionSalt = []byte(os.Getenv("SESSION_KV_SALT"))
+	case strings.TrimSpace(os.Getenv("SESSION_KV_SALT")) != "":
+		cfg.AttributionSalt = []byte(strings.TrimSpace(os.Getenv("SESSION_KV_SALT")))
 	case os.Getenv("A2A_ATTRIBUTION_SALT") != "":
 		cfg.AttributionSalt = []byte(os.Getenv("A2A_ATTRIBUTION_SALT"))
 	default:

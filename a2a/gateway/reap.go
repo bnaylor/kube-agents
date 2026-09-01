@@ -9,10 +9,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// reapLoop enforces the idle TTL: a session silent past the TTL loses its
-// pod. Nothing is saved first, because the stream already has everything —
-// that's the whole point of the transcript of record. The KV entry stays,
-// holding the contextId.
+// reapLoop enforces the idle TTL — a session silent past the TTL loses its
+// pod — and the ask bound (boundAskCopy), which runs on every record the
+// scan visits, pod or no pod. Nothing is saved first, because the stream
+// already has everything — that's the whole point of the transcript of
+// record. The KV entry stays, holding the contextId.
 func (g *Gateway) reapLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()

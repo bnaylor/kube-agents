@@ -56,6 +56,17 @@ func TestFromEnvSaltPrecedence(t *testing.T) {
 		t.Fatalf("SESSION_KV_SALT must win over every fallback: %q", cfg.AttributionSalt)
 	}
 
+	// The shipped redactor does .strip() on this env; a Secret made from a
+	// file with a trailing newline must hash the same on both surfaces.
+	t.Setenv("SESSION_KV_SALT", "\ninstall-salt \n")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(cfg.AttributionSalt) != "install-salt" {
+		t.Fatalf("SESSION_KV_SALT not trimmed to match the redactor: %q", cfg.AttributionSalt)
+	}
+
 	// No salt of any kind and an empty password: the derived fallback would
 	// be a public constant — refuse at boot.
 	t.Setenv("SESSION_KV_SALT", "")

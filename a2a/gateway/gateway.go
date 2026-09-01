@@ -292,17 +292,38 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 			msg.Text = rest
-		} else if rec.SessionRouted && rec.PodName == "" {
-			// A session-routed conversation with no live incarnation gets a
-			// fresh bus session name before the task's addressee is chosen -
-			// a spawn, so the cap holds here too, or Delegate refusals just
-			// push the flood one affordance over.
-			if g.refuseAtSessionCap(ctx, rec, false) {
+		} else if rec.SessionRouted {
+			// Every new task on the session route gets a fresh incarnation.
+			// The worker adapter is one task per process, so a lingering
+			// PodName names an executor that can never serve this task -
+			// publishing toward it wedges the conversation with a task
+			// nothing will run and nothing will terminate (S9 review
+			// finding). Retire it the way Delegate does: supervisor
+			// terminal for a detached task first, then the delete, then
+			// the successor. The cap holds here too, or Delegate refusals
+			// just push the flood one affordance over.
+			if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
 				return
+			}
+			if rec.PodName != "" {
+				if !g.closeDetachedBeforeDelete(ctx, rec) {
+					g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
+					return
+				}
+				// Spawner-nil is the W4-rollback shape: the record is
+				// session-routed but nothing can manage pods. Clear the
+				// binding and degrade the way this path always did.
+				if g.spawner != nil {
+					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+						g.log.Warn("previous incarnation delete failed; pod may linger",
+							"pod", rec.PodName, "err", err)
+					}
+				}
+				rec.PodName = ""
 			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
-		} else if !rec.SessionRouted {
+		} else {
 			// Re-home after a delegated task: a plain ask on a fixed-route
 			// conversation always goes to the configured addressee, never
 			// to a dead delegate session.
@@ -518,8 +539,13 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	}
 	active.Detached = true
 	// Detached outlives ActiveTask (a new turn overwrites it), so the
-	// cancel is also recorded on the task's history entry — the durable
-	// evidence Sweep reads when it must choose `canceled` over `failed`.
+	// cancel is also recorded on the task's history entry — the evidence
+	// Sweep reads when it must choose `canceled` over `failed`. It rides
+	// the end-of-turn record write, so a sustained KV failure at exactly
+	// this moment can lose the mark while the cancel stands, and a later
+	// sweep would then say `failed` for a task the user stopped. Known
+	// residue; replaying the in subject for the cancel envelope is the
+	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
 	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
 }

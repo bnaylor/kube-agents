@@ -2,6 +2,9 @@ package gateway
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -472,7 +475,9 @@ func TestLiveSaltJoinsAcrossSurfaces(t *testing.T) {
 		PrincipalMapPath: mapFile,
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
-		AttributionSalt:  []byte(salt),
+		// Trimmed the way FromEnv trims it, so this gateway is configured
+		// exactly as the deployed one.
+		AttributionSalt: []byte(strings.TrimSpace(salt)),
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
 	if err != nil {
@@ -511,7 +516,14 @@ func TestLiveSaltJoinsAcrossSurfaces(t *testing.T) {
 	if err := json.Unmarshal(env.Authority, &a); err != nil {
 		t.Fatalf("authority block: %v", err)
 	}
-	want := NewPseudonymizer([]byte(salt)).Hash("test:bnaylor")
+	// The expectation is constructed independently of the Pseudonymizer —
+	// raw HMAC over the stripped salt, the way the shipped redactor
+	// computes it (hmac.new(salt.strip(), value, sha256).hexdigest()) — so
+	// a construction divergence between the two surfaces fails here
+	// instead of passing a gateway-equals-gateway comparison.
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(salt)))
+	mac.Write([]byte("test:bnaylor"))
+	want := "hmac:" + hex.EncodeToString(mac.Sum(nil))[:32]
 	if a.Requester.Principal != want {
 		t.Fatalf("principal on the bus = %s, want %s (HMAC under the install salt)", a.Requester.Principal, want)
 	}

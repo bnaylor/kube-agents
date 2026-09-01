@@ -17,17 +17,18 @@ import (
 
 // eventsEnvelopes replays everything on an addressee's events subjects —
 // the supervisor tests read the stream, not the gateway's memory, because
-// the property under test is what replay sees.
-func eventsEnvelopes(t *testing.T, url, addressee string) []*lib.Envelope {
-	t.Helper()
+// the property under test is what replay sees. Error-returning (no
+// *testing.T) so the fake spawner's onDelete hook can call it from the
+// gateway's own goroutine.
+func eventsEnvelopes(url, addressee string) ([]*lib.Envelope, error) {
 	nc, err := nats.Connect(url)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer nc.Close()
 	js, err := jetstream.New(nc)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -35,12 +36,12 @@ func eventsEnvelopes(t *testing.T, url, addressee string) []*lib.Envelope {
 		FilterSubjects: []string{fmt.Sprintf("a2a.tasks.%s.*.events", addressee)},
 	})
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	var out []*lib.Envelope
 	it, err := cons.Messages()
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer it.Stop()
 	for {
@@ -55,14 +56,19 @@ func eventsEnvelopes(t *testing.T, url, addressee string) []*lib.Envelope {
 			out = append(out, env)
 		}
 	}
-	return out
+	return out, nil
 }
 
-// terminalFor returns the final status-update for a task on an addressee's
-// events, or nil.
-func terminalFor(t *testing.T, url, addressee, taskID string) *lib.StatusUpdate {
-	t.Helper()
-	for _, env := range eventsEnvelopes(t, url, addressee) {
+// finalsFor returns every final status-update for a task on an addressee's
+// events — the payload spec allows exactly one, so a slice longer than that
+// is itself a finding.
+func finalsFor(url, addressee, taskID string) ([]lib.StatusUpdate, error) {
+	envs, err := eventsEnvelopes(url, addressee)
+	if err != nil {
+		return nil, err
+	}
+	var out []lib.StatusUpdate
+	for _, env := range envs {
 		if env.Kind != lib.KindStatusUpdate || env.TaskID != taskID {
 			continue
 		}
@@ -71,10 +77,31 @@ func terminalFor(t *testing.T, url, addressee, taskID string) *lib.StatusUpdate 
 			continue
 		}
 		if s.Final {
-			return &s
+			out = append(out, s)
 		}
 	}
-	return nil
+	return out, nil
+}
+
+// hasTerminal is finalsFor as a hook-safe boolean: errors read as "not
+// there", which can only fail an assertion, never pass one.
+func hasTerminal(url, addressee, taskID string) bool {
+	finals, err := finalsFor(url, addressee, taskID)
+	return err == nil && len(finals) > 0
+}
+
+// terminalFor returns the final status-update for a task on an addressee's
+// events, or nil.
+func terminalFor(t *testing.T, url, addressee, taskID string) *lib.StatusUpdate {
+	t.Helper()
+	finals, err := finalsFor(url, addressee, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finals) == 0 {
+		return nil
+	}
+	return &finals[0]
 }
 
 // TestDelegateOverDetachedPublishesCanceledBeforeDelete: the one rule for
@@ -108,6 +135,12 @@ func TestDelegateOverDetachedPublishesCanceledBeforeDelete(t *testing.T) {
 		return false
 	})
 
+	// The ordering is the rule's whole content: at the moment of deletion
+	// the terminal must already be on the stream — "terminal exists and
+	// pod deleted" would also pass a delete-then-publish regression.
+	atDelete := make(chan bool, 4)
+	spawn.onDelete = func(string) { atDelete <- hasTerminal(r.url, first.Session, first.TaskID) }
+
 	r.adapter.inbox <- InboundMessage{
 		Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "s-102", Text: "Delegate: second task",
@@ -116,6 +149,9 @@ func TestDelegateOverDetachedPublishesCanceledBeforeDelete(t *testing.T) {
 
 	if deleted := spawn.deleted(); len(deleted) != 1 || deleted[0] != first.Session {
 		t.Fatalf("previous incarnation not retired: %v", deleted)
+	}
+	if !<-atDelete {
+		t.Fatal("pod deleted before its task's terminal was on the stream")
 	}
 	s := terminalFor(t, r.url, first.Session, first.TaskID)
 	if s == nil {
@@ -144,11 +180,16 @@ func TestReapDetachedPublishesCanceledBeforeDelete(t *testing.T) {
 	if err := r.g.reg.Put(context.Background(), rec); err != nil {
 		t.Fatal(err)
 	}
+	atDelete := make(chan bool, 4)
+	spawn.onDelete = func(string) { atDelete <- hasTerminal(r.url, "chat-heron-r1", "task-sup2") }
 
 	r.g.reapOnce(context.Background())
 
 	if deleted := spawn.deleted(); len(deleted) != 1 || deleted[0] != "chat-heron-r1" {
 		t.Fatalf("idle detached pod not reaped: %v", deleted)
+	}
+	if !<-atDelete {
+		t.Fatal("reap deleted the pod before its task's terminal was on the stream")
 	}
 	s := terminalFor(t, r.url, "chat-heron-r1", "task-sup2")
 	if s == nil {
@@ -184,8 +225,8 @@ func TestReapIdlePodWithoutTaskPublishesNothing(t *testing.T) {
 	if deleted := spawn.deleted(); len(deleted) != 1 || deleted[0] != "chat-vole-r2" {
 		t.Fatalf("idle pod not reaped: %v", deleted)
 	}
-	if envs := eventsEnvelopes(t, r.url, "chat-vole-r2"); len(envs) != 0 {
-		t.Fatalf("idle reap published %d events; want none", len(envs))
+	if envs, err := eventsEnvelopes(r.url, "chat-vole-r2"); err != nil || len(envs) != 0 {
+		t.Fatalf("idle reap published %d events (err=%v); want none", len(envs), err)
 	}
 }
 
@@ -287,6 +328,125 @@ func TestMintAdoptsTheRaceWinner(t *testing.T) {
 	}
 	if rec.ContextID != "ctx-winner" {
 		t.Fatalf("loser minted its own identity: %q, want the winner's ctx-winner", rec.ContextID)
+	}
+}
+
+// TestNoSecondFinalWhenWorkerAlreadyConfirmed: Detached means the terminal
+// has not been RELAYED, not that it does not exist. A worker that confirmed
+// the cancel before the relay clears the flag already put the one final on
+// the stream; the retirement path must find it there (sweep's guard) and
+// publish nothing, or the gateway itself authors the protocol error
+// assertion 10 makes every consumer surface.
+func TestNoSecondFinalWhenWorkerAlreadyConfirmed(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-sup5"
+	// A detached task whose executor's own final canceled is already on
+	// the stream, with the relay's clear not yet applied to the record —
+	// the relay-lag shape.
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-sup5", Kind: "group",
+		Addressee: "chat-marten-x1", BusSession: "chat-marten-x1", PodName: "chat-marten-x1",
+		SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC(),
+		ActiveTask:   &ActiveTask{TaskID: "task-sup5", CorrelationID: "corr-sup5", Detached: true},
+		Tasks:        []TaskRef{{ID: "task-sup5", Addressee: "chat-marten-x1", Canceled: true}},
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: "task-sup5", ContextID: "ctx-sup5",
+		Status: lib.TaskStatus{State: lib.StateCanceled}, Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: "chat-marten-x1", AgentType: "test-worker"},
+		"task-sup5", "ctx-sup5", "corr-sup5", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject("chat-marten-x1", "task-sup5"), env); err != nil {
+		t.Fatal(err)
+	}
+
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "s-150", Text: "Delegate: next thing",
+	}
+	waitFor(t, "successor spawn", func() bool { return len(spawn.calls()) == 1 })
+	if deleted := spawn.deleted(); len(deleted) != 1 || deleted[0] != "chat-marten-x1" {
+		t.Fatalf("previous incarnation not retired: %v", deleted)
+	}
+	finals, err := finalsFor(r.url, "chat-marten-x1", "task-sup5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finals) != 1 {
+		t.Fatalf("stream carries %d finals for the task, want exactly the worker's own", len(finals))
+	}
+}
+
+// TestSessionRoutePlainAskRetiresDeadIncarnation: the worker adapter is one
+// task per process, so on the session route a lingering PodName names an
+// executor that can never serve a NEW task — a plain ask must retire it the
+// way Delegate does (terminal for a detached task first) and mint the
+// successor, not publish toward the dead addressee and wedge the
+// conversation (S9 review finding 4).
+func TestSessionRoutePlainAskRetiresDeadIncarnation(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-sup6"
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-sup6", Kind: "group",
+		Addressee: "chat-puffin-d1", BusSession: "chat-puffin-d1", PodName: "chat-puffin-d1",
+		SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC(),
+		ActiveTask:   &ActiveTask{TaskID: "task-sup6", CorrelationID: "corr-sup6", Detached: true},
+		Tasks:        []TaskRef{{ID: "task-sup6", Addressee: "chat-puffin-d1", Canceled: true}},
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "s-160", Text: "hello again",
+	}
+	waitFor(t, "fresh incarnation for the plain ask", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	if call.Session == "chat-puffin-d1" {
+		t.Fatalf("plain ask reused the dead incarnation %q", call.Session)
+	}
+	if deleted := spawn.deleted(); len(deleted) != 1 || deleted[0] != "chat-puffin-d1" {
+		t.Fatalf("dead incarnation not retired: %v", deleted)
+	}
+	s := terminalFor(t, r.url, "chat-puffin-d1", "task-sup6")
+	if s == nil || s.Status.State != lib.StateCanceled {
+		t.Fatalf("detached task's terminal = %+v, want canceled before the retirement", s)
+	}
+	// And the completed-pod shape: ActiveTask already cleared, pod still
+	// bound. Nothing is owed to the stream, but the successor must not
+	// publish toward the dead addressee.
+	conv2 := "discord:g1/thread-sup7"
+	rec2 := &SessionRecord{
+		Key: conv2, ContextID: "ctx-sup7", Kind: "group",
+		Addressee: "chat-vole-d2", BusSession: "chat-vole-d2", PodName: "chat-vole-d2",
+		SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC(),
+	}
+	if err := r.g.reg.Put(context.Background(), rec2); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv2, Kind: "group",
+		AuthorID: "1001", MessageID: "s-161", Text: "one more",
+	}
+	waitFor(t, "fresh incarnation after a completed pod", func() bool { return len(spawn.calls()) == 2 })
+	if call := spawn.calls()[1]; call.Session == "chat-vole-d2" {
+		t.Fatalf("plain ask reused the completed incarnation %q", call.Session)
+	}
+	if envs, err := eventsEnvelopes(r.url, "chat-vole-d2"); err != nil || len(envs) != 0 {
+		t.Fatalf("retiring an idle pod published %d events (err=%v); want none", len(envs), err)
 	}
 }
 
