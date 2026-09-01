@@ -919,11 +919,24 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"pods"},
-			Verbs:     []string{"create", "get", "list", "watch", "delete"},
-		}},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"create", "get", "list", "watch", "delete"},
+			},
+			// One read, on one named object: the gateway resolves its own
+			// Deployment's UID at boot to build the ownerReference its
+			// spawned pods carry (an ownerReference is name+UID, and the UID
+			// exists only server-side). resourceNames pins the grant to
+			// exactly that Deployment — this is not a deployments read.
+			{
+				APIGroups:     []string{"apps"},
+				Resources:     []string{"deployments"},
+				ResourceNames: []string{a2aGatewayName(agent)},
+				Verbs:         []string{"get"},
+			},
+		},
 	}
 }
 
@@ -997,6 +1010,22 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
 								FieldPath: "metadata.namespace",
 							}}},
+							// The attribution salt is SESSION_KV_SALT, the
+							// same Secret key the platform agent hashes
+							// session metadata with (settled 8/31) — one
+							// human, one pseudonym, on the bus and in
+							// session metadata, or the cross-surface audit
+							// join silently yields nothing. Same resolver as
+							// the agent render, same optional posture: a pod
+							// without it degrades to the gateway's derived
+							// fallback, the recorded deviation.
+							{Name: "SESSION_KV_SALT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVSaltSecretRef(agent)}},
+							// The gateway's own Deployment: spawned session
+							// pods carry an ownerReference to it, so
+							// Kubernetes GC reaps sessions when cleanupA2A —
+							// or anything else — deletes the gateway. The
+							// Role above grants the one get this needs.
+							{Name: "A2A_OWNER_DEPLOYMENT", Value: name},
 						},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,

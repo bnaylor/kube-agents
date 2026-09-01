@@ -804,10 +804,22 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	if ns.ValueFrom == nil || ns.ValueFrom.FieldRef == nil || ns.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
 		t.Errorf("POD_NAMESPACE = %+v", ns)
 	}
+	// The salt: the SAME Secret key the platform agent hashes session
+	// metadata with, through the same resolver — the cross-surface join is
+	// the property.
+	salt := env["SESSION_KV_SALT"]
+	if salt.ValueFrom == nil || salt.ValueFrom.SecretKeyRef == nil ||
+		salt.ValueFrom.SecretKeyRef.Name != "platform-agent-secrets" ||
+		salt.ValueFrom.SecretKeyRef.Key != "SESSION_KV_SALT" {
+		t.Errorf("SESSION_KV_SALT = %+v", salt)
+	}
+	if env["A2A_OWNER_DEPLOYMENT"].Value != "test-agent-a2a-gateway" {
+		t.Errorf("A2A_OWNER_DEPLOYMENT = %+v", env["A2A_OWNER_DEPLOYMENT"])
+	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 1 {
-		t.Fatalf("gateway Role has %d rules, want exactly the pod rule", len(role.Rules))
+	if len(role.Rules) != 2 {
+		t.Fatalf("gateway Role has %d rules, want the pod rule plus the pinned owner get", len(role.Rules))
 	}
 	rule := role.Rules[0]
 	if len(rule.Resources) != 1 || rule.Resources[0] != "pods" {
@@ -821,6 +833,15 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 		if !wantVerbs[v] {
 			t.Errorf("unexpected verb %q", v)
 		}
+	}
+	// The owner rule is one verb on one named object — a deployments read
+	// would be a finding.
+	owner := role.Rules[1]
+	if len(owner.APIGroups) != 1 || owner.APIGroups[0] != "apps" ||
+		len(owner.Resources) != 1 || owner.Resources[0] != "deployments" ||
+		len(owner.Verbs) != 1 || owner.Verbs[0] != "get" ||
+		len(owner.ResourceNames) != 1 || owner.ResourceNames[0] != "test-agent-a2a-gateway" {
+		t.Errorf("owner rule = %+v", owner)
 	}
 
 	rb := buildA2AGatewayRoleBinding(agent)
