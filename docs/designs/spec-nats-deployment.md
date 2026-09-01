@@ -81,9 +81,17 @@ Three KV buckets ride the same JetStream deployment:
 - `session-state` - the gateway's session registry (session key, `contextId`, current
   pod, roster, and the active task's bounded ask echo - user content, deliberately; the
   gateway design owns the content-vs-identifier rule). The gateway's user is the only
-  writer, and since the 8/31 narrowing the only reader too: no other user holds
-  `$KV.session-state.>` on either side, and the web user's consumer-create route into
-  the bucket is closed by its per-stream enumeration.
+  writer by grant, and since the 8/31 narrowing the only reader too: no other user
+  holds `$KV.session-state.>` on either side, and the web user's consumer-create route
+  INTO the bucket - a push consumer bound to `KV_session-state` - is closed by the
+  per-stream enumeration. One write route survives and is the deliver-subject residue
+  recorded with the web user below, not an exception to it: a consumer created on a
+  granted stream may aim its deliver subject at `$KV.session-state.>`, and the server's
+  own replay publishes land as bucket revisions. What the gateway reads back is
+  corruptible that way - current pod name, bus session name, roster - so "only writer"
+  is a statement about grants, not a property the subject list enforces. The residue's
+  closes are the residue paragraph's: the callout, or a separate account with an
+  export/import.
 - A bucket reserved for capability entries per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`), which landed on KV-backed
   capabilities. Reserved so the account layout allows for it; it arms with the
@@ -287,12 +295,12 @@ deployment's job is to keep the substrate intact and reachable:
   `max_bytes`.
 - The audit path is read-only by construction: the exporter's user may subscribe and may
   not publish, enforced at connect like everything else.
-- The attribution salt the gateway hashes identifiers with must be one value per
-  install - replicas must agree or the pseudonyms on the stream stop joining. A
-  dedicated salt Secret provisioned with this deployment is the target shape; stage 1
-  derives the salt from the shared bus credential when none is configured. The gateway
-  design owns that rule and its rotation hazard; this deployment owes the Secret when
-  it lands.
+- The attribution salt the gateway hashes identifiers with is `SESSION_KV_SALT`, the
+  per-install salt the chart already provisions into `platform-agent-secrets` for the
+  shipped attribution path - not a new secret this deployment mints. Replicas must
+  read that one value or the pseudonyms on the stream stop joining, to each other and
+  to session metadata. The gateway design owns the rule and why a second salt is worse
+  than no salt.
 - W stays a tenancy decision as well as a cost one - the bus holds labelled content at rest
   for the whole window.
 

@@ -177,10 +177,17 @@ Two rules keep the conversation's route coherent:
 - **The previous incarnation dies at delegation, deliberately.** A lingering pod from
   an earlier incarnation is deleted, not merely untracked: reap walks session records
   and sweep sees only terminal pod phases, so an untracked Running pod would hold its
-  bus credential with nothing able to reclaim it. The active-task guard above is what
-  makes this safe - a delegation is only recognized with no live task in flight, so
-  the previous task is already closed (healed or detached) and the delete is what
-  reap or sweep would have done anyway.
+  bus credential with nothing able to reclaim it. The active-task guard above bounds
+  which pods this can reach: a delegation is only recognized when no task serializes
+  the conversation, so the pod is either idle or running a DETACHED task. Detached is
+  not closed, and that case is where the gateway's supervisor duty applies - a
+  detached task's pod deleted here would leave a task non-terminal on the stream for
+  the rest of the retention window, with the adapter's deadline dying alongside the
+  process and Sweep never seeing a terminal pod phase. So the gateway publishes the
+  terminal `failed` for a detached task before deleting its pod, as the supervisor of
+  the sessions it spawned (payload spec: every task has a supervisor; assertion 13: a
+  cancel always ends in a terminal event, never a silent stop). With that published,
+  the delete is what reap or sweep would have done anyway.
 
 ## Session lifecycle
 
@@ -277,14 +284,22 @@ metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds label
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
 gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
-lowest-common-denominator grant computation when the authority work lands. The salt
-must be one value per install, shared by every replica - or hashes diverge between
-turns of the same conversation and `openDirect` routing and audit joins silently
-corrupt. A dedicated salt Secret is the target shape; stage 1 derives the salt from
-the shared bus credential when none is configured, which keeps replicas agreeing but
-couples the pseudonyms to a password rotation - rotate the NATS password and every
-pseudonym on the stream stops joining to its history. Named here so the rotation
-hazard is a known cost, not a surprise.
+lowest-common-denominator grant computation when the authority work lands.
+
+**The salt is `SESSION_KV_SALT`, the one the install already provisions** (settled
+8/31). It is generated once into `platform-agent-secrets`, deliberately never
+rewritten on upgrade - rotating it re-anonymises every user and breaks correlation
+with their own history - and it is what the shipped attribution path already hashes
+with. Using it is what makes the "same posture" claim above true rather than
+approximate: one human hashes to one value in session metadata and in
+`authority.requester.principal`, so the cross-surface audit join resolves. A second
+salt would not merely be redundant, it would silently yield nothing on exactly the
+join this rule exists to preserve. The requirement that follows: one value per
+install, read by every gateway replica from that Secret. Deriving a salt from
+another credential - the stage 1 gateway derives from the bus password when none is
+configured - is a deviation on two counts, the broken join and a de-anonymization
+key handed to whoever holds that credential over an identifier space (chat emails, a
+room roster) small enough to enumerate.
 
 **The rule covers identifiers, not content (stated explicitly 8/31; it was always the
 design, never written down).** Task content cannot be pseudonymized without destroying
