@@ -9,13 +9,25 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+const (
+	// reapInterval paces the idle scan; reapPassTimeout bounds one pass so
+	// a hung registry or API call cannot make passes pile up. Same clock
+	// and reasoning as the orphan sweep's pair in spawn.go.
+	reapInterval    = time.Minute
+	reapPassTimeout = time.Minute
+	// primerTaskResultCap bounds one task's result text in the rehydration
+	// primer, so one giant artifact cannot crowd every other task out of a
+	// fresh pod's first input.
+	primerTaskResultCap = 2000
+)
+
 // reapLoop enforces the idle TTL — a session silent past the TTL loses its
 // pod — and the ask bound (boundAskCopy), which runs on every record the
 // scan visits, pod or no pod. Nothing is saved first, because the stream
 // already has everything — that's the whole point of the transcript of
 // record. The KV entry stays, holding the contextId.
 func (g *Gateway) reapLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(reapInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -28,7 +40,7 @@ func (g *Gateway) reapLoop(ctx context.Context) {
 }
 
 func (g *Gateway) reapOnce(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, reapPassTimeout)
 	defer cancel()
 	recs, err := g.reg.Sessions(ctx)
 	if err != nil {
@@ -141,8 +153,8 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		fmt.Fprintf(&b, "\n--- task %s (%s)\n", task.ID, task.State)
 		if art := task.Artifact(lib.ArtifactResult); art != nil {
 			text := joinTextParts(art.Parts)
-			if len(text) > 2000 {
-				text = text[:2000] + "…"
+			if len(text) > primerTaskResultCap {
+				text = text[:primerTaskResultCap] + "…"
 			}
 			b.WriteString(text)
 			b.WriteString("\n")
