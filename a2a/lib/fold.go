@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -211,19 +212,34 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 // deleteReplayConsumer removes the ephemeral consumer a replay built. It runs on
 // every exit from TasksGet, including the ones where ctx is already dead — a
 // caller who cancelled mid-replay leaks a consumer otherwise, which is the case
-// most likely to happen in bulk — so the delete carries its own short deadline
-// rather than the caller's context. A delete that fails is logged and nothing
-// more: the consumer's InactiveThreshold still reaps it, just five minutes later.
+// most likely to happen in bulk — so the delete carries its own deadline rather
+// than the caller's context.
+//
+// Both bounds on that deadline are deliberate. TasksGet sits on the gateway's
+// terminal path, so the cleanup must never become a stall: a disconnected
+// connection buffers the request instead of refusing it, which turns a dead bus
+// into seconds of latency per call at exactly the moment the gateway should be
+// shedding load. So an unreachable server is skipped outright rather than
+// waited on, and a reachable but slow one gets one second. Giving up costs
+// nothing that matters — InactiveThreshold still reaps the consumer, five
+// minutes later, and five minutes of one idle consumer is the cheaper failure.
 func (c *Client) deleteReplayConsumer(ctx context.Context, cons jetstream.Consumer, taskID string) {
 	info := cons.CachedInfo()
 	if info == nil || info.Name == "" {
 		return
 	}
-	_, js := c.conn()
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	nc, js := c.conn()
+	if nc == nil || nc.Status() != nats.CONNECTED {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
+	// Not found means someone already removed it — nats.go's own reset does
+	// that — and a connection that closed under us is the case above losing a
+	// race, not a fault. Neither is worth waking anyone for.
 	if err := js.DeleteConsumer(ctx, TasksStream, info.Name); err != nil &&
-		!errors.Is(err, jetstream.ErrConsumerNotFound) {
+		!errors.Is(err, jetstream.ErrConsumerNotFound) &&
+		!errors.Is(err, nats.ErrConnectionClosed) {
 		c.log.Warn("a2a replay consumer not deleted",
 			"task", taskID, "consumer", info.Name, "err", err)
 	}

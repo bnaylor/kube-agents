@@ -226,22 +226,51 @@ func TestTasksGet_DoesNotExhaustMaxConsumers(t *testing.T) {
 	}
 
 	// The half that proves the consumers went away rather than that the replays
-	// happened to fit: someone else must still be able to open one.
-	nc, err := nats.Connect(clientURL(s))
+	// happened to fit under the cap. "Room for one more" is satisfied by an
+	// implementation that leaks one at a time; a count is not.
+	if n := streamConsumerCount(t, clientURL(s), TasksStream); n != 0 {
+		t.Fatalf("TASKS carries %d consumers after %d replays, want 0", n, replays)
+	}
+}
+
+// The cleanup has to be a defer rather than a step on the success path, because
+// the error exits are where a leak compounds: a caller retrying a tasks/get
+// that keeps failing leaks once per attempt. Driving TasksGet to a fold error
+// is the cheapest of the four error returns to reach deterministically.
+func TestTasksGet_DeletesItsConsumerOnAnErrorExit(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	c := replayFixture(t, clientURL(s), "task-pe", []TaskState{StateSubmitted})
+	ctx := testCtx(t)
+
+	// A status-update whose payload names a different task than its envelope:
+	// it survives replay's kind and addressee filters and fails in FoldTask.
+	origin, err := NewMessageEnvelope(Party{Session: "chatops"}, "task-pe", "ctx-task-pe", "corr-pe",
+		validMessagePayload())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer nc.Close()
-	js, err := jetstream.New(nc)
+	exec, err := c.NewTaskExecution(origin, Party{Session: "worker-task-pe"}, replayAddressee("task-pe"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.CreateConsumer(ctx, TasksStream, jetstream.ConsumerConfig{
-		Durable:       "another-reader",
-		FilterSubject: "a2a.tasks.>",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-	}); err != nil {
-		t.Fatalf("a consumer create after %d replays: %v", replays, err)
+	env, err := exec.StatusEnvelope(StateWorking, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Payload = json.RawMessage(
+		`{"taskId": "some-other-task", "contextId": "ctx-task-pe", "status": {"state": "working"}, "final": false}`)
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishRaw(t, clientURL(s), TaskEventsSubject(replayAddressee("task-pe"), "task-pe"), raw)
+
+	if _, err := c.TasksGet(ctx, replayAddressee("task-pe"), "task-pe"); err == nil {
+		t.Fatal("TasksGet should have failed on a payload/envelope taskId mismatch")
+	}
+	if n := streamConsumerCount(t, clientURL(s), TasksStream); n != 0 {
+		t.Fatalf("TASKS carries %d consumers after a failed replay, want 0", n)
 	}
 }
 
@@ -274,6 +303,40 @@ func TestDeleteReplayConsumer_SurvivesACancelledCallerContext(t *testing.T) {
 
 	if _, err := js.Consumer(live, TasksStream, name); !errors.Is(err, jetstream.ErrConsumerNotFound) {
 		t.Fatalf("consumer %q survived cleanup under a cancelled caller context: %v", name, err)
+	}
+}
+
+// The cleanup must not become a stall. TasksGet sits on the gateway's terminal
+// path, and a delete that cannot succeed anyway — the connection is gone, or
+// reconnecting — must not hold the caller's return while it finds that out.
+// The consumer's InactiveThreshold is the fallback and it costs nothing here.
+func TestDeleteReplayConsumer_DoesNotWaitOutAnUnreachableServer(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	c := replayFixture(t, clientURL(s), "task-un", []TaskState{StateSubmitted})
+	_, js := c.conn()
+
+	cons, err := js.OrderedConsumer(testCtx(t), TasksStream, jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{TaskEventsSubject(replayAddressee("task-un"), "task-un")},
+		DeliverPolicy:  jetstream.DeliverAllPolicy,
+	})
+	if err != nil {
+		t.Fatalf("OrderedConsumer: %v", err)
+	}
+
+	// Close before returning rather than at cleanup: killing the server leaves
+	// the client reconnecting at a port the next test's server could be handed.
+	defer c.Close()
+	nc, _ := c.conn()
+	s.Shutdown()
+	waitFor(t, 10*time.Second, "the client to notice the server is gone", func() bool {
+		return nc.Status() != nats.CONNECTED
+	})
+
+	start := time.Now()
+	c.deleteReplayConsumer(context.Background(), cons, "task-un")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("cleanup against an unreachable server took %s; it must give up promptly", elapsed)
 	}
 }
 

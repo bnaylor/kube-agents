@@ -134,6 +134,33 @@ func clientURL(s *natsserver.Server) string {
 	return fmt.Sprintf("nats://%s", s.Addr().String())
 }
 
+// streamConsumerCount returns how many consumers a stream currently carries —
+// the direct observation of whether an ephemeral reader cleaned up after
+// itself, rather than the indirect "is there room for one more".
+func streamConsumerCount(t *testing.T, url, stream string) int {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := js.Stream(ctx, stream)
+	if err != nil {
+		t.Fatalf("stream %s: %v", stream, err)
+	}
+	info, err := st.Info(ctx)
+	if err != nil {
+		t.Fatalf("stream info: %v", err)
+	}
+	return info.State.Consumers
+}
+
 // streamMsgCount returns how many messages a stream holds.
 func streamMsgCount(t *testing.T, url, stream string) uint64 {
 	t.Helper()
