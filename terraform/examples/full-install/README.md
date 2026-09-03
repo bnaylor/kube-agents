@@ -111,7 +111,17 @@ uniform bucket-level access, in the cluster's region — and a gitignored
 installs in one project keep separate state. State is only half of the
 second-install story: set `agent_service_account_id` too, or the installs
 collide on the agent GSA's fixed default name halfway through the second
-install's first apply. Versioning is the recovery story:
+install's first apply. Through the installer front doors that means
+`export TF_VAR_agent_service_account_id=...` before running them -
+install.sh, upgrade.sh and uninstall.sh regenerate `terraform.tfvars` on
+every run, so a line hand-added there is silently dropped (Terraform reads
+`TF_VAR_*` only where the file is silent, and on this key it stays silent).
+And a distinct name un-collides creation, not identity: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so
+both installs bind the same principal and each agent can mint the other's
+GSA tokens. The `agent_service_account_id` description in `variables.tf`
+carries the limits to read before relying on this. Versioning is the
+recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
