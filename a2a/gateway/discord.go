@@ -288,7 +288,7 @@ func (d *DiscordAdapter) Roster(conversation string) ([]string, bool, error) {
 			ids = append(ids, m.UserID)
 		}
 		// One page covers the test rooms; a thread past it is incomplete.
-		return ids, len(members) < 100, nil
+		return ids, len(members) < threadMembersPage, nil
 	default:
 		return nil, false, nil
 	}
