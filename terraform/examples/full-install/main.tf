@@ -521,6 +521,11 @@ resource "helm_release" "kube_agents" {
       org     = local.github_org
       repo    = local.github_repo_name
       appId   = var.github_app_id
+      # The minty rule's only gate on platform-agent-scope is assertion.email
+      # against this value; left unset the chart falls back to the fixed
+      # kubeagents-platform-gsa name, so an install that overrides
+      # agent_service_account_id would annotate one GSA and allowlist another.
+      allowedServiceAccount = module.kube_agents_iam.service_account_email
       kms = {
         keyring = var.github_minter_kms_keyring
         key     = var.github_minter_kms_key
