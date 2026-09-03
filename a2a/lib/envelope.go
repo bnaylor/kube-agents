@@ -136,6 +136,13 @@ func validDNS1123Label(s string) bool {
 	return true
 }
 
+// ValidSubjectToken reports whether s is a legal task-subject token — a
+// dot-free DNS-1123 label. Exposed so components can validate configured
+// addressees at boot instead of failing per-message at publish.
+func ValidSubjectToken(s string) bool {
+	return validDNS1123Label(s)
+}
+
 // taskScoped reports whether taskId/contextId are required for the kind.
 func taskScoped(k Kind) bool {
 	switch k {
