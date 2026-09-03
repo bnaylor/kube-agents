@@ -38,6 +38,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -75,6 +76,12 @@ const (
 	// The stage 1 dev registry. A dev toggle's default may name a dev
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
+	//
+	// None of the three images above are in images.json, deliberately: the
+	// inventory documents what a SUPPORTED install pulls, and mode next is an
+	// unsupported dev toggle. That exemption is graduation debt alongside the
+	// registry move — a mirrored or air-gapped install that flips next must
+	// override all three via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
 	// a2aPostureComment travels on every rendered config and script so the
@@ -136,6 +143,16 @@ func randomA2APassword() (string, error) {
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
 var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
 
+// a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
+// security check, not tidiness: buildA2ANATSConfigSecret interpolates these
+// values into nats.conf inside double quotes, so a value carrying a quote and
+// a newline is a config injection — a new user, a widened grant — that the
+// operator would then faithfully re-render on every reconcile, converting a
+// one-time Secret write into durable bus authority. A key that does not match
+// is treated exactly like a missing key and re-rolled; hand-seeding the creds
+// Secret is not a supported flow (see ensureA2ACredsSecret).
+var a2aCredsValueRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
 // a2aReader returns the reader for A2A bookkeeping objects. Straight from the
 // API server on purpose: the cached client's first Get against a kind starts
 // a cluster-wide informer for it, and this path runs on every reconcile of
@@ -165,7 +182,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 			existing.Data = map[string][]byte{}
 		}
 		for _, key := range a2aCredsKeys {
-			if len(existing.Data[key]) > 0 {
+			if a2aCredsValueRe.Match(existing.Data[key]) {
 				continue
 			}
 			pw, err := randomA2APassword()
@@ -498,9 +515,10 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: ptr.To(true),
-						RunAsUser:    ptr.To(int64(1000)),
-						FSGroup:      ptr.To(int64(1000)),
+						RunAsNonRoot:   ptr.To(true),
+						RunAsUser:      ptr.To(int64(1000)),
+						FSGroup:        ptr.To(int64(1000)),
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
 						Name:  "nats",
@@ -534,7 +552,12 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
-				ObjectMeta: metav1.ObjectMeta{Name: "data"},
+				// The labels ride to the PVC the StatefulSet controller
+				// stamps out, which is what lets handleDeletion verify the
+				// claim is this render's before deleting it — a template PVC
+				// carries no owner reference, so the instance label is the
+				// only ownership signal it has.
+				ObjectMeta: metav1.ObjectMeta{Name: "data", Labels: a2aLabels(agent, "nats")},
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 					Resources: corev1.VolumeResourceRequirements{
@@ -726,7 +749,13 @@ echo "a2a provisioning complete"
 
 // buildA2AProvisionJob runs the provisioning script against the rendered NATS.
 // The name carries a hash of the script so a changed payload is a new Job —
-// Jobs are immutable — and completed runs clean themselves up via TTL.
+// Jobs are immutable — and completed runs clean themselves up via TTL. The
+// TTL has a known cost, chosen not overlooked: once it removes the completed
+// Job, the next reconcile's create-if-absent re-runs the (idempotent) script
+// under the same name, so a standing next install re-proves its provisioning
+// roughly daily. That churn is one short-lived pod a day; the alternative — a
+// completed Job kept forever as the done-marker — trades it for permanent
+// clutter and a stale-looking object in every kubectl listing.
 //
 // Creation is create-only convergence: the script's `info || add` lines make
 // re-runs clean but do NOT edit a stream that already exists, so a retention
@@ -749,6 +778,9 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 				Spec: corev1.PodSpec{
 					RestartPolicy:                corev1.RestartPolicyOnFailure,
 					AutomountServiceAccountToken: ptr.To(false),
+					SecurityContext: &corev1.PodSecurityContext{
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
 					Containers: []corev1.Container{{
 						Name:    "provision",
 						Image:   a2aProvisionImage(),
@@ -871,8 +903,8 @@ func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-a2a-gateway.md: Discord adapter and session manager; the
-// program itself arrives in its own PR). It is expected to crash-loop until
+// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager;
+// the program itself arrives in its own PR). It is expected to crash-loop until
 // the gateway image is reachable and the discord-bot Secret is created — both
 // are optional references so the render never blocks the rest of the stack.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
@@ -899,8 +931,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					ServiceAccountName:           a2aGatewayName(agent),
 					AutomountServiceAccountToken: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: ptr.To(true),
-						RunAsUser:    ptr.To(int64(1000)),
+						RunAsNonRoot:   ptr.To(true),
+						RunAsUser:      ptr.To(int64(1000)),
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
 						Name:  "gateway",

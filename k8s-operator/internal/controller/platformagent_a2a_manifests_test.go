@@ -400,13 +400,22 @@ func TestUnrecognizedModePreservesRunningNextStack(t *testing.T) {
 
 // A creds Secret missing a key would render `password: ""` into nats.conf — a
 // user anyone can log in as — so the shape is repaired, while intact keys are
-// never re-rolled.
+// never re-rolled. "Intact" means the exact shape randomA2APassword emits:
+// these values are interpolated into nats.conf inside double quotes, so a
+// value carrying a quote and a newline is a config injection (a new user, a
+// widened grant) that the operator would re-render on every reconcile —
+// malformed keys are therefore re-rolled exactly like missing ones.
 func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
+	const intact = "0123456789abcdef0123456789abcdef"
+	injected := "x\"}\nusers [ { user: evil, password: \"pw\" } ]"
 	partial := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
-		Data:       map[string][]byte{"gateway-password": []byte("keep-this-value-intact-1234")},
+		Data: map[string][]byte{
+			"gateway-password": []byte(intact),
+			"worker-password":  []byte(injected),
+		},
 	}
 
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, partial).Build()
@@ -416,14 +425,56 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureA2ACredsSecret failed: %v", err)
 	}
-	if string(got.Data["gateway-password"]) != "keep-this-value-intact-1234" {
+	if string(got.Data["gateway-password"]) != intact {
 		t.Error("an intact key was re-rolled")
 	}
+	if string(got.Data["worker-password"]) == injected {
+		t.Error("a malformed key survived repair; its value reaches nats.conf inside quotes")
+	}
 	for _, key := range a2aCredsKeys {
-		if len(got.Data[key]) == 0 {
-			t.Errorf("key %q was not repaired", key)
+		if !a2aCredsValueRe.Match(got.Data[key]) {
+			t.Errorf("key %q was not repaired to the generated shape: %q", key, got.Data[key])
 		}
 	}
+}
+
+// The JetStream PVC comes from a volumeClaimTemplate, so it has no owner
+// reference and the finalizer deletes it by name — but a name is not
+// ownership. The instance label the claim template stamps is the guard: a
+// squatter PVC wearing the exact name is left alone.
+func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
+	scheme := setupScheme()
+
+	run := func(t *testing.T, pvcLabels map[string]string, wantDeleted bool) {
+		t.Helper()
+		agent := a2aTestAgent()
+		agent.Finalizers = []string{platformAgentFinalizer}
+		now := metav1.Now()
+		agent.DeletionTimestamp = &now
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-agent-a2a-nats-0", Namespace: "test-ns", Labels: pvcLabels,
+		}}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pvc).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+		if _, err := r.handleDeletion(context.Background(), agent); err != nil {
+			t.Fatalf("handleDeletion failed: %v", err)
+		}
+		err := cl.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{})
+		if wantDeleted && !errors.IsNotFound(err) {
+			t.Errorf("labeled JetStream PVC survived deletion (err=%v)", err)
+		}
+		if !wantDeleted && err != nil {
+			t.Errorf("an unlabeled squatter PVC was deleted (err=%v)", err)
+		}
+	}
+
+	t.Run("labeled PVC is reaped", func(t *testing.T) {
+		run(t, buildA2ANATSStatefulSet(a2aTestAgent(), "h").Spec.VolumeClaimTemplates[0].Labels, true)
+	})
+	t.Run("unlabeled squatter is left alone", func(t *testing.T) {
+		run(t, nil, false)
+	})
 }
 
 // The web read surface: a websocket listener (plain ws is the stated

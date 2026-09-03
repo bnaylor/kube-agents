@@ -542,11 +542,20 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 
 		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
 		// reference (nothing from a template does), so without this a
-		// deleted next-mode agent leaks its 40Gi JetStream volume.
-		a2aPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-			Name: "data-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace,
-		}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
+		// deleted next-mode agent leaks its 40Gi JetStream volume. Guarded by
+		// the instance label the claim template stamps, because a name is not
+		// ownership: a PVC squatting this exact name that this render did not
+		// create is left alone rather than destroyed.
+		a2aPVC := &corev1.PersistentVolumeClaim{}
+		pvcKey := client.ObjectKey{Name: "data-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace}
+		switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
+		case err == nil:
+			if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+				if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		case client.IgnoreNotFound(err) != nil:
 			return ctrl.Result{}, err
 		}
 
