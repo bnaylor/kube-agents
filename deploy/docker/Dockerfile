@@ -595,10 +595,41 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # gets.
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
+#
+# Slack: ask for the reactions scope the adapter already spends. `hermes slack
+# manifest` is the only description of the Slack app an installer ever writes --
+# the operator pastes that JSON in and clicks Save -- and its bot_scopes list
+# grants reactions:read and stops. The adapter calls reactions.add three times
+# (eyes on pickup, white_check_mark/x on the outcome) and reactions.remove once,
+# all of which need reactions:write, so Slack answers every one missing_scope
+# and no kube-agents install has ever shown a reaction. The manifest is
+# self-inconsistent rather than merely short: it already subscribes to
+# reaction_added and reaction_removed, so the app it describes is built to hear
+# reactions and not to make any.
+#
+# Nothing surfaces the failure. _add_reaction logs at debug with a comment that
+# names this exact case ("may fail if already reacted or missing scope"),
+# neither caller reads the False it returns, and the turn otherwise succeeds --
+# a dead feature is indistinguishable from a slow agent. SLACK_REACTIONS
+# defaults to true, so it is enabled everywhere and works nowhere.
+#
+# A grep guard is not enough on its own here either. _build_full_manifest
+# appends to bot_scopes on two of its three messaging_experience branches and
+# sorts before emitting, so the element being in the source says nothing about
+# the JSON that gets pasted. verify_slack_reactions_scope.py calls the real
+# function once per branch and reads the scope out of the manifest it returns,
+# and fails the build the other way too -- if upstream drops the reaction calls,
+# the patch is widening the app's permissions for nothing.
+#
+# Rides this COPY and RUN for the same budget reason as the block above.
+# See the module docstring in
+# deploy/docker/patches/apply_slack_reactions_scope.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
+     deploy/docker/patches/apply_slack_reactions_scope.py \
+     deploy/docker/patches/verify_slack_reactions_scope.py \
      deploy/docker/patches/patchlib.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
@@ -608,9 +639,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     grep -qF "kube-agents patch: attachment-fallback notice" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -qF "_credential_proxy_relay_patched" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
+    grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
