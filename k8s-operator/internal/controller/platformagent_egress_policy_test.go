@@ -282,7 +282,7 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 		{
 			name: "the Hindsight memory API", ns: agent.Namespace,
 			labels: map[string]string{"app.kubernetes.io/name": "hindsight", "app.kubernetes.io/component": "api"},
-			port:  8888,
+			port:   8888,
 			why: "buildPodEnv sets HINDSIGHT_API_URL on every agent container, and the install this rule " +
 				"saves is the one that enforces the policy — the same lesson buildNetworkPolicy's rule 10 " +
 				"records",

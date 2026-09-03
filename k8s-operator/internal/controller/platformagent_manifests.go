@@ -2038,44 +2038,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: credentialProxyTokenMountPath + "/token",
 		})
 	}
-
-	// The A2A bus, under `next` only (W5 delta memo #1, ask 2): address and
-	// credentials for the worker user, whose grants already fit an agent-side
-	// reader — subscribe on a2a.topics.>, publish on the provisioned topics.
-	// From the same Secret the A2A gateway reads, and container env only: a
-	// copy in a profile .env on the PVC would be a second place to rotate and
-	// a first place to leak. W7's bridge sidecar shares the pod and needs the
-	// same three, so this is one seam, not two.
-	//
-	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
-	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
-	// lands in the container whatever the address says; a plugin that replaced
-	// NATS_URL (spec.env is copied verbatim, mergeEnvVars replaces in place)
-	// would have the client hand the worker password to an address of the
-	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
-	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
-	// cluster. Found by the W6.1 adversarial review; the same names are in
-	// SensitiveEnvVars so the CR's own spec.deployment.env cannot reach them
-	// either.
-	if a2aAgentSurface(agent) {
-		envVars = append(envVars,
-			corev1.EnvVar{
-				Name:  "NATS_URL",
-				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
-			},
-			corev1.EnvVar{
-				Name:  "NATS_USER",
-				Value: "worker",
-			},
-			corev1.EnvVar{
-				Name: "NATS_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-					Key:                  "worker-password",
-				}},
-			},
-		)
-	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -4194,6 +4156,79 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 	return peers
 }
 
+// dnsEgressPeers returns the cluster-DNS peer set for an egress rule: kube-dns
+// and node-local-dns by label, the node-local link-local address, and the
+// resolved (or default) DNS Service ClusterIPs. Shared by the agent's policy
+// and the A2A session-pod policy so the two cannot drift on what "DNS" means.
+func dnsEgressPeers(profile netpolProfile) []networkingv1.NetworkPolicyPeer {
+	dnsIPs := profile.DNSClusterIPs
+	if len(dnsIPs) == 0 {
+		dnsIPs = []string{defaultDNSClusterIP}
+	}
+	peers := []networkingv1.NetworkPolicyPeer{
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "kube-dns",
+				},
+			},
+		},
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "node-local-dns",
+				},
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: "169.254.20.10/32",
+			},
+		},
+	}
+
+	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
+	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
+	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
+	// operator, which always widen to a single host. The default is the fallback for
+	// nothing surviving, not for each entry that does not parse -- two bad entries
+	// used to emit the default twice.
+	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
+	if len(dnsIPPeers) == 0 {
+		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
+	}
+	return append(peers, dnsIPPeers...)
+}
+
+// litellmEgressPorts is the LiteLLM port set, shared by the agent policy and
+// the A2A session-pod policy so a port correction cannot land in one and not
+// the other. Policy is evaluated AFTER the Service DNAT (Dataplane V2), so
+// the port that must be granted is the CONTAINER's: every LiteLLM this repo
+// renders listens on 8080 (charts/kube-agents/templates/litellm.yaml and
+// config/integrations/litellm both set --port 8080), and the a2a-next-dev
+// install was measured at 8080 live. 80 covers an endpoint listening on the
+// Service port directly; 4000 is legacy lineage from the kustomize policy,
+// kept for continuity with installs that predate the 8080 move — remove it
+// from here, not from one call site.
+func litellmEgressPorts() []networkingv1.NetworkPolicyPort {
+	tcp := corev1.ProtocolTCP
+	return []networkingv1.NetworkPolicyPort{
+		{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+		{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
+		{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+	}
+}
+
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
 //
@@ -4202,11 +4237,6 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string, otlpDisabled bool) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
-
-	dnsIPs := profile.DNSClusterIPs
-	if len(dnsIPs) == 0 {
-		dnsIPs = []string{defaultDNSClusterIP}
-	}
 
 	apiPeers := formatCIDRPeers(apiCIDRs, true)
 	if len(apiPeers) == 0 {
@@ -4250,49 +4280,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		})
 	}
 
-	dnsPeers := []networkingv1.NetworkPolicyPeer{
-		{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": "kube-system",
-				},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"k8s-app": "kube-dns",
-				},
-			},
-		},
-		{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": "kube-system",
-				},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"k8s-app": "node-local-dns",
-				},
-			},
-		},
-		{
-			IPBlock: &networkingv1.IPBlock{
-				CIDR: "169.254.20.10/32",
-			},
-		},
-	}
-
-	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
-	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
-	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
-	// operator, which always widen to a single host. The default is the fallback for
-	// nothing surviving, not for each entry that does not parse -- two bad entries
-	// used to emit the default twice.
-	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
-	if len(dnsIPPeers) == 0 {
-		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
-	}
-	dnsPeers = append(dnsPeers, dnsIPPeers...)
+	dnsPeers := dnsEgressPeers(profile)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
@@ -4347,13 +4335,10 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	}
 
 	egressRules = append(egressRules,
-		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
+		// 4. LiteLLM Gateway and standalone-replay in the agent namespace
+		// (ports: litellmEgressPorts, which owns why each one is granted)
 		networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
-			},
+			Ports: litellmEgressPorts(),
 			To: []networkingv1.NetworkPolicyPeer{
 				{
 					PodSelector: &metav1.LabelSelector{
@@ -4484,29 +4469,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 	})
-
-	// 11. The A2A bus, under `next` only (W5 delta memo #1, ask 1). The NATS
-	// pods by label rather than CIDR: the pod IP does not survive a restart,
-	// and a policy pinned to an address silently stops matching. Egress here
-	// is deny-by-default, and a missing rule does not refuse the dial — it
-	// hangs it to the timeout, the least diagnosable shape this failure has.
-	if a2aAgentSurface(agent) {
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
-			},
-			To: []networkingv1.NetworkPolicyPeer{
-				{
-					PodSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{
-							labelPartOf:       a2aPartOf,
-							a2aComponentLabel: "nats",
-						},
-					},
-				},
-			},
-		})
-	}
 
 	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
 	// addition to the operator's own set rather than being interleaved with it.
@@ -4646,4 +4608,3 @@ func buildPluginStagingContainerName(pluginName string) string {
 	}
 	return name
 }
-
