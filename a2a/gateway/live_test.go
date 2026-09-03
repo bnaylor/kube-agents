@@ -20,6 +20,13 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// liveTestRelayDurable keeps the in-process gateway off the deployed
+// gateway's durable: bound to one durable, the two would split event
+// deliveries and starve each other probabilistically (observed live, 9/3).
+// One fixed name, reused across runs, so the install's max_consumers
+// budget pays for exactly one extra consumer rather than one per run.
+const liveTestRelayDurable = "gateway-relay-livetest"
+
 // TestLiveAgainstInstallNATS runs the gateway (fake chat adapter, real bus
 // client) against a real deployment's NATS — the W6 install via
 // port-forward — under the REAL gateway user's deny-by-default grants, with
@@ -78,7 +85,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("live-test-salt"),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +237,7 @@ func TestLiveEndToEndThroughBridge(t *testing.T) {
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("live-test-salt"),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +353,7 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	}
 	adapter := newFakeAdapter()
 	sp := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: sp})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: sp, RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +486,7 @@ func TestLiveSaltJoinsAcrossSurfaces(t *testing.T) {
 		// exactly as the deployed one.
 		AttributionSalt: []byte(strings.TrimSpace(salt)),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +605,7 @@ func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
 	if err := sp.resolveOwner(ctx); err != nil {
 		t.Fatalf("resolving owner on the install: %v", err)
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: sp})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: sp, RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}

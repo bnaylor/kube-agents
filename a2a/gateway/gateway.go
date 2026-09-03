@@ -19,6 +19,10 @@ import (
 // slot instead of holding it forever.
 const turnTimeout = 60 * time.Second
 
+// relayDurable is the event relay's durable consumer name; see
+// Options.RelayDurable for the one caller that may not share it.
+const relayDurable = "gateway-relay"
+
 // gatewayParty is the gateway's own identity in from — routing and display
 // only, never an authorization input. Its supervisor events carry it so
 // replay always distinguishes "the worker said failed" from "the supervisor
@@ -58,6 +62,8 @@ type Gateway struct {
 
 	// backend names the chat backend for authority blocks.
 	backend string
+	// relayDurable is the event relay's durable name (Options.RelayDurable).
+	relayDurable string
 }
 
 // Options are the injectable pieces; tests provide fakes.
@@ -69,6 +75,13 @@ type Options struct {
 	Backend string
 	// Spawner overrides the k8s-backed pod spawner - test injection only.
 	Spawner spawner
+	// RelayDurable overrides the event relay's durable consumer name (the
+	// default relayDurable). Two gateways bound to one durable SPLIT the
+	// event deliveries - and this relay acks what it cannot route - so an
+	// in-process gateway pointed at an install with a running gateway pod
+	// (the live tests) must bind its own durable or the two starve each
+	// other probabilistically. The deployed binary never sets this.
+	RelayDurable string
 }
 
 // New assembles a gateway.
@@ -91,6 +104,9 @@ func New(o Options) (*Gateway, error) {
 	backend := o.Backend
 	if backend == "" {
 		backend = "discord"
+	}
+	if o.RelayDurable == "" {
+		o.RelayDurable = relayDurable
 	}
 	// Tests and embedders build Config directly, bypassing FromEnv's
 	// parse-and-validate; unset means the default there too.
@@ -116,6 +132,7 @@ func New(o Options) (*Gateway, error) {
 		taskSessions: map[string]string{},
 		relays:       map[string]*relayState{},
 		backend:      backend,
+		relayDurable: o.RelayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -145,7 +162,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	sub, err := g.client.SubscribeDurable(ctx, lib.SubscribeConfig{
 		Stream:  lib.TasksStream,
 		Subject: "a2a.tasks.*.*.events",
-		Durable: "gateway-relay",
+		Durable: g.relayDurable,
 		Session: gatewayParty.Session,
 	}, func(env *lib.Envelope) { g.relayEvent(ctx, env) })
 	if err != nil {
