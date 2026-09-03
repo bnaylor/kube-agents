@@ -723,12 +723,13 @@ func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
 // fakeSpawner records spawn calls; the delegate flow's pod machinery without
 // a cluster.
 type fakeSpawner struct {
-	mu      sync.Mutex
-	spawns  []fakeSpawn
-	deletes []string
-	orphans []orphanPod
-	live    int
-	liveErr error
+	mu       sync.Mutex
+	spawns   []fakeSpawn
+	deletes  []string
+	orphans  []orphanPod
+	live     int
+	liveErr  error
+	spawnErr error
 	// onDelete, when set, observes the moment of deletion — the supervisor
 	// tests use it to assert the terminal was already on the stream when
 	// the pod went, which "terminal exists and pod deleted" alone cannot.
@@ -743,8 +744,19 @@ type fakeSpawn struct {
 func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.spawnErr != nil {
+		return "", s.spawnErr
+	}
 	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID})
 	return rec.BusSession, nil
+}
+
+// failSpawns makes every Spawn fail with err until reset with nil — the
+// quota-refusal shape the spawn-failure supervisor test needs.
+func (s *fakeSpawner) failSpawns(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spawnErr = err
 }
 
 func (s *fakeSpawner) Delete(_ context.Context, podName string) error {

@@ -104,6 +104,18 @@ func (rec *SessionRecord) TaskCanceled(taskID string) bool {
 	return false
 }
 
+// AddressedToOwnSession reports whether tasks currently go to the
+// conversation's own bus session (an incarnation the gateway spawns)
+// rather than a fixed executor — true on the standing session route AND
+// during a one-shot Delegate from a fixed-route conversation, which is why
+// it is not the SessionRouted field: the two executors differ on steers
+// (refused by the fixed executor, absorbed by a session worker), so the
+// status matcher's width bias and the steer acknowledgement condition on
+// where the task actually runs, not on the standing route.
+func (rec *SessionRecord) AddressedToOwnSession() bool {
+	return rec.BusSession != "" && rec.Addressee == rec.BusSession
+}
+
 // AddresseeFor returns the addressee a task was published to. Session
 // addressees rotate per incarnation and Delegate re-homes the record, so
 // rec.Addressee only says where the LATEST task went; a straggler's replay

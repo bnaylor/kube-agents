@@ -64,12 +64,16 @@ var statusQueries = map[string]bool{
 // false positive costs nothing; a session worker absorbs steers, so a
 // stolen one is a dropped correction and only the exact phrases match -
 // a status-shaped steer there is a question the worker can answer itself.
+// wideMatchLenCap bounds the wide interrogative match: past this length a
+// message is a composed instruction, not a status poke, however it starts.
+const wideMatchLenCap = 48
+
 func isStatusQuery(text string, wide bool) bool {
 	n := normalize(text)
 	if statusQueries[n] {
 		return true
 	}
-	if !wide || len(n) > 48 {
+	if !wide || len(n) > wideMatchLenCap {
 		return false
 	}
 	statusish := strings.Contains(n, "doing") || strings.Contains(n, "happening") ||

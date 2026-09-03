@@ -12,10 +12,11 @@ import (
 )
 
 // PrincipalMap resolves backend-native user ids to principals in our trust
-// domain. For Discord it is a checked-in test mapping table by construction:
-// a Discord identity never maps to a real cloud principal, full stop
-// (spec-chatops-gateway.md). A sender with no entry cannot be verified and
-// their message is dropped at ingress.
+// domain. For Discord it is a mounted install-side mapping table (a
+// ConfigMap; nothing is checked into the repo) and a test fixture by
+// construction: a Discord identity never maps to a real cloud principal,
+// full stop (spec-chatops-gateway.md). A sender with no entry cannot be
+// verified and their message is dropped at ingress.
 type PrincipalMap struct {
 	mu sync.RWMutex
 	m  map[string]string

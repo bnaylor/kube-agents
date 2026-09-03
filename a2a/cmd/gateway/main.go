@@ -1,9 +1,10 @@
 // The a2a chatops gateway: Discord in, tasks on the bus out.
 //
-// PLAYGROUND POSTURE (see round_2/something-working.md): static per-component
-// NATS users instead of the auth callout, bot token as a plain Secret, no
-// exporter, no breaker, gateway sweep as the only janitor. Each has a decided
-// design in the specs; none gates "Adam can play". Static creds are the
+// PLAYGROUND POSTURE: static per-component NATS users instead of the auth
+// callout, bot token as a plain Secret, no exporter, no breaker, gateway
+// sweep as the only janitor. Each has a decided design in
+// docs/designs/spec-nats-deployment.md and spec-chatops-gateway.md; the
+// auth callout is the product path and stage 2 work. Static creds are the
 // playground, not the product.
 package main
 

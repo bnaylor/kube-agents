@@ -14,6 +14,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// turnTimeout bounds one handler turn — an inbound message or a relay
+// batch — so a stuck bus or backend call frees the conversation's queue
+// slot instead of holding it forever.
+const turnTimeout = 60 * time.Second
+
 // gatewayParty is the gateway's own identity in from — routing and display
 // only, never an authorization input. Its supervisor events carry it so
 // replay always distinguishes "the worker said failed" from "the supervisor
@@ -188,7 +193,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l.Lock()
 	defer l.Unlock()
 
-	ctx, cancel := context.WithTimeout(g.runCtx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
 	defer cancel()
 
 	rec, err := g.reg.Get(ctx, msg.Conversation)
@@ -227,10 +232,15 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// hasn't landed), release the serialization instead of steering the
 	// user into a finished task. Only the serialization: the task index
 	// stays until the relay retires it, so a queued terminal event still
-	// posts its result.
+	// posts its result. Healing at all means the render was probably lost
+	// (an acked event is never redelivered), so post the replayed status
+	// card rather than clearing silently — the same deterministic template
+	// the status ask uses. In the relay-lag case this duplicates the
+	// rolling-line edit that follows; redundant beats swallowed.
 	if active := rec.ActiveTask; active != nil && !active.Detached {
 		if task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID); err == nil && task.Final {
 			g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
+			g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
 			rec.ActiveTask = nil
 		}
 	}
@@ -239,13 +249,26 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// The status matcher's wide interrogative rule is only safe where a
 	// stolen steer costs nothing: a fixed-route executor (Hermes) refuses
 	// steers, a session worker absorbs them - so a session-addressed task
-	// gets the exact phrases only (see isStatusQuery).
-	wideStatus := !(rec.BusSession != "" && rec.Addressee == rec.BusSession)
+	// gets the exact phrases only (see isStatusQuery). A detached task
+	// gets the exact phrases on either route: after a stop, the wide
+	// reading of "any update on the rollout" would steal a NEW task to
+	// replay a dead one, so the cost argument inverts there too.
+	wideStatus := !rec.AddressedToOwnSession() && !(active != nil && active.Detached)
 	switch {
 	case active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case active != nil && !active.Detached && isStop(msg.Text):
 		g.cancelTask(ctx, rec, authority)
+	case isStop(msg.Text):
+		// A stop with nothing to stop must not fall through and become a
+		// task that literally reads "stop": the impatient second "stop"
+		// (cancel sent, terminal pending) and a bare "stop" with nothing
+		// running both land here, answered deterministically.
+		if active != nil {
+			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
+		} else {
+			g.post(rec.Key, "🤷 nothing is running")
+		}
 	case active != nil && !active.Detached:
 		g.steerTask(ctx, rec, msg, authority)
 	default:
@@ -365,7 +388,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		g.startTask(ctx, rec, msg, principal, authority)
 	}
 
-	if err := withRetry(3, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 	}
 }
@@ -511,11 +534,17 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, "⚠️ could not send that to the running task; it is still working on the original instruction")
 		return
 	}
-	// Say what we know and no more: the steer is on the stream. Whether the
-	// executor absorbs it is the executor's answer - a session worker takes
-	// it at its next turn boundary and says nothing, Hermes publishes its
-	// refusal. Both arrive after this line.
-	g.post(rec.Key, "✏️ steering sent — the executor picks it up at its next turn boundary")
+	// Say what we know and no more: the steer is on the stream, and what
+	// happens next is the route's contract (spec: gateway-authored posts,
+	// amended 8/31) - a session worker absorbs at its next turn boundary if
+	// the task is still running; the fixed-route executor refuses mid-task
+	// input and publishes its refusal itself. Neither line claims the steer
+	// was absorbed, which the gateway cannot know.
+	if rec.AddressedToOwnSession() {
+		g.post(rec.Key, "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running")
+	} else {
+		g.post(rec.Key, "✏️ steering sent — the standing executor does not take mid-task input; its reply will say so")
+	}
 }
 
 // cancelTask publishes kind:cancel — the hard interrupt — and detaches the
@@ -535,6 +564,7 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("cancel publish failed", "taskId", active.TaskID, "err", err)
+		g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
 		return
 	}
 	active.Detached = true
@@ -552,13 +582,13 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 
 // answerStatusByReplay answers "what is it doing" from the stream, not from
 // a live connection — tasks/get materialized by replay is the durability
-// payoff, and beat 2 of something-working.
+// payoff the payload spec's replay rule promises.
 func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
 	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
 	if err != nil {
 		if _, ok := err.(*lib.A2AError); ok {
-			g.post(rec.Key, "📭 no events on the stream yet — the task was just submitted")
+			g.post(rec.Key, "📭 no events on the stream for this task yet")
 			return
 		}
 		g.log.Error("status replay failed", "taskId", active.TaskID, "err", err)

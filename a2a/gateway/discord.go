@@ -10,6 +10,18 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+const (
+	// threadAutoArchiveMinutes is Discord's 24h auto-archive tier; an
+	// archived thread reopens on the next message, so sessions survive it.
+	threadAutoArchiveMinutes = 1440
+	// threadMembersPage is Discord's ThreadMembers page-size ceiling; the
+	// roster past one page is reported rosterComplete=false, not paged.
+	threadMembersPage = 100
+	// threadNameCap keeps minted thread names under Discord's 100-char
+	// limit with headroom for the ellipsis.
+	threadNameCap = 80
+)
+
 // DiscordAdapter is the test backend: the only one of the three with no
 // approval gate — we own the server — and outbound-websocket-only, so no
 // inbound endpoint on the dev cluster. Its identity mapping table is a
@@ -184,7 +196,7 @@ func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreat
 			}
 			thread, err := s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{
 				Name:                threadName(text),
-				AutoArchiveDuration: 1440,
+				AutoArchiveDuration: threadAutoArchiveMinutes,
 			})
 			if err != nil {
 				d.log.Error("thread start failed; channel messages cannot become sessions", "channel", m.ChannelID, "err", err)
@@ -212,7 +224,7 @@ func threadName(text string) string {
 	if name == "" {
 		name = "a2a session"
 	}
-	return truncateRunes(name, 80)
+	return truncateRunes(name, threadNameCap)
 }
 
 func stripMention(text, botID string) string {
@@ -267,7 +279,7 @@ func (d *DiscordAdapter) Roster(conversation string) ([]string, bool, error) {
 		}
 		return ids, true, nil
 	case ch.IsThread():
-		members, err := d.s.ThreadMembers(channel, 100, false, "")
+		members, err := d.s.ThreadMembers(channel, threadMembersPage, false, "")
 		if err != nil {
 			return nil, false, err
 		}

@@ -53,11 +53,11 @@ func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
 	l.Lock()
 	defer l.Unlock()
 
-	ctx, cancel := context.WithTimeout(g.runCtx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
 	defer cancel()
 
 	var rec *SessionRecord
-	err := withRetry(3, func() error {
+	err := withRetry(kvRetryAttempts, func() error {
 		var e error
 		rec, e = g.reg.Get(ctx, sessionKey)
 		return e
@@ -68,7 +68,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
 		// the conversation with the result never posted.
 		g.log.Error("relay: session record unavailable; requeueing batch", "session", sessionKey, "err", err)
 		go func() {
-			time.Sleep(2 * time.Second)
+			time.Sleep(requeueDelay)
 			for _, env := range batch {
 				g.events.enqueue(sessionKey, env)
 			}
@@ -80,7 +80,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
 		g.applyEvent(ctx, rec, env, i == len(batch)-1)
 	}
 
-	if err := withRetry(3, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("relay: session record write failed", "session", rec.Key, "err", err)
 	}
 }
@@ -310,15 +310,23 @@ func (g *Gateway) sessionForTask(ctx context.Context, taskID string) string {
 	return key
 }
 
-// withRetry runs f up to n times with a short pause — enough to ride out a
-// connection rebuild window without inventing a second resilience layer.
+// KV access rides withRetry with these shapes: enough to ride out a
+// connection rebuild window without inventing a second resilience layer,
+// and a short requeue pause where a whole batch has to come back.
+const (
+	kvRetryAttempts = 3
+	kvRetryPause    = 200 * time.Millisecond
+	requeueDelay    = 2 * time.Second
+)
+
+// withRetry runs f up to n times with a short linear-backoff pause.
 func withRetry(n int, f func() error) error {
 	var err error
 	for i := 0; i < n; i++ {
 		if err = f(); err == nil {
 			return nil
 		}
-		time.Sleep(time.Duration(i+1) * 200 * time.Millisecond)
+		time.Sleep(time.Duration(i+1) * kvRetryPause)
 	}
 	return err
 }

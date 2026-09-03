@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -63,6 +64,20 @@ func mintSessionName(profile string) string {
 }
 
 const (
+	// ownerResolveTimeout bounds the boot-time GET for the owner
+	// Deployment, so a hung API server fails boot fast into the crashloop
+	// backoff instead of hanging it.
+	ownerResolveTimeout = 30 * time.Second
+	// primerCap bounds the rehydration-primer annotation, well under the
+	// object annotation budget.
+	primerCap = 8192
+	// workerRunAsUser is the arbitrary non-root UID session pods run as.
+	workerRunAsUser = 1000
+	// Worker requests: the harness spike's per-session footprint, and what
+	// the session cap's sizing math multiplies.
+	workerCPURequest    = "250m"
+	workerMemoryRequest = "512Mi"
+
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
 	labelRole   = "app.kubernetes.io/component"
@@ -103,9 +118,7 @@ func newPodSpawner(cfg *Config, log *slog.Logger) (*podSpawner, error) {
 		return nil, err
 	}
 	s := &podSpawner{cfg: cfg, client: cs, log: log}
-	// Bounded, so a hung API server fails boot fast into the crashloop
-	// backoff instead of hanging it.
-	rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	rctx, cancel := context.WithTimeout(context.Background(), ownerResolveTimeout)
 	defer cancel()
 	if err := s.resolveOwner(rctx); err != nil {
 		// Refuse to boot rather than quietly spawn unowned pods: an owner
@@ -193,7 +206,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				// The rehydration primer rides the pod until W4's adapter
 				// grows a first-input path for it; bounded well under the
 				// object annotation budget.
-				annoPrimer: truncateRunes(primer, 8192),
+				annoPrimer: truncateRunes(primer, primerCap),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -206,8 +219,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			// used to name as unowned.
 			ActiveDeadlineSeconds: ptr.To(int64((s.cfg.TaskDeadline + podDeadlineGrace) / time.Second)),
 			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot: ptr.To(true),
-				RunAsUser:    ptr.To(int64(1000)),
+				RunAsNonRoot:   ptr.To(true),
+				RunAsUser:      ptr.To(int64(workerRunAsUser)),
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Containers: []corev1.Container{{
 				Name:  "worker",
@@ -234,14 +248,15 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("250m"),
-						corev1.ResourceMemory: resource.MustParse("512Mi"),
+						corev1.ResourceCPU:    resource.MustParse(workerCPURequest),
+						corev1.ResourceMemory: resource.MustParse(workerMemoryRequest),
 					},
 				},
 				VolumeMounts: []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch"}},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: ptr.To(false),
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
 			}},
 			Volumes: []corev1.Volume{{
@@ -374,6 +389,23 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)
+		// The task is already on the stream and no pod will ever run it.
+		// Left alone it is invisible to Sweep (which watches pods) and
+		// non-terminal for the whole retention window while the
+		// conversation steers into it — so the supervisor rule applies
+		// here exactly as at deletion: publish the terminal and let the
+		// relay render it onto the rolling line, the same way it renders
+		// Sweep's. `failed`, not `canceled`: nothing was stopped, the
+		// executor never existed.
+		if perr := g.publishSupervisorTerminal(ctx, rec.Addressee, taskID, rec.ContextID, activeCorrelation(rec),
+			lib.StateFailed, "session pod could not be created; declared failed by its supervisor"); perr != nil {
+			// The residue: the task publish just succeeded, so failing
+			// here means the bus dropped between the two publishes. The
+			// task stays non-terminal until the user's stop detaches it
+			// and retirement completes the cancel.
+			g.log.Error("spawn-failure supervisor terminal failed; task left non-terminal", "task", taskID, "err", perr)
+			g.post(rec.Key, "⚠️ the session worker could not be started and the task could not be closed — `stop` it, then try again")
+		}
 		return
 	}
 	rec.PodName = podName
@@ -404,6 +436,14 @@ func (g *Gateway) sweepLoop(ctx context.Context) {
 	}
 }
 
+// isTaskNotFound reports whether a TasksGet failure means "no events yet"
+// (the library's TaskNotFound A2AError) rather than the stream failing to
+// answer. The supervisor paths may only proceed on the former.
+func isTaskNotFound(err error) bool {
+	var aerr *lib.A2AError
+	return errors.As(err, &aerr) && aerr.Code == lib.CodeTaskNotFound
+}
+
 func (g *Gateway) sweepOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
@@ -423,6 +463,14 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		if err == nil && task.Final {
 			_ = g.spawner.Delete(ctx, o.PodName) // clean exit; nothing owed
 			g.releaseIncarnation(ctx, o)
+			continue
+		}
+		if err != nil && !isTaskNotFound(err) {
+			// TaskNotFound says "no events", which is the orphan shape.
+			// Anything else is the stream not answering — and a terminal we
+			// cannot rule out is a reason to wait a cycle, not to author
+			// what could be the second final (assertion 10).
+			g.log.Error("sweep: replay failed; retrying next cycle", "task", o.TaskID, "err", err)
 			continue
 		}
 		// The supervisor writes what happened: `canceled` if a cancel for
@@ -478,10 +526,18 @@ func (g *Gateway) closeDetachedBeforeDelete(ctx context.Context, rec *SessionRec
 	// with the delete already done — already put the one final on the
 	// stream, and a second would be the protocol error assertion 10 makes
 	// every consumer surface.
-	if task, err := g.client.TasksGet(ctx, addressee, active.TaskID); err == nil && task.Final {
+	task, err := g.client.TasksGet(ctx, addressee, active.TaskID)
+	if err == nil && task.Final {
 		return true
 	}
-	err := g.publishSupervisorTerminal(ctx, addressee, active.TaskID, rec.ContextID, active.CorrelationID,
+	if err != nil && !isTaskNotFound(err) {
+		// Same rule as Sweep: a replay failure means an existing final
+		// could not be ruled out, and guessing would author the duplicate
+		// the guard above exists to prevent. Keep the pod.
+		g.log.Error("pre-delete replay failed; keeping the pod", "task", active.TaskID, "err", err)
+		return false
+	}
+	err = g.publishSupervisorTerminal(ctx, addressee, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.StateCanceled, "the requester's stop, completed by the supervisor at pod retirement")
 	if err != nil {
 		g.log.Error("supervisor terminal before delete failed", "task", active.TaskID, "err", err)
