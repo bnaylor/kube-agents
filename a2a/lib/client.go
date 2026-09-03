@@ -343,6 +343,13 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 			return &ProtocolError{Msg: fmt.Sprintf("envelope to %q disagrees with subject addressee %q", env.To.Session, addressee)}
 		}
 	}
+	// The topic plane has the same shape of rule: dot-free tokens, and the
+	// artifact's name is the topic the subject names (assertion 16).
+	if strings.HasPrefix(subject, topicPrefix) {
+		if err := checkTopicPublish(subject, env); err != nil {
+			return err
+		}
+	}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
