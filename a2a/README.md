@@ -49,10 +49,15 @@ Build on these; they have conformance tests or merged spec behind them:
 Anything named in a findings record's "owed" list is not settled.  The ones
 most likely to bite a consumer of this branch:
 
-- **`TasksGet` leaks ordered consumers** (`a2a/lib/fold.go`) - a polling
-  caller can wedge the task plane against `max_consumers`.  A fix is in
-  flight on the owning branch as of 2026-09-02; until it lands, do not poll
-  `tasks/get` in a loop.
+- **Ordered-consumer leaks against `max_consumers`.**  The `tasks/get` half
+  is fixed on this branch (`a2a/lib/fold.go` deletes its replay consumer;
+  merged 2026-09-02).  The worker-adapter half is not fixed anywhere yet:
+  `fetchOrigin` creates a new ordered consumer inside its retry loop, and
+  `consumeIn`'s cleanup stops delivery without deleting the consumer.  A
+  fresh install caps TASKS at 64 consumers, and those slots are shared with
+  the gateway relay and the bridge - the failure presents as a worker unable
+  to open its input, not as replay failing.  Escalated to bnaylor; details
+  in the S10 findings addendum (2026-09-02).
 - The static bus users (`gateway`/`worker`/`web`/`seed`) are the playground
   posture.  The auth callout replaces them at stage 2 and will change how
   credentials reach every component.
