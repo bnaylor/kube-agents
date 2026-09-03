@@ -111,10 +111,14 @@ uniform bucket-level access, in the cluster's region — and a gitignored
 installs in one project keep separate state. State is only half of the
 second-install story: set `agent_service_account_id` too, or the installs
 collide on the agent GSA's fixed default name halfway through the second
-install's first apply. Through the installer front doors that means
-`export TF_VAR_agent_service_account_id=...` before running them -
-install.sh, upgrade.sh and uninstall.sh regenerate `terraform.tfvars` on
-every run, so a line hand-added there is silently dropped (Terraform reads
+install's first apply. Through the installer front doors that means a
+`TF_VAR_agent_service_account_id=...` line in `install.env` - every front
+door sources it with `set -a`, so the line persists and exports on each
+run. Do not rely on a shell `export` instead: it dies with the shell, and
+the next front-door run resolves the variable back to the default name and
+plans the GSA's destroy-and-recreate under `-auto-approve`. And do not
+hand-edit `terraform.tfvars`: install.sh, upgrade.sh and uninstall.sh
+regenerate it on every run, silently dropping the line (Terraform reads
 `TF_VAR_*` only where the file is silent, and on this key it stays silent).
 And a distinct name un-collides creation, not identity: the Workload
 Identity principal names a namespace and KSA project-wide, no cluster, so
