@@ -26,6 +26,57 @@ import (
 // switch; a setting, not surgery (retarget 8/26).
 const RouteSession = "session"
 
+const (
+	// sweepInterval paces the orphan sweep; sweepPassTimeout bounds one
+	// pass, so a hung stream or API call cannot make passes pile up.
+	sweepInterval    = time.Minute
+	sweepPassTimeout = time.Minute
+	// podDeadlineGrace is what the pod-level activeDeadlineSeconds adds
+	// above the adapter's task deadline. The adapter's contract is that its
+	// deadline sits BELOW the pod's, so the failure is the adapter's to
+	// report — the pod deadline only fires for a wedged adapter, handing it
+	// to Sweep instead of letting it hold its bus credential indefinitely.
+	// The grace covers what the adapter's clock does not: the image pull
+	// before the process starts (activeDeadlineSeconds runs from pod start)
+	// plus the adapter's own shutdown-and-publish window at its deadline.
+	podDeadlineGrace = 10 * time.Minute
+	// ownerResolveTimeout bounds the boot-time GET for the owner
+	// Deployment, so a hung API server fails boot fast into the crashloop
+	// backoff instead of hanging it.
+	ownerResolveTimeout = 30 * time.Second
+	// primerCap bounds the rehydration-primer annotation, well under the
+	// object annotation budget.
+	primerCap = 8192
+	// workerRunAsUser is the arbitrary non-root UID session pods run as.
+	workerRunAsUser = 1000
+	// Worker requests: the harness spike's per-session footprint, and what
+	// the session cap's sizing math multiplies.
+	workerCPURequest    = "250m"
+	workerMemoryRequest = "512Mi"
+	// sessionNameHexWidth suffixes minted session names — wide enough that
+	// two conversations can't plausibly collide onto one addressee.
+	// supervisorCorrHexWidth suffixes the fallback correlation id a
+	// supervisor terminal mints when the orphan carried none.
+	sessionNameHexWidth    = 4
+	supervisorCorrHexWidth = 6
+
+	labelPartOf = "app.kubernetes.io/part-of"
+	partOfValue = "a2a-next"
+	labelRole   = "app.kubernetes.io/component"
+	sessionRole = "a2a-session"
+	annoTask    = "a2a.kubeagents.dev/task-id"
+	annoContext = "a2a.kubeagents.dev/context-id"
+	annoCorr    = "a2a.kubeagents.dev/correlation-id"
+	annoAddr    = "a2a.kubeagents.dev/addressee"
+	annoConvo   = "a2a.kubeagents.dev/session-key"
+	annoPrimer  = "a2a.kubeagents.dev/rehydration-primer"
+)
+
+// sessionNameAnimals seeds minted session names. W5 owns the canonical
+// animal list (stolen from the demo); this short one keeps the dark path
+// honest until integration.
+var sessionNameAnimals = []string{"otter", "badger", "heron", "lynx", "marten", "puffin", "stoat", "vole"}
+
 // spawner is the session-pod half of the lifecycle. It stays dark behind
 // SpawnSessions until W4's worker image exists; the gateway pod gets its
 // service-account token with that change, not before.
@@ -54,41 +105,11 @@ type orphanPod struct {
 // mintSessionName gives an incarnation its bus session name,
 // <profile>-<animal> per the house ruling, minted FRESH per incarnation —
 // reaping and respawning changes the pod and the bus session name;
-// contextId is what persists (gateway design). The suffix is wide enough
-// that two conversations can't plausibly collide onto one addressee. W5
-// owns the canonical animal list (stolen from the demo); this short one
-// keeps the dark path honest until integration.
+// contextId is what persists (gateway design).
 func mintSessionName(profile string) string {
-	animals := []string{"otter", "badger", "heron", "lynx", "marten", "puffin", "stoat", "vole"}
-	return fmt.Sprintf("%s-%s-%s", profile, animals[int(time.Now().UnixNano())%len(animals)], randHex(4))
+	return fmt.Sprintf("%s-%s-%s", profile,
+		sessionNameAnimals[int(time.Now().UnixNano())%len(sessionNameAnimals)], randHex(sessionNameHexWidth))
 }
-
-const (
-	// ownerResolveTimeout bounds the boot-time GET for the owner
-	// Deployment, so a hung API server fails boot fast into the crashloop
-	// backoff instead of hanging it.
-	ownerResolveTimeout = 30 * time.Second
-	// primerCap bounds the rehydration-primer annotation, well under the
-	// object annotation budget.
-	primerCap = 8192
-	// workerRunAsUser is the arbitrary non-root UID session pods run as.
-	workerRunAsUser = 1000
-	// Worker requests: the harness spike's per-session footprint, and what
-	// the session cap's sizing math multiplies.
-	workerCPURequest    = "250m"
-	workerMemoryRequest = "512Mi"
-
-	labelPartOf = "app.kubernetes.io/part-of"
-	partOfValue = "a2a-next"
-	labelRole   = "app.kubernetes.io/component"
-	sessionRole = "a2a-session"
-	annoTask    = "a2a.kubeagents.dev/task-id"
-	annoContext = "a2a.kubeagents.dev/context-id"
-	annoCorr    = "a2a.kubeagents.dev/correlation-id"
-	annoAddr    = "a2a.kubeagents.dev/addressee"
-	annoConvo   = "a2a.kubeagents.dev/session-key"
-	annoPrimer  = "a2a.kubeagents.dev/rehydration-primer"
-)
 
 func activeCorrelation(rec *SessionRecord) string {
 	if rec.ActiveTask != nil {
@@ -156,16 +177,6 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 	}
 	return nil
 }
-
-// podDeadlineGrace is what the pod-level activeDeadlineSeconds adds above
-// the adapter's task deadline. The adapter's contract is that its deadline
-// sits BELOW the pod's, so the failure is the adapter's to report — the pod
-// deadline only fires for a wedged adapter, handing it to Sweep instead of
-// letting it hold its bus credential indefinitely. The grace covers what
-// the adapter's clock does not: the image pull before the process starts
-// (activeDeadlineSeconds runs from pod start) plus the adapter's own
-// shutdown-and-publish window at its deadline.
-const podDeadlineGrace = 10 * time.Minute
 
 // Spawn creates the session pod: the demo's reference worker shape — no
 // ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests —
@@ -424,7 +435,7 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 // "the supervisor declared it dead". (The dispatcher's janitor is the other
 // half, for profile-addressed tasks — stage 3.)
 func (g *Gateway) sweepLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -445,7 +456,7 @@ func isTaskNotFound(err error) bool {
 }
 
 func (g *Gateway) sweepOnce(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, sweepPassTimeout)
 	defer cancel()
 	orphans, err := g.spawner.TerminalOrphans(ctx)
 	if err != nil {
@@ -575,7 +586,7 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 	if correlationID == "" {
 		// The record should always carry it; a missing one still gets a
 		// terminal event, honestly labeled.
-		correlationID = "corr-supervisor-" + randHex(6)
+		correlationID = "corr-supervisor-" + randHex(supervisorCorrHexWidth)
 	}
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID:    taskID,
@@ -584,7 +595,7 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 			State: state,
 			Message: &lib.Message{
 				Role:      "agent",
-				MessageID: "msg-" + randHex(8),
+				MessageID: "msg-" + randHex(messageIDHexWidth),
 				Parts:     []lib.Part{{Kind: "text", Text: note}},
 			},
 		},

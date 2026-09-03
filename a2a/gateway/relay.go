@@ -17,6 +17,15 @@ const discordChunk = 1900
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
 
+// KV access rides withRetry with these shapes: enough to ride out a
+// connection rebuild window without inventing a second resilience layer,
+// and a short requeue pause where a whole batch has to come back.
+const (
+	kvRetryAttempts = 3
+	kvRetryPause    = 200 * time.Millisecond
+	requeueDelay    = 2 * time.Second
+)
+
 // relayState is the in-memory render state for one task's rolling line. It
 // is cache: a gateway restart loses it, and the terminal path falls back to
 // a stream replay to recover the result — the stream is the record.
@@ -316,15 +325,6 @@ func (g *Gateway) sessionForTask(ctx context.Context, taskID string) string {
 	}
 	return key
 }
-
-// KV access rides withRetry with these shapes: enough to ride out a
-// connection rebuild window without inventing a second resilience layer,
-// and a short requeue pause where a whole batch has to come back.
-const (
-	kvRetryAttempts = 3
-	kvRetryPause    = 200 * time.Millisecond
-	requeueDelay    = 2 * time.Second
-)
 
 // withRetry runs f up to n times with a short linear-backoff pause.
 func withRetry(n int, f func() error) error {

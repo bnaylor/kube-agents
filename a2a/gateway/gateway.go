@@ -23,6 +23,16 @@ const turnTimeout = 60 * time.Second
 // Options.RelayDurable for the one caller that may not share it.
 const relayDurable = "gateway-relay"
 
+// Hex-suffix widths for the ids the gateway mints. Context and correlation
+// ids are wider than task and message ids: they outlive one task and join
+// records across surfaces, so a collision costs more.
+const (
+	taskIDHexWidth        = 8
+	messageIDHexWidth     = 8
+	contextIDHexWidth     = 12
+	correlationIDHexWidth = 12
+)
+
 // gatewayParty is the gateway's own identity in from — routing and display
 // only, never an authorization input. Its supervisor events carry it so
 // replay always distinguishes "the worker said failed" from "the supervisor
@@ -419,7 +429,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*SessionRecord, error) {
 	rec := &SessionRecord{
 		Key:          msg.Conversation,
-		ContextID:    "ctx-" + randHex(12),
+		ContextID:    "ctx-" + randHex(contextIDHexWidth),
 		Addressee:    g.cfg.DefaultAddressee,
 		Kind:         msg.Kind,
 		LastActivity: time.Now().UTC(),
@@ -450,10 +460,10 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 // startTask mints the identifiers, publishes the submission, and posts the
 // placeholder the relay will edit.
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, principal string, authority []byte) {
-	taskID := "task-" + randHex(8)
+	taskID := "task-" + randHex(taskIDHexWidth)
 	// correlationId is minted here and nowhere else — the originating user
 	// interaction (payload spec field rule).
-	correlationID := "corr-" + randHex(12)
+	correlationID := "corr-" + randHex(correlationIDHexWidth)
 
 	// The ingress log is the plaintext join: backend message id against
 	// correlationId, so the audit chain runs chat message -> correlationId ->
@@ -620,7 +630,7 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 	return marshalMessage(lib.Message{
 		Role:      "user",
 		Parts:     []lib.Part{{Kind: "text", Text: text}},
-		MessageID: "msg-" + randHex(8),
+		MessageID: "msg-" + randHex(messageIDHexWidth),
 		TaskID:    taskID,
 		ContextID: contextID,
 	})
