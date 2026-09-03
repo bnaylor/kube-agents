@@ -164,9 +164,16 @@ type PlatformAgentReconciler struct {
 // DaemonSet port (issue #747 B4) — a second consumer of a grant that already existed for
 // buildMinimalPlatformRole's escalation-prevention requirement.
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
+// `secrets` and full `jobs` verbs exist for the mode-next A2A stack: the
+// generated NATS credentials/config Secrets and the provisioning Job.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
-// +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;resourcequotas;limitranges;endpoints;pods/log,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
+// Full `resourcequotas` verbs exist for the mode-next session-pod quota (the
+// enforcement half of the session cap); everything else only reads quotas.
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=metrics.k8s.io,resources=nodes;pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch
@@ -420,6 +427,26 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// The mode gate: `next` additionally renders the NATS component and the
+	// A2A gateway; `today` keeps the dark stack dark — including tearing it
+	// back down after a flip, so `mode` absent renders exactly today's stack
+	// rather than today's stack plus leftovers. Version skew touches NEITHER
+	// branch: renderMode fails closed to today, and letting that reach
+	// cleanupA2A would have a one-version operator rollback tear down a live
+	// bus that a newer CRD's mode legitimately rendered. Skew is a status
+	// problem (below), not a rendering instruction.
+	var a2aState a2aProvisionState
+	a2aNext := modeErr == nil && renderMode(instance, "nats") == ModeNext
+	if a2aNext {
+		if a2aState, err = r.reconcileA2A(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if modeErr == nil {
+		if err := r.cleanupA2A(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// 9. Update status phase. While the mode is unrecognized the phase is
 	// Degraded with a named reason — silently rendering today at that point
 	// would leave nothing in `kubectl describe` saying the cluster runs
@@ -433,6 +460,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	if a2aState.failed {
+		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -442,6 +475,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// A2A provisioning still running — Jobs are not watched (see a2aReader),
+	// so completion, failure, and the TTL removing a finished Job are all
+	// invisible without a requeue.
+	if a2aNext && !a2aState.done {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -497,6 +537,16 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
+		// reference (nothing from a template does), so without this a
+		// deleted next-mode agent leaks its 40Gi JetStream volume.
+		a2aPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: "data-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace,
+		}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
 			return ctrl.Result{}, err
 		}
 
