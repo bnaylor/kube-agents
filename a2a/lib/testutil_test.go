@@ -52,6 +52,17 @@ func startServer(t *testing.T) *natsserver.Server {
 // one limits-retention stream over a2a.tasks.>.
 func provisionTasksStream(t *testing.T, url string) {
 	t.Helper()
+	provisionCappedTasksStream(t, url, 0)
+}
+
+// provisionCappedTasksStream is provisionTasksStream with a max_consumers
+// bound, which the deployment sets and a plain embedded server does not.
+// maxConsumers of 0 means unlimited, matching jetstream's own encoding.
+func provisionCappedTasksStream(t *testing.T, url string, maxConsumers int) {
+	t.Helper()
+	if maxConsumers == 0 {
+		maxConsumers = -1
+	}
 	nc, err := nats.Connect(url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -64,10 +75,11 @@ func provisionTasksStream(t *testing.T, url string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      "TASKS",
-		Subjects:  []string{"a2a.tasks.>"},
-		Retention: jetstream.LimitsPolicy,
-		MaxAge:    72 * time.Hour,
+		Name:         "TASKS",
+		Subjects:     []string{"a2a.tasks.>"},
+		Retention:    jetstream.LimitsPolicy,
+		MaxAge:       72 * time.Hour,
+		MaxConsumers: maxConsumers,
 	})
 	if err != nil {
 		t.Fatalf("create TASKS stream: %v", err)

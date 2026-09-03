@@ -199,6 +199,84 @@ func TestTasksGet_UnknownTask(t *testing.T) {
 	}
 }
 
+// Every TasksGet builds an ordered consumer on TASKS. If it does not delete it,
+// the consumers pile up against the stream's max_consumers until the stream
+// refuses to make another one — and TASKS is shared, so the first thing to fail
+// is not tasks/get but a worker opening its input consumer or the gateway
+// re-establishing its relay after a reconnect. A read path wedging the task
+// plane. Both halves matter: the folds must succeed, and the stream must still
+// have room afterwards.
+func TestTasksGet_DoesNotExhaustMaxConsumers(t *testing.T) {
+	const maxConsumers = 4
+	const replays = maxConsumers * 3
+
+	s := startServer(t)
+	provisionCappedTasksStream(t, clientURL(s), maxConsumers)
+	c := replayFixture(t, clientURL(s), "task-mc", []TaskState{StateSubmitted, StateWorking})
+	ctx := testCtx(t)
+
+	for i := range replays {
+		task, err := c.TasksGet(ctx, replayAddressee("task-mc"), "task-mc")
+		if err != nil {
+			t.Fatalf("TasksGet #%d of %d against max_consumers=%d: %v", i+1, replays, maxConsumers, err)
+		}
+		if task.State != StateWorking {
+			t.Fatalf("TasksGet #%d folded state %s, want %s", i+1, task.State, StateWorking)
+		}
+	}
+
+	// The half that proves the consumers went away rather than that the replays
+	// happened to fit: someone else must still be able to open one.
+	nc, err := nats.Connect(clientURL(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.CreateConsumer(ctx, TasksStream, jetstream.ConsumerConfig{
+		Durable:       "another-reader",
+		FilterSubject: "a2a.tasks.>",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	}); err != nil {
+		t.Fatalf("a consumer create after %d replays: %v", replays, err)
+	}
+}
+
+// A replay whose caller gave up still owns the consumer it built, and that is
+// the case most likely to arrive in bulk — a chat surface times out its
+// tasks/get and retries. So the cleanup cannot ride the caller's context: by
+// the time it runs, that context is exactly the thing that died.
+func TestDeleteReplayConsumer_SurvivesACancelledCallerContext(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	c := replayFixture(t, clientURL(s), "task-dc", []TaskState{StateSubmitted})
+	live := testCtx(t)
+	_, js := c.conn()
+
+	cons, err := js.OrderedConsumer(live, TasksStream, jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{TaskEventsSubject(replayAddressee("task-dc"), "task-dc")},
+		DeliverPolicy:  jetstream.DeliverAllPolicy,
+	})
+	if err != nil {
+		t.Fatalf("OrderedConsumer: %v", err)
+	}
+	name := cons.CachedInfo().Name
+	if _, err := js.Consumer(live, TasksStream, name); err != nil {
+		t.Fatalf("consumer %q should exist before cleanup: %v", name, err)
+	}
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.deleteReplayConsumer(dead, cons, "task-dc")
+
+	if _, err := js.Consumer(live, TasksStream, name); !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Fatalf("consumer %q survived cleanup under a cancelled caller context: %v", name, err)
+	}
+}
+
 // An event whose payload names a different task than its envelope must not
 // fold silently into this task.
 func TestFoldTask_PayloadTaskIDMismatch(t *testing.T) {

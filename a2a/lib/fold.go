@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -146,6 +147,13 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 	if err != nil {
 		return nil, fmt.Errorf("ordered consumer for %s: %w", taskID, err)
 	}
+	// Stopping the iterator does not remove the consumer — nats.go only deletes
+	// one when the ordered consumer resets itself, so a completed replay leaves
+	// its consumer standing until InactiveThreshold (5 minutes) expires it. That
+	// is one consumer per tasks/get against the stream's max_consumers, on the
+	// TASKS stream every worker input consumer and the gateway relay also live
+	// on, so the read path exhausts the cap and the write path is what fails.
+	defer c.deleteReplayConsumer(ctx, cons, taskID)
 	it, err := cons.Messages()
 	if err != nil {
 		return nil, fmt.Errorf("replay messages for %s: %w", taskID, err)
@@ -198,6 +206,27 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			"task", taskID, "dropped", task.PostFinalDropped)
 	}
 	return task, nil
+}
+
+// deleteReplayConsumer removes the ephemeral consumer a replay built. It runs on
+// every exit from TasksGet, including the ones where ctx is already dead — a
+// caller who cancelled mid-replay leaks a consumer otherwise, which is the case
+// most likely to happen in bulk — so the delete carries its own short deadline
+// rather than the caller's context. A delete that fails is logged and nothing
+// more: the consumer's InactiveThreshold still reaps it, just five minutes later.
+func (c *Client) deleteReplayConsumer(ctx context.Context, cons jetstream.Consumer, taskID string) {
+	info := cons.CachedInfo()
+	if info == nil || info.Name == "" {
+		return
+	}
+	_, js := c.conn()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteConsumer(ctx, TasksStream, info.Name); err != nil &&
+		!errors.Is(err, jetstream.ErrConsumerNotFound) {
+		c.log.Warn("a2a replay consumer not deleted",
+			"task", taskID, "consumer", info.Name, "err", err)
+	}
 }
 
 // ValidateArtifacts enforces assertion 18: a completed task carries at least
