@@ -228,10 +228,11 @@ locals {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id      = var.project_id
-  namespace       = var.namespace
-  project_roles   = local.agent_project_roles
-  scoped_clusters = var.scoped_clusters
+  project_id         = var.project_id
+  namespace          = var.namespace
+  project_roles      = local.agent_project_roles
+  scoped_clusters    = var.scoped_clusters
+  service_account_id = var.agent_service_account_id
 
   # module.gke_cluster, and not only the API enablements, because the module's
   # workload_identity binding names the pool as an interpolated string

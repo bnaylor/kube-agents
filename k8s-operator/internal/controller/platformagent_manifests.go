@@ -2038,6 +2038,44 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: credentialProxyTokenMountPath + "/token",
 		})
 	}
+
+	// The A2A bus, under `next` only (W5 delta memo #1, ask 2): address and
+	// credentials for the worker user, whose grants already fit an agent-side
+	// reader — subscribe on a2a.topics.>, publish on the provisioned topics.
+	// From the same Secret the A2A gateway reads, and container env only: a
+	// copy in a profile .env on the PVC would be a second place to rotate and
+	// a first place to leak. W7's bridge sidecar shares the pod and needs the
+	// same three, so this is one seam, not two.
+	//
+	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
+	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
+	// lands in the container whatever the address says; a plugin that replaced
+	// NATS_URL (spec.env is copied verbatim, mergeEnvVars replaces in place)
+	// would have the client hand the worker password to an address of the
+	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
+	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
+	// cluster. Found by the W6.1 adversarial review; the same names are in
+	// SensitiveEnvVars so the CR's own spec.deployment.env cannot reach them
+	// either.
+	if a2aAgentSurface(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name:  "NATS_URL",
+				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+			},
+			corev1.EnvVar{
+				Name:  "NATS_USER",
+				Value: "worker",
+			},
+			corev1.EnvVar{
+				Name: "NATS_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
+					Key:                  "worker-password",
+				}},
+			},
+		)
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -4446,6 +4484,29 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 	})
+
+	// 11. The A2A bus, under `next` only (W5 delta memo #1, ask 1). The NATS
+	// pods by label rather than CIDR: the pod IP does not survive a restart,
+	// and a policy pinned to an address silently stops matching. Egress here
+	// is deny-by-default, and a missing rule does not refuse the dial — it
+	// hangs it to the timeout, the least diagnosable shape this failure has.
+	if a2aAgentSurface(agent) {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							labelPartOf:       a2aPartOf,
+							a2aComponentLabel: "nats",
+						},
+					},
+				},
+			},
+		})
+	}
 
 	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
 	// addition to the operator's own set rather than being interleaved with it.
