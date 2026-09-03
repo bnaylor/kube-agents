@@ -267,7 +267,14 @@ func terminalLine(state lib.TaskState, progress string) string {
 		lib.StateRejected:  "🚫",
 	}[state]
 	line := fmt.Sprintf("%s **%s**", icon, state)
-	if progress != "" {
+	// No tail on completed: the result is posted as its own message right
+	// before this edit, and the worker adapter's progress deviation (no
+	// explicit progress tool — assistant text becomes `progress`, the final
+	// text becomes `result`) makes the last narration routinely BE the
+	// result on a single-turn task, so keeping it rendered the answer
+	// twice. The other terminals post no result, so their last narration
+	// is genuine context ("🛑 canceled — was checking node pressure").
+	if progress != "" && state != lib.StateCompleted {
 		line += " — " + progress
 	}
 	return line

@@ -263,6 +263,97 @@ func TestHealPostsTheLostTerminal(t *testing.T) {
 	})
 }
 
+// TestCompletedResultRendersExactlyOnce: the worker adapter has no explicit
+// progress tool — assistant text becomes `progress` and the final text
+// becomes `result`, so on a single-turn task the SAME text arrives as both
+// (W4's documented deviation). The rolling line must therefore drop its
+// progress tail at `completed`, where the result is posted separately, or
+// the room sees the answer twice — observed live in Discord, 9/3. The
+// other terminals post no result, so their tail is genuine context and
+// stays.
+func TestCompletedResultRendersExactlyOnce(t *testing.T) {
+	const answer = "There once was a pod in a queue"
+	r := startRig(t)
+	conv := "discord:g1/thread-double"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dr-1", Text: "write me a limerick"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress,
+		Parts: []lib.Part{{Kind: "text", Text: answer}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: answer}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "result posted", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, answer) {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "terminal rolling line", func() bool {
+		edits := r.adapter.editTexts()
+		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], string(lib.StateCompleted))
+	})
+	// What the user is left looking at: the posts, plus the FINAL state of
+	// the rolling line (intermediate edits are overwritten in place).
+	// The answer appears exactly once.
+	seen := 0
+	for _, p := range r.adapter.postTexts() {
+		seen += strings.Count(p, answer)
+	}
+	edits := r.adapter.editTexts()
+	finalLine := edits[len(edits)-1]
+	seen += strings.Count(finalLine, answer)
+	if seen != 1 {
+		t.Fatalf("the answer renders %d times (final line %q, posts %q); want exactly once",
+			seen, finalLine, r.adapter.postTexts())
+	}
+}
+
+// TestNonCompletedTerminalKeepsTheNarrationTail: failed/canceled/rejected
+// post no result, so the last narration on the rolling line is genuine
+// context there and must survive the completed-tail fix.
+func TestNonCompletedTerminalKeepsTheNarrationTail(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-failtail"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "ft-1", Text: "check node pressure"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress,
+		Parts: []lib.Part{{Kind: "text", Text: "was checking node pressure"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateFailed, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "failed rolling line keeps the narration", func() bool {
+		edits := r.adapter.editTexts()
+		if len(edits) == 0 {
+			return false
+		}
+		last := edits[len(edits)-1]
+		return strings.Contains(last, string(lib.StateFailed)) &&
+			strings.Contains(last, "was checking node pressure")
+	})
+}
+
 // TestSpawnSetsSeccompRuntimeDefault: the operator's own workloads pin
 // seccompProfile RuntimeDefault; a session pod without it is rejected
 // outright in a namespace enforcing restricted pod security — which would
