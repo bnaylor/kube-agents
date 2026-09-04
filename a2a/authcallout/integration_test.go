@@ -1,7 +1,6 @@
 package authcallout
 
 import (
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -33,8 +32,9 @@ import (
 // a subject that worked.
 
 const (
-	svcUser = "auth_service"
-	svcPass = "svcpass"
+	// The callout's own user and password as the operator renders them.
+	svcUser = "callout"
+	svcPass = "pw-callout"
 
 	// The two identities the DoD needs to tell apart.
 	gatewayToken = "token-for-the-gateway-serviceaccount-padded-to-a-realistic-length"
@@ -126,44 +126,27 @@ func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string)
 	xkeySeed, _ := xkeyKP.Seed()
 	xkeyPub, _ := xkeyKP.PublicKey()
 
-	conf := fmt.Sprintf(`
-port: -1
-# A ServiceAccount token rides inside the CONNECT line, and the 4096 default
-# leaves under 4KB for the whole frame. Measured cutoff is ~3920 bytes of
-# token, so a bound projected token with several audiences does not
-# comfortably fit and the failure is a hard connect refusal.
-max_control_line: 65536
-
-accounts {
-  AUTH: {
-    users: [
-      { user: %s, password: %s,
-        permissions: {
-          subscribe: ["$SYS.REQ.USER.AUTH"]
-          publish: ["$SYS._INBOX.>"]
-        } }
-    ]
-  }
-  APP: { jetstream: enabled }
-  SYS: { users: [ { user: sys, password: syspass } ] }
-}
-system_account: SYS
-
-authorization {
-  # Above roughly two seconds the server's own first-ping timer fires on the
-  # not-yet-authenticated connection and the Go client aborts the connect
-  # with "expected 'PONG', got 'PING'" - which names nothing about
-  # authorization. Two keeps the failure a clean Authorization Violation.
-  timeout: 2
-
-  auth_callout {
-    issuer: %s
-    account: AUTH
-    auth_users: [ %s, sys ]
-    xkey: %s
-  }
-}
-`, svcUser, svcPass, issuerPub, svcUser, xkeyPub)
+	// The operator's REAL rendered nats.conf, not a hand-written mirror of it.
+	//
+	// This is the point of the fixture. A callout suite that writes its own
+	// config proves the callout works against that config; it says nothing
+	// about the one this product ships, and every interesting failure here is
+	// a config-shape failure — a malformed auth_callout block, a static user
+	// missing from auth_users, max_control_line left at a default that a
+	// projected token does not fit inside. Starting a real server from the
+	// real render is what makes those fail in CI instead of on a cluster.
+	//
+	// Two substitutions, both mechanical. The committed fixture carries
+	// placeholder public keys because the seeds must not be in the repository,
+	// so the freshly generated public halves go in here where the matching
+	// seeds are in hand. Ports and the store directory are overridden on the
+	// parsed options below rather than in the text.
+	rendered, err := os.ReadFile("testdata/rendered-nats.conf")
+	if err != nil {
+		t.Fatalf("reading the operator's rendered nats.conf: %v", err)
+	}
+	conf := replaceConfKey(string(rendered), "issuer: ", issuerPub)
+	conf = replaceConfKey(conf, "xkey: ", xkeyPub)
 
 	confPath := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
@@ -175,6 +158,12 @@ authorization {
 		t.Fatalf("the rendered nats.conf was refused by the server: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
+	// Ports and paths are the only things a test may move: the render pins
+	// 4222 and 9222 and a JetStream store at /data, none of which a test
+	// process can have. Everything the test is actually asserting about —
+	// accounts, users, grants, the callout block — is untouched.
+	opts.Port = -1
+	opts.Websocket.Port = -1
 	opts.StoreDir = t.TempDir()
 
 	srv, err := natsserver.NewServer(opts)
@@ -477,4 +466,18 @@ func TestIssuedUsersLandInTheAccountTheirMapEntryNames(t *testing.T) {
 	if !found {
 		t.Fatal("the gateway connection was not visible to Connz")
 	}
+}
+
+// replaceConfKey swaps the value of a `key: value` line in the rendered config.
+func replaceConfKey(conf, prefix, value string) string {
+	i := strings.Index(conf, prefix)
+	if i < 0 {
+		return conf
+	}
+	start := i + len(prefix)
+	end := start
+	for end < len(conf) && conf[end] != '\n' {
+		end++
+	}
+	return conf[:start] + value + conf[end:]
 }

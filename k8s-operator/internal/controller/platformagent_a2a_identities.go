@@ -80,6 +80,12 @@ type a2aIdentity struct {
 	// as TokenReview spells it. Set only for a2aAuthCallout.
 	serviceAccount string
 
+	// comment is rendered above this principal's block in nats.conf, for the
+	// static ones, or beside its entry in the map. The rationale belongs
+	// where the operator reading the live config will find it, not only
+	// here.
+	comment string
+
 	publish   []string
 	subscribe []string
 }
@@ -123,6 +129,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	return a2aIdentity{
 		user:           "gateway",
 		account:        a2aAccountApp,
+		comment:        "task requester, chat-session supervisor, session-registry owner",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, a2aGatewayName(agent)),
 		// $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
@@ -174,6 +181,7 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	return a2aIdentity{
 		user:           "agent",
 		account:        a2aAccountApp,
+		comment:        "the platform agent's own container and the Hermes bridge sidecar beside it: a topic and directory reader, with no reach onto the task plane",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),
 		// Topic grants name the provisioned registry exactly (payload
@@ -215,6 +223,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 	return a2aIdentity{
 		user:           "provision",
 		account:        a2aAccountApp,
+		comment:        "creates the streams, buckets and starter topics; nothing on the task plane",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, a2aProvisionServiceAccountName(agent)),
 		publish: []string{
@@ -245,8 +254,13 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 // for the same reason; it is the artifact nothing owns.
 func workerIdentity() a2aIdentity {
 	return a2aIdentity{
-		user:     "worker",
-		account:  a2aAccountApp,
+		user:    "worker",
+		account: a2aAccountApp,
+		comment: "executor for any addressee, shared by every spawned session pod.\n" +
+			"STATIC because a session pod carries no Kubernetes identity at all -\n" +
+			"no ServiceAccount, no projected token, nothing to present. Giving them\n" +
+			"all one shared ServiceAccount would move the shared credential rather\n" +
+			"than end it, so this closes when each session gets its own principal.",
 		auth:     a2aAuthStatic,
 		credsKey: "worker-password",
 		publish: []string{
@@ -289,8 +303,13 @@ func workerIdentity() a2aIdentity {
 // they close with a separate account and an export/import, which stays open.
 func webIdentity() a2aIdentity {
 	return a2aIdentity{
-		user:     "web",
-		account:  a2aAccountApp,
+		user:    "web",
+		account: a2aAccountApp,
+		comment: "the read surface, and the only credential published to a browser by\n" +
+			"design. STATIC permanently: a browser holds no ServiceAccount token and\n" +
+			"there is no mechanism by which it could. Read-only is not expressible as\n" +
+			"a subject list - JetStream puts the reach in the request BODY - so the JS\n" +
+			"API grants are enumerated per stream and there is no ack grant.",
 		auth:     a2aAuthStatic,
 		credsKey: "web-password",
 		publish: []string{
@@ -328,8 +347,10 @@ func webIdentity() a2aIdentity {
 // separate matter and is not this principal — see a2aCalloutServiceUser.
 func sysIdentity() a2aIdentity {
 	return a2aIdentity{
-		user:     "sys",
-		account:  a2aAccountSys,
+		user:    "sys",
+		account: a2aAccountSys,
+		comment: "human operators and monitoring. No agent ever authenticates here.\n" +
+			"STATIC: the holder is a person with a port-forward or a scrape config.",
 		auth:     a2aAuthStatic,
 		credsKey: "sys-password",
 	}

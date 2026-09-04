@@ -190,3 +190,16 @@ func TestTheAgentPrincipalCannotReachTheTaskPlane(t *testing.T) {
 		}
 	}
 }
+
+// a2aTestCalloutKeys generates a real keypair set for render tests. Real rather
+// than a fixture string: the server validates both key types and refuses to
+// start on either being wrong, so a test rendering a placeholder would assert
+// against a config the server would reject.
+func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
+	t.Helper()
+	keys, _, err := generateA2ACalloutKeys()
+	if err != nil {
+		t.Fatalf("generateA2ACalloutKeys: %v", err)
+	}
+	return keys
+}

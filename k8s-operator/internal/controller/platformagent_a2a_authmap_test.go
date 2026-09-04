@@ -190,3 +190,64 @@ func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
 		t.Errorf("the rendered map and the fixture the callout parses have diverged.\nRegenerate with: go test ./internal/controller/ -run TestRenderedAuthMap -update\n--- fixture\n%s\n--- rendered\n%s", want, rendered)
 	}
 }
+
+// natsConfFixturePath is the operator's real rendered nats.conf, which the a2a
+// module's integration test starts an actual nats-server from.
+//
+// This is the other half of the same contract as the identity-map fixture, and
+// it closes the larger gap: a callout test written against a hand-written
+// config proves the callout works against THAT config, not against the one this
+// operator ships. With the real render in the loop, a malformed auth_callout
+// block, a missing max_control_line, or a static user left out of auth_users
+// fails over in the a2a suite instead of on a cluster.
+//
+// Only public halves are written. The seeds stay out of the repository, and the
+// consuming test substitutes its own keypair's public values so it can hold the
+// matching seeds.
+//
+// Regenerate with: go test ./internal/controller/ -run TestRenderedNATSConf -update
+const natsConfFixturePath = "../../../a2a/authcallout/testdata/rendered-nats.conf"
+
+func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+
+	// The generated keys differ on every run, so the committed fixture is
+	// normalised to a stable placeholder. The consuming test replaces these
+	// with real values anyway; what has to stay byte-stable here is the
+	// structure around them.
+	conf = a2aNormaliseKeyLine(conf, "issuer: ", "A")
+	conf = a2aNormaliseKeyLine(conf, "xkey: ", "X")
+
+	path := filepath.Clean(natsConfFixturePath)
+	if *updateAuthMapFixture {
+		if err := os.WriteFile(path, []byte(conf), 0o644); err != nil {
+			t.Fatalf("writing fixture: %v", err)
+		}
+		t.Logf("wrote %s", path)
+		return
+	}
+
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the nats.conf fixture: %v\nRegenerate with: go test ./internal/controller/ -run TestRenderedNATSConf -update", err)
+	}
+	if string(want) != conf {
+		t.Errorf("the rendered nats.conf and the fixture the callout suite starts a server from have diverged.\nRegenerate with: go test ./internal/controller/ -run TestRenderedNATSConf -update")
+	}
+}
+
+// a2aNormaliseKeyLine replaces a generated public key with a stable
+// placeholder of the same prefix, so the fixture diffs on structure rather than
+// on entropy.
+func a2aNormaliseKeyLine(conf, prefix, keyPrefix string) string {
+	i := strings.Index(conf, prefix+keyPrefix)
+	if i < 0 {
+		return conf
+	}
+	start := i + len(prefix)
+	end := start
+	for end < len(conf) && conf[end] != '\n' {
+		end++
+	}
+	return conf[:start] + keyPrefix + "PLACEHOLDERPUBLICKEYSUBSTITUTEDBYTHECALLOUTTESTSUITE" + conf[end:]
+}

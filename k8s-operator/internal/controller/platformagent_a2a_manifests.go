@@ -149,7 +149,12 @@ func randomA2APassword() (string, error) {
 // a2aCredsKeys is every key the creds Secret must carry; an absent or empty
 // key would render `password: ""` into nats.conf — a user anyone can log in
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
-var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
+// The gateway, agent and provision principals are absent on purpose: under the
+// auth callout they hold no shared secret at all, which is the point. The
+// gateway and seed keys survive so an install that predates the callout keeps a
+// valid Secret shape through the upgrade, and so the hand-applied seed tooling
+// still has a credential.
+var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password", "callout-password"}
 
 // a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
 // security check, not tidiness: buildA2ANATSConfigSecret interpolates these
@@ -241,7 +246,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // _INBOX prefixes so the reply path cannot leak what the subject grants
 // withheld. $JS.API.> on every app user is playground posture; production
 // narrows it to the per-stream API subjects when the callout arms.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) *corev1.Secret {
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) *corev1.Secret {
 	pw := func(key string) string { return string(creds.Data[key]) }
 
 	conf := a2aPostureComment + `
@@ -249,6 +254,16 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 server_name: ` + a2aNATSName(agent) + `
 port: 4222
 http: 8222
+
+# A ServiceAccount token travels inside the client's CONNECT frame, and the
+# default max_control_line of 4096 bounds that whole frame - measured, the
+# usable room for the token itself is around 3920 bytes once the rest of the
+# CONNECT JSON is accounted for. A plain projected token fits with room to
+# spare; one bound to several audiences, from a client with a long name, does
+# not. The failure is not graceful: the server closes the connection with
+# "Maximum Control Line Exceeded" before authentication happens at all, so it
+# reads as the bus refusing a workload rather than as a size limit.
+max_control_line: 65536
 
 # Websocket listener for the web user (the read-only web rail reads the bus
 # over this).
@@ -293,192 +308,97 @@ jetstream {
   # inside this.
   max_file_store: 34359738368
 }
-
 accounts {
-  APP {
-    jetstream: enabled
+  # AUTH: the auth callout service and nothing else.
+  #
+  # A dedicated account, and that is a boundary rather than tidiness. The
+  # server publishes each authorization request into THIS account and takes
+  # the first answer that comes back on the reply inbox — and it does not
+  # check that the answer's outer envelope was signed by the configured
+  # issuer (measured; the inner user JWT's signature IS checked). So anything
+  # able to publish into this account's $SYS._INBOX.> and win the race can
+  # answer an authorization request. It could not forge a grant without the
+  # issuer seed, but it could refuse one. Nothing else belongs in here.
+  AUTH {
     users [
       {
-        # gateway: task requester, chat-session supervisor, session-registry
-        # owner. Production scopes supervisor publish to sessions the gateway
-        # spawned; statically that collapses to the task-events wildcard.
-        user: gateway
-        password: "` + pw("gateway-password") + `"
+        # The callout cannot authenticate through itself, so it is exempt via
+        # auth_users below and carries a password. This permission pair is
+        # the entire surface it needs: read the requests, answer them.
+        user: callout
+        password: "` + pw("callout-password") + `"
         permissions {
-          # $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
-          # explicit ack is a publish to $JS.ACK.<stream>.<consumer>..., and
-          # push flow control answers on $JS.FC.>. Without them a consumer
-          # redelivers forever while TCP health stays green.
-          #
-          # The ack grant is scoped to the streams this user actually
-          # consumes with explicit ack (the gateway-relay durable on TASKS;
-          # everything else it reads is ordered/ack-none). An ack subject
-          # names a stream and a CONSUMER, never the caller, so unscoped
-          # $JS.ACK.> would let this user +TERM another principal's
-          # in-flight delivery on ANY stream — the escape deleted from the
-          # web user below. What scoping cannot close: within a granted
-          # stream, consumer names are the caller's choice (NATS wildcards
-          # match whole tokens, so per-name scoping is not expressible), so
-          # gateway and worker can still address each other's TASKS
-          # deliveries. The auth callout closes that residue when it arms.
-          publish { allow = [
-            "a2a.tasks.*.*.in",
-            "a2a.tasks.*.*.events",
-            "$KV.session-state.>",
-            "$JS.API.>",
-            "$JS.ACK.TASKS.>",
-            "$JS.FC.>",
-            "_INBOX.gateway.>"
-          ] }
-          subscribe { allow = [
-            "a2a.tasks.*.*.events",
-            "a2a.agents.>",
-            "agents.hb.>",
-            "$KV.session-state.>",
-            "_INBOX.gateway.>"
-          ] }
-        }
-      }
-      {
-        # worker: executor for any addressee (production: per-identity users
-        # minted by the callout; the shared static user is the playground).
-        user: worker
-        password: "` + pw("worker-password") + `"
-        permissions {
-          # Topic grants name the provisioned registry exactly (payload spec:
-          # topics are provisioned-only). A wildcard here would let a publish
-          # to an unprovisioned topic vanish into core NATS; the exact list
-          # turns that into a connect-time refusal instead of silent loss.
-          #
-          # Ack scope: TASKS only — the bridge sidecar's durable task
-          # consumer rides this user; the worker adapter and every topic or
-          # state read are ordered/ack-none. See the gateway's comment for
-          # why unscoped $JS.ACK.> is a cross-principal +TERM and what
-          # scoping still cannot close inside a shared stream.
-          publish { allow = [
-            "a2a.tasks.*.*.events",
-            "a2a.topics.agent.platform.upgrade-readiness",
-            "a2a.topics.shared.blueprint",
-            "a2a.topics.shared.annotations",
-            "a2a.agents.>",
-            "agents.hb.>",
-            "$KV.runtime-state.>",
-            "$JS.API.>",
-            "$JS.ACK.TASKS.>",
-            "$JS.FC.>",
-            "_INBOX.worker.>"
-          ] }
-          subscribe { allow = [
-            "a2a.tasks.>",
-            "a2a.topics.>",
-            "$KV.runtime-state.>",
-            "_INBOX.worker.>"
-          ] }
-        }
-      }
-      {
-        # seed: provisions the streams and buckets (the $JS.API grant is what
-        # the provision Job runs under) and writes the starter topic entries.
-        # Nothing on the task plane — a seed that can publish tasks is a seed
-        # that can impersonate the fabric.
-        user: seed
-        password: "` + pw("seed-password") + `"
-        permissions {
-          # No ack grant at all: seed creates no consumers. Provisioning is
-          # $JS.API requests, the starter topics are publishes, and the
-          # CLI's topic reads are stream API calls — nothing here ever acks,
-          # so an ack grant would be pure unused capability to +TERM other
-          # principals' deliveries (the same deletion the web user got).
-          publish { allow = [
-            "a2a.topics.agent.platform.upgrade-readiness",
-            "a2a.topics.shared.blueprint",
-            "a2a.topics.shared.annotations",
-            "$JS.API.>",
-            "_INBOX.seed.>"
-          ] }
-          subscribe { allow = [
-            "a2a.topics.>",
-            "_INBOX.seed.>"
-          ] }
-        }
-      }
-      {
-        # web: the read surface, the one user meant to face a browser, and
-        # the only user whose credential is published to one by design.
-        #
-        # "Read-only" is not expressible as a subject list, and the first
-        # version of this user proved it the hard way. Subject permissions
-        # cannot see a request BODY, and JetStream puts the reach there: a
-        # consumer's target stream, its durability, and its delivery subject
-        # are all fields, not subjects. Every grant below is therefore
-        # enumerated per stream rather than wildcarded, because the wildcard
-        # is what turned "may read a2a.>" into three findings adversarial
-        # review reproduced live:
-        #
-        #   $JS.API.CONSUMER.CREATE.>  — a push consumer on KV_session-state
-        #     with deliver_subject set to web's OWN inbox read the session
-        #     registry out of a bucket web has no $KV grant for, on either
-        #     side. Subscribe permissions are not consulted when a consumer
-        #     is created; the deliver subject is.
-        #   $JS.ACK.>                  — an ack subject names a stream and a
-        #     CONSUMER, not the caller, so web could publish +TERM onto the
-        #     gateway's in-flight delivery and destroy it. The web rail uses
-        #     ack-none ordered consumers, so the grant is simply gone.
-        #   CONSUMER.MSG.NEXT.*.*      — web could pull messages off the
-        #     gateway's own durable and retune its config through
-        #     CONSUMER.CREATE, which is create-OR-UPDATE by name.
-        #
-        # The list is now exactly what the web rail needs, confirmed against
-        # its live conformance suite: the four a2a message streams, no KV
-        # buckets, no enumeration (NAMES/LIST), no ACK, no FC, no DELETE.
-        #
-        # Residues that remain, because a static permission map cannot hold
-        # them, both closed by the auth callout when it arms:
-        #  - Durability is a body field. Withholding the legacy
-        #    DURABLE.CREATE subject does NOT prevent a durable; the modern
-        #    CREATE carries durable_name. max_consumers on each stream bounds
-        #    what that can cost.
-        #  - Within these four streams, consumer names are the caller's
-        #    choice, so web can still address another principal's consumer.
-        #    Dropping ACK removed the destructive half; what is left is
-        #    stealing a delivery of data web may already read.
-        user: web
-        password: "` + pw("web-password") + `"
-        permissions {
-          publish { allow = [
-            "$JS.API.INFO",
-            "$JS.API.STREAM.INFO.TASKS",
-            "$JS.API.STREAM.INFO.DIRECTORY",
-            "$JS.API.STREAM.INFO.TOPICS-STATE",
-            "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-            "$JS.API.CONSUMER.CREATE.TASKS.>",
-            "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
-            "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
-            "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
-            "$JS.API.CONSUMER.INFO.TASKS.*",
-            "$JS.API.CONSUMER.INFO.DIRECTORY.*",
-            "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
-            "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
-            "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-            "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
-            "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
-            "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
-            "_INBOX.web.>"
-          ] }
-          subscribe { allow = [
-            "a2a.>",
-            "_INBOX.web.>"
-          ] }
+          subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }
+          publish { allow = [ "$SYS._INBOX.>" ] }
         }
       }
     ]
   }
+  APP {
+    jetstream: enabled
+    users [
+` + renderA2AStaticUsers(agent, creds, a2aAccountApp) + `    ]
+  }
   # $SYS: human operators and monitoring only; no agent authenticates here.
   SYS {
-    users [ { user: sys, password: "` + pw("sys-password") + `" } ]
+    users [
+` + renderA2AStaticUsers(agent, creds, a2aAccountSys) + `    ]
   }
 }
 system_account: SYS
+
+# The auth callout: who a connection is, decided against the cluster that
+# issued its identity rather than against a password this file rendered.
+#
+# What changes for a client: it presents a projected ServiceAccount token
+# instead of a password, the callout validates that token with a TokenReview
+# against the local API server, and the grants it gets back are the ones the
+# operator rendered for that ServiceAccount. What does NOT change is where
+# enforcement happens — the permission set still arrives before the connection
+# is usable, and the server still refuses on it without consulting any
+# application code.
+authorization {
+  # Two seconds, and this is a ceiling rather than a preference.
+  #
+  # The server starts a first-ping timer on a connection that has not yet
+  # authenticated, at roughly two seconds. If the callout has not answered by
+  # then the client receives a PING where the Go client library requires a
+  # PONG, and it aborts the connect reporting "expected 'PONG', got 'PING'" —
+  # which names nothing about authorization and sends whoever is debugging it
+  # to the network layer. Measured: at timeout 2 the failure is a clean
+  # Authorization Violation at a predictable deadline; at 3 or above it is
+  # that message instead. A merely SLOW callout hits it too, so the real
+  # budget for a TokenReview round trip is under two seconds whatever this
+  # number says.
+  timeout: 2
+
+  auth_callout {
+    # Public halves only. The seeds live in the callout's own Secret, mounted
+    # by the callout Deployment and nothing else. The issuer signs the user
+    # JWTs that carry the permissions this server enforces, so its holder can
+    # mint a user with any grants at all — see the callout-keys Secret for the
+    # custody note.
+    issuer: ` + keys.IssuerPublic + `
+    account: AUTH
+
+    # The request carries the client's raw ServiceAccount token, so it is
+    # encrypted in flight to the callout. Note the server does not require the
+    # RESPONSE to be encrypted even with this set, so response confidentiality
+    # is the callout's own discipline rather than something enforced here.
+    xkey: ` + keys.XKeyPublic + `
+
+    # Exempt from the callout: authenticated from this file, by username.
+    #
+    # This is a bypass and not a fallback — a listed user with a wrong
+    # password is refused statically and never reaches the callout at all.
+    # Every name here is a principal that cannot present a ServiceAccount
+    # token: the callout itself (it cannot authenticate through itself), the
+    # session workers (a session pod carries no Kubernetes identity yet), the
+    # browser-facing read user (a browser never can), and the operator's own
+    # $SYS login.
+    auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
+  }
+}
 `
 
 	return &corev1.Secret{
@@ -1065,6 +985,11 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// AuthMapVersion is the identity-map version this reconcile rendered.
+	// BusCredentialsReady is the callout confirming it is serving this
+	// value, so it has to travel out of the render to the status write.
+	AuthMapVersion string
 }
 
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
@@ -1077,7 +1002,31 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
 	}
 
-	config := buildA2ANATSConfigSecret(agent, creds)
+	// Before the config, because the config carries the public halves. A
+	// nats.conf rendered without them would name an issuer nothing holds and
+	// refuse every callout-authenticated connection.
+	calloutKeys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
+	}
+
+	// The identity map before the server that will be authorizing against
+	// it: the callout refuses connections until it is serving a map, so
+	// rendering the map first shortens the window in which a restarting bus
+	// has a callout with nothing to say.
+	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
+	}
+	if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
+		return state, err
+	}
+	if err := r.applyManaged(ctx, agent, authMap); err != nil {
+		return state, fmt.Errorf("failed to apply the A2A identity map: %w", err)
+	}
+	state.AuthMapVersion = authMapVersion
+
+	config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
 	if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
 		return state, err
 	}

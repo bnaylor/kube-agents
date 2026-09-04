@@ -1,0 +1,105 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// Rendering the principals that still authenticate from nats.conf.
+//
+// These come from the same list the callout's identity map is rendered from, so
+// a principal cannot end up in both renders or in neither, and its grant list
+// cannot say one thing here and another there.
+
+// a2aCalloutConfUser is the NATS user the callout service itself connects as.
+// It is in AUTH rather than APP, and it is exempt from the callout because it
+// cannot authenticate through the thing it is.
+const a2aCalloutConfUser = "callout"
+
+// renderA2AStaticUsers renders the user blocks for one account.
+func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, account string) string {
+	var b strings.Builder
+	for _, id := range staticIdentities(agent) {
+		if id.account != account {
+			continue
+		}
+		b.WriteString(renderA2AStaticUser(id, string(creds.Data[id.credsKey])))
+	}
+	return b.String()
+}
+
+func renderA2AStaticUser(id a2aIdentity, password string) string {
+	var b strings.Builder
+	const indent = "      "
+
+	for _, line := range strings.Split(id.comment, "\n") {
+		b.WriteString(indent + "# " + line + "\n")
+	}
+	b.WriteString(indent + "{\n")
+	b.WriteString(indent + "  user: " + id.user + "\n")
+	b.WriteString(indent + `  password: "` + password + "\"\n")
+
+	// $SYS's user holds the system account's own privileges and carries no
+	// subject lists; a permissions block with empty allow lists would deny it
+	// everything.
+	if len(id.publish) > 0 || len(id.subscribe) > 0 {
+		b.WriteString(indent + "  permissions {\n")
+		b.WriteString(renderA2ASubjectList(indent+"    ", "publish", id.publish))
+		b.WriteString(renderA2ASubjectList(indent+"    ", "subscribe", id.subscribe))
+		b.WriteString(indent + "  }\n")
+	}
+	b.WriteString(indent + "}\n")
+	return b.String()
+}
+
+func renderA2ASubjectList(indent, kind string, subjects []string) string {
+	if len(subjects) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(indent + kind + " { allow = [\n")
+	for i, s := range subjects {
+		comma := ","
+		if i == len(subjects)-1 {
+			comma = ""
+		}
+		b.WriteString(indent + `  "` + s + `"` + comma + "\n")
+	}
+	b.WriteString(indent + "] }\n")
+	return b.String()
+}
+
+// renderA2AAuthUsers renders the auth_users exemption list.
+//
+// It is built from the static set rather than written out, because the two must
+// agree exactly and the failure when they do not is asymmetric. A static user
+// missing from this list is handed to a callout that has never heard of it and
+// is refused at connect — that one is loud. A name here with no matching user
+// block is the quiet one: the server accepts the config, and the exemption
+// simply covers nothing.
+func renderA2AAuthUsers(agent *agentv1alpha1.PlatformAgent) string {
+	names := []string{a2aCalloutConfUser}
+	for _, id := range staticIdentities(agent) {
+		names = append(names, id.user)
+	}
+	return strings.Join(names, ", ")
+}

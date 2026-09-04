@@ -56,6 +56,8 @@ func a2aTestCreds() *corev1.Secret {
 			"worker-password":  []byte("pw-worker"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
+			"sys-password":     []byte("pw-sys"),
+			"callout-password": []byte("pw-callout"),
 		},
 	}
 }
@@ -65,7 +67,7 @@ func a2aTestCreds() *corev1.Secret {
 // the auth callout, but the deny-by-default subject lists are the real shape.
 func TestBuildA2ANATSConfig(t *testing.T) {
 	agent := a2aTestAgent()
-	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds())
+	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t))
 
 	if secret.Name != "test-agent-a2a-nats-config" {
 		t.Errorf("config secret name = %q", secret.Name)
@@ -82,43 +84,89 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 		t.Error("nats.conf does not enable jetstream")
 	}
 
-	// Per-user inbox prefixes: without them any agent can subscribe to any
-	// inbox and the connect-time property leaks through the reply path.
-	for _, user := range []string{"gateway", "worker", "seed"} {
+	// The static principals, with their inbox prefixes and their generated
+	// passwords. Per-user inbox prefixes are what stop the connect-time
+	// property leaking through the reply path.
+	for _, user := range []string{"worker", "web"} {
 		if !strings.Contains(conf, "user: "+user) {
-			t.Errorf("nats.conf missing user %q", user)
+			t.Errorf("nats.conf missing static user %q", user)
 		}
 		if !strings.Contains(conf, "_INBOX."+user+".>") {
 			t.Errorf("nats.conf missing the _INBOX prefix for %q", user)
 		}
 	}
-
-	// Passwords come from the creds Secret, not from literals invented here.
-	for _, pw := range []string{"pw-gateway", "pw-worker", "pw-seed"} {
+	for _, pw := range []string{"pw-worker", "pw-web"} {
 		if !strings.Contains(conf, pw) {
 			t.Errorf("nats.conf does not carry the generated password %q", pw)
 		}
 	}
 
-	// Spot the load-bearing grants: the gateway owns the session registry and
-	// the task plane; the seed writes exactly the three starter topics.
-	for _, grant := range []string{
-		"a2a.tasks.*.*.in",
-		"a2a.tasks.*.*.events",
-		"$KV.session-state.>",
-		"a2a.topics.agent.platform.upgrade-readiness",
-		"a2a.topics.shared.blueprint",
-		"a2a.topics.shared.annotations",
-		// The delivery path's reply subjects: without an ack grant an
-		// explicit ack is a permissions violation and every consumer
-		// redelivers forever while TCP health stays green. Scoped per
-		// stream — the exact surface is
-		// TestSystemUsersAckGrantsAreScopedPerStream's to pin.
-		"$JS.ACK.TASKS.>",
-		"$JS.FC.>",
-	} {
-		if !strings.Contains(conf, grant) {
-			t.Errorf("nats.conf missing grant %q", grant)
+	// The principals the callout issues must NOT be here. A user present in
+	// both renders is authenticated by whichever path the client happened to
+	// take, and the config copy would still carry a password - which is the
+	// whole thing this change removes.
+	for _, user := range calloutIdentities(agent) {
+		if strings.Contains(conf, "user: "+user.user+"\n") {
+			t.Errorf("nats.conf still carries a static block for %q, which the callout now issues", user.user)
+		}
+	}
+	if strings.Contains(conf, "pw-gateway") {
+		t.Error("nats.conf still carries the gateway password; the gateway authenticates with a ServiceAccount token now")
+	}
+
+	// The callout wiring itself.
+	if !strings.Contains(conf, "auth_callout {") {
+		t.Fatal("nats.conf has no auth_callout block")
+	}
+	if !strings.Contains(conf, "account: AUTH") {
+		t.Error("the callout is not scoped to its own account")
+	}
+	// Public halves only. A seed in the server config would hand the thing
+	// that mints every grant to anyone who can read the config Secret.
+	for _, seedPrefix := range []string{"issuer: SA", "xkey: SX"} {
+		if strings.Contains(conf, seedPrefix) {
+			t.Errorf("nats.conf carries a SEED (%q); it must hold only public halves", seedPrefix)
+		}
+	}
+	if !strings.Contains(conf, "issuer: A") {
+		t.Error("auth_callout.issuer is not an account public key")
+	}
+	if !strings.Contains(conf, "xkey: X") {
+		t.Error("auth_callout.xkey is not a curve public key")
+	}
+
+	// Above roughly two seconds the connect failure stops being an
+	// Authorization Violation and becomes "expected 'PONG', got 'PING'".
+	if !strings.Contains(conf, "timeout: 2") {
+		t.Error("authorization.timeout is not 2")
+	}
+
+	// A ServiceAccount token rides in the CONNECT line, and the 4096 default
+	// leaves under 4KB for the whole frame.
+	if !strings.Contains(conf, "max_control_line:") {
+		t.Error("nats.conf does not raise max_control_line; a projected token can exceed the default and the failure is a hard connect refusal")
+	}
+
+	// Every static principal must be exempt, or it is handed to a callout
+	// that has never heard of it and refused at connect.
+	for _, id := range staticIdentities(agent) {
+		if !strings.Contains(conf, id.user) {
+			t.Errorf("static principal %q is missing from nats.conf entirely", id.user)
+		}
+	}
+	authUsers := conf[strings.Index(conf, "auth_users:"):]
+	authUsers = authUsers[:strings.Index(authUsers, "]")]
+	for _, id := range staticIdentities(agent) {
+		if !strings.Contains(authUsers, id.user) {
+			t.Errorf("static principal %q is not in auth_users; it would be refused at connect", id.user)
+		}
+	}
+	if !strings.Contains(authUsers, a2aCalloutConfUser) {
+		t.Error("the callout's own user is not exempt; it could not connect to serve the subject it exists to serve")
+	}
+	for _, id := range calloutIdentities(agent) {
+		if strings.Contains(authUsers, id.user) {
+			t.Errorf("%q is exempt from the callout but is issued BY the callout", id.user)
 		}
 	}
 
@@ -138,40 +186,42 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 // tokens), so any widening of this list is a review conversation, not a
 // diff.
 func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	agent := a2aTestAgent()
 
+	// Asserted against the principal list, which spans both renders: the
+	// gateway is now issued by the callout and the worker still comes from
+	// nats.conf, and an unscoped ack grant is exactly as dangerous in either.
 	want := map[string][]string{
-		"gateway": {"$JS.ACK.TASKS.>"},
-		"worker":  {"$JS.ACK.TASKS.>"},
-		"seed":    nil,
-		"web":     nil,
+		"gateway":   {"$JS.ACK.TASKS.>"},
+		"worker":    {"$JS.ACK.TASKS.>"},
+		"agent":     nil,
+		"provision": nil,
+		"web":       nil,
+		"sys":       nil,
 	}
-	for user, wantAcks := range want {
-		start := strings.Index(conf, "user: "+user)
-		if start < 0 {
-			t.Fatalf("nats.conf has no %s user", user)
-		}
-		block := conf[start:]
-		if next := strings.Index(block[1:], "user: "); next >= 0 {
-			block = block[:next+1]
-		}
-		pubStart, subStart := strings.Index(block, "publish"), strings.Index(block, "subscribe")
-		if pubStart < 0 || subStart < 0 {
-			t.Fatalf("%s: could not slice the publish block", user)
+
+	for _, id := range a2aIdentities(agent) {
+		wantAcks, known := want[id.user]
+		if !known {
+			t.Errorf("principal %q has no expected ack surface; add one rather than letting a new principal inherit silence", id.user)
+			continue
 		}
 		var got []string
-		for _, line := range strings.Split(block[pubStart:subStart], "\n") {
-			entry := strings.Trim(strings.TrimSuffix(strings.TrimSpace(line), ","), `"`)
-			if strings.HasPrefix(entry, "$JS.ACK") {
-				got = append(got, entry)
+		for _, grant := range id.publish {
+			if strings.HasPrefix(grant, "$JS.ACK") {
+				got = append(got, grant)
 			}
 		}
 		if !reflect.DeepEqual(got, wantAcks) {
-			t.Errorf("%s ack grants = %q, want %q", user, got, wantAcks)
+			t.Errorf("%s ack grants = %q, want %q", id.user, got, wantAcks)
+		}
+		// The unscoped form is a cross-principal +TERM whoever holds it.
+		if slices.Contains(got, "$JS.ACK.>") {
+			t.Errorf("%s holds unscoped $JS.ACK.>", id.user)
 		}
 	}
 
-	// The unscoped form is gone from the whole config, not just relocated.
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 	if strings.Contains(conf, `"$JS.ACK.>"`) {
 		t.Error("nats.conf still grants unscoped $JS.ACK.> to someone")
 	}
@@ -489,7 +539,7 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
 func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
@@ -788,24 +838,15 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 		t.Error("probe subject is not provisioned; a refusal against it would only prove the subject is missing")
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds()).Data["nats.conf"])
-	for _, user := range []string{"gateway", "worker", "seed", "web"} {
-		start := strings.Index(conf, "user: "+user)
-		if start < 0 {
-			t.Fatalf("no %s user in nats.conf", user)
-		}
-		entry := conf[start:]
-		if next := strings.Index(entry[1:], "user: "); next >= 0 {
-			entry = entry[:next+1]
-		}
-		pub := entry[strings.Index(entry, "publish"):strings.Index(entry, "subscribe")]
-		for _, line := range strings.Split(pub, "\n") {
-			line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
-			if !strings.HasPrefix(line, `"`) {
-				continue
-			}
-			if grant := strings.Trim(line, `"`); subjectMatches(grant, probe) {
-				t.Errorf("user %q can publish the probe subject via grant %q; it must have no writer", user, grant)
+	// Checked against the principal list rather than by parsing nats.conf,
+	// because since the callout armed there are two renders and the conf is
+	// only one of them. A grant that made the probe writable from the
+	// callout's identity map would be just as fatal to the probe's meaning
+	// and would not appear in the config at all.
+	for _, id := range a2aIdentities(agent) {
+		for _, grant := range id.publish {
+			if subjectMatches(grant, probe) {
+				t.Errorf("principal %q can publish the probe subject via grant %q; it must have no writer", id.user, grant)
 			}
 		}
 	}
