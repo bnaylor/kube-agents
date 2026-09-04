@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -132,5 +133,164 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		if err := g.get(); !errors.IsNotFound(err) {
 			t.Errorf("callout %s survives a flip to today (err=%v)", g.what, err)
 		}
+	}
+}
+
+// Label-blind teardown sweep: the check that catches an object nobody
+// remembered to delete.
+//
+// TestA2ACalloutIsGatedByMode asserts each object it knows about by name, which
+// is exactly the wrong shape for the failure that actually happens — someone
+// adds a ninth object to the render and not to cleanupA2A, and every
+// named-object test still passes. This enumerates the namespace by kind instead
+// and asks whether anything at all is still labelled as part of the next stack.
+//
+// The documented residue is deliberate and small: the per-user creds Secret
+// (re-enabling must not re-roll credentials a running pod may have cached) and
+// the JetStream PVC (the file store is the audit substrate). Everything else
+// must be gone. The PVC does not appear here because the fake client does not
+// run the StatefulSet controller, so no PVC is ever created.
+func TestNothingA2ALabelledSurvivesAFlipToToday(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+
+	// Sanity: the sweep is only meaningful if it saw a populated namespace
+	// first. A sweep that passes because nothing was ever rendered is the
+	// vacuous version of this test.
+	if n := countA2ALabelled(ctx, t, cl); n == 0 {
+		t.Fatal("no A2A-labelled objects under next; the sweep would pass vacuously")
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("flip to today: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after flip: %v", err)
+	}
+
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+		// The one documented survivor.
+		if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+			return
+		}
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("these A2A-labelled objects survive a flip to today: %v\n"+
+			"Either add them to cleanupA2A, or add them to this test's documented-residue list with a reason.", leftovers)
+	}
+}
+
+func countA2ALabelled(ctx context.Context, t *testing.T, cl client.Client) int {
+	t.Helper()
+	n := 0
+	sweepA2ALabelled(ctx, t, cl, func(string, string) { n++ })
+	return n
+}
+
+// sweepA2ALabelled visits every object of every kind this change can render
+// that carries the next stack's part-of label. Listed by kind rather than by
+// name, so an object added to the render without being added to the teardown is
+// found here rather than on a cluster.
+func sweepA2ALabelled(ctx context.Context, t *testing.T, cl client.Client, visit func(kind, name string)) {
+	t.Helper()
+	inNS := client.InNamespace("test-ns")
+	hasLabel := client.MatchingLabels{labelPartOf: a2aPartOf}
+
+	var secrets corev1.SecretList
+	if err := cl.List(ctx, &secrets, inNS, hasLabel); err != nil {
+		t.Fatalf("list secrets: %v", err)
+	}
+	for i := range secrets.Items {
+		visit("Secret", secrets.Items[i].Name)
+	}
+
+	var cms corev1.ConfigMapList
+	if err := cl.List(ctx, &cms, inNS, hasLabel); err != nil {
+		t.Fatalf("list configmaps: %v", err)
+	}
+	for i := range cms.Items {
+		visit("ConfigMap", cms.Items[i].Name)
+	}
+
+	var sas corev1.ServiceAccountList
+	if err := cl.List(ctx, &sas, inNS, hasLabel); err != nil {
+		t.Fatalf("list serviceaccounts: %v", err)
+	}
+	for i := range sas.Items {
+		visit("ServiceAccount", sas.Items[i].Name)
+	}
+
+	var svcs corev1.ServiceList
+	if err := cl.List(ctx, &svcs, inNS, hasLabel); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	for i := range svcs.Items {
+		visit("Service", svcs.Items[i].Name)
+	}
+
+	var deps appsv1.DeploymentList
+	if err := cl.List(ctx, &deps, inNS, hasLabel); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	for i := range deps.Items {
+		visit("Deployment", deps.Items[i].Name)
+	}
+
+	var sts appsv1.StatefulSetList
+	if err := cl.List(ctx, &sts, inNS, hasLabel); err != nil {
+		t.Fatalf("list statefulsets: %v", err)
+	}
+	for i := range sts.Items {
+		visit("StatefulSet", sts.Items[i].Name)
+	}
+
+	var roles rbacv1.RoleList
+	if err := cl.List(ctx, &roles, inNS, hasLabel); err != nil {
+		t.Fatalf("list roles: %v", err)
+	}
+	for i := range roles.Items {
+		visit("Role", roles.Items[i].Name)
+	}
+
+	var rbs rbacv1.RoleBindingList
+	if err := cl.List(ctx, &rbs, inNS, hasLabel); err != nil {
+		t.Fatalf("list rolebindings: %v", err)
+	}
+	for i := range rbs.Items {
+		visit("RoleBinding", rbs.Items[i].Name)
+	}
+
+	// Cluster-scoped, and therefore the one that cannot be reclaimed by an
+	// owner reference — the residue most likely to be left behind and the
+	// most visible to anyone auditing a "normal" install.
+	var crbs rbacv1.ClusterRoleBindingList
+	if err := cl.List(ctx, &crbs, hasLabel); err != nil {
+		t.Fatalf("list clusterrolebindings: %v", err)
+	}
+	for i := range crbs.Items {
+		visit("ClusterRoleBinding", crbs.Items[i].Name)
 	}
 }
