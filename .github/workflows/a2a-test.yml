@@ -4,6 +4,14 @@ name: A2A Module Tests
 # runs against an embedded JetStream server (a test-only dependency), so this
 # job needs no cluster and no credentials.
 #
+# The auth callout suite additionally wants a real Kubernetes API server, which
+# `setup-envtest` provides as a pair of local binaries - still no cluster, no
+# kubelet and no credentials. It is what makes the audience binding testable at
+# all: a token minted and validated by a real API server is the only way that
+# assertion is about Kubernetes rather than about a stub this repository also
+# wrote. Those tests SKIP when KUBEBUILDER_ASSETS is unset, so without this step
+# they would run nowhere and the job would still report green.
+#
 # The trigger arrangement is k8s-operator-test.yml's, for the reasons its
 # header comment gives: on a pull request the job always starts and the
 # `Detect changes` step decides whether to test, so the check can be required
@@ -61,7 +69,10 @@ jobs:
 
       - name: Run Tests
         if: steps.filter.outputs.a2a == 'true'
+        # envtest-path installs the binaries if absent and prints the path, so
+        # the Kubernetes version stays declared once, in k8s-operator/Makefile.
         run: |
+          ASSETS="$(make -C k8s-operator -s envtest-path)"
           cd a2a
           go vet ./...
-          go test -race ./...
+          KUBEBUILDER_ASSETS="$ASSETS" go test -race ./...
