@@ -44,6 +44,14 @@ misconfigurations:
     paths:
       - "k8s-operator/config/rbac/**"
 
+  # Ignore KSV-0041: manager-role manages the A2A NATS credential/config
+  # Secrets it generates under mode: next (named, owner-referenced to the
+  # PlatformAgent, never regenerated on reconcile). The grant and its reason
+  # live at the rbac marker in platformagent_controller.go.
+  - id: KSV-0041
+    paths:
+      - "k8s-operator/config/rbac/**"
+
   # Ignore KSV-0118: sample manifests, testdata, and kustomize overlays do not define full security contexts
   - id: KSV-0118
     paths:

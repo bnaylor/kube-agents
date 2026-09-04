@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -54,6 +55,9 @@ func newTestScheme() *runtime.Scheme {
 	_ = agentv1alpha1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
+	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
+	// reconcile, which is every golden case.
+	_ = batchv1.AddToScheme(s)
 	_ = networkingv1.AddToScheme(s)
 	_ = policyv1.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
