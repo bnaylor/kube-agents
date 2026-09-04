@@ -147,21 +147,27 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 	return svc, nil
 }
 
-func isAccountSeed(seed string) bool {
-	// Seeds are "S" followed by the prefix letter of the key type: SA for
-	// account, SU for user, SX for curve.
-	return len(seed) > 1 && seed[0] == 'S' && seed[1] == 'A'
-}
-
 // Subscribe joins the callout queue group on an established connection.
 func (s *Service) Subscribe(nc *nats.Conn) (*nats.Subscription, error) {
 	sub, err := nc.QueueSubscribe(AuthRequestSubject, AuthQueueGroup, s.handle)
 	if err != nil {
 		return nil, fmt.Errorf("subscribing to %s: %w", AuthRequestSubject, err)
 	}
-	if err := nc.Flush(); err != nil {
-		return nil, fmt.Errorf("flushing the callout subscription: %w", err)
-	}
+	// Deliberately no Flush.
+	//
+	// The connection this is handed may legitimately be RECONNECTING: the
+	// operator applies the NATS StatefulSet and the callout Deployment
+	// milliseconds apart, so on a fresh install the callout reliably starts
+	// before the bus is listening, and nats.Connect with RetryOnFailedConnect
+	// returns a usable client in that state. The subscription buffers and is
+	// replayed when the connection establishes.
+	//
+	// A Flush here waits for a PONG that cannot arrive until then, times out
+	// after ten seconds, and returns an error that exits the process — turning
+	// "retry forever" into CrashLoopBackOff, with a log line naming the flush
+	// rather than the bus. Because the callout gates every non-exempt
+	// connection, that is the whole fabric dark to new work for the length of
+	// the backoff, on exactly the path every install takes.
 	s.log.Info("serving authorization requests", "subject", AuthRequestSubject, "queue", AuthQueueGroup)
 	return sub, nil
 }

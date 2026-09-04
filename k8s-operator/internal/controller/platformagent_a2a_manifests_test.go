@@ -67,7 +67,8 @@ func a2aTestCreds() *corev1.Secret {
 // the auth callout, but the deny-by-default subject lists are the real shape.
 func TestBuildA2ANATSConfig(t *testing.T) {
 	agent := a2aTestAgent()
-	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t))
+	keys := a2aTestCalloutKeys(t)
+	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys)
 
 	if secret.Name != "test-agent-a2a-nats-config" {
 		t.Errorf("config secret name = %q", secret.Name)
@@ -77,6 +78,19 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 	}
 
 	conf := string(secret.Data["nats.conf"])
+	// Matched as whole lines, not substrings. `Contains(conf, "timeout: 2")`
+	// is satisfied by `timeout: 20` - ten times the budget the comment beside
+	// it calls a ceiling - and `Contains(conf, "max_control_line:")` is
+	// satisfied by a value BELOW the default it exists to raise. Both were
+	// mutation-tested and both passed while wrong.
+	confLine := func(want string) bool {
+		for _, line := range strings.Split(conf, "\n") {
+			if strings.TrimSpace(line) == want {
+				return true
+			}
+		}
+		return false
+	}
 	if !strings.Contains(conf, "PLAYGROUND POSTURE") {
 		t.Error("nats.conf is missing the playground-posture comment block")
 	}
@@ -118,41 +132,55 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 	if !strings.Contains(conf, "account: AUTH") {
 		t.Error("the callout is not scoped to its own account")
 	}
-	// Public halves only. A seed in the server config would hand the thing
-	// that mints every grant to anyone who can read the config Secret.
-	for _, seedPrefix := range []string{"issuer: SA", "xkey: SX"} {
-		if strings.Contains(conf, seedPrefix) {
-			t.Errorf("nats.conf carries a SEED (%q); it must hold only public halves", seedPrefix)
+	// The exact keys, not their first letter. `Contains(conf, "issuer: A")`
+	// matches any account key at all, including one unrelated to the callout's
+	// seed - which is the mismatch that refuses every connection with a bare
+	// Authorization Violation naming nothing.
+	if !confLine("issuer: " + keys.IssuerPublic) {
+		t.Errorf("auth_callout.issuer is not this callout's issuer public key (%s)", keys.IssuerPublic)
+	}
+	if !confLine("xkey: " + keys.XKeyPublic) {
+		t.Errorf("auth_callout.xkey is not this callout's curve public key (%s)", keys.XKeyPublic)
+	}
+	// And no seed reaches the config: it would hand whoever can read the
+	// config Secret the key that mints every grant on the bus.
+	for _, seed := range []string{keys.IssuerSeed, keys.XKeySeed} {
+		if strings.Contains(conf, seed) {
+			t.Error("nats.conf carries a SEED; it must hold only public halves")
 		}
-	}
-	if !strings.Contains(conf, "issuer: A") {
-		t.Error("auth_callout.issuer is not an account public key")
-	}
-	if !strings.Contains(conf, "xkey: X") {
-		t.Error("auth_callout.xkey is not a curve public key")
 	}
 
 	// Above roughly two seconds the connect failure stops being an
 	// Authorization Violation and becomes "expected 'PONG', got 'PING'".
-	if !strings.Contains(conf, "timeout: 2") {
-		t.Error("authorization.timeout is not 2")
+	if !confLine("timeout: 2") {
+		t.Error("authorization.timeout is not exactly 2; above it the client-side failure names nothing about authorization")
+	}
+	// A ServiceAccount token rides in the CONNECT frame, and the 4096 default
+	// leaves under 4KB for the whole thing.
+	if !confLine("max_control_line: 65536") {
+		t.Error("max_control_line is not raised to 65536; below it a projected token is a hard connect refusal before authentication")
 	}
 
-	// A ServiceAccount token rides in the CONNECT line, and the 4096 default
-	// leaves under 4KB for the whole frame.
-	if !strings.Contains(conf, "max_control_line:") {
-		t.Error("nats.conf does not raise max_control_line; a projected token can exceed the default and the failure is a hard connect refusal")
-	}
-
-	// Every static principal must be exempt, or it is handed to a callout
-	// that has never heard of it and refused at connect.
+	// Whole-line again: `Contains(conf, "web")` matches `websocket` and
+	// `Contains(conf, "sys")` matches `system_account`, so the obvious form of
+	// this check cannot fail.
 	for _, id := range staticIdentities(agent) {
-		if !strings.Contains(conf, id.user) {
-			t.Errorf("static principal %q is missing from nats.conf entirely", id.user)
+		if !confLine("user: " + id.user) {
+			t.Errorf("static principal %q has no user block in nats.conf", id.user)
 		}
 	}
-	authUsers := conf[strings.Index(conf, "auth_users:"):]
-	authUsers = authUsers[:strings.Index(authUsers, "]")]
+	// Reported rather than panicked: a slice on Index would panic with -1 if
+	// the block went missing, which is a failure mode worth a message.
+	authStart := strings.Index(conf, "auth_users:")
+	if authStart < 0 {
+		t.Fatal("nats.conf has no auth_users list; every static principal would be handed to the callout and refused")
+	}
+	authUsers := conf[authStart:]
+	authEnd := strings.Index(authUsers, "]")
+	if authEnd < 0 {
+		t.Fatal("the auth_users list is unterminated")
+	}
+	authUsers = authUsers[:authEnd]
 	for _, id := range staticIdentities(agent) {
 		if !strings.Contains(authUsers, id.user) {
 			t.Errorf("static principal %q is not in auth_users; it would be refused at connect", id.user)

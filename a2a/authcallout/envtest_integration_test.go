@@ -303,22 +303,58 @@ func TestLiveTwoServiceAccountsGetDifferentGrants(t *testing.T) {
 func TestLiveATokenForAnotherAudienceIsRefused(t *testing.T) {
 	h := startLiveHarness(t)
 
-	for _, audience := range []string{
-		"https://kubernetes.default.svc", // the API server's own
-		"some-other-service",
-	} {
-		t.Run(audience, func(t *testing.T) {
-			token := h.mintToken(t, agentSAName, audience)
+	cases := []struct {
+		name      string
+		audiences []string
+	}{
+		{
+			// THE case. Minting with no audience yields the API server's
+			// own default — which is exactly what every ordinary pod's
+			// default ServiceAccount token carries. If the bus accepted
+			// this, any token readable anywhere in the cluster would be a
+			// bus credential for whoever it belongs to.
+			//
+			// It has to be discovered from the server rather than written
+			// down: an earlier version of this test named a plausible
+			// default as a literal, which envtest does not use, so the
+			// token was refused for the wrong reason and the test passed
+			// with the audience binding deleted outright. Asking for the
+			// default is what makes it a fact about Kubernetes.
+			name:      "the API server's own default audience, as every pod's default token carries",
+			audiences: nil,
+		},
+		{
+			name:      "an unrelated service's audience",
+			audiences: []string{"some-other-service"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			token := h.mintToken(t, agentSAName, tc.audiences...)
 			nc, err := nats.Connect(h.nats.ClientURL(), nats.Token(token), nats.Name("wrong-audience"))
 			if err == nil {
 				nc.Close()
-				t.Fatalf("a token minted for audience %q authenticated to the bus", audience)
+				t.Fatalf("a token minted for audiences %v authenticated to the bus", tc.audiences)
 			}
 			if !strings.Contains(err.Error(), "Authorization Violation") {
 				t.Errorf("connect error = %v, want an Authorization Violation", err)
 			}
 		})
 	}
+
+	// The control: the same ServiceAccount, correctly audienced, connects. It
+	// is what stops the two cases above passing because the identity is
+	// unusable for some unrelated reason.
+	t.Run("the control: the same identity with the right audience connects", func(t *testing.T) {
+		nc, err := nats.Connect(h.nats.ClientURL(),
+			nats.Token(h.mintToken(t, agentSAName, busAudience)),
+			nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+		if err != nil {
+			t.Fatalf("the correctly-audienced token was refused: %v", err)
+		}
+		nc.Close()
+	})
 }
 
 // A real, valid, correctly-audienced token for a ServiceAccount this deployment

@@ -18,9 +18,19 @@ package authcallout
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
+
+// mintableAccounts is every NATS account the callout will issue a user into.
+//
+// The deployment renders exactly one application account, and the callout's own
+// account holds nothing but the callout. Anything else - $SYS above all - is
+// either a mistake or an attempt, and both are worth refusing at the point the
+// map is parsed rather than at the point a connection lands somewhere it should
+// not be.
+var mintableAccounts = []string{"APP"}
 
 const (
 	// ServiceAccountPrefix is how the Kubernetes TokenReview API spells a
@@ -97,8 +107,8 @@ func (m *IdentityMap) validate() error {
 		return fmt.Errorf("identity map has no version")
 	}
 	// An empty map is never intentional. The operator always renders at
-	// least the gateway, the agent and the provisioner, so zero entries
-	// means the render produced nothing — and serving it would refuse every
+	// least the agent and the provisioner, so zero entries means the render
+	// produced nothing — and serving it would refuse every
 	// connection on a callout that reports itself perfectly healthy. Refuse
 	// it here so the previous map keeps serving and the reason is logged.
 	if len(m.Identities) == 0 {
@@ -137,6 +147,17 @@ func (id Identity) validate() error {
 	}
 	if id.Account == "" {
 		return fmt.Errorf("user %q has no account", id.User)
+	}
+	// Allowlisted, not merely non-empty. The account name in a map entry
+	// becomes the audience of the user JWT this callout signs, which is what
+	// decides the account a connection lands in - so an entry naming SYS would
+	// mint a system-account user with whatever grants it also names. Writing
+	// the map is already a privileged act, but the callout is the enforcement
+	// point and has no reason to honour an account the deployment never
+	// renders.
+	if !slices.Contains(mintableAccounts, id.Account) {
+		return fmt.Errorf("user %q names account %q, which this callout will not mint into (allowed: %v)",
+			id.User, id.Account, mintableAccounts)
 	}
 	// An entry granting nothing at all is almost certainly a render bug,
 	// and serving it produces a client that connects and then hangs on its

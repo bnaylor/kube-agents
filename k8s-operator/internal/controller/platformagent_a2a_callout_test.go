@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -77,7 +79,7 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		t.Errorf("identity map not rendered under next: %v", err)
 	}
 	crb := &rbacv1.ClusterRoleBinding{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-callout-tokenreview"}, crb); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:a2a-callout-tokenreview:test-ns:test-agent"}, crb); err != nil {
 		t.Errorf("callout ClusterRoleBinding not rendered under next: %v", err)
 	}
 	if crb.RoleRef.Name != a2aAuthDelegatorRole {
@@ -126,7 +128,7 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		// no owner reference, and a security reviewer diffing a "normal"
 		// install lists cluster-scoped objects first.
 		{"ClusterRoleBinding", func() error {
-			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-callout-tokenreview"}, &rbacv1.ClusterRoleBinding{})
+			return cl.Get(ctx, types.NamespacedName{Name: "kubeagents:a2a-callout-tokenreview:test-ns:test-agent"}, &rbacv1.ClusterRoleBinding{})
 		}},
 	}
 	for _, g := range gone {
@@ -292,5 +294,75 @@ func sweepA2ALabelled(ctx context.Context, t *testing.T, cl client.Client, visit
 	}
 	for i := range crbs.Items {
 		visit("ClusterRoleBinding", crbs.Items[i].Name)
+	}
+}
+
+// Deleting the CR must reclaim the cluster-scoped grant too.
+//
+// There are two ways the next stack goes away and they run different code: a
+// flip to today goes through cleanupA2A, deletion goes through handleDeletion.
+// The ClusterRoleBinding can carry no owner reference, so nothing reclaims it
+// implicitly, and the generic RBAC sweep does not select it — its labels and
+// its name both fall outside what that sweep matches. Left behind it is a
+// standing grant of tokenreviews/create to a ServiceAccount name in a
+// namespace, outliving the workload it was minted for.
+func TestDeletingTheCRReclaimsTheCalloutClusterRoleBinding(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	crbName := a2aCalloutClusterRoleBindingName(agent)
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, &rbacv1.ClusterRoleBinding{}); err != nil {
+		t.Fatalf("the ClusterRoleBinding was not rendered under next: %v", err)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if err := cl.Delete(ctx, fresh); err != nil {
+		t.Fatalf("delete agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after delete: %v", err)
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, &rbacv1.ClusterRoleBinding{}); !errors.IsNotFound(err) {
+		t.Errorf("the callout ClusterRoleBinding survives deletion of the CR (err=%v).\n"+
+			"Nothing else reclaims it: it is cluster-scoped so it carries no owner reference, and the generic RBAC sweep does not select it.", err)
+	}
+}
+
+// The cluster-scoped name must be unambiguous between two agents of the same
+// name in different namespaces. A collision is not benign — each reconcile
+// would rewrite the other's Subjects, so one namespace's callout silently loses
+// TokenReview and refuses every connection.
+func TestTheCalloutClusterRoleBindingNameIsNamespaceQualified(t *testing.T) {
+	a := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "team-a"}}
+	b := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "team-b"}}
+
+	if a2aCalloutClusterRoleBindingName(a) == a2aCalloutClusterRoleBindingName(b) {
+		t.Errorf("two agents named %q in different namespaces share the cluster-scoped binding name %q",
+			a.Name, a2aCalloutClusterRoleBindingName(a))
+	}
+	for _, agent := range []*agentv1alpha1.PlatformAgent{a, b} {
+		name := a2aCalloutClusterRoleBindingName(agent)
+		if !strings.Contains(name, agent.Namespace) {
+			t.Errorf("%q does not carry the namespace", name)
+		}
 	}
 }

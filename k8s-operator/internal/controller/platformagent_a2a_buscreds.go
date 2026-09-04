@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -89,9 +90,13 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 	default:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = busCredsReasonUnavailable
-		// The numbers, because "not ready" on a component that gates every
-		// new connection is the first thing someone will want to size.
-		condition.Message = "the auth callout is not fully ready; new connections to the bus may be refused"
+		// With the counts, because "not ready" on a component that gates
+		// every new connection is the first thing someone will want to size:
+		// one replica of two is a degraded rollout, zero of two is the bus
+		// accepting no new client at all.
+		condition.Message = fmt.Sprintf(
+			"the auth callout has %d of %d replicas ready; new connections to the bus may be refused",
+			dep.Status.ReadyReplicas, dep.Status.Replicas)
 	}
 
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)

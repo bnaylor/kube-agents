@@ -142,11 +142,11 @@ func run(log *slog.Logger) error {
 		_ = statusSrv.Shutdown(shutdownCtx)
 	}()
 
-	go func() {
-		if err := store.WatchConfigMap(ctx, clientset, namespace, authMapName, authMapKey); err != nil && ctx.Err() == nil {
-			log.Error("the identity map watch stopped", "error", err)
-		}
-	}()
+	// WatchConfigMap returns only when the context ends, so there is no
+	// error branch here to log: the informer retries internally and a
+	// genuinely broken watch surfaces as the store never becoming ready,
+	// which WaitForMap below reports with the reason attached.
+	go func() { _ = store.WatchConfigMap(ctx, clientset, namespace, authMapName, authMapKey) }()
 
 	// Serving nothing means refusing everything, so do not subscribe until
 	// there is a map to answer from. Subscribing first would mean the window

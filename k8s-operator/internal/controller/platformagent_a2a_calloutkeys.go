@@ -140,28 +140,69 @@ func (r *PlatformAgentReconciler) ensureA2ACalloutKeysSecret(ctx context.Context
 	return generated, nil
 }
 
+// readA2ACalloutKeys loads the seeds and DERIVES the public halves from them.
+//
+// The stored public keys are never read back for rendering, and that is a
+// security property rather than tidiness. Both public halves are interpolated
+// unquoted into nats.conf, so a value carrying a quote and a newline is a config
+// injection — a whole replacement `accounts { }` block, with attacker-chosen
+// users, passwords and grants, which the operator would then faithfully
+// re-render on every reconcile. That converts one Secret write into durable
+// authority over the entire bus. The per-user passwords on this same render path
+// have carried a shape guard against exactly this since before the callout
+// existed; these two values arrived without one.
+//
+// Deriving closes it completely rather than filtering for it: a public key
+// computed from a validated seed cannot contain anything but a public key. It
+// also closes a second failure the stored copy allowed — an issuer public that
+// is not the public half of the issuer seed, which the server accepts happily
+// and which then refuses every callout-authenticated connection with a bare
+// Authorization Violation naming nothing.
+//
+// The Secret keeps its public entries. They are for a human reading the object,
+// and nothing renders from them.
 func readA2ACalloutKeys(secret *corev1.Secret) (*a2aCalloutKeys, bool) {
-	keys := &a2aCalloutKeys{
-		IssuerSeed:   string(secret.Data[a2aCalloutIssuerSeedKey]),
-		IssuerPublic: string(secret.Data[a2aCalloutIssuerPubKey]),
-		XKeySeed:     string(secret.Data[a2aCalloutXKeySeedKey]),
-		XKeyPublic:   string(secret.Data[a2aCalloutXKeyPubKey]),
-	}
-	if keys.IssuerSeed == "" || keys.IssuerPublic == "" || keys.XKeySeed == "" || keys.XKeyPublic == "" {
+	issuerSeed := string(secret.Data[a2aCalloutIssuerSeedKey])
+	xkeySeed := string(secret.Data[a2aCalloutXKeySeedKey])
+	if issuerSeed == "" || xkeySeed == "" {
 		return nil, false
 	}
-	// The key TYPE is checked, not just presence. The server validates
+
+	// The key TYPE is checked, not just decodability. The server validates
 	// auth_callout.issuer as a public ACCOUNT nkey and auth_callout.xkey as a
-	// public curve key, and it refuses to start on either being wrong — so a
+	// public curve key, and refuses to start on either being wrong — so a
 	// Secret hand-edited with a user key would take the bus down at the next
 	// config change rather than at the edit.
-	if prefix, _, err := nkeys.DecodeSeed([]byte(keys.IssuerSeed)); err != nil || prefix != nkeys.PrefixByteAccount {
+	if prefix, _, err := nkeys.DecodeSeed([]byte(issuerSeed)); err != nil || prefix != nkeys.PrefixByteAccount {
 		return nil, false
 	}
-	if prefix, _, err := nkeys.DecodeSeed([]byte(keys.XKeySeed)); err != nil || prefix != nkeys.PrefixByteCurve {
+	if prefix, _, err := nkeys.DecodeSeed([]byte(xkeySeed)); err != nil || prefix != nkeys.PrefixByteCurve {
 		return nil, false
 	}
-	return keys, true
+
+	issuerKP, err := nkeys.FromSeed([]byte(issuerSeed))
+	if err != nil {
+		return nil, false
+	}
+	issuerPublic, err := issuerKP.PublicKey()
+	if err != nil {
+		return nil, false
+	}
+	xkeyKP, err := nkeys.FromSeed([]byte(xkeySeed))
+	if err != nil {
+		return nil, false
+	}
+	xkeyPublic, err := xkeyKP.PublicKey()
+	if err != nil {
+		return nil, false
+	}
+
+	return &a2aCalloutKeys{
+		IssuerSeed:   issuerSeed,
+		IssuerPublic: issuerPublic,
+		XKeySeed:     xkeySeed,
+		XKeyPublic:   xkeyPublic,
+	}, true
 }
 
 func generateA2ACalloutKeys() (*a2aCalloutKeys, map[string][]byte, error) {

@@ -204,12 +204,34 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 		// another principal's delivery. The bridge sidecar's durable
 		// task consumer is the one thing here that acked, and it is not
 		// this principal's — see the note on workerIdentity.
+		// The JetStream API surface is enumerated per stream, not granted
+		// as $JS.API.>, and that is what makes the paragraph above true
+		// rather than aspirational. A grant list is a capability surface
+		// for JetStream, not a read/write distinction: subject permissions
+		// cannot see a request BODY, and a consumer's target stream and
+		// its delivery subject are both body fields. So $JS.API.> hands
+		// back everything the subject lists withhold - a push consumer on
+		// TASKS delivering into a subject this principal CAN subscribe to
+		// reads the whole task plane, and STREAM.DELETE destroys it. Both
+		// demonstrated live against the rendered config. This is the same
+		// escape the web user's comment below records, and the same close.
+		//
+		// What is actually needed: a topic read is
+		// jetstream.Stream(...).GetLastMsgForSubject, which is STREAM.INFO
+		// plus a message get on the two topic streams and nothing else. No
+		// consumer is ever created.
 		publish: []string{
 			"a2a.topics.agent.platform.upgrade-readiness",
 			"a2a.topics.shared.blueprint",
 			"a2a.topics.shared.annotations",
 			"agents.hb.>",
-			"$JS.API.>",
+			"$JS.API.INFO",
+			"$JS.API.STREAM.INFO.TOPICS-STATE",
+			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.STREAM.MSG.GET.TOPICS-STATE",
+			"$JS.API.STREAM.MSG.GET.TOPICS-JOURNAL",
+			"$JS.API.DIRECT.GET.TOPICS-STATE",
+			"$JS.API.DIRECT.GET.TOPICS-JOURNAL",
 			"_INBOX.agent.>",
 		},
 		subscribe: []string{
@@ -234,11 +256,48 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		comment:        "creates the streams, buckets and starter topics; nothing on the task plane",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, a2aProvisionServiceAccountName(agent)),
+		// Enumerated per object, for the reason spelled out on the agent
+		// principal above: $JS.API.> would let this principal create a
+		// consumer that delivers TASKS into its own inbox, and delete any
+		// stream on the bus. It provisions - it creates the four streams
+		// and three buckets, idempotently, with an info-then-add - so it
+		// needs CREATE and INFO on exactly those and nothing else. A KV
+		// bucket is a stream named KV_<bucket>, which is why those appear
+		// in stream form.
+		//
+		// Notably absent: STREAM.DELETE, STREAM.PURGE and the whole
+		// CONSUMER surface. A provisioner that can delete what it created
+		// is a provisioner that can destroy the audit substrate.
 		publish: []string{
 			"a2a.topics.agent.platform.upgrade-readiness",
 			"a2a.topics.shared.blueprint",
 			"a2a.topics.shared.annotations",
-			"$JS.API.>",
+			"$JS.API.INFO",
+			// The stream-name lookup, which is not optional for the way the
+			// script is written. It provisions idempotently with
+			// `stream info X || stream add X`, and on a fresh bus the CLI
+			// answers a miss by trying to LIST the streams so it can offer a
+			// choice. Without this grant that list is refused, so the info
+			// call does not return not-found - it hangs to its deadline, once
+			// per object, on the first run of every install, and logs a
+			// timeout rather than the absence it actually found. Read-only,
+			// and only over the account this principal already provisions.
+			"$JS.API.STREAM.NAMES",
+			"$JS.API.STREAM.LIST",
+			"$JS.API.STREAM.CREATE.TASKS",
+			"$JS.API.STREAM.CREATE.DIRECTORY",
+			"$JS.API.STREAM.CREATE.TOPICS-STATE",
+			"$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+			"$JS.API.STREAM.CREATE.KV_runtime-state",
+			"$JS.API.STREAM.CREATE.KV_session-state",
+			"$JS.API.STREAM.CREATE.KV_cap",
+			"$JS.API.STREAM.INFO.TASKS",
+			"$JS.API.STREAM.INFO.DIRECTORY",
+			"$JS.API.STREAM.INFO.TOPICS-STATE",
+			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.STREAM.INFO.KV_runtime-state",
+			"$JS.API.STREAM.INFO.KV_session-state",
+			"$JS.API.STREAM.INFO.KV_cap",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{

@@ -646,12 +646,14 @@ set -euo pipefail
 # token, which the auth callout resolves against the cluster. It holds no
 # password: there is no "provision" entry in nats.conf at all.
 #
-# The token goes in the PASSWORD field rather than a --token flag, for two
-# reasons. It keeps the credential out of the process argument list, where
-# --token would put it on display to anything that can read /proc; and the
-# username half then carries the ServiceAccount this Job claims to be, which
-# the callout logs before it validates anything — so a flood of refusals names
-# who is being refused. The callout accepts the token in either field.
+# The token goes in the PASSWORD field rather than a --token flag. NOT for
+# secrecy: --password puts it on argv exactly as --token would, so it is in
+# /proc/<pid>/cmdline for the life of each call either way, and the pod is the
+# boundary that matters. The reason is that the username half then carries the
+# ServiceAccount this Job claims to be - a claim the callout does not trust and
+# does not need to, since it validates the token and derives the identity from
+# the TokenReview. It travels because it costs nothing and makes a connection
+# legible in a server-side log. The callout accepts the token in either field.
 BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
 
 # --inbox-prefix: every stream/kv call here is a $JS.API request whose reply
@@ -786,10 +788,12 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						}, {
 							Name: "XDG_CONFIG_HOME", Value: "/tmp",
 						}, {
-							// The ServiceAccount this Job claims to be. The
-							// callout does not trust it - it trusts the
-							// TokenReview - but it logs it, so a refusal
-							// names a workload instead of an IP.
+							// The ServiceAccount this Job claims to be.
+							// Unverified by construction: the callout
+							// derives the real identity from the TokenReview
+							// and never reads this. It is here so the
+							// connection is legible in a server-side log,
+							// not as any part of the decision.
 							Name:  "BUS_USER",
 							Value: a2aServiceAccountName(agent.Namespace, a2aProvisionServiceAccountName(agent)),
 						}},
@@ -1292,18 +1296,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// residue: cluster-scoped objects are exactly what a security reviewer
 	// lists first. The ownership refusal above cannot apply, so it is matched
 	// on its labels instead.
-	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent) + "-tokenreview"}}
-	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(crb), crb); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			return err
-		}
-	} else {
-		if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
-			return fmt.Errorf("refusing to delete unowned A2A ClusterRoleBinding %s", crb.Name)
-		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crb)); err != nil {
-			return err
-		}
+	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
+		return err
 	}
 
 	// Provision Jobs carry a content hash in the name; find them by label.
@@ -1324,4 +1318,24 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		}
 	}
 	return nil
+}
+
+// deleteA2ACalloutClusterRoleBinding reaps the callout's cluster-scoped grant.
+//
+// Called from two places, because there are two ways the next stack goes away:
+// a flip to today (cleanupA2A) and deletion of the CR itself (handleDeletion).
+// Nothing else reclaims it — a cluster-scoped object cannot carry an owner
+// reference to a namespaced CR — so missing either path leaves a standing
+// TokenReview grant behind forever.
+func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutClusterRoleBindingName(agent)}}
+	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(crb), crb); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	// Ownership by label, since the refusal the named objects get cannot
+	// apply: there is no owner reference to check.
+	if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
+		return fmt.Errorf("refusing to delete unowned A2A ClusterRoleBinding %s", crb.Name)
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, crb))
 }

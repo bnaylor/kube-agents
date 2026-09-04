@@ -138,10 +138,24 @@ func buildA2ACalloutServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // spec's stock-Kubernetes requirement.
 const a2aAuthDelegatorRole = "system:auth-delegator"
 
+// a2aCalloutClusterRoleBindingName qualifies the binding by namespace as well
+// as agent name.
+//
+// It is cluster-scoped, so a bare CR name is ambiguous between two agents of
+// the same name in different namespaces — and the collision is not benign.
+// Each would rewrite the other's Subjects on every reconcile, so one namespace's
+// callout silently loses TokenReview and refuses every connection with an error
+// indistinguishable from a bad token; and teardown then fails the ownership
+// check and returns "refusing to delete unowned" forever. The controller
+// already spells cluster-scoped names this way elsewhere.
+func a2aCalloutClusterRoleBindingName(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("kubeagents:a2a-callout-tokenreview:%s:%s", agent.Namespace, agent.Name)
+}
+
 func buildA2ACalloutClusterRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRoleBinding {
 	return &rbacv1.ClusterRoleBinding{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
-		ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent) + "-tokenreview", Labels: a2aLabels(agent, "callout")},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutClusterRoleBindingName(agent), Labels: a2aLabels(agent, "callout")},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
@@ -349,10 +363,10 @@ func buildA2ACalloutService(agent *agentv1alpha1.PlatformAgent) *corev1.Service 
 // reconcileA2ACallout applies the callout's objects in dependency order.
 func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// Namespaced objects get an owner reference so they are reclaimed with
-	// the CR. The two cluster-scoped ones cannot: a cluster-scoped object
+	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage
-	// collector, which deletes it immediately. cleanupA2A removes them by
-	// name instead.
+	// collector, which deletes it immediately. It is reclaimed by name
+	// instead, from both the mode flip and the deletion path.
 	owned := []client.Object{
 		buildA2ACalloutServiceAccount(agent),
 		// The provision Job's identity, applied here so it exists before the

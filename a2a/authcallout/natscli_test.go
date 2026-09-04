@@ -54,11 +54,40 @@ func TestTheProvisionJobsCredentialShapeWorksWithTheRealCLI(t *testing.T) {
 		return string(out), err
 	}
 
-	// A $JS.API request, which is what every stream and bucket call in the
-	// provisioning script is. It only returns if the reply reached the inbox
-	// prefix this principal is granted.
-	if out, err := run("stream", "ls"); err != nil {
-		t.Errorf("the provision credential could not make a JetStream API call: %v\n%s", err, out)
+	// Every object the provisioning script creates, with the two calls it
+	// makes per object: info-then-add, idempotently.
+	//
+	// Enumerated rather than sampled, and that is the point. The JetStream API
+	// grant is now per object rather than $JS.API.>, so a stream or bucket the
+	// script provisions but the grant list forgot is a Job that fails on a real
+	// install and nowhere else. An earlier version of this test called
+	// `stream ls`, which the script never does — it passed while granting
+	// nothing the script needs, and then failed when the grant was narrowed
+	// correctly. These are the calls the render actually emits.
+	for _, stream := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		// info first: on a fresh bus this is a legitimate not-found, which is
+		// what the script's `info || add` relies on. A permissions failure
+		// would surface as a timeout instead, since the reply cannot land.
+		if out, err := run("stream", "info", stream); err != nil && strings.Contains(out, "deadline exceeded") {
+			t.Errorf("stream info %s timed out, which is what a missing grant looks like: %s", stream, out)
+		}
+		if out, err := run("stream", "add", stream,
+			"--subjects", "probe."+stream+".>", "--storage", "file",
+			"--retention", "limits", "--replicas", "1", "--defaults",
+		); err != nil {
+			t.Errorf("the provision credential cannot create stream %s: %v\n%s", stream, err, out)
+		}
+		if out, err := run("stream", "info", stream); err != nil {
+			t.Errorf("the provision credential cannot info stream %s: %v\n%s", stream, err, out)
+		}
+	}
+	for _, bucket := range []string{"runtime-state", "session-state", "cap"} {
+		if out, err := run("kv", "add", bucket, "--history", "1"); err != nil {
+			t.Errorf("the provision credential cannot create bucket %s: %v\n%s", bucket, err, out)
+		}
+		if out, err := run("kv", "info", bucket); err != nil {
+			t.Errorf("the provision credential cannot info bucket %s: %v\n%s", bucket, err, out)
+		}
 	}
 
 	// A provisioned topic, which the script writes starter entries to.
@@ -108,5 +137,63 @@ func TestWithoutTheInboxPrefixTheProvisionCredentialTimesOutRatherThanFailing(t 
 	// Anyone debugging this on a cluster will go looking at the network.
 	if !strings.Contains(string(out), "deadline exceeded") && !strings.Contains(string(out), "timeout") {
 		t.Errorf("expected a timeout, got:\n%s", out)
+	}
+}
+
+// The narrowing, verified where it matters: against a real server, with the
+// real CLI, using the operator's real rendered grants.
+//
+// The claim the agent principal exists to make is that it cannot reach the task
+// plane. Withholding `a2a.tasks.>` from its subject lists does not achieve that
+// on its own — for JetStream a grant list is a capability surface rather than a
+// read/write distinction, because subject permissions cannot see a request body
+// and a consumer's target stream and delivery subject are both body fields. So
+// `$JS.API.>` would hand the whole task plane back through a consumer that
+// delivers TASKS into an inbox the principal *can* subscribe to.
+//
+// This asserts both halves: the reads the principal genuinely needs still work,
+// and the two escapes do not.
+func TestTheProvisionPrincipalCannotEscapeThroughTheJetStreamAPI(t *testing.T) {
+	cli := natsCLI(t)
+	h := startLiveHarness(t)
+
+	token := h.mintToken(t, provisionSAName, busAudience)
+	serviceAccount := "system:serviceaccount:" + h.namespace + ":" + provisionSAName
+	server := strings.TrimPrefix(h.nats.ClientURL(), "nats://")
+
+	run := func(extra ...string) (string, error) {
+		args := append([]string{
+			"--server", server,
+			"--user", serviceAccount,
+			"--password", token,
+			"--inbox-prefix=_INBOX.provision",
+		}, extra...)
+		out, err := exec.Command(cli, args...).CombinedOutput()
+		return string(out), err
+	}
+
+	// What it must still be able to do: create the streams it provisions.
+	if out, err := run("stream", "add", "TASKS",
+		"--subjects", "a2a.tasks.>", "--storage", "file", "--retention", "limits",
+		"--replicas", "1", "--defaults",
+	); err != nil {
+		t.Fatalf("the provision principal cannot create the stream it provisions: %v\n%s", err, out)
+	}
+	if out, err := run("stream", "info", "TASKS"); err != nil {
+		t.Errorf("the provision principal cannot read back the stream it created: %v\n%s", err, out)
+	}
+
+	// What it must not: deleting the audit substrate it provisioned.
+	if out, err := run("stream", "rm", "TASKS", "--force"); err == nil {
+		t.Errorf("the provision principal deleted a stream:\n%s", out)
+	}
+
+	// And the consumer escape — a push consumer on TASKS delivering into an
+	// inbox this principal can subscribe to would read the whole task plane.
+	out, err := run("consumer", "add", "TASKS", "pwn",
+		"--target", "_INBOX.provision.steal", "--deliver", "all", "--ack", "none",
+		"--replay", "instant", "--filter", "", "--defaults")
+	if err == nil {
+		t.Errorf("the provision principal created a push consumer on TASKS:\n%s", out)
 	}
 }

@@ -570,6 +570,25 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 
+		// The auth callout's ClusterRoleBinding, which nothing else reclaims.
+		//
+		// It is cluster-scoped, so it carries no owner reference — the garbage
+		// collector treats a cluster-scoped object owned by a namespaced one as
+		// an orphan and deletes it immediately, which is worse than leaking it.
+		// cleanupAgentRBAC's two label sweeps do not reach it either: the first
+		// selects agent-name/agent-namespace labels that commonLabels does not
+		// set, the second selects part-of=kube-agents which a2aLabels overrides
+		// to a2a-next, and both then require a kubeagents-prefixed name.
+		//
+		// Left behind, it is a standing grant of tokenreviews/create and
+		// subjectaccessreviews/create to a ServiceAccount name in a namespace,
+		// surviving the workload it was minted for — so anyone who can later
+		// create a ServiceAccount of that name inherits it. cleanupA2A reaps it
+		// on a mode flip; this is the other way the stack can go away.
+		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
 		// reference (nothing from a template does), so without this a
 		// deleted next-mode agent leaks its 40Gi JetStream volume. Guarded by
