@@ -116,6 +116,14 @@ func a2aGatewayImage() string {
 
 func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Name + "-a2a-nats" }
 func a2aGatewayName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-gateway" }
+func a2aCalloutName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-callout" }
+
+// The provision Job's pods run as their own ServiceAccount so the auth callout
+// has an identity to resolve them by. It holds no RBAC — the token exists to
+// authenticate to NATS, not to talk to the API server.
+func a2aProvisionServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-provision"
+}
 
 // a2aLabels returns the common labels with part-of overridden to a2a-next and
 // the component named. withCommonLabels leaves pre-set keys alone, so these
