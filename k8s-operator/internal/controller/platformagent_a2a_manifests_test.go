@@ -838,11 +838,21 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("ingress rule is not exactly TCP 4222: %+v", rule.Ports)
 	}
 
-	// The client list, pinned exactly: the agent pod (whose sidecars share
-	// its labels), the A2A gateway, session pods, the provision Job, and the
-	// hand-applied seed tooling. All same-namespace pod selectors — no
-	// namespace-crossing, no IPBlock.
+	// The client list, pinned exactly: the auth callout, the agent pod
+	// (whose sidecars share its labels), the A2A gateway, session pods, the
+	// provision Job, and the hand-applied seed tooling. All same-namespace
+	// pod selectors — no namespace-crossing, no IPBlock.
+	//
+	// Pinned exactly, and the count is load-bearing rather than tidy: this
+	// fence sits in front of every connection to the bus, and the callout
+	// peer in particular is the one whose absence is invisible. Without it
+	// the callout cannot reach 4222, so it answers no authorization
+	// request, so no NEW connection succeeds — while every established one
+	// keeps working and the bus looks healthy. A peer added without
+	// updating this list is a peer nobody decided on; a peer removed is the
+	// fabric going dark somewhere it takes a reconnect to notice.
 	wantPeers := []map[string]string{
+		{"app": "test-agent-a2a-callout"},
 		{"app": "test-agent-gateway"},
 		{"app": "test-agent-a2a-gateway"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},

@@ -645,6 +645,34 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
 				},
 				From: []networkingv1.NetworkPolicyPeer{
+					// The auth callout, FIRST, and the ordering is the
+					// point rather than tidiness.
+					//
+					// The callout is itself a bus client: it holds a
+					// system-account subscription on $SYS.REQ.USER.AUTH
+					// and answers every connection attempt. So it sits
+					// ON the connection path, and a fence that does not
+					// name it refuses the one peer every new connection
+					// depends on. Nothing looks broken when that
+					// happens — established connections are already
+					// authorized and keep working, so the bus stays up,
+					// serves traffic, and silently accepts no new
+					// client until something tries to connect and hangs.
+					// That is why this peer and the callout itself have
+					// to land in one change: arming the callout against
+					// a fence that predates it takes the fabric dark to
+					// new work.
+					//
+					// The same rule is owed to the peers that arm later.
+					// The audit exporter, the janitor and the metrics
+					// scrape each add one when they exist. And the NATS
+					// pods join on their route port the moment this
+					// leaves the single-node dev shape: a 3-node cluster's
+					// servers dial each other, and a fence without the
+					// route peer means the cluster never forms.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aCalloutName(agent),
+					}}},
 					// The agent pod — a bridge sidecar declared on
 					// spec.deployment.sidecars rides this selector too.
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
