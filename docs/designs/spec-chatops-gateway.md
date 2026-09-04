@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord adapter) - session spawning is dark behind `A2A_SPAWN_SESSIONS`, and the operator renders neither the gateway Deployment nor its env yet
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Slack adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`, and the operator renders neither the gateway Deployment nor its env yet
 
 ## Purpose
 
@@ -467,9 +467,11 @@ the invitation is the trust boundary for group ingress.
 
 **The mapping table - where it lives and who writes it.** The join is Slack's immutable
 `user_id` against a table sourced from our own IdP; never `profile.email` (the identity
-section above says why). The table is a Kubernetes Secret (`a2a-slack-principal-map`)
-in the install namespace, mounted read-only at the gateway's principal-map path, same
-file format the Discord ConfigMap uses. A Secret rather than a ConfigMap because a
+section above says why). The table is a Kubernetes Secret, mounted read-only at the
+gateway's principal-map path, same file format the Discord ConfigMap uses.
+`a2a-slack-principal-map` is the name for the hand-made Secret today and the one the
+future `principalMapSecretRef` render binds - nothing in-tree creates it yet, like the
+rest of the gateway's env. A Secret rather than a ConfigMap because a
 write to this table grants a principal - it is an impersonation primitive, and it holds
 emails besides. Write access is the install admin's, through the install path. No
 product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
@@ -487,7 +489,7 @@ burden. The dedupe bounds what an unverified sender can make the gateway post. T
 gateway behavior, not Slack behavior, so Discord gets it too.
 
 **Roster.** Channel membership via the members API, one page; past a page the roster
-reports incomplete rather than paging (the 32-entry cap truncates far below it anyway).
+reports incomplete rather than paging (the roster cap truncates far below it anyway).
 Slack has no per-thread membership, and anyone in the channel can read the thread, so
 channel membership is the honest answer to "who could have read this."
 
@@ -503,14 +505,14 @@ into mrkdwn is a narrow deterministic translation of the two forms the relay emi
 
 ## What stage 2 builds from this doc
 
-- The gateway: Discord adapter, session manager (spawn / stream / reap / rehydrate /
-  sweep), bus client, KV session registry.
+- The gateway: Discord adapter (Slack joined it 9/4, per the section above), session
+  manager (spawn / stream / reap / rehydrate / sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
 - The `authority` block, populated at ingress, advisory.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, the gchat and slack adapters,
-`grants`, and anything that makes `authority` decision-grade.
+Not in stage 2: the classifier, the LCD permissions tool, the gchat adapter (~~and
+slack~~ - landed 9/4), `grants`, and anything that makes `authority` decision-grade.
 
 ## Inherited from the kanban retirement (added 8/24)
 

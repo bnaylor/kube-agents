@@ -43,7 +43,8 @@ type Config struct {
 	SlackBotToken string
 	SlackAppToken string
 
-	// PrincipalMapPath is the mounted principal-map ConfigMap.
+	// PrincipalMapPath is the mounted principal map — Discord's test
+	// ConfigMap or Slack's admin-owned Secret; same on-disk shape either way.
 	PrincipalMapPath string
 
 	// DefaultAddressee is where every conversation's tasks route until a
