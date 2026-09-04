@@ -448,6 +448,31 @@ one cluster regardless of how wide discovery is. Until then the design recommend
 `folders` for a fleet an operator would be comfortable reading with one account, and documents
 `organizations` as available but wide.
 
+### A scope is one trust domain, by operator assertion
+
+The widening above is about what a credential may read. The scope change also decides what
+happens to what it has read, and the design's answer is that declaring a scope is the
+operator asserting these projects may share findings.
+
+Cross-project reach is not itself new: the broker never pinned a project (§2), the
+`manage-cluster` skill takes `--project` today (§7), and §5's own snapshot example carries
+a profile in another project. What the stock IAM grant did was make an operator arrange
+each one deliberately. A scope makes reading across projects the supported default, and
+the aggregation stage is where that lands — the sweep fans out per cluster, so each Cluster
+Agent's context holds one, but the roll-up in the Platform Agent holds all of them and
+nothing there keeps them apart. For the case this document motivates, one organisation and
+several of its own projects, that is what the operator wants. For a scope drawn across
+projects whose findings should not meet, it is not.
+
+The check is one sentence: _every project in this scope may see every other project's
+findings._ An install that cannot say yes wants two Platform Agents with disjoint scopes,
+which is where §11's cardinality question also points — though disjointness is a
+declaration too, and nothing prevents two installs from declaring overlapping scopes.
+
+Nothing in `spec.scope` verifies any of this. The platform enforces the scope; the trust
+boundary is the operator's claim that the scope is drawn where the trust is. Where those
+diverge, the divergence is silent.
+
 ## 10. Implementation order
 
 Each step is shippable alone and live-testable on a shared install by granting its service account
