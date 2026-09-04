@@ -13,6 +13,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
 	t.Setenv("SESSION_KV_SALT", "")
 	t.Setenv("A2A_ATTRIBUTION_SALT", "")
 	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
@@ -137,6 +139,51 @@ func TestFromEnvAskTTL(t *testing.T) {
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_ASK_TTL=%q accepted", bad)
 		}
+	}
+}
+
+// TestFromEnvBackendSelection: exactly one chat backend per gateway
+// process — two gateways bound to one relay durable split event deliveries
+// (Options.RelayDurable), so a second backend is a second Deployment, and
+// zero backends is a gateway with no front door. Socket Mode needs both
+// Slack tokens, so half a pair refuses too.
+func TestFromEnvBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "discord" {
+		t.Fatalf("Backend() = %q, want discord", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "slack" {
+		t.Fatalf("Backend() = %q, want slack", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "x")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("two backends accepted; one relay durable means one backend per gateway")
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("no backend accepted")
+	}
+
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("half a Slack token pair accepted; Socket Mode needs both")
 	}
 }
 

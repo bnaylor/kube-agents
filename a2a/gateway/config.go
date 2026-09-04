@@ -33,6 +33,16 @@ type Config struct {
 	NATSPassword string
 	DiscordToken string
 
+	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
+	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
+	// no inbound endpoint, nothing to expose). Exactly one backend may be
+	// configured per gateway process: two gateways bound to one relay
+	// durable split event deliveries (Options.RelayDurable), so a second
+	// backend is a second Deployment with its own durable, not a second
+	// adapter here.
+	SlackBotToken string
+	SlackAppToken string
+
 	// PrincipalMapPath is the mounted principal-map ConfigMap.
 	PrincipalMapPath string
 
@@ -129,6 +139,14 @@ type Config struct {
 	MaxSessions int
 }
 
+// Backend names the chat backend this config arms: "slack" or "discord".
+func (c *Config) Backend() string {
+	if c.SlackBotToken != "" {
+		return "slack"
+	}
+	return "discord"
+}
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -136,6 +154,8 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
+		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
+		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
@@ -146,8 +166,17 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	if cfg.DiscordToken == "" {
-		return nil, fmt.Errorf("DISCORD_TOKEN is required (W0's discord-bot Secret)")
+	// One backend per gateway process, chosen by which credential is set.
+	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
+	// choice, so it refuses rather than silently running Discord.
+	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
+		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
+	}
+	switch {
+	case cfg.SlackBotToken != "" && cfg.DiscordToken != "":
+		return nil, fmt.Errorf("both DISCORD_TOKEN and the SLACK_*_TOKEN pair are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
+	case cfg.SlackBotToken == "" && cfg.DiscordToken == "":
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
