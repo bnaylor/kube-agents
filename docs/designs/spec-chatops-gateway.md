@@ -433,13 +433,73 @@ principal.
 
 Google Chat stays the supported production ingress, for the trust-domain reason above -
 it is the first real adapter, built during stage 2 once the interface is proven against
-Discord. Slack follows when a customer asks, with the mapping table as a hard
-prerequisite.
+Discord. ~~Slack follows when a customer asks, with the mapping table as a hard
+prerequisite.~~ **Update 9/4:** Slack lands ahead of gchat - resequenced against this
+doc's stated order, with the mapping table built as part of the card rather than as a
+later chore. The section below is that adapter's design of record.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
 operations, normalized. If the Discord adapter leaks Discord-isms through that interface,
 that's a bug in the interface, and better to learn it on the throwaway backend.
+
+## The Slack adapter (added 9/4)
+
+The second adapter behind the five-operation interface, and the first with a real
+identity join. Transport is Socket Mode - an outbound websocket, so no inbound endpoint
+on the cluster and no ingress to secure, the same property that made Discord cheap. The
+existing `SlackSpec` already carries the two Secret refs Socket Mode needs (bot token
+for the Web API, app token for the socket).
+
+**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
+threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
+channel mention binds the session to the mention message's own ts as thread root, with
+no thread-creation failure mode to handle. Session semantics are unchanged: the whole
+DM is one conversation, a channel is not a session, a thread in it is.
+
+**Which messages become turns.** DMs carry every message. A channel message must
+mention the bot, and the ask roots the session thread. A thread reply is a turn when it
+mentions the bot or the thread root did - that is what lets a session thread carry
+every message (the Discord parity) without making every thread in a joined channel a
+session. Everything else drops in the adapter: bots, our own posts, edits and other
+subtypes, socket redeliveries. The bot only sees channels it has been invited to, so
+the invitation is the trust boundary for group ingress.
+
+**The mapping table - where it lives and who writes it.** The join is Slack's immutable
+`user_id` against a table sourced from our own IdP; never `profile.email` (the identity
+section above says why). The table is a Kubernetes Secret (`a2a-slack-principal-map`)
+in the install namespace, mounted read-only at the gateway's principal-map path, same
+file format the Discord ConfigMap uses. A Secret rather than a ConfigMap because a
+write to this table grants a principal - it is an impersonation primitive, and it holds
+emails besides. Write access is the install admin's, through the install path. No
+product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
+it, so nothing an agent can be talked into doing edits its own identity table. When the
+W6 rendering series reaches the gateway, the operator renders the mount from a
+`principalMapSecretRef` on `spec.integration.slack`, which makes write authority "may
+write the PlatformAgent CR" and puts changes in the API server audit log. Generating
+the Secret's content from the IdP is a job we do not build yet; until it exists the
+table is maintained by hand, which is honest at the current install count.
+
+**Unmapped senders.** Dropped at ingress, as everywhere - but visibly now: the gateway
+posts a one-line notice to the conversation, once per sender per conversation per
+process, and keeps the structured log line. A silent drop of a real user is a support
+burden. The dedupe bounds what an unverified sender can make the gateway post. This is
+gateway behavior, not Slack behavior, so Discord gets it too.
+
+**Roster.** Channel membership via the members API, one page; past a page the roster
+reports incomplete rather than paging (the 32-entry cap truncates far below it anyway).
+Slack has no per-thread membership, and anyone in the channel can read the thread, so
+channel membership is the honest answer to "who could have read this."
+
+**One backend per gateway process.** The relay binds one durable, and two gateways on
+one durable split event deliveries - so config refuses a Slack pair and a Discord token
+together. A second backend is a second Deployment with its own durable, when we want
+one.
+
+`verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
+the socket and asserted the `user_id`, our table joined it to a principal. Rendering
+into mrkdwn is a narrow deterministic translation of the two forms the relay emits
+(bold, links); the legacy Hermes converter stays where it is.
 
 ## What stage 2 builds from this doc
 
