@@ -25,25 +25,25 @@ func (f *fakeSlackAPI) AuthTest() (*slack.AuthTestResponse, error) {
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
-	channel, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
+	_, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
 	if err != nil {
 		return "", "", err
 	}
 	f.posted = append(f.posted, struct{ channel, thread, text string }{
-		channel, values.Get("thread_ts"), values.Get("text"),
+		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
-	return channel, "999.001", nil
+	return channelID, "999.001", nil
 }
 
 func (f *fakeSlackAPI) UpdateMessage(channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error) {
-	channel, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
+	_, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
 	if err != nil {
 		return "", "", "", err
 	}
 	f.updated = append(f.updated, struct{ channel, ts, text string }{
-		channel, timestamp, values.Get("text"),
+		values.Get("channel"), timestamp, values.Get("text"),
 	})
-	return channel, timestamp, "", nil
+	return channelID, timestamp, "", nil
 }
 
 func (f *fakeSlackAPI) GetUsersInConversation(params *slack.GetUsersInConversationParameters) ([]string, string, error) {
@@ -69,6 +69,68 @@ func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevent
 	return &slackevents.MessageEvent{
 		ChannelType: channelType, Channel: channel, User: user,
 		Text: text, TimeStamp: ts, ThreadTimeStamp: threadTS,
+	}
+}
+
+func TestSlackPostThreadsAndTranslates(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	ts, err := a.Post("slack:C1/100.1", "⚙️ **working**")
+	if err != nil || ts != "999.001" {
+		t.Fatalf("post: ts=%q err=%v", ts, err)
+	}
+	p := api.posted[0]
+	if p.channel != "C1" || p.thread != "100.1" || p.text != "⚙️ *working*" {
+		t.Errorf("post = %+v", p)
+	}
+	if _, err := a.Post("slack:dm/D1", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if api.posted[1].thread != "" {
+		t.Error("DM posts must not set thread_ts")
+	}
+	if _, err := a.Post("discord:1/2", "x"); err == nil {
+		t.Error("malformed conversation must error")
+	}
+}
+
+func TestSlackEditTranslates(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	if err := a.Edit("slack:C1/100.1", "100.2", "✅ **completed**"); err != nil {
+		t.Fatal(err)
+	}
+	u := api.updated[0]
+	if u.channel != "C1" || u.ts != "100.2" || u.text != "✅ *completed*" {
+		t.Errorf("update = %+v", u)
+	}
+	if err := a.Edit("nonsense", "1", "x"); err == nil {
+		t.Error("malformed conversation must error")
+	}
+}
+
+func TestSlackRosterReadsChannelMembers(t *testing.T) {
+	api := &fakeSlackAPI{members: []string{"U1", "U2"}}
+	a := newTestSlackAdapter(api)
+	ids, complete, err := a.Roster("slack:C1/100.1")
+	if err != nil || !complete || len(ids) != 2 {
+		t.Fatalf("roster = %v %v %v", ids, complete, err)
+	}
+	api.cursor = "more"
+	if _, complete, _ = a.Roster("slack:C1/100.1"); complete {
+		t.Error("a next cursor means the roster is incomplete")
+	}
+	if _, _, err := a.Roster("discord:1/2"); err == nil {
+		t.Error("malformed conversation must error")
+	}
+}
+
+func TestSlackOpenDirect(t *testing.T) {
+	api := &fakeSlackAPI{openedIM: "D9"}
+	a := newTestSlackAdapter(api)
+	conv, err := a.OpenDirect("U1")
+	if err != nil || conv != "slack:dm/D9" {
+		t.Fatalf("openDirect = %q, %v", conv, err)
 	}
 }
 

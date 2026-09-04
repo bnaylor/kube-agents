@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -19,6 +21,19 @@ const slackDMPrefix = "slack:dm/"
 // unacked envelopes, so delivered (channel, ts) pairs are remembered and
 // re-deliveries dropped. Sized to roughly a busy hour of messages.
 const slackSeenCap = 2048
+
+// slackRosterPage is one conversations.members page; a channel past it is
+// reported rosterComplete=false, not paged — rosterCap (32) truncates far
+// below it anyway, and larger rooms are live-read territory for the LCD
+// tool (gateway design, roster cap decision).
+const slackRosterPage = 200
+
+// Slack token prefixes, checked at construction so a swapped pair fails at
+// boot with a message instead of as an opaque 401 from the first API call.
+const (
+	slackBotTokenPrefix = "xoxb-"
+	slackAppTokenPrefix = "xapp-"
+)
 
 // slackAPI is the slice of the Slack Web API the adapter uses; *slack.Client
 // satisfies it, tests fake it.
@@ -96,6 +111,122 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 func toMrkdwn(text string) string {
 	text = strings.ReplaceAll(text, "**", "*")
 	return slackLinkRE.ReplaceAllString(text, "<$2|$1>")
+}
+
+var _ Adapter = (*SlackAdapter)(nil)
+
+// NewSlackAdapter builds the Socket Mode client pair. The bot token drives
+// the Web API and the app token the outbound websocket — the two refs the
+// existing SlackSpec already carries, and everything Socket Mode needs.
+func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter, error) {
+	if !strings.HasPrefix(botToken, slackBotTokenPrefix) || !strings.HasPrefix(appToken, slackAppTokenPrefix) {
+		return nil, fmt.Errorf("slack tokens look wrong: bot tokens start %s, app tokens %s", slackBotTokenPrefix, slackAppTokenPrefix)
+	}
+	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+	return &SlackAdapter{
+		api:          api,
+		sm:           socketmode.New(api),
+		log:          log,
+		sessionRoots: map[string]bool{},
+		seen:         map[string]bool{},
+	}, nil
+}
+
+// Run resolves the bot's own identity, consumes Socket Mode events, and
+// holds the websocket open until ctx is done.
+func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	auth, err := s.api.AuthTest()
+	if err != nil {
+		return fmt.Errorf("slack auth.test: %w", err)
+	}
+	s.botUserID = auth.UserID
+	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID)
+	go func() {
+		for evt := range s.sm.Events {
+			if evt.Type != socketmode.EventTypeEventsAPI {
+				continue
+			}
+			e, ok := evt.Data.(slackevents.EventsAPIEvent)
+			if !ok {
+				continue
+			}
+			// Ack immediately: unacked envelopes redeliver in seconds, and
+			// per-conversation ordering is the gateway queue's job, not the
+			// socket's.
+			if evt.Request != nil {
+				if err := s.sm.Ack(*evt.Request); err != nil {
+					s.log.Warn("socket mode ack failed", "err", err)
+				}
+			}
+			if e.Type != slackevents.CallbackEvent {
+				continue
+			}
+			m, ok := e.InnerEvent.Data.(*slackevents.MessageEvent)
+			if !ok {
+				continue
+			}
+			if msg, ok := s.inbound(m); ok {
+				handler(msg)
+			}
+		}
+	}()
+	return s.sm.RunContext(ctx)
+}
+
+// Post writes into the conversation — threaded for sessions rooted in a
+// channel, plain for DMs — and returns the message ts the rolling line edits.
+func (s *SlackAdapter) Post(conversation, text string) (string, error) {
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	return ts, err
+}
+
+// Edit replaces a previously posted message — the rolling progress line.
+func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
+	channel, _, ok := slackChannelThread(conversation)
+	if !ok {
+		return fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	_, _, _, err := s.api.UpdateMessage(channel, messageID, slack.MsgOptionText(toMrkdwn(text), false))
+	return err
+}
+
+// Roster is the channel's membership. Slack has no per-thread membership,
+// and anyone in the channel can read the thread, so the channel roster IS
+// the "who could have read this" the audience snapshot exists to answer.
+// One page; a channel past it is incomplete rather than paged.
+func (s *SlackAdapter) Roster(conversation string) ([]string, bool, error) {
+	channel, _, ok := slackChannelThread(conversation)
+	if !ok {
+		return nil, false, fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	members, next, err := s.api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+		ChannelID: channel, Limit: slackRosterPage,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return members, next == "", nil
+}
+
+// OpenDirect returns the DM conversation for a user — the DM-switch
+// primitive. Shipped, unused: everything posts to the room it came from
+// until the classifier exists.
+func (s *SlackAdapter) OpenDirect(userID string) (string, error) {
+	ch, _, _, err := s.api.OpenConversation(&slack.OpenConversationParameters{
+		Users: []string{userID}, ReturnIM: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	return slackDMPrefix + ch.ID, nil
 }
 
 // slackMentionsBot reports whether text mentions the bot user. Slack encodes
