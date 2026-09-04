@@ -1051,6 +1051,15 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
+	// The auth callout, before the fence and before anything that dials the
+	// bus. nats.conf now names it as the authority for every non-exempt
+	// connection, so a bus standing up without it accepts only the static
+	// users and refuses everything else — and refuses it as an Authorization
+	// Violation, which reads exactly like a credential problem.
+	if err := r.reconcileA2ACallout(ctx, agent); err != nil {
+		return state, err
+	}
+
 	// The bus fence rides this function so it appears and disappears with the
 	// stack it fences — including the skew freeze, where a frozen, running bus
 	// keeps its ingress policy.
@@ -1194,6 +1203,19 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		reader client.Reader
 	}{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The auth callout, before the bus it authorizes for. Its Deployment
+		// goes first so it stops answering while there is still a server to
+		// answer for; the keys Secret goes with it rather than surviving like
+		// the per-user creds, because a flip back to today and forward again
+		// re-renders nats.conf anyway, and a stale issuer is the one thing
+		// that would make every callout answer be refused.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
@@ -1225,6 +1247,29 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 			return fmt.Errorf("refusing to delete unowned A2A %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+			return err
+		}
+	}
+
+	// The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
+	// owner reference — the garbage collector treats a cluster-scoped object
+	// owned by a namespaced one as an orphan and deletes it at once — which
+	// means nothing reclaims it but this. Left behind, it is an A2A-named
+	// ClusterRoleBinding on an install that is supposed to look like it has
+	// never heard of A2A, and it is the darkness property's most visible
+	// residue: cluster-scoped objects are exactly what a security reviewer
+	// lists first. The ownership refusal above cannot apply, so it is matched
+	// on its labels instead.
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent) + "-tokenreview"}}
+	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(crb), crb); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	} else {
+		if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
+			return fmt.Errorf("refusing to delete unowned A2A ClusterRoleBinding %s", crb.Name)
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, crb)); err != nil {
 			return err
 		}
 	}

@@ -190,6 +190,18 @@ type PlatformAgentReconciler struct {
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+//
+// The A2A auth callout also verifies callers with a TokenReview, and under mode next the
+// operator binds it to the built-in system:auth-delegator ClusterRole. RBAC escalation
+// prevention refuses that binding unless the operator either holds every permission in the
+// role it is granting or holds `bind` on that role by name. It holds tokenreviews/create
+// above but not subjectaccessreviews/create, which system:auth-delegator also carries — so
+// without this line the binding is refused at runtime and the callout never gets TokenReview,
+// on every install that turns next on. Measured against a real API server, not inferred:
+// without it, "attempting to grant RBAC permissions not currently held"; with it, allowed.
+// `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
+// confers none of its permissions on the operator itself.
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
