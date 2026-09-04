@@ -631,13 +631,26 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
-	server := fmt.Sprintf("nats://seed:${SEED_PASSWORD}@%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)
+	server := fmt.Sprintf("%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)
 	return a2aPostureComment + `
 set -euo pipefail
+# This Job authenticates to the bus with its own projected ServiceAccount
+# token, which the auth callout resolves against the cluster. It holds no
+# password: there is no "provision" entry in nats.conf at all.
+#
+# The token goes in the PASSWORD field rather than a --token flag, for two
+# reasons. It keeps the credential out of the process argument list, where
+# --token would put it on display to anything that can read /proc; and the
+# username half then carries the ServiceAccount this Job claims to be, which
+# the callout logs before it validates anything — so a flood of refusals names
+# who is being refused. The callout accepts the token in either field.
+BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
+
 # --inbox-prefix: every stream/kv call here is a $JS.API request whose reply
-# lands on an inbox, and seed may only subscribe under _INBOX.seed.> — the
-# CLI's default _INBOX.<nuid> would be refused and every call would time out.
-NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
+# lands on an inbox, and this principal may only subscribe under
+# _INBOX.provision.> — the CLI's default _INBOX.<nuid> would be refused and
+# every call would time out.
+NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
 # max_consumers caps each stream at 64. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
@@ -735,7 +748,13 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy:                corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					// Its own ServiceAccount, holding no RBAC at all: the
+					// token exists to authenticate to the bus, not to talk to
+					// the API server. Automount stays off and the bus token is
+					// an explicit projected volume, so the only credential in
+					// this pod is the audience-bound one it actually needs.
+					ServiceAccountName:           a2aProvisionServiceAccountName(agent),
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
@@ -745,7 +764,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					// The nats CLI wants a writable HOME for its context
 					// directory even when every call passes --server, so the
 					// hardened read-only root needs somewhere to point it.
-					Volumes: []corev1.Volume{{
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), {
 						Name:         "tmp",
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
@@ -754,18 +773,22 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
-						VolumeMounts:    []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
 						Env: []corev1.EnvVar{{
 							Name: "HOME", Value: "/tmp",
 						}, {
 							Name: "XDG_CONFIG_HOME", Value: "/tmp",
 						}, {
-							Name: "SEED_PASSWORD",
-							ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-								Key:                  "seed-password",
-							}},
+							// The ServiceAccount this Job claims to be. The
+							// callout does not trust it - it trusts the
+							// TokenReview - but it logs it, so a refusal
+							// names a workload instead of an IP.
+							Name:  "BUS_USER",
+							Value: a2aServiceAccountName(agent.Namespace, a2aProvisionServiceAccountName(agent)),
 						}},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "tmp", MountPath: "/tmp"},
+							a2aBusTokenVolumeMount(),
+						},
 					}},
 				},
 			},
@@ -1214,6 +1237,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aProvisionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},

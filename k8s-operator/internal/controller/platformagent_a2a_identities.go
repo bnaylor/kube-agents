@@ -126,12 +126,19 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 // Production scopes supervisor publish to sessions the gateway spawned;
 // statically that collapses to the task-events wildcard.
 func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	_ = ns
 	return a2aIdentity{
-		user:           "gateway",
-		account:        a2aAccountApp,
-		comment:        "task requester, chat-session supervisor, session-registry owner",
-		auth:           a2aAuthCallout,
-		serviceAccount: a2aServiceAccountName(ns, a2aGatewayName(agent)),
+		user:    "gateway",
+		account: a2aAccountApp,
+		comment: "task requester, chat-session supervisor, session-registry owner.\n" +
+			"STATIC, and this one is a sequencing fact rather than a property of\n" +
+			"the gateway. It has a ServiceAccount and could authenticate with it\n" +
+			"tomorrow; what it does not yet have is a client that presents a token\n" +
+			"instead of a password, because the gateway program lands separately\n" +
+			"from this render. Moving the identity before the program that uses it\n" +
+			"would refuse the gateway at connect on every install.",
+		auth:     a2aAuthStatic,
+		credsKey: "gateway-password",
 		// $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
 		// explicit ack is a publish to $JS.ACK.<stream>.<consumer>...,
 		// and push flow control answers on $JS.FC.>. Without them a

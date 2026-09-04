@@ -355,6 +355,9 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 	// name instead.
 	owned := []client.Object{
 		buildA2ACalloutServiceAccount(agent),
+		// The provision Job's identity, applied here so it exists before the
+		// Job that mounts a token for it.
+		buildA2AProvisionServiceAccount(agent),
 		buildA2ACalloutRole(agent),
 		buildA2ACalloutRoleBinding(agent),
 		buildA2ACalloutDeployment(agent),
@@ -380,4 +383,18 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		}
 	}
 	return nil
+}
+
+// buildA2AProvisionServiceAccount is the provision Job's identity. It holds no
+// RBAC: the token exists so the auth callout has something to resolve, not so
+// the Job can talk to the API server.
+func buildA2AProvisionServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aProvisionServiceAccountName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "provision"),
+		},
+	}
 }

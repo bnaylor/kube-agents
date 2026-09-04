@@ -1,29 +1,6 @@
 {
-  "version": "6dbef077c9594515",
+  "version": "e31f3209735456ff",
   "identities": [
-    {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
-      "user": "gateway",
-      "account": "APP",
-      "grants": {
-        "publish": [
-          "a2a.tasks.*.*.in",
-          "a2a.tasks.*.*.events",
-          "$KV.session-state.>",
-          "$JS.API.>",
-          "$JS.ACK.TASKS.>",
-          "$JS.FC.>",
-          "_INBOX.gateway.>"
-        ],
-        "subscribe": [
-          "a2a.tasks.*.*.events",
-          "a2a.agents.>",
-          "agents.hb.>",
-          "$KV.session-state.>",
-          "_INBOX.gateway.>"
-        ]
-      }
-    },
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
       "user": "agent",

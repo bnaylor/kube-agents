@@ -47,7 +47,7 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// one of them changed without the other being considered, and for this
 	// particular list that means a workload either lost its grants or
 	// silently gained some.
-	want := map[string]bool{"gateway": true, "agent": true, "provision": true}
+	want := map[string]bool{"agent": true, "provision": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)
@@ -61,9 +61,14 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// The static residue must not be here. A principal served by both the
 	// callout and nats.conf's auth_users exemption is authenticated by
 	// whichever path the client happened to take.
+	//
+	// gateway is on this list rather than the one above on purpose: it has a
+	// ServiceAccount and will move, but its client program lands separately
+	// from the render, so the identity may not move before the program that
+	// presents a token for it.
 	for _, id := range m.Identities {
 		switch id.User {
-		case "worker", "web", "sys":
+		case "gateway", "worker", "web", "sys":
 			t.Errorf("%q is a static principal and must not appear in the callout's map", id.User)
 		}
 	}

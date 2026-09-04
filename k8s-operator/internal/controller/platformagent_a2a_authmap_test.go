@@ -155,8 +155,8 @@ func TestTheRenderedMapIsReadable(t *testing.T) {
 	if strings.Contains(body, escapedWildcard) {
 		t.Errorf("rendered map contains %s escapes; SetEscapeHTML(false) was lost", escapedWildcard)
 	}
-	if !strings.Contains(body, "_INBOX.gateway.>") {
-		t.Error("rendered map does not carry the gateway inbox grant as a plain wildcard")
+	if !strings.Contains(body, "_INBOX.agent.>") {
+		t.Error("rendered map does not carry the agent inbox grant as a plain wildcard")
 	}
 }
 

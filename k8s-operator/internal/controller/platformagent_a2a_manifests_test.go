@@ -87,7 +87,7 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 	// The static principals, with their inbox prefixes and their generated
 	// passwords. Per-user inbox prefixes are what stop the connect-time
 	// property leaking through the reply path.
-	for _, user := range []string{"worker", "web"} {
+	for _, user := range []string{"worker", "web", "gateway"} {
 		if !strings.Contains(conf, "user: "+user) {
 			t.Errorf("nats.conf missing static user %q", user)
 		}
@@ -95,7 +95,7 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 			t.Errorf("nats.conf missing the _INBOX prefix for %q", user)
 		}
 	}
-	for _, pw := range []string{"pw-worker", "pw-web"} {
+	for _, pw := range []string{"pw-worker", "pw-web", "pw-gateway"} {
 		if !strings.Contains(conf, pw) {
 			t.Errorf("nats.conf does not carry the generated password %q", pw)
 		}
@@ -109,9 +109,6 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 		if strings.Contains(conf, "user: "+user.user+"\n") {
 			t.Errorf("nats.conf still carries a static block for %q, which the callout now issues", user.user)
 		}
-	}
-	if strings.Contains(conf, "pw-gateway") {
-		t.Error("nats.conf still carries the gateway password; the gateway authenticates with a ServiceAccount token now")
 	}
 
 	// The callout wiring itself.
@@ -289,7 +286,7 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		// Every stream/kv call is a $JS.API request answered on an inbox, and
 		// seed may only subscribe under _INBOX.seed.> — without the prefix
 		// override every CLI call times out and the Job can never succeed.
-		"--inbox-prefix=_INBOX.seed",
+		"--inbox-prefix=_INBOX.provision",
 		// posture
 		"PLAYGROUND POSTURE",
 	} {

@@ -154,17 +154,20 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 	}
 }
 
-// The residue, asserted so it cannot grow quietly. A1 leaves exactly three
-// static principals and each has a reason recorded at its definition: worker
-// (session pods carry no Kubernetes identity — A2 closes it), web (a browser
-// can never hold one) and sys (a human). A fourth appearing here means someone
+// The residue, asserted so it cannot grow quietly. Each of these has a reason
+// recorded at its definition, and the reasons are not the same kind of thing:
+// web can never present a ServiceAccount token because a browser has none;
+// worker has no identity to present because session pods are spawned without
+// one; sys is a human; and gateway could move today but its client program
+// lands separately from this render, so moving the identity first would refuse
+// it at connect on every install. A fifth name appearing here means someone
 // added a principal without asking whether it could have an identity.
-func TestTheStaticResidueIsExactlyTheThreeWithReasons(t *testing.T) {
+func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	var got []string
 	for _, id := range staticIdentities(identityTestAgent()) {
 		got = append(got, id.user)
 	}
-	want := []string{"worker", "web", "sys"}
+	want := []string{"gateway", "worker", "web", "sys"}
 	if !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
 	}
