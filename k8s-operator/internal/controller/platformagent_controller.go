@@ -166,7 +166,10 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
 // `secrets` and full `jobs` verbs exist for the mode-next A2A stack: the
 // generated NATS credentials/config Secrets and the provisioning Job.
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// No list/watch: the A2A code does one Get, Create, Update, apply-Patch and
+// Delete by name, and a2aReader() exists so those never go through the cache.
+// Without the enumeration verbs a cached Secret read cannot be added by accident.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
@@ -547,7 +550,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// ownership: a PVC squatting this exact name that this render did not
 		// create is left alone rather than destroyed.
 		a2aPVC := &corev1.PersistentVolumeClaim{}
-		pvcKey := client.ObjectKey{Name: "data-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace}
+		pvcKey := client.ObjectKey{Name: a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace}
 		switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
 		case err == nil:
 			if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1018,5 +1019,125 @@ func TestA2ASessionQuotaGatedByMode(t *testing.T) {
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-quota", Namespace: "test-ns"}, quota); !errors.IsNotFound(err) {
 		t.Errorf("session quota still present under today (err=%v)", err)
+	}
+}
+
+// TestEveryA2AContainerHasAHardenedSecurityContext is the mode-next half of
+// TestEveryContainerHasAHardenedSecurityContext, which walks the agent Pod and
+// stops there. These three containers are rendered by their own builders and
+// sit outside that walk, which is how all three shipped without the helper --
+// the provision container with no SecurityContext at all. One list, so a fourth
+// A2A container has somewhere to be added and fails here until it is.
+func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
+	agent := newTestPlatformAgent()
+	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
+	job := buildA2AProvisionJob(agent)
+	dep := buildA2AGatewayDeployment(agent)
+
+	for _, tc := range []struct {
+		render string
+		spec   corev1.PodSpec
+	}{
+		{"nats", sts.Spec.Template.Spec},
+		{"provision", job.Spec.Template.Spec},
+		{"gateway", dep.Spec.Template.Spec},
+	} {
+		t.Run(tc.render, func(t *testing.T) {
+			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
+			if len(all) == 0 {
+				t.Fatalf("%s: no containers, so this test would pass vacuously", tc.render)
+			}
+			for _, c := range all {
+				sc := c.SecurityContext
+				if sc == nil {
+					t.Errorf("container %s: no SecurityContext; want hardenedSecurityContext()", c.Name)
+					continue
+				}
+				if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+					t.Errorf("container %s: ReadOnlyRootFilesystem is not true", c.Name)
+				}
+				if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+					t.Errorf("container %s: AllowPrivilegeEscalation is not false", c.Name)
+				}
+				if sc.Capabilities == nil || !slices.Contains(sc.Capabilities.Drop, corev1.Capability("ALL")) {
+					t.Errorf("container %s: capabilities do not drop ALL, got %v", c.Name, sc.Capabilities)
+				}
+			}
+			// Pod level: the same floor the NATS and gateway pods already set.
+			// A restricted-PSA namespace rejects the pod without these.
+			psc := tc.spec.SecurityContext
+			if psc == nil || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
+				t.Errorf("%s pod: RunAsNonRoot is not true", tc.render)
+			}
+			if psc == nil || psc.SeccompProfile == nil ||
+				psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+				t.Errorf("%s pod: seccomp profile is not RuntimeDefault", tc.render)
+			}
+		})
+	}
+}
+
+// TestA2AProvisionJobConditionsDriveStatus exercises the three branches the Job
+// condition scan feeds: done, failed (which the controller turns into a Degraded
+// phase with A2AProvisionFailed), and neither (which requeues). All three shipped
+// unexercised -- nothing seeded a Job condition -- so dropping the JobFailed case
+// or inverting the ConditionTrue guard left a stream-less bus reporting Ready
+// with the suite green.
+func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cond       *batchv1.JobCondition
+		wantDone   bool
+		wantFailed bool
+	}{
+		{"pending", nil, false, false},
+		{"complete", &batchv1.JobCondition{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+		}, true, false},
+		{"failed", &batchv1.JobCondition{
+			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+			Reason: "BackoffLimitExceeded", Message: "Job has reached the specified backoff limit",
+		}, false, true},
+		// A condition present but False is not the event: the scan must skip it
+		// rather than read the type alone.
+		{"failed-but-false", &batchv1.JobCondition{
+			Type: batchv1.JobFailed, Status: corev1.ConditionFalse,
+		}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := a2aTestAgent()
+			job := buildA2AProvisionJob(agent)
+			withCommonLabels(job, agent)
+			if tc.cond != nil {
+				job.Status.Conditions = []batchv1.JobCondition{*tc.cond}
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, job).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+			state, err := r.reconcileA2A(context.Background(), agent)
+			if err != nil {
+				t.Fatalf("reconcileA2A: %v", err)
+			}
+			if state.done != tc.wantDone {
+				t.Errorf("done = %v, want %v", state.done, tc.wantDone)
+			}
+			if state.failed != tc.wantFailed {
+				t.Errorf("failed = %v, want %v", state.failed, tc.wantFailed)
+			}
+			if tc.wantFailed {
+				if !strings.Contains(state.message, job.Name) {
+					t.Errorf("message does not name the Job to inspect: %q", state.message)
+				}
+				if !strings.Contains(state.message, "BackoffLimitExceeded") {
+					t.Errorf("message drops the condition reason: %q", state.message)
+				}
+			}
+		})
 	}
 }

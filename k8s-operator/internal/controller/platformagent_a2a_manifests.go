@@ -489,6 +489,12 @@ system_account: SYS
 // container only reads it at boot, so the hash rides the pod template — the
 // agent Deployment's config-hash mechanism — and a changed render rolls the
 // server instead of silently diverging from it.
+// a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
+// controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
+// so a rename here that is not matched there turns the reap into a silent no-op
+// and leaks the PV on every CR deletion. One spelling, both sites.
+const a2aNATSDataClaim = "data"
+
 func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string) *appsv1.StatefulSet {
 	name := a2aNATSName(agent)
 	labels := a2aLabels(agent, "nats")
@@ -531,12 +537,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
-							{Name: "data", MountPath: "/data"},
+							{Name: a2aNATSDataClaim, MountPath: "/data"},
 						},
-						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: ptr.To(false),
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-						},
+						SecurityContext: hardenedSecurityContext(),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("monitor")},
@@ -557,7 +560,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 				// claim is this render's before deleting it — a template PVC
 				// carries no owner reference, so the instance label is the
 				// only ownership signal it has.
-				ObjectMeta: metav1.ObjectMeta{Name: "data", Labels: a2aLabels(agent, "nats")},
+				ObjectMeta: metav1.ObjectMeta{Name: a2aNATSDataClaim, Labels: a2aLabels(agent, "nats")},
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 					Resources: corev1.VolumeResourceRequirements{
@@ -780,12 +783,27 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+						RunAsNonRoot:   ptr.To(true),
+						RunAsUser:      ptr.To(int64(1000)),
 					},
+					// The nats CLI wants a writable HOME for its context
+					// directory even when every call passes --server, so the
+					// hardened read-only root needs somewhere to point it.
+					Volumes: []corev1.Volume{{
+						Name:         "tmp",
+						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+					}},
 					Containers: []corev1.Container{{
-						Name:    "provision",
-						Image:   a2aProvisionImage(),
-						Command: []string{"sh", "-c", script},
+						Name:            "provision",
+						Image:           a2aProvisionImage(),
+						Command:         []string{"sh", "-c", script},
+						SecurityContext: hardenedSecurityContext(),
+						VolumeMounts:    []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
 						Env: []corev1.EnvVar{{
+							Name: "HOME", Value: "/tmp",
+						}, {
+							Name: "XDG_CONFIG_HOME", Value: "/tmp",
+						}, {
 							Name: "SEED_PASSWORD",
 							ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
@@ -986,10 +1004,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						VolumeMounts: []corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
 						}},
-						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: ptr.To(false),
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-						},
+						SecurityContext: hardenedSecurityContext(),
 					}},
 					Volumes: []corev1.Volume{{
 						Name: "principal-map",
@@ -1142,10 +1157,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 // deleting the gateway here hands any stragglers to Kubernetes GC, with no
 // operator exception to the IsControlledBy refusal below.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	// Deployment/StatefulSet/Service reads come from the cache — those kinds
-	// are already watched (Owns) so the reads are free. Secret and Job reads
-	// go through a2aReader: a cached read would start a cluster-wide informer
-	// for a kind this controller otherwise never watches, on every install.
+	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
+	// those kinds are already watched (Owns, see SetupWithManager) so the reads
+	// are free. Secret, Role/RoleBinding, ResourceQuota and Job reads go through
+	// a2aReader: a cached read would start a cluster-wide informer for a kind
+	// this controller otherwise never watches, on every install.
+	//
+	// Those uncached reads are the standing cost of this path, which runs on
+	// every reconcile of every today install — see the note on the sweep below.
 	named := []struct {
 		obj    client.Object
 		reader client.Reader
@@ -1153,7 +1172,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// ServiceAccount is an Owns() kind, so this read is cached and free.
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
