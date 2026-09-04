@@ -67,10 +67,13 @@ type Gateway struct {
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
-	// droppedNotices dedupes the unmapped-sender notice per (conversation,
-	// sender) for the life of the process: the drop stays visible (a silent
-	// drop of a real user is a support burden) while a repeat-typer cannot
-	// make the gateway spam the room.
+	// droppedNotices dedupes the unmapped-sender notice per sender for the
+	// life of the process: the drop stays visible (a silent drop of a real
+	// user is a support burden) while a repeat-typer cannot make the
+	// gateway spam the room. Per sender, NOT per conversation — a channel
+	// mention mints a fresh conversation every time, so a conversation-
+	// scoped key would be no bound at all. Growth is bounded by workspace
+	// membership; the backend authenticated the id.
 	droppedNotices map[string]bool
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
@@ -221,12 +224,12 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
 		// Say so visibly: a silent drop of a real user is a support burden
 		// (chat-adapters card). A deterministic template over facts the
-		// gateway owns, inside the no-model rule; the dedupe bounds what an
-		// unverified sender can make the gateway post.
+		// gateway owns, inside the no-model rule; the per-sender dedupe
+		// bounds what an unverified sender can make the gateway post (see
+		// the droppedNotices field for why it is not per conversation).
 		g.mu.Lock()
-		noticeKey := msg.Conversation + "\x00" + msg.AuthorID
-		notified := g.droppedNotices[noticeKey]
-		g.droppedNotices[noticeKey] = true
+		notified := g.droppedNotices[msg.AuthorID]
+		g.droppedNotices[msg.AuthorID] = true
 		g.mu.Unlock()
 		if !notified {
 			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+

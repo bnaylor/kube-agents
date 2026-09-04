@@ -257,10 +257,37 @@ func TestToMrkdwn(t *testing.T) {
 		"see [the doc](https://x.example/p)": "see <https://x.example/p|the doc>",
 		"plain text":                         "plain text",
 		"**a** and **b**":                    "*a* and *b*",
+		// Executor text is model output; Slack control sequences in it must
+		// arrive escaped, or a prompt-injected result pings the room.
+		"<!channel> deploy done": "&lt;!channel&gt; deploy done",
+		"ping <@U999> now":       "ping &lt;@U999&gt; now",
+		"a & b < c":              "a &amp; b &lt; c",
 	}
 	for in, want := range cases {
 		if got := toMrkdwn(in); got != want {
 			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestSlackTurnSubtypes: thread_broadcast is a steer with "also send to
+// channel" checked and file_share is an ask with an attachment — both are
+// genuine turns and must not vanish silently. Edits stay dropped.
+func TestSlackTurnSubtypes(t *testing.T) {
+	api := &fakeSlackAPI{replies: map[string][]slack.Message{
+		"C1/100.1": {{Msg: slack.Msg{Text: "<@UBOT> check the nodes", User: "U1"}}},
+	}}
+	a := newTestSlackAdapter(api)
+
+	broadcast := slackMsg("channel", "C1", "U2", "also try the east cluster", "8.0", "100.1")
+	broadcast.SubType = "thread_broadcast"
+	if _, ok := a.inbound(broadcast); !ok {
+		t.Error("thread_broadcast reply in a bot-rooted thread must deliver")
+	}
+
+	file := slackMsg("im", "D1", "U1", "here is the manifest", "9.0", "")
+	file.SubType = "file_share"
+	if _, ok := a.inbound(file); !ok {
+		t.Error("file_share with text must deliver")
 	}
 }

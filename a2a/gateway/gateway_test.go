@@ -345,15 +345,17 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 }
 
 // TestUnmappedSenderIsDropped: nothing an unmapped sender types reaches the
-// bus, and the drop is visible — one notice per (conversation, sender), so
-// a real user's silent drop doesn't become a support ticket while a
-// repeat-typer still can't make the gateway spam the room (chat-adapters
-// card: "say so visibly somewhere").
+// bus, and the drop is visible — one notice per sender, so a real user's
+// silent drop doesn't become a support ticket while a repeat-typer still
+// can't make the gateway spam the room (chat-adapters card: "say so visibly
+// somewhere"). The second message arrives in a DIFFERENT conversation on
+// purpose: a channel mention mints a fresh conversation every time, so a
+// conversation-scoped dedupe would be no bound at all.
 func TestUnmappedSenderIsDropped(t *testing.T) {
 	r := startRig(t)
 	for i := 0; i < 2; i++ {
 		r.adapter.inbox <- InboundMessage{
-			Conversation: "discord:g1/thread1", Kind: "group",
+			Conversation: fmt.Sprintf("discord:g1/thread%d", i), Kind: "group",
 			AuthorID: "9999", MessageID: fmt.Sprintf("d-%d", i), Text: "let me in",
 		}
 	}

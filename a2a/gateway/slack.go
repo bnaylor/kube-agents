@@ -22,6 +22,24 @@ const slackDMPrefix = "slack:dm/"
 // re-deliveries dropped. Sized to roughly a busy hour of messages.
 const slackSeenCap = 2048
 
+// slackRootsCap bounds the thread-root cache the same way; one entry
+// accrues per distinct thread replied to, and a busy workspace should not
+// grow the gateway forever.
+const slackRootsCap = 2048
+
+// slackTurnSubtypes are the message subtypes that are genuine user turns.
+// Plain messages have no subtype; thread_broadcast is a thread reply with
+// "also send to channel" checked (dropping it would eat a steer silently),
+// and file_share is an ask with an attachment. Everything else — edits,
+// deletes, joins, bot_message — is not a turn.
+var slackTurnSubtypes = map[string]bool{"": true, "thread_broadcast": true, "file_share": true}
+
+// slackEscaper is Slack's documented escaping for the three characters that
+// open control sequences. Relayed text is executor-authored — model output,
+// by definition — so without this a prompt-injected result containing
+// <!channel> would ping the room.
+var slackEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+
 // slackRosterPage is one conversations.members page; a channel past it is
 // reported rosterComplete=false, not paged — rosterCap (32) truncates far
 // below it anyway, and larger rooms are live-read territory for the LCD
@@ -64,8 +82,10 @@ type SlackAdapter struct {
 	mu sync.Mutex
 	// sessionRoots caches whether a thread's root message mentions the bot
 	// — the rule that lets a bot-rooted thread carry every message without
-	// making every thread in a joined channel a session.
+	// making every thread in a joined channel a session. rootsOrder gives
+	// it the same eviction ring as seen.
 	sessionRoots map[string]bool
+	rootsOrder   []string
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
 	seen      map[string]bool
 	seenOrder []string
@@ -104,11 +124,14 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 	return channel, threadTS, true
 }
 
-// toMrkdwn translates the two markdown forms the relay emits (bold pairs,
-// links) into Slack mrkdwn. Deterministic and narrow on purpose: full
-// markdown fidelity is presentation polish, and the legacy Hermes path's
-// converter is not this code path's to reuse.
+// toMrkdwn escapes Slack's control characters, then translates the two
+// markdown forms the relay emits (bold pairs, links) into mrkdwn. Escaping
+// first, so the only < and > on the wire are the ones our own deterministic
+// link translation writes. Narrow on purpose: full markdown fidelity is
+// presentation polish, and the legacy Hermes path's converter is not this
+// code path's to reuse.
 func toMrkdwn(text string) string {
+	text = slackEscaper.Replace(text)
 	text = strings.ReplaceAll(text, "**", "*")
 	return slackLinkRE.ReplaceAllString(text, "<$2|$1>")
 }
@@ -142,7 +165,15 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	s.botUserID = auth.UserID
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID)
 	go func() {
-		for evt := range s.sm.Events {
+		// socketmode never closes Events; exiting on ctx keeps embedders and
+		// the live test from leaking this goroutine past Run.
+		for {
+			var evt socketmode.Event
+			select {
+			case <-ctx.Done():
+				return
+			case evt = <-s.sm.Events:
+			}
 			if evt.Type != socketmode.EventTypeEventsAPI {
 				continue
 			}
@@ -325,6 +356,13 @@ func (s *SlackAdapter) isSessionRoot(channel, threadTS string) bool {
 func (s *SlackAdapter) markSessionRoot(key string, isRoot bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.sessionRoots[key]; !exists {
+		s.rootsOrder = append(s.rootsOrder, key)
+		if len(s.rootsOrder) > slackRootsCap {
+			delete(s.sessionRoots, s.rootsOrder[0])
+			s.rootsOrder = s.rootsOrder[1:]
+		}
+	}
 	s.sessionRoots[key] = isRoot
 }
 
@@ -335,7 +373,7 @@ func (s *SlackAdapter) markSessionRoot(key string, isRoot bool) {
 // it mentions the bot or the thread root did. Everything else — bots, our
 // own posts, edits and other subtypes, redeliveries — is not a turn.
 func (s *SlackAdapter) inbound(m *slackevents.MessageEvent) (InboundMessage, bool) {
-	if m.SubType != "" || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
+	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
 	}

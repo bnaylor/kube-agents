@@ -461,9 +461,14 @@ DM is one conversation, a channel is not a session, a thread in it is.
 mention the bot, and the ask roots the session thread. A thread reply is a turn when it
 mentions the bot or the thread root did - that is what lets a session thread carry
 every message (the Discord parity) without making every thread in a joined channel a
-session. Everything else drops in the adapter: bots, our own posts, edits and other
-subtypes, socket redeliveries. The bot only sees channels it has been invited to, so
-the invitation is the trust boundary for group ingress.
+session. Two subtypes count as turns besides plain messages: `thread_broadcast` (a
+thread reply with "also send to channel" checked - dropping it would eat a steer
+silently) and `file_share` (an ask with an attachment). Everything else drops in the
+adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs
+(mpim) are group spaces here, not DMs - they have threads, so the mention affordance
+applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The bot
+only sees channels it has been invited to, so the invitation is the trust boundary for
+group ingress.
 
 **The mapping table - where it lives and who writes it.** The join is Slack's immutable
 `user_id` against a table sourced from our own IdP; never `profile.email` (the identity
@@ -483,10 +488,11 @@ the Secret's content from the IdP is a job we do not build yet; until it exists 
 table is maintained by hand, which is honest at the current install count.
 
 **Unmapped senders.** Dropped at ingress, as everywhere - but visibly now: the gateway
-posts a one-line notice to the conversation, once per sender per conversation per
-process, and keeps the structured log line. A silent drop of a real user is a support
-burden. The dedupe bounds what an unverified sender can make the gateway post. This is
-gateway behavior, not Slack behavior, so Discord gets it too.
+posts a one-line notice to the conversation, once per sender per process, and keeps
+the structured log line. A silent drop of a real user is a support burden. Per sender,
+not per conversation - a channel mention mints a fresh conversation every time, so a
+conversation-scoped dedupe would be no bound at all. This is gateway behavior, not
+Slack behavior, so Discord gets it too.
 
 **Roster.** Channel membership via the members API, one page; past a page the roster
 reports incomplete rather than paging (the roster cap truncates far below it anyway).
@@ -501,7 +507,9 @@ one.
 `verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
 the socket and asserted the `user_id`, our table joined it to a principal. Rendering
 into mrkdwn is a narrow deterministic translation of the two forms the relay emits
-(bold, links); the legacy Hermes converter stays where it is.
+(bold, links); the legacy Hermes converter stays where it is. Everything posted is
+escaped first (`&`, `<`, `>`) - relayed text is executor-authored, ie model output,
+and an unescaped `<!channel>` in a result would ping the room.
 
 ## What stage 2 builds from this doc
 
