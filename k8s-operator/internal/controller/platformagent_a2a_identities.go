@@ -117,6 +117,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		agentIdentity(agent, ns),
 		provisionIdentity(agent, ns),
 		workerIdentity(),
+		seedIdentity(),
 		webIdentity(),
 		sysIdentity(),
 	}
@@ -288,6 +289,46 @@ func workerIdentity() a2aIdentity {
 			"a2a.topics.>",
 			"$KV.runtime-state.>",
 			"_INBOX.worker.>",
+		},
+	}
+}
+
+// seed: the hand-applied seed tooling (a2a/deploy/seed.yaml), which writes the
+// starter topic entries.
+//
+// STATIC, and it is the legacy twin of the provision principal above: the same
+// job, done by an object nothing in this repository renders. The darkness audit
+// records it as the artifact nobody owns — referenced by no chart, no kustomize
+// path, no Makefile target and no operator code, and it survives a flip to
+// today until someone deletes it by hand.
+//
+// It keeps its password because it is APPLIED rather than rendered. It exists on
+// the demo install right now, so dropping its user from nats.conf would refuse
+// it at connect the next time anyone re-ran it — a live break caused by a change
+// that never touched the file, and one no test in this repository could have
+// caught, because the file is not in this repository's render path at all. It
+// goes away when the seed content becomes a render or ships with the gateway,
+// which is an open question elsewhere and not this change's to answer.
+func seedIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:     "seed",
+		account:  a2aAccountApp,
+		auth:     a2aAuthStatic,
+		credsKey: "seed-password",
+		comment: "hand-applied seed tooling. STATIC because it is applied rather than\n" +
+			"rendered: it exists on installs today, and removing its user would refuse\n" +
+			"it at connect the next time it ran. The rendered provisioner beside it\n" +
+			"does the same job through the callout.",
+		publish: []string{
+			"a2a.topics.agent.platform.upgrade-readiness",
+			"a2a.topics.shared.blueprint",
+			"a2a.topics.shared.annotations",
+			"$JS.API.>",
+			"_INBOX.seed.>",
+		},
+		subscribe: []string{
+			"a2a.topics.>",
+			"_INBOX.seed.>",
 		},
 	}
 }

@@ -68,7 +68,7 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// presents a token for it.
 	for _, id := range m.Identities {
 		switch id.User {
-		case "gateway", "worker", "web", "sys":
+		case "gateway", "worker", "seed", "web", "sys":
 			t.Errorf("%q is a static principal and must not appear in the callout's map", id.User)
 		}
 	}

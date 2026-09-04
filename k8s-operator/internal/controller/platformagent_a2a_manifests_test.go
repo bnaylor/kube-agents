@@ -193,6 +193,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"worker":    {"$JS.ACK.TASKS.>"},
 		"agent":     nil,
 		"provision": nil,
+		"seed":      nil,
 		"web":       nil,
 		"sys":       nil,
 	}
