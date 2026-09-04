@@ -18,7 +18,11 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"reflect"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
 	"strings"
 	"testing"
@@ -1139,5 +1143,122 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
+// early exit. The exit reads three sentinels and returns when all are absent,
+// which is only sound while nothing it deletes can outlive them: the
+// StatefulSet is deleted last, the gateway Deployment first, and the config
+// Secret is the one object the render creates before the StatefulSet.
+//
+// The failure this pins is the one the optimisation invites — a pass that dies
+// partway leaves objects behind, and the NEXT pass steps over them because its
+// sentinels have already gone. So: fail a delete in the middle, then let a
+// clean pass run, and require the tree to be empty at the end rather than
+// merely error-free.
+func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	failRole := true
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, isRole := obj.(*rbacv1.Role); isRole && failRole {
+					return fmt.Errorf("injected: API server said no")
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	// Pass one dies on the Role. The gateway Deployment (deleted first) is
+	// already gone by then; the StatefulSet (deleted last) is untouched.
+	if err := r.cleanupA2A(ctx, agent); err == nil {
+		t.Fatal("cleanup pass 1: want the injected error, got nil")
+	}
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}, sts); err != nil {
+		t.Fatalf("the sentinel must survive a failed pass, or this test proves nothing: %v", err)
+	}
+
+	// Pass two, unobstructed, must run the whole list rather than exit early.
+	failRole = false
+	if err := r.cleanupA2A(ctx, agent); err != nil {
+		t.Fatalf("cleanup pass 2: %v", err)
+	}
+
+	for _, tc := range []struct {
+		what string
+		obj  client.Object
+		name string
+	}{
+		{"gateway Deployment", &appsv1.Deployment{}, "test-agent-a2a-gateway"},
+		{"gateway Role", &rbacv1.Role{}, "test-agent-a2a-gateway"},
+		{"gateway RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-gateway"},
+		{"gateway ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-gateway"},
+		{"NATS Service", &corev1.Service{}, "test-agent-a2a-nats"},
+		{"NATS config Secret", &corev1.Secret{}, "test-agent-a2a-nats-config"},
+		{"NATS StatefulSet", &appsv1.StatefulSet{}, "test-agent-a2a-nats"},
+	} {
+		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns"}, tc.obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("%s survived the resumed cleanup (err=%v) — the early exit stepped over it", tc.what, err)
+		}
+	}
+
+	// A third pass on the now-empty tree is the exit doing its job.
+	if err := r.cleanupA2A(ctx, agent); err != nil {
+		t.Errorf("cleanup pass 3 on an empty tree: %v", err)
+	}
+}
+
+// TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean measures the thing the
+// change was for. Counting is the only honest check here: the early exit is a
+// cost optimisation, and a correctness test passes just as well with the reads
+// still happening one object at a time.
+func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	gets, lists := 0, 0
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				gets++
+				return c.Get(ctx, key, obj, opts...)
+			},
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				lists++
+				return c.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.cleanupA2A(context.Background(), agent); err != nil {
+		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
+	}
+	// Three sentinel Gets and nothing else: no per-object walk, and in
+	// particular no Job List, which is the uncached one that ran every
+	// reconcile of every today install before this.
+	if gets != 3 {
+		t.Errorf("Gets = %d, want 3 (the sentinels); the per-object walk is running on a no-op", gets)
+	}
+	if lists != 0 {
+		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
 	}
 }
