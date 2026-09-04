@@ -486,6 +486,21 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// BusCredentialsReady, after the Ready write so the two do not race each
+	// other's resourceVersion. Under today it is removed rather than set
+	// false: a normal install must not carry a condition describing a
+	// component it does not have, which is the darkness property reaching
+	// status and not only objects.
+	if a2aNext {
+		if err := r.setBusCredentialsReady(ctx, instance, a2aState.AuthMapVersion); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if r.clearBusCredentialsReady(instance) {
+		if err := r.Status().Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// A plugin image that cannot be pulled only surfaces on the pod seconds after the
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
