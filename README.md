@@ -141,6 +141,8 @@ Walkthrough: [Architecture](https://gke-labs.github.io/kube-agents/overview/arch
 
 Contributions are welcome. See [docs/contributing.md](docs/contributing.md) for CLA requirements and the [contributing guide](https://gke-labs.github.io/kube-agents/contributing/) for PR hygiene, commit conventions, and the local checks CI enforces. Repository conventions for AI coding agents are in [AGENTS.md](AGENTS.md).
 
+Bug reports and feature requests go in [issues](https://github.com/gke-labs/kube-agents/issues). If your GitHub account cannot open one here, use the [feedback form](https://gke-labs.github.io/kube-agents/feedback), which files it for you.
+
 ## Disclaimer
 
 This is not an officially supported Google product.

@@ -66,8 +66,8 @@ kube-agents/
 ├── examples/                                      gitops-repo template + inference/
 │                                                  integration READMEs
 ├── k8s-operator/                                  operator, event watcher, Minty READMEs
-├── scripts/                                       installer/, dev/, release/ and
-│                                                  testdata/ READMEs
+├── scripts/                                       installer/, dev/, release/,
+│                                                  feedback_form/ and testdata/ READMEs
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
 └── tests/e2e/                                     Google Chat E2E suite README
@@ -413,6 +413,7 @@ only what the title does not say.
 | `k8s-operator/config/integrations/hindsight/README.md` | Component README | The Hindsight API and its Postgres/pgvector database — the memory store behind the Chat Agent: the kustomize dev copy of what the chart renders, why it needs no credentials, and the in-cluster URL the agent image bakes in. | Passwordless Postgres, NetworkPolicy, digest pinning, no HF egress | Operators installing the memory store; the design rationale is `docs/designs/memory.md` |
 | `scripts/installer/README.md` | Component README | **Canonical** home for the shared installer defaults (the table; the values live in `install.defaults.env`), the `install.env` configuration model, and the helper scripts the installer front doors still share. | Shared defaults, configuration model, helper inventory | Installer and dev-tooling developers |
 | `scripts/dev/README.md` | Component README | The script automating GCP Workload Identity Federation so GitHub Actions can deploy keylessly. | WIF/OIDC CI auth | Repo maintainers |
+| `scripts/feedback_form/README.md` | Component README | The public Google Form that files outside feedback as `external-feedback` issues, for reporters whose enterprise-managed GitHub accounts cannot open issues here: the Apps Script behind it, its setup, the token it needs, and what to do when filing fails. | External feedback intake, Apps Script, token setup | Repo maintainers |
 | `k8s-operator/testing/staging_workloads/README.md` | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators. | Cluster maps, workload bundle, load shapes | Developers building staging fleets |
 | `scripts/eval_dashboard/SCHEMA.md` | Reference | The `data.json` contract (schema version 1) between the eval-dashboard collector (`scripts/eval_dashboard/collect.py`, which writes it from Prow logs) and the dashboard renderer and publisher built against it in parallel: field names, types, derivation rules, and the additive-only change policy with `schema_version` bumps. | Run and case records, task results, pass rates, additive-only evolution | Dashboard collector/renderer/publisher developers |
 | `scripts/release/README.md` | Component README | Overview of the release automation scripts: candidate tag creation, environment provisioning and teardown, GKE readiness & E2E test execution, validated tag promotion, the nightly staging promotion, the in-place reconcile and drift report for the long-lived environments, and the GA release. Carries what the nightly environment needs before it can run, and is canonical for the GA release gate and how its schedule is turned on. | Release Candidate scripts, RC automation, environment reconcile | CI maintainers and release operators |
