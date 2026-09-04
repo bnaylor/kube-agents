@@ -86,11 +86,18 @@ const (
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
-	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): static per-component NATS users instead of
-# the auth callout, single-node R1 JetStream (production: 3-node R3), no
-# audit exporter, no breaker, gateway sweep as the only janitor. Each has a
-# decided design in the specs (spec-nats-deployment.md); none gates letting
-# people play. Static creds are the playground, not the product.`
+	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
+# R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
+# has a decided design in the specs (spec-nats-deployment.md); none gates
+# letting people play.
+#
+# Authentication is NOT on that list any more. The auth callout is armed: a
+# client presents a projected Kubernetes ServiceAccount token, the callout
+# validates it against the cluster with a TokenReview, and answers with the
+# permission set the operator mapped that identity to. The users that remain
+# static below are the ones with nothing to present - a browser, a session pod
+# that carries no ServiceAccount, an operator at a port-forward, the callout
+# itself - and each says so where it is defined.`
 )
 
 func a2aNATSImage() string {
@@ -568,9 +575,10 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// The auth callout, FIRST, and the ordering is the
 					// point rather than tidiness.
 					//
-					// The callout is itself a bus client: it holds a
-					// system-account subscription on $SYS.REQ.USER.AUTH
-					// and answers every connection attempt. So it sits
+					// The callout is itself a bus client: it subscribes
+					// to $SYS.REQ.USER.AUTH from its own AUTH account -
+					// the subject name is not the system account - and
+					// answers every connection attempt. So it sits
 					// ON the connection path, and a fence that does not
 					// name it refuses the one peer every new connection
 					// depends on. Nothing looks broken when that
