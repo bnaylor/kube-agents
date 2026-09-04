@@ -67,6 +67,15 @@ jobs:
           cache: true
           cache-dependency-path: "a2a/go.sum"
 
+      # The provision Job hands the nats CLI a ServiceAccount token in the
+      # password field, and whether that works is a fact about the CLI rather
+      # than about our client library - so the test that covers the one product
+      # client authenticating through the callout needs the real binary. A Go
+      # install, no container.
+      - name: Install the nats CLI
+        if: steps.filter.outputs.a2a == 'true'
+        run: go install github.com/nats-io/natscli/nats@latest
+
       - name: Run Tests
         if: steps.filter.outputs.a2a == 'true'
         # envtest-path installs the binaries if absent and prints the path, so
@@ -75,4 +84,4 @@ jobs:
           ASSETS="$(make -C k8s-operator -s envtest-path)"
           cd a2a
           go vet ./...
-          KUBEBUILDER_ASSETS="$ASSETS" go test -race ./...
+          KUBEBUILDER_ASSETS="$ASSETS" PATH="$(go env GOPATH)/bin:$PATH" go test -race ./...
