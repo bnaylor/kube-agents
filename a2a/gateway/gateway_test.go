@@ -344,18 +344,42 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 	}
 }
 
+// TestUnmappedSenderIsDropped: nothing an unmapped sender types reaches the
+// bus, and the drop is visible — one notice per (conversation, sender), so
+// a real user's silent drop doesn't become a support ticket while a
+// repeat-typer still can't make the gateway spam the room (chat-adapters
+// card: "say so visibly somewhere").
 func TestUnmappedSenderIsDropped(t *testing.T) {
 	r := startRig(t)
-	r.adapter.inbox <- InboundMessage{
-		Conversation: "discord:g1/thread1", Kind: "group",
-		AuthorID: "9999", MessageID: "d-1", Text: "let me in",
+	for i := 0; i < 2; i++ {
+		r.adapter.inbox <- InboundMessage{
+			Conversation: "discord:g1/thread1", Kind: "group",
+			AuthorID: "9999", MessageID: fmt.Sprintf("d-%d", i), Text: "let me in",
+		}
 	}
 	time.Sleep(500 * time.Millisecond)
 	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
 		t.Fatalf("unverified sender reached the bus: %d envelopes", len(envs))
 	}
-	if posts := r.adapter.postTexts(); len(posts) != 0 {
-		t.Fatalf("unverified sender got a reply: %v", posts)
+	posts := r.adapter.postTexts()
+	if len(posts) != 1 {
+		t.Fatalf("drop must be visible exactly once per sender per conversation, got %d posts: %v", len(posts), posts)
+	}
+	if !strings.Contains(posts[0], "can't verify") {
+		t.Fatalf("drop notice missing: %q", posts[0])
+	}
+}
+
+// TestVerifiedByNamesTheMechanism: the authority block should say what was
+// actually checked. Slack's sender is asserted by Slack over the Socket
+// Mode connection and joined by our table; Discord (and anything unlisted)
+// is the test mapping table alone.
+func TestVerifiedByNamesTheMechanism(t *testing.T) {
+	if got := verifiedByFor("slack"); got != "slack-socket-mode+principal-map" {
+		t.Fatalf("verifiedByFor(slack) = %q", got)
+	}
+	if got := verifiedByFor("discord"); got != "principal-map" {
+		t.Fatalf("verifiedByFor(discord) = %q", got)
 	}
 }
 

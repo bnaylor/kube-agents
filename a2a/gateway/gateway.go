@@ -67,6 +67,11 @@ type Gateway struct {
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
+	// droppedNotices dedupes the unmapped-sender notice per (conversation,
+	// sender) for the life of the process: the drop stays visible (a silent
+	// drop of a real user is a support burden) while a repeat-typer cannot
+	// make the gateway spam the room.
+	droppedNotices map[string]bool
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
 
@@ -130,19 +135,20 @@ func New(o Options) (*Gateway, error) {
 		o.Config.AskTTL = defaultAskTTL
 	}
 	g := &Gateway{
-		cfg:          o.Config,
-		client:       o.Client,
-		reg:          NewRegistry(o.Client),
-		adapter:      o.Adapter,
-		pm:           pm,
-		ps:           NewPseudonymizer(o.Config.AttributionSalt),
-		log:          log,
-		runCtx:       context.Background(),
-		sessionLocks: map[string]*sync.Mutex{},
-		taskSessions: map[string]string{},
-		relays:       map[string]*relayState{},
-		backend:      backend,
-		relayDurable: o.RelayDurable,
+		cfg:            o.Config,
+		client:         o.Client,
+		reg:            NewRegistry(o.Client),
+		adapter:        o.Adapter,
+		pm:             pm,
+		ps:             NewPseudonymizer(o.Config.AttributionSalt),
+		log:            log,
+		runCtx:         context.Background(),
+		sessionLocks:   map[string]*sync.Mutex{},
+		taskSessions:   map[string]string{},
+		droppedNotices: map[string]bool{},
+		relays:         map[string]*relayState{},
+		backend:        backend,
+		relayDurable:   o.RelayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -213,6 +219,19 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if principal == "" {
 		g.log.Warn("dropping message from unmapped sender",
 			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		// Say so visibly: a silent drop of a real user is a support burden
+		// (chat-adapters card). A deterministic template over facts the
+		// gateway owns, inside the no-model rule; the dedupe bounds what an
+		// unverified sender can make the gateway post.
+		g.mu.Lock()
+		noticeKey := msg.Conversation + "\x00" + msg.AuthorID
+		notified := g.droppedNotices[noticeKey]
+		g.droppedNotices[noticeKey] = true
+		g.mu.Unlock()
+		if !notified {
+			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+
+				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to the principal map.")
+		}
 		return
 	}
 
@@ -250,7 +269,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
 	authority := BuildAuthority(g.ps, g.pm, principal, g.backend, msg.AuthorID,
-		"principal-map", msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
+		verifiedByFor(g.backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
 	rec.Roster = hashRoster(g.ps, g.pm, rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already
@@ -418,6 +437,18 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 	}
+}
+
+// verifiedByFor names the ingress verification mechanism per backend — the
+// authority block should say what was actually checked, not just "the map".
+// Slack: Slack authenticated the sender over the Socket Mode connection and
+// asserted the immutable user_id; the install's mapping table joined it to
+// a principal. Discord (and anything unlisted): the test mapping table.
+func verifiedByFor(backend string) string {
+	if backend == "slack" {
+		return "slack-socket-mode+principal-map"
+	}
+	return "principal-map"
 }
 
 // mintSession is first contact with a conversation: contextId is minted
