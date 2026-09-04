@@ -1,0 +1,66 @@
+{
+  "version": "6dbef077c9594515",
+  "identities": [
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
+      "user": "gateway",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.tasks.*.*.in",
+          "a2a.tasks.*.*.events",
+          "$KV.session-state.>",
+          "$JS.API.>",
+          "$JS.ACK.TASKS.>",
+          "$JS.FC.>",
+          "_INBOX.gateway.>"
+        ],
+        "subscribe": [
+          "a2a.tasks.*.*.events",
+          "a2a.agents.>",
+          "agents.hb.>",
+          "$KV.session-state.>",
+          "_INBOX.gateway.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
+      "user": "agent",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "agents.hb.>",
+          "$JS.API.>",
+          "_INBOX.agent.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "a2a.agents.>",
+          "_INBOX.agent.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
+      "user": "provision",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "$JS.API.>",
+          "_INBOX.provision.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "_INBOX.provision.>"
+        ]
+      }
+    }
+  ]
+}
