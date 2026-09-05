@@ -15,8 +15,9 @@ A bump starts here but rarely ends here. Several images keep a second copy that 
 source for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on both a
 default and a mirrored install; the build-time bases against their Dockerfile `ARG` defaults; the
-fluent-bit fallback baked into the operator binary; the example manifests; and the kustomize
-integrations, which it requires to name a variable this file owns rather than a literal.
+Go builder pin against the `go` directive in `k8s-operator/go.mod`; the fluent-bit fallback baked
+into the operator binary; the example manifests; and the kustomize integrations, which it requires
+to name a variable this file owns rather than a literal.
 
 Two copies it does not reach, where a stale pin passes every check. An image behind a non-default
 chart toggle is never rendered, so Hindsight (`memory.provider`) and the GitHub token minter
@@ -275,7 +276,10 @@ make docker-build-platform \
 
 Unset args keep their upstream defaults, so an ordinary build is unchanged. Mirror the base
 images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than `docker` — the
-Hermes pin is by digest, and a `docker pull`/`push` round trip changes it.
+Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mirrored `golang` copy
+is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`,
+so a later bump of the `go` directive in `k8s-operator/go.mod` past that patch fails the rebuild
+instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
 
 ### Registry authentication
 

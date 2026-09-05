@@ -76,6 +76,12 @@ FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 # cross-compiles to TARGETARCH, the architecture of the image being produced.
 # The :-amd64 fallback only fires on builders that don't populate TARGETARCH.
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS watcher-builder
+# The official golang image sets this already; repeated so a substituted
+# GOLANG_IMAGE cannot reintroduce GOTOOLCHAIN=auto, under which a
+# k8s-operator/go.mod newer than GOLANG_VERSION would download a toolchain the
+# pin does not name instead of failing. Same reason as k8s-operator/Dockerfile
+# (#1138).
+ENV GOTOOLCHAIN=local
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /workspace
