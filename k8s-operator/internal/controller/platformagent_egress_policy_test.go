@@ -236,7 +236,7 @@ func labelSet(from map[string]string) labels.Set {
 // one, and for the other two addresses it is every port without exception.
 // TestTheDNSRuleReachesTheCloudDNSResolver holds the other side of it.
 func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
-	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, managedOTelCollectorNamespace)
 
 	for _, address := range metadataServerAddresses {
 		if permitsBeyondDNS(policy, address) {
@@ -262,7 +262,7 @@ func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
 // addressed by name — so the symptom is a total outage that reads like a
 // credential bug, which is how it was first reported.
 func TestTheDNSRuleReachesTheCloudDNSResolver(t *testing.T) {
-	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, managedOTelCollectorNamespace)
 
 	if !permits(policy, metadataLinkLocalIP) {
 		t.Errorf("the DNS rule does not name %s, so a Cloud DNS for GKE cluster has no resolver and "+
@@ -321,7 +321,7 @@ func TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree(t *testing.T) {
 // permitted regardless of the other rules.
 func TestTheRenderedPolicyIsDefaultDeny(t *testing.T) {
 	agent := egressPolicyAgent()
-	policy, _ := buildAgentEgressNetworkPolicy(agent, nil)
+	policy, _ := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 
 	found := false
 	for _, policyType := range policy.Spec.PolicyTypes {
@@ -351,7 +351,7 @@ func TestTheRenderedPolicyIsDefaultDeny(t *testing.T) {
 // agent would lose its credentials rather than its escape route.
 func TestTheBrokerPodIsNotSelectedByTheEgressPolicy(t *testing.T) {
 	agent := egressPolicyAgent()
-	policy, _ := buildAgentEgressNetworkPolicy(agent, nil)
+	policy, _ := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 
 	brokerLabels := map[string]string{"app": credentialBrokerName(agent)}
 	selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
@@ -370,7 +370,7 @@ func TestTheBrokerPodIsNotSelectedByTheEgressPolicy(t *testing.T) {
 // rather than trust it.
 func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 	agent := egressPolicyAgent()
-	policy, _ := buildAgentEgressNetworkPolicy(agent, nil)
+	policy, _ := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 
 	cases := []struct {
 		name   string
@@ -436,7 +436,7 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 // with a guess. (Not the event watcher — the split this policy requires
 // already refuses to render while the watcher is enabled.)
 func TestTheControlPlaneRuleIsAbsentUntilAskedFor(t *testing.T) {
-	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, managedOTelCollectorNamespace)
 	if permits(policy, "172.16.0.2") {
 		t.Error("a control-plane range was rendered without egressAllowlist.controlPlaneCIDRs asking for one")
 	}
@@ -445,7 +445,7 @@ func TestTheControlPlaneRuleIsAbsentUntilAskedFor(t *testing.T) {
 		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
 			ControlPlaneCIDRs: []string{"172.16.0.0/28"},
 		}
-	}), nil)
+	}), nil, managedOTelCollectorNamespace)
 	if !permits(configured, "172.16.0.2") {
 		t.Error("egressAllowlist.controlPlaneCIDRs was supplied but the API server is still unreachable")
 	}
@@ -499,7 +499,7 @@ func TestAControlPlaneCIDRCannotBeTheWholeInternet(t *testing.T) {
 					ControlPlaneCIDRs: []string{tc.cidr},
 				}
 			})
-			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 			reason, _ := validateEgressPolicy(agent)
 
 			if !tc.refused {
@@ -743,7 +743,7 @@ func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
 				}
 			})
 			refusals := egressAllowlistRefusals(agent)
-			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 			rendered := false
 			for _, rule := range policy.Spec.Egress {
 				for _, peer := range rule.To {
@@ -941,7 +941,7 @@ func TestExtraRulesCannotReopenTheMetadataServer(t *testing.T) {
 					ExtraRules: []networkingv1.NetworkPolicyEgressRule{tc.rule},
 				}
 			})
-			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 
 			if tc.kept {
 				if len(dropped) != 0 {
@@ -1285,13 +1285,13 @@ func TestTheFlagAddedToARunningAgentRendersTheGuardrail(t *testing.T) {
 // applied to only one of the Pod's two policies is silently ignored by the
 // other.
 func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
-	resolved, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"34.118.224.10"})
+	resolved, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"34.118.224.10"}, managedOTelCollectorNamespace)
 	if !permits(resolved, "34.118.224.10") {
 		t.Error("the resolved DNS ClusterIP is not on the rendered policy; on a VIP-matching dataplane " +
 			"every named destination becomes unreachable with it absent")
 	}
 
-	fallback, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
+	fallback, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, managedOTelCollectorNamespace)
 	if !permits(fallback, defaultDNSClusterIP) {
 		t.Errorf("with no resolved IPs the rule must fall back to the documented default %s, as the "+
 			"gateway policy does", defaultDNSClusterIP)
@@ -1304,7 +1304,7 @@ func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
 	// credential port is any of the three. The fallback then applies, because
 	// the filter leaves the resolved set empty: a policy whose DNS rule names no
 	// address at all is the total block this rule exists to prevent.
-	poisoned, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"169.254.169.254"})
+	poisoned, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"169.254.169.254"}, managedOTelCollectorNamespace)
 	for _, address := range metadataServerAddresses {
 		if permitsBeyondDNS(poisoned, address) {
 			t.Errorf("a metadata address supplied as a DNS ClusterIP reached a credential port: %s", address)
@@ -1319,7 +1319,7 @@ func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
 	// address answers the token API on 988 and no DNS at all, so a rule naming
 	// it on 53 grants reach for nothing.
 	for _, address := range []string{metadataDaemonIP, "fd20:ce::254"} {
-		daemonAsDNS, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{address})
+		daemonAsDNS, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{address}, managedOTelCollectorNamespace)
 		if permits(daemonAsDNS, address) {
 			t.Errorf("%s was rendered as a DNS peer; only the resolver address belongs on the DNS rule", address)
 		}
@@ -1361,7 +1361,7 @@ func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
 // the value their nodes use arrives at a peer the rule already has.
 func TestTheDNSRuleDoesNotRepeatAPeerItAlreadyCarries(t *testing.T) {
 	bareNodeLocalIP := strings.TrimSuffix(nodeLocalDNSCacheIP, "/32")
-	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{bareNodeLocalIP})
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{bareNodeLocalIP}, managedOTelCollectorNamespace)
 
 	occurrences := 0
 	for _, rule := range policy.Spec.Egress {
@@ -1394,7 +1394,7 @@ func TestABareControlPlaneAddressIsWidenedNotRefused(t *testing.T) {
 	if refusals := egressAllowlistRefusals(agent); len(refusals) != 0 {
 		t.Fatalf("a bare control-plane address must be widened to /32, not refused: %v", refusals)
 	}
-	policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
+	policy, dropped := buildAgentEgressNetworkPolicy(agent, nil, managedOTelCollectorNamespace)
 	if len(dropped) != 0 {
 		t.Fatalf("the builder dropped the widened address: %v", dropped)
 	}
@@ -1462,5 +1462,136 @@ func TestTheDNSLadderRunsEvenWithTheGatewayPolicyDisabled(t *testing.T) {
 	if !permits(rendered, "34.118.230.7") {
 		t.Error("the dnsClusterIPs override did not reach the egress policy's DNS rule in the one shape " +
 			"where that rule is the Pod's only route to DNS")
+	}
+}
+
+// TestTheOTelRuleNamesTheResolvedCollectorNamespace covers #1080. The gateway
+// policy reads the collector namespace off the resolved OTLP endpoint; this
+// policy used to name gke-managed-otel whatever the endpoint was, so on an
+// install with a discovered or configured collector elsewhere it permitted a
+// namespace the agent never sent to and, once enforcing, blocked the export
+// it did. The two policies select the same Pod and must not disagree.
+func TestTheOTelRuleNamesTheResolvedCollectorNamespace(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		namespace string // what the caller read off the endpoint
+		want      string // namespace the rule must name; "" means no rule
+	}{
+		{name: "managed collector", namespace: managedOTelCollectorNamespace, want: managedOTelCollectorNamespace},
+		{name: "collector elsewhere", namespace: "observability", want: "observability"},
+		{name: "no in-cluster namespace", namespace: "", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, tc.namespace)
+			if tc.want == "" {
+				for _, rule := range policy.Spec.Egress {
+					for _, peer := range rule.To {
+						if peer.NamespaceSelector != nil && rulePermitsOTLPPort(rule) {
+							t.Errorf("an endpoint with no in-cluster namespace still rendered an OTel rule, to %v", peer.NamespaceSelector.MatchLabels)
+						}
+					}
+				}
+				return
+			}
+			if !hasCollectorEgress(policy, tc.want) {
+				t.Fatalf("the OTel rule does not name %q, so the export to the resolved collector is blocked once the policy enforces", tc.want)
+			}
+			if tc.want != managedOTelCollectorNamespace && hasCollectorEgress(policy, managedOTelCollectorNamespace) {
+				t.Errorf("the OTel rule still names %q alongside the resolved %q, which permits traffic the agent never sends", managedOTelCollectorNamespace, tc.want)
+			}
+		})
+	}
+}
+
+// rulePermitsOTLPPort reports whether rule names either OTLP receiver port.
+func rulePermitsOTLPPort(rule networkingv1.NetworkPolicyEgressRule) bool {
+	for _, port := range rule.Ports {
+		if port.Port != nil && (port.Port.IntValue() == 4317 || port.Port.IntValue() == 4318) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTheReconciledOTelRuleFollowsTheResolvedEndpoint is the reconcile-level
+// half: the namespace has to arrive from resolveOTLPEndpoint, on the normal
+// path and on the refusal path that reconcileAgentNetworkGuardrails keeps
+// maintained, or the builder test above proves only that the plumbing could
+// carry it.
+func TestTheReconciledOTelRuleFollowsTheResolvedEndpoint(t *testing.T) {
+	const endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+	pointAtObservability := func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{OTLPEndpoint: endpoint}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.PlatformAgent)
+		reason string // "" for the normal path
+	}{
+		{name: "normal path", mutate: pointAtObservability},
+		{
+			name:   "refusal path",
+			reason: reasonEgressAllowlistRefused,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				pointAtObservability(a)
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(tc.mutate)
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
+			if tc.reason != "" {
+				stored := &agentv1alpha1.PlatformAgent{}
+				if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+					t.Fatalf("failed to re-read the agent: %v", err)
+				}
+				var gotReason string
+				for _, condition := range stored.Status.Conditions {
+					if condition.Type == "Ready" {
+						gotReason = condition.Reason
+					}
+				}
+				if gotReason != tc.reason {
+					t.Fatalf("the spec was not refused, so this case proves nothing about the refusal path; got reason %q", gotReason)
+				}
+			}
+
+			egress := &networkingv1.NetworkPolicy{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}, egress); err != nil {
+				t.Fatalf("the egress policy was not rendered: %v", err)
+			}
+			if !hasCollectorEgress(egress, "observability") {
+				t.Errorf("spec.telemetry.otlpEndpoint names a collector in observability but the egress policy's OTel rule does not, so the export is blocked once the policy enforces")
+			}
+			if hasCollectorEgress(egress, managedOTelCollectorNamespace) {
+				t.Errorf("the egress policy still permits %s while the agent exports to observability", managedOTelCollectorNamespace)
+			}
+
+			// The gateway policy is the reference: whatever it names, this one must too.
+			gateway := &networkingv1.NetworkPolicy{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gateway-netpol", Namespace: agent.Namespace}, gateway); err != nil {
+				t.Fatalf("the gateway policy was not rendered: %v", err)
+			}
+			if hasCollectorEgress(gateway, "observability") != hasCollectorEgress(egress, "observability") {
+				t.Errorf("the two policies selecting the agent Pod disagree about the collector namespace")
+			}
+		})
 	}
 }

@@ -239,7 +239,12 @@ func ptrIntOrString(port int32) *intstr.IntOrString {
 // the selector peers below never fire and the VIP peer is what keeps DNS
 // alive. Empty falls back to the documented default, exactly as the gateway
 // policy does.
-func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) (*networkingv1.NetworkPolicy, []string) {
+//
+// otlpCollectorNS is the namespace of the collector the agent exports to,
+// read off the resolved OTLP endpoint by otlpCollectorNamespace the same way
+// buildNetworkPolicy reads it for the gateway policy. Empty means the endpoint
+// names nothing in-cluster, and the OTel rule is not rendered.
+func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string, otlpCollectorNS string) (*networkingv1.NetworkPolicy, []string) {
 	labels := commonLabels(agent)
 	labels["kubeagents.x-k8s.io/component"] = "agent-egress"
 
@@ -355,19 +360,35 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	})
 
 	// Traces and metrics. OTEL_EXPORTER_OTLP_ENDPOINT is set on every agent
-	// container by otelTelemetryEnvVars and addresses the GKE Managed
-	// OpenTelemetry collector. Blocking it loses telemetry rather than
-	// function, but a silently trace-less agent is its own kind of security
-	// problem. 4317 accompanies 4318 because the endpoint's protocol is
-	// configurable through spec.deployment.env.
-	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-		Ports: []networkingv1.NetworkPolicyPort{tcpPort(4317), tcpPort(4318)},
-		To: []networkingv1.NetworkPolicyPeer{{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"kubernetes.io/metadata.name": "gke-managed-otel"},
-			},
-		}},
-	})
+	// container by otelTelemetryEnvVars, and the peer is the namespace of
+	// whatever collector resolveOTLPEndpoint settled on — the managed
+	// collector by default, but a discovered or configured collector lives
+	// wherever it lives, and a rule naming gke-managed-otel on such an install
+	// permits traffic the agent never sends while blocking the export it does
+	// (#1080). Blocking it loses telemetry rather than function, but a
+	// silently trace-less agent is its own kind of security problem. 4317
+	// accompanies 4318 because the endpoint's protocol is configurable
+	// through spec.deployment.env.
+	//
+	// Unlike the gateway policy's rule 8, this one is kept when the agent
+	// resolves to no collector at all: otlpCollectorNamespace("") is the
+	// managed namespace, and the caller passes that through rather than
+	// dropping the rule, because the hermes_otel plugin does not read
+	// OTEL_EXPORTER_OTLP_ENDPOINT and keeps its baked gke-managed-otel backend
+	// on exactly that cluster (#933). Dropping the rule would turn that
+	// cosmetic gap into a blocked export the moment a collector appears there.
+	// A vendor endpoint or a bare hostname has no in-cluster namespace to
+	// name, so nothing is rendered for it, as for the gateway policy.
+	if otlpCollectorNS != "" {
+		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(4317), tcpPort(4318)},
+			To: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"kubernetes.io/metadata.name": otlpCollectorNS},
+				},
+			}},
+		})
+	}
 
 	// The Hindsight memory API. buildPodEnv sets HINDSIGHT_API_URL to
 	// http://hindsight-api.<ns>.svc.cluster.local:8888 on every agent

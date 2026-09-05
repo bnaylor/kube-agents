@@ -123,9 +123,9 @@ its default (set it to `false` and the gateway policy is withheld instead — on
 allowlist is then the Pod's only policy and really does default-deny on an enforcing CNI; a Kustomize
 install still carries the static `platform-agent-core-egress` set over the same Pod). So enabling
 `egressPolicy: Allowlist` leaves the Pod's permitted egress a strict superset of what it was — wider
-by the credential broker on TCP 8765, and wider also by the collector namespace on 4317/4318 when the
-agent is not exporting telemetry, since the gateway policy drops its own OTel rule in that case. It
-cannot take a destination away. The gateway policy permits `169.254.169.254/32` on TCP 80 and on port
+by the credential broker on TCP 8765, and wider also by the managed collector namespace on 4317/4318
+when the agent is not exporting telemetry, since the gateway policy drops its own OTel rule in that
+case. It cannot take a destination away. The gateway policy permits `169.254.169.254/32` on TCP 80 and on port
 53, plus the discovered metadata-daemon port (`988` by default) to both link-local metadata
 addresses, so the metadata path stays open, and it permits TCP 443 to `0.0.0.0/0` minus the private
 ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half stays open too. A Kustomize

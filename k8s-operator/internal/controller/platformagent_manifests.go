@@ -4370,7 +4370,7 @@ func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // otlpCollectorNamespace extracts the target namespace from an OTLP endpoint URL.
 func otlpCollectorNamespace(endpoint string) string {
 	if endpoint == "" {
-		return "gke-managed-otel"
+		return managedOTelCollectorNamespace
 	}
 	host := strings.TrimPrefix(endpoint, "https://")
 	host = strings.TrimPrefix(host, "http://")

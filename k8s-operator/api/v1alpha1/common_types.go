@@ -647,10 +647,12 @@ type SecuritySpec struct {
 	// there. Everywhere else, turning this on leaves the
 	// Pod's permitted egress a strict superset of what it was. In the default
 	// shape the only destination it adds is the credential broker on TCP 8765
-	// — plus, when the agent is not exporting telemetry, the collector
+	// — plus, when the agent is not exporting telemetry, the managed collector
 	// namespace on 4317/4318, because the gateway policy omits its own OTel
-	// rule in that case and this one is rendered unconditionally. Anything
-	// egressAllowlist names is added on top of that.
+	// rule in that case and this one keeps gke-managed-otel, which the Hermes
+	// tracing plugin still addresses there. With an endpoint, both policies
+	// name the namespace read off it. Anything egressAllowlist names is added
+	// on top of that.
 	//
 	// What the gateway policy already permits, and therefore what this cannot
 	// take away:
@@ -713,9 +715,10 @@ type SecuritySpec struct {
 	// the current behaviour — and do not schedule a capability review for a
 	// change that will not alter anything yet.
 	//
-	// The allowlist covers DNS, the credential broker, LiteLLM, the managed
-	// OpenTelemetry collector, and whatever egressAllowlist adds. Everything
-	// else the agent container reaches on its own would go away:
+	// The allowlist covers DNS, the credential broker, LiteLLM, the namespace
+	// of the OpenTelemetry collector the agent resolved, the Hindsight memory
+	// API, and whatever egressAllowlist adds. Everything else the agent
+	// container reaches on its own would go away:
 	//
 	//   - DuckDuckGo web search, which the shared default config turns on for
 	//     every profile, and the "browser" toolset, which only the Chat Agent

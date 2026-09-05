@@ -429,7 +429,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 12b. Reconcile the agent Pod's default-deny egress policy, if it has one.
-	if err := r.reconcileAgentEgressPolicy(ctx, instance, r.agentEgressDNSClusterIPs(ctx, instance, netpolProf)); err != nil {
+	if err := r.reconcileAgentEgressPolicy(ctx, instance, r.agentEgressDNSClusterIPs(ctx, instance, netpolProf), otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1459,7 +1459,7 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
 		return err
 	}
-	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf))
+	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf), otlpEndpoint)
 }
 
 // agentEgressDNSClusterIPs is the resolved cluster DNS VIP list for the agent
@@ -1502,7 +1502,14 @@ func (r *PlatformAgentReconciler) agentEgressDNSClusterIPs(ctx context.Context, 
 // The cost is a stale policy after an opt-out: the door stays shut for anything
 // the agent Pod later needs to reach. The egressPolicy CRD field description
 // carries that warning, so it reaches kubectl explain.
-func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) error {
+//
+// otlpEndpoint is the endpoint resolveOTLPEndpoint returned for this
+// reconcile; the policy's OTel rule names the namespace it reads off it, so
+// the two policies selecting the agent Pod cannot disagree about where the
+// collector is (#1080). An empty endpoint keeps the managed namespace — see
+// the rule's comment in buildAgentEgressNetworkPolicy for why that differs
+// from the gateway policy.
+func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string, otlpEndpoint string) error {
 	if !agentEgressPolicyEnabled(agent) {
 		return nil
 	}
@@ -1513,7 +1520,7 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 	// path that skipped validation. Log it rather than assume: the drop is what
 	// keeps the rendered object safe, and a silent drop is the failure mode
 	// this guard exists for.
-	policy, dropped := buildAgentEgressNetworkPolicy(agent, dnsClusterIPs)
+	policy, dropped := buildAgentEgressNetworkPolicy(agent, dnsClusterIPs, otlpCollectorNamespace(otlpEndpoint))
 	for _, reason := range dropped {
 		log.Info("WARNING: dropped an egressAllowlist destination that would widen the policy onto the "+
 			"metadata server or the open internet. It was dropped, not narrowed: an ipBlock \"except\" "+
