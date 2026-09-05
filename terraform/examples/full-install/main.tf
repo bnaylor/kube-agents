@@ -23,6 +23,11 @@ locals {
 
   use_vertex     = var.model_provider == "vertex_ai"
   vertex_project = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
+  # The two resources that live in vertex_project rather than project_id. A
+  # cross-project serving project is often one the applying identity holds no
+  # IAM on, and the composition cannot tell that apart from a project where the
+  # grant simply has not happened yet — so the operator says which it is.
+  manage_vertex_serving = local.use_vertex && var.vertex_manage_serving_project
   # Not var.location: a model is only callable from a location that serves it,
   # and the cluster's is often not one — on a zonal cluster it is not even a
   # valid Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
@@ -269,9 +274,11 @@ module "kube_agents_iam" {
 # ─── Vertex AI gateway identity (model_provider = "vertex_ai") ────────────────
 # Vertex has no API key: the LiteLLM gateway calls it as this GSA through
 # Workload Identity. The GSA lives in project_id; the aiplatform.user grant and
-# the API enablement go to the serving project, which may be a different one.
+# the API enablement go to the serving project, which may be a different one —
+# and when it is one the applying identity cannot administer,
+# vertex_manage_serving_project = false leaves both to the operator.
 resource "google_project_service" "vertex_ai" {
-  count = local.use_vertex ? 1 : 0
+  count = local.manage_vertex_serving ? 1 : 0
 
   project            = local.vertex_project
   service            = "aiplatform.googleapis.com"
@@ -308,7 +315,7 @@ resource "google_project_iam_member" "litellm_vertex_user" {
   #checkov:skip=CKV_GCP_46:Dedicated custom service account used for LiteLLM workload identity
   #checkov:skip=CKV_GCP_49:LiteLLM gateway uses dedicated service account for Vertex AI inference
   #checkov:skip=CKV_GCP_117:Vertex AI user role required for LiteLLM gateway inference access
-  count = local.use_vertex ? 1 : 0
+  count = local.manage_vertex_serving ? 1 : 0
 
   project = local.vertex_project
   role    = "roles/aiplatform.user"
