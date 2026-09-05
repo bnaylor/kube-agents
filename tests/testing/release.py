@@ -15,6 +15,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "k8s-operator",
     "platform-agent",
     "credential-proxy",
+    "agent-sandbox",
     "replay-proxy",
     "pubsub-platform",
     "gke-stockout-investigator",
