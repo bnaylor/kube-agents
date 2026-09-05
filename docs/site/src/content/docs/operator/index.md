@@ -143,7 +143,7 @@ controller-runtime fall back to its own 9443 default.
 Re-apply the manifests; do not bump the image alone. `targetPort` lives in the Service, so a
 `kubectl set image` — or any pipeline that rolls the tag without re-applying `config/webhook/` —
 leaves the Service pointing at 9443 while the new pod listens on 10250, which is the wedge described
-below on what looked like a routine version bump. `make deploy` applies both.
+below on what looked like a routine version bump. `make deploy IMG=$IMG` applies both.
 
 Applying both together still leaves a short window: the Service starts sending traffic to 10250 the
 moment it is applied, and the old pod does not answer there. Any `PlatformAgent` write in the gap
@@ -162,7 +162,31 @@ kubectl -n kubeagents-system set env deploy/kubeagents-controller-manager ENABLE
 ```
 
 That leaves the cluster with the same validation coverage a chart install has. Re-apply with
-`make deploy` once the cause is fixed.
+`make deploy IMG=$IMG` once the cause is fixed.
+
+## An image ahead of its ClusterRole
+
+The webhook port above is one instance of a general skew: `make deploy` ships the ClusterRole with
+the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
+is upgraded on its next pod reschedule while the applied ClusterRole stays put, and the first verb
+the newer controller needs that the older role lacks fails every reconcile with `forbidden`
+(issue #1009). Two things say so.
+
+`make deploy` refuses an `IMG` whose tag is `latest`, `main`, `master`, `HEAD`, `dev`, or missing,
+unless `ALLOW_MUTABLE_IMG=1` is set for a cluster that will be thrown away before its next
+reschedule.
+
+The controller checks its own permissions with `SelfSubjectAccessReview` when it starts and every
+five minutes after, on its own ticker rather than on the reconcile worker. A denial is one
+`RBAC self-check failed` line in the startup log naming the denied permissions
+(`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
+`RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
+`Degraded` for another reason. Reconciles continue; the steps that need the missing verb still fail
+until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and
+triggers no reconcile, so the condition follows the next reconcile after the probe notices: every
+five minutes while the condition stands and the reconcile completes, or, while the reconcile itself
+is failing on the missing verb, on controller-runtime's retry backoff, which caps at about seventeen
+minutes.
 
 ## Related resources
 

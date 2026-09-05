@@ -133,6 +133,12 @@ type PlatformAgentReconciler struct {
 	// hour. Nil falls back to the cached client, which is what tests supply.
 	APIReader client.Reader
 
+	// RBAC reports the permissions this controller's RBAC markers declare and
+	// the API server denies it — an image deployed ahead of its ClusterRole
+	// (#1009). Nil never probes, which is what tests and the golden harness
+	// supply; see rbac_selfcheck.go.
+	RBAC *RBACChecker
+
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
 	// avoids a discovery round-trip on every reconcile of every agent. Only an
@@ -247,6 +253,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		// Return immediately after update to fetch the fresh ResourceVersion, preventing OptimisticLockErrors
 		return ctrl.Result{}, nil
+	}
+
+	// 2c. Say on the status when the ClusterRole is behind this image, before
+	// any step that could fail on it: a reconcile that errors below never
+	// reaches updateStatusReady, and without this the only trace of the skew
+	// is the `Reconciler error` loop itself (#1009). Writes status and carries
+	// on; nothing here withholds a step.
+	rbacDegraded, err := r.reportRBACSkew(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// 2b. Validate the mode gate once at the top; everything downstream asks
@@ -491,6 +507,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
+	// which triggers no reconcile of its own, so poll while the condition
+	// stands rather than leave it until an unrelated event (rbac_selfcheck.go).
+	if rbacDegraded {
+		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
 	}
 
 	// Default and None are the telemetry outcomes that can improve without anything else
@@ -2142,7 +2165,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
-	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) ||
+	// A Degraded/RBACIncomplete condition is reportRBACSkew's, and this function
+	// leaves it in place below; it must count as unchanged here too, or every
+	// pass under an out-of-date ClusterRole writes status, re-enqueues itself
+	// through the unfiltered PlatformAgent watch, and reconciles continuously.
+	rbacDegradedPreserved := degradedStatus == metav1.ConditionFalse && existingDegradedCond != nil &&
+		existingDegradedCond.Reason == reasonRBACIncomplete
+	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
 		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == "InvalidGitRepoURL" && existingDegradedCond.Message == condMsg)
 
 	// Check if anything actually changed
@@ -2198,8 +2227,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			LastTransitionTime: now,
 		}
 		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
-	} else {
-		meta.RemoveStatusCondition(&agent.Status.Conditions, "Degraded")
+	} else if degraded := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType); degraded != nil && degraded.Reason != reasonRBACIncomplete {
+		// A Degraded/RBACIncomplete condition is reportRBACSkew's to clear, on
+		// the pass where the probe comes back clean; a Ready workload does not
+		// mean the ClusterRole caught up with the image.
+		meta.RemoveStatusCondition(&agent.Status.Conditions, degradedConditionType)
 	}
 
 	if eventWatcherOn {

@@ -145,6 +145,7 @@ identifier appears, add its source here.
 | `app.kubernetes.io/*` label values on installed objects | `k8s-operator/internal/controller/manifest_helpers.go`, each `kustomization.yaml`, and `a2a/gateway/spawn.go` (gateway-spawned session pods) |
 | The mode switch's key, values, and skew reason (`KUBEAGENTS_MODE`, `today`/`next`, `ModeNotRecognized`) | `k8s-operator/internal/controller/mode.go` and `platformagent_manifests.go` (writer), `agents/platform/scripts/runtime_mode.py` (reader) |
 | Controller permissions | `k8s-operator/config/rbac/` |
+| The operator RBAC self-check: the `RBACIncomplete` reason, its re-check interval and condition message; the floating tags `make deploy` refuses and `ALLOW_MUTABLE_IMG` | `k8s-operator/internal/controller/rbac_selfcheck.go`; `k8s-operator/Makefile` |
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
 | The GitHub environment variables an install is configured from, which install.env key each becomes, and which are required to reconcile a long-lived environment | `MAPPING`, `REQUIRED_ALWAYS` and `REQUIRED_STRICT` in `scripts/release/render_install_env.sh` |
 | Paths baked into the agent image (`/opt/defaults/...`) | `deploy/docker/Dockerfile` |

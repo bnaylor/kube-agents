@@ -471,7 +471,10 @@ Set your registry destination and build the container image:
 ```bash
 cd k8s-operator
 
-export IMG=us-central1-docker.pkg.dev/<YOUR_PROJECT>/<YOUR_REPO>/kube-agents-operator:latest
+# An immutable tag: `make deploy` refuses a floating tag such as `latest`, because it
+# lets a pod reschedule upgrade the controller past the RBAC applied with it.
+# Set ALLOW_MUTABLE_IMG=1 only for a cluster you will discard.
+export IMG=us-central1-docker.pkg.dev/<YOUR_PROJECT>/<YOUR_REPO>/kube-agents-operator:$(git rev-parse HEAD)
 
 make docker-build IMG=$IMG
 make docker-push IMG=$IMG
