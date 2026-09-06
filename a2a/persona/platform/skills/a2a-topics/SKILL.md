@@ -82,8 +82,8 @@ cannot reach the bus, and a write tool is on hold until the authority work
 decides which principal a model-driven write acts as — a write recorded under
 a shared identity would be worse than no write. Until then, put a finding
 worth other agents' attention in your task result, where the caller can see
-it. Provisioning-side writers (the seed Job and other non-agent components)
-are unaffected; they keep the `a2a` CLI.
+it. Writers outside the agent pod — provisioning and seed tooling with their
+own containers and clients — are unaffected by any of this.
 
 ## What this skill is not
 

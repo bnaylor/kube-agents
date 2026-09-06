@@ -1,6 +1,10 @@
 // Command a2a is the topics client: read the current answer on a provisioned
 // topic, or write one. It is the reader beat 3 needs before any session pod
-// exists, and the thing the platform agent's a2a-topics skill shells out to.
+// exists. The platform agent reaches it through `a2a mcp` (mcp.go), which
+// serves the read surface as MCP tools - the agent pod no longer runs
+// model-issued commands, so nothing there shells this binary any more. The
+// command form remains for humans and for components with a shell of their
+// own.
 //
 // Playground posture: credentials are a static per-role NATS user in the
 // environment, because that is what the operator renders under mode: next.

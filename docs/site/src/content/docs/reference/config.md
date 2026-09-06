@@ -46,6 +46,17 @@ mcp_servers:
     lazy: true
     connect_timeout: 30
     timeout: 60
+  a2a_topics:
+    command: "/usr/local/bin/a2a"
+    args:
+      - "mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
+    env:
+      NATS_URL: "${NATS_URL}"
+      NATS_USER: "${NATS_USER}"
+      NATS_PASSWORD: "${NATS_PASSWORD}"
 
 platform_toolsets:
   cli:
@@ -53,12 +64,14 @@ platform_toolsets:
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - mcp-a2a_topics
     - memory
   api_server:
     - hermes-api-server
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - mcp-a2a_topics
     - memory
 
 # Top-level `toolsets` gates the kanban orchestrator surface: the kanban tools
@@ -100,14 +113,15 @@ plugins:
 
 MCP servers Hermes exposes to the agent. `developer_knowledge` is not listed here — it comes from the shared defaults this file is merged onto at image build.
 
-Every server is `lazy: true`, so none of them is started at boot. Hermes registers a server's tools from the profile's `cache/mcp_schema_cache.json` and spawns the child process on the first call to one of its tools. The agent sees an identical tool list either way; what changes is who pays the connect. It matters because most Platform Agent turns run in a throwaway kanban worker, and connecting every server eagerly cost each of those workers roughly three seconds before the agent could say anything — a cost the long-lived gateway pays once at boot and a worker re-paid every task. (That figure was measured with four servers declared, before `agent_common` was removed; three remain, so the saving is slightly smaller.) The trade is that a server which cannot start now fails on its first tool call rather than at startup.
+Every server is `lazy: true`, so none of them is started at boot. Hermes registers a server's tools from the profile's `cache/mcp_schema_cache.json` and spawns the child process on the first call to one of its tools. The agent sees an identical tool list either way; what changes is who pays the connect. It matters because most Platform Agent turns run in a throwaway kanban worker, and connecting every server eagerly cost each of those workers roughly three seconds before the agent could say anything — a cost the long-lived gateway pays once at boot and a worker re-paid every task. (That figure was measured with four servers declared, before `agent_common` was removed; four are declared again now that `a2a_topics` exists, though that one advertises no tools at all on an install without the A2A bus.) The trade is that a server which cannot start now fails on its first tool call rather than at startup.
 
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Planning Agent). The `env:` block is an allowlist rather than a pass-through: Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed. Currently the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the project ids, the Google Chat and Slack home channels, the API server key, and the Session KV bearer token and database path. A home channel is what `send_notification` falls back to when a notification has no thread to reply into — every alert-driven investigation — and it needs `spec.integration.googleChat.homeChannel` set to carry a value; the bearer token is what lets it read `chat_id` and `thread_id` back in the first place, so an absent one costs the thread and the incident report both. See the comments on those keys in the source file.
 - **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
+- **`a2a_topics`** — In-pod Go MCP server: the `a2a` binary serving the A2A topics read surface (`topics_list`, `topics_read`) over stdio. Declared unconditionally but behaviourally dark: without a usable `NATS_URL` it advertises zero tools, so on an install that does not run the A2A bus the agent's tool surface is unchanged. Its `env:` block names the three `NATS_*` variables the reader needs — the same allowlist rule as `platform_control` — and those variables reach the agent container only on an install running the A2A stack.
 
 The two servers reached through `mcp-remote` — `gke` here, and `developer_knowledge` from the shared defaults — each pass `--header User-Agent: kube-agents/${KUBE_AGENTS_VERSION}`. Without it the request reaches Google as undici's default `node` and the API team serving the endpoint cannot separate kube-agents traffic from anything else running on Node. Hermes resolves `${KUBE_AGENTS_VERSION}` in `args` from the agent process environment, where the image build put it — the commit the image was built from, or `dev` for a build that passed no version. The string is the same everywhere it appears, including in the Cluster Agent template; it names the product and the build, and nothing else. The shared defaults and the platform overlay in particular have to stay character-identical, since the build-time merge unions the two arg lists: the repeated `--header` token dedups away and a divergent value is left as a stray positional after the URL, so the overlay's spelling is silently the one that goes missing.
 
-The two servers are timed out differently on purpose. `platform_control` gets `connect_timeout: 120` for cold-start latency — under `lazy` that bounds the first tool call rather than startup — and `timeout: 300` for long reasoning chains; it is a local subprocess, so a slow call is a slow call. `gke` gets `connect_timeout: 30` / `timeout: 60` because it is a remote endpoint reached through `mcp-remote`, where a failed call can consume the whole deadline without ever returning; the rationale is recorded in full alongside the block in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). Healthy calls to it measure under a second.
+The servers are timed out differently on purpose. `platform_control` gets `connect_timeout: 120` for cold-start latency — under `lazy` that bounds the first tool call rather than startup — and `timeout: 300` for long reasoning chains; it is a local subprocess, so a slow call is a slow call. `gke` gets `connect_timeout: 30` / `timeout: 60` because it is a remote endpoint reached through `mcp-remote`, where a failed call can consume the whole deadline without ever returning; the rationale is recorded in full alongside the block in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). Healthy calls to it measure under a second. `a2a_topics` shares the `30`/`60` pair for a different reason: the binary bounds one bus operation at 30 seconds internally, so `timeout: 60` is one retry's worth of headroom over that, and the child itself starts in milliseconds.
 
 Which is why adding an `os.environ` read to a local MCP server means adding the variable to that block in the same change: a name the block omits arrives unset, and the read silently yields its default rather than failing.
 

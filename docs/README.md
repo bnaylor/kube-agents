@@ -33,6 +33,8 @@ here for it to disagree with.
 kube-agents/
 ├── README.md, INSTALL.md, AGENTS.md, CLAUDE.md    project front door, install
 │                                                  guide, contributor/agent rules
+├── a2a/                                           A2A bus Go module; its docs are
+│                                                  persona/ SKILL.md bundles
 ├── agents/                                        agent blueprints (runtime docs)
 │   ├── chat/                                      Planning Agent front door: persona
 │   │                                              docs, onboarding templates,
@@ -248,6 +250,7 @@ pull request:
 | `INSTALL.md` | Install guide | Self-contained, executable installation guide: automated GCP/GKE provisioning, manual Kubernetes deployment, local dev, declarative Terraform+Helm install (pointer to its canonical guide), teardown, troubleshooting. Commands only; explanation lives on the site. | Prerequisites, provisioning stages, integrations, teardown | Written to be runnable end-to-end by a human or an AI agent |
 | `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the engineering rules, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. States the rules; the commands that carry them out live in `docs/pull-request-workflow.md` and the mechanics that are prose in `.agents/rules/`. | Doc ownership table, engineering rules, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES; loaded into every session, so `make docs-check-context-budget` caps its size |
 | `CLAUDE.md` | Contributor rules | Imports `AGENTS.md` and points to it for commit authorship and PR attribution guidance. | Points to `AGENTS.md` rules | Claude Code sessions |
+| `a2a/persona/platform/skills/*/SKILL.md` | Skill bundle | The A2A persona's skill bundles for the platform profile — today the a2a-topics doctrine: read standing state through the `topics_list`/`topics_read` MCP tools served by `a2a mcp`, relay every entry's provenance, and the explicit hold on model-driven writes pending the authority work. Consumed by the agent-bus change's next-only entrypoint overlay (same PR series); nothing installs it on a today install, and it is outside the generated skill catalog's `agents/` globs on purpose. | Topics doctrine, MCP reader, mode darkness | Runtime doc; shipped dark by design |
 | `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, LLM gateway setup, chat, observability, integrations, validation | Console users and contributors |
 | `admin_console/CONNECTION_SECURITY.md` | Security reference | Security contract for the local console's persisted connection lease. | Stored metadata, filesystem controls, identity binding, revalidation, trust boundary | Console users and security reviewers |
 

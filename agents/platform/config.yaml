@@ -122,8 +122,12 @@ mcp_servers:
   # skill that shells the CLI, because the agent pod no longer runs
   # model-issued commands — those execute in the shell sandbox, which by
   # design holds no credentials and has no route to the bus. This child runs
-  # in the agent container, where the operator already places the bus
-  # credential, so the sandbox needs nothing.
+  # in the agent container, so the sandbox needs nothing. The binary and the
+  # bus env both arrive with the agent-bus change (the same series):
+  # /usr/local/bin/a2a via its Dockerfile builder stage, and
+  # NATS_URL/NATS_USER/NATS_PASSWORD rendered onto this container under
+  # mode: next only — until both land, every install resolves the
+  # interpolations below to nothing and this server advertises no tools.
   #
   # Declared unconditionally, gated behaviourally: on an install without the
   # A2A bus, NATS_URL is absent and the server advertises ZERO tools

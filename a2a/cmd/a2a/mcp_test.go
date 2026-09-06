@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -243,6 +245,42 @@ func TestMCPUnknownMethodAndMalformedInput(t *testing.T) {
 	}
 	if _, ok := msgs[3]["result"]; !ok {
 		t.Errorf("ping got no result: %v", msgs[3])
+	}
+}
+
+func TestMCPConnectErrorsDoNotEchoTheBusAddress(t *testing.T) {
+	// NATS URLs may carry userinfo credentials, and url.Parse quotes the whole
+	// raw URL in its error. A malformed credentialed address must not arrive
+	// in model-visible tool output.
+	t.Setenv("NATS_URL", "nats://user:supersecret@[::1:1")
+	msgs := exchange(t, handshake()+jrpc(2, "tools/call", map[string]any{
+		"name": "topics_read", "arguments": map[string]any{"topic": "upgrade-readiness"},
+	}))
+	text, isErr := callResult(t, msgs[1])
+	if !isErr {
+		t.Error("connect failure did not set isError")
+	}
+	if strings.Contains(text, "supersecret") {
+		t.Errorf("connect error echoed the credential: %q", text)
+	}
+	if !strings.Contains(text, "cannot connect") {
+		t.Errorf("connect error text %q does not name the failure class", text)
+	}
+}
+
+func TestMCPOverlongLineEndsTheSessionLoudly(t *testing.T) {
+	// Dying on a >1MiB frame is the chosen posture (a real client never sends
+	// one through Hermes); this pins that the limit fails the session rather
+	// than hanging it, so dropping the limit or swallowing the error shows up.
+	t.Setenv("NATS_URL", "")
+	input := handshake() + strings.Repeat("x", mcpMaxLineBytes+1) + "\n" + jrpc(2, "ping", nil)
+	var out bytes.Buffer
+	err := serveMCP(strings.NewReader(input), &out)
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("serveMCP returned %v, want bufio.ErrTooLong", err)
+	}
+	if got := strings.Count(out.String(), "\n"); got != 1 {
+		t.Errorf("wrote %d responses, want 1 (initialize only; the session dies at the fault)", got)
 	}
 }
 

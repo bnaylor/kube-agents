@@ -4,9 +4,10 @@
 // This exists because the agent pod no longer runs model-issued commands
 // (#913): a skill that shells `a2a topics read` executes in the shell
 // sandbox, which by design holds no credentials and has no route to the bus.
-// An MCP server is a process the harness spawns in the agent container, so
-// the bus credential stays where the deployment already put it and the
-// sandbox needs nothing. The model calls a tool; no shell is involved.
+// An MCP server is a process the harness spawns in the agent container -
+// where the agent-bus change renders NATS_URL/NATS_USER/NATS_PASSWORD under
+// mode: next, and nowhere else - so the sandbox needs nothing. The model
+// calls a tool; no shell is involved.
 //
 // The read-only surface is deliberate. Which principal a model-driven write
 // should act as is an open authority question (per-session credentials are
@@ -39,8 +40,13 @@ const (
 )
 
 // mcpMaxLineBytes bounds one incoming message. Requests here are tool calls
-// with a topic name, not payloads; a line this long is a protocol fault.
+// with a topic name, not payloads; a line this long is a protocol fault, and
+// the session dies on it rather than resynchronising mid-frame.
 const mcpMaxLineBytes = 1 << 20
+
+// mcpScannerInitialBytes is the scanner's starting buffer; it grows on demand
+// up to mcpMaxLineBytes.
+const mcpScannerInitialBytes = 64 * 1024
 
 // JSON-RPC 2.0 error codes, by their spec names.
 const (
@@ -54,6 +60,13 @@ const (
 // cache is stale across a mode flip; the model relays this rather than
 // guessing an address.
 const mcpNoBusMessage = "a2a: NATS_URL is not set - this install is not running the A2A bus; say so and answer another way"
+
+// mcpConnectFailedMessage deliberately carries no detail. NATS URLs may embed
+// userinfo credentials, and a malformed one quotes ITSELF - credentials
+// included - into url.Parse's error text, which a tool result would hand to
+// the model and every transcript after it. The CLI may print what its caller
+// already typed; this surface may not.
+const mcpConnectFailedMessage = "a2a: cannot connect to the A2A bus; check NATS_URL and the bus credentials on the agent container"
 
 type jsonrpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -102,7 +115,7 @@ func runMCP(args []string) error {
 // protocol frames only - anything human-readable belongs on stderr.
 func serveMCP(r io.Reader, w io.Writer) error {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), mcpMaxLineBytes)
+	scanner.Buffer(make([]byte, 0, mcpScannerInitialBytes), mcpMaxLineBytes)
 	enc := json.NewEncoder(w)
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -256,7 +269,7 @@ func toolTopicsList() (any, *jsonrpcError) {
 	defer cancel()
 	c, err := connect(ctx, "mcp")
 	if err != nil {
-		return toolError("a2a: " + err.Error()), nil
+		return toolError(mcpConnectFailedMessage), nil
 	}
 	defer c.Close()
 	registry, err := c.TopicRegistry(ctx)
@@ -287,7 +300,7 @@ func toolTopicsRead(arguments json.RawMessage) (any, *jsonrpcError) {
 	defer cancel()
 	c, err := connect(ctx, "mcp")
 	if err != nil {
-		return toolError("a2a: " + err.Error()), nil
+		return toolError(mcpConnectFailedMessage), nil
 	}
 	defer c.Close()
 	entry, err := resolve(ctx, c, args.Topic)

@@ -18,6 +18,9 @@
 # there. Anything union merge gets wrong shows up as `make docs-check` failing
 # on a stale roster, and `make docs-generate` writes the correct file.
 
+a2a/persona/platform/skills/*/SKILL.md
+  a2a/persona/platform/skills/a2a-topics/SKILL.md
+
 agents/chat/defaults/onboarding/*.md
   agents/chat/defaults/onboarding/scan_completed.md
   agents/chat/defaults/onboarding/scan_in_progress.md

@@ -237,5 +237,41 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
         self.assertGreater(checked, 0, "no local Python MCP server was examined")
 
 
+class A2ATopicsDeclaresItsBusEnvTest(unittest.TestCase):
+    """The a2a_topics server's env block is load-bearing and nothing else
+    guards it: the AST check above reads only python3-command servers, and
+    this server is a Go binary. An undeclared variable never reaches an MCP
+    child, and for this one the symptom is the honest no-bus answer on every
+    install — a fail-closed sentence the model treats as a result, so the
+    feature goes dark with no error anywhere. This is the API_SERVER_KEY bug
+    class (see the module docstring) wearing a different server."""
+
+    # The whole environment the a2a mcp server reads (a2a/cmd/a2a/mcp.go's
+    # busConfigured plus the CLI connect path it reuses). A2A_SESSION and
+    # A2A_PROFILE are write-path only and the MCP surface is read-only.
+    EXPECTED_ENV = frozenset({"NATS_URL", "NATS_USER", "NATS_PASSWORD"})
+
+    def setUp(self):
+        self.block = merged_config().get("mcp_servers", {}).get("a2a_topics")
+
+    def test_the_server_is_declared(self):
+        self.assertIsNotNone(self.block, "a2a_topics vanished from mcp_servers")
+
+    def test_it_declares_exactly_the_bus_env(self):
+        self.assertEqual(
+            set(self.block.get("env", {})),
+            self.EXPECTED_ENV,
+            "a2a_topics' env block drifted from what the a2a mcp server "
+            "reads; a missing key silently darkens the topics reader on "
+            "every install, an extra one widens the child's environment "
+            "for nothing",
+        )
+
+    def test_it_stays_lazy(self):
+        # Eager boot would spawn the child in every fresh kanban worker for a
+        # tool most turns never call — the cost the file header measures.
+        self.assertIs(self.block.get("lazy"), True)
+
+
 if __name__ == "__main__":
     unittest.main()
