@@ -386,11 +386,14 @@ class C1IsolationIsStructural(unittest.TestCase):
         the pair on purpose -- in both places, which is the point -- keeps this
         green.
         """
-        fence = h.text("a2a_session_fence")
+        # The operator's constants are split across two files in one package.
+        fence = h.text("a2a_session_fence") + h.text("operator_labels")
         spawner = h.text("a2a_spawner")
 
         def go_const(source: str, name: str) -> str:
-            match = re.search(rf"^\s*{name}\s*=\s*\"([^\"]+)\"", source, re.MULTILINE)
+            match = re.search(
+                rf"^\s*(?:const\s+)?{name}\s*=\s*\"([^\"]+)\"", source, re.MULTILINE
+            )
             self.assertIsNotNone(match, f"{name} is no longer a string constant")
             return match.group(1)
 

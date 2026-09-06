@@ -201,6 +201,12 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
     ),
+    # labelPartOf lives here rather than beside the fence, so resolving the
+    # operator's side of the pair needs both files.
+    "operator_labels": Source(
+        "k8s-operator/internal/controller/manifest_helpers.go",
+        ("labelPartOf",),
+    ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
         ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
