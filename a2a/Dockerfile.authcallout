@@ -1,0 +1,28 @@
+# The a2a auth callout image.
+#
+# The service that decides who may connect to the bus: a client presents a
+# projected Kubernetes ServiceAccount token, this validates it with a
+# TokenReview against the local API server, and answers with the account and
+# permission set the operator mapped that identity to.
+#
+# It sits on the connection path — while it is down, no NEW connection is
+# authorized, though every established one keeps working — so the Deployment
+# that runs it uses two replicas and a rollout that never drops below the
+# running count.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.authcallout -t <registry>/a2a-authcallout:<tag> .
+
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/authcallout ./cmd/authcallout
+
+# Distroless nonroot matches the Deployment's runAsNonRoot/runAsUser 1000 and
+# its read-only root filesystem: this binary writes nothing to disk.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/authcallout /authcallout
+USER nonroot
+ENTRYPOINT ["/authcallout"]
