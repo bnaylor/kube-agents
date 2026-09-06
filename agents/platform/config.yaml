@@ -117,6 +117,41 @@ mcp_servers:
     lazy: true
     connect_timeout: 30
     timeout: 60
+  # The A2A topics reader: the a2a binary serving its read surface as MCP
+  # tools over stdio (`a2a mcp`, a2a/cmd/a2a/mcp.go). An MCP child and not a
+  # skill that shells the CLI, because the agent pod no longer runs
+  # model-issued commands — those execute in the shell sandbox, which by
+  # design holds no credentials and has no route to the bus. This child runs
+  # in the agent container, where the operator already places the bus
+  # credential, so the sandbox needs nothing.
+  #
+  # Declared unconditionally, gated behaviourally: on an install without the
+  # A2A bus, NATS_URL is absent and the server advertises ZERO tools
+  # (toolCatalog in mcp.go — the mode switch's promise is that a normal
+  # install cannot tell the feature exists). A call arriving through a stale
+  # schema cache anyway gets an isError result naming the missing bus, not a
+  # guess.
+  #
+  # The env block is load-bearing: Hermes hands a stdio MCP child only a safe
+  # baseline plus the keys named here (`_build_safe_env`; the note on
+  # GOOGLE_CHAT_HOME_CHANNEL above carries the story). Without these three
+  # lines the child sees no bus on every install and the feature is silently
+  # dark everywhere.
+  #
+  # The binary bounds one operation at 30s internally (cliTimeout), so
+  # timeout: 60 is one retry's worth of headroom, and the child itself starts
+  # in milliseconds.
+  a2a_topics:
+    command: "/usr/local/bin/a2a"
+    args:
+      - "mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
+    env:
+      NATS_URL: "${NATS_URL}"
+      NATS_USER: "${NATS_USER}"
+      NATS_PASSWORD: "${NATS_PASSWORD}"
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
@@ -149,12 +184,14 @@ platform_toolsets:
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - mcp-a2a_topics
     - memory
   api_server:
     - hermes-api-server
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - mcp-a2a_topics
     - memory
 
 # Top-level `toolsets` gates the kanban orchestrator surface: the kanban tools

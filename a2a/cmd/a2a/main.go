@@ -30,6 +30,7 @@ usage:
   a2a topics list                  list the provisioned topics and their retention class
   a2a topics read <topic>          print the latest entry on a topic
   a2a topics write <topic> [flags] publish one entry to a topic
+  a2a mcp                          serve the topics reader as MCP tools on stdio
 
 <topic> is a bare name (upgrade-readiness), a scope-qualified name
 (shared.blueprint, agent.platform.upgrade-readiness), or a full subject. A bare
@@ -61,6 +62,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "topics":
 		return runTopics(args[1:])
+	case "mcp":
+		return runMCP(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil
@@ -131,11 +134,17 @@ func topicsList(args []string) error {
 	if *asJSON {
 		return json.NewEncoder(os.Stdout).Encode(registry)
 	}
+	return writeRegistry(os.Stdout, registry)
+}
+
+// writeRegistry renders the provisioned-topics table. Shared by the CLI and
+// the MCP topics_list tool, so both surfaces show one shape.
+func writeRegistry(out io.Writer, registry []lib.TopicEntry) error {
 	if len(registry) == 0 {
-		fmt.Println("no topics provisioned")
-		return nil
+		_, err := fmt.Fprintln(out, "no topics provisioned")
+		return err
 	}
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "TOPIC\tCLASS\tWRITER SCOPE\tSUBJECT")
 	for _, e := range registry {
 		scope := e.Scope
@@ -202,7 +211,7 @@ func topicsRead(args []string) error {
 			// the caller is usually an agent about to answer a question from
 			// it: say so in words it can relay, and exit non-zero so a script
 			// does not mistake silence for content.
-			fmt.Printf("topic %s (%s) is provisioned but has no entries yet\n", entry.Topic, entry.Subject)
+			fmt.Println(emptyTopicMessage(entry))
 			os.Exit(2)
 		}
 		return err
@@ -213,6 +222,13 @@ func topicsRead(args []string) error {
 		return enc.Encode(env)
 	}
 	return printEntry(os.Stdout, entry, env)
+}
+
+// emptyTopicMessage is the provisioned-but-unwritten answer, shared by the
+// CLI's exit-2 path and the MCP tool's non-error result: a real answer ("no
+// one has assessed this"), phrased so the agent can relay it.
+func emptyTopicMessage(entry lib.TopicEntry) string {
+	return fmt.Sprintf("topic %s (%s) is provisioned but has no entries yet", entry.Topic, entry.Subject)
 }
 
 // printEntry renders one topic entry for a reader that is usually a language
