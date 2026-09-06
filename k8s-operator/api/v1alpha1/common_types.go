@@ -48,6 +48,15 @@ var SensitiveEnvVars = map[string]struct{}{
 	// spec.deployment.env[i].name.
 	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
 	"HERMES_HOME":                        {},
+	// The A2A bus wiring the operator renders under `mode: next`. NATS_PASSWORD
+	// arrives by SecretKeyRef, so the credential is in the container no matter
+	// what the address says: a CR-set NATS_URL would send the worker password
+	// to an address of the setter's choosing, in the CONNECT frame, in the
+	// clear. NATS_USER is here for the same reason at one remove — picking the
+	// identity picks which grants the connection gets.
+	"NATS_URL":      {},
+	"NATS_USER":     {},
+	"NATS_PASSWORD": {},
 }
 
 type HermesSpec struct {

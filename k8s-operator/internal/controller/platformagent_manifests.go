@@ -2164,6 +2164,25 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	if len(agentPlugins) > 0 {
 		extEnvs := extractAgentPluginEnvVars(agentPlugins)
+		// The bus names are reserved while the A2A surface is up, because the
+		// operator appends them AFTER this merge (below) and an appended name
+		// does not shadow a same-named plugin entry — it sits beside it, and
+		// server-side apply refuses a duplicate key in `env`, which would wedge
+		// every reconcile of this CR (the EVENT_WATCHER_ENABLED comment in
+		// buildCredentialProxyContainer records the same rule). Gated on the
+		// surface rather than unconditional so a today install's plugin env is
+		// untouched — dropping a name only the next stack cares about would be
+		// one more way to tell the feature exists.
+		if a2aAgentSurface(agent) {
+			kept := extEnvs[:0]
+			for _, e := range extEnvs {
+				if e.Name == "NATS_URL" || e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
+					continue
+				}
+				kept = append(kept, e)
+			}
+			extEnvs = kept
+		}
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}
@@ -2241,6 +2260,54 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// The A2A bus, under `next` only: address and credentials for the worker
+	// user, whose grants fit an agent-side reader — subscribe on a2a.topics.>,
+	// publish on the provisioned topics. From the same Secret the A2A gateway
+	// reads, and container env only: a copy in a profile .env on the PVC would
+	// be a second place to rotate and a first place to leak. A bridge sidecar
+	// declared in spec.deployment.sidecars shares the pod and declares the
+	// same three against the same Secret, so this is one Secret seam, not two.
+	//
+	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
+	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
+	// lands in the container whatever the address says; if a plugin could set
+	// NATS_URL, the client would hand the worker password to an address of the
+	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
+	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
+	// cluster. It cannot: the three names are dropped from plugin env above
+	// while the surface is up, and they are in SensitiveEnvVars so the CR's
+	// own spec.deployment.env cannot reach them either. Found by adversarial
+	// review before this shipped.
+	//
+	// The SecretKeyRef is Optional, and that is what keeps the skew branch of
+	// a2aAgentSurface inert rather than fatal: on a today-lineage install that
+	// hit skew the creds Secret has never existed, and a required ref there
+	// would roll the pod (strategy Recreate) into CreateContainerConfigError —
+	// a full agent outage bought by a helper that exists to prevent one. With
+	// Optional the kubelet omits the variable when the Secret is absent and
+	// injects it when a frozen next stack's Secret exists, which is the freeze
+	// the helper promises. Under plain next the Secret is reconciled into
+	// existence before anything dials, so Optional costs nothing there.
+	if a2aAgentSurface(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name:  "NATS_URL",
+				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+			},
+			corev1.EnvVar{
+				Name:  "NATS_USER",
+				Value: "worker",
+			},
+			corev1.EnvVar{
+				Name: "NATS_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
+					Key:                  "worker-password",
+					Optional:             ptr.To(true),
+				}},
+			},
+		)
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -4835,6 +4902,29 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 	})
+
+	// 13. The A2A bus, under `next` only. The NATS pods by label rather than
+	//     CIDR: the pod IP does not survive a restart, and a policy pinned to
+	//     an address silently stops matching. Egress here is deny-by-default,
+	//     and a missing rule does not refuse the dial — it hangs it to the
+	//     timeout, the least diagnosable shape this failure has.
+	if a2aAgentSurface(agent) {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							labelPartOf:       a2aPartOf,
+							a2aComponentLabel: "nats",
+						},
+					},
+				},
+			},
+		})
+	}
 
 	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
 	// addition to the operator's own set rather than being interleaved with it.
