@@ -21,8 +21,11 @@ with no chat adapters and nothing in the symptom pointed at a Slack file.
 
 So this checks the shim against the thing it actually wraps:
 
-1. the signatures of every upstream callable the two patches replace are still
-   the signatures they were written against;
+1. the signatures and parameter defaults of every upstream callable the runtime
+   patches replace, reimplement or call into are still the signatures and
+   defaults they were written against -- the two relay patches, and
+   ``sandbox_artifact_patch``, which wraps the kanban notifier's artifact
+   delivery and reuses upstream's media-delivery denylist;
 2. a plugin-sourced entry registers through the shim exactly as
    ``hermes_cli/plugins.py`` registers one, scope and all, and comes back
    relay-backed and findable;
@@ -34,9 +37,11 @@ So this checks the shim against the thing it actually wraps:
    in the environment, scripts on ``PYTHONPATH`` -- so ``sitecustomize``'s
    import hook is what installs the patch, not this file.
 
-Check 1 is a pin. When it fails, read the upstream method, decide whether the
-shim needs to change, and then update the expectation deliberately -- do not
-refresh it to whatever the new image says.
+Check 1 is a pin covering both callable signatures (`UPSTREAM_SIGNATURES`) and
+critical parameter defaults (`PINNED_DEFAULTS`) on reimplemented methods. When
+either fails, read the upstream method, decide whether the shim needs to change,
+and then update the expectation deliberately -- do not refresh it to whatever
+the new image says.
 
 Checks 1-4 run in a process where ``SLACK_RELAY_URL`` is *unset at startup*,
 because ``sitecustomize.install_hook()`` reads the environment as it is
@@ -45,6 +50,11 @@ word in and ``PlatformRegistry.register`` is already wrapped by the time the
 signatures are read, which would pin the shim against itself. The wired
 process is check 5's job, and it asserts the hook fired rather than installing
 anything by hand.
+
+``sandbox_artifact_patch`` cannot be held off the same way -- ``sitecustomize``
+installs it unconditionally, with no variable to unset -- so the one signature
+it wraps is read through ``inspect.unwrap`` instead. See
+``upstream_callables()``.
 """
 
 from __future__ import annotations
@@ -53,6 +63,8 @@ import inspect
 import os
 import subprocess
 import sys
+
+from typing import Any
 
 # Never dialled: every check here stops short of a request. It only has to look
 # like a configured relay to ``relay_without_token()``.
@@ -138,18 +150,78 @@ UPSTREAM_SIGNATURES = {
     "GoogleChatAdapter._handle_setup_files_command": (
         "self, chat_id, thread_id, raw_text, sender_email=..."
     ),
+    "GoogleChatAdapter._post_attachment_fallback": (
+        "self, chat_id, path, filename, caption, thread_id"
+    ),
+    "GatewayKanbanWatchersMixin._deliver_kanban_artifacts": (
+        "self, *, adapter, chat_id, metadata, event_payload, task"
+    ),
+    "BasePlatformAdapter.filter_local_delivery_paths": "file_paths",
+    "base._media_delivery_strict_mode": "",
+    "base._path_under_denied_prefix": "resolved",
+}
+
+# Default values the relay patches depend on. Keyed by (callable label, parameter name).
+# Only reimplemented methods/functions where a changed upstream default creates silent
+# drift are pinned here; delegating wrappers (PlatformRegistry.register,
+# PlatformRegistry.create_adapter) pass through *args/**kwargs unchanged and are exempt
+# from default pinning.
+PINNED_DEFAULTS: dict[tuple[str, str], object] = {
+    ("SlackAdapter.connect", "is_reconnect"): False,
+    ("GoogleChatAdapter.connect", "is_reconnect"): False,
+    ("SlackAdapter._download_slack_file", "audio"): False,
+    ("SlackAdapter._download_slack_file", "team_id"): "",
+    ("SlackAdapter._download_slack_file_bytes", "team_id"): "",
+    ("slack._standalone_send", "thread_id"): None,
+    ("slack._standalone_send", "media_files"): None,
+    ("slack._standalone_send", "force_document"): False,
+    ("slack._standalone_send", "caption"): None,
+    ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): None,
 }
 
 
-def upstream_callables() -> dict[str, object]:
-    """Resolve every pinned callable out of the image's own Hermes tree."""
+def upstream_callables() -> dict[str, Any]:
+    """Resolve every pinned callable out of the image's own Hermes tree.
+
+    ``_deliver_kanban_artifacts`` needs unwrapping first. This runs with
+    ``/opt/defaults/scripts`` on ``PYTHONPATH``, so ``sitecustomize`` executes in
+    this interpreter too and arms a finder that installs
+    ``sandbox_artifact_patch`` as ``gateway.platform_registry`` loads -- and that
+    patch replaces the method. Reading the attribute afterwards pins the shim
+    against itself and checks nothing. Import order cannot get ahead of it,
+    because everything below reaches the registry one way or another, so the
+    patch applies ``functools.wraps`` and ``inspect.unwrap`` recovers the real
+    method here. The identity check is what keeps that honest.
+    """
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+    import sandbox_artifact_patch
+
+    kanban_deliver = GatewayKanbanWatchersMixin._deliver_kanban_artifacts
+    if getattr(GatewayKanbanWatchersMixin, sandbox_artifact_patch.PATCH_FLAG, False):
+        kanban_deliver = inspect.unwrap(kanban_deliver)
+        if kanban_deliver is GatewayKanbanWatchersMixin._deliver_kanban_artifacts:
+            fail(
+                "GatewayKanbanWatchersMixin._deliver_kanban_artifacts",
+                "sandbox_artifact_patch wrapped it without __wrapped__, so the "
+                "pin would compare the shim against itself",
+            )
+
     from gateway.platform_registry import PlatformRegistry
+    from gateway.platforms import base as platforms_base
+    from gateway.platforms.base import BasePlatformAdapter
     from plugins.platforms.google_chat import adapter as google_chat_adapter
     from plugins.platforms.slack import adapter as slack_adapter
 
     slack = slack_adapter.SlackAdapter
     google_chat = google_chat_adapter.GoogleChatAdapter
     return {
+        "GatewayKanbanWatchersMixin._deliver_kanban_artifacts": kanban_deliver,
+        "BasePlatformAdapter.filter_local_delivery_paths": (
+            BasePlatformAdapter.filter_local_delivery_paths
+        ),
+        "base._media_delivery_strict_mode": platforms_base._media_delivery_strict_mode,
+        "base._path_under_denied_prefix": platforms_base._path_under_denied_prefix,
         "PlatformRegistry.register": PlatformRegistry.register,
         "PlatformRegistry.create_adapter": PlatformRegistry.create_adapter,
         "SlackAdapter.connect": slack.connect,
@@ -166,6 +238,9 @@ def upstream_callables() -> dict[str, object]:
         "GoogleChatAdapter._new_authed_http": google_chat._new_authed_http,
         "GoogleChatAdapter._handle_setup_files_command": (
             google_chat._handle_setup_files_command
+        ),
+        "GoogleChatAdapter._post_attachment_fallback": (
+            google_chat._post_attachment_fallback
         ),
     }
 
@@ -284,6 +359,56 @@ def unwired() -> int:
 
     for label, func in upstream_callables().items():
         check(f"upstream signature: {label}", shape(func), UPSTREAM_SIGNATURES[label])
+
+    for (label, param_name), expected_default in PINNED_DEFAULTS.items():
+        func = upstream_callables()[label]
+        sig = inspect.signature(func)
+        param = sig.parameters.get(param_name)
+        if param is None:
+            fail(
+                f"upstream default: {label}({param_name})",
+                "parameter missing from signature",
+            )
+        else:
+            check(
+                f"upstream default: {label}({param_name})",
+                param.default,
+                expected_default,
+            )
+
+    # --- the Google Chat message cap the inline paste is budgeted against ---
+    # google_chat_relay_patch splits a deliverable into messages sized to fit
+    # under the adapter's own ceiling, and it holds that ceiling as its own
+    # constant. A signature pin does not cover a number, and the failure is
+    # quiet in the same way: the unit suite compares chunks against the copy,
+    # so a base image that lowers the real cap keeps every test green and ships
+    # an image whose every fenced multi-part paste is re-split by send() with
+    # the fence cut in half. verify_kanban_progress_lines.py guards MAX_RENDER
+    # against the same constant for the same reason.
+    import google_chat_relay_patch
+
+    from plugins.platforms.google_chat import adapter as google_chat_adapter
+
+    upstream_cap = getattr(google_chat_adapter, "_MAX_TEXT_LENGTH", None)
+    check(
+        "the adapter's text cap was located",
+        isinstance(upstream_cap, int),
+        True,
+    )
+    if isinstance(upstream_cap, int):
+        check(
+            "the relay patch's copy of the cap matches the adapter's",
+            google_chat_relay_patch.MESSAGE_CHAR_CAP,
+            upstream_cap,
+        )
+        check(
+            "a decorated chunk still fits under the cap",
+            google_chat_relay_patch._payload_budget(fenced=True)
+            + google_chat_relay_patch.HEADER_RESERVE_CHARS
+            + google_chat_relay_patch.FENCE_RESERVE_CHARS
+            <= upstream_cap,
+            True,
+        )
 
     os.environ["SLACK_RELAY_URL"] = RELAY_URL
     # No token anywhere: the credential proxy holds the only one, and that is

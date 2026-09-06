@@ -25,6 +25,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_ID=""
 REGION="us-central1"
 APP_ID="4675512"
+# The read half, and not settable by flag: verify_ci_pool_project.py fails a
+# project whose ledger issues this exact installation cannot read, so a
+# different one here would only mis-address the warning in step 1.4.
+LEDGER_APP_ID="4739812"
+LEDGER_INSTALLATION_ID="157029058"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
@@ -358,6 +363,14 @@ else
   echo "  https://github.com/organizations/gke-agentic/settings/installations"
 fi
 
+# The same edit again on the read half. Two Apps, two installations: the minter
+# above writes the GitOps repo, and this one reads back the ledger issue the
+# bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
+# step 5's Ledger Read Credential check fails the project until it is done.
+echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
+echo "  That edit widens which repositories a minted token can read issues from:"
+echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
+
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform
 # bucket-level access are not optional: this bucket holds the only record of
@@ -406,11 +419,20 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # -input=false, so a missing one is a hard "No value for required variable"
     # rather than a prompt. api_server_key is generated the same way
     # hack/ci-deploy.sh generates it when unset (openssl rand -hex 16).
+    # model_provider drives more than the chart: at "vertex_ai" the
+    # composition's litellm_vertex_iam module creates the gateway's own
+    # kubeagents-litellm-gsa, its roles/aiplatform.user grant, and the
+    # Workload Identity binding hack/ci-deploy.sh's per-lease helm upgrade
+    # relies on. The eval installs moved off the GEMINI_API_KEY path after
+    # its fixed paid-tier-3 quota redded every smoke run on 2026-09-02
+    # (#1097; diagnosis on #1184). verify_ci_pool_project.py checks the
+    # binding, so a project provisioned before this line reports the gap.
     cat > "${TFVARS}" <<EOF
 project_id     = "${PROJECT_ID}"
 cluster_name   = "${HOST_CLUSTER_NAME}"
 location       = "${REGION}"
 api_server_key = "$(openssl rand -hex 16)"
+model_provider = "vertex_ai"
 EOF
 
     KUBE_AGENTS_STATE_BUCKET="${STATE_BUCKET}" \

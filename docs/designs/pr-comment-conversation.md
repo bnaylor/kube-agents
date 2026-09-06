@@ -161,7 +161,7 @@ the gate is narrower rather than absent — the hardline floor (`rm -rf /`, `mkf
 sudo-stdin guard and any `approvals.deny` rule all sit above the bypass. If a session type is ever
 found that lands there, the route to covering it is `ctx.register_hook("pre_tool_call", …)`,
 dispatched from `model_tools.py` above the approval layer and not gated on session context, rather
-than a nineteenth anchored substitution in `deploy/docker/patches/`. That hook dispatch swallows
+than another anchored substitution in `deploy/docker/patches/`. That hook dispatch swallows
 exceptions and is fail-open, so such a hook must catch internally and decide explicitly.
 
 ## 3. The forge provider
@@ -180,7 +180,7 @@ class ForgeProvider(Protocol):
     def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
                                                           # can_write, can_write_known,
                                                           # created_at, kind, path/line
-    def post_comment(self, repo, pr, body_file) -> None
+    def post_comment(self, repo, pr, body) -> None        # the text; travels on fd 0, not a path
     def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
     def list_commits(self, repo, pr) -> list[Commit]      # sha + committed_at, tip last;
                                                           # backs the reply claim check
@@ -253,23 +253,19 @@ The module also owns the plumbing that would otherwise become a third copy: the 
 
 ### What a second forge actually costs
 
-The provider protocol makes this feature portable. The stack under it is not, and four places would
-each need work. None is caused by this design; all are worth naming so the next person does not
-discover them one at a time.
+The provider protocol makes this feature portable. The stack under it is not — token brokering, the
+sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
+that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
+account and the order the layers have to be unwound in; this section records only what bears on the
+protocol above them.
 
-1. **Token brokering.** `terraform/modules/github-minter` mints GitHub App installation tokens.
-   GitLab and Bitbucket have no equivalent shape — project access tokens, or OAuth refresh flows.
-2. **The sidecar.** `ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")`. GitLab could add
-   `glab`; **Bitbucket has no comparable CLI**, so it needs a `/v1/<forge>/…` proxy route, because
-   the agent container may never hold the token. That route is the `ProxyForgeProvider` the `_call()`
-   seam exists for.
-3. **Git credentials.** `refresh_git_credentials` writes GitHub-shaped credentials; other forges want
-   a different username convention.
-4. **The CRD.** `GitHubSpec` is the only integration (`common_types.go`), while `ValidateGitRepoURL`
-   is host-agnostic — so the CR already accepts a URL nothing downstream serves.
-
-Also worth recording: "Bitbucket" is two providers. Cloud (`/2.0/repositories/…`) and Data Center
-(`/rest/api/1.0/projects/…`) share almost nothing.
+"Bitbucket" is two providers, which is the limit of how far one provider class stretches. Cloud
+(`/2.0/repositories/…`) and Data Center (`/rest/api/1.0/projects/…`) share almost nothing, so a class
+branching on which one it is talking to would be two implementations in a trench coat. Two separate
+providers are cheap here because of the `_call()` seam, which exists for a different reason: a forge
+with no CLI to shell cannot reach anything except through a sidecar route, and Bitbucket has no `gh`
+equivalent at all. Its tokens come from OAuth refresh flows, so it would want a third token strategy
+again.
 
 ## 4. The pull-request sweep
 
@@ -334,12 +330,13 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   it as untrusted posts a public refusal at a collaborator over a transient API failure — which the
   marker then makes permanent. Holding costs one tick and the next one asks again. The count goes
   to stderr, like deferral.
-- **Anything the gate posts is written to `/opt/data/scratch`, never `/tmp`.** `gh` in this container
-  is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
-  filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
-  file the container executing the command cannot open, and every refusal dies on "no such file" —
-  as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
-  the sort of thing a second implementation rediscovers the hard way.
+- **Anything the gate posts goes to `gh` on stdin, never as a path.** `gh` does not run where the
+  caller does: the gate runs in the agent pod, ssh carries the command to the sandbox, and the shim
+  forwards it to the credential broker in a third pod. A `--body-file /some/path` names a file only
+  the first of those can open. Both earlier attempts to make a path work failed — `/tmp` is a
+  per-container `emptyDir`, so every refusal died on "no such file" live, and the shared volume that
+  replaced it then needed the file made group-readable across the uid split of #955. `--body-file -`
+  needs neither, and is what the fleet audit already does (`audit_report.BODY_STDIN`).
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
@@ -605,16 +602,18 @@ Three details are deliberate:
 - **Markers are stripped from the bodies** (`pr_triggers.strip_markers`, display only —
   `handled_node_ids` still reads raw bodies). Feeding the model its own `<!-- agent-answered:… -->`
   syntax invites it to imitate it in prose that `reply` then stamps a second, real marker onto.
-- **Both caps report what they dropped** — `omitted_earlier` on the thread, `truncated_chars` on the
-  comment. A silently shortened transcript reads exactly like a complete one, and the worker would
-  answer confidently from a conversation it half saw.
+- **Caps report what they dropped** — `omitted_earlier` on the thread transcript (`CONTEXT_MAX_COMMENTS = 40`),
+  `omitted_requests` on the thread (`CONTEXT_MAX_REQUESTS = 10`), `truncated_chars` on the comment body
+  (`CONTEXT_MAX_BODY_CHARS = 4000`) and on the request line (`CONTEXT_MAX_REQUEST_CHARS = 500`), and a stderr
+  notice for requests deferred past `CONTEXT_MAX_REQUESTS = 10`. A silently shortened transcript reads exactly
+  like a complete one, and the worker would answer confidently from a conversation it half saw.
 - **The comment cap drops the oldest**, the opposite of the sweep's oldest-first rule for triggers.
   A trigger queue must not starve its head; a transcript is a story whose recent end explains the
   request being answered now. **The requests themselves are pinned past the cap**, because those two
   rules point at the same comment: on a thread longer than the cap, the oldest unanswered trigger —
   the one the sweep just handed over — is the first thing the window throws away. For a bare
   `@mention` the card carries no copy of the request either, so the worker would be asked to answer
-  words that appear nowhere in its context. Pinning costs at most `PR_AGENT_MAX_PER_TICK` rows.
+  words that appear nowhere in its context. Pinning costs at most `CONTEXT_MAX_REQUESTS` rows.
 
 This widens what reaches the model — a comment from an account with no write access is now in the
 prompt even though it can never be acted on. That is the point, and it is why SKILL.md states in the

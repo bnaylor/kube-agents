@@ -7,6 +7,7 @@ GKE NotFound. Missing identity, transient errors, and reserved profiles are neve
 deleted.
 """
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import chat_platforms  # noqa: E402
 import cluster_agent_profile as cap  # noqa: E402
 import cluster_agent_reconcile as rec  # noqa: E402
 
@@ -29,17 +31,29 @@ def _home_factory(root: Path, incomplete=frozenset()):
 
     reconcile() reads the filesystem to tell a finished scaffold from one killed
     after the identity stamp, so these have to exist. Names in ``incomplete`` get
-    the directory without the artifacts ``create_profile`` writes last.
+    the directory without the artifacts ``create_profile`` writes last. The
+    kubeconfig is written here too, for ``_local_kubeconfig_landed`` to find --
+    on a real install it is on the sandbox's volume, not this one.
     """
     def factory(name: str) -> Path:
         home = root / name
         home.mkdir(parents=True, exist_ok=True)
         if name not in incomplete:
-            for artifact in rec.SCAFFOLD_ARTIFACTS:
+            for artifact in (*rec.SCAFFOLD_ARTIFACTS, rec.KUBECONFIG_ARTIFACT):
                 (home / artifact).touch()
         return home
 
     return factory
+
+
+def _local_kubeconfig_landed(path: Path) -> bool:
+    """A ``kubeconfig_landed`` stub that answers from this filesystem.
+
+    The real one asks the sandbox over SSH. Patching it keeps these tests off
+    that path and off whatever HERMES_SANDBOX_* happens to be set in the
+    environment running them.
+    """
+    return path.exists()
 
 
 class HomesMixin(unittest.TestCase):
@@ -47,6 +61,14 @@ class HomesMixin(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.homes = Path(self._tmp.name)
+        # Answer the kubeconfig question from this filesystem for every test in
+        # these classes. The real one asks the sandbox over SSH, so leaving it
+        # in place would make the result depend on the environment running the
+        # suite. IncompleteScaffoldTest patches it again, per test, to say what
+        # the sandbox answered.
+        landed = mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed)
+        landed.start()
+        self.addCleanup(landed.stop)
 
 
 class ReconcileTest(HomesMixin):
@@ -184,7 +206,8 @@ class IncompleteScaffoldTest(HomesMixin):
 
     def _reconcile(self, incomplete):
         created: list = []
-        with mock.patch.object(rec, "_project", return_value="p"), \
+        with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed), \
+             mock.patch.object(rec, "_project", return_value="p"), \
              mock.patch.object(rec, "_all_clusters", return_value=[("p", "beta", "us-central1")]), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
              mock.patch.object(rec, "profile_home",
@@ -211,11 +234,41 @@ class IncompleteScaffoldTest(HomesMixin):
     def test_scaffold_gaps_names_what_is_missing(self):
         home = self.homes / "cluster-beta"
         home.mkdir()
-        self.assertEqual(rec._scaffold_gaps(home), list(rec.SCAFFOLD_ARTIFACTS))
-        (home / "kubeconfig.yaml").touch()
-        self.assertEqual(rec._scaffold_gaps(home), ["USER.md"])
+        with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed):
+            self.assertEqual(rec._scaffold_gaps(home), ["kubeconfig.yaml", "USER.md"])
+            (home / "kubeconfig.yaml").touch()
+            self.assertEqual(rec._scaffold_gaps(home), ["USER.md"])
+            (home / "USER.md").touch()
+            self.assertEqual(rec._scaffold_gaps(home), [])
+
+    def test_a_kubeconfig_only_the_sandbox_can_see_is_not_a_gap(self):
+        """The regression the sandbox split introduces.
+
+        With a sandbox, `gcloud container clusters get-credentials` runs in the
+        shell pod and writes to the shell pod's volume. Stat'ing the path on
+        this pod finds nothing, so every profile would read as half-scaffolded
+        on every hourly tick: the whole fleet re-scaffolded, and a credential
+        re-fetched per cluster, forever.
+        """
+        home = self.homes / "cluster-beta"
+        home.mkdir()
         (home / "USER.md").touch()
-        self.assertEqual(rec._scaffold_gaps(home), [])
+        # Nothing at home/kubeconfig.yaml on this filesystem; the sandbox has it.
+        with mock.patch.object(rec, "kubeconfig_landed", return_value=True) as landed:
+            self.assertEqual(rec._scaffold_gaps(home), [])
+        self.assertEqual(landed.call_args.args[0], home / "kubeconfig.yaml")
+
+    def test_a_sandbox_that_cannot_answer_reads_as_a_gap(self):
+        """kubeconfig_landed returns False when it cannot ask, and that must count.
+
+        A recreated sandbox PVC is exactly this: the profile is on the gateway's
+        volume, its credential is not, and re-scaffolding is the repair.
+        """
+        home = self.homes / "cluster-beta"
+        home.mkdir()
+        (home / "USER.md").touch()
+        with mock.patch.object(rec, "kubeconfig_landed", return_value=False):
+            self.assertEqual(rec._scaffold_gaps(home), ["kubeconfig.yaml"])
 
 
 class AllClustersTest(unittest.TestCase):
@@ -535,6 +588,66 @@ class NotificationGatingTest(unittest.TestCase):
     def test_dry_run_never_notifies(self):
         notify = self._main_with(self._report(pruned=["cluster-a"]), ["prog", "--dry-run"])
         notify.assert_not_called()
+
+
+class NotifyTargetTest(unittest.TestCase):
+    """Where _notify sends. Regression cover for #989, where it sent to the
+    literal `google_chat` and a Slack-only install heard nothing at all."""
+
+    def _sends(self, platforms, run=None):
+        """Run _notify with a stubbed resolver; return the `--to` value of each send."""
+        with mock.patch.object(rec, "enabled_chat_platforms", return_value=platforms), \
+             mock.patch.object(rec.subprocess, "run", side_effect=run) as sub:
+            rec._notify("hello")
+        return [call.args[0][3] for call in sub.call_args_list]
+
+    def test_posts_to_every_resolved_platform(self):
+        self.assertEqual(self._sends(["google_chat", "slack"]), ["google_chat", "slack"])
+
+    def test_slack_only_install_gets_the_summary(self):
+        # The reported bug: this used to send to google_chat regardless, and the
+        # failure was swallowed into a log line on a run that still exits 0.
+        self.assertEqual(self._sends(["slack"]), ["slack"])
+
+    def test_one_platform_failing_does_not_cost_the_other_the_summary(self):
+        def run(cmd, **kwargs):
+            if cmd[3] == "google_chat":
+                raise subprocess.CalledProcessError(1, cmd, stderr="no home channel")
+            return mock.DEFAULT
+
+        self.assertEqual(self._sends(["google_chat", "slack"], run=run),
+                         ["google_chat", "slack"])
+
+    def test_the_message_is_the_same_on_every_platform(self):
+        # Asserts the whole argv of every call, not the set of messages: a set is
+        # equally satisfied by one send, so the set form passed against the
+        # pre-#989 `--to google_chat` and pinned nothing this class exists to pin.
+        with mock.patch.object(rec, "enabled_chat_platforms", return_value=["google_chat", "slack"]), \
+             mock.patch.object(rec.subprocess, "run") as sub:
+            rec._notify("hello")
+        self.assertEqual([call.args[0] for call in sub.call_args_list],
+                         [[rec.HERMES_BIN, "send", "--to", "google_chat", "hello"],
+                          [rec.HERMES_BIN, "send", "--to", "slack", "hello"]])
+
+    def test_a_slack_only_environment_reaches_slack_through_the_real_resolver(self):
+        # Every other case here stubs enabled_chat_platforms, so none of them would
+        # notice the two halves being wired together wrongly. This one drives the
+        # real resolver off the environment the operator renders for a Slack-only
+        # install, which is the configuration #989 was reported against.
+        #
+        # Both path constants are pinned away, not just CONFIG_PATH. They are computed
+        # at import time, so `clear=True` does not move them, and the managed scope is
+        # consulted first and wins outright — on a machine that has an /etc/hermes
+        # (the agent pod itself) this assertion would be decided by that host's CR
+        # rather than by the fixture below.
+        with mock.patch.multiple(chat_platforms,
+                                 CONFIG_PATH="/nonexistent/config.yaml",
+                                 MANAGED_CONFIG_PATH="/nonexistent/managed.yaml"), \
+             mock.patch.dict(os.environ, {"SLACK_RELAY_URL": "http://127.0.0.1:8780"}, clear=True), \
+             mock.patch.object(rec.subprocess, "run") as sub:
+            rec._notify("created 1 profile(s): demo")
+        self.assertEqual([call.args[0] for call in sub.call_args_list],
+                         [[rec.HERMES_BIN, "send", "--to", "slack", "created 1 profile(s): demo"]])
 
 
 class FormatNotificationTest(unittest.TestCase):
