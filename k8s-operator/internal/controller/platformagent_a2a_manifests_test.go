@@ -628,11 +628,6 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	for _, e := range pod.Containers[0].Env {
 		env[e.Name] = e
 	}
-	// Spawning stays dark until the worker PR renders the arming: the switch
-	// env must not appear here at all.
-	if _, armed := env["A2A_SPAWN_SESSIONS"]; armed {
-		t.Error("A2A_SPAWN_SESSIONS rendered before the worker PR arms spawning")
-	}
 	ns := env["POD_NAMESPACE"]
 	if ns.ValueFrom == nil || ns.ValueFrom.FieldRef == nil || ns.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
 		t.Errorf("POD_NAMESPACE = %+v", ns)
@@ -651,12 +646,12 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 1 {
-		t.Fatalf("gateway Role has %d rules, want exactly the pinned owner get", len(role.Rules))
+	if len(role.Rules) != 2 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule plus the pinned owner get", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
-	owner := role.Rules[0]
+	owner := role.Rules[1]
 	if len(owner.APIGroups) != 1 || owner.APIGroups[0] != "apps" ||
 		len(owner.Resources) != 1 || owner.Resources[0] != "deployments" ||
 		len(owner.Verbs) != 1 || owner.Verbs[0] != "get" ||
@@ -867,6 +862,157 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 // The bus fence rides the mode switch exactly like the rest of the next
 // stack: rendered by reconcileA2A under next, torn down by cleanupA2A on the
 // flip back, absent from a today render entirely.
+// The three halves of arming, asserted together because shipping any one
+// without the others is the failure this PR's scoping exists to avoid: the
+// flag without the verbs is a gateway that refuses every delegation, and the
+// verbs without the flag are a standing pod-lifecycle grant with no caller.
+func TestBuildA2AGatewaySpawnArming(t *testing.T) {
+	agent := a2aTestAgent()
+
+	env := map[string]corev1.EnvVar{}
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	if env["A2A_SPAWN_SESSIONS"].Value != "true" {
+		t.Errorf("A2A_SPAWN_SESSIONS = %+v, want the spawner armed", env["A2A_SPAWN_SESSIONS"])
+	}
+	// Rendered unconditionally, so that an install pulling from a mirror can
+	// redirect the image the arming just started pulling.
+	if env["A2A_WORKER_IMAGE"].Value != defaultA2AWorkerImage {
+		t.Errorf("A2A_WORKER_IMAGE = %+v, want the resolved worker image", env["A2A_WORKER_IMAGE"])
+	}
+	t.Setenv(a2aWorkerImageEnvVar, "registry.example/mirror/worker:pinned")
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "A2A_WORKER_IMAGE" && e.Value != "registry.example/mirror/worker:pinned" {
+			t.Errorf("the operator override did not reach the spawner: %+v", e)
+		}
+	}
+
+	pods := buildA2AGatewayRole(agent).Rules[0]
+	if len(pods.APIGroups) != 1 || pods.APIGroups[0] != "" ||
+		len(pods.Resources) != 1 || pods.Resources[0] != "pods" {
+		t.Fatalf("session-pod rule targets %v/%v, want the core group's pods", pods.APIGroups, pods.Resources)
+	}
+	// Exactly the spawn-and-reap verbs. patch and update would let the
+	// gateway edit a running session pod; pods/exec would be a route into
+	// one. Neither is something the spawner does, so neither is granted.
+	wantVerbs := []string{"create", "get", "list", "watch", "delete"}
+	if !reflect.DeepEqual(pods.Verbs, wantVerbs) {
+		t.Errorf("session-pod verbs = %v, want exactly %v", pods.Verbs, wantVerbs)
+	}
+	if len(pods.ResourceNames) != 0 {
+		t.Errorf("session-pod rule is pinned by name (%v) — the pods do not exist yet when it creates them", pods.ResourceNames)
+	}
+}
+
+func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
+	np := buildA2ASessionNetworkPolicy(a2aTestAgent(), []string{"10.96.0.10"})
+
+	if np.Name != "test-agent-a2a-session-netpol" {
+		t.Errorf("unexpected name %q", np.Name)
+	}
+	// Selects exactly the labels the spawner stamps (a2a/gateway/spawn.go),
+	// which is also what the bus fence's session peer names.
+	wantSel := map[string]string{
+		labelPartOf:                   a2aPartOf,
+		"app.kubernetes.io/component": a2aSessionComponent,
+	}
+	if !reflect.DeepEqual(np.Spec.PodSelector.MatchLabels, wantSel) {
+		t.Errorf("pod selector = %v, want %v", np.Spec.PodSelector.MatchLabels, wantSel)
+	}
+
+	// Both policy types. The empty ingress list is the assertion: nothing
+	// dials a session pod, so a listener in a worker is an accident and an
+	// accident should be unreachable.
+	wantTypes := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
+	if !reflect.DeepEqual(np.Spec.PolicyTypes, wantTypes) {
+		t.Errorf("policy types = %v, want %v", np.Spec.PolicyTypes, wantTypes)
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("session policy grants ingress: %+v", np.Spec.Ingress)
+	}
+
+	if len(np.Spec.Egress) != 3 {
+		t.Fatalf("expected exactly 3 egress rules (DNS, bus, LiteLLM), got %d: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	}
+
+	// Rule 1: DNS on 53 only, and to named destinations. A DNS rule with a
+	// nil To is port-53 egress to every address, which is a tunnel rather
+	// than name resolution.
+	dns := np.Spec.Egress[0]
+	if len(dns.Ports) != 2 ||
+		*dns.Ports[0].Protocol != corev1.ProtocolUDP || dns.Ports[0].Port.IntVal != 53 ||
+		*dns.Ports[1].Protocol != corev1.ProtocolTCP || dns.Ports[1].Port.IntVal != 53 {
+		t.Errorf("DNS rule ports = %+v, want udp+tcp 53", dns.Ports)
+	}
+	if len(dns.To) == 0 {
+		t.Error("DNS rule has no peer, which permits port 53 to every destination")
+	}
+
+	// Rule 2: the bus, by pod label rather than IPBlock — a pod IP does not
+	// survive a restart and a policy pinned to one stops matching silently.
+	bus := np.Spec.Egress[1]
+	if len(bus.Ports) != 1 || bus.Ports[0].Port.IntVal != 4222 || *bus.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("bus rule is not exactly TCP 4222: %+v", bus.Ports)
+	}
+	if len(bus.To) != 1 || bus.To[0].PodSelector == nil ||
+		bus.To[0].PodSelector.MatchLabels[a2aComponentLabel] != "nats" ||
+		bus.To[0].PodSelector.MatchLabels[labelPartOf] != a2aPartOf {
+		t.Errorf("bus peer does not select the NATS pods by label: %+v", bus.To)
+	}
+
+	// Rule 3: LiteLLM, the workers' only model path — they hold no API key
+	// and no Workload Identity, so there is no direct 443 to a provider.
+	llm := np.Spec.Egress[2]
+	if len(llm.Ports) != 3 || llm.Ports[0].Port.IntVal != 80 || llm.Ports[1].Port.IntVal != 4000 || llm.Ports[2].Port.IntVal != 8080 {
+		t.Errorf("LiteLLM rule ports = %+v, want tcp 80+4000+8080", llm.Ports)
+	}
+	if len(llm.To) != 1 || llm.To[0].PodSelector == nil || llm.To[0].PodSelector.MatchLabels["app"] != "litellm" {
+		t.Errorf("LiteLLM peer = %+v, want app=litellm", llm.To)
+	}
+
+	// The refusal, stated as a refusal: outside the DNS rule nothing reaches
+	// an address, only a labelled pod. An IPBlock on the bus or model rule
+	// would be the widening this fence exists to prevent, and every peer that
+	// names a namespace must name this agent's own.
+	for i, rule := range np.Spec.Egress[1:] {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil {
+				t.Errorf("egress rule %d carries an IPBlock peer: %+v", i+1, peer)
+			}
+			if peer.NamespaceSelector != nil &&
+				peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "test-ns" {
+				t.Errorf("egress rule %d crosses namespaces: %+v", i+1, peer)
+			}
+		}
+	}
+}
+
+// The session fence must not inherit the agent policy's off switch: that flag
+// withholds the agent pod's own gateway policy, and reading it as permission
+// to unfence the workers would make delegation the way around the very
+// allowlist it governs.
+func TestSessionNetworkPolicySurvivesNetworkPolicyDisabled(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.NetworkPolicy = &agentv1alpha1.NetworkPolicySpec{
+		Enabled:       ptr.To(false),
+		DNSClusterIPs: []string{"10.1.2.3"},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+
+	ips := r.a2aSessionDNSClusterIPs(context.Background(), agent)
+	if !reflect.DeepEqual(ips, []string{"10.1.2.3"}) {
+		t.Errorf("DNS cluster IPs = %v, want the operator's documented override honoured", ips)
+	}
+
+	np := buildA2ASessionNetworkPolicy(agent, ips)
+	if len(np.Spec.Egress) != 3 || len(np.Spec.Ingress) != 0 {
+		t.Errorf("the fence changed shape when spec.networkPolicy.enabled=false: %+v", np.Spec)
+	}
+}
+
 func TestA2ANATSNetworkPolicyGatedByMode(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
@@ -894,8 +1040,12 @@ func TestA2ANATSNetworkPolicyGatedByMode(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-netpol", Namespace: "test-ns"}, nats); err != nil {
 		t.Errorf("NATS NetworkPolicy not rendered under next: %v", err)
 	}
+	session := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-netpol", Namespace: "test-ns"}, session); err != nil {
+		t.Errorf("session NetworkPolicy not rendered under next: %v", err)
+	}
 
-	// Flip to today: the fence goes back to dark, and the agent's own netpol
+	// Flip to today: both fences go back to dark, and the agent's own netpol
 	// stays.
 	fresh := &agentv1alpha1.PlatformAgent{}
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
@@ -910,6 +1060,9 @@ func TestA2ANATSNetworkPolicyGatedByMode(t *testing.T) {
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-netpol", Namespace: "test-ns"}, nats); !errors.IsNotFound(err) {
 		t.Errorf("NATS NetworkPolicy still present under today (err=%v)", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-netpol", Namespace: "test-ns"}, session); !errors.IsNotFound(err) {
+		t.Errorf("session NetworkPolicy still present under today (err=%v)", err)
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, &networkingv1.NetworkPolicy{}); err != nil {
 		t.Errorf("the agent's own NetworkPolicy vanished with the A2A cleanup: %v", err)
