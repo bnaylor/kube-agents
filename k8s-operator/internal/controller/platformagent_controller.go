@@ -1207,6 +1207,16 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 // its copy only on a path where spec.networkPolicy is provably set, while this runs
 // on every reconcile, including the common CR that omits the block entirely.
 func (r *PlatformAgentReconciler) shellSandboxDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
+	return r.ungatedDNSClusterIPs(ctx, agent)
+}
+
+// ungatedDNSClusterIPs runs the DNS resolution ladder with
+// spec.networkPolicy.enabled lifted, for the policies that render whatever
+// that flag says. Shared by the sandbox policy and the A2A session fence:
+// both are policies the flag does not withhold, so both need the documented
+// dnsClusterIPs override to survive it, and one copy of that rule is one
+// place to correct it.
+func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
 	if agent.Spec.NetworkPolicy == nil || agent.Spec.NetworkPolicy.Enabled == nil {
 		return r.resolveNetpolProfile(ctx, agent).DNSClusterIPs
 	}

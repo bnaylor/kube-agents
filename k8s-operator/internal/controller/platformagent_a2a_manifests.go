@@ -630,9 +630,9 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 // session pod it creates, paired with part-of: a2aPartOf under the STANDARD
 // app.kubernetes.io/component key (the spawner is a client of the cluster, not
 // the operator, so it uses the standard key; operator-rendered pieces carry
-// a2aComponentLabel). Session-pod spawning arms in the worker PR; the bus
-// fence below enumerates the pair now so it is already correct when the first
-// session pod exists.
+// a2aComponentLabel). Three things select on this pair and must agree: the
+// bus fence's session peer, the session fence's own podSelector, and the
+// gateway's session cap and sweeper, which count and list pods by it.
 const a2aSessionComponent = "a2a-session"
 
 func a2aNATSNetpolName(agent *agentv1alpha1.PlatformAgent) string {
@@ -672,28 +672,15 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // be unreachable. kubectl exec and logs ride the kubelet API rather than the
 // pod network, so debugging is unaffected.
 func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
-	// The same fixed peers the agent egress policy's DNS rule names, for the
-	// same reasons it gives: kube-dns, NodeLocal DNSCache by label and at its
-	// link-local address, and the Cloud DNS for GKE resolver. Port 53 to the
-	// resolver address reaches no credential — the credential API is on :80
-	// pre-NAT and :988 post-NAT, and no rule here names either.
-	dnsPeers := []networkingv1.NetworkPolicyPeer{
-		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "kube-dns"}),
-		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "node-local-dns"}),
-		{IPBlock: &networkingv1.IPBlock{CIDR: nodeLocalDNSCacheIP}},
-		{IPBlock: &networkingv1.IPBlock{CIDR: metadataResolverCIDR}},
-	}
-	safeDNSIPs := make([]string, 0, len(dnsClusterIPs))
-	for _, ip := range dnsClusterIPs {
-		if isMetadataAddress(ip) {
-			continue
-		}
-		safeDNSIPs = append(safeDNSIPs, ip)
-	}
-	dnsIPPeers := formatCIDRPeers(safeDNSIPs, false)
-	if len(dnsIPPeers) == 0 {
-		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
-	}
+	// clusterDNSPeers is the one definition of "DNS" this package has — the
+	// gateway policy and the shell sandbox's policy already share it, and
+	// sharing it here is what keeps a correction from landing on two of the
+	// three. Its own comment argues each peer; the part that matters for a
+	// session pod is that port 53 to the Cloud DNS resolver address reaches
+	// no credential, because the token API is on :80 pre-NAT and :988
+	// post-NAT and the only rule below naming 80 is LiteLLM's, whose peer is
+	// a Pod selector that no link-local address matches.
+	dnsPeers := clusterDNSPeers(dnsClusterIPs)
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -703,6 +690,12 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 			Labels:    a2aLabels(agent, "session-netpol"),
 		},
 		Spec: networkingv1.NetworkPolicySpec{
+			// No instance label, unlike the rest of what the operator
+			// renders, because the spawner stamps none — the selector can
+			// only name what the pods carry. Two PlatformAgents in one
+			// namespace would each fence the other's session pods with an
+			// identical rule set, so the effect is a duplicate fence rather
+			// than a gap; the bus grants still separate them at auth.
 			PodSelector: metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					labelPartOf:                   a2aPartOf,
@@ -716,7 +709,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 			Egress: []networkingv1.NetworkPolicyEgressRule{
 				{
 					Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
-					To:    append(dnsPeers, peersNotAlreadyPresent(dnsPeers, dnsIPPeers)...),
+					To:    dnsPeers,
 				},
 				{
 					Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
@@ -1033,9 +1026,21 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // Namespaced, and pods only. The gateway creates and reaps one pod per
 // delegated task in its own namespace; it reads no Secret, no ConfigMap and no
-// other namespace. The pods it creates carry no ServiceAccount of their own
-// (spawn.go), so this grant does not compose into a wider one by spawning
-// something more privileged than itself.
+// other namespace.
+//
+// What it does NOT bound, stated because the next reader will otherwise take
+// this rule for a ceiling: `create` on pods is a privilege-escalation
+// primitive wherever admission does not constrain the PodSpec, and nothing in
+// this repository constrains it here. A gateway that is compromised or
+// prompt-steered into building its own PodSpec can name any ServiceAccount in
+// the namespace — including the platform agent's, whose Workload Identity
+// binding then resolves for that pod — mount any Secret in it, and stamp
+// labels no NetworkPolicy selects. spawn.go declining to do any of that is
+// what the gateway CHOOSES, not what this grant PERMITS, and the two are not
+// the same claim. Narrowing it takes a ValidatingAdmissionPolicy on pod create
+// by this subject (no serviceAccountName, no secret volumes,
+// automountServiceAccountToken false); that policy does not exist yet and is
+// named in this change's PR body as the follow-up it owes.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
@@ -1142,6 +1147,18 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// when it matches the gateway's own default, so
 							// the operator-side override reaches it.
 							{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
+							// The Secret the spawner projects the bus
+							// password from. The gateway's baked default
+							// spells it for a CR named platform-agent, so on
+							// any install that renames the CR every session
+							// pod would wedge in CreateContainerConfigError
+							// on a Secret that does not exist — and wedge
+							// silently, because a pod that never runs never
+							// reaches a terminal phase for the sweeper to
+							// find, holding its session slot until the
+							// deadline. Same travel-together rule as the
+							// namespace and the owner.
+							{Name: "A2A_NATS_CREDS_SECRET", Value: a2aNATSName(agent) + "-creds"},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
 							// reads the gateway's own Deployment in THIS
@@ -1197,24 +1214,16 @@ type a2aProvisionState struct {
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
-// fence's DNS rule.
-//
-// Ungated, for the reason shellSandboxDNSClusterIPs gives about its own
-// policy: spec.networkPolicy.enabled withholds the agent's gateway policy and
-// nothing else, so a profile that returned early because that flag is false
-// would hand this rule an empty list and pin it to the fallback VIP —
-// discarding a documented dnsClusterIPs override on a policy that is still
-// enforcing. Nor does that flag switch the session fence off: it is a knob
-// about the agent pod's policy, and reading it as permission to unfence the
-// workers would make delegation the way around the agent's own allowlist,
-// which is the hole this fence closes.
+// fence's DNS rule. Ungated through the shared helper: spec.networkPolicy
+// .enabled withholds the agent's own gateway policy and nothing else, so a
+// profile that returned early on that flag would pin this rule to the
+// fallback VIP and discard a documented override on a policy that is still
+// enforcing. Nor does the flag switch the fence off — it is a knob about the
+// agent pod's policy, and reading it as permission to unfence the workers
+// would make delegation the way around the agent's own allowlist, which is
+// the hole this fence closes.
 func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
-	if agent.Spec.NetworkPolicy == nil || agent.Spec.NetworkPolicy.Enabled == nil {
-		return r.resolveNetpolProfile(ctx, agent).DNSClusterIPs
-	}
-	ungated := agent.DeepCopy()
-	ungated.Spec.NetworkPolicy.Enabled = nil
-	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
+	return r.ungatedDNSClusterIPs(ctx, agent)
 }
 
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
@@ -1409,9 +1418,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The session fence goes after the gateway Deployment above, which is
-		// what stops new session pods being spawned: unfencing first would
-		// leave the pods that are still draining with open egress for the rest
-		// of their lives.
+		// what stops new pods being spawned. It does not close the window:
+		// Delete returns as soon as the API server accepts it, and the pods
+		// already running are reaped asynchronously by GC through their
+		// ownerReference, then by their termination grace. So a flip to today
+		// with sessions in flight leaves those workers unfenced for seconds,
+		// not for their lifetimes — ordering shortens that window rather than
+		// removing it, and removing it would take a foreground delete and a
+		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
 		// ResourceQuota is not a watched kind, so the read goes through

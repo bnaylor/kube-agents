@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"net"
 	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -878,7 +879,7 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 	// Rendered unconditionally, so that an install pulling from a mirror can
 	// redirect the image the arming just started pulling.
-	if env["A2A_WORKER_IMAGE"].Value != defaultA2AWorkerImage {
+	if env["A2A_WORKER_IMAGE"].Value != a2aWorkerImage() {
 		t.Errorf("A2A_WORKER_IMAGE = %+v, want the resolved worker image", env["A2A_WORKER_IMAGE"])
 	}
 	t.Setenv(a2aWorkerImageEnvVar, "registry.example/mirror/worker:pinned")
@@ -886,6 +887,12 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 		if e.Name == "A2A_WORKER_IMAGE" && e.Value != "registry.example/mirror/worker:pinned" {
 			t.Errorf("the operator override did not reach the spawner: %+v", e)
 		}
+	}
+
+	// The spawner projects the bus password from this Secret; the gateway's
+	// baked default is right only for a CR named platform-agent.
+	if env["A2A_NATS_CREDS_SECRET"].Value != "test-agent-a2a-nats-creds" {
+		t.Errorf("A2A_NATS_CREDS_SECRET = %+v, want the Secret this CR's render actually creates", env["A2A_NATS_CREDS_SECRET"])
 	}
 
 	pods := buildA2AGatewayRole(agent).Rules[0]
@@ -946,7 +953,24 @@ func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
 		t.Errorf("DNS rule ports = %+v, want udp+tcp 53", dns.Ports)
 	}
 	if len(dns.To) == 0 {
-		t.Error("DNS rule has no peer, which permits port 53 to every destination")
+		t.Fatal("DNS rule has no peer, which permits port 53 to every destination")
+	}
+	// Port 53 to an unbounded destination is an exfiltration channel, not
+	// name resolution — the one rule here that names addresses is the one
+	// that has to be bounded. Every peer is either a named pod or a host
+	// route.
+	for _, peer := range dns.To {
+		if peer.IPBlock == nil {
+			continue
+		}
+		if _, network, err := net.ParseCIDR(peer.IPBlock.CIDR); err != nil {
+			t.Errorf("DNS peer %q is not a CIDR", peer.IPBlock.CIDR)
+		} else if ones, bits := network.Mask.Size(); ones != bits {
+			t.Errorf("DNS peer %q is a range, not a host: port 53 to a range is a tunnel", peer.IPBlock.CIDR)
+		}
+		if len(peer.IPBlock.Except) != 0 {
+			t.Errorf("DNS peer %q carries an except block, which only ever widens a host route", peer.IPBlock.CIDR)
+		}
 	}
 
 	// Rule 2: the bus, by pod label rather than IPBlock — a pod IP does not

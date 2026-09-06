@@ -192,6 +192,19 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
+    # C1's cross-module pair. The session fence is rendered by the operator
+    # (Go module k8s-operator) and its selector has to match the labels the
+    # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
+    # can compare them, and a NetworkPolicy that selects nothing is
+    # indistinguishable from one that is working.
+    "a2a_session_fence": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
+    ),
+    "a2a_spawner": Source(
+        "a2a/gateway/spawn.go",
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",

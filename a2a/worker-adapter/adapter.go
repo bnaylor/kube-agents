@@ -336,7 +336,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				// marks this window: the choice of deliverable is
 				// adapter-internal.
 				log.Warn("steer after deliverable; refusing visibly", "task", a.taskID)
-				a.publishSteerRefusal(text)
+				a.publishSteerRefusal(text, "")
 				continue
 			}
 			if err := proc.writeUser(text); err != nil {
@@ -525,11 +525,14 @@ func (a *adapter) publishResult(text string) error {
 // Best-effort, like the other stream telemetry. A refusal that fails to
 // publish is logged loudly and the run continues to its terminal event; the
 // terminal is the load-bearing publish and must not be lost to this one.
-func (a *adapter) publishSteerRefusal(steer string) {
+func (a *adapter) publishSteerRefusal(steer, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), steerRefusalPublishTimeout)
 	defer cancel()
 
-	text := "steer refused: this task's deliverable was already decided when the message arrived, so it was not applied. Send it as a new request."
+	if reason == "" {
+		reason = "this task's deliverable was already decided when the message arrived, so it was not applied. Send it as a new request."
+	}
+	text := "steer refused: " + reason
 	if echo := truncateRunes(strings.TrimSpace(steer), steerEchoCap); echo != "" {
 		text += "\nrefused message: " + echo
 	}
@@ -645,12 +648,15 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error) {
 	subject := lib.TaskInSubject(a.cfg.Addressee(), a.cfg.TaskID)
 	deadline := time.Now().Add(30 * time.Second)
+	// One consumer for the whole wait. Creating it per iteration left up to
+	// sixty ephemeral consumers on TASKS behind a slow pod start, each living
+	// until its inactivity threshold.
+	cons, consErr := a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{subject},
+		DeliverPolicy:  jetstream.DeliverAllPolicy,
+	})
 	for {
-		cons, err := a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
-			FilterSubjects: []string{subject},
-			DeliverPolicy:  jetstream.DeliverAllPolicy,
-		})
-		if err == nil {
+		if consErr == nil {
 			batch, err := cons.FetchNoWait(16)
 			if err == nil {
 				for msg := range batch.Messages() {
@@ -671,12 +677,21 @@ func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error
 			}
 		}
 		if time.Now().After(deadline) {
+			if consErr != nil {
+				return nil, 0, fmt.Errorf("consumer on %s: %w", subject, consErr)
+			}
 			return nil, 0, fmt.Errorf("no kind:message on %s within 30s", subject)
 		}
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
+		}
+		if consErr != nil {
+			cons, consErr = a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
+				FilterSubjects: []string{subject},
+				DeliverPolicy:  jetstream.DeliverAllPolicy,
+			})
 		}
 	}
 }
@@ -733,7 +748,12 @@ func (a *adapter) consumeIn(ctx context.Context, startSeq uint64, originEnvelope
 			select {
 			case steerCh <- text:
 			default:
-				a.log.Warn("steer queue full; dropping", "task", a.cfg.TaskID)
+				// Same rule as the post-deliverable window: a message the
+				// user typed does not disappear with nothing on the stream
+				// saying so. A log line is not "anywhere" — nobody holding
+				// the conversation reads the pod's logs.
+				a.log.Warn("steer queue full; refusing visibly", "task", a.cfg.TaskID)
+				a.publishSteerRefusal(text, "the queue of pending corrections for this task is full, so it was not applied. Wait for the current turn to land, then send it again.")
 			}
 		case lib.KindCancel:
 			select {

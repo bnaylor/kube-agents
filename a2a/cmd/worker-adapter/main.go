@@ -111,12 +111,16 @@ func harnessCommand() []string {
 	if maxTurns == "" {
 		maxTurns = "20"
 	}
-	// The tool surface is deliberately narrow: no Bash, no
-	// in-place edits. The pod has no ambient credentials either way; this
-	// keeps the blast radius at "writes in its own scratch dir".
+	// The tool surface is deliberately narrow: no Bash, no in-place edits,
+	// and nothing that reaches the network. The session pod's egress fence
+	// (the operator's session NetworkPolicy) permits DNS, the bus and
+	// LiteLLM, so WebFetch and WebSearch would not fail fast — a denied
+	// egress under NetworkPolicy is a black hole, and each call would burn
+	// its connect timeout against the task deadline. The fence is the
+	// control; this list agreeing with it is what keeps the failure legible.
 	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
 	if allowed == "" {
-		allowed = "Read,Write,Glob,Grep,TodoWrite,WebFetch,WebSearch"
+		allowed = "Read,Write,Glob,Grep,TodoWrite"
 	}
 	argv := []string{
 		path,
@@ -135,12 +139,32 @@ func harnessCommand() []string {
 	return argv
 }
 
-// harnessEnv is the subprocess environment: the pod env plus model-auth
-// defaults. With nothing configured, the harness talks to the install's own
-// LiteLLM - Vertex-backed via the install's credentials, no per-worker key
-// (playground posture; the deployment spec's auth story replaces this).
+// busCredentialEnv names the pod env the harness must not inherit. The
+// adapter is the only thing in this pod with any business talking to the bus,
+// and the worker user is shared across every session pod: its password
+// publishes task events for any addressee and subscribes to a2a.tasks.>. The
+// harness is a model-directed subprocess with Read in its tool surface and
+// /proc/self/environ readable at its own UID, so anything left in its
+// environment is a prompt injection away from the artifact stream.
+var busCredentialEnv = []string{"NATS_PASSWORD", "NATS_USER", "NATS_URL"}
+
+// harnessEnv is the subprocess environment: the pod env minus the bus
+// credential, plus model-auth defaults. With nothing configured, the harness
+// talks to the install's own LiteLLM - Vertex-backed via the install's
+// credentials, no per-worker key (playground posture; the deployment spec's
+// auth story replaces this).
 func harnessEnv() []string {
-	env := os.Environ()
+	withheld := make(map[string]bool, len(busCredentialEnv))
+	for _, key := range busCredentialEnv {
+		withheld[key] = true
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		if i := strings.Index(kv, "="); i > 0 && withheld[kv[:i]] {
+			continue
+		}
+		env = append(env, kv)
+	}
 	has := func(key string) bool {
 		return os.Getenv(key) != ""
 	}

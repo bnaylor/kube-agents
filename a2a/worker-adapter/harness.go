@@ -83,6 +83,7 @@ type harnessProc struct {
 
 	mu         sync.Mutex
 	stdinDead  bool
+	reapedAt   bool
 	killTimers []*time.Timer
 }
 
@@ -211,8 +212,17 @@ func (p *harnessProc) kill(grace time.Duration) {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	})
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Reaped already, which the select in the run loop can reach in the same
+	// round as a cancel: stop the timer here rather than appending it to a
+	// list nothing will drain again. Otherwise the escalation fires grace
+	// later at a pgid the kernel may have handed to someone else, which is
+	// the exact failure the timer list exists to prevent.
+	if p.reapedAt {
+		t.Stop()
+		return
+	}
 	p.killTimers = append(p.killTimers, t)
-	p.mu.Unlock()
 }
 
 // reaped stops any armed escalation timers; called after Wait so a recycled
@@ -220,6 +230,7 @@ func (p *harnessProc) kill(grace time.Duration) {
 func (p *harnessProc) reaped() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.reapedAt = true
 	for _, t := range p.killTimers {
 		t.Stop()
 	}
@@ -250,9 +261,19 @@ func (t *tailBuffer) String() string {
 	return string(t.buf)
 }
 
+// truncate cuts on a rune boundary, not a byte one: the callers put the
+// result in a JSON-marshalled status message, and a byte cut through a
+// multi-byte sequence marshals to replacement characters.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	runes := []rune(s)
+	for n > 0 && len(string(runes[:min(n, len(runes))])) > n {
+		n--
+	}
+	if n > len(runes) {
+		n = len(runes)
+	}
+	return string(runes[:n]) + "…"
 }
