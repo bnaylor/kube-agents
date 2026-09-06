@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,13 +38,27 @@ import (
 // it, and the condition is how anything downstream asks. False while the
 // callout is absent or not fully ready; true, naming the rendered map version,
 // once every replica is serving.
+// sandboxKeysSecret satisfies the reconcile step that reports a missing shell
+// sandbox keypair. Without it the reconcile parks Degraded and returns before
+// any status condition below that point is written — including this one — so a
+// status test that omits it is testing the early return rather than the
+// condition. On a working install the Secret exists.
+func sandboxKeysSecret(agent *agentv1alpha1.PlatformAgent) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      shellSandboxAuthorizedKeysSecretName(agent),
+			Namespace: agent.Namespace,
+		},
+	}
+}
+
 func TestBusCredentialsReadyTracksTheCallout(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, sandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -115,7 +130,7 @@ func TestBusCredentialsReadyIsAbsentUnderToday(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, sandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
