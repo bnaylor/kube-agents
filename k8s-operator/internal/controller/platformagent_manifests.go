@@ -333,11 +333,13 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		// render never intended — and the mode this file delivers is read back
 		// through exactly that line shape (Hermes loads the file per-line into
 		// the environment with override semantics, last occurrence winning;
-		// agents/platform/scripts/runtime_mode.py answers from the result), so
-		// a smuggled `KUBEAGENTS_MODE=next` line rendered after the operator's
-		// own pin is a mode flip written by whoever can edit the CR's chat
-		// settings. Stripped, not escaped: nothing downstream reads a
-		// multi-line value, so there is nothing to preserve.
+		// agents/platform/scripts/runtime_mode.py answers from the result, and
+		// the entrypoint's a2a_mode_probe hands these same lines to that
+		// reader to gate the A2A skill overlay at boot), so a smuggled
+		// `KUBEAGENTS_MODE=next` line rendered after the operator's own pin is
+		// a mode flip written by whoever can edit the CR's chat settings.
+		// Stripped, not escaped: nothing downstream reads a multi-line value,
+		// so there is nothing to preserve.
 		value = strings.ReplaceAll(value, "\n", "")
 		value = strings.ReplaceAll(value, "\r", "")
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))

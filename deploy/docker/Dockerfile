@@ -90,6 +90,23 @@ WORKDIR /workspace/k8s-operator
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
+# The a2a CLI — the topics reader/writer for the A2A bus (mode: next). Same
+# pattern as the event watcher above. The binary ships UNGATED at
+# /usr/local/bin: it is inert until something invokes it, and the thing that
+# invokes it — the a2a-topics skill — is what ships dark (see the
+# /opt/a2a-template COPY below and docker-entrypoint.sh step 2.6a-bis).
+FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS a2a-builder
+# Repeated for the same reason as watcher-builder above: a substituted
+# GOLANG_IMAGE must not reintroduce GOTOOLCHAIN=auto (#1138).
+ENV GOTOOLCHAIN=local
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /workspace
+COPY a2a/ /workspace/a2a/
+WORKDIR /workspace/a2a
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 
 USER root
@@ -1261,6 +1278,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
 
+# The a2a CLI, ungated (see the a2a-builder stage for why that is safe).
+COPY --from=a2a-builder --chmod=0755 /workspace/bin/a2a /usr/local/bin/a2a
+
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
 EXPOSE 9119
@@ -1365,6 +1385,17 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
      agents/platform/CAPABILITIES.md \
      /opt/platform-template/
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
+
+# --- A2A persona content, deliberately OUTSIDE /opt/platform-template ---
+# A skill in the template appears in the agent's skill list on every install,
+# including the ones where the bus does not exist — which breaks the mode
+# switch's promise that a normal install cannot tell this feature exists
+# (a2a/persona/README.md). It lands here instead, and docker-entrypoint.sh
+# step 2.6a-bis overlays it into the platform profile only when
+# runtime_mode.is_next(). Step 2.6a's replace-from-image is also why the PVC
+# is not a place a skill can live: this template is the only route.
+COPY --chown=hermes:hermes a2a/persona/platform/skills/ /opt/a2a-template/skills/
+
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
 # The specialist's Hindsight connection file. Profile-scoped: a kanban worker
@@ -1629,7 +1660,7 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 # account for.
 RUN set -eu; \
     chown -R hermes:hermes /opt/defaults; \
-    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /tmp/repo-plugins; do \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /opt/a2a-template /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
@@ -1641,7 +1672,7 @@ RUN set -eu; \
     rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
-    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do \
+    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do \
         [ -d "$d" ] \
             || { echo "$d does not exist at manifest generation; the boot check refuses to start a pod whose skill tree has no manifest inside it, so shipping this image would crash-loop the fleet" >&2; exit 1; }; \
         [ -z "$(find "$d" -type l -print -quit)" ] \
@@ -1653,7 +1684,7 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts
 
 # Guard: nothing that carries a cluster credential may come back into this image.
 #
