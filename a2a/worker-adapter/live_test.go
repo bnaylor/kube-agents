@@ -200,6 +200,42 @@ sleep 90
 		}
 	})
 
+	// The bus credential must not reach the harness, demonstrated rather than
+	// read off the code. The harness here is a script that reports what its
+	// own environment holds, through the same result channel a real harness
+	// uses, so the assertion runs against what the subprocess actually got.
+	//
+	// A marker rides in the pod env beside the password, which is what makes
+	// this a demonstration rather than an absence: the marker arriving proves
+	// the pod env reached the harness at all, so the password being missing
+	// is the filter working and not an empty environment.
+	t.Run("TheBusCredentialDoesNotReachTheHarness", func(t *testing.T) {
+		session := "chat-live-" + liveSuffix(6)
+		taskID := "task-live-" + liveSuffix(8)
+		script := `echo '{"type":"system","subtype":"init","session_id":"live-env"}'
+read first || exit 1
+SAW_PASSWORD=absent
+if [ -n "${NATS_PASSWORD:-}" ]; then SAW_PASSWORD=PRESENT; fi
+SAW_MARKER=absent
+if [ -n "${A2A_LIVE_ENV_MARKER:-}" ]; then SAW_MARKER="$A2A_LIVE_ENV_MARKER"; fi
+printf '{"type":"result","subtype":"success","result":"password=%s marker=%s"}\n' "$SAW_PASSWORD" "$SAW_MARKER"
+`
+
+		liveSubmit(t, ctx, c, session, taskID, "report your environment")
+		livePodWithScript(t, kubeContext, namespace, image, session, taskID, script)
+
+		task := liveWaitFinal(t, ctx, c, session, taskID, 4*time.Minute)
+		result := liveArtifactText(task, "result")
+		t.Logf("the harness reported: %s", result)
+
+		if !strings.Contains(result, "marker=live-marker-ok") {
+			t.Errorf("the marker did not reach the harness (%q), so this run proves nothing about the password", result)
+		}
+		if !strings.Contains(result, "password=absent") {
+			t.Errorf("the bus credential reached the harness: %q", result)
+		}
+	})
+
 	t.Run("Cancel", func(t *testing.T) {
 		session := "chat-live-" + liveSuffix(6)
 		taskID := "task-live-" + liveSuffix(8)
@@ -347,7 +383,9 @@ spec:
               name: platform-agent-a2a-nats-creds
               key: worker-password
         - name: A2A_SESSION
-          value: %s%s
+          value: %s
+        - name: A2A_LIVE_ENV_MARKER
+          value: live-marker-ok%s
       resources:
         requests: { cpu: 250m, memory: 512Mi }
       securityContext:
