@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import Rail from "./Rail.tsx";
 import { initialState, type UiState } from "./model.ts";
 
@@ -41,6 +41,45 @@ describe("Rail", () => {
     render(<Rail state={state} />);
     expect(screen.getByText("platform-bridge")).toBeTruthy();
     expect(screen.getByRole("button", { name: /replay platform-bridge/i })).toBeTruthy();
+  });
+
+  // The bus delivers envelopes faster than the 120ms ghost step on a busy
+  // install, and every non-anomalous envelope rebuilds state.agents. If the
+  // step timer is tied to anything derived from that, the replay starves:
+  // "replaying" shows in the footer and no chip ever lights.
+  it("advances the replay while the bus keeps delivering envelopes", () => {
+    vi.useFakeTimers();
+    try {
+      const base: UiState = {
+        ...initialState,
+        connection: "up",
+        pulses: [
+          { id: 1, fromSession: "platform-bridge", correlationId: "c1", kind: "status-update", at: 1 },
+          { id: 2, fromSession: "platform-bridge", correlationId: "c1", kind: "artifact-update", at: 2 },
+          { id: 3, fromSession: "platform-bridge", correlationId: "c1", kind: "status-update", at: 3 },
+        ],
+      };
+      const state = withAgents(base, "platform-bridge");
+      const { container, rerender } = render(<Rail state={state} />);
+      fireEvent.click(screen.getByRole("button", { name: /replay platform-bridge/i }));
+
+      // Traffic every 100ms — under the 120ms step — for a full second.
+      for (let i = 0; i < 10; i++) {
+        act(() => {
+          vi.advanceTimersByTime(100);
+        });
+        const agents = new Map(state.agents);
+        agents.set("platform-bridge", {
+          ...agents.get("platform-bridge")!,
+          lastActivity: 1000 + i,
+        });
+        rerender(<Rail state={{ ...state, agents }} />);
+      }
+
+      expect(container.querySelectorAll(".chip-on").length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows the stream attach count in the footer", () => {

@@ -282,20 +282,35 @@ export default function Rail({ state }: { state: UiState }) {
     [state],
   );
 
+  // `launch` is rebuilt whenever tapX changes, which is every envelope from
+  // any session (touchAgent replaces state.agents). Depending on it here
+  // would tear down and restart the step timeout on each one, so on a bus
+  // busier than one envelope per GHOST_STEP_MS the index never advances and
+  // the strip stays dark while the footer reads "replaying". The clock keys
+  // on the run's own position and reaches `launch` through a ref.
+  const launchRef = useRef(launch);
+  launchRef.current = launch;
+
+  const ghostSession = ghost?.session;
+  const ghostIndex = ghost?.index ?? -1;
+  const ghostLast = ghost ? ghost.steps.length - 1 : -1;
+
   useEffect(() => {
-    if (!ghost) return;
-    if (ghost.index >= ghost.steps.length - 1) {
+    if (ghostSession === undefined) return;
+    if (ghostIndex >= ghostLast) {
       const done = setTimeout(() => setGhost(null), PULSE_MS + 300);
       return () => clearTimeout(done);
     }
     const next = setTimeout(() => {
-      const i = ghost.index + 1;
-      const step = ghost.steps[i];
-      launch(ghost.session, step.kind, "", true, `g${ghost.session}-${i}`);
-      setGhost((g) => (g && g.session === ghost.session ? { ...g, index: i } : g));
+      setGhost((g) => {
+        if (!g || g.session !== ghostSession || g.index !== ghostIndex) return g;
+        const i = ghostIndex + 1;
+        launchRef.current(g.session, g.steps[i].kind, "", true, `g${g.session}-${i}`);
+        return { ...g, index: i };
+      });
     }, GHOST_STEP_MS);
     return () => clearTimeout(next);
-  }, [ghost, launch]);
+  }, [ghostSession, ghostIndex, ghostLast]);
 
   // --- render ----------------------------------------------------------------
   const now = performance.now();
