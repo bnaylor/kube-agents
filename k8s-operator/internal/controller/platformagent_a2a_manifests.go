@@ -798,7 +798,18 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
-						VolumeMounts:    []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
+						// nats-box ships WORKDIR /root and declares no USER, so
+						// it expects to run as root (measured on 0.14.5). The
+						// pod above runs it as 1000, which cannot so much as
+						// stat a 0700 root-owned directory: the Job died on
+						// "stat .: permission denied" after printing its
+						// provisioning JSON, and a fresh next install came up
+						// with a healthy bus and no streams at all (#1259).
+						// An image's WORKDIR is chosen for the user that image
+						// expects, so a render overriding the user owns the
+						// working directory too. /tmp is the emptyDir above.
+						WorkingDir:   "/tmp",
+						VolumeMounts: []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
 						Env: []corev1.EnvVar{{
 							Name: "HOME", Value: "/tmp",
 						}, {

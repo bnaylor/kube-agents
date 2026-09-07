@@ -1081,6 +1081,42 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	}
 }
 
+// TestTheProvisionJobDeclaresItsOwnWorkingDirectory pins the half of the
+// hardening above that #1211 did not carry, and that #1259 found on a real
+// cluster: the pod runs nats-box as UID 1000, and nats-box ships WORKDIR /root
+// with no USER because it expects to be root. Inheriting that WORKDIR killed
+// every provisioning run on "stat .: permission denied" after it printed its
+// JSON -- a healthy bus with no streams at all, and a client seeing
+// "stream TOPICS-STATE: not found" with nothing in the render to blame.
+//
+// Neither unit tests nor goldens could see it, because the render was right and
+// the kubelet was the one refusing. That is the argument for asserting it here
+// anyway: the render is where the decision lives, even when the failure lands
+// somewhere else.
+//
+// The general rule, for whoever adds the fourth A2A container: an image's
+// WORKDIR is chosen for the user that image expects, so a render that overrides
+// the user owns the working directory too. Asserted against the container's
+// mounts rather than the literal "/tmp", so moving the writable volume cannot
+// leave this green while pointing somewhere unwritable.
+func TestTheProvisionJobDeclaresItsOwnWorkingDirectory(t *testing.T) {
+	job := buildA2AProvisionJob(newTestPlatformAgent())
+	spec := job.Spec.Template.Spec
+	c := spec.Containers[0]
+
+	if c.WorkingDir == "" {
+		t.Fatalf("provision container inherits the image's WORKDIR (/root on nats-box) "+
+			"while the pod runs as UID %d, which cannot stat it", *spec.SecurityContext.RunAsUser)
+	}
+	if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+		return m.MountPath == c.WorkingDir
+	}) {
+		t.Errorf("WorkingDir %q is not one of the container's mounts %v; the hardened "+
+			"context sets ReadOnlyRootFilesystem, so an unmounted path is unwritable",
+			c.WorkingDir, c.VolumeMounts)
+	}
+}
+
 // TestA2AProvisionJobConditionsDriveStatus exercises the three branches the Job
 // condition scan feeds: done, failed (which the controller turns into a Degraded
 // phase with A2AProvisionFailed), and neither (which requeues). All three shipped
