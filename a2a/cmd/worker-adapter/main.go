@@ -26,6 +26,39 @@ import (
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
+const (
+	// defaultTaskDeadlineSeconds is the worker half of a contract whose other
+	// half is the gateway's defaultTaskDeadline (a2a/gateway/config.go). The
+	// two must agree, and its comment points here by env var name -- so the
+	// value it points at has to be findable by name rather than as a bare
+	// literal mid-function.
+	defaultTaskDeadlineSeconds = 1800
+	// defaultKillGraceSeconds is how long a SIGTERMed harness has to flush
+	// before the adapter stops waiting for it.
+	defaultKillGraceSeconds = 10
+
+	// defaultWorkdir is the pod's scratch emptyDir. A local run falls back to
+	// the current directory, which is why this is a default and not a require.
+	defaultWorkdir = "/scratch"
+
+	// defaultModel is the profile-neutral alias LiteLLM routes; naming the
+	// concrete model belongs in the install, not here.
+	defaultModel = "model-default"
+	// defaultMaxTurns bounds one task's agent loop. A string because it is
+	// passed straight through as an argv value.
+	defaultMaxTurns = "20"
+	// defaultAllowedTools is the harness tool surface, deliberately narrow:
+	// no Bash, no in-place edits, nothing that reaches the network. It has to
+	// agree with the session pod's egress fence -- see the comment at its use.
+	defaultAllowedTools = "Read,Write,Glob,Grep,TodoWrite"
+
+	// defaultModelBaseURL is the install's own LiteLLM. defaultModelAPIKey is
+	// not a credential: LiteLLM here runs keyless and the harness only checks
+	// that the variable is non-empty.
+	defaultModelBaseURL = "http://litellm"
+	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
+)
+
 func main() {
 	os.Exit(run())
 }
@@ -51,8 +84,8 @@ func run() int {
 		Session:        os.Getenv("A2A_SESSION"),
 		HarnessCommand: harnessCommand(),
 		HarnessEnv:     harnessEnv(),
-		TaskDeadline:   envDuration("A2A_TASK_DEADLINE_SECONDS", 1800),
-		KillGrace:      envDuration("A2A_KILL_GRACE_SECONDS", 10),
+		TaskDeadline:   envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
+		KillGrace:      envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
 		Logger:         log,
 	}
 
@@ -60,7 +93,7 @@ func run() int {
 	// the current directory keeps local runs working.
 	workdir := os.Getenv("A2A_WORKDIR")
 	if workdir == "" {
-		workdir = "/scratch"
+		workdir = defaultWorkdir
 	}
 	if err := os.Chdir(workdir); err != nil {
 		log.Warn("workdir unavailable; staying put", "workdir", workdir, "err", err)
@@ -105,11 +138,11 @@ func harnessCommand() []string {
 	}
 	model := os.Getenv("A2A_MODEL")
 	if model == "" {
-		model = "model-default"
+		model = defaultModel
 	}
 	maxTurns := os.Getenv("A2A_MAX_TURNS")
 	if maxTurns == "" {
-		maxTurns = "20"
+		maxTurns = defaultMaxTurns
 	}
 	// The tool surface is deliberately narrow: no Bash, no in-place edits,
 	// and nothing that reaches the network. The session pod's egress fence
@@ -120,7 +153,7 @@ func harnessCommand() []string {
 	// control; this list agreeing with it is what keeps the failure legible.
 	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
 	if allowed == "" {
-		allowed = "Read,Write,Glob,Grep,TodoWrite"
+		allowed = defaultAllowedTools
 	}
 	argv := []string{
 		path,
@@ -170,10 +203,10 @@ func harnessEnv() []string {
 	}
 	if !has("ANTHROPIC_BASE_URL") && !has("CLAUDE_CODE_USE_VERTEX") && !has("ANTHROPIC_API_KEY") {
 		env = append(env,
-			"ANTHROPIC_BASE_URL=http://litellm",
+			"ANTHROPIC_BASE_URL="+defaultModelBaseURL,
 			// LiteLLM here runs keyless; the value only satisfies the
 			// harness's "an API key exists" check.
-			"ANTHROPIC_API_KEY=a2a-playground")
+			"ANTHROPIC_API_KEY="+defaultModelAPIKey)
 	}
 	for _, kv := range []string{
 		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
