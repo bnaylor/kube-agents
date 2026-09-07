@@ -23,6 +23,24 @@ import (
 // self-contained executable, not a cli.js).
 const DefaultHarnessPath = "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
 
+const (
+	// stderrTailBytes is how much of the harness's stderr is kept for a
+	// failure message. A tail rather than the whole stream: the useful part
+	// of a crash is its end, and the value rides a status event onto the bus.
+	stderrTailBytes = 2048
+	// harnessEventDepth buffers events between the scanner goroutine and the
+	// adapter loop, so a slow publish does not stall the read that keeps the
+	// harness's stdout pipe draining.
+	harnessEventDepth = 64
+	// scannerInitialBytes is the scanner's starting buffer; scannerMaxBytes is
+	// the ceiling and is load-bearing. One harness event is one line of JSON,
+	// and a result line above this limit does not truncate -- the scanner stops
+	// with bufio.ErrTooLong and the task loses its deliverable, so this bounds
+	// the largest answer a worker can return.
+	scannerInitialBytes = 64 * 1024
+	scannerMaxBytes     = 8 * 1024 * 1024
+)
+
 // harnessEvent is one stream-json line from the harness stdout. Only the
 // fields the mapper consults; unknown fields and unknown types pass through
 // the decoder untouched and are ignored, mirroring the envelope's own
@@ -107,14 +125,14 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 	if err != nil {
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
-	stderr := &tailBuffer{max: 2048}
+	stderr := &tailBuffer{max: stderrTailBytes}
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn harness: %w", err)
 	}
 
-	events := make(chan harnessEvent, 64)
+	events := make(chan harnessEvent, harnessEventDepth)
 	scanDone := make(chan struct{})
 	var scanFailed error
 	var scanMu sync.Mutex
@@ -123,7 +141,7 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 		defer close(events)
 		sc := bufio.NewScanner(stdout)
 		// Result lines carry a whole turn's text; give them room.
-		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		sc.Buffer(make([]byte, 0, scannerInitialBytes), scannerMaxBytes)
 		for sc.Scan() {
 			line := sc.Bytes()
 			if len(line) == 0 {
@@ -268,12 +286,18 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	runes := []rune(s)
-	for n > 0 && len(string(runes[:min(n, len(runes))])) > n {
-		n--
+	// The cut is the last rune boundary at or before the budget. The first
+	// spelling shrank n while the first n RUNES exceeded n BYTES, a condition
+	// only satisfiable on a pure-ASCII prefix -- so it walked n down to the
+	// first multi-byte rune and stopped, discarding everything after it.
+	// "10 ASCII + é + 200 more" truncated to 10 characters against a budget of
+	// 50, and an all-multibyte string truncated to nothing at all.
+	cut := 0
+	for i := range s { // range over a string yields rune start offsets
+		if i > n {
+			break
+		}
+		cut = i
 	}
-	if n > len(runes) {
-		n = len(runes)
-	}
-	return string(runes[:n]) + "…"
+	return s[:cut] + "…"
 }

@@ -167,9 +167,19 @@ func waitOutcome(t *testing.T, done <-chan runOutcome, within time.Duration) run
 }
 
 // waitState polls the fold until the task reaches the given state.
+// waitDeadline bounds the polling helpers below. It is deliberately generous:
+// every one of them returns the moment the condition holds, so the value costs
+// a passing run nothing and only decides how long a genuine failure takes to
+// report. 15s was not generous enough -- TestAssertion21_SteerReachesStdinExactlyOnce
+// failed CI at 15.12s while taking 3.5s locally, because the shared runner is
+// slower under -race and these tests drive a real embedded JetStream server and
+// a shell harness. A flake here reads as a product defect, which is worse than
+// a slow failure.
+const waitDeadline = 90 * time.Second
+
 func waitState(t *testing.T, c *lib.Client, addressee, taskID string, state lib.TaskState) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		task, err := c.TasksGet(ctx, addressee, taskID)
@@ -449,7 +459,7 @@ sleep 10
 	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
 	waitState(t, c, session, taskID, lib.StateWorking)
 
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for {
 		if _, err := os.Stat(marker); err == nil {
 			break
