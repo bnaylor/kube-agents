@@ -89,13 +89,24 @@ func testClient(t *testing.T, url string) *lib.Client {
 
 // stub writes a shell script standing in for the harness binary and returns
 // the argv to run it.
+// stub writes a fake harness. BASH, not sh, and the difference is not
+// cosmetic: the steer stub below paces itself with `read -t`, which is a bash
+// extension POSIX does not have. macOS /bin/sh is bash and accepts it; Ubuntu
+// /bin/sh is dash and answers "read: Illegal option -t", so on CI the read
+// returned instantly instead of waiting.
+//
+// That did not fail loudly. It made the task race through `working` to
+// terminal before waitState's poller could observe the transition, so the test
+// failed as "task never reached working" -- a state machine complaint about a
+// shell portability bug. Raising the deadline only made it fail slower, which
+// is how it was misdiagnosed as a slow-runner flake first time round.
 func stub(t *testing.T, body string) []string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "stub.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/bash\n"+body), 0o755); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
-	return []string{"/bin/sh", path}
+	return []string{"/bin/bash", path}
 }
 
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
