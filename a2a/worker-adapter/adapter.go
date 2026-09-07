@@ -1,6 +1,7 @@
 package workeradapter
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -404,7 +405,20 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			reason += " - " + waitErr.Error()
 		}
 		if serr := proc.scanErr(); serr != nil {
-			reason += " - stdout: " + serr.Error()
+			// Name the ceiling and its value rather than relaying
+			// "token too long", which says nothing an operator can act on.
+			// The deliverable is refused, never truncated: a silently
+			// shortened answer is worse than a loud failure.
+			if errors.Is(serr, bufio.ErrTooLong) {
+				reason += fmt.Sprintf(
+					" - the harness emitted a single output line over the %d-byte limit"+
+						" (%d MiB, scannerMaxBytes in harness.go); the deliverable was refused"+
+						" rather than truncated. A line this size is usually a file dumped"+
+						" into the answer.",
+					scannerMaxBytes, scannerMaxBytes/(1024*1024))
+			} else {
+				reason += " - stdout: " + serr.Error()
+			}
 		}
 		if evidence != "" {
 			reason += "\nstderr tail:\n" + evidence

@@ -9,35 +9,28 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// TestLifecycle_OversizeResultLineStallsToTheDeadline answers the question naming
-// scannerMaxBytes raised but did not settle: a result line past the 8 MiB
-// ceiling does not truncate, so what does the task become?
+// TestLifecycle_OversizeResultLineFailsWithTheCeilingNamed pins what a result
+// line past scannerMaxBytes does. It does not truncate, and it must not stall.
 //
-// The bad answer would be an apparently-successful empty result — the harness
-// exits 0 having written its deliverable, the adapter never parses it, and the
-// task completes with nothing in it. That is worse than losing the text,
-// because a caller cannot tell it happened.
+// It used to stall. The scanner stopped with bufio.ErrTooLong and nothing
+// drained stdout, so the harness blocked forever writing into a full 64KB pipe,
+// cmd.Wait never returned, and the task ran to TaskDeadline -- 1800s in
+// production -- reporting `deadline-exceeded`. That reason is worse than no
+// reason: it sends the next debugger after a slow model when the answer is a
+// full pipe.
 //
-// The actual answer is worse than either, and this pins it so a fix can be
-// measured against it. The scanner stops with bufio.ErrTooLong and nothing
-// drains stdout afterwards, so the harness BLOCKS forever writing into a full
-// pipe. cmd.Wait never returns, the adapter never reaches its
-// stream-ended-without-result path, and the task sits until TaskDeadline —
-// 1800s in production (A2A_TASK_DEADLINE_SECONDS) — before reporting
-// `deadline-exceeded`.
+// Now the scan goroutine drains and discards after the error, so the child
+// exits, cmd.Wait returns, and the terminal reason names the ceiling and its
+// value. The deliverable is still refused rather than truncated, which is the
+// deliberate half: a silently shortened answer is worse than a loud failure,
+// and a line this size means a model dumped a file into its result.
 //
-// So the cost is not just the lost deliverable:
-//   - the reason is actively misleading; `deadline-exceeded` reads as "the
-//     model took too long", not "the answer was too big to read",
-//   - the pod holds its session slot, and its shared bus credential, for the
-//     whole deadline doing nothing,
-//   - and `scannerMaxBytes` is therefore not a truncation limit but a stall
-//     trigger.
-//
-// The fix is to keep draining stdout after a scan error (discarding), so the
-// harness can exit and the adapter can report the real cause. Recorded rather
-// than fixed here: it is a behaviour change on the worker's terminal path.
-func TestLifecycle_OversizeResultLineStallsToTheDeadline(t *testing.T) {
+// The deadline here is injected and generous on purpose. It has to be injected
+// so a regression fails in a minute instead of hanging for the production
+// 1800s, and generous because a deadline-based test that waits on a stall is
+// exactly the shape that flakes -- this PR already fixed one that failed CI at
+// 15.12s against a 15s bound.
+func TestLifecycle_OversizeResultLineFailsWithTheCeilingNamed(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
 	const session, taskID = "chat-tapir-oversize", "task-oversize-1"
@@ -53,7 +46,10 @@ head -c 9000000 /dev/zero | tr '\0' 'x'
 printf '"}\n'
 exit 0
 `)
-	out := waitOutcome(t, runAdapter(context.Background(), adapterConfig(url, taskID, session, harness)), 120*time.Second)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.TaskDeadline = 90 * time.Second
+	started := time.Now()
+	out := waitOutcome(t, runAdapter(context.Background(), cfg), 120*time.Second)
 	if out.res.State != lib.StateFailed {
 		t.Fatalf("state %q, want failed: an oversize deliverable must not read as success", out.res.State)
 	}
@@ -63,15 +59,22 @@ exit 0
 	}
 	events := replayEvents(t, url, session, taskID)
 	text := statusOf(t, events[len(events)-1]).Status.Message.Parts[0].Text
-	// Pinned as-is, deliberately. When the drain lands, this flips to
-	// stream-ended-without-result naming bufio.ErrTooLong, and this test
-	// failing is the signal that it worked.
-	if !strings.Contains(text, "deadline-exceeded") {
-		t.Errorf("expected the documented current behaviour (a stall to the task "+
-			"deadline); if this now names the scanner error instead, the drain "+
-			"landed and this test should be inverted: %q", text)
+	if strings.Contains(text, "deadline-exceeded") {
+		t.Fatalf("the oversize line stalled to the task deadline again — the "+
+			"drain after the scan error has regressed: %q", text)
 	}
-	if strings.Contains(text, "token too long") {
-		t.Errorf("the scanner error now reaches the reason — good; invert this test")
+	if !strings.Contains(text, "stream-ended-without-result") {
+		t.Errorf("reason does not say the stream ended without a result: %q", text)
+	}
+	if !strings.Contains(text, "8388608-byte limit") || !strings.Contains(text, "scannerMaxBytes") {
+		t.Errorf("reason does not name the ceiling and its value, so it is accurate "+
+			"but not actionable: %q", text)
+	}
+	// The point of the drain is that this no longer waits out the clock. A
+	// wide margin: the assertion is "promptly, not at the deadline", and the
+	// deadline is 90s.
+	if elapsed := time.Since(started); elapsed > 60*time.Second {
+		t.Errorf("took %s to fail; the drain should let the harness exit "+
+			"promptly rather than running to the deadline", elapsed)
 	}
 }

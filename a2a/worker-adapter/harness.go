@@ -161,6 +161,14 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 			scanMu.Lock()
 			scanFailed = err
 			scanMu.Unlock()
+			// Drain what the scanner will no longer read. The harness does not
+			// know we have stopped: it keeps writing, the 64KB pipe fills, and
+			// it blocks on write forever -- so cmd.Wait never returns and the
+			// task stalls to its deadline (1800s in production) instead of
+			// failing with the cause recorded just above. Discarding rather
+			// than buffering, deliberately: the line that overflowed is the one
+			// we already refused to hold in memory.
+			_, _ = io.Copy(io.Discard, stdout)
 		}
 	}()
 
