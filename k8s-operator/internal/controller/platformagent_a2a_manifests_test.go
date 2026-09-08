@@ -222,9 +222,15 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"worker":    {"$JS.ACK.TASKS.>"},
 		"agent":     nil,
 		"provision": nil,
-		"seed":      nil,
-		"web":       nil,
-		"sys":       nil,
+		// The session's grants are derived, so it holds no listed grant of
+		// any kind, ack included. What it actually gets at mint time is
+		// also ack-free: its three consumers are ack-none pulls, and an ack
+		// grant on the shared TASKS stream cannot distinguish consumers, so
+		// granting one would let a session +TERM the gateway's deliveries.
+		"session": nil,
+		"seed":    nil,
+		"web":     nil,
+		"sys":     nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {

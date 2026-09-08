@@ -167,6 +167,17 @@ func a2aProvisionServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-provision"
 }
 
+// Spawned session pods run as their own ServiceAccount so the callout has an
+// identity to resolve them by, and so the projected token they carry is bound
+// to their own pod. It holds no RBAC at all, and that is the security property:
+// the token's whole purpose is to be presented to NATS, and a session pod that
+// could reach the API server with it would have gained something no session
+// needs. One ServiceAccount is shared by every session — the pod claim is what
+// separates them, not the account. See sessionIdentity.
+func a2aSessionServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-session"
+}
+
 // a2aLabels returns the common labels with part-of overridden to a2a-next and
 // the component named. withCommonLabels leaves pre-set keys alone, so these
 // survive applyManaged.
@@ -1182,6 +1193,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// or anything else — deletes the gateway. The
 							// Role above grants the one get this needs.
 							{Name: "A2A_OWNER_DEPLOYMENT", Value: name},
+							// The identity spawned sessions run as. Rendered
+							// rather than baked for the same reason as the
+							// creds Secret above: the gateway's default spells
+							// it for a CR named platform-agent, and on a
+							// renamed CR every session pod would fail to
+							// schedule against a ServiceAccount that does not
+							// exist. The callout's map is keyed on this exact
+							// name, so the render and the spawner must agree
+							// or every session is refused at connect.
+							{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
 						},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
@@ -1459,6 +1480,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aProvisionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The session identity. Removed on a flip to today alongside the
+		// session fence below: with the gateway gone nothing spawns pods that
+		// would mount a token for it, and leaving it behind would leave a
+		// mintable bus identity in a namespace that no longer runs a bus.
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},

@@ -79,6 +79,12 @@ type a2aAuthMapIdentity struct {
 	User           string           `json:"user"`
 	Account        string           `json:"account"`
 	Grants         a2aAuthMapGrants `json:"grants"`
+
+	// Narrowing is omitted for the ordinary principals, so adding it changed
+	// no existing entry's bytes and therefore no existing version. Where it
+	// is set, the callout ignores Grants entirely and derives them from the
+	// claim it attested — and refuses the map if Grants is not empty.
+	Narrowing string `json:"narrowing,omitempty"`
 }
 
 type a2aAuthMapDocument struct {
@@ -106,6 +112,7 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent) (a2aAuthMapDocument, e
 				Publish:   id.publish,
 				Subscribe: id.subscribe,
 			},
+			Narrowing: id.narrowing,
 		})
 	}
 

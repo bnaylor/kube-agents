@@ -46,6 +46,22 @@ func TestEveryPrincipalMaySubscribeToItsOwnInbox(t *testing.T) {
 			// human with the system account's own privileges.
 			continue
 		}
+		if id.narrowing != "" {
+			// A narrowed principal's inbox grant is derived at mint
+			// time from the claim the API server attested, not listed
+			// here — and the callout refuses the whole map if it IS
+			// listed, which would take every other principal down with
+			// it. So the property this test exists for is asserted
+			// where the derivation happens, against a real server:
+			// a2a/authcallout, TestASessionReachesEverythingItsOwnWorkNeeds.
+			// What is checkable here is the half that keeps the map
+			// servable at all.
+			if len(id.publish) > 0 || len(id.subscribe) > 0 {
+				t.Errorf("%s narrows on %q but carries grants (%d publish, %d subscribe); the callout refuses a map like this outright",
+					id.user, id.narrowing, len(id.publish), len(id.subscribe))
+			}
+			continue
+		}
 		want := "_INBOX." + id.user + ".>"
 		if !slices.Contains(id.subscribe, want) {
 			t.Errorf("%s: subscribe list lacks %q; every reply it waits on would time out", id.user, want)
@@ -207,4 +223,49 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 		t.Fatalf("generateA2ACalloutKeys: %v", err)
 	}
 	return keys
+}
+
+// The narrowed principal, pinned as data. Three things have to agree for a
+// session to connect at all — the ServiceAccount the spawner names, the
+// ServiceAccount the map is keyed on, and the narrowing the callout switches on
+// — and they are rendered from three different places.
+func TestTheSessionPrincipalIsNarrowedAndOtherwiseEmpty(t *testing.T) {
+	agent := identityTestAgent()
+	var session *a2aIdentity
+	for _, id := range a2aIdentities(agent) {
+		if id.user == "session" {
+			cp := id
+			session = &cp
+		}
+	}
+	if session == nil {
+		t.Fatal("no session principal is rendered; spawned pods would have no identity to present")
+	}
+	if session.auth != a2aAuthCallout {
+		t.Error("the session principal does not authenticate by callout; a static session is the shared credential again")
+	}
+	if session.credsKey != "" {
+		t.Errorf("the session principal carries creds key %q; no session may have a shared secret", session.credsKey)
+	}
+	if session.narrowing != a2aNarrowingPod {
+		t.Errorf("session narrowing = %q, want %q", session.narrowing, a2aNarrowingPod)
+	}
+	if len(session.publish) != 0 || len(session.subscribe) != 0 {
+		t.Errorf("the session principal carries grants: %v / %v", session.publish, session.subscribe)
+	}
+	// Keyed on the ServiceAccount the spawner will actually name.
+	want := a2aServiceAccountName(agent.Namespace, a2aSessionServiceAccountName(agent))
+	if session.serviceAccount != want {
+		t.Errorf("session serviceAccount = %q, want %q", session.serviceAccount, want)
+	}
+}
+
+// No session pod may be handed the shared worker password again. This is the
+// regression that gke-labs#1270 is about, asserted at the render.
+func TestNoSessionPrincipalSharesTheWorkerCredential(t *testing.T) {
+	for _, id := range a2aIdentities(identityTestAgent()) {
+		if id.user == "session" && id.credsKey == "worker-password" {
+			t.Fatal("the session principal was given the worker password back")
+		}
+	}
 }

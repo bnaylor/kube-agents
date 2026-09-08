@@ -86,9 +86,22 @@ type a2aIdentity struct {
 	// here.
 	comment string
 
+	// narrowing, when set, means this principal's grants are NOT rendered
+	// into the map: the callout derives them at mint time from a claim the
+	// API server attested about the workload connecting. a2aNarrowingPod is
+	// the only value. A narrowed principal MUST leave publish and subscribe
+	// empty, and the callout refuses the whole map if it does not — see
+	// sessionIdentity for why that is fail-closed rather than fussy.
+	narrowing string
+
 	publish   []string
 	subscribe []string
 }
+
+// a2aNarrowingPod marks a principal whose grants derive from the attested pod
+// name. It must match the callout's NarrowingPod; the two modules cannot import
+// each other, so the shared fixture is what keeps them honest.
+const a2aNarrowingPod = "pod"
 
 // Account names. One application account per scope; $SYS for operators and
 // monitoring, which no agent ever authenticates into.
@@ -116,6 +129,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		gatewayIdentity(agent, ns),
 		agentIdentity(agent, ns),
 		provisionIdentity(agent, ns),
+		sessionIdentity(agent, ns),
 		workerIdentity(),
 		seedIdentity(),
 		webIdentity(),
@@ -307,27 +321,70 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 	}
 }
 
-// worker: executor for any addressee, shared by every spawned session pod.
+// session: one spawned session pod, per incarnation.
 //
-// STATIC, and this is the residue A2 exists to close. A session pod carries no
-// Kubernetes identity at all — the spawner sets AutomountServiceAccountToken
-// false, names no ServiceAccountName, and mounts nothing but scratch — so there
-// is no token to present and nothing for the callout to resolve. Giving every
-// session pod one shared ServiceAccount would move the shared credential rather
-// than end it, which is why A1 leaves this alone: A2 gives each session its own
-// principal, scoped to its own addressee prefix, and this entry goes away.
+// This is the entry with no grants, and the empty lists are the point.
 //
-// The seed Job (hand-applied, `a2a/deploy/seed.yaml`) also authenticates here
-// for the same reason; it is the artifact nothing owns.
+// Every session pod runs as this one ServiceAccount. That is deliberate: a KSA
+// per conversation would be a credential-bearing API object created and reaped
+// per chat, which is the orphan class the pod sweep just closed, in its most
+// dangerous form. So the ServiceAccount cannot tell two sessions apart — and it
+// does not have to. The spawner projects a token bound to the pod, TokenReview
+// reports that pod's name and UID, and the callout builds the session's entire
+// grant set from the attested name: its own events subject, its own three named
+// consumers on TASKS, its own inbox, and nothing else.
+//
+// Why the grants are not written here and then narrowed. If this entry carried
+// the real grants, then one code path that forgot to narrow — or one map edit by
+// someone who did not know the code narrowed it — would hand every session pod
+// the whole list at once. That is the shared `worker` credential reborn under a
+// new name, and it would look correct in review. An entry that grants nothing
+// on its own cannot be widened by editing the map: no claim, no grants, no
+// connection. The callout refuses at parse if this entry ever gains a grant.
+//
+// What a reader of the live ConfigMap sees here is therefore an entry that
+// appears to do nothing, and the comment beside it has to carry the whole
+// explanation, because the grants cannot.
+func sessionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	return a2aIdentity{
+		user:    "session",
+		account: a2aAccountApp,
+		comment: "one spawned session pod, per incarnation. Its grants are DERIVED, not listed: " +
+			"every session runs as this one ServiceAccount, and the callout scopes each connection " +
+			"to the pod the API server attested it was minted into - its own task's events, its own " +
+			"three consumers, its own inbox. The empty lists here are load-bearing: an entry that " +
+			"granted anything on its own could be widened by editing this map, which is how the " +
+			"shared worker credential would come back.",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aSessionServiceAccountName(agent)),
+		narrowing:      a2aNarrowingPod,
+	}
+}
+
+// worker: executor for any addressee.
+//
+// STATIC, and it is now a shrinking residue rather than the whole session
+// story. Session pods no longer authenticate as this: they have a
+// ServiceAccount and a pod-bound token, and the session principal above gives
+// each incarnation its own grants. What still uses this password is the
+// hand-applied seed tooling's twin below and the agent-side workloads that have
+// not moved yet, so the entry stays until those do — retiring it is sequencing,
+// not this change's.
+//
+// It is kept here unchanged on purpose: every grant in this list is something a
+// session pod used to hold, and the diff between it and sessionIdentity above
+// is the measure of what A2 actually removed. Publishing task events for ANY
+// addressee, `$JS.API.>`, and a subscribe on the whole task plane are the three
+// that mattered.
 func workerIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    "worker",
 		account: a2aAccountApp,
-		comment: "executor for any addressee, shared by every spawned session pod.\n" +
-			"STATIC because a session pod carries no Kubernetes identity at all -\n" +
-			"no ServiceAccount, no projected token, nothing to present. Giving them\n" +
-			"all one shared ServiceAccount would move the shared credential rather\n" +
-			"than end it, so this closes when each session gets its own principal.",
+		comment: "executor for any addressee. STATIC, and no longer held by session pods:\n" +
+			"each session now presents a pod-bound ServiceAccount token and the callout\n" +
+			"scopes it to its own task (see the session entry in the identity map). What\n" +
+			"still authenticates here is the hand-applied seed tooling's twin and the\n" +
+			"agent-side workloads that have not moved, so the password stays until they do.",
 		auth:     a2aAuthStatic,
 		credsKey: "worker-password",
 		publish: []string{
