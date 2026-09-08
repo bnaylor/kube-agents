@@ -359,9 +359,16 @@ accounts {
             # (the operator once profiles are CRs), not by workers", and
             # nothing in the tree publishes one today — this grant had no
             # caller and let the least-trusted principal in the deployment
-            # overwrite any profile's directory entry. The gateway keeps
-            # SUBSCRIBE on the same subjects, which is the read discovery
-            # actually needs.
+            # forge any profile's card. The gateway keeps SUBSCRIBE on the
+            # same subjects, which is the read discovery actually needs.
+            #
+            # This closes forgery, not reach: $JS.API.> below still covers
+            # STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
+            # STREAM.DELETE.DIRECTORY, so worker can still erase the whole
+            # directory in one call. Scoping that wildcard the way #1306
+            # scopes seed's is gke-labs/kube-agents#1316, and it is a
+            # separate change: the worker's JetStream use is TASKS and the
+            # KV bucket, and narrowing to those wants its own live proof.
             "agents.hb.>",
             "$KV.runtime-state.>",
             "$JS.API.>",
