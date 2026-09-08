@@ -148,12 +148,15 @@ var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-passwor
 // the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
 // KV_<bucket>, so they belong in the same list.
 //
-// The provision script and the seed grant in nats.conf both render from this
-// one slice on purpose. They are a pair — a grant that does not name a stream
-// makes the script's create for it time out on a refused API request, and a
-// script that creates a stream the grant does not name is the same bug from the
-// other side. Held apart in two string literals, the pair drifts silently the
-// first time someone adds a stream; held here, it cannot.
+// The seed grant in nats.conf renders from this slice. The provision script
+// does not: each stream's create line carries its own subjects, retention and
+// caps, so the script names the streams itself, in a2aProvisionScript. The two
+// are a pair — a grant that does not name a stream makes the script's create
+// for it time out on a refused API request, and a script that creates a stream
+// the grant does not name is the same bug from the other side — and what holds
+// them together is TestSeedGrantsAndProvisionScriptNameTheSameStreams, which
+// reads the script's `stream add` / `kv add` lines and checks both directions
+// against this list. Add a stream to one side and that test says so.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap",

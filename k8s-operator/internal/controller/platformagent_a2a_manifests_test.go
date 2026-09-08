@@ -1313,12 +1313,16 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 	script := a2aProvisionScript(a2aTestAgent())
 
 	for _, s := range a2aProvisionedStreams {
-		// KV buckets appear in the script under their bare name; streams under theirs.
-		bare := strings.TrimPrefix(s, "KV_")
-		if !strings.Contains(script, " "+bare+" ") && !strings.Contains(script, " "+bare+"\n") &&
-			!strings.Contains(script, " "+bare+" \\") {
-			t.Errorf("a2aProvisionedStreams names %q but the provision script never mentions %q; "+
-				"the grant permits a stream nothing creates", s, bare)
+		// Anchor to the create itself, not to the bare name: the script's prose
+		// mentions every bucket by name in a comment block, so a token match
+		// stayed green with the `kv add` line deleted. Only a create counts.
+		create := "stream add " + s + " "
+		if bare, isKV := strings.CutPrefix(s, "KV_"); isKV {
+			create = "kv add " + bare + " "
+		}
+		if !strings.Contains(script, create) {
+			t.Errorf("a2aProvisionedStreams names %q but the provision script has no %q; "+
+				"the grant permits a stream nothing creates", s, strings.TrimSpace(create))
 		}
 		for _, verb := range []string{"CREATE", "INFO"} {
 			want := "$JS.API.STREAM." + verb + "." + s
@@ -1354,9 +1358,19 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 // STREAM.PURGE against the running install, and the provision Job still
 // completing. This test exists to keep the wildcard from coming back by accident.
 //
-// The routes named here are the ones architecture A3's write-surface enumeration
-// calls identity-forgery grants: they author or edit bytes on an identity-bearing
-// subject without any publish permission on it.
+// It asks two questions, neither by substring. The first version of this test
+// scanned seed's block for seven banned strings, and `$JS.API.STREAM.>` — which
+// grants PURGE, DELETE, MSG.DELETE, RESTORE and UPDATE on every stream — contains
+// none of them; the web user's test in this file records the same lesson.
+//
+//  1. The publish allow-list is pinned exactly: the three starter topics, the
+//     grants a2aSeedJetStreamGrants renders, and seed's own inbox. Any other
+//     entry, in any spelling, is a diff.
+//  2. Every route architecture A3's write-surface enumeration calls an
+//     identity-forgery grant — a concrete subject per verb, on a provisioned
+//     stream — is run through subjectMatches against every rendered entry,
+//     including the ones a2aSeedJetStreamGrants produced. That is the question
+//     the server asks, so a wildcard cannot grant a route without naming it.
 func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
 
@@ -1376,18 +1390,44 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	if closeIdx < 0 {
 		t.Fatal("seed's publish allow-list is unterminated")
 	}
-	seedBlock := conf[openIdx : openIdx+closeIdx]
-
-	if strings.Contains(seedBlock, "$JS.API.>") {
-		t.Error("seed carries the wholesale $JS.API.> wildcard again; it grants STREAM.RESTORE, " +
-			"MSG.DELETE, PURGE and CONSUMER.CREATE, none of which provisioning uses")
+	var got []string
+	for _, line := range strings.Split(conf[openIdx:openIdx+closeIdx], "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			got = append(got, strings.Trim(line, `"`))
+		}
 	}
-	for _, forbidden := range []string{
-		"$JS.API.STREAM.RESTORE", "$JS.API.STREAM.MSG.DELETE", "$JS.API.STREAM.PURGE",
-		"$JS.API.STREAM.DELETE", "$JS.API.CONSUMER.CREATE", "$JS.API.STREAM.UPDATE",
-	} {
-		if strings.Contains(seedBlock, forbidden) {
-			t.Errorf("seed's grants name %q; provisioning does not use it", forbidden)
+
+	want := []string{
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+	}
+	want = append(want, a2aSeedJetStreamGrants()...)
+	want = append(want, "_INBOX.seed.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("seed publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// The forbidden routes, as the concrete subjects a client would publish
+	// to. One per verb on one provisioned stream is enough: a grant that
+	// matches any of these matches by wildcard or by name, and either is the
+	// re-widening this test exists to refuse.
+	forbidden := []string{
+		"$JS.API.STREAM.RESTORE.TASKS",
+		"$JS.API.STREAM.MSG.DELETE.TASKS",
+		"$JS.API.STREAM.PURGE.TOPICS-JOURNAL",
+		"$JS.API.STREAM.DELETE.DIRECTORY",
+		"$JS.API.STREAM.UPDATE.DIRECTORY",
+		"$JS.API.CONSUMER.CREATE.TASKS.x",
+		"$JS.API.CONSUMER.CREATE.KV_session-state.x",
+		"$JS.API.STREAM.CREATE.NOT-PROVISIONED",
+	}
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("seed grant %q permits %q; provisioning does not use it", grant, subject)
+			}
 		}
 	}
 }
