@@ -251,3 +251,96 @@ func a2aNormaliseKeyLine(conf, prefix, keyPrefix string) string {
 	}
 	return conf[:start] + keyPrefix + "PLACEHOLDERPUBLICKEYSUBSTITUTEDBYTHECALLOUTTESTSUITE" + conf[end:]
 }
+
+// The render is the operator's last chance to notice it is about to publish a
+// map the callout will throw away.
+//
+// The failure this closes is not a refused connection — it is a condition that
+// lies. The callout keeps serving the previous map when a new one fails to
+// parse, so its readiness probe stays green, so the Deployment stays Ready, so
+// setBusCredentialsReady sets True and names the version this reconcile
+// rendered. The operator reports it is serving a map that was rejected, and
+// goes on reporting it until someone reads the callout's own /status.
+func TestTheRenderedMapSatisfiesTheCalloutsOwnRules(t *testing.T) {
+	doc, err := renderA2AAuthMap(authMapTestAgent())
+	if err != nil {
+		t.Fatalf("the map this operator renders today does not satisfy the callout's rules: %v", err)
+	}
+	if len(doc.Identities) == 0 {
+		t.Fatal("the render produced no identities, so the check below proves nothing")
+	}
+}
+
+// One case per rule, each written as the edit a maintainer would plausibly
+// make. The narrowed-entry case is the one that motivated the check: adding a
+// publish grant to the session principal looks like every other grant edit in
+// the file, and is the one edit that turns per-session narrowing back into a
+// shared credential.
+func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
+	ok := func() []a2aAuthMapIdentity {
+		return []a2aAuthMapIdentity{
+			{
+				ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
+				User:           "gateway",
+				Account:        a2aAccountApp,
+				Grants:         a2aAuthMapGrants{Publish: []string{"a2a.tasks.>"}},
+			},
+			{
+				ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-session",
+				User:           "session",
+				Account:        a2aAccountApp,
+				Narrowing:      a2aNarrowingPod,
+			},
+		}
+	}
+
+	if err := validateA2AAuthMapIdentities(ok()); err != nil {
+		t.Fatalf("the baseline map was refused, so every case below is untrustworthy: %v", err)
+	}
+
+	cases := map[string]func([]a2aAuthMapIdentity) []a2aAuthMapIdentity{
+		"a narrowed entry that also carries grants": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].Grants.Publish = []string{"a2a.tasks.>"}
+			return ids
+		},
+		"a narrowed entry carrying only a subscribe": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].Grants.Subscribe = []string{"a2a.tasks.>"}
+			return ids
+		},
+		"a narrowing the callout does not implement": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].Narrowing = "namespace"
+			return ids
+		},
+		"an entry with neither grants nor narrowing": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Grants = a2aAuthMapGrants{}
+			return ids
+		},
+		"an entry in the system account": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Account = a2aAccountSys
+			return ids
+		},
+		"a username that is not a ServiceAccount": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].ServiceAccount = "kubernetes-admin"
+			return ids
+		},
+		"two entries for one ServiceAccount": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].ServiceAccount = ids[0].ServiceAccount
+			return ids
+		},
+		"two entries sharing a NATS user": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].User = ids[0].User
+			return ids
+		},
+		"no identities at all": func([]a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			return nil
+		},
+	}
+
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := validateA2AAuthMapIdentities(mutate(ok())); err == nil {
+				t.Error("the render accepted a map the callout refuses, so BusCredentialsReady would report a version that was never served")
+			}
+		})
+	}
+}

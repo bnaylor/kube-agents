@@ -25,11 +25,15 @@ package controller
 // streams, retention, and the account layout; subjects come from the payload
 // spec (docs/designs/spec-a2a-payloads.md).
 //
-// PLAYGROUND POSTURE (stage 1): static per-component NATS users instead of
-// the auth callout, single-node R1 JetStream (production: 3-node R3), no
-// audit exporter, no breaker, gateway sweep as the only janitor. Each has a
-// decided design in the specs; none gates letting people play. Static creds
-// are the playground, not the product.
+// PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
+// R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
+// has a decided design in the specs; none gates letting people play.
+//
+// Authentication came off that list. The auth callout is armed, and the
+// identities that have a ServiceAccount and a client that presents it — the
+// session pods above all — authenticate through it. The static users that
+// remain are enumerated in a2aPostureComment below, which travels onto the
+// cluster in the rendered config; keep the two in step.
 
 import (
 	"context"
@@ -95,14 +99,16 @@ const (
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
 	//
-	// None of the four A2A images are in images.json, deliberately: the
-	// inventory documents what a SUPPORTED install pulls, and mode next is an
+	// None of the A2A images are in images.json, deliberately: the inventory
+	// documents what a SUPPORTED install pulls, and mode next is an
 	// unsupported dev toggle. That exemption is graduation debt alongside the
 	// registry move — a mirrored or air-gapped install that flips next must
-	// override all four via the env vars until then.
+	// override every one of them via the env vars until then. There are five
+	// now: NATS, provision, gateway, worker, and the auth callout
+	// (A2A_CALLOUT_IMAGE, in platformagent_a2a_callout.go).
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
-	// The session-pod image, on the same terms as the three above. The
+	// The session-pod image, on the same terms as the others. The
 	// gateway binary carries this same default of its own (gateway/config.go),
 	// which is what a gateway run outside the operator falls back to; the
 	// operator renders the env unconditionally so that the override exists
@@ -122,10 +128,17 @@ const (
 # Authentication is NOT on that list any more. The auth callout is armed: a
 # client presents a projected Kubernetes ServiceAccount token, the callout
 # validates it against the cluster with a TokenReview, and answers with the
-# permission set the operator mapped that identity to. The users that remain
-# static below are the ones with nothing to present - a browser, a session pod
-# that carries no ServiceAccount, an operator at a port-forward, the callout
-# itself - and each says so where it is defined.`
+# permission set the operator mapped that identity to. Session pods go through
+# it, and a session's grants are derived from the pod the API server attested
+# rather than read from a map, so two sessions on one account cannot reach each
+# other.
+#
+# The users that remain static below are of two kinds, and each says which it
+# is where it is defined. Some have nothing to present: a browser, an operator
+# at a port-forward, the callout itself, which cannot authenticate through
+# itself. The rest have a ServiceAccount and could move tomorrow, but no client
+# that sends a token yet - moving the identity before the program that uses it
+# would refuse the workload at connect.`
 )
 
 func a2aNATSImage() string {
@@ -1103,10 +1116,10 @@ func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager;
-// the program itself arrives in its own PR). It is expected to crash-loop until
-// the gateway image is reachable and the discord-bot Secret is created — both
-// are optional references so the render never blocks the rest of the stack.
+// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager).
+// It is expected to crash-loop until the gateway image is reachable and the
+// discord-bot Secret is created — both are optional references so the render
+// never blocks the rest of the stack.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")

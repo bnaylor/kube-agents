@@ -323,3 +323,110 @@ func TestSessionGrantsMentionNoPodButTheirOwn(t *testing.T) {
 		t.Fatalf("sessionGrants(%q) = %+v, want grants on both sides", podA, g)
 	}
 }
+
+// A KNOWN LIMIT of the capability model, pinned as a test because it is the
+// one place the grant enumeration in session.go cannot be read as closure.
+//
+// Subject permissions govern the subject a client publishes ON. They do not
+// govern the reply subject it names, and nats-server does not check one:
+// isReservedReply (server/client.go) refuses service-import replies, $JS.ACK
+// and gateway-prefixed replies, and accepts anything else unchecked. So a
+// session can address a JetStream request it IS granted — MSG.NEXT on its own
+// consumer — and have the server deliver the answer to a subject it is
+// refused. Measured here: the payload lands on the gateway's inbox, which the
+// same connection is refused a direct publish to two lines above.
+//
+// What it is worth is much less than "the allowlist does not hold", and the
+// bounds are asserted rather than asserted-away:
+//
+//   - The delivered message keeps its ORIGINAL subject in the Subject field —
+//     measured, not assumed: it arrives at the reply subject but reads as
+//     a2a.tasks.<attacker>.<task>.events. So a receiver that decides anything
+//     from the subject is not fooled, and the attacker cannot make a message
+//     look like it came from a subject it cannot publish to. The assertion
+//     below pins that, because if it stopped being true this would stop being
+//     a redirect and become subject forgery.
+//   - The content is a message the session could already read. It is a
+//     redirect, not a read primitive: it cannot fetch what its filter subject
+//     does not cover.
+//   - Reaching a request/reply peer means naming its inbox exactly, and those
+//     carry a random NUID token per request.
+//
+// It is not fixable with subject permissions, so it is not a bug in the
+// narrowing: the `worker` credential this replaces had the same property over
+// a far wider grant set. It is recorded so the next person to read
+// sessionGrants as an exhaustive statement of reach finds this first.
+func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
+	h := startHarness(t, sessionMap, sessionTokens())
+
+	gw, _ := h.connectAs(t, "gateway", gatewayToken)
+	js, err := gw.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream from the gateway connection: %v", err)
+	}
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}}); err != nil {
+		t.Fatalf("AddStream: %v", err)
+	}
+	const victimSubject = "_INBOX.gateway.reply-42"
+	victim, err := gw.SubscribeSync(victimSubject)
+	if err != nil {
+		t.Fatalf("the victim could not subscribe: %v", err)
+	}
+	if err := gw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	nc, violations := h.connectAs(t, podA, tokenPodA)
+
+	// The baseline this test is only interesting against: a direct publish
+	// to that subject is refused.
+	if !publishRefused(t, nc, violations, victimSubject) {
+		t.Fatalf("the session was ALLOWED a direct publish to %s; the grant set has widened and everything below is moot", victimSubject)
+	}
+
+	const payload = "written-by-the-session"
+	if err := nc.Publish(lib.TaskEventsSubject(podA, "task-1"), []byte(payload)); err != nil {
+		t.Fatalf("publishing to its own events subject: %v", err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	name := lib.SessionConsumerName(podA, lib.SessionConsumerEvents)
+	filter := lib.TaskEventsSubject(podA, "*")
+	createBody := `{"stream_name":"TASKS","config":{"name":"` + name +
+		`","filter_subject":"` + filter + `","ack_policy":"none","deliver_policy":"all"}}`
+	if _, err := nc.Request(consumerSubject("CREATE", name)+"."+filter, []byte(createBody), 3*time.Second); err != nil {
+		t.Fatalf("creating its own granted consumer: %v", err)
+	}
+
+	// Granted subject, ungranted reply.
+	if err := nc.PublishRequest(consumerSubject("MSG.NEXT", name), victimSubject, []byte(`{"batch":1,"no_wait":true}`)); err != nil {
+		t.Fatalf("PublishRequest: %v", err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	got, err := victim.NextMsg(3 * time.Second)
+	if err != nil {
+		t.Fatalf("the redirect did not land, so this limit no longer holds as described: %v.\n"+
+			"That is good news, but the comment above and the closure discussion in session.go "+
+			"were written around it and both need rereading before this test is deleted", err)
+	}
+	if string(got.Data) != payload {
+		t.Errorf("redirected payload = %q, want %q", got.Data, payload)
+	}
+
+	// The bound that makes this a redirect rather than subject forgery: the
+	// message reads as what it is. It was DELIVERED to the gateway's inbox,
+	// which is the escape, but its Subject is still the attacker's own events
+	// subject, so nothing downstream can be made to believe the gateway
+	// published it or that it came off a subject the session cannot reach.
+	// If this ever fails the finding is a great deal worse than recorded.
+	if got.Subject != lib.TaskEventsSubject(podA, "task-1") {
+		t.Errorf("the redirected delivery reads as subject %q, want the originating %q; "+
+			"a receiver can no longer tell a redirected message from one published to it",
+			got.Subject, lib.TaskEventsSubject(podA, "task-1"))
+	}
+}

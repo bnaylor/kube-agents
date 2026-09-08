@@ -36,7 +36,10 @@ const (
 	// above the adapter's task deadline. The adapter's contract is that its
 	// deadline sits BELOW the pod's, so the failure is the adapter's to
 	// report — the pod deadline only fires for a wedged adapter, handing it
-	// to Sweep instead of letting it hold its bus credential indefinitely.
+	// to Sweep instead of letting it run indefinitely. It bounds the process,
+	// not the credential: a bus connection the adapter already opened outlives
+	// the pod by up to the callout's grant TTL, for the reason set out on
+	// busTokenExpirationSeconds below.
 	// The grace covers what the adapter's clock does not: the image pull
 	// before the process starts (activeDeadlineSeconds runs from pod start)
 	// plus the adapter's own shutdown-and-publish window at its deadline.
@@ -54,11 +57,28 @@ const (
 	// refreshes at 80% of it, so a session outliving its token is a case the
 	// client's re-read on reconnect already handles.
 	//
-	// The lifetime is not the revocation story and must not be read as one.
-	// What makes a reaped session's credential worthless is the pod binding:
-	// once the pod object is gone the API server stops authenticating the
-	// token, measured at about ten seconds behind the delete. An hour is how
-	// long it lasts if nothing revokes it; the pod is what revokes it.
+	// The lifetime is not the revocation story, and neither the lifetime nor
+	// the pod binding revokes an established connection. Two clocks, and it
+	// matters which one a claim is about:
+	//
+	//   - A NEW connection. The pod binding governs this one. Once the pod
+	//     object is gone the API server stops authenticating the token, so a
+	//     stolen token buys nothing; measured at about ten seconds behind the
+	//     delete, the TokenReview success cache rather than the hour below.
+	//   - An ALREADY-OPEN connection. Nothing above touches it. The callout
+	//     is consulted once, at CONNECT, and the grants it issued live in a
+	//     signed user JWT the server holds for that connection; the server
+	//     closes it when that JWT expires and at no other time. That is the
+	//     callout's grant TTL — an hour less jitter, not this token's hour —
+	//     and authcallout's TestANarrowedMapDoesNotReachAnEstablishedConnection
+	//     pins the behaviour.
+	//
+	// So a harness that opens a second bus connection before its task ends
+	// keeps that connection's grants for up to the grant TTL after the pod is
+	// reaped. What bounds the damage is that those grants are this session's
+	// own subjects and nothing else, which is the change #1270 asked for; what
+	// does NOT bound it is the pod lifecycle. Shortening the exposure means
+	// shortening the callout's grant TTL, and that is the knob to reach for.
 	busTokenExpirationSeconds = 3600
 
 	// workerRunAsUser is the arbitrary non-root UID session pods run as.
@@ -270,8 +290,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// The worker env contract (launch-card constants):
 					// TASK_ID/PROFILE/NATS_URL. PROFILE names the
 					// AgentProfile — the addressee is the bus session name,
-					// which is not a profile. Bus creds ride alongside; how
-					// W4 wants them delivered is its call to revise.
+					// which is not a profile. No bus credential rides here any
+					// more: it is the projected token mounted below, which is
+					// the whole of gke-labs#1270.
 					{Name: "TASK_ID", Value: taskID},
 					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},

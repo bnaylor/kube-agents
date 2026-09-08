@@ -47,14 +47,31 @@ import (
 //
 // **What it does not assert**, so nobody reads more into it than it carries: it
 // does not confirm that a named replica has observed a named map version. The
-// gap is the sub-second window after a re-render in which a ready replica may
-// still be serving the previous map. That is acceptable while the identity set
-// changes only when the operator re-renders it — which is A1's situation, where
-// the identities are fixed at install. It stops being acceptable when profiles
-// arrive at runtime and identities become dynamic: at that point this has to
-// become a per-replica check of the served version against the rendered one,
-// and the callout's status endpoint already exposes exactly what such a check
-// would read.
+// message names the version this reconcile RENDERED, not one any replica
+// reported serving, and nothing here reads the callout's /status. That is
+// acceptable while the identity set changes only when the operator re-renders
+// it — which is A1's situation, where the identities are fixed at install. It
+// stops being acceptable when profiles arrive at runtime and identities become
+// dynamic: at that point this has to become a per-replica check of the served
+// version against the rendered one, and the callout's status endpoint already
+// exposes exactly what such a check would read.
+//
+// Two failure shapes fit in that gap, and they are not the same size:
+//
+//   - The benign one, and the only one this comment used to name: the
+//     sub-second window after a re-render in which a ready replica is still
+//     serving the previous map. It closes by itself on the next informer event.
+//   - The one that does NOT close by itself: a map the callout REFUSES at
+//     parse. It keeps serving the previous map on purpose, so its probe stays
+//     green, so the Deployment stays Ready, so this sets True and names a
+//     version that was never served — permanently, and while silently dropping
+//     every other identity change in the same map. renderA2AAuthMap now runs
+//     the callout's own validation before writing the ConfigMap, so the
+//     reconcile fails with the offending entry named instead of reaching this
+//     function at all. That closes the shape the operator can see. A map the
+//     callout refuses for a reason the operator's copy does not know about
+//     would still land here, which is the residual argument for the
+//     per-replica check above.
 //
 // Rolling the callout pods on every map change would close the gap and was
 // rejected: the callout is on the connection path, so a rolling restart is a
