@@ -397,8 +397,9 @@ func workerIdentity() a2aIdentity {
 	}
 }
 
-// seed: the hand-applied seed tooling (a2a/deploy/seed.yaml), which writes the
-// starter topic entries.
+// seed: the hand-applied seed tooling, which writes the starter topic entries.
+// There is deliberately no path to cite here — the manifest lives outside this
+// repository, which is the whole of what follows.
 //
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit

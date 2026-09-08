@@ -370,8 +370,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         Under `spec.mode: next` the operator renders an egress NetworkPolicy
         over the pods the A2A gateway spawns per delegated task. That fence is
         what stops delegation being the way around the agent pod's own egress
-        allowlist: a session pod runs the model, holds a shared bus credential,
-        and without the fence has open egress.
+        allowlist: a session pod runs the model, holds a bus credential scoped
+        to its own task, and without the fence has open egress. The credential
+        narrowed (C1 above); the egress did not, and it is a separate fence.
 
         A NetworkPolicy binds by label. The selector is a constant in the
         operator (Go module `k8s-operator`) and the labels are constants in the

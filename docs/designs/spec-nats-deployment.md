@@ -111,8 +111,18 @@ holder can mint arbitrary bus users. The capability envelope design
 (`docs/architecture/09-capability-envelope.md`, "one cryptographic key does exist") owns
 that analysis; the callout service inherits its hardening requirements. The callout
 validates the client's KSA token against the cluster's OIDC issuer (audience-bound,
-short-lived, kubelet-rotated) and returns the account and the permission set. Revocation
-is the issuer's problem, and it already solved it. This works on stock Kubernetes; there
+short-lived, kubelet-rotated) and returns the account and the permission set.
+
+Revocation is the issuer's problem for the credential, and the issuer has solved it: a
+projected token is bound to its pod, so the API server stops authenticating it once the
+pod object is gone - measured at about ten seconds behind the delete, which is the
+TokenReview success cache rather than the token's hour. That governs the NEXT connection
+and only the next one. An ALREADY-OPEN connection is not revoked by anything above: the
+callout is consulted once, at CONNECT, and the server holds the grants it issued in a
+signed user JWT until that JWT expires - the callout's grant TTL, an hour less jitter.
+So the bound on a compromised bus client is its grant TTL, not its pod lifetime, and
+shortening that exposure means shortening the grant TTL. Both clocks matter and they are
+not the same clock; a claim about one is not a claim about the other. This works on stock Kubernetes; there
 is no GKE dependency. Concretely, validation is a `TokenReview` call against the local
 API server - zero key handling, works on any conformant cluster - with local JWT
 verification against the API server's `openid/v1/jwks` endpoint as the offline
@@ -308,8 +318,16 @@ Layout:
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
-  gateway gets `session-state`, workers get the artifact bucket, nobody gets a bucket
-  their role doesn't name. Miss this and the first oversized artifact dies with an
+  gateway gets `session-state`, the artifact bucket goes to whoever writes artifacts,
+  nobody gets a bucket their role doesn't name. **Amended 9/8:** that last clause now
+  binds the session worker too, and it names none - the derived per-session grant set
+  below has no `$KV` or `$O` subject in it at all. Nothing breaks today, because the
+  worker adapter never offloads: it chunks artifact updates onto its own events
+  subject under the bus message limit (`resultChunkSize`) rather than writing a
+  bucket. What it means is that the bucket path is not available to a session, and
+  that is deliberate rather than an oversight - bucket scoping is the parked question
+  in the next sentence, and granting a session the bucket before scoping it would
+  hand every session every other session's artifacts. Miss this and the first oversized artifact dies with an
   Authorization Violation. Within the artifact bucket, visibility is bucket-wide;
   per-task artifact scoping is still parked. Per-session credentials landed (9/8) and did
   not close it: a session's grants are derived from its pod name, which the gateway mints

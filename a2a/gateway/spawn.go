@@ -111,9 +111,12 @@ const (
 // honest until integration.
 var sessionNameAnimals = []string{"otter", "badger", "heron", "lynx", "marten", "puffin", "stoat", "vole"}
 
-// spawner is the session-pod half of the lifecycle. It stays dark behind
-// SpawnSessions until W4's worker image exists; the gateway pod gets its
-// service-account token with that change, not before.
+// spawner is the session-pod half of the lifecycle, dark behind
+// SpawnSessions. What it creates is a pod holding a projected bus token: the
+// credential a session authenticates with is minted by the API server against
+// this pod object, so the pod IS the identity and Delete below is the closest
+// thing to revocation the fabric has (bounded by the callout's grant TTL for
+// a connection already open - see busTokenExpirationSeconds).
 type spawner interface {
 	// Spawn creates the session pod for a task and returns the pod name.
 	Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string) (string, error)
