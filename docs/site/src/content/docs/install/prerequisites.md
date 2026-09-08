@@ -83,7 +83,7 @@ On Autopilot you'll additionally need to patch the deployments to append `--lead
 
 ## Chat platform
 
-- **Google Chat** (opt-in, off by default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
+- **Google Chat** (opt-in, but the interactive installer pre-selects it): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
 - **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Follow the [Hermes Slack setup guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). Slack is configured only if you enable it in the installer's chat menu (or set `enable_slack = true` in `terraform.tfvars`).
 
 **A GCP project holds one Chat app.** Google's rule is that "each Google Chat app that you create
@@ -91,10 +91,13 @@ requires its own Google Cloud project with the Chat API enabled" —
 [Configure the Chat API](https://developers.google.com/workspace/chat/configure-chat-api). So a
 project already running a Chat app cannot also run kube-agents' Chat integration.
 
-This only applies if you turn Chat on. It is off by default on every surface
-(`enable_google_chat`, the installer's chat menu, `googleChat.enabled`), and an install that leaves
-it off takes no slot. **Slack is unaffected** — it provisions no GCP resource at all, so a project
-whose Chat slot is already spoken for can still run kube-agents with Slack in it.
+This only applies if Chat is on, and whether it is on by default depends on which front door you
+use. Terraform and Helm both default it off — `enable_google_chat` and the chart's
+`googleChat.enabled` are `false`, so neither takes a slot unless you ask. The interactive installer
+goes the other way: its chat menu pre-selects **Google Chat**, so pressing enter at that prompt
+provisions the Chat backend. Pick "None" or Slack there if you want the project's Chat slot left
+alone. **Slack is unaffected** — it provisions no GCP resource at all, so a project whose Chat slot
+is already spoken for can still run kube-agents with Slack in it.
 
 If you do want Chat and the slot is taken, moving just the Chat backend elsewhere is not available
 through the supported paths: the chart renders the CR's `projectId` from
