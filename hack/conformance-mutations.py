@@ -349,8 +349,12 @@ Mutation(
         "add an auto-merge job, which is the thing B2 exists to forbid",
     ),
     Mutation(
+        # autopush-redeploy-agent.yml was deleted by #1199, which consolidated
+        # the autopush deploys; every run of the whole sweep has crashed on
+        # the missing path since. autopush-deploy.yml is the replacement and
+        # carries the same predicate, once.
         "B4-workflow-run-gate",
-        ".github/workflows/autopush-redeploy-agent.yml",
+        ".github/workflows/autopush-deploy.yml",
         ("github.event.workflow_run.head_branch == 'main'", "true"),
         "test_B4_every_workflow_run_deploy_gates",
         "drop the branch predicate while debugging a deploy, which is when it "
