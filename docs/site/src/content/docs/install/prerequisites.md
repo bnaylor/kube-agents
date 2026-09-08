@@ -99,10 +99,8 @@ whose Chat slot is already spoken for can still run kube-agents with Slack in it
 If you do want Chat and the slot is taken, moving just the Chat backend elsewhere is not available
 through the supported paths: the chart renders the CR's `projectId` from
 `platformAgent.harness.projectId`, so the installer and the chart always put the Chat topic in the
-cluster's project. Moving the whole install is not a free swap either — the install project is the
-fleet the Platform Agent manages, and it is scoped to that one project, so relocating changes which
-clusters the agent can see. An organisation with clusters in several projects installs kube-agents
-once per project.
+cluster's project. That leaves installing into a project whose Chat slot is free — a choice worth
+weighing against how you want the agent's fleet scoped, not against Chat alone.
 
 ## LLM credentials
 
