@@ -40,6 +40,7 @@ kube-agents/
 │   ├── cluster/                                   Cluster Agent profile TEMPLATE:
 │   │                                              persona docs + runtime-debugging
 │   │                                              SKILL.md bundles
+│   ├── contributor/                               Contributor-agent protocol (claim/PR/review loop)
 │   └── platform/                                  Platform Agent profile
 │       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and workspace docs
 │       ├── docs/                                  runtime references (glossary,
@@ -49,6 +50,8 @@ kube-agents/
 │       │                                          report-prioritization SOPs
 │       └── skills/                                SKILL.md bundles + the
 │                                                  gke-compute-classes references
+├── a2a/docs/                                      design notes kept beside the A2A
+│                                                  bus Go module they describe
 ├── bench/                                         devops-bench evaluation harness README
 │                                                  + the task/harness authoring how-to
 ├── charts/                                        canonical Helm charts (kube-agents)
@@ -179,9 +182,11 @@ identifier appears, add its source here.
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, install-configuration keys read, which commands count as mutations | `scripts/live_test_lease.py` |
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
+| Unresolved-thread hold: the label, the pool condition, the sweep interval, the ownership rule | `scripts/hold_unresolved_threads.py` and `.github/workflows/hold-unresolved-threads.yml` |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 | Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, and `OWNERS_ALIASES` |
 | Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
+| Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`) and the `triage` permission grant | external tide automation and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
 | Queue-wait thresholds that justify onboarding an eval project, and the window they run over | `scripts/pool_pressure.py` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
@@ -214,8 +219,10 @@ code, first check which era it belongs to:
   the agent at runtime. Similarly, every `SOUL.md`, `AGENTS.md`,
   `CAPABILITIES.md`, `SKILL.md`, and governance SOP under `agents/` is agent
   runtime material, copied into images or scaffolded into the pod — editing
-  them changes agent behavior, not just prose. (The human-facing glossary is
-  the separate site page `reference/glossary.md`.)
+  them changes agent behavior, not just prose. The exception is
+  `agents/contributor/AGENTS.md`, a non-runtime contributor protocol that is
+  not shipped in the images. (The human-facing glossary is the separate
+  site page `reference/glossary.md`.)
 
 ## 4. Inventory
 
@@ -248,6 +255,7 @@ pull request:
 | `INSTALL.md` | Install guide | Self-contained, executable installation guide: automated GCP/GKE provisioning, manual Kubernetes deployment, local dev, declarative Terraform+Helm install (pointer to its canonical guide), teardown, troubleshooting. Commands only; explanation lives on the site. | Prerequisites, provisioning stages, integrations, teardown | Written to be runnable end-to-end by a human or an AI agent |
 | `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the engineering rules, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. States the rules; the commands that carry them out live in `docs/pull-request-workflow.md` and the mechanics that are prose in `.agents/rules/`. | Doc ownership table, engineering rules, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES; loaded into every session, so `make docs-check-context-budget` caps its size |
 | `CLAUDE.md` | Contributor rules | Imports `AGENTS.md` and points to it for commit authorship and PR attribution guidance. | Points to `AGENTS.md` rules | Claude Code sessions |
+| `a2a/docs/hermes-bridge.md` | Feature design | The Hermes bridge, a stand-in executor for `platform`-addressed A2A tasks until the dispatcher and worker adapter land: sidecar placement via `spec.deployment.sidecars`, what that deployment method costs (the mode-flip blocker, the unscreened sidecar env), bus user and grants, task lifecycle, and the startup sweep with CAS finalization. | Sidecar placement, flip blocker, bus grants, sweep, demolition date | Scaffolding design kept beside the `a2a/` module rather than in `docs/designs/` — it is deleted with the bridge when the dispatcher lands |
 | `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, LLM gateway setup, chat, observability, integrations, validation | Console users and contributors |
 | `admin_console/CONNECTION_SECURITY.md` | Security reference | Security contract for the local console's persisted connection lease. | Stored metadata, filesystem controls, identity binding, revalidation, trust boundary | Console users and security reviewers |
 
@@ -266,6 +274,7 @@ pull request:
 | `agents/chat/plugins/memory/multiuser_memory/README.md` | Component README | The file-based memory provider kept as the zero-infrastructure alternative to `kube_agents_memory`: what it stores (one Markdown file per user, one shared), what it gives up (no ranking, no search, the whole store in the window every turn), and how an install selects it (`--memory=file`). | File-per-user store, provider selection, tradeoff | Contributors changing the provider; the choice itself is `docs/designs/memory.md` |
 | `agents/cluster/*.md` (SOUL, AGENTS, CAPABILITIES) | Runtime persona | The Cluster Agent profile TEMPLATE personas: a read-only SRE pinned to exactly one GKE cluster — worker protocol (`kanban_show` → diagnose → `kanban_complete` with structured RCA + proposed patch metadata), read-only red lines (never mutate, never open PRs), and the routing blurb `list_agents` shows for each `cluster-*` profile. | Single-cluster diagnostics, kanban worker handoff, read-only red lines | Scaffolded into per-cluster profiles by `cluster_agent_profile.py`; force-synced from the image template on pod start |
 | `agents/cluster/skills/*/SKILL.md` | Skill bundle | The Cluster Agents' single-cluster runtime-debugging bundles: `gke-observability`, `gke-reliability`, `gke-storage`, `gke-workload-scaling` (+ HPA/VPA example assets), `gke-workload-security` (+ netpol/WI assets and an audit script), `gke-workload-troubleshooting`. | Per-skill diagnostics procedures | Listed under their own persona group in the generated skill catalog |
+| `agents/contributor/AGENTS.md` | Contributor rules | Contract for an AI agent contributing as a developer: the claim loop (assignee as the sole claim, deterministic tie-break on collision), escalating blocked work to humans via the `needs-human` label plus an `@mention`, and responding to review until the `lgtm` merge gate. Framework-agnostic: specifies GitHub state to read and write, not how to poll. | Claim protocol, `needs-human` escalation, `lgtm` merge gate | External contributor agents; referenced from the root `AGENTS.md`; not a runtime blueprint |
 | `agents/platform/SOUL.md` | Runtime persona | Persona of the Platform Agent ("Harness Custodian & Architect", the `platform` profile): kanban worker protocol, GitOps-only declarative changes, recovery ladder, observability guidance, incident-communication policy, deployment architecture. | Worker protocol, declarative workflow playbook, autonomy, incident triage | System persona; several docs reference its section numbers ("SOUL.md §N") |
 | `agents/platform/AGENTS.md` | Runtime workspace | Workspace doc: session startup (consult the glossary), memory conventions (daily notes, `MEMORY.md`), how kanban work arrives and must be closed, red lines. | Startup, memory, kanban worker protocol | Runtime doc |
 | `agents/platform/CAPABILITIES.md` | Runtime routing | One-paragraph routing blurb advertising the Platform Agent as the fleet-wide GKE architect and default specialist. | What to route to it | Consumed by the Planning Agent's roster discovery |
