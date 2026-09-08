@@ -945,18 +945,9 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
 					Containers: []corev1.Container{{
-						Name:    "provision",
-						Image:   a2aProvisionImage(),
-						Command: []string{"sh", "-c", script},
-						// The nats-box image's WORKDIR is /root, which mode
-						// 0700 makes unreachable to the non-root user the
-						// hardened context runs this as - and the nats CLI
-						// fails on a cwd it cannot stat, reporting it as
-						// "could not load schema" from deep inside stream
-						// creation rather than as a permissions problem.
-						// Found live: the provisioning Job could not create a
-						// single stream. /tmp is the emptyDir mounted below.
-						WorkingDir:      "/tmp",
+						Name:            "provision",
+						Image:           a2aProvisionImage(),
+						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
 						Env: []corev1.EnvVar{{
 							Name: "HOME", Value: "/tmp",
