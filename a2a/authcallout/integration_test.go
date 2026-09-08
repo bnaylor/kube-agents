@@ -73,27 +73,35 @@ const twoIdentityMap = `{
 }`
 
 type harness struct {
-	server    *natsserver.Server
-	url       string
-	store     *Store
-	tokenToSA map[string]string
+	server *natsserver.Server
+	url    string
+	store  *Store
+	tokens map[string]Attested
 }
 
-// tokenReviewer maps a presented token to the ServiceAccount the cluster would
-// vouch for, and refuses anything else — the shape of a real TokenReview
-// answer, including the audience the validator insists on.
-func tokenReviewer(tokenToSA map[string]string) *fake.Clientset {
+// tokenReviewer maps a presented token to what the cluster would vouch for,
+// and refuses anything else — the shape of a real TokenReview answer, including
+// the audience the validator insists on and the pod-bound Extra fields the
+// authenticator writes for a projected token.
+func tokenReviewer(tokens map[string]Attested) *fake.Clientset {
 	c := fake.NewSimpleClientset()
 	c.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		req := action.(k8stesting.CreateAction).GetObject().(*authnv1.TokenReview)
-		sa, ok := tokenToSA[req.Spec.Token]
+		att, ok := tokens[req.Spec.Token]
 		if !ok {
 			req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
 			return true, req, nil
 		}
+		user := authnv1.UserInfo{Username: att.ServiceAccount}
+		if att.PodName != "" || att.PodUID != "" {
+			user.Extra = map[string]authnv1.ExtraValue{
+				"authentication.kubernetes.io/pod-name": {att.PodName},
+				"authentication.kubernetes.io/pod-uid":  {att.PodUID},
+			}
+		}
 		req.Status = authnv1.TokenReviewStatus{
 			Authenticated: true,
-			User:          authnv1.UserInfo{Username: sa},
+			User:          user,
 			Audiences:     req.Spec.Audiences,
 		}
 		return true, req, nil
@@ -103,7 +111,7 @@ func tokenReviewer(tokenToSA map[string]string) *fake.Clientset {
 
 // startHarness renders a real nats.conf with an auth_callout block, starts a
 // server from it, and connects the callout service.
-func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string) *harness {
+func startHarness(t *testing.T, identityMap string, tokens map[string]Attested) *harness {
 	t.Helper()
 
 	// The issuer is an ACCOUNT keypair: the server holds the public half and
@@ -181,7 +189,7 @@ func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string)
 		t.Fatalf("loading the identity map: %v", err)
 	}
 
-	validator, err := NewTokenValidator(tokenReviewer(tokenToSA), testAudience)
+	validator, err := NewTokenValidator(tokenReviewer(tokens), testAudience)
 	if err != nil {
 		t.Fatalf("NewTokenValidator: %v", err)
 	}
@@ -206,7 +214,7 @@ func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string)
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	return &harness{server: srv, url: srv.ClientURL(), store: store, tokenToSA: tokenToSA}
+	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens}
 }
 
 // connectAs dials with a ServiceAccount token, the way a workload will.
@@ -250,11 +258,11 @@ func publishRefused(t *testing.T, nc *nats.Conn, violations chan error, subject 
 	}
 }
 
-func defaultTokens() map[string]string {
-	return map[string]string{
-		gatewayToken: "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
-		agentToken:   agentSA,
-		strangerTok:  strangerSA,
+func defaultTokens() map[string]Attested {
+	return map[string]Attested{
+		gatewayToken: {ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-gateway"},
+		agentToken:   {ServiceAccount: agentSA},
+		strangerTok:  {ServiceAccount: strangerSA},
 	}
 }
 
