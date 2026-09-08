@@ -740,7 +740,10 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
+        # rule renders only above one replica, and the HA fixture is the only
+        # golden that sets it.
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
         ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
          "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",

@@ -6028,7 +6028,6 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 	}
 }
 
-
 // TestLeaderRolePodsRuleTracksLeaderElectionArming pins the grant to its consumer.
 //
 // pods get/patch on the agent's ServiceAccount exists for one caller:
@@ -6044,8 +6043,8 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 // only found by someone auditing RBAC.
 func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		replicas *int32
+		name        string
+		replicas    *int32
 		scaleToZero *bool
 	}{
 		{name: "unset (defaults to one)"},
@@ -6065,8 +6064,20 @@ func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 
 			var hasPods bool
 			for _, r := range buildPlatformLeaderRole(agent).Rules {
-				if slices.Contains(r.Resources, "pods") {
-					hasPods = true
+				if !slices.Contains(r.Resources, "pods") {
+					continue
+				}
+				hasPods = true
+				// The verbs, not just the resource. update_pod_label reads its
+				// own pod and patches one label, so get and patch is the whole
+				// requirement -- and this is the agent identity's only write
+				// grant on workloads, so a verb added here is worth a red test
+				// rather than a quiet golden update.
+				if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+					t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+				}
+				if !slices.Equal(r.Resources, []string{"pods"}) {
+					t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
 				}
 			}
 

@@ -4241,8 +4241,10 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	// Residual, above one replica: this is still namespace-wide. RBAC cannot say
 	// "only your own pod", so narrowing further needs admission -- a
 	// ValidatingAdmissionPolicy holding the agent's ServiceAccount to the
-	// is-leader label on pods of its own Deployment. That is the same admission
-	// work already owed for the gateway's pods:create grant.
+	// is-leader label on pods of its own Deployment. Nothing today does that:
+	// the two policies in config/admission/agent-rbac-policy.yaml govern the
+	// content of a Role and the subject of a RoleBinding, not the objects a
+	// bound identity may then reach.
 	if replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment); replicas > 1 {
 		rules = append(rules, rbacv1.PolicyRule{
 			APIGroups: []string{""},
