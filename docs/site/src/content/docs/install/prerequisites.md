@@ -83,24 +83,26 @@ On Autopilot you'll additionally need to patch the deployments to append `--lead
 
 ## Chat platform
 
-- **Google Chat** (default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
+- **Google Chat** (opt-in, off by default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
 - **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Follow the [Hermes Slack setup guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). Slack is configured only if you enable it in the installer's chat menu (or set `enable_slack = true` in `terraform.tfvars`).
 
-**A GCP project can hold only one Chat app, and kube-agents takes the slot.** The Chat API's
-configuration is scoped to the project, and there is exactly one configuration per project — app
-name, avatar, description and connection settings are all singular. So a project that already runs
-a Chat app cannot also run kube-agents' Chat integration, and a project you install kube-agents
-into gives that slot up for anything else. This is a Google Chat platform limitation rather than a
-kube-agents one; see
-[Configure the Chat API](https://developers.google.com/workspace/chat/configure-chat-api).
+**A GCP project holds one Chat app.** Google's rule is that "each Google Chat app that you create
+requires its own Google Cloud project with the Chat API enabled" —
+[Configure the Chat API](https://developers.google.com/workspace/chat/configure-chat-api). So a
+project already running a Chat app cannot also run kube-agents' Chat integration.
 
-Plan for it before you pick a project, because it is awkward to discover afterwards. Two Chat apps
-means two projects, and the installer does not currently split them: the
-[`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub)
-creates the topic, the subscription and the Workspace Add-ons service identity all under one
-`project_id`, the same one holding the cluster. Pointing kube-agents at a Chat topic in a
-different project is not a supported configuration today. If the project you want the cluster in
-already has a Chat app, either install into a different project or use Slack.
+This only applies if you turn Chat on. It is off by default on every surface
+(`enable_google_chat`, the installer's chat menu, `googleChat.enabled`), and an install that leaves
+it off takes no slot. **Slack is unaffected** — it provisions no GCP resource at all, so a project
+whose Chat slot is already spoken for can still run kube-agents with Slack in it.
+
+If you do want Chat and the slot is taken, moving just the Chat backend elsewhere is not available
+through the supported paths: the chart renders the CR's `projectId` from
+`platformAgent.harness.projectId`, so the installer and the chart always put the Chat topic in the
+cluster's project. Moving the whole install is not a free swap either — the install project is the
+fleet the Platform Agent manages, and it is scoped to that one project, so relocating changes which
+clusters the agent can see. An organisation with clusters in several projects installs kube-agents
+once per project.
 
 ## LLM credentials
 
