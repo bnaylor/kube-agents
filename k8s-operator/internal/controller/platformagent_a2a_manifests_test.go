@@ -1262,3 +1262,60 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
 	}
 }
+
+// TestNoWorkerCanPublishToTheDirectory pins the identity plane against its least
+// trusted principal.
+//
+// a2a.agents.{profile} is last-value, so a single publish REPLACES a profile's
+// card and an agent-closed tombstone retires it. The payload spec assigns that to
+// the profile's owner explicitly -- "not by workers" -- and nothing in the tree
+// publishes a card at all today, so the grant this removes had no caller.
+//
+// Asserted against the worker's publish list specifically rather than the whole
+// config: the gateway keeps SUBSCRIBE on the same subjects, which is the read
+// discovery needs, and a test that just greps the file for "a2a.agents" would
+// fail on that legitimate line.
+func TestNoWorkerCanPublishToTheDirectory(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	start := strings.Index(conf, "user: worker")
+	if start < 0 {
+		t.Fatal("no worker user in the rendered config")
+	}
+	openIdx := strings.Index(conf[start:], "publish { allow = [")
+	if openIdx < 0 {
+		t.Fatal("worker has no publish allow-list")
+	}
+	openIdx += start
+	closeIdx := strings.Index(conf[openIdx:], "] }")
+	if closeIdx < 0 {
+		t.Fatal("worker's publish allow-list is unterminated")
+	}
+	// Comment lines are stripped before matching. The rationale comment left in
+	// place of the removed grant names the subject it removes, and matching raw
+	// text reported the comment as the grant -- which it did, on the first run.
+	var workerPublish strings.Builder
+	for _, line := range strings.Split(conf[openIdx:openIdx+closeIdx], "\n") {
+		if t := strings.TrimSpace(line); !strings.HasPrefix(t, "#") {
+			workerPublish.WriteString(line + "\n")
+		}
+	}
+
+	if strings.Contains(workerPublish.String(), "a2a.agents") {
+		t.Error("worker holds publish on the directory; one publish replaces a profile's " +
+			"card, and the payload spec assigns cards to the profile owner, not workers")
+	}
+
+	// The control: the gateway's READ of the directory must survive, or this
+	// test would pass just as well against a config that broke discovery.
+	gwStart := strings.Index(conf, "user: gateway")
+	gwSub := strings.Index(conf[gwStart:], "subscribe { allow = [")
+	if gwSub < 0 {
+		t.Fatal("gateway has no subscribe allow-list")
+	}
+	gwSub += gwStart
+	gwEnd := strings.Index(conf[gwSub:], "] }")
+	if !strings.Contains(conf[gwSub:gwSub+gwEnd], "a2a.agents.>") {
+		t.Error("the gateway lost subscribe on the directory; discovery reads it")
+	}
+}

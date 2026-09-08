@@ -352,7 +352,16 @@ accounts {
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
-            "a2a.agents.>",
+            # No a2a.agents.> publish. The directory is the identity plane:
+            # a2a.agents.{profile} is last-value, so one publish REPLACES a
+            # profile's card, and an agent-closed tombstone retires it. The
+            # payload spec says cards are "published by the profile's owner
+            # (the operator once profiles are CRs), not by workers", and
+            # nothing in the tree publishes one today — this grant had no
+            # caller and let the least-trusted principal in the deployment
+            # overwrite any profile's directory entry. The gateway keeps
+            # SUBSCRIBE on the same subjects, which is the read discovery
+            # actually needs.
             "agents.hb.>",
             "$KV.runtime-state.>",
             "$JS.API.>",
