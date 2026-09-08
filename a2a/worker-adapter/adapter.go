@@ -61,10 +61,10 @@ func (c Config) Addressee() string {
 
 func (c *Config) applyDefaults() {
 	if c.TaskDeadline <= 0 {
-		c.TaskDeadline = 30 * time.Minute
+		c.TaskDeadline = defaultTaskDeadline
 	}
 	if c.KillGrace <= 0 {
-		c.KillGrace = 10 * time.Second
+		c.KillGrace = defaultKillGrace
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -81,6 +81,30 @@ type Result struct {
 
 // resultChunkSize bounds one result artifact-update well under the bus max
 // message size with envelope headroom (the bridge's number).
+const (
+	// defaultTaskDeadline and defaultKillGrace are the library's fallbacks when
+	// Config leaves them unset. They are the same contract as
+	// cmd/worker-adapter's defaultTaskDeadlineSeconds/defaultKillGraceSeconds
+	// (1800s / 10s) and the gateway's defaultTaskDeadline -- three spellings of
+	// two numbers that must agree, which is exactly why each one is named.
+	defaultTaskDeadline = 30 * time.Minute
+	defaultKillGrace    = 10 * time.Second
+
+	// originFetchDeadline bounds the wait for the submitting envelope; a pod
+	// that starts before its own task message is the case it exists for.
+	// originFetchBatch is how many messages one FetchNoWait asks for, and
+	// originFetchPoll paces the retries between fetches.
+	originFetchDeadline = 30 * time.Second
+	originFetchBatch    = 16
+	originFetchPoll     = 500 * time.Millisecond
+
+	// steerQueueDepth buffers steers arriving while a turn is in flight.
+	steerQueueDepth = 16
+	// failureEvidenceCap bounds the partial output attached to a failure, so a
+	// runaway harness cannot put its whole stdout on the bus.
+	failureEvidenceCap = 4096
+)
+
 const resultChunkSize = 256 * 1024
 
 // terminalPublishTimeout is the fresh budget terminal publishes get - they
@@ -218,7 +242,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// submission (the dual-reader rule: everything after the submission -
 	// steers, follow-ups, cancel - belongs to the executor). Starting at
 	// originSeq+1 means input published before this line still arrives.
-	steerCh := make(chan string, 16)
+	steerCh := make(chan string, steerQueueDepth)
 	cancelCh := make(chan struct{}, 1)
 	stopIn, err := a.consumeIn(ctx, originSeq+1, origin.EnvelopeID, steerCh, cancelCh)
 	if err != nil {
@@ -617,7 +641,7 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	} else {
 		text := reason
 		if evidence != "" {
-			text += "\npartial output:\n" + truncate(evidence, 4096)
+			text += "\npartial output:\n" + truncate(evidence, failureEvidenceCap)
 		}
 		update := lib.StatusUpdate{
 			TaskID:    a.taskID,
@@ -661,7 +685,7 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 // TASKS stream by subject and returns it with its stream sequence.
 func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error) {
 	subject := lib.TaskInSubject(a.cfg.Addressee(), a.cfg.TaskID)
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(originFetchDeadline)
 	// One consumer for the whole wait. Creating it per iteration left up to
 	// sixty ephemeral consumers on TASKS behind a slow pod start, each living
 	// until its inactivity threshold.
@@ -671,7 +695,7 @@ func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error
 	})
 	for {
 		if consErr == nil {
-			batch, err := cons.FetchNoWait(16)
+			batch, err := cons.FetchNoWait(originFetchBatch)
 			if err == nil {
 				for msg := range batch.Messages() {
 					env, perr := lib.ParseEnvelope(msg.Data())
@@ -694,12 +718,12 @@ func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error
 			if consErr != nil {
 				return nil, 0, fmt.Errorf("consumer on %s: %w", subject, consErr)
 			}
-			return nil, 0, fmt.Errorf("no kind:message on %s within 30s", subject)
+			return nil, 0, fmt.Errorf("no kind:message on %s within %s", subject, originFetchDeadline)
 		}
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(originFetchPoll):
 		}
 		if consErr != nil {
 			cons, consErr = a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{

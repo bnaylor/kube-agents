@@ -87,9 +87,12 @@ type userMessageBody struct {
 // harnessProc supervises one harness subprocess: stdin writer, stdout
 // scanner, stderr tail, process-group kill.
 type harnessProc struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	events <-chan harnessEvent
+	// closeInput ends the input stream, at most once, from either the run
+	// loop or the scan-error path.
+	closeInput func()
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	events     <-chan harnessEvent
 	// scanDone closes when the stdout scanner has hit EOF - Wait must not
 	// run before it, or the pipe teardown races the last buffered events
 	// (the result line, typically) out of existence.
@@ -136,6 +139,22 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 	scanDone := make(chan struct{})
 	var scanFailed error
 	var scanMu sync.Mutex
+	// closeStdinOnce ends the input stream at most once. Shared by the scan-
+	// error path above and harnessProc.closeStdin, which can both reach it.
+	var stdinOnce sync.Once
+	var markDead func()
+	stdinMarkDead := func() {
+		if markDead != nil {
+			markDead()
+		}
+	}
+	closeStdinOnce := func() {
+		stdinOnce.Do(func() {
+			stdinMarkDead()
+			_ = stdin.Close()
+		})
+	}
+
 	go func() {
 		defer close(scanDone)
 		defer close(events)
@@ -161,22 +180,34 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 			scanMu.Lock()
 			scanFailed = err
 			scanMu.Unlock()
-			// Drain what the scanner will no longer read. The harness does not
-			// know we have stopped: it keeps writing, the 64KB pipe fills, and
-			// it blocks on write forever -- so cmd.Wait never returns and the
-			// task stalls to its deadline (1800s in production) instead of
-			// failing with the cause recorded just above. Discarding rather
-			// than buffering, deliberately: the line that overflowed is the one
-			// we already refused to hold in memory.
+			// End the turn, THEN drain. Both halves are needed and each one
+			// alone deadlocks:
+			//
+			//   - Without the close, the harness waits on stdin for the next
+			//     turn and never exits, so stdout never closes, the drain below
+			//     blocks forever, close(events) never runs and cmd.Wait is
+			//     never reached. The task then parks until TaskDeadline (1800s
+			//     in production) and publishes `deadline-exceeded`, which
+			//     hides the ceiling diagnostic this path exists to produce.
+			//   - Without the drain, the harness blocks writing into a full
+			//     64KB pipe and cannot reach its own exit.
+			//
+			// Closing stdin is the same signal the result arm sends to end a
+			// turn, so the harness shuts down the way it normally does rather
+			// than being killed.
+			closeStdinOnce()
+			// Discarding rather than buffering, deliberately: the line that
+			// overflowed is the one we already refused to hold in memory.
 			_, _ = io.Copy(io.Discard, stdout)
 		}
 	}()
 
 	p := &harnessProc{
-		cmd:      cmd,
-		stdin:    stdin,
-		events:   events,
-		scanDone: scanDone,
+		cmd:        cmd,
+		stdin:      stdin,
+		closeInput: closeStdinOnce,
+		events:     events,
+		scanDone:   scanDone,
 		scanErr: func() error {
 			scanMu.Lock()
 			defer scanMu.Unlock()
@@ -184,6 +215,13 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 		},
 		stderr: stderr,
 		log:    log,
+	}
+	// Now that p exists, a close from the scan-error path also marks the
+	// stream dead, so writeUser refuses instead of writing to a closed pipe.
+	markDead = func() {
+		p.mu.Lock()
+		p.stdinDead = true
+		p.mu.Unlock()
 	}
 	if err := p.writeUser(prompt); err != nil {
 		p.kill(0)
@@ -221,7 +259,7 @@ func (p *harnessProc) closeStdin() {
 	p.mu.Lock()
 	p.stdinDead = true
 	p.mu.Unlock()
-	_ = p.stdin.Close()
+	p.closeInput()
 }
 
 // kill delivers SIGTERM to the process group, escalating to SIGKILL after

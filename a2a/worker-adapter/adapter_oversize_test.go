@@ -78,3 +78,50 @@ exit 0
 			"promptly rather than running to the deadline", elapsed)
 	}
 }
+
+// TestLifecycle_OversizeLineWithAHarnessThatWaitsOnStdin is the version of the
+// test above with a stub that behaves like the real harness: after writing, it
+// keeps reading stdin rather than exiting.
+//
+// That difference is the whole finding. The real harness is an agent loop whose
+// turn ends when the adapter closes stdin; the `result` arm does that, and the
+// scan-error path did not. So the drain blocked on a pipe that never closed,
+// the goroutine never returned, `close(events)` never ran, `cmd.Wait` was never
+// reached, and the task parked until TaskDeadline -- publishing
+// `deadline-exceeded` and never reaching the ceiling diagnostic. A stub that
+// exits on its own hides all of it.
+func TestLifecycle_OversizeLineWithAHarnessThatWaitsOnStdin(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-tapir-oversize2", "task-oversize-2"
+	submit(t, c, session, taskID, "write something enormous")
+
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"stub-oversize2"}'
+printf '{"type":"result","subtype":"success","result":"'
+head -c 9000000 /dev/zero | tr '\0' 'x'
+printf '"}\n'
+# The real harness does not exit here: it waits for the next turn on stdin,
+# and exits when the adapter closes it.
+while read -r _line; do :; done
+exit 0
+`)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.TaskDeadline = 90 * time.Second
+	started := time.Now()
+	out := waitOutcome(t, runAdapter(context.Background(), cfg), 120*time.Second)
+	if out.res.State != lib.StateFailed {
+		t.Fatalf("state %q, want failed", out.res.State)
+	}
+	text := statusOf(t, replayEvents(t, url, session, taskID)[len(replayEvents(t, url, session, taskID))-1]).Status.Message.Parts[0].Text
+	if strings.Contains(text, "deadline-exceeded") {
+		t.Fatalf("stalled to the deadline with a harness that waits on stdin — "+
+			"the scan-error path must end the input stream, not just drain: %q", text)
+	}
+	if !strings.Contains(text, "scannerMaxBytes") {
+		t.Errorf("reason does not name the ceiling: %q", text)
+	}
+	if elapsed := time.Since(started); elapsed > 60*time.Second {
+		t.Errorf("took %s; the harness was not released promptly", elapsed)
+	}
+}
