@@ -145,9 +145,11 @@ MUTATIONS: list[Mutation] = [
         "obvious improvement that turns a denial into an oracle",
     ),
         Mutation(
-        # The original unpinned bind's resourceNames; #387 removed the bind
-        # rule outright, so the live escalation edit is granting escalate on
-        # the RBAC rule the operator still holds full CRUD through.
+        # The original unpinned bind's resourceNames. #387 removed the bind
+        # rule outright and this edit became "grant escalate on the RBAC rule
+        # the operator holds full CRUD through"; the auth callout has since
+        # brought bind back, scoped to one name, and A4-bind-unscoped below
+        # is the mutation that covers the scoping. This one stays on escalate.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
         ("      - roles\n    verbs:\n      - create\n",
@@ -196,9 +198,37 @@ MUTATIONS: list[Mutation] = [
         "refusals, which is how a control gets switched off in production",
     ),
         Mutation(
-        # Originally unpinned the chart's bind-to-view rule; the rule is gone
-        # from both delivery paths (#387), so the live edit is bind returning
-        # to the chart copy alone — the same-ceiling drift A4 exists to catch.
+        # The bind grant is only bounded while it names resources. Stripping
+        # resourceNames leaves a rule that lets the operator attach ANY
+        # existing ClusterRole -- cluster-admin included -- to any subject it
+        # can write a binding for, which is escalate without the verb.
+        "A4-bind-unscoped",
+        "k8s-operator/config/rbac/role.yaml",
+        ("    resourceNames:\n      - system:auth-delegator\n", ""),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "drop the resourceNames bound on the operator's bind grant so it can "
+        "attach any role to any subject -- escalate without the verb",
+    ),
+    Mutation(
+        # The generated block is gated byte-for-byte by `make chart-check`, so
+        # the interesting place to hide a grant is just past its end marker:
+        # chart-sync will not touch it and a parser that reads only the block
+        # never sees it.
+        "A4-chart-bind-outside-markers",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - rbac.authorization.k8s.io\n"
+         "    resources:\n      - clusterroles\n    verbs:\n      - bind"),
+        "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
+        "write an unrestricted bind into the chart BELOW the generated-rules "
+        "marker, where chart-sync leaves it and a block-scoped parse misses it",
+    ),
+    Mutation(
+        # Originally unpinned the chart's bind-to-view rule. Both delivery
+        # paths now carry a bind again (scoped to system:auth-delegator), so
+        # the edit is an UNSCOPED bind appearing in the chart copy alone —
+        # the same-ceiling drift A4 exists to catch, in the direction that
+        # widens.
         "A4-chart-bind-returns",
         "charts/kube-agents/templates/operator-rbac.yaml",
         ("  # END GENERATED RULES",

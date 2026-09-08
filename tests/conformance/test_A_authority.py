@@ -284,22 +284,26 @@ class A3ThePrincipalComesFromAVerifiedChannel(unittest.TestCase):
         )
 
 
+RBAC_GROUP = "rbac.authorization.k8s.io"
+
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is
 # bounded. Adding a name here is the review: `bind` on a role confers none of
 # its permissions on the operator, but it lets the operator hand that role to
 # any subject it can write a binding for -- so the question a new entry has to
 # answer is what the worst subject-plus-role pairing grants.
 #
-#   view                   built-in, read-only, no secrets. Held before #387
-#                          removed the rule; kept here because removing a name
-#                          from this set should be a narrowing that needs no
-#                          test edit.
 #   system:auth-delegator  built-in: tokenreviews/create and
 #                          subjectaccessreviews/create, both of which only ask
 #                          the API server questions. Bound to the mode: next
 #                          auth callout's ServiceAccount so it can validate the
 #                          tokens bus clients present.
-BINDABLE_CLUSTER_ROLES = frozenset({"view", "system:auth-delegator"})
+#
+# `view` is deliberately NOT here. The operator held bind over it until #387
+# removed the rule, and leaving the name behind would make re-adding that grant
+# a silent change -- the one thing this set exists to prevent. The set is what
+# the tree binds today, so adding to it is the review and removing from it is a
+# narrowing.
+BINDABLE_CLUSTER_ROLES = frozenset({"system:auth-delegator"})
 
 
 class A4DelegationAttenuates(unittest.TestCase):
@@ -353,12 +357,19 @@ class A4DelegationAttenuates(unittest.TestCase):
                             "add it to BINDABLE_CLUSTER_ROLES with a note on "
                             "what it grants, or scope the rule down",
                         )
-                    if "*" in verbs:
-                        self.assertNotIn(
-                            "rbac.authorization.k8s.io",
-                            groups,
-                            "a wildcard verb on the RBAC API group is escalate "
-                            "by another name",
+                    # A wildcard is not a third thing. `*` in apiGroups
+                    # matches every group including the RBAC one, and `*` in
+                    # verbs matches escalate, impersonate and an unscoped bind
+                    # at once -- so the three named checks above, which read
+                    # the literal spelling, all read past it. This reads what
+                    # the rule authorizes.
+                    if "*" in verbs and (
+                        "*" in groups or RBAC_GROUP in groups
+                    ):
+                        self.fail(
+                            "a wildcard verb reaching the RBAC API group is "
+                            "escalate, impersonate and an unrestricted bind "
+                            "under one asterisk; enumerate the verbs"
                         )
 
     def test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role(self) -> None:
@@ -387,6 +398,25 @@ class A4DelegationAttenuates(unittest.TestCase):
         # markers rather than templating the chart.
         begin = chart.index("# BEGIN GENERATED RULES")
         end = chart.index("# END GENERATED RULES")
+        # Everything below parses the generated block, and `make chart-check`
+        # already gates that block byte-for-byte against role.yaml. What
+        # neither of them can see is a rule written into one of the chart's
+        # OTHER RBAC objects, or hand-added past the end marker: it is not
+        # generated, so chart-sync leaves it alone, and it is outside the
+        # slice, so the parse never reaches it. The scan for `escalate` and
+        # `- impersonate` above covers the whole file for exactly this reason;
+        # `bind` gets the same treatment before the slice narrows things.
+        offset = 0
+        for lineno, line in enumerate(chart.splitlines(keepends=True), start=1):
+            if line.strip() == "- bind":
+                self.assertTrue(
+                    begin < offset < end,
+                    f"charts/kube-agents/templates/operator-rbac.yaml:{lineno} "
+                    "grants bind outside the generated rules block, where "
+                    "neither `make chart-check` nor the parity assertion "
+                    "below can see it",
+                )
+            offset += len(line)
         block = chart[chart.index("\n", begin) + 1 : chart.rindex("\n", begin, end)]
         chart_rules = yaml.safe_load(textwrap.dedent(block))
         self.assertIsInstance(
