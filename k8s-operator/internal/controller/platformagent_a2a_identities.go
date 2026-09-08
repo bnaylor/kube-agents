@@ -191,9 +191,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 // as `worker` — the same credential every spawned session pod holds — because
 // before the callout there was no way to tell the two apart: one password, one
 // grant list, three workloads. The agent pod has a ServiceAccount of its own, so
-// now it gets the grants its job actually needs. Its job is reading topics and
-// the directory, which is what the env comment in platformagent_manifests.go
-// already said it was ("grants already fit an agent-side reader").
+// now it gets the grants its job actually needs, which is reading topics and
+// the directory and nothing else.
 //
 // What it loses by being named: the task plane entirely. As `worker` it could
 // publish task events for ANY addressee — impersonate any executor on the bus,
@@ -409,8 +408,9 @@ func workerIdentity() a2aIdentity {
 	}
 }
 
-// seed: the hand-applied seed tooling (a2a/deploy/seed.yaml), which writes the
-// starter topic entries.
+// seed: the hand-applied seed tooling, which writes the starter topic entries.
+// There is deliberately no path to cite here — the manifest lives outside this
+// repository, which is the whole of what follows.
 //
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit

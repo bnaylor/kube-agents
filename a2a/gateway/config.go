@@ -44,9 +44,11 @@ type Config struct {
 	DefaultAddressee string
 
 	// SpawnSessions arms the session-pod path (spawn/rehydrate/sweep with
-	// client-go). Off until W4's worker image exists; the gateway pod has no
-	// service-account token until this arms, so the k8s client is built
-	// lazily.
+	// client-go). The gateway pod now always mounts a service-account token
+	// (it needs one to create pods at all), so this is a rollout switch
+	// rather than a capability one: off, the gateway routes every task to
+	// DefaultAddressee and creates nothing. The k8s client is still built
+	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
 	// IdleTTL is the reap threshold since the last user message (decided

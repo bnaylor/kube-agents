@@ -21,9 +21,11 @@ import (
 // a timeout. Every component dials through here so none of them has to
 // rediscover that.
 //
-// Static per-component users are the playground posture: the product answer is
-// the auth callout validating a KSA token per agent identity. What survives
-// the switch is the deny-by-default subject lists, which are already exact.
+// This is the static path, and it is no longer the only one: KSATokenNATSOptions
+// below is what a workload with a projected ServiceAccount token dials through,
+// and it is what the callout resolves. Both are live. What is the same across
+// them is the deny-by-default subject lists and the per-user inbox prefix - the
+// trap above is identical whichever credential got you in.
 func WithUserPassword(user, password string) ClientOption {
 	return func(o *clientOptions) {
 		if user == "" {
