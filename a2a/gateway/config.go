@@ -102,11 +102,21 @@ type Config struct {
 	// unowned pods, the pre-S9 posture.
 	OwnerDeployment string
 
-	// Namespace, WorkerImage, and NATSCredsSecret configure the dark spawn
-	// path; the secret holds the worker user's password for spawned pods.
-	Namespace       string
-	WorkerImage     string
-	NATSCredsSecret string
+	// Namespace and WorkerImage configure the dark spawn path.
+	Namespace   string
+	WorkerImage string
+
+	// SessionServiceAccount is the ServiceAccount every session pod runs
+	// as, rendered by the operator as <agent>-a2a-session and passed here
+	// so the two cannot disagree. It carries no RBAC; its only purpose is
+	// to be the identity the kubelet mints the pod-bound bus token against,
+	// and the identity the callout's map is keyed on.
+	//
+	// There is no default. A wrong or absent name spawns pods whose token
+	// the callout has no entry for, which fails as every session refused at
+	// connect — a boot-time refusal here is the same information, hours
+	// earlier and in one place.
+	SessionServiceAccount string
 
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
@@ -141,13 +151,20 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
-		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
+
+		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
 	if cfg.DiscordToken == "" {
 		return nil, fmt.Errorf("DISCORD_TOKEN is required (W0's discord-bot Secret)")
+	}
+	// Only when the spawn path is armed: a gateway that spawns nothing has
+	// no session identity to name, and demanding one would break every
+	// bridge-only install.
+	if cfg.SpawnSessions && cfg.SessionServiceAccount == "" {
+		return nil, fmt.Errorf("A2A_SESSION_SERVICE_ACCOUNT is required when A2A_SPAWN_SESSIONS is true; session pods authenticate to the bus as it, and there is no safe default")
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs

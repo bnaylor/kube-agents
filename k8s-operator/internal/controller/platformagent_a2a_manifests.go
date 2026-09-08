@@ -1158,18 +1158,6 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// when it matches the gateway's own default, so
 							// the operator-side override reaches it.
 							{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
-							// The Secret the spawner projects the bus
-							// password from. The gateway's baked default
-							// spells it for a CR named platform-agent, so on
-							// any install that renames the CR every session
-							// pod would wedge in CreateContainerConfigError
-							// on a Secret that does not exist — and wedge
-							// silently, because a pod that never runs never
-							// reaches a terminal phase for the sweeper to
-							// find, holding its session slot until the
-							// deadline. Same travel-together rule as the
-							// namespace and the owner.
-							{Name: "A2A_NATS_CREDS_SECRET", Value: a2aNATSName(agent) + "-creds"},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
 							// reads the gateway's own Deployment in THIS
