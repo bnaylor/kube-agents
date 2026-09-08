@@ -40,6 +40,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -142,6 +143,67 @@ func randomA2APassword() (string, error) {
 // key would render `password: ""` into nats.conf — a user anyone can log in
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
 var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
+
+// a2aProvisionedStreams is every JetStream stream the provision Job creates, and
+// the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
+// KV_<bucket>, so they belong in the same list.
+//
+// The provision script and the seed grant in nats.conf both render from this
+// one slice on purpose. They are a pair — a grant that does not name a stream
+// makes the script's create for it time out on a refused API request, and a
+// script that creates a stream the grant does not name is the same bug from the
+// other side. Held apart in two string literals, the pair drifts silently the
+// first time someone adds a stream; held here, it cannot.
+var a2aProvisionedStreams = []string{
+	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
+	"KV_runtime-state", "KV_session-state", "KV_cap",
+}
+
+// a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
+// replacing the `$JS.API.>` wildcard this user shipped with.
+//
+// seed is trust-root — it is the identity the provision Job runs under — so this
+// is defence in depth rather than a boundary. It is worth having anyway, because
+// the seed password lives in the creds Secret for the life of the CR and
+// deliberately survives a flip back to today, so the blast radius of a leak is
+// not bounded by anything else.
+//
+// What the wildcard granted that provisioning never uses, and this list now
+// refuses: STREAM.RESTORE (arbitrary messages with arbitrary stored subjects),
+// STREAM.MSG.DELETE and PURGE (selective editing of the audit substrate),
+// CONSUMER.CREATE (deliver-subject redirection, the server-originated write onto
+// a subject nobody granted), and STREAM.DELETE.
+//
+// UPDATE is absent deliberately, and it is the interesting one. The script
+// guards every create with an info check (`stream info X || stream add X`), so
+// it never updates an existing stream — which means seed cannot set RePublish on
+// one either. RePublish is a stream-config field settable at CREATE and UPDATE,
+// and CREATE only succeeds on a stream that does not exist yet; on a provisioned
+// install all seven do. So the one write route that survives a name-scoped
+// allow-list in general is closed here by the script's own idempotence. If a
+// future script ever needs UPDATE, that reopens RePublish and the grant should
+// say so out loud rather than quietly gaining a verb.
+func a2aSeedJetStreamGrants() []string {
+	// Account-level JetStream discovery; the CLI asks before anything else.
+	grants := []string{"$JS.API.INFO"}
+	for _, s := range a2aProvisionedStreams {
+		grants = append(grants,
+			`$JS.API.STREAM.CREATE.`+s,
+			`$JS.API.STREAM.INFO.`+s,
+		)
+	}
+	return grants
+}
+
+// a2aSeedJetStreamGrantLines renders those grants as nats.conf allow-list
+// entries at the seed block's indentation.
+func a2aSeedJetStreamGrantLines() string {
+	lines := make([]string, 0, len(a2aSeedJetStreamGrants()))
+	for _, g := range a2aSeedJetStreamGrants() {
+		lines = append(lines, fmt.Sprintf("            %q,", g))
+	}
+	return strings.Join(lines, "\n")
+}
 
 // a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
 // security check, not tidiness: buildA2ANATSConfigSecret interpolates these
@@ -385,7 +447,7 @@ accounts {
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
-            "$JS.API.>",
+` + a2aSeedJetStreamGrantLines() + `
             "_INBOX.seed.>"
           ] }
           subscribe { allow = [

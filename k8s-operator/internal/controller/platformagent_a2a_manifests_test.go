@@ -1298,3 +1298,96 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
 	}
 }
+
+// TestSeedGrantsAndProvisionScriptNameTheSameStreams pins the pair. seed's
+// $JS.API allow-list and the provision script are rendered from
+// a2aProvisionedStreams, and this asserts the script actually uses that list
+// rather than a second copy that happens to agree today.
+//
+// The failure it prevents is quiet in the worst way: a stream added to the
+// script but not the grant makes provisioning hang on a refused API request
+// until the Job's backoff gives up, and the install comes up with a healthy bus
+// and a missing stream. That is the exact shape of #1259 — a provisioning step
+// that fails without the render looking wrong.
+func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+
+	for _, s := range a2aProvisionedStreams {
+		// KV buckets appear in the script under their bare name; streams under theirs.
+		bare := strings.TrimPrefix(s, "KV_")
+		if !strings.Contains(script, " "+bare+" ") && !strings.Contains(script, " "+bare+"\n") &&
+			!strings.Contains(script, " "+bare+" \\") {
+			t.Errorf("a2aProvisionedStreams names %q but the provision script never mentions %q; "+
+				"the grant permits a stream nothing creates", s, bare)
+		}
+		for _, verb := range []string{"CREATE", "INFO"} {
+			want := "$JS.API.STREAM." + verb + "." + s
+			if !slices.Contains(a2aSeedJetStreamGrants(), want) {
+				t.Errorf("seed grant is missing %q", want)
+			}
+		}
+	}
+
+	// The other direction: every `stream add` / `kv add` in the script must be
+	// covered by the list, or provisioning breaks on a refusal.
+	for _, line := range strings.Split(script, "\n") {
+		for _, verb := range []string{"stream add ", "kv add "} {
+			idx := strings.Index(line, verb)
+			if idx < 0 {
+				continue
+			}
+			name := strings.Fields(line[idx+len(verb):])[0]
+			if verb == "kv add " {
+				name = "KV_" + name
+			}
+			if !slices.Contains(a2aProvisionedStreams, name) {
+				t.Errorf("the provision script creates %q, which a2aProvisionedStreams does not name, "+
+					"so seed has no grant for it and the create will be refused", name)
+			}
+		}
+	}
+}
+
+// TestSeedHoldsNoWholesaleJetStreamAPI is a shape check, and only that — it reads
+// the rendered config rather than asking a server, so it cannot prove a refusal.
+// The refusal proof is the live validation in the PR body: seed denied on
+// STREAM.PURGE against the running install, and the provision Job still
+// completing. This test exists to keep the wildcard from coming back by accident.
+//
+// The routes named here are the ones architecture A3's write-surface enumeration
+// calls identity-forgery grants: they author or edit bytes on an identity-bearing
+// subject without any publish permission on it.
+func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	// Seed's publish allow-list exactly, not the span to the next user: the
+	// following block's explanatory comment names grants of its own, and a
+	// sloppier cut reads them as seed's. It did, on this test's first run.
+	start := strings.Index(conf, "user: seed")
+	if start < 0 {
+		t.Fatal("no seed user in the rendered config")
+	}
+	openIdx := strings.Index(conf[start:], "publish { allow = [")
+	if openIdx < 0 {
+		t.Fatal("seed has no publish allow-list")
+	}
+	openIdx += start
+	closeIdx := strings.Index(conf[openIdx:], "] }")
+	if closeIdx < 0 {
+		t.Fatal("seed's publish allow-list is unterminated")
+	}
+	seedBlock := conf[openIdx : openIdx+closeIdx]
+
+	if strings.Contains(seedBlock, "$JS.API.>") {
+		t.Error("seed carries the wholesale $JS.API.> wildcard again; it grants STREAM.RESTORE, " +
+			"MSG.DELETE, PURGE and CONSUMER.CREATE, none of which provisioning uses")
+	}
+	for _, forbidden := range []string{
+		"$JS.API.STREAM.RESTORE", "$JS.API.STREAM.MSG.DELETE", "$JS.API.STREAM.PURGE",
+		"$JS.API.STREAM.DELETE", "$JS.API.CONSUMER.CREATE", "$JS.API.STREAM.UPDATE",
+	} {
+		if strings.Contains(seedBlock, forbidden) {
+			t.Errorf("seed's grants name %q; provisioning does not use it", forbidden)
+		}
+	}
+}
