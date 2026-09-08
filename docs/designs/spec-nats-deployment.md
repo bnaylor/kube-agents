@@ -348,7 +348,12 @@ says X" is checkable against the running system rather than against the rendered
 
 **What ships today is coarser than that sentence, and the gap is deliberate.** The
 condition is on the `PlatformAgent`, not on an `AgentProfile`, because neither the CRD
-nor the dispatcher exists yet. It asserts that the callout Deployment is Available with
+nor the dispatcher exists yet. For the same reason the second half of the sentence -
+"nothing dispatches before that condition is true" - is not yet enforced by anything:
+the operator writes `BusCredentialsReady` and no code in this repository reads it. The
+dispatcher that would is the intended reader, so the condition is deliberately built
+ahead of its consumer rather than being dead code; but until that consumer exists the
+ordering is a published signal an operator can watch, not a gate. **Amended 9/8.** It asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
 served, that means every replica is serving one. Reasons are `CalloutServing`,
 `CalloutUnavailable` and `CalloutAbsent`, and the message names the rendered map version.
