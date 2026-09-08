@@ -145,9 +145,12 @@ MUTATIONS: list[Mutation] = [
         "obvious improvement that turns a denial into an oracle",
     ),
         Mutation(
-        # The original unpinned bind's resourceNames; #387 removed the bind
-        # rule outright, so the live escalation edit is granting escalate on
-        # the RBAC rule the operator still holds full CRUD through.
+        # This originally unpinned the bind rule's resourceNames. #387 removed
+        # the operator's bind entirely and the auth callout brought one back,
+        # scoped to system:auth-delegator -- so unpinning is live again and
+        # covered by A4-bind-unpinned below. This one stays on `escalate`,
+        # which is the wider verb and the one the operator holds full RBAC CRUD
+        # behind.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
         ("      - roles\n    verbs:\n      - create\n",
@@ -196,9 +199,11 @@ MUTATIONS: list[Mutation] = [
         "refusals, which is how a control gets switched off in production",
     ),
         Mutation(
-        # Originally unpinned the chart's bind-to-view rule; the rule is gone
-        # from both delivery paths (#387), so the live edit is bind returning
-        # to the chart copy alone — the same-ceiling drift A4 exists to catch.
+        # Originally unpinned the chart's bind-to-view rule. Both paths carry
+        # a bind again (system:auth-delegator, for the auth callout), so the
+        # live edit is a SECOND bind — unrestricted — appearing on the chart
+        # copy alone: the same-ceiling drift A4 exists to catch, in the
+        # direction that makes one install path more powerful than the other.
         "A4-chart-bind-returns",
         "charts/kube-agents/templates/operator-rbac.yaml",
         ("  # END GENERATED RULES",
@@ -207,6 +212,19 @@ MUTATIONS: list[Mutation] = [
         "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
         "give the chart's operator role an unrestricted bind the kustomize "
         "role does not carry -- one delivery path quietly grows a ceiling",
+    ),
+    Mutation(
+        "A4-bind-unpinned",
+        "k8s-operator/config/rbac/role.yaml",
+        ("    resourceNames:\n      - system:auth-delegator\n    resources:\n"
+         "      - clusterroles\n    verbs:\n      - bind\n",
+         "    resources:\n      - clusterroles\n    verbs:\n      - bind\n"),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "drop the resourceNames scope from the operator's bind. The verb list "
+        "is unchanged and the rule still reads as one narrow grant, but an "
+        "unrestricted bind lets the operator attach any ClusterRole the cluster "
+        "already ships -- cluster-admin included -- to any subject it can write "
+        "a binding for, which is escalation without the escalate verb",
     ),
     Mutation(
         "A4-inject-assertion-renamed",
@@ -958,14 +976,49 @@ Mutation(
         "pod, which the API server reports as success",
     ),
     Mutation(
-        "C1-session-pod-gets-an-identity",
+        "C1-session-pod-gets-a-second-token",
         "a2a/gateway/spawn.go",
         ("AutomountServiceAccountToken: ptr.To(false),",
          "AutomountServiceAccountToken: ptr.To(true),"),
         "test_C1_a_session_pod_carries_no_kubernetes_identity",
-        "mount the default ServiceAccount token into a session pod, giving the "
-        "model-directed worker a Kubernetes identity the session fence's rule "
-        "set was written on the assumption it did not have",
+        "automount a SECOND token into a session pod, beside the bus token it "
+        "is supposed to have. A session pod now names a ServiceAccount -- the "
+        "callout resolves a Kubernetes identity, so it has to -- and this is "
+        "the flip that turns that identity from inert into a cluster "
+        "credential: the automounted token carries the API server's default "
+        "audience, so unlike the projected bus token it authenticates against "
+        "the API server, which the session fence's rule set does not account "
+        "for",
+    ),
+    Mutation(
+        "C1-session-token-loses-its-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          lib.BusTokenAudience,", ""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "drop the audience from the session pod's projected token. An "
+        "audience-less projection is a default-audience token by another name, "
+        "so automount staying off would stop meaning anything -- and this is "
+        "the quiet version, because the pod keeps exactly one token file at "
+        "exactly the path the worker reads",
+    ),
+    Mutation(
+        "C1-session-account-gets-rbac",
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("""\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
+\t\tSubjects: []rbacv1.Subject{{
+\t\t\tKind:      "ServiceAccount",
+\t\t\tName:      a2aCalloutName(agent),""",
+         """\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
+\t\tSubjects: []rbacv1.Subject{{
+\t\t\tKind:      "ServiceAccount",
+\t\t\tName:      a2aSessionServiceAccountName(agent),"""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "point an RBAC binding at the session ServiceAccount instead of the "
+        "callout's. The session account holds no permissions, which is the "
+        "third thing keeping a session pod's token inert; this is the "
+        "cross-module half, because the account is named by the gateway "
+        "(module a2a) and granted by the operator (module k8s-operator) and no "
+        "Go test in either can see both",
     ),
     Mutation(
         "harness-fixture-emptied",

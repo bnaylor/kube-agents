@@ -438,10 +438,31 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         The fence grants DNS, the bus and LiteLLM and nothing else -- no
         API-server rule, no 443, no metadata rule beyond DNS -- and that is
-        only safe while a session pod has no ServiceAccount to use them with.
-        The spawner sets AutomountServiceAccountToken false and names no
-        ServiceAccountName; if either changes, the pod acquires an identity
-        the fence was written on the assumption it did not have.
+        only safe while a session pod holds no credential it could use against
+        the API server if it found a route.
+
+        This used to read "names no ServiceAccountName", because the pod had
+        none. Per-session bus credentials gave it one: the callout resolves a
+        Kubernetes identity, so a session has to present a token, and a token
+        has to be minted for a ServiceAccount. What keeps the fence's premise
+        true is no longer the absence of an identity but the shape of the only
+        credential that identity gets, which is three things at once and needs
+        all three:
+
+        - Automount stays off, so the default-audience token -- the one the API
+          server accepts -- is never mounted.
+        - The one token that is mounted is a projected token naming the bus
+          audience. The API server refuses it for anything else, so it is not a
+          cluster credential even though it is a Kubernetes one.
+        - The ServiceAccount it is minted for is bound to nothing, so even a
+          token that reached the API server would authenticate as a principal
+          holding no permissions.
+
+        The third clause is why this lives here rather than in Go: the pod is
+        spawned by the gateway (module `a2a`) and the ServiceAccount is
+        rendered by the operator (module `k8s-operator`), so no Go test in
+        either module can check that the identity one names is the identity the
+        other left empty.
         """
         spawner = h.text("a2a_spawner")
         body = h.go_function_body(spawner, "Spawn")
@@ -449,13 +470,68 @@ class C1IsolationIsStructural(unittest.TestCase):
         self.assertIn(
             "AutomountServiceAccountToken: ptr.To(false)",
             body,
-            "the spawner no longer refuses the ServiceAccount token mount",
+            "the spawner no longer refuses the default ServiceAccount token "
+            "mount, so a session pod carries an API-server credential beside "
+            "its bus token",
         )
-        self.assertNotIn(
-            "ServiceAccountName:",
+
+        # Every token the pod is handed, and what each is good for. An
+        # audience-less ServiceAccountToken projection is a default-audience
+        # token by another name -- automount off would no longer mean anything.
+        projections = re.findall(
+            r"ServiceAccountToken:\s*&corev1\.ServiceAccountTokenProjection\{(.+?)\n\t+\}",
             body,
-            "the spawner now names a ServiceAccount, so a session pod has a "
-            "Kubernetes identity the session fence's rule set does not account for",
+            re.DOTALL,
+        )
+        self.assertTrue(
+            projections,
+            "the session pod projects no ServiceAccount token at all; if the "
+            "bus credential moved, this test has to move with it",
+        )
+        for projection in projections:
+            with self.subTest(projection=projection.strip()[:80]):
+                self.assertIn(
+                    "Audience:",
+                    projection,
+                    "a projected token with no audience is accepted by the API "
+                    "server, which is the credential the fence assumes the pod "
+                    "does not have",
+                )
+                self.assertIn(
+                    "lib.BusTokenAudience",
+                    projection,
+                    "the session pod's token names an audience other than the "
+                    "bus, so it reaches something the fence did not account for",
+                )
+
+        # The identity itself. `a2a_spawner` names the ServiceAccount from
+        # config; the operator is what decides whether that name has any
+        # permissions, and the only RBAC the A2A stack renders is the
+        # callout's. A subject naming the session account means the pod's
+        # token stopped being inert.
+        self.assertIn(
+            "ServiceAccountName: s.cfg.SessionServiceAccount",
+            body,
+            "the spawner no longer takes the session ServiceAccount from "
+            "config, so the operator-side half of this check may be pointed at "
+            "the wrong account",
+        )
+        callout = h.text("a2a_callout_rbac")
+        session_sa = "a2aSessionServiceAccountName"
+        for match in re.finditer(r"Subjects: \[\]rbacv1\.Subject\{(.+?)\}\}", callout, re.DOTALL):
+            with self.subTest(subject=match.group(1).strip()[:80]):
+                self.assertNotIn(
+                    session_sa,
+                    match.group(1),
+                    "an RBAC binding names the session ServiceAccount, so a "
+                    "session pod's token now authorises something at the API "
+                    "server and the fence's rule set no longer covers it",
+                )
+        self.assertIn(
+            "func buildA2ASessionServiceAccount",
+            callout,
+            "the session ServiceAccount is no longer built here, so the "
+            "binding scan above may be reading the wrong file",
         )
 
     @h.known_violation("C1", "slice-2b/findings.md 1.4 (see gke-labs/kube-agents#676)")
