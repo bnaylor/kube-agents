@@ -80,33 +80,48 @@ const (
 // addressee and the thing the callout derived the grant from.
 func WithKSAToken(path, inboxOwner string) ClientOption {
 	return func(o *clientOptions) {
-		if path == "" {
-			o.err = fmt.Errorf("WithKSAToken: no token path")
+		opts, err := KSATokenNATSOptions(path, inboxOwner)
+		if err != nil {
+			o.err = err
 			return
 		}
-		if inboxOwner == "" || strings.ContainsAny(inboxOwner, ".*> \t") {
-			o.err = fmt.Errorf("WithKSAToken: inbox owner %q is not a single subject token", inboxOwner)
-			return
-		}
-		if _, err := readToken(path); err != nil {
-			o.err = fmt.Errorf("WithKSAToken: %w", err)
-			return
-		}
-		o.natsOpts = append(o.natsOpts,
-			nats.TokenHandler(func() string {
-				tok, err := readToken(path)
-				if err != nil {
-					// No logger here and no error return; an empty token is
-					// refused by the server and the reconnect loop tries
-					// again, which is the right shape for a transient
-					// rotation race.
-					return ""
-				}
-				return tok
-			}),
-			nats.CustomInboxPrefix("_INBOX."+inboxOwner),
-		)
+		o.natsOpts = append(o.natsOpts, opts...)
 	}
+}
+
+// KSATokenNATSOptions is the same thing as raw nats.go options, for a caller
+// that also opens a plain nats.Conn.
+//
+// The worker adapter is that caller: it holds a lib client for validated
+// publishes and a raw JetStream handle for its consumers, and the two are one
+// principal on the bus. Building the options once means the second connection
+// cannot end up with the token and not the inbox prefix — a combination that
+// authenticates fine and then times out on every JetStream call, which is the
+// worst failure shape in this system to read from the outside.
+func KSATokenNATSOptions(path, inboxOwner string) ([]nats.Option, error) {
+	if path == "" {
+		return nil, fmt.Errorf("bus token: no token path")
+	}
+	if !ValidSubjectToken(inboxOwner) {
+		return nil, fmt.Errorf("bus token: inbox owner %q is not a single subject token", inboxOwner)
+	}
+	if _, err := readToken(path); err != nil {
+		return nil, fmt.Errorf("bus token: %w", err)
+	}
+	return []nats.Option{
+		nats.TokenHandler(func() string {
+			tok, err := readToken(path)
+			if err != nil {
+				// No logger here and no error return; an empty token is
+				// refused by the server and the reconnect loop tries
+				// again, which is the right shape for a transient
+				// rotation race.
+				return ""
+			}
+			return tok
+		}),
+		nats.CustomInboxPrefix("_INBOX." + inboxOwner),
+	}, nil
 }
 
 // readToken reads and trims a token file. The kubelet writes the token with no
