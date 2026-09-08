@@ -58,12 +58,26 @@ const (
 //     worker needs neither.
 //   - No $JS.ACK, no $JS.FC: the worker's consumers are ack-none pulls.
 //   - No subscribe on the task subjects at all. Pull deliveries arrive on the
-//     inbox, so the only subscribe a session needs is its own inbox prefix.
+//     reply subject the client names, and this session names its own inbox, so
+//     the only subscribe it needs is its own inbox prefix.
+//
+// What this list is NOT is a statement of everywhere a session's bytes can
+// end up. Subject permissions govern the subject a client publishes on, not
+// the reply subject it names, and nats-server checks the second one only
+// against a short reserved list — so a session can address a JetStream request
+// it is granted and have the answer delivered to a subject it is refused.
+// TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants measures it and
+// states the bounds (the delivery keeps its originating subject, so it is a
+// redirect and not forgery). It is a property of subject-based permissions, so
+// no enumeration here can close it; the shared `worker` credential this
+// replaces had it too, over a far wider grant set. Read the list below as what
+// a session may ASK FOR, which is what it governs, rather than as reach.
 //
 // The task id is not part of the claim, so the events grant is per incarnation
 // (`<pod>.*.events`) rather than per task id. The gateway spawns one
-// incarnation per task, which makes those the same thing today; the spawner
-// pins that.
+// incarnation per task, which makes those the same thing today; the gateway
+// pins that when it routes a session (gateway.go, the SessionRouted branch,
+// which retires the previous incarnation and re-mints rec.BusSession).
 func sessionGrants(pod string) Grants {
 	inbox := "_INBOX." + pod + ".>"
 	g := Grants{
