@@ -200,7 +200,7 @@ shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egr
 fenced (8/31) to DNS, the bus, and LiteLLM - the deployment spec owns the policy),
 running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
-the install's own LiteLLM, in-namespace, with no *cloud* credential at all - the spawned
+the install's own LiteLLM, in-namespace, with no _cloud_ credential at all - the spawned
 pod has no Workload Identity. **Amended 9/8:** it does now carry a ServiceAccount and a
 bus credential of its own. The static `worker` password is gone from the pod entirely; in
 its place is a projected ServiceAccount token, audience-bound to the bus and bound by the
