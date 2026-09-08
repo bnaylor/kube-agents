@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
 	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,14 +82,19 @@ func startPodClaimHarness(t *testing.T) *podClaimHarness {
 
 const sessionSAName = "agent-a2a-session"
 
-// createPod makes the object a token can be bound to. envtest runs no kubelet,
-// so the pod stays Pending forever — which is all this needs, because the bound
-// object reference is checked against the API object and never against a
-// running container.
-func (h *podClaimHarness) createPod(t *testing.T, name string) *corev1.Pod {
+// createSessionPod makes the object a token can be bound to. envtest runs no
+// kubelet, so the pod stays Pending forever — which is all this needs, because
+// the bound object reference is checked against the API object and never
+// against a running container.
+//
+// Free functions rather than methods: the end-to-end test below drives the full
+// liveHarness (API server plus bus plus callout), and both harnesses have to
+// mint a pod-bound token the same way or the two files could disagree about
+// what the spawner asks for.
+func createSessionPod(t *testing.T, k8s kubernetes.Interface, ns, name string) *corev1.Pod {
 	t.Helper()
-	pod, err := h.k8s.CoreV1().Pods(h.namespace).Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: h.namespace},
+	pod, err := k8s.CoreV1().Pods(ns).Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: sessionSAName,
 			Containers:         []corev1.Container{{Name: "adapter", Image: "worker-adapter:test"}},
@@ -99,11 +106,11 @@ func (h *podClaimHarness) createPod(t *testing.T, name string) *corev1.Pod {
 	return pod
 }
 
-// mintPodToken asks for exactly what the spawner's projected volume asks for:
-// an audience-bound token whose bound object is this pod.
-func (h *podClaimHarness) mintPodToken(t *testing.T, pod *corev1.Pod) string {
+// mintPodBoundToken asks for exactly what the spawner's projected volume asks
+// for: an audience-bound token whose bound object is this pod.
+func mintPodBoundToken(t *testing.T, k8s kubernetes.Interface, ns string, pod *corev1.Pod) string {
 	t.Helper()
-	tr, err := h.k8s.CoreV1().ServiceAccounts(h.namespace).CreateToken(context.Background(), sessionSAName,
+	tr, err := k8s.CoreV1().ServiceAccounts(ns).CreateToken(context.Background(), sessionSAName,
 		&authnv1.TokenRequest{Spec: authnv1.TokenRequestSpec{
 			Audiences: []string{busAudience},
 			BoundObjectRef: &authnv1.BoundObjectReference{
@@ -114,6 +121,16 @@ func (h *podClaimHarness) mintPodToken(t *testing.T, pod *corev1.Pod) string {
 		t.Fatalf("minting a pod-bound token: %v", err)
 	}
 	return tr.Status.Token
+}
+
+func (h *podClaimHarness) createPod(t *testing.T, name string) *corev1.Pod {
+	t.Helper()
+	return createSessionPod(t, h.k8s, h.namespace, name)
+}
+
+func (h *podClaimHarness) mintPodToken(t *testing.T, pod *corev1.Pod) string {
+	t.Helper()
+	return mintPodBoundToken(t, h.k8s, h.namespace, pod)
 }
 
 // The claim itself. If this fails, session.go's entire derivation is built on a
@@ -230,5 +247,91 @@ func TestLiveDeletingThePodStopsItsTokenAuthenticating(t *testing.T) {
 	}
 	if !strings.Contains(lastErr.Error(), "not authenticated") {
 		t.Errorf("refusal was %v, want it to come from the authenticator rather than from a call failure", lastErr)
+	}
+}
+
+// End to end, with nothing stubbed anywhere on the path.
+//
+// The suite above measures Kubernetes and session_integration_test.go measures
+// the bus, but each fakes the other's half: the pod probe has no NATS, and the
+// grant tests feed the callout a stubbed TokenReview. This test is the only
+// place where a token minted by a real API server, into a real pod's bound
+// object reference, is validated by a real TokenReview through the callout's
+// own ServiceAccount, turned into grants derived from the attested claim, and
+// then enforced by a real nats-server on a real publish.
+//
+// That is the chain #1270 is closed by. If any link fakes the previous one, the
+// demonstration is of the fake.
+func TestLiveASessionPodGetsGrantsDerivedFromItsOwnPodAndNoOthers(t *testing.T) {
+	h := startLiveHarness(t)
+	const (
+		mine   = "chat-otter-1a2b"
+		theirs = "chat-badger-9f9f"
+	)
+	pod := createSessionPod(t, h.k8s, h.namespace, mine)
+
+	// The NATS user is the pod name, not the map entry's — so the inbox
+	// prefix the client pins is the pod's too. Getting this wrong does not
+	// fail loudly; every reply just times out.
+	nc, violations := h.connect(t, mine, mintPodBoundToken(t, h.k8s, h.namespace, pod))
+
+	checkPublish(t, nc, violations, map[string]bool{
+		// Its own work.
+		"a2a.tasks." + mine + ".t1.events":        false,
+		consumerSubject("MSG.NEXT", mine+"-in"):   false,
+		consumerSubject("DELETE", mine+"-events"): false,
+		"_INBOX." + mine + ".reply":               false,
+
+		// The other session's, which shares its ServiceAccount and
+		// differs only in the pod the API server attested. This is the
+		// assertion that says the credential is per session rather than
+		// per role.
+		"a2a.tasks." + theirs + ".t1.events":      true,
+		consumerSubject("MSG.NEXT", theirs+"-in"): true,
+		"_INBOX." + theirs + ".reply":             true,
+
+		// The gateway's task-plane durable, reachable from any grant that
+		// wildcarded the consumer name.
+		consumerSubject("MSG.NEXT", relayDurable): true,
+		consumerSubject("DELETE", relayDurable):   true,
+
+		// Stream-level reads, which see subjects no consumer grant does.
+		"$JS.API.STREAM.INFO.TASKS":    true,
+		"$JS.API.STREAM.MSG.GET.TASKS": true,
+
+		// And the planes a session has no business on at all.
+		"a2a.topics.shared.blueprint":         true,
+		"agents.hb.claude-code.owner.session": true,
+		"a2a.tasks." + mine + ".t1.in":        true,
+	})
+
+	if !subscribeRefused(t, nc, violations, ">") {
+		t.Error("a session subscribed to the whole account")
+	}
+	if !nc.IsConnected() {
+		t.Error("the connection closed on a permissions violation; refusals must not disconnect a session mid-task")
+	}
+}
+
+// The same ServiceAccount, no pod claim, refused at connect — measured against
+// a real API server rather than a stub that this package taught to omit the
+// field.
+//
+// This is what stops the narrowing from being bypassable by asking for a
+// different kind of token. Anything that can create a ServiceAccount token for
+// the session account (the gateway, via the API) still cannot get a usable bus
+// credential out of it without binding it to a pod, and binding it to a pod is
+// what names the grants.
+func TestLiveASessionTokenWithNoPodBindingIsRefusedByTheRealCallout(t *testing.T) {
+	h := startLiveHarness(t)
+
+	unbound := h.mintToken(t, sessionSAName, busAudience)
+	nc, err := nats.Connect(h.nats.ClientURL(), nats.Token(unbound), nats.Name("unbound-session"))
+	if err == nil {
+		nc.Close()
+		t.Fatal("an unbound token for the session ServiceAccount authenticated to the bus")
+	}
+	if !strings.Contains(err.Error(), "uthorization") {
+		t.Errorf("refused, but not as an authorization failure: %v", err)
 	}
 }

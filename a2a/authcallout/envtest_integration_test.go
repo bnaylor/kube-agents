@@ -95,7 +95,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: envtestNamespace}}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("namespace: %v", err)
 	}
-	for _, sa := range []string{agentSAName, provisionSAName, strangerSAName, "a2a-callout"} {
+	for _, sa := range []string{agentSAName, provisionSAName, sessionSAName, strangerSAName, "a2a-callout"} {
 		if _, err := admin.CoreV1().ServiceAccounts(envtestNamespace).Create(ctx,
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: sa}}, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("serviceaccount %s: %v", sa, err)
