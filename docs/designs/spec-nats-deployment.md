@@ -118,17 +118,19 @@ API server - zero key handling, works on any conformant cluster - with local JWT
 verification against the API server's `openid/v1/jwks` endpoint as the offline
 alternative.
 
-Status (amended 9/4, the callout armed): the render now carries the `auth_callout`
-block, and a principal authenticates one of two ways. **Through the callout**, by
-presenting a projected ServiceAccount token: the platform agent pod (with the Hermes
-bridge sidecar beside it) and the bus provisioning Job. **Statically**, from `nats.conf`
-and listed in `auth_users`: the callout itself, which cannot authenticate through the
-thing it is; the chatops gateway, purely as sequencing, since it has a ServiceAccount and
-its client program lands separately from this render; the shared `worker`, because a
-session pod carries no Kubernetes identity for the callout to resolve; `web`, because a
-browser never can; `seed`, because the hand-applied seed tooling is applied rather than
-rendered and dropping its user would refuse an object already running; and `sys`, a human
-at a port-forward.
+Status (amended 9/4, the callout armed; amended 9/8, sessions moved): the render now
+carries the `auth_callout` block, and a principal authenticates one of two ways.
+**Through the callout**, by presenting a projected ServiceAccount token: the platform
+agent pod (with the Hermes bridge sidecar beside it), the bus provisioning Job, and every
+spawned session pod. **Statically**, from `nats.conf` and listed in `auth_users`: the
+callout itself, which cannot authenticate through the thing it is; the chatops gateway,
+purely as sequencing, since it has a ServiceAccount and its client program lands
+separately from this render; `web`, because a browser never can; `seed`, because the
+hand-applied seed tooling is applied rather than rendered and dropping its user would
+refuse an object already running; `sys`, a human at a port-forward; and the shared
+`worker`, which is now a shrinking residue rather than the session story — no session pod
+authenticates as it, and what keeps it alive is the seed tooling's twin and the
+agent-side workloads that have not moved.
 
 Two of those are permanent and the rest are waiting on something nameable. The single
 source for all of it - the config's static user blocks, the callout's map, and the
@@ -259,12 +261,15 @@ Layout:
   leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
   fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
-  fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has
-  no other legitimate destination, carrying no ServiceAccount and no Workload
-  Identity; its bus credential is the static worker user, and the auth callout does not
-  reach it - a session pod carries no ServiceAccount and no projected token for the
-  callout to resolve, so this closes when each session gets a principal of its own
-  rather than when the callout arms). The origin
+  fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
+  other legitimate destination). **Amended 9/8:** a session pod now carries a
+  ServiceAccount and a projected bus token, so the reason for the fence's shape changed
+  while the fence did not. The kubelet delivers that token through a volume, so the
+  credential arrives without the pod dialling anything, and this policy is what withholds
+  the API-server route it would otherwise imply; automount stays off so no second
+  default-audience token rides along; and the session ServiceAccount holds no RBAC and no
+  Workload Identity. The pod that executes model output is the one place three
+  independent reasons is the right number. The origin
   allow-list (`allowed_origins`, not `same_origin`, which can never match a UI on a
   different port) remains the browser-side control: WebSockets are exempt from CORS,
   so for as long as a port-forward runs, any page the operator's browser visits could
@@ -276,17 +281,38 @@ Layout:
   gateway gets `session-state`, workers get the artifact bucket, nobody gets a bucket
   their role doesn't name. Miss this and the first oversized artifact dies with an
   Authorization Violation. Within the artifact bucket, visibility is bucket-wide;
-  per-task artifact scoping is parked with the per-task credentials tightening.
+  per-task artifact scoping is still parked. Per-session credentials landed (9/8) and did
+  not close it: a session's grants are derived from its pod name, which the gateway mints
+  one of per task, so the scope is per incarnation and the KV buckets are not in a
+  session's grant set at all. Scoping the bucket itself is a separate change.
 
 The callout reads an identity-to-permissions map rendered by the operator (**amended
 8/24** for the subagent framework; **amended 9/4** to what ships): one entry per
 callout-authenticated principal, keyed by the ServiceAccount as TokenReview spells it
 (`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
-`<agent>-a2a-authmap` under key `identities.json`. Today that is two entries, the agent
-pod and the provisioning Job. The gateway is **not** among them - it is a static
-`nats.conf` user for now - and there is no audit exporter or janitor yet. The designed
-shape is one entry per `AgentProfile` rendered from the CR's bus grants, which arrives
-with the CRD.
+`<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now three
+entries - the agent pod, the provisioning Job, and the session principal. The gateway is
+**not** among them - it is a static `nats.conf` user for now - and there is no audit
+exporter or janitor yet. The designed shape is one entry per `AgentProfile` rendered from
+the CR's bus grants, which arrives with the CRD.
+
+The session entry is a different kind of entry and the difference is load-bearing. Every
+session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
+sessions apart; what can is the pod. A projected token is bound by the kubelet to the pod
+it was issued into, `TokenReview` reports that pod's name and UID in the user's `Extra`
+fields, the API server stops authenticating the token once the pod object is gone, and the
+gateway names the pod after the bus session - so the attested pod name IS the addressee.
+The entry therefore carries `narrowing: "pod"` and **no grants at all**: they are built at
+mint time from the attested name. An entry that both narrowed and carried grants would be
+one skipped code path, or one well-meaning map edit, away from handing every session the
+whole list - the shared `worker` credential reborn under a new name, and it would look
+correct in review. The callout refuses such an entry at parse. No claim, no grants, no
+connection.
+
+A reaped session's credential stops working because the pod object is gone, not because
+the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
+10.1 seconds later, the API server's successful-authentication cache being the delay. The
+one-hour token lifetime is not the revocation story and must not be read as one.
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
 never read the map - the constrained party does not see its own ceiling, it just hits it.

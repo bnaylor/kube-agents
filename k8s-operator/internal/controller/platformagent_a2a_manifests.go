@@ -608,10 +608,21 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 //	            selector matches after the ClusterIP translation, so the port
 //	            that must be granted is the container's.
 //
-// There is no API-server rule, no 443 and no metadata rule beyond DNS, because
-// a session pod carries no ServiceAccount and no Workload Identity (spawn.go
-// sets AutomountServiceAccountToken: false and names none). A worker that
-// needs the internet is a design change, not a policy widening.
+// There is no API-server rule, no 443 and no metadata rule beyond DNS, and the
+// reason changed with per-session credentials without the policy changing.
+//
+// A session pod now DOES carry a ServiceAccount and a Kubernetes token — the
+// projected bus token, audience-bound to the bus and bound by the kubelet to
+// this pod. What it does not carry is a route to the API server, and this
+// policy is what withholds it. The kubelet delivers the token through the
+// volume, so the credential arrives without the pod ever dialling anything;
+// AutomountServiceAccountToken stays false in spawn.go so no second,
+// default-audience token rides along; and the session ServiceAccount holds no
+// RBAC and no Workload Identity annotation, so the token would buy nothing
+// even if a route existed. Three independent reasons, which is deliberate:
+// this is the pod that executes model output.
+//
+// A worker that needs the internet is a design change, not a policy widening.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
