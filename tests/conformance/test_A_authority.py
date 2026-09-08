@@ -14,7 +14,10 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import re
+import textwrap
 import unittest
+
+import yaml
 
 from . import _harness as h
 from ._harness import command_policy
@@ -281,6 +284,24 @@ class A3ThePrincipalComesFromAVerifiedChannel(unittest.TestCase):
         )
 
 
+# The ClusterRoles the operator is allowed to hold `bind` over, and why each is
+# bounded. Adding a name here is the review: `bind` on a role confers none of
+# its permissions on the operator, but it lets the operator hand that role to
+# any subject it can write a binding for -- so the question a new entry has to
+# answer is what the worst subject-plus-role pairing grants.
+#
+#   view                   built-in, read-only, no secrets. Held before #387
+#                          removed the rule; kept here because removing a name
+#                          from this set should be a narrowing that needs no
+#                          test edit.
+#   system:auth-delegator  built-in: tokenreviews/create and
+#                          subjectaccessreviews/create, both of which only ask
+#                          the API server questions. Bound to the mode: next
+#                          auth callout's ServiceAccount so it can validate the
+#                          tokens bus clients present.
+BINDABLE_CLUSTER_ROLES = frozenset({"view", "system:auth-delegator"})
+
+
 class A4DelegationAttenuates(unittest.TestCase):
     """A4: a delegated token is a strict subset, and triggering is delegation."""
 
@@ -289,10 +310,22 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         Without `escalate`, the API server refuses to let the operator create a
         role granting permissions the operator does not itself hold. With it,
-        the ceiling in C5 is advisory. `bind` used to be present, restricted
-        by `resourceNames: [view]`; #387 removed the rule outright, so the
-        branch below guarding a restricted bind is defence-in-depth for its
-        return rather than a description of the tree.
+        the ceiling in C5 is advisory.
+
+        `bind` is the third escalation verb and the operator holds one, on
+        `system:auth-delegator` by name: it is how the auth callout gets to
+        create TokenReviews without the operator holding `clusterroles: create`
+        and the ability to author arbitrary cluster permissions. What makes
+        that safe is the `resourceNames` scope, so that is what is asserted --
+        an unrestricted `bind` lets the operator attach any existing role,
+        `cluster-admin` included, to anything it can create a binding for.
+
+        Asserted as an allowlist rather than an exact list. The set has been
+        `[view]` (before #387 removed it) and is `[system:auth-delegator]` now;
+        pinning whichever one is current makes every legitimate change to it a
+        test edit, and the invariant was never the identity of the role. It is
+        that the scope exists and names roles whose grants are bounded and
+        known.
         """
         documents = h.yaml_documents("operator_clusterrole")
         cluster_roles = h.objects_of_kind(documents, "ClusterRole")
@@ -306,12 +339,19 @@ class A4DelegationAttenuates(unittest.TestCase):
                     self.assertNotIn("escalate", verbs)
                     self.assertNotIn("impersonate", verbs)
                     if "bind" in verbs:
-                        self.assertEqual(
-                            ["view"],
-                            rule.get("resourceNames"),
-                            "bind must stay restricted to the built-in view "
-                            "ClusterRole; an unrestricted bind lets the operator "
-                            "attach any existing role to an agent",
+                        names = rule.get("resourceNames") or []
+                        self.assertTrue(
+                            names,
+                            "an unrestricted bind lets the operator attach any "
+                            "existing role -- cluster-admin included -- to an "
+                            "agent; bind must carry resourceNames",
+                        )
+                        self.assertLessEqual(
+                            set(names),
+                            BINDABLE_CLUSTER_ROLES,
+                            "bind names a ClusterRole outside the reviewed set; "
+                            "add it to BINDABLE_CLUSTER_ROLES with a note on "
+                            "what it grants, or scope the rule down",
                         )
                     if "*" in verbs:
                         self.assertNotIn(
@@ -331,24 +371,54 @@ class A4DelegationAttenuates(unittest.TestCase):
         chart = h.text("chart_operator_rbac")
         self.assertNotIn("escalate", chart)
         self.assertNotIn("- impersonate", chart)
-        # This used to assert exactly one `bind`, restricted to `view`. #387
-        # removed the operator's bind-to-view rule outright — a narrowing, so
-        # parity now means neither delivery path carries bind at all. Both
-        # halves are asserted so the grant returning to either path alone is
-        # red: same-ceiling is the invariant, not any particular ceiling.
-        bind_occurrences = [
-            line for line in chart.splitlines() if line.strip() in ("- bind",)
+        # Parity on `bind` is asserted as agreement, not as a fixed count. The
+        # operator has carried zero bind rules (after #387) and carries one now
+        # (system:auth-delegator, for the auth callout's TokenReviews). Either
+        # is a defensible ceiling; a ceiling present on one delivery path and
+        # not the other is not, because it is a ceiling for whoever happened to
+        # install the tested way.
+
+        def bind_rules(rules: list) -> list:
+            return [r for r in rules if "bind" in set(r.get("verbs") or [])]
+
+        # The chart's copy is not parseable as a whole -- its metadata is Helm
+        # expressions -- but the block `make chart-sync` writes is plain YAML,
+        # and it is the block parity is about. Read it out between its own
+        # markers rather than templating the chart.
+        begin = chart.index("# BEGIN GENERATED RULES")
+        end = chart.index("# END GENERATED RULES")
+        block = chart[chart.index("\n", begin) + 1 : chart.rindex("\n", begin, end)]
+        chart_rules = yaml.safe_load(textwrap.dedent(block))
+        self.assertIsInstance(
+            chart_rules, list, "the chart's generated rules block is not a rule list"
+        )
+
+        config_rules = [
+            rule
+            for role in h.objects_of_kind(
+                h.yaml_documents("operator_clusterrole"), "ClusterRole"
+            )
+            for rule in role.get("rules") or []
         ]
+        chart_binds = bind_rules(chart_rules)
+        config_binds = bind_rules(config_rules)
         self.assertEqual(
-            0, len(bind_occurrences), "a bind grant returned to the chart role"
+            sorted(
+                tuple(sorted(rule.get("resourceNames") or [])) for rule in config_binds
+            ),
+            sorted(
+                tuple(sorted(rule.get("resourceNames") or [])) for rule in chart_binds
+            ),
+            "the two delivery paths grant bind over different sets of roles",
         )
-        config_role = h.text("operator_clusterrole")
-        self.assertNotIn(
-            "- bind",
-            config_role,
-            "a bind grant returned to the kustomize role without the chart "
-            "half of this test noticing",
-        )
+        # And each is still scoped -- so the two paths agreeing on an
+        # unrestricted bind cannot pass this as parity.
+        for rule in chart_binds + config_binds:
+            with self.subTest(rule=rule):
+                self.assertTrue(
+                    rule.get("resourceNames"),
+                    "an unrestricted bind grant reached a delivery path",
+                )
 
     def test_A4_triggering_is_covered_by_the_A3_inject_finding(self) -> None:
         """The second half of A4 has one instance in this codebase, already named.
