@@ -311,17 +311,22 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					Name:         "scratch",
 					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 				},
-				// The bus credential, as a file rather than as an
-				// environment variable. That is the whole of gke-labs#1270:
-				// the adapter is PID 1 and the model harness is its child at
-				// the same UID, so anything in the adapter's environment is
-				// readable through /proc/1/environ no matter how carefully
-				// the adapter builds the child's env. A file is not, and the
-				// adapter can keep it out of the child's filesystem view.
+				// The bus credential, as a pod-bound token rather than a
+				// shared password.
 				//
-				// Audience-bound so it is not a general cluster credential,
-				// and pod-bound by the kubelet so the callout can tell this
-				// session from the one next to it on the same account.
+				// Being a file is NOT what fixes gke-labs#1270, and reading
+				// it that way would be a false sense of safety: the harness
+				// runs at the same UID in the same pod, so it can read this
+				// file as easily as it could read /proc/1/environ. What
+				// changes is what the credential is worth. It is
+				// audience-bound, so it is not a cluster credential; it is
+				// bound by the kubelet to this pod, so the callout can tell
+				// this session from the one beside it on the same account;
+				// and the grants minted from it cover this session's own
+				// subjects and nothing else. A harness that reads it holds
+				// exactly the authority it already had by being the session.
+				// The shared `worker` password it replaces spoke for the
+				// whole task plane.
 				{
 					Name: "bus-token",
 					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
