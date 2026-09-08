@@ -144,13 +144,15 @@ SOURCES: dict[str, Source] = {
         ("DefaultPlatformAgentVersion",),
     ),
     "operator_clusterrole": Source(
-        # The second anchor was "resourceNames", proving the bind-to-view
-        # restriction. #387 removed the bind rule outright — the operator no
-        # longer binds agents to the built-in view role at all, a narrowing —
-        # so the restriction has nothing to anchor to and A4 asserts bind's
-        # absence instead.
+        # "resourceNames" is back as an anchor, and it is the load-bearing one.
+        # #387 removed the operator's only bind rule (bind-to-view), and for a
+        # while A4 asserted bind's absence, so there was nothing for it to
+        # anchor to. The auth callout reintroduces bind, over exactly one name
+        # (system:auth-delegator), and A4 is once again a statement about how
+        # that bind is bounded rather than about its absence. Deleting the
+        # scoping is the mutation this anchor exists to make loud.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings",),
+        ("clusterrolebindings", "resourceNames"),
     ),
     "chart_operator_rbac": Source(
         "charts/kube-agents/templates/operator-rbac.yaml",
