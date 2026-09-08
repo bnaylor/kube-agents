@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord adapter) - session spawning is dark behind `A2A_SPAWN_SESSIONS`, and the operator renders neither the gateway Deployment nor its env yet
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord adapter), and the operator renders its Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next`
 
 ## Purpose
 
