@@ -322,11 +322,13 @@ The callout reads an identity-to-permissions map rendered by the operator (**ame
 8/24** for the subagent framework; **amended 9/4** to what ships): one entry per
 callout-authenticated principal, keyed by the ServiceAccount as TokenReview spells it
 (`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
-`<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now three
-entries - the agent pod, the provisioning Job, and the session principal. The gateway is
-**not** among them - it is a static `nats.conf` user for now - and there is no audit
-exporter or janitor yet. The designed shape is one entry per `AgentProfile` rendered from
-the CR's bus grants, which arrives with the CRD.
+`<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now two
+entries - the provisioning Job and the session principal. The agent pod is **not** among
+them: nothing in-tree renders its ServiceAccount an `a2a-bus` token, it connects as the
+static shared `worker`, and a map entry no token can ever match authenticates nobody. Nor
+is the gateway - also a static `nats.conf` user for now - and there is no audit exporter
+or janitor yet. The designed shape is one entry per `AgentProfile` rendered from the CR's
+bus grants, which arrives with the CRD.
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
