@@ -318,11 +318,15 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         `bind` is the third escalation verb and the operator holds one, on
         `system:auth-delegator` by name: it is how the auth callout gets to
-        create TokenReviews without the operator holding `clusterroles: create`
-        and the ability to author arbitrary cluster permissions. What makes
-        that safe is the `resourceNames` scope, so that is what is asserted --
-        an unrestricted `bind` lets the operator attach any existing role,
-        `cluster-admin` included, to anything it can create a binding for.
+        create TokenReviews. Note what that grant is NOT -- it is not a
+        substitute for `clusterroles: create`, which the operator holds
+        unscoped, per the first line of this docstring. It is needed because
+        `system:auth-delegator` also grants `subjectaccessreviews: create`,
+        which the operator does not hold, so the escalation check refuses the
+        binding without it. What makes it safe is the `resourceNames` scope, so
+        that is what is asserted -- an unrestricted `bind` lets the operator
+        attach any existing role, `cluster-admin` included, to anything it can
+        create a binding for.
 
         Asserted as an allowlist rather than an exact list. The set has been
         `[view]` (before #387 removed it) and is `[system:auth-delegator]` now;
