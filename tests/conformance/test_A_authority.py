@@ -323,6 +323,165 @@ def rbac_rules(documents: tuple[dict, ...]) -> list[tuple[str, dict]]:
             collected.append((f"{document['kind']} {name}", rule))
     return collected
 
+class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
+    """A3 on the A2A bus: identity is derived from the subject, so the subject
+    must have the writer set it claims.
+
+    The bus has no per-message signing and the server cannot stamp a
+    publisher's identity into a message (measured, `round_2/test-plan-stage0-
+    checks.md`). What a consumer can trust is the subject a message arrived
+    on, because NATS enforces publish permissions at the connection -- and
+    only where the set of principals whose grants reach that subject is
+    exactly the set the subject names. `from` is publisher-asserted; a forged
+    `from` on a subject with two writers is impersonation asserted by the
+    caller, which is A3's historical attack in a new spelling. These assert
+    the writer sets, over every rendered principal's publish list with the
+    same wildcard rules the server applies, so a grant added to the wrong
+    principal is a red test rather than a quiet widening.
+
+    The executor's grants are not in the map: the callout derives them from
+    the attested pod name (`sessionGrants`), so the session half reads that
+    derivation.
+    """
+
+    SUPERVISOR_PROBE = "a2a.tasks.chat-otter-1a2b.task-0001.supervisor"
+    EVENTS_PROBE = "a2a.tasks.chat-otter-1a2b.task-0001.events"
+    IN_PROBE = "a2a.tasks.chat-otter-1a2b.task-0001.in"
+
+    @staticmethod
+    def _subject_matches(pattern: str, subject: str) -> bool:
+        """NATS wildcard matching: `*` one token, `>` the rest, literal otherwise."""
+        p = pattern.split(".")
+        s = subject.split(".")
+        for i, token in enumerate(p):
+            if token == ">":
+                return len(s) > i
+            if i >= len(s):
+                return False
+            if token != "*" and token != s[i]:
+                return False
+        return len(p) == len(s)
+
+    @classmethod
+    def _rendered_publish_grants(cls) -> dict[str, list[str]]:
+        """Every rendered principal's publish list, keyed by its Go builder.
+
+        Read out of each `...Identity` function body rather than from one
+        expected entry, so a grant added to any principal is examined. The
+        anchor test below keeps the set of builders honest.
+        """
+        source = h.text("a2a_identities")
+        grants = {}
+        for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
+            body = h.go_function_body(source, builder)
+            block = re.search(r"publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
+            grants[builder] = re.findall(r'"([^"]+)"', block.group(1)) if block else []
+        return grants
+
+    @classmethod
+    def _session_publish_derivation(cls) -> str:
+        """The literal Publish list `sessionGrants` starts from, as Go source."""
+        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
+        assert block is not None, "sessionGrants no longer starts from a Publish literal"
+        return block.group(1)
+
+    def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
+        """The builders the writer-set tests iterate, so a moved one is loud."""
+        grants = self._rendered_publish_grants()
+        for builder in ("gatewayIdentity", "workerIdentity", "webIdentity"):
+            self.assertIn(builder, grants, f"{builder} is no longer a rendered principal")
+        self.assertTrue(grants["gatewayIdentity"], "the gateway renders no publish grants")
+
+    def test_A3_the_supervisor_subject_has_exactly_one_writer(self) -> None:
+        """`…supervisor` is written by the supervisor and nobody else.
+
+        The token exists so that "the supervisor declared it dead" can only
+        be written by the supervisor: before it, supervisor terminals shared
+        `…events` with the executor, and a session that ended its own task
+        wearing the gateway's `from` was indistinguishable on replay from
+        the gateway ending it. The gateway is the supervisor for the chat
+        sessions it spawns; the dispatcher's janitor inherits the token at
+        stage 3 and joins this set when it does, deliberately.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in grants)
+        )
+        self.assertEqual(["gatewayIdentity"], writers)
+        self.assertNotIn(
+            "TaskSupervisorSubject",
+            self._session_publish_derivation(),
+            "the callout derives a session a publish grant on its own supervisor "
+            "subject; an executor that can write there can end its own task and "
+            "have the record read as infrastructure",
+        )
+
+    def test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject(self) -> None:
+        """The executor's subject has one writer class, and it is not the supervisor.
+
+        Asserted separately from the exact-set test below because that one
+        is a known violation, and an expected failure records its first
+        failing clause and stops: this half holds today and has to stay
+        visible on its own.
+        """
+        gateway = self._rendered_publish_grants()["gatewayIdentity"]
+        reaching = [g for g in gateway if self._subject_matches(g, self.EVENTS_PROBE)]
+        self.assertEqual(
+            [], reaching,
+            f"the gateway's publish grants {reaching} reach an executor's events "
+            f"subject; a supervisor terminal there is exactly what a hostile "
+            f"executor would forge",
+        )
+
+    def test_A3_the_executors_grant_does_not_reach_its_own_in_subject(self) -> None:
+        """Writers of `…in` are requesters; the executor is not one.
+
+        The per-task grant the cards sketched, `a2a.tasks.{addressee}.{taskId}.>`,
+        would put the executor in its own `…in` writer set -- steering and
+        cancelling itself as if from the user. The derivation publishes the
+        events subject and nothing else on the task plane; `…in` appears in
+        it only as a consumer FILTER (a read), which is what the assertion
+        distinguishes.
+        """
+        publish = self._session_publish_derivation()
+        self.assertIn("lib.TaskEventsSubject(pod", publish)
+        self.assertNotIn("TaskInSubject", publish, "the session's Publish literal reaches its own in subject")
+        self.assertNotIn(
+            "a2a.tasks.", publish,
+            "a literal task-plane grant in the session derivation; the derivation "
+            "is supposed to name subjects through the lib helpers so the token "
+            "grammar and the class are the library's",
+        )
+        gateway = self._rendered_publish_grants()["gatewayIdentity"]
+        self.assertTrue(
+            any(self._subject_matches(g, self.IN_PROBE) for g in gateway),
+            "the requester can no longer write the in subject; the probe below is then vacuous",
+        )
+
+    @h.known_violation("A3", "round_2/a2-followon-launch.md A5 (F-2); gke-labs/kube-agents#1316")
+    def test_A3_the_events_subject_has_no_rendered_writer(self) -> None:
+        """KNOWN VIOLATION. The static `worker` still writes every executor's `…events`.
+
+        After the split the only legitimate writer of a task's `…events` is
+        its executor, whose grant is derived per session and appears in no
+        map -- so the rendered map should hold NO principal whose publish
+        grant reaches the subject. `worker` does: `a2a.tasks.*.*.events` for
+        every addressee, the shared credential the Hermes bridge sidecar
+        still authenticates with. Until A5 gives the bridge its own principal
+        and retires the user, `…events` identity is decision-grade for
+        session pods by the callout's derivation and not by this map.
+
+        Deleting this decorator is the signal A5 landed.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.EVENTS_PROBE) for g in grants)
+        )
+        self.assertEqual([], writers, f"rendered principals reaching an executor's events subject: {writers}")
+
 
 class A4DelegationAttenuates(unittest.TestCase):
     """A4: a delegated token is a strict subset, and triggering is delegation."""
