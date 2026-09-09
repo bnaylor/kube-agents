@@ -66,6 +66,7 @@ variable "project_roles" {
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
   ]
 }
 

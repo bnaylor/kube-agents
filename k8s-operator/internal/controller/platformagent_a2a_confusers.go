@@ -19,8 +19,6 @@ package controller
 import (
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
-
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
@@ -36,13 +34,20 @@ import (
 const a2aCalloutConfUser = "callout"
 
 // renderA2AStaticUsers renders the user blocks for one account.
-func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, account string) string {
+//
+// pw rather than the creds Secret, and that is a constraint rather than a
+// style: renderA2ANATSConf takes every password through pw so a2aConfigRolloutHash
+// can walk the same template with placeholders and get a digest that covers
+// every non-secret byte without covering a credential. Reading the Secret here
+// would put five real passwords back into the hashed input by a route the
+// digest's own guard test cannot see.
+func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, account string) string {
 	var b strings.Builder
 	for _, id := range staticIdentities(agent) {
 		if id.account != account {
 			continue
 		}
-		b.WriteString(renderA2AStaticUser(id, string(creds.Data[id.credsKey])))
+		b.WriteString(renderA2AStaticUser(id, pw(id.credsKey)))
 	}
 	return b.String()
 }
