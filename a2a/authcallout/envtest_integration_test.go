@@ -2,11 +2,13 @@ package authcallout
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -57,9 +59,12 @@ const (
 
 	// The ServiceAccounts the operator's rendered map is keyed on. Taken from
 	// the fixture rather than invented, so a rename in the render fails here.
-	agentSAName     = "agent"
 	provisionSAName = "agent-a2a-provision"
-	strangerSAName  = "not-in-the-map"
+	// secondSAName holds no operator-rendered principal. It exists so the
+	// per-identity resolution can be measured with two accounts while the
+	// operator renders one; the map entry for it is added by the test.
+	secondSAName   = "agent-second-principal"
+	strangerSAName = "not-in-the-map"
 )
 
 type liveHarness struct {
@@ -96,7 +101,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: envtestNamespace}}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("namespace: %v", err)
 	}
-	for _, sa := range []string{agentSAName, provisionSAName, strangerSAName, "a2a-callout"} {
+	for _, sa := range []string{provisionSAName, secondSAName, strangerSAName, "a2a-callout"} {
 		if _, err := admin.CoreV1().ServiceAccounts(envtestNamespace).Create(ctx,
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: sa}}, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("serviceaccount %s: %v", sa, err)
@@ -262,38 +267,111 @@ func (h *liveHarness) connect(t *testing.T, user, token string) (*nats.Conn, cha
 	return nc, violations
 }
 
+// editMap rewrites the served identity map through the API server and blocks
+// until the callout's informer has delivered the new version, so a connection
+// made after it returns is answered from the edited map rather than racing it.
+//
+// It goes through ParseIdentityMap and the production types rather than editing
+// the JSON as text: an edit that this package can no longer represent is a
+// divergence from the operator's shape, and it should fail here rather than
+// quietly serve something the callout will refuse at runtime.
+func (h *liveHarness) editMap(t *testing.T, fn func(*IdentityMap)) {
+	t.Helper()
+	before := h.store.Version()
+
+	cm, err := h.k8s.CoreV1().ConfigMaps(h.namespace).Get(context.Background(), "agent-a2a-authmap", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get map: %v", err)
+	}
+	m, err := ParseIdentityMap([]byte(cm.Data["identities.json"]))
+	if err != nil {
+		t.Fatalf("the served map does not parse: %v", err)
+	}
+	fn(m)
+	m.Version = before + "-edited"
+
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal map: %v", err)
+	}
+	cm.Data["identities.json"] = string(raw)
+	if _, err := h.k8s.CoreV1().ConfigMaps(h.namespace).Update(context.Background(), cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update map: %v", err)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for h.store.Version() == before {
+		if time.Now().After(deadline) {
+			t.Fatalf("the informer did not deliver the edit; still serving %q", before)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // DoD, with a token the cluster actually minted and actually validated.
 func TestLiveARealServiceAccountTokenGetsItsMappedGrants(t *testing.T) {
 	h := startLiveHarness(t)
-	nc, violations := h.connect(t, "agent", h.mintToken(t, agentSAName, busAudience))
+	nc, violations := h.connect(t, "provision", h.mintToken(t, provisionSAName, busAudience))
 
 	if publishRefused(t, nc, violations, "a2a.topics.shared.blueprint") {
-		t.Error("the agent was refused a topic its map entry grants")
+		t.Error("provision was refused a starter topic its map entry grants")
 	}
 	if !publishRefused(t, nc, violations, "a2a.tasks.platform.t1.in") {
-		t.Error("the agent reached the task plane; its principal grants none of it")
+		t.Error("provision reached the task plane; its principal grants none of it")
 	}
 	if !nc.IsConnected() {
 		t.Error("the connection closed on a permissions violation")
 	}
 }
 
+// Two distinct cluster identities resolve to two distinct grant sets. This is
+// the callout's reason to exist, so it is measured rather than reasoned.
+//
+// The operator renders one callout principal on this branch — `provision`; the
+// second arrives with the session principal in the follow-on — so the second
+// entry here is added to the served map rather than rendered into it. It is
+// built by copying the operator's own entry and changing the two fields that
+// make it a different identity, so the shape under test is the operator's even
+// though the content is not: a field this package expects and the operator
+// stops rendering still fails, in the contract test next door.
 func TestLiveTwoServiceAccountsGetDifferentGrants(t *testing.T) {
 	h := startLiveHarness(t)
-	agent, agentViolations := h.connect(t, "agent", h.mintToken(t, agentSAName, busAudience))
-	provision, provisionViolations := h.connect(t, "provision", h.mintToken(t, provisionSAName, busAudience))
 
-	// Both are granted the provisioned topics.
-	if publishRefused(t, agent, agentViolations, "a2a.topics.shared.annotations") {
-		t.Error("the agent was refused a granted topic")
-	}
+	// The second identity: the same grants plus the heartbeat subject, keyed
+	// on a different ServiceAccount.
+	h.editMap(t, func(m *IdentityMap) {
+		var extra Identity
+		for _, id := range m.Identities {
+			if id.User == "provision" {
+				extra = id
+			}
+		}
+		if extra.User == "" {
+			t.Fatal("no provision principal in the operator's rendered map to copy")
+		}
+		extra.User = "second"
+		extra.ServiceAccount = "system:serviceaccount:" + h.namespace + ":" + secondSAName
+		extra.Grants.Publish = append(slices.Clone(extra.Grants.Publish), "agents.hb.>", "_INBOX.second.>")
+		extra.Grants.Subscribe = append(slices.Clone(extra.Grants.Subscribe), "_INBOX.second.>")
+		m.Identities = append(m.Identities, extra)
+	})
+
+	provision, provisionViolations := h.connect(t, "provision", h.mintToken(t, provisionSAName, busAudience))
+	second, secondViolations := h.connect(t, "second", h.mintToken(t, secondSAName, busAudience))
+
+	// Both are granted the provisioned topics. Without this the two refusals
+	// below would be consistent with a second identity that authorises
+	// nothing at all.
 	if publishRefused(t, provision, provisionViolations, "a2a.topics.shared.annotations") {
 		t.Error("provision was refused a granted topic")
 	}
-	// Only the agent publishes heartbeats. Two distinct grant sets, resolved
-	// from two distinct cluster identities.
-	if publishRefused(t, agent, agentViolations, "agents.hb.claude-code.owner.session") {
-		t.Error("the agent was refused the heartbeat subject its entry grants")
+	if publishRefused(t, second, secondViolations, "a2a.topics.shared.annotations") {
+		t.Error("the second identity was refused a granted topic")
+	}
+	// Only the second publishes heartbeats. Two distinct grant sets, resolved
+	// from two distinct cluster identities on one bus.
+	if publishRefused(t, second, secondViolations, "agents.hb.claude-code.owner.session") {
+		t.Error("the second identity was refused the heartbeat subject its entry grants")
 	}
 	if !publishRefused(t, provision, provisionViolations, "agents.hb.claude-code.owner.session") {
 		t.Error("provision reached the heartbeat plane; the two grant sets are not distinct")
@@ -339,7 +417,7 @@ func TestLiveATokenForAnotherAudienceIsRefused(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			token := h.mintToken(t, agentSAName, tc.audiences...)
+			token := h.mintToken(t, provisionSAName, tc.audiences...)
 			nc, err := nats.Connect(h.nats.ClientURL(), nats.Token(token), nats.Name("wrong-audience"))
 			if err == nil {
 				nc.Close()
@@ -356,8 +434,8 @@ func TestLiveATokenForAnotherAudienceIsRefused(t *testing.T) {
 	// unusable for some unrelated reason.
 	t.Run("the control: the same identity with the right audience connects", func(t *testing.T) {
 		nc, err := nats.Connect(h.nats.ClientURL(),
-			nats.Token(h.mintToken(t, agentSAName, busAudience)),
-			nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+			nats.Token(h.mintToken(t, provisionSAName, busAudience)),
+			nats.CustomInboxPrefix("_INBOX.provision"), nats.Name("provision"))
 		if err != nil {
 			t.Fatalf("the correctly-audienced token was refused: %v", err)
 		}
@@ -436,9 +514,9 @@ func TestLiveAMapEditReachesTheCalloutAndChangesNewGrants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get map: %v", err)
 	}
-	// Narrow the agent: drop its heartbeat publish.
+	// Narrow provision: drop one of its starter-topic publishes.
 	cm.Data["identities.json"] = strings.Replace(cm.Data["identities.json"],
-		"\"agents.hb.>\",\n", "", 1)
+		"\"a2a.topics.shared.annotations\",\n", "", 1)
 	cm.Data["identities.json"] = strings.Replace(cm.Data["identities.json"],
 		before, before+"-narrowed", 1)
 	if _, err := h.k8s.CoreV1().ConfigMaps(h.namespace).Update(context.Background(), cm, metav1.UpdateOptions{}); err != nil {
@@ -453,8 +531,8 @@ func TestLiveAMapEditReachesTheCalloutAndChangesNewGrants(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	nc, violations := h.connect(t, "agent", h.mintToken(t, agentSAName, busAudience))
-	if !publishRefused(t, nc, violations, "agents.hb.claude-code.owner.session") {
+	nc, violations := h.connect(t, "provision", h.mintToken(t, provisionSAName, busAudience))
+	if !publishRefused(t, nc, violations, "a2a.topics.shared.annotations") {
 		t.Error("a connection made after the narrowing still holds the removed grant")
 	}
 }

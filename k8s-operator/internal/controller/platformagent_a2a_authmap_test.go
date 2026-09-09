@@ -113,28 +113,39 @@ func TestTheMapVersionNamesTheContent(t *testing.T) {
 	}
 }
 
-// The map keys on whatever ServiceAccount the pod actually runs as, including a
-// CR override. Rendering the default name while the pod runs as the override
-// would refuse the agent at connect with a valid token — the failure that looks
-// like the callout is broken when it is doing exactly what it was told.
-func TestTheMapFollowsAServiceAccountOverride(t *testing.T) {
+// The map keys on whatever ServiceAccount the workload actually runs as. Two
+// renders of the same name, from two functions, in two files: the map's key and
+// the Job's ServiceAccountName. If they drift, the Job authenticates with a
+// valid token and the callout answers that it knows nobody by that name — the
+// failure that looks like the callout is broken when it is doing exactly what
+// it was told.
+//
+// Asserted against the rendered Job object rather than against the helper both
+// sides call, because calling the helper twice would agree with itself no
+// matter what either render does.
+func TestTheMapKeysOnTheServiceAccountTheProvisionJobRunsAs(t *testing.T) {
 	agent := authMapTestAgent()
-	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: "custom-agent-sa"}
+
+	job := buildA2AProvisionJob(agent)
+	sa := job.Spec.Template.Spec.ServiceAccountName
+	if sa == "" {
+		t.Fatal("the provision Job renders no ServiceAccountName; the check below would pass on the empty string")
+	}
+	want := "system:serviceaccount:" + agent.Namespace + ":" + sa
 
 	doc, err := renderA2AAuthMap(agent)
 	if err != nil {
 		t.Fatalf("renderA2AAuthMap: %v", err)
 	}
-	want := "system:serviceaccount:kubeagents-system:custom-agent-sa"
 	for _, id := range doc.Identities {
-		if id.User == "agent" {
+		if id.User == "provision" {
 			if id.ServiceAccount != want {
-				t.Errorf("agent principal keys on %q, want %q", id.ServiceAccount, want)
+				t.Errorf("provision principal keys on %q, but the Job runs as %q", id.ServiceAccount, want)
 			}
 			return
 		}
 	}
-	t.Fatal("no agent principal in the rendered map")
+	t.Fatal("no provision principal in the rendered map")
 }
 
 // The wildcard readability check, asserted because the default JSON encoder
@@ -155,8 +166,8 @@ func TestTheRenderedMapIsReadable(t *testing.T) {
 	if strings.Contains(body, escapedWildcard) {
 		t.Errorf("rendered map contains %s escapes; SetEscapeHTML(false) was lost", escapedWildcard)
 	}
-	if !strings.Contains(body, "_INBOX.agent.>") {
-		t.Error("rendered map does not carry the agent inbox grant as a plain wildcard")
+	if !strings.Contains(body, "_INBOX.provision.>") {
+		t.Error("rendered map does not carry the provision inbox grant as a plain wildcard")
 	}
 }
 

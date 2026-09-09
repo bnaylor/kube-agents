@@ -120,14 +120,16 @@ alternative.
 
 Status (amended 9/4, the callout armed): the render now carries the `auth_callout`
 block, and a principal authenticates one of two ways. **Through the callout**, by
-presenting a projected ServiceAccount token: the platform agent pod (with the Hermes
-bridge sidecar beside it) and the bus provisioning Job. **Statically**, from `nats.conf`
-and listed in `auth_users`: the callout itself, which cannot authenticate through the
-thing it is; the chatops gateway, purely as sequencing, since it has a ServiceAccount and
-its client program lands separately from this render; the shared `worker`, because a
-session pod carries no Kubernetes identity for the callout to resolve; `web`, because a
-browser never can; `seed`, because the hand-applied seed tooling is applied rather than
-rendered and dropping its user would refuse an object already running; and `sys`, a human
+presenting a projected ServiceAccount token: the bus provisioning Job, and nothing else
+yet. **Statically**, from `nats.conf` and listed in `auth_users`: the callout itself,
+which cannot authenticate through the thing it is; the chatops gateway, purely as
+sequencing, since it has a ServiceAccount and its client program lands separately from
+this render; the shared `worker`, which is also what the platform agent pod and the
+Hermes bridge sidecar beside it connect as, because a session pod carries no Kubernetes
+identity for the callout to resolve and the bridge has not moved off the shared
+credential; `web`, because a browser never can; `seed`, because the hand-applied seed
+tooling is applied rather than rendered and dropping its user would refuse an object
+already running; and `sys`, a human
 at a port-forward.
 
 Two of those are permanent and the rest are waiting on something nameable. The single
