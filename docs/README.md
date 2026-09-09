@@ -141,6 +141,7 @@ identifier appears, add its source here.
 | Defaults an install gets for saying nothing (region, cluster, permission set, registry prefix) | `install.defaults.env` |
 | Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) |
 | A2A wire constants: protocol version, stream names, size thresholds, token grammar | `a2a/lib/envelope.go` and `a2a/lib/topics.go` |
+| A2A subject grammar: the task subject classes (`in`, `events`, `supervisor`), their constructors and the parse that recovers addressee, taskId and class | `a2a/lib/client.go` |
 | Minimum supported tool versions (`gcloud`) | `scripts/installer/min_versions.sh` |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
 | Cron job rosters and schedules | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |

@@ -141,7 +141,7 @@ lacked.
 | `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                                                                                              |
 | `ts`                   | Required. ISO-8601 UTC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `from`                 | Required. Never the source of identity or authority - both come from the subject an envelope was delivered on (Verified identity, below). On an identity-bearing subject `from` MUST agree with the writer the subject implies, and a disagreement is a protocol error: the envelope is refused, not re-attributed. `from.profile` names the AgentProfile a worker runs as; mandatory (9/9) for a profile-addressed executor's events and on the directory, where it is the profile binding, optional elsewhere. Display reads it; nothing decides on it. |
-| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere. On `…in` it MUST agree with the subject's addressee token (assertion 4); on the event subjects it names the requester and is not an identity check.                                                                                                                                                                                                                                                                                |
+| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere. Where it is present on ANY task subject it MUST agree with that subject's addressee token; on `…in` assertion 4 additionally requires it to be there. Event envelopes carry no `to`.                                                                                                                                                                                                                                               |
 | `identity`             | **Reserved and permanently null** (decided 9/9). Verified identity is a property of the delivery, not a field. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
@@ -159,7 +159,7 @@ content on the bus.
 Reserved in 0.2 as two names, so that filling them later would not be a protocol rev.
 One of them is now decided the other way.
 
-- `identity` stays **null, permanently** (decided 9/9, `round_2/a3-decision.md`). The
+- `identity` stays **null, permanently** (decided 9/9). The
   verified identity of a publisher is the principal the subject implies - NATS enforces
   publish permissions at the connection, the server cannot stamp an identity into a
   message (measured, 8/24), and any identity bytes a publisher can set are advisory by
@@ -231,8 +231,9 @@ executor's name - a profile, or a chat session. With it in the subject, connecti
 grants become exact: who may delegate to which profiles, who may emit events as which
 executor, each a per-user subject-prefix grant. Without it (0.3 and earlier), every
 grant collapsed to `a2a.tasks.>` and the deployment spec's connect-time property was
-unimplementable on the task plane. The envelope's `to` MUST agree with the subject's
-addressee token; a mismatch is a protocol error. `{addressee}` and `{taskId}` MUST be
+unimplementable on the task plane. An envelope's `to`, where it has one, MUST agree with
+the subject's addressee token; a mismatch is a protocol error on every task
+subject, not only on `…in`. `{addressee}` and `{taskId}` MUST be
 dot-free tokens - lowercase alphanumerics and hyphens, DNS-1123-shaped - because dots
 are NATS token separators, and a dotted value silently changes the subject's token
 count out from under every wildcard filter. (Topic tokens already carry this rule; it
@@ -251,7 +252,7 @@ calls and become properties of the stream:
 | A2A operation                    | On the bus                                                                                                                                                                                                                                                                                                                                   |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it.                                                                                                                            |
-| `message/stream`                 | The same publish, plus subscribe to the `events` subject. Streaming is not an optional capability here; it is how the bus works.                                                                                                                                                                                                             |
+| `message/stream`                 | The same publish, plus subscribe to BOTH the `events` and `supervisor` subjects. Streaming is not an optional capability here; it is how the bus works. A subscriber to `events` alone is not wrong about anything it sees, but it never sees the terminal a supervisor declares, so it waits out a task the bus has already ended.          |
 | `tasks/get`                      | Replay the `events` and `supervisor` subjects from sequence 1, in stream order, and fold them into a `Task`. No live executor required - this is the durability payoff. The two subjects share the stream sequence, so the fold needs no merge; whichever terminal the stream holds first is the task's, and the other is a post-final drop. |
 | `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                                                                                                                                             |
 | `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                                                                                                                                                        |
@@ -304,7 +305,7 @@ calls and become properties of the stream:
   already published - the executor is being torn down deliberately, on that cancel -
   the terminal is `canceled`. The supervisor writes what happened, and assertion 13's
   enumeration holds for every path a cancel can take. **The supervisor writes it on
-  `…supervisor`, never on `…events`** (ratified 9/9, `round_2/events-super-ratification.md`).
+  `…supervisor`, never on `…events`** (ratified 9/9).
   Until 9/9 the two shared `…events` and this doc said `from` was how replay told them
   apart; `from` is publisher-asserted, so a hostile executor could end its own task
   wearing the supervisor's identity and the record read as infrastructure. The split
@@ -339,14 +340,16 @@ four carry reserved semantics.
 stored subject, on replay - and that implication is decision-grade exactly where two
 conditions hold. No signed claim, no signing key on the hot path, no key registry at
 replay: every check is a field-to-token comparison, plus the one supervisor name a
-consumer is configured with. The decision and the alternatives it beat are in
-`round_2/a3-decision.md` (three hostile review rounds); this section is the contract.
+consumer is configured with. The alternatives this beat - a signed claim per envelope,
+a server-stamped header, a key registry consulted at replay - were taken through three
+hostile review rounds before it was ratified; this section is the contract, and the
+reasoning that is load-bearing for reading it is restated here rather than cited.
 
 **Condition 1 - the writer set.** The subject's writer set equals the principals its
 tokens name, counted over the full write surface: publish grants, and every JetStream
 route by which stored bytes can be made to land on a subject (deliver-subject
 redirection, `RePublish`, transforms, sources, `STREAM.RESTORE`, message delete and
-purge). Writer sets are permissions invariants and live in `tests/conformance/`.
+purge). Writer sets are permissions invariants and belong in `tests/conformance/`.
 
 **Condition 2 - the envelope agrees with the subject**, checked per subject class,
 closed-world on kind: on an identity-bearing subject only the kinds enumerated for its
@@ -463,9 +466,10 @@ Envelope:
    ingress path; every other producer emits it null. Inbound values are passed through
    byte-identical and are not consulted for any decision.
 4. A consumer on a wildcard ignores envelopes whose `to` names another session, and an
-   envelope on `…in` whose `to` disagrees with its subject's addressee token is surfaced
-   as a protocol error. (Scoped to `…in` 9/9: on the event subjects `to` names the
-   requester, and the identity checks there are assertion 23's.)
+   envelope whose `to` disagrees with its subject's addressee token is surfaced as a
+   protocol error. (Refined 9/9: requiring `to` to be PRESENT is an `…in` rule, since
+   event envelopes carry none; checking a `to` that is present is every task subject's
+   rule, which is where it already was.)
 5. A redelivered envelope (same `envelopeId`) reaches the application at most once.
 
 Payloads:
@@ -533,16 +537,18 @@ Verified identity (added 9/9):
     non-final or non-status envelope on a supervisor subject is a protocol error; a
     supervisor terminal on an executor's `…events` is a writer-class disagreement.
 23. Envelope-subject agreement, per class and closed-world on kind, as the Verified
-    identity table states: a relocated envelope whose kind, `taskId`, `to` (on `…in`)
-    or writer class disagrees with its subject is a protocol error at delivery and at
+    identity table states: a relocated envelope whose kind, `taskId`, `to` or writer
+    class disagrees with its subject is a protocol error at delivery and at
     publish, and is skipped and counted on replay. A legitimate card is never refused
     for lacking a `taskId`.
 24. The writer sets themselves - `…events` the executor only, `…supervisor` the
     supervisor only, `…in` requesters only with the executor's grant never reaching it,
     and no principal outside the trust root holding a server-originated write route onto
     an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
-    live in `tests/conformance/` rather than in the library suite. The suite records the
-    static `worker` grant as a known violation of the first until A5 retires it.
+    belong in `tests/conformance/` rather than in the library suite. They arrive with
+    the change that implements this section, one of them as a known violation: the
+    static `worker` user holds publish on every addressee's `…events`, so that writer
+    set is not yet single-writer, and it closes when `worker` is retired.
 
 ## Open Questions
 
@@ -567,12 +573,20 @@ Calls for @bnaylor, not silently resolved here:
   experiment.
 - ~~**Orphaned tasks.**~~ Settled 8/24, in two ratified halves: every task has a
   supervisor, and the supervisor is the janitor - the gateway for chat sessions it
-  spawned, the dispatcher for profile-addressed tasks. A supervisor's grant is publish
+  spawned, the dispatcher for profile-addressed tasks. ~~A supervisor's grant is publish
   on its own addressees' `…events` subjects - subject-level, since NATS permissions
-  cannot see the envelope `kind`; that a supervisor emits only terminal `status-update`
-  is a conformance assertion, not a connect-time control. Its synthesized events carry
-  its own identity in `from`, so replay always distinguishes "the worker said failed"
-  from "the supervisor declared it dead."
+  cannot see the envelope `kind`; that a supervisor emits only terminal
+  `status-update` is a conformance assertion, not a connect-time control. Its
+  synthesized events carry its own identity in `from`, so replay always distinguishes
+  "the worker said failed" from "the supervisor declared it dead."~~ **Amended 9/9:**
+  the last clause was the part that did not hold. `from` is written by the publisher,
+  so an executor could put the supervisor's identity on its own terminal and replay
+  could not tell. A supervisor now publishes on `…supervisor`, which its grant reaches
+  and no executor's does, so the distinction is the subject rather than the field, and
+  the writer set enforces it at connect time. That a supervisor emits only terminal
+  `status-update` is still not a connect-time control - NATS permissions cannot see
+  `kind` - but it is now a delivery-time refusal (assertion 22) rather than only a
+  conformance assertion.
 - ~~**`contextId` scope.**~~ Settled by the gateway design, 8/24: one per backend
   conversation (thread or DM), minted at first contact, persistent across pod
   incarnations.

@@ -289,11 +289,16 @@ stopped, which is the distinction the rule exists to keep.
 
 The payload spec reserves two envelope fields and this doc names what goes in them.
 
-**`identity` stays empty.** It is the link-level field - the verified identity of the
-_publisher_, bound to the authenticated NATS connection. A server-stamped header was
-ruled out empirically (8/24); the remaining choice - signed claim vs subject-derived
-identity - belongs with the deployment spec's account design and the authority work.
-The gateway has no business writing it.
+**`identity` stays empty - permanently, as of 9/9.** It is the link-level field: the
+verified identity of the _publisher_, bound to the authenticated NATS connection. A
+server-stamped header was ruled out empirically (8/24), and the choice that was left
+open here - signed claim vs subject-derived identity - is now settled as
+subject-derived. The publisher is the principal the subject implies, because the
+subject's writer set is pinned by connect-time grants. There is nothing for a
+publisher to write into `identity` that a consumer would be right to read, so the
+field is not "unarmed pending a mechanism"; it is empty because the mechanism that
+replaced it puts the answer somewhere a publisher cannot reach. The gateway has no
+business writing it, and neither does anyone else.
 
 **`authority` is the request-level field, and the gateway populates it.** Who asked,
 verified how, in front of whom:
@@ -389,11 +394,19 @@ How `principal` gets established depends on the backend, and the three are not e
   full stop.
 
 **What advisory means, stated plainly:** the gateway verifies the requester at ingress,
-but until connection-bound publisher identity lands, nothing stops another bus client
-from publishing an envelope with an invented `authority` block. So consumers MUST NOT
-authorize on it yet. It is carried now for the audit trail and for parity testing, and
-it becomes decision-grade only when `identity` arms and the deployment spec's accounts
-pin who may publish to the task subjects.
+but nothing stops another bus client from publishing an envelope with an invented
+`authority` block. So consumers MUST NOT authorize on it yet. It is carried now for the
+audit trail and for parity testing.
+
+**Corrected 9/9: it does not become decision-grade "when `identity` arms."** `identity`
+never arms; see above. And subject-derived publisher identity, which did land for the
+task plane on 9/9, is not enough on its own either - it says which principal wrote the
+bytes, while `authority` claims which human asked. An executor writing its own
+`…events` subject is the legitimate writer of that subject and can still put any
+`authority` block it likes in the envelope. What `authority` needs is a rule binding
+the block to the one publisher entitled to originate it, on subjects only that
+publisher writes; that is the authority half of the consumer rule, and it is still
+owed.
 
 The payload spec has carried this rule since 0.3: `authority` is populate-by-gateway-only,
 consumers forbidden from deciding on it, libraries pass it through untouched.

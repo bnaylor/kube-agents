@@ -111,7 +111,16 @@ matching the profile's `activeDeadlineSeconds`) takes the same kill path and lan
 ## Supervision
 
 The bridge is its own janitor, per the ratified split - every task's supervisor is the
-component that spawned its execution. Two failure classes:
+component that spawned its execution.
+
+**It is not a supervisor principal, and 9/9's subject split does not move it.** The
+gateway spawns session pods and finalizes tasks it did not execute, so it publishes on
+`…supervisor`, a subject no executor reaches. The bridge is the executor. When it
+finalizes an orphan it is finishing its OWN task across a restart, as itself, so its
+terminal stays on `…events` where every other event it writes goes, and its `from`
+agrees with that subject like any executor's. Profile-addressed tasks have no
+supervisor principal at all until the dispatcher lands; that is a gap the profiles
+spec names, not one this sweep fills. Two failure classes:
 
 - **The subprocess dies under a live bridge.** The runner sees the exit and publishes
   terminal `failed` with the evidence. Ordinary executor path, nothing special.
@@ -127,6 +136,14 @@ expected-last-subject-sequence pinned to the last event the fold saw. A dying
 subprocess's flush racing the sweep wins cleanly, the CAS is rejected, and the sweep
 re-reads instead of double-finalizing. Whichever writer loses lands in the
 warn-and-drop path like any other post-final event.
+
+That still holds here after 9/9, and it is worth saying why, because the profiles spec
+records that the same CAS stopped protecting the dispatcher's janitor on that date.
+Expected-last-subject-sequence is per subject. The janitor's terminal moved to
+`…supervisor` while the executor kept writing `…events`, so the two writers stopped
+sharing the subject the CAS is evaluated on. The bridge's sweep reads and writes the
+same `…events` subject as the runner it is racing, so the racing write still
+invalidates the expectation and the server still refuses the loser.
 
 The sweep assumes incarnations are serial. That assumption is real on this install -
 the kubelet restarts the sidecar container in place, and the operator renders the agent

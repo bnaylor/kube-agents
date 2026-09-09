@@ -349,10 +349,28 @@ source of truth instead of a poll over pods.
 
 The synthesize is a compare-and-swap, not a read-then-write: the janitor publishes its
 terminal event with the expected last subject sequence it observed when it found no
-terminal - so a dying pod's SIGTERM flush racing the sweep wins cleanly, the janitor's
-publish is rejected, and it re-reads instead of double-finalizing. "Exactly one final
-event" is arbitrated by the write, not by the check before it; whichever writer loses
-lands in the warn-and-drop path like any other post-final event.
+terminal, so two janitor incarnations - a leader-election flap, a restart mid-sweep -
+cannot both finalize the same task. One of them is rejected and re-reads.
+
+**What that CAS stopped covering on 9/9, and what replaces it.** JetStream's
+expected-last-subject-sequence is per SUBJECT. While the janitor and the executor both
+wrote to `…events`, the janitor's expected sequence was invalidated by the executor's
+racing SIGTERM flush, and the losing writer was refused at the server - the property
+this paragraph used to claim. The supervisor split ends that: the janitor's CAS is now
+on `…supervisor`, a subject no executor can write, so an executor's terminal landing
+between the janitor's read and its publish does not invalidate anything and both
+terminals reach the stream. The CAS still does the job it is written for above, which
+is janitor-against-janitor; it no longer arbitrates janitor-against-executor.
+
+"Exactly one final event" is therefore arbitrated by the FOLD, not by the write. The
+two subjects share the `TASKS` sequence, so replay sees a total order: the first
+terminal in stream order is the task's, and the other is a post-final drop, counted
+like any other. A janitor should still re-read both subjects immediately before
+publishing - it narrows the window and costs one `GetLastMsgForSubject` per subject -
+but it must not be written as though a refusal will save it, because none is coming.
+The cost of the change is a duplicate terminal on the wire where there used to be a
+server-side refusal; live consumers drop it, and a relay that renders terminals should
+expect to see one it has already rendered.
 
 This is the dispatcher's half of the payload spec's orphaned-task answer; the gateway
 sweeps its own chat sessions the same way (the ratified 8/24 split - every task's
