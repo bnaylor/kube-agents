@@ -121,17 +121,38 @@ func buildA2ACalloutServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 
 // a2aAuthDelegatorRole is the built-in ClusterRole that grants TokenReview.
 //
-// Bound rather than authored, and that is a decision about the OPERATOR's
-// privilege rather than the callout's. TokenReview is a cluster-scoped API, so
-// the callout's grant has to be a ClusterRoleBinding either way — but writing
-// our own ClusterRole would additionally require the operator to hold
-// clusterroles/create, which is the ability to define arbitrary cluster
-// permissions, on every install including the ones that never turn this on.
-// Binding a role the cluster already ships avoids that.
+// Bound rather than authored. TokenReview is a cluster-scoped API, so the
+// callout's grant is a ClusterRoleBinding either way; what differs is which
+// ClusterRole it points at.
 //
-// What it costs: system:auth-delegator also grants subjectaccessreviews/create,
-// which the callout does not need. That is the ability to ask "could X do Y",
-// an information disclosure at worst, and it is the narrower trade of the two.
+// Why the operator needs `bind` at all, measured rather than reasoned: the
+// operator has held unscoped create/update/patch/delete on clusterroles and
+// clusterrolebindings since long before this callout existed, so `bind` is not
+// standing in for a grant it lacks. What stops that CRUD from being a general
+// escalation is the API server's escalation check plus the absence of
+// `escalate`. system:auth-delegator grants subjectaccessreviews/create, which
+// the operator does NOT hold — so without `bind` the API server refuses the
+// binding outright:
+//
+//	clusterrolebindings.rbac.authorization.k8s.io "..." is forbidden: user
+//	"system:serviceaccount:kubeagents-system:kubeagents-controller" is
+//	attempting to grant RBAC permissions not currently held:
+//	{APIGroups:["authorization.k8s.io"], Resources:["subjectaccessreviews"],
+//	Verbs:["create"]}
+//
+// That grant is therefore load-bearing, and scoped by resourceNames to this one
+// role so it cannot attach cluster-admin to anything.
+//
+// What it costs, and the alternative it was chosen over: system:auth-delegator
+// also carries subjectaccessreviews/create, which the callout never calls. An
+// operator-authored ClusterRole holding only tokenreviews/create would give the
+// callout exactly what it uses and would need no new operator permission at all
+// — the operator already holds tokenreviews/create, so the escalation check
+// passes (verified by server-side dry run against a cluster with no `bind`
+// rule: the tokenreviews-only role is admitted, a subjectaccessreviews one is
+// refused). Binding the role kube-apiserver ships is the conventional pattern
+// for a TokenReview client and keeps the grant auditable by name in role.yaml,
+// which is why it is what ships; the narrower option is tracked as #1320.
 //
 // It is part of kube-apiserver's default RBAC bootstrap, so it exists on every
 // cluster with RBAC enabled — no GKE dependency, consistent with the deployment
