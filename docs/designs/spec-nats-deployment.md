@@ -293,11 +293,14 @@ The callout reads an identity-to-permissions map rendered by the operator (**ame
 8/24** for the subagent framework; **amended 9/4** to what ships): one entry per
 callout-authenticated principal, keyed by the ServiceAccount as TokenReview spells it
 (`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
-`<agent>-a2a-authmap` under key `identities.json`. Today that is two entries, the agent
-pod and the provisioning Job. The gateway is **not** among them - it is a static
-`nats.conf` user for now - and there is no audit exporter or janitor yet. The designed
-shape is one entry per `AgentProfile` rendered from the CR's bus grants, which arrives
-with the CRD.
+`<agent>-a2a-authmap` under key `identities.json`. Today that is one entry, the
+provisioning Job, which is the only workload anything in-tree renders an `a2a-bus`
+token for; the agent pod is **not** among them, because it connects as the static
+shared `worker` and a map entry no token can ever match authenticates nobody. Nor is
+the gateway - also a static `nats.conf` user for now - and there is no audit exporter
+or janitor yet. Session pods are the next entry, and they arrive with per-session
+credentials. The designed shape is one entry per `AgentProfile` rendered from the CR's
+bus grants, which arrives with the CRD.
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
 never read the map - the constrained party does not see its own ceiling, it just hits it.
