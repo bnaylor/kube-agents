@@ -39,6 +39,14 @@ const (
 	// the largest answer a worker can return.
 	scannerInitialBytes = 64 * 1024
 	scannerMaxBytes     = 8 * 1024 * 1024
+	// chatterEchoCap bounds how much of a non-JSON stdout line reaches the
+	// log. The line is unparsed harness output, so its length is not ours to
+	// predict and a single one could be scannerMaxBytes long. Deliberately
+	// not shared with adapter.go's steerEchoCap, which happens to hold the
+	// same number today: that one bounds a user's message quoted back to
+	// them, this one bounds untrusted output written to a log, and the two
+	// should be free to move apart.
+	chatterEchoCap = 200
 )
 
 // harnessEvent is one stream-json line from the harness stdout. Only the
@@ -171,7 +179,7 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 				// Non-JSON chatter on stdout is logged, never fatal - the
 				// harness owns its stdout and the contract owns only the
 				// JSON lines.
-				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), 200))
+				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), chatterEchoCap))
 				continue
 			}
 			events <- ev
