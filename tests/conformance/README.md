@@ -244,9 +244,10 @@ python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 
 82 mutations: 62 KILLED, 18 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — as of a full sweep on this
-branch over 2026-09-08's `main`; re-run the harness rather than trusting
-these numbers, which is the sentence this paragraph exists to make cheap.
+handling), zero genuine survivors, zero stale — re-measured on this branch after
+merging 2026-09-09's `main` (#1310 and #1313); re-run the harness rather
+than trusting these numbers, which is the sentence this paragraph exists
+to make cheap.
 Each names the control it removes, the test that must notice, and the
 plausible bad change it imitates. It is not run in CI — it edits tracked
 files in place — so it is a thing to run when adding a test, which step 4
