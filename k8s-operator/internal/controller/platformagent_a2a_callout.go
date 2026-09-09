@@ -292,6 +292,22 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					Containers: []corev1.Container{{
 						Name:  "callout",
 						Image: a2aCalloutImage(),
+						// The image's WORKDIR is /home/nonroot, 0700 owned by
+						// 65532, and the pod above imposes 1000 - measured with
+						// `crane config` on a build of Dockerfile.authcallout,
+						// and on the distroless base it inherits it from. An
+						// image's WORKDIR is chosen for the user that image
+						// expects, so a render overriding the user owns the
+						// working directory too (#1259, and hardenedSecurityContext()
+						// carries the general form). Latent rather than broken
+						// here, the same as the gateway: the binary never stats
+						// "." and this Deployment has run at 2/2 live. It is set
+						// anyway because "latent" is a property of today's code
+						// and the next line that touches the filesystem would
+						// end it silently. "/" rather than a mount because the
+						// callout writes nothing - it needs to enter its cwd,
+						// not write to it.
+						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: a2aCalloutConfUser},

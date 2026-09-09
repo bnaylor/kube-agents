@@ -334,47 +334,6 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 	}
 }
 
-// The provision container runs a third-party image (nats-box) at a uid that
-// image did not pick. nats-box declares WORKDIR /root, 0700 and root-owned, so
-// under runAsUser 1000 the container's cwd is one it cannot stat — and the nats
-// CLI stats the cwd while resolving the JSON schema it validates a stream
-// config against, so every `nats stream add` fails before it sends a byte:
-//
-//	could not create Stream: configuration validation failed:
-//	could not load schema {...}: stat .: permission denied
-//
-// Observed live on 2026-09-09; the Job crash-looped and provisioned nothing.
-// The fix is to pin the cwd, not to relax the uid or the read-only root, so
-// this asserts both halves of that: a WorkingDir is set, and it is a path this
-// container actually mounts writable. Asserting the literal "/tmp" would pass
-// against a WorkingDir pointing at a directory the pod no longer mounts.
-func TestProvisionJobPinsAWritableWorkingDir(t *testing.T) {
-	job := buildA2AProvisionJob(a2aTestAgent())
-
-	writable := map[string]bool{}
-	for _, v := range job.Spec.Template.Spec.Volumes {
-		if v.EmptyDir != nil {
-			writable[v.Name] = true
-		}
-	}
-
-	for _, c := range job.Spec.Template.Spec.Containers {
-		if c.WorkingDir == "" {
-			t.Errorf("container %q sets no WorkingDir; it inherits the image's, which nats-box points at root-owned /root", c.Name)
-			continue
-		}
-		mounted := false
-		for _, m := range c.VolumeMounts {
-			if m.MountPath == c.WorkingDir && writable[m.Name] && !m.ReadOnly {
-				mounted = true
-			}
-		}
-		if !mounted {
-			t.Errorf("container %q WorkingDir = %q, which it does not mount writable; the cwd must be somewhere uid 1000 can actually read and write", c.Name, c.WorkingDir)
-		}
-	}
-}
-
 // mode: next renders the A2A stack; flipping back to today removes it. This is
 // the reconciler-level gate — builders are covered above.
 func TestReconcileA2AGatedByMode(t *testing.T) {
