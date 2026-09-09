@@ -43,11 +43,24 @@ const (
 	correlationIDHexWidth = 12
 )
 
-// gatewayParty is the gateway's own identity in from — routing and display
-// only, never an authorization input. Its supervisor events carry it so
-// replay always distinguishes "the worker said failed" from "the supervisor
-// declared it dead".
+// gatewayParty is the gateway's own identity in from. Never the source of
+// authority: what makes a supervisor terminal the supervisor's is the subject
+// it is published on (`…supervisor`, which only the gateway's grant reaches),
+// and from is checked for agreement with that subject by every consumer -
+// a terminal on `…supervisor` whose from is not this party is a protocol
+// error, and so is one on an executor's `…events` wearing it. That is how
+// replay distinguishes "the worker said failed" from "the supervisor declared
+// it dead" without trusting a field the publisher writes.
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
+
+// supervisorAgreement is the envelope-subject agreement policy for the
+// gateway's own consumers: it is the supervisor for every session it spawned,
+// so the `…supervisor` writer check is exact rather than the negative form.
+var supervisorAgreement = lib.AgreementPolicy{Supervisor: gatewayParty.Session}
+
+// SupervisorAgreement is the policy main hands the bus client, so tasks/get
+// replay and the relay agree about who the supervisor is.
+func SupervisorAgreement() lib.AgreementPolicy { return supervisorAgreement }
 
 // Gateway wires the adapter, the session manager, and the bus client.
 type Gateway struct {
@@ -206,11 +219,20 @@ func New(o Options) (*Gateway, error) {
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Both task-event subjects, one durable: the executors' events and the
+	// terminals this gateway synthesizes as supervisor, which it relays to
+	// the requester and retires the task on exactly like an executor's own.
+	// Two filter subjects put the filter in the request body, which the
+	// gateway's unscoped consumer-create grant permits and a session's
+	// pinned grant would not; the durable already exists on every install
+	// with the single filter, and rebinding it to the pair is an update the
+	// server accepts (lib's rebind test).
 	sub, err := g.client.SubscribeDurable(ctx, lib.SubscribeConfig{
-		Stream:  lib.TasksStream,
-		Subject: "a2a.tasks.*.*.events",
-		Durable: g.relayDurable,
-		Session: gatewayParty.Session,
+		Stream:    lib.TasksStream,
+		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:   g.relayDurable,
+		Session:   gatewayParty.Session,
+		Agreement: &supervisorAgreement,
 	}, func(env *lib.Envelope) { g.relayEvent(ctx, env) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
