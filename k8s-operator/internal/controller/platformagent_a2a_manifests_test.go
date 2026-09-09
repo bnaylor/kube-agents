@@ -1081,12 +1081,12 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	}
 }
 
-// TestTheProvisionJobDeclaresItsOwnWorkingDirectory pins the half of the
-// hardening above that #1211 did not carry, and that #1259 found on a real
-// cluster: the pod runs nats-box as UID 1000, and nats-box ships WORKDIR /root
-// with no USER because it expects to be root. Inheriting that WORKDIR killed
-// every provisioning run on "stat .: permission denied" after it printed its
-// JSON -- a healthy bus with no streams at all, and a client seeing
+// TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse is the other half
+// of the hardening above, and the half #1211 did not carry. #1259 found it on a
+// real cluster: the provision pod runs nats-box as UID 1000, and nats-box ships
+// WORKDIR /root with no USER because it expects to be root. Inheriting that
+// WORKDIR killed every provisioning run on "stat .: permission denied" after it
+// printed its JSON -- a healthy bus with no streams at all, and a client seeing
 // "stream TOPICS-STATE: not found" with nothing in the render to blame.
 //
 // Neither unit tests nor goldens could see it, because the render was right and
@@ -1094,26 +1094,72 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 // anyway: the render is where the decision lives, even when the failure lands
 // somewhere else.
 //
-// The general rule, for whoever adds the fourth A2A container: an image's
-// WORKDIR is chosen for the user that image expects, so a render that overrides
-// the user owns the working directory too. Asserted against the container's
-// mounts rather than the literal "/tmp", so moving the writable volume cannot
-// leave this green while pointing somewhere unwritable.
-func TestTheProvisionJobDeclaresItsOwnWorkingDirectory(t *testing.T) {
-	job := buildA2AProvisionJob(newTestPlatformAgent())
-	spec := job.Spec.Template.Spec
-	c := spec.Containers[0]
+// imageWorkDir is measured, not assumed -- `crane config <pinned tag>` on each
+// of the three, recorded here so a reader can check the premise without pulling
+// anything. All three pods override the user, so wherever the image's WORKDIR
+// is not traversable by the UID the pod imposes, the render owes an explicit
+// WorkingDir. A fourth A2A container needs a row, and fails here until it has
+// one -- the same shape as the hardening test above, deliberately.
+func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
+	agent := newTestPlatformAgent()
+	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
+	job := buildA2AProvisionJob(agent)
+	dep := buildA2AGatewayDeployment(agent)
 
-	if c.WorkingDir == "" {
-		t.Fatalf("provision container inherits the image's WORKDIR (/root on nats-box) "+
-			"while the pod runs as UID %d, which cannot stat it", *spec.SecurityContext.RunAsUser)
-	}
-	if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-		return m.MountPath == c.WorkingDir
-	}) {
-		t.Errorf("WorkingDir %q is not one of the container's mounts %v; the hardened "+
-			"context sets ReadOnlyRootFilesystem, so an unmounted path is unwritable",
-			c.WorkingDir, c.VolumeMounts)
+	for _, tc := range []struct {
+		render    string
+		container string
+		spec      corev1.PodSpec
+		// imageWorkDir is what the pinned image ships, and traversable says
+		// whether the UID the pod imposes can chdir into it.
+		imageWorkDir string
+		traversable  bool
+	}{
+		// nats:2.10-alpine -- WORKDIR /, mode 0755, so UID 1000 is fine and
+		// the render owes nothing.
+		{"nats", "nats", sts.Spec.Template.Spec, "/", true},
+		// natsio/nats-box:0.14.5 -- WORKDIR /root, no USER, and /root is
+		// drwx------ root:root. This is #1259.
+		{"provision", "provision", job.Spec.Template.Spec, "/root", false},
+		// distroless static nonroot -- WORKDIR /home/nonroot, drwx------
+		// owned by 65532, and the pod runs as 1000. Latent rather than broken
+		// because the gateway binary never stats ".".
+		{"gateway", "gateway", dep.Spec.Template.Spec, "/home/nonroot", false},
+	} {
+		t.Run(tc.render, func(t *testing.T) {
+			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
+			if len(all) == 0 {
+				t.Fatalf("%s: no containers, so this test would pass vacuously", tc.render)
+			}
+			idx := slices.IndexFunc(all, func(c corev1.Container) bool { return c.Name == tc.container })
+			if idx < 0 {
+				t.Fatalf("%s: no container named %q; the table is stale", tc.render, tc.container)
+			}
+			c := all[idx]
+
+			if tc.traversable {
+				return
+			}
+			if c.WorkingDir == "" {
+				uid := "the pod's user"
+				if tc.spec.SecurityContext != nil && tc.spec.SecurityContext.RunAsUser != nil {
+					uid = fmt.Sprintf("UID %d", *tc.spec.SecurityContext.RunAsUser)
+				}
+				t.Fatalf("container %s inherits the image's WORKDIR (%s) while the pod runs as %s, "+
+					"which cannot chdir into it", c.Name, tc.imageWorkDir, uid)
+			}
+			// A WorkingDir that names one of the container's own mounts has to
+			// name a writable one: the hardened context sets
+			// ReadOnlyRootFilesystem, so a read-only mount is no better than
+			// the read-only root it sits on. A path that is not a mount is
+			// taken on the image's terms -- "/" is 0755 on all three.
+			for _, m := range c.VolumeMounts {
+				if m.MountPath == c.WorkingDir && m.ReadOnly {
+					t.Errorf("container %s: WorkingDir %q is mount %q, which is ReadOnly",
+						c.Name, c.WorkingDir, m.Name)
+				}
+			}
+		})
 	}
 }
 

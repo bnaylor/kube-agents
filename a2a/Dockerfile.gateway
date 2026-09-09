@@ -17,7 +17,10 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/gateway ./cmd/gateway
 
-# Distroless nonroot matches the Deployment's runAsNonRoot/runAsUser posture.
+# Distroless nonroot satisfies the Deployment's runAsNonRoot, but it does not match its
+# runAsUser: this image's USER is 65532 and the pod imposes 1000. That override is why the
+# Deployment sets WorkingDir explicitly -- the image's WORKDIR /home/nonroot is 0700 owned
+# by 65532, which 1000 cannot chdir into. See hardenedSecurityContext() and #1259.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/gateway /gateway
 USER nonroot
