@@ -927,9 +927,26 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
 					Containers: []corev1.Container{{
-						Name:            "provision",
-						Image:           a2aProvisionImage(),
-						Command:         []string{"sh", "-c", script},
+						Name:    "provision",
+						Image:   a2aProvisionImage(),
+						Command: []string{"sh", "-c", script},
+						// nats-box declares WORKDIR /root, which is 0700
+						// root-owned, so at runAsUser 1000 this container's
+						// own working directory is one it cannot stat. That
+						// is not cosmetic: the nats CLI validates a stream
+						// config against a JSON schema before it sends
+						// anything, and the schema loader resolves relative
+						// to the cwd, so every `nats stream add` dies with
+						// "could not load schema ...: stat .: permission
+						// denied" and the Job never provisions the bus.
+						// Nothing about the pod's own posture is wrong - the
+						// image's WORKDIR simply assumes the uid it stopped
+						// running as - so pin the cwd to the writable
+						// emptyDir this container already carries for HOME
+						// rather than relaxing the uid or the root
+						// filesystem. Any image we run at a uid it did not
+						// pick wants the same treatment.
+						WorkingDir:      "/tmp",
 						SecurityContext: hardenedSecurityContext(),
 						Env: []corev1.EnvVar{{
 							Name: "HOME", Value: "/tmp",

@@ -316,8 +316,9 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		// KV buckets, capped like the streams
 		"runtime-state", "session-state", "--max-bucket-size",
 		// Every stream/kv call is a $JS.API request answered on an inbox, and
-		// seed may only subscribe under _INBOX.seed.> — without the prefix
-		// override every CLI call times out and the Job can never succeed.
+		// this principal may only subscribe under _INBOX.provision.> — without
+		// the prefix override every CLI call times out and the Job can never
+		// succeed.
 		"--inbox-prefix=_INBOX.provision",
 		// posture
 		"PLAYGROUND POSTURE",
@@ -330,6 +331,47 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 	// checked as a distinct word so "cap" inside another token cannot satisfy it.
 	if !strings.Contains(script, "kv add cap") {
 		t.Error("provision script missing the reserved capability bucket")
+	}
+}
+
+// The provision container runs a third-party image (nats-box) at a uid that
+// image did not pick. nats-box declares WORKDIR /root, 0700 and root-owned, so
+// under runAsUser 1000 the container's cwd is one it cannot stat — and the nats
+// CLI stats the cwd while resolving the JSON schema it validates a stream
+// config against, so every `nats stream add` fails before it sends a byte:
+//
+//	could not create Stream: configuration validation failed:
+//	could not load schema {...}: stat .: permission denied
+//
+// Observed live on 2026-09-09; the Job crash-looped and provisioned nothing.
+// The fix is to pin the cwd, not to relax the uid or the read-only root, so
+// this asserts both halves of that: a WorkingDir is set, and it is a path this
+// container actually mounts writable. Asserting the literal "/tmp" would pass
+// against a WorkingDir pointing at a directory the pod no longer mounts.
+func TestProvisionJobPinsAWritableWorkingDir(t *testing.T) {
+	job := buildA2AProvisionJob(a2aTestAgent())
+
+	writable := map[string]bool{}
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.EmptyDir != nil {
+			writable[v.Name] = true
+		}
+	}
+
+	for _, c := range job.Spec.Template.Spec.Containers {
+		if c.WorkingDir == "" {
+			t.Errorf("container %q sets no WorkingDir; it inherits the image's, which nats-box points at root-owned /root", c.Name)
+			continue
+		}
+		mounted := false
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == c.WorkingDir && writable[m.Name] && !m.ReadOnly {
+				mounted = true
+			}
+		}
+		if !mounted {
+			t.Errorf("container %q WorkingDir = %q, which it does not mount writable; the cwd must be somewhere uid 1000 can actually read and write", c.Name, c.WorkingDir)
+		}
 	}
 }
 
