@@ -50,6 +50,15 @@ const (
 	// herd this spreads is the one the callout would otherwise create for
 	// itself, every TTL, forever.
 	grantTTLJitter = 0.2
+
+	// authDecisionBudget is the wall clock the whole decision gets,
+	// TokenReview round trip included. It is not a number we chose freely:
+	// the server starts a first-ping timer on the not-yet-authenticated
+	// connection at roughly two seconds, and the Go client fails the connect
+	// outright on a PING where it expected a PONG. Overrun does not surface
+	// as an authorization failure, it surfaces as "expected 'PONG', got
+	// 'PING'" — which names nothing about authorization at all. See handle.
+	authDecisionBudget = 1500 * time.Millisecond
 )
 
 // Config is what the callout needs to answer.
@@ -173,13 +182,8 @@ func (s *Service) Subscribe(nc *nats.Conn) (*nats.Subscription, error) {
 }
 
 func (s *Service) handle(m *nats.Msg) {
-	// The server's own timer bounds this hard. It starts a first-ping timer
-	// on the not-yet-authenticated connection at roughly two seconds, and
-	// the Go client fails the connect outright on a PING where it expected a
-	// PONG — reported to the user as "expected 'PONG', got 'PING'", which
-	// names nothing about authorization at all. So two seconds is the real
-	// budget for everything below, including the TokenReview round trip,
-	// whatever authorization.timeout is set to.
+	// The server's own first-ping timer, not authorization.timeout, is what
+	// actually bounds everything below. See authDecisionBudget.
 	ctx, cancel := context.WithTimeout(context.Background(), authDecisionBudget)
 	defer cancel()
 
@@ -240,9 +244,6 @@ func (s *Service) handle(m *nats.Msg) {
 		s.log.Error("could not answer an authorization request", "error", err)
 	}
 }
-
-// authDecisionBudget is the wall clock the whole decision gets. See handle.
-const authDecisionBudget = 1500 * time.Millisecond
 
 // decode unwraps the request, decrypting it when the server encrypted it.
 func (s *Service) decode(m *nats.Msg) (*jwt.AuthorizationRequestClaims, string, error) {

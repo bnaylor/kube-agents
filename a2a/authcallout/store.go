@@ -16,6 +16,20 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+const (
+	// mapPollInterval is how often WaitForMap re-checks whether the informer
+	// has delivered a map. It bounds startup latency rather than steady-state
+	// cost: the loop runs only until the first map lands, and every tick that
+	// finds nothing is one the process would otherwise spend not ready.
+	mapPollInterval = 50 * time.Millisecond
+
+	// nameFieldSelector is the field the ConfigMap watch is narrowed on. It
+	// is the API server's own field name rather than a Go identifier, so
+	// nothing here checks the spelling — see WatchConfigMap for why the watch
+	// is narrowed at all.
+	nameFieldSelector = "metadata.name"
+)
+
 // Store holds the identity map the callout is currently serving, kept current
 // by an API informer.
 //
@@ -128,7 +142,7 @@ func (s *Store) Update(raw []byte) error {
 // for the sake of one — the same class of mistake as the cluster-wide Secret
 // and Job informers a dark A2A install used to start (W6 finding #3).
 func (s *Store) WatchConfigMap(ctx context.Context, client kubernetes.Interface, namespace, name, key string) error {
-	byName := fields.OneTermEqualSelector("metadata.name", name).String()
+	byName := fields.OneTermEqualSelector(nameFieldSelector, name).String()
 
 	lw := &cache.ListWatch{
 		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -183,7 +197,7 @@ func (s *Store) WatchConfigMap(ctx context.Context, client kubernetes.Interface,
 func (s *Store) WaitForMap(ctx context.Context, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	tick := time.NewTicker(50 * time.Millisecond)
+	tick := time.NewTicker(mapPollInterval)
 	defer tick.Stop()
 
 	for {
