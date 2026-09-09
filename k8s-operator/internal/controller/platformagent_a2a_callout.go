@@ -63,9 +63,9 @@ const (
 	a2aBusTokenAudience = "a2a-bus"
 
 	// a2aBusTokenPath is where every bus client finds its projected token.
-	a2aBusTokenPath      = "/var/run/secrets/a2a-bus"
+	a2aBusTokenPath      = "/var/run/secrets/a2a-bus" // #nosec G101 -- Mount path, not a credential
 	a2aBusTokenFile      = "token"
-	a2aBusTokenVolume    = "a2a-bus-token"
+	a2aBusTokenVolume    = "a2a-bus-token" // #nosec G101 -- Volume name, not a credential
 	a2aBusTokenExpirySec = 3600
 
 	// a2aCalloutStatusPort serves readiness, liveness and the served map
