@@ -191,24 +191,35 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	}
 }
 
-// The agent pod's narrowing is the security outcome of this change, so it is
-// asserted rather than left to the comment. As `worker` it could publish task
-// events for any addressee — impersonate any executor, terminate any task in
-// flight. Its own principal has no task-plane publish at all.
-func TestTheAgentPrincipalCannotReachTheTaskPlane(t *testing.T) {
-	var agentID a2aIdentity
+// The other half of the static-residue check, and the one that catches the
+// opposite mistake: a principal declared on the callout that no workload can
+// present a token for.
+//
+// An entry in the identity map is a grant on a ServiceAccount, live from the
+// moment the map is served. If nothing renders an a2a-bus token for that
+// account, the grant is not documentation of a future client — it is a standing
+// authorization waiting for one, in the file that is supposed to record who
+// actually authenticates. This branch had exactly that: an `agent` principal
+// keyed on the platform agent's ServiceAccount, whose only bus client is the
+// Hermes bridge sidecar authenticating as static `worker`.
+//
+// So the set is pinned by name rather than by shape. Adding a principal here
+// means saying, at review, which rendered workload presents its token.
+func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
+	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {
-		if id.user == "agent" {
-			agentID = id
+		if id.auth == a2aAuthCallout {
+			got = append(got, id.user)
 		}
 	}
-	if agentID.user == "" {
-		t.Fatal("no agent principal")
-	}
-	for _, subject := range agentID.publish {
-		if strings.HasPrefix(subject, "a2a.tasks.") {
-			t.Errorf("the agent principal may publish %q; it has no reason to reach the task plane", subject)
-		}
+	// The order is a2aIdentities' order. Both names have a workload that
+	// mounts an a2a-bus token for the ServiceAccount the entry is keyed on:
+	// the provisioning Job, through a2aBusTokenVolumeSource, and a spawned
+	// session pod, through the projection the gateway builds in
+	// a2a/gateway/spawn.go.
+	want := []string{"provision", "session"}
+	if !slices.Equal(got, want) {
+		t.Errorf("callout principals = %v, want %v.\nA new callout principal needs a workload that mounts an a2a-bus token for its ServiceAccount — a2aBusTokenVolumeSource / a2aBusTokenVolumeMount here, or the session spawner's own projection in a2a/gateway/spawn.go. Without one the entry authorizes nobody and misreports who authenticates.", got, want)
 	}
 }
 

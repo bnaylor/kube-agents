@@ -35,11 +35,10 @@ import (
 // found twice.
 //
 // Deny-by-default is unchanged and so are the subject lists: arming the callout
-// changes who vouches for an identity, not what that identity may say. The
-// exception is deliberate and is the point of the exercise — see agentIdentity
-// below, where a principal that had the shared worker grants gets the narrower
-// set its actual job needs, because it now has a name of its own to hang them
-// on.
+// changes who vouches for an identity, not what that identity may say. No
+// principal's grants move in this change, and no principal moves off the shared
+// worker credential in it either — see the note where the agent principal is
+// not, below.
 
 // a2aAuthMode says how a principal proves who it is.
 type a2aAuthMode int
@@ -127,7 +126,6 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	ns := agent.Namespace
 	return []a2aIdentity{
 		gatewayIdentity(agent, ns),
-		agentIdentity(agent, ns),
 		provisionIdentity(agent, ns),
 		sessionIdentity(agent, ns),
 		workerIdentity(),
@@ -184,76 +182,40 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	}
 }
 
-// agent: the platform agent's own container and the Hermes bridge sidecar that
-// shares its pod.
+// No `agent` principal here, deliberately, and the omission is the correction
+// of a claim this file used to make.
 //
-// This principal is new, and it is the first narrowing the callout buys. It ran
-// as `worker` — the same credential every spawned session pod holds — because
-// before the callout there was no way to tell the two apart: one password, one
-// grant list, three workloads. The agent pod has a ServiceAccount of its own, so
-// now it gets the grants its job actually needs, which is reading topics and
-// the directory and nothing else.
+// The platform agent's pod holds the widest reach in the namespace, and giving
+// it a name of its own on the bus — off the shared `worker` credential and onto
+// a token-authenticated identity scoped to reading topics and the directory —
+// is the narrowing the callout is worth arming for. It is not this change. The
+// only bus client in that pod is the Hermes bridge sidecar, and it authenticates
+// from NATS_USER/NATS_PASSWORD as static `worker`
+// (a2a/cmd/hermes-bridge/main.go). Nothing anywhere renders an a2a-bus token
+// for the agent ServiceAccount, and there are only two things that render one
+// at all: a2aBusTokenVolumeSource, whose single caller is the provisioning Job,
+// and the projection the gateway builds per session pod in
+// a2a/gateway/spawn.go. That is still true after #1256, which gives the agent
+// pod bus credentials as `worker` rather than a token.
 //
-// What it loses by being named: the task plane entirely. As `worker` it could
-// publish task events for ANY addressee — impersonate any executor on the bus,
-// and emit a terminal event on any task in flight. Nothing it does needs that,
-// and it is the single widest thing a prompt-injected agent could have reached.
-func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
-	return a2aIdentity{
-		user:           "agent",
-		account:        a2aAccountApp,
-		comment:        "the platform agent's own container and the Hermes bridge sidecar beside it: a topic and directory reader, with no reach onto the task plane",
-		auth:           a2aAuthCallout,
-		serviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),
-		// Topic grants name the provisioned registry exactly (payload
-		// spec: topics are provisioned-only). A wildcard here would let
-		// a publish to an unprovisioned topic vanish into core NATS; the
-		// exact list turns that into a connect-time refusal instead of
-		// silent loss. Adding a topic is still two edits that travel
-		// together — the stream's subject list and this grant.
-		//
-		// No ack grant: every read this principal makes is ordered or
-		// ack-none, so an ack grant would be unused capability to +TERM
-		// another principal's delivery. The bridge sidecar's durable
-		// task consumer is the one thing here that acked, and it is not
-		// this principal's — see the note on workerIdentity.
-		// The JetStream API surface is enumerated per stream, not granted
-		// as $JS.API.>, and that is what makes the paragraph above true
-		// rather than aspirational. A grant list is a capability surface
-		// for JetStream, not a read/write distinction: subject permissions
-		// cannot see a request BODY, and a consumer's target stream and
-		// its delivery subject are both body fields. So $JS.API.> hands
-		// back everything the subject lists withhold - a push consumer on
-		// TASKS delivering into a subject this principal CAN subscribe to
-		// reads the whole task plane, and STREAM.DELETE destroys it. Both
-		// demonstrated live against the rendered config. This is the same
-		// escape the web user's comment below records, and the same close.
-		//
-		// What is actually needed: a topic read is
-		// jetstream.Stream(...).GetLastMsgForSubject, which is STREAM.INFO
-		// plus a message get on the two topic streams and nothing else. No
-		// consumer is ever created.
-		publish: []string{
-			"a2a.topics.agent.platform.upgrade-readiness",
-			"a2a.topics.shared.blueprint",
-			"a2a.topics.shared.annotations",
-			"agents.hb.>",
-			"$JS.API.INFO",
-			"$JS.API.STREAM.INFO.TOPICS-STATE",
-			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-			"$JS.API.STREAM.MSG.GET.TOPICS-STATE",
-			"$JS.API.STREAM.MSG.GET.TOPICS-JOURNAL",
-			"$JS.API.DIRECT.GET.TOPICS-STATE",
-			"$JS.API.DIRECT.GET.TOPICS-JOURNAL",
-			"_INBOX.agent.>",
-		},
-		subscribe: []string{
-			"a2a.topics.>",
-			"a2a.agents.>",
-			"_INBOX.agent.>",
-		},
-	}
-}
+// So an entry here would be a grant on the agent ServiceAccount that no
+// workload can present, in the map that is supposed to be the record of who
+// actually authenticates. The narrowing lands with the change that moves the
+// agent pod onto a projected token, which is where the grant list belongs and
+// where it can be tested against a client that exists. Until then the agent pod
+// keeps `worker`'s grants, which is what it has today.
+
+// a2aJetStreamSurfaceRationale, kept as prose rather than a symbol because it
+// is the reason every callout principal below enumerates its JetStream API
+// subjects one at a time instead of taking $JS.API.>:
+//
+// A grant list is a capability surface for JetStream, not a read/write
+// distinction. Subject permissions cannot see a request BODY, and a consumer's
+// target stream and its delivery subject are both body fields. So $JS.API.>
+// hands back everything the subject lists withhold — a push consumer on TASKS
+// delivering into a subject the principal CAN subscribe to reads the whole task
+// plane, and STREAM.DELETE destroys it. Both demonstrated live against the
+// rendered config, and the same escape the web user's comment below records.
 
 // provision: the operator-rendered Job that creates the streams, buckets and
 // starter topics.
@@ -269,8 +231,9 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		comment:        "creates the streams, buckets and starter topics; nothing on the task plane",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, a2aProvisionServiceAccountName(agent)),
-		// Enumerated per object, for the reason spelled out on the agent
-		// principal above: $JS.API.> would let this principal create a
+		// Enumerated per object, for the reason spelled out in
+		// a2aJetStreamSurfaceRationale above: $JS.API.> would let this
+		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
 		// stream on the bus. It provisions - it creates the four streams
 		// and three buckets, idempotently, with an info-then-add - so it

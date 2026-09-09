@@ -1,32 +1,6 @@
 {
-  "version": "795c7002dba9c91c",
+  "version": "c9d0e6f571c76efa",
   "identities": [
-    {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
-      "user": "agent",
-      "account": "APP",
-      "grants": {
-        "publish": [
-          "a2a.topics.agent.platform.upgrade-readiness",
-          "a2a.topics.shared.blueprint",
-          "a2a.topics.shared.annotations",
-          "agents.hb.>",
-          "$JS.API.INFO",
-          "$JS.API.STREAM.INFO.TOPICS-STATE",
-          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-          "$JS.API.STREAM.MSG.GET.TOPICS-STATE",
-          "$JS.API.STREAM.MSG.GET.TOPICS-JOURNAL",
-          "$JS.API.DIRECT.GET.TOPICS-STATE",
-          "$JS.API.DIRECT.GET.TOPICS-JOURNAL",
-          "_INBOX.agent.>"
-        ],
-        "subscribe": [
-          "a2a.topics.>",
-          "a2a.agents.>",
-          "_INBOX.agent.>"
-        ]
-      }
-    },
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
       "user": "provision",

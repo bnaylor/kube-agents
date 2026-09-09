@@ -131,19 +131,21 @@ alternative.
 Status (amended 9/4, the callout armed; amended 9/8, sessions moved): the render now
 carries the `auth_callout` block, and a principal authenticates one of two ways.
 **Through the callout**, by presenting a projected ServiceAccount token: the bus
-provisioning Job and every spawned session pod. The platform agent pod has its map entry
-(`agent`) rendered and waiting, but no program in the tree presents a token for it yet -
-the Hermes bridge beside it still connects with `NATS_USER`/`NATS_PASSWORD` if they are
-set and has no token path at all, so that entry is mapped rather than reached. Giving the
-bridge one is what moves it, and `a2a/docs/hermes-bridge.md` owns that step. **Statically**, from `nats.conf` and listed in `auth_users`: the
+provisioning Job and every spawned session pod. Those two, and nothing else — a principal
+is only declared on the callout when a rendered workload mounts an `a2a-bus` token for
+its ServiceAccount, so the map stays a record of who actually authenticates rather than
+of who we would like to. **Statically**, from `nats.conf` and listed in `auth_users`: the
 callout itself, which cannot authenticate through the thing it is; the chatops gateway,
 purely as sequencing, since it has a ServiceAccount and its client program lands
 separately from this render; `web`, because a browser never can; `seed`, because the
 hand-applied seed tooling is applied rather than rendered and dropping its user would
 refuse an object already running; `sys`, a human at a port-forward; and the shared
 `worker`, which is now a shrinking residue rather than the session story — no session pod
-authenticates as it, and what keeps it alive is the seed tooling's twin and the
-agent-side workloads that have not moved.
+authenticates as it. What keeps it alive is the seed tooling's twin and the agent-side
+workloads that have not moved: the platform agent pod and the Hermes bridge sidecar
+beside it both connect as `worker`, since the bridge reads `NATS_USER`/`NATS_PASSWORD`
+and has no token path at all. Giving it one is what moves the agent pod off the shared
+credential, and `a2a/docs/hermes-bridge.md` owns that step.
 
 Two of those are permanent and the rest are waiting on something nameable. The single
 source for all of it - the config's static user blocks, the callout's map, and the
