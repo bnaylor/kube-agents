@@ -101,6 +101,35 @@ const (
 	// annotation. The annotation is a change detector, not an identifier.
 	a2aConfigHashLength = 16
 
+	// a2aNATSClientPort is the bus's client port: what the server listens on,
+	// what the Service and the container port publish, what the ingress fence
+	// allows, and what every client URL below dials. One name because those
+	// five have to agree — a port changed in four of them is a bus nothing can
+	// reach, and each is in a different shape (a config line, an int32, an
+	// intstr, a URL) so a grep does not reliably find them all.
+	a2aNATSClientPort = 4222
+
+	// The other two listeners, named for the same reason: each is written in
+	// the config, the container port and the Service, and the ingress fence
+	// argues about all three by number.
+	a2aNATSMonitorPort   = 8222
+	a2aNATSWebSocketPort = 9222
+
+	// The creds Secret's keys. Each is written in at least three places — this
+	// list, the nats.conf template, and whatever workload consumes it through
+	// a secretKeyRef — and a key that disagrees between them renders
+	// `password: ""` or mounts nothing, so they are named rather than spelled
+	// out at each site.
+	a2aGatewayPasswordKey = "gateway-password" // #nosec G101 -- Secret key name, not a credential
+	a2aWorkerPasswordKey  = "worker-password"  // #nosec G101 -- Secret key name, not a credential
+	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
+	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+
+	// a2aCredsSecretSuffix is appended to the NATS object name.
+	a2aCredsSecretSuffix = "-creds"
+
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
 	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
@@ -142,6 +171,22 @@ func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Na
 func a2aGatewayName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-gateway" }
 func a2aCalloutName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-callout" }
 
+// a2aCredsSecretName is the Secret holding the static users' passwords.
+func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
+	return a2aNATSName(agent) + a2aCredsSecretSuffix
+}
+
+// a2aNATSAddress is the bus's in-cluster host:port. a2aNATSClientURL is the
+// same thing as a client URL; both exist because the nats CLI takes the first
+// and the Go client takes the second.
+func a2aNATSAddress(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("%s.%s.svc:%d", a2aNATSName(agent), agent.Namespace, a2aNATSClientPort)
+}
+
+func a2aNATSClientURL(agent *agentv1alpha1.PlatformAgent) string {
+	return "nats://" + a2aNATSAddress(agent)
+}
+
 // The provision Job's pods run as their own ServiceAccount so the auth callout
 // has an identity to resolve them by. It holds no RBAC — the token exists to
 // authenticate to NATS, not to talk to the API server.
@@ -178,7 +223,10 @@ func randomA2APassword() (string, error) {
 // gateway and seed keys survive so an install that predates the callout keeps a
 // valid Secret shape through the upgrade, and so the hand-applied seed tooling
 // still has a credential.
-var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password", "callout-password"}
+var a2aCredsKeys = []string{
+	a2aGatewayPasswordKey, a2aWorkerPasswordKey, a2aSeedPasswordKey,
+	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+}
 
 // a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
 // security check, not tidiness: buildA2ANATSConfigSecret interpolates these
@@ -210,7 +258,7 @@ func (r *PlatformAgentReconciler) a2aReader() client.Reader {
 // gateway image may have cached in a still-running pod. The one thing it
 // changes on an existing Secret is a missing or empty key, which it fills.
 func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*corev1.Secret, error) {
-	name := types.NamespacedName{Name: a2aNATSName(agent) + "-creds", Namespace: agent.Namespace}
+	name := types.NamespacedName{Name: a2aCredsSecretName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
@@ -297,8 +345,8 @@ func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) s
 	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
-port: 4222
-http: 8222
+port: ` + strconv.Itoa(a2aNATSClientPort) + `
+http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 
 # A ServiceAccount token travels inside the client's CONNECT frame, and the
 # default max_control_line of 4096 bounds that whole frame - measured, the
@@ -342,7 +390,7 @@ max_control_line: 65536
 # anything that is not a browser simply omits it. The boundary is the web
 # user's grant list below.
 websocket {
-  port: 9222
+  port: ` + strconv.Itoa(a2aNATSWebSocketPort) + `
   no_tls: true
   allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]
 }
@@ -371,7 +419,7 @@ accounts {
         # auth_users below and carries a password. This permission pair is
         # the entire surface it needs: read the requests, answer them.
         user: callout
-        password: "` + pw("callout-password") + `"
+        password: "` + pw(a2aCalloutPasswordKey) + `"
         permissions {
           subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }
           publish { allow = [ "$SYS._INBOX.>" ] }
@@ -553,9 +601,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Image: a2aNATSImage(),
 						Args:  []string{"-c", "/etc/nats/nats.conf"},
 						Ports: []corev1.ContainerPort{
-							{Name: "client", ContainerPort: 4222},
-							{Name: "monitor", ContainerPort: 8222},
-							{Name: "websocket", ContainerPort: 9222},
+							{Name: "client", ContainerPort: a2aNATSClientPort},
+							{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
+							{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
@@ -602,12 +650,12 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{"app": name},
 			Ports: []corev1.ServicePort{
-				{Name: "client", Port: 4222},
-				{Name: "monitor", Port: 8222},
+				{Name: "client", Port: a2aNATSClientPort},
+				{Name: "monitor", Port: a2aNATSMonitorPort},
 				// The web user's transport. ClusterIP on purpose: the demo
 				// reaches it with kubectl port-forward, and plain ws must not
 				// be reachable any other way.
-				{Name: "websocket", Port: 9222},
+				{Name: "websocket", Port: a2aNATSWebSocketPort},
 			},
 		},
 	}
@@ -656,7 +704,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{{
 				Ports: []networkingv1.NetworkPolicyPort{
-					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSClientPort))},
 				},
 				From: []networkingv1.NetworkPolicyPeer{
 					// The auth callout, FIRST, and the ordering is the
@@ -726,7 +774,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
-	server := fmt.Sprintf("%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)
+	server := a2aNATSAddress(agent)
 	return a2aPostureComment + `
 set -euo pipefail
 # This Job authenticates to the bus with its own projected ServiceAccount
@@ -1035,11 +1083,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Name:  "gateway",
 						Image: a2aGatewayImage(),
 						Env: []corev1.EnvVar{
-							{Name: "NATS_URL", Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)},
+							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: "gateway"},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-								Key:                  "gateway-password",
+								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+								Key:                  a2aGatewayPasswordKey,
 							}}},
 							// Created by hand at install time (the bot token is
 							// operator input, never repo content); the

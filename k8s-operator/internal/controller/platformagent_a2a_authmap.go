@@ -54,6 +54,17 @@ const (
 	// StatefulSet already rides and is far past collision concerns for a
 	// value whose whole job is "did this change".
 	a2aAuthMapVersionLength = 16
+
+	// a2aAuthMapVersionAnnotation carries the rendered version on the
+	// ConfigMap.
+	a2aAuthMapVersionAnnotation = "kubeagents.x-k8s.io/a2a-authmap-version"
+
+	// a2aAuthMapVersionUnknown is what the condition reports when the
+	// ConfigMap cannot be read or carries no version. A placeholder rather
+	// than an empty string, because a message ending in "serving identity
+	// map " reads as a truncated log line rather than as a thing that was
+	// looked for and not found.
+	a2aAuthMapVersionUnknown = "(unknown)"
 )
 
 // a2aAuthMapName is the ConfigMap holding the identity map.
@@ -156,9 +167,6 @@ func buildA2AAuthMapConfigMap(agent *agentv1alpha1.PlatformAgent) (*corev1.Confi
 		Data: map[string]string{a2aAuthMapKey: string(body) + "\n"},
 	}, doc.Version, nil
 }
-
-// a2aAuthMapVersionAnnotation carries the rendered version on the ConfigMap.
-const a2aAuthMapVersionAnnotation = "kubeagents.x-k8s.io/a2a-authmap-version"
 
 // encodeA2AJSON marshals with HTML escaping off and no trailing newline.
 //
