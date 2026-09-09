@@ -316,8 +316,21 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // decides who may say what before a message is read. Deny-by-default — a
 // permissions block with allow lists denies everything else — with per-user
 // _INBOX prefixes so the reply path cannot leak what the subject grants
-// withheld. $JS.API.> on every app user is playground posture; production
-// narrows it to the per-stream API subjects when the callout arms.
+// withheld.
+//
+// A bare $JS.API.> is playground posture and this render still contains three
+// of them. This comment used to say "on every app user", which was a summary
+// worth replacing with the count: it was not true when it was written either,
+// because web has carried the enumerated per-stream subjects since before the
+// callout existed. Of the five APP identities in a2aIdentities today, provision
+// has moved to the callout and holds the enumerated subjects too, and gateway,
+// worker and seed still hold the bare grant. Each is static for a reason its own
+// identity comment argues and none of them is that the grant is right - the
+// gateway has no client that presents a token yet, a session pod carries no
+// Kubernetes identity to present, and the seed is applied by hand rather than
+// rendered. The narrowing is per identity as each stops being static, not one
+// switch that arming the callout throws, so this comment is only true of the
+// identity table below it: read that, not this.
 //
 // pw is a parameter rather than a closure over the creds Secret because two
 // callers walk this template: buildA2ANATSConfigSecret with the real lookup,

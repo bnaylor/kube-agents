@@ -214,3 +214,40 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 	}
 	return keys
 }
+
+// TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant pins the sentence in
+// renderA2ANATSConf's doc comment that names them.
+//
+// That sentence used to read "$JS.API.> on every app user is playground
+// posture". It was a summary, nothing checked it, and it was wrong in both
+// directions by the time anyone read it again: web has carried the enumerated
+// per-stream subjects since before the callout existed, so "every" was never
+// true, and provision moved to the callout, so the set changed underneath it.
+// A comment that names a set is a comment that needs a test naming the same
+// set, which is what this is.
+//
+// Failing here means one of two things and they want opposite responses. An
+// identity dropping off the list is the callout doing its job — narrow the
+// grant, then narrow this list and the comment with it. An identity appearing
+// on it is a new bare $JS.API.>, which is a principal that can create, delete
+// or purge any stream and any consumer on the account, including another
+// principal's. That is not a list to grow without an argument in the identity's
+// own comment for why it cannot be enumerated instead.
+func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
+	const bare = "$JS.API.>"
+	expected := []string{"gateway", "seed", "worker"}
+
+	var got []string
+	for _, id := range a2aIdentities(identityTestAgent()) {
+		if slices.Contains(id.publish, bare) || slices.Contains(id.subscribe, bare) {
+			got = append(got, id.user)
+		}
+	}
+	slices.Sort(got)
+
+	if !slices.Equal(got, expected) {
+		t.Errorf("the set of identities holding a bare %s is %v, and renderA2ANATSConf's doc "+
+			"comment says %v; correct whichever is wrong, and read this test's own comment "+
+			"first because the two directions want opposite fixes", bare, got, expected)
+	}
+}
