@@ -42,7 +42,7 @@ import (
 // sandboxKeysSecret satisfies the reconcile step that reports a missing shell
 // sandbox keypair, so that the tests using it exercise a Ready install rather
 // than a Degraded one. It no longer has to exist for BusCredentialsReady to be
-// written — that was the defect the two tests at the bottom of this file pin —
+// written — that was the defect the four tests at the bottom of this file pin —
 // but Ready=True is the state most of these assertions are about.
 func sandboxKeysSecret(agent *agentv1alpha1.PlatformAgent) *corev1.Secret {
 	return &corev1.Secret{
@@ -270,5 +270,145 @@ func TestBusCredentialsReadyIsClearedOnAFlipToTodayThatAlsoParksDegraded(t *test
 		t.Errorf("BusCredentialsReady survived the flip to today as %s/%s (%q); "+
 			"the CR describes a callout it no longer has",
 			cond.Status, cond.Reason, cond.Message)
+	}
+}
+
+// The two above were only two of the parks, and moving the write up the
+// sequence fixed those two rather than the class. Four refusals return above
+// the bus step and cannot be moved below it -- they are refusals of today's
+// stack, and the bus step is at the end because it renders on top of what they
+// withhold. So the condition cannot be written in sequence at all: it has to be
+// written on the way out, whichever exit the reconcile takes.
+//
+// ShellSandboxCannotBeDisabled stands for all four here. It is a hard refusal:
+// no requeue, no rendering, and every step after it withheld -- including both
+// the bus step and the teardown.
+
+// First direction: a next CR refused before the bus step ever runs. The callout
+// does not exist because nothing rendered it, and saying so is the whole point
+// -- a CR with no BusCredentialsReady at all is indistinguishable from a today
+// install to anything reading conditions.
+func TestBusCredentialsReadyIsWrittenWhenARefusalReturnsAboveTheBusStep(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{
+			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if ready := meta.FindStatusCondition(fresh.Status.Conditions, "Ready"); ready == nil ||
+		ready.Reason != reasonShellSandboxCannotBeDisabled {
+		t.Fatalf("precondition: want Ready parked by the refusal, got %+v", ready)
+	}
+	cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition)
+	if cond == nil {
+		t.Fatal("no BusCredentialsReady on a next install refused above the bus step; " +
+			"nothing downstream can tell the bus is not there")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != busCredsReasonAbsent {
+		t.Errorf("condition = %s/%s, want False/%s: the refusal withheld the callout, so it is absent",
+			cond.Status, cond.Reason, busCredsReasonAbsent)
+	}
+}
+
+// Second direction, and the worse one: a condition that was true stops being
+// re-derived. updateStatusDegraded writes Ready alone and preserves the rest,
+// so the last value stands unchallenged for as long as the refusal does -- the
+// CR reports a callout serving a named map version while every replica of it
+// has gone. Absent is a gap somebody notices; this reads as healthy.
+func TestBusCredentialsReadyIsNotLeftStaleByARefusalAboveTheBusStep(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	dep := &appsv1.Deployment{}
+	depKey := types.NamespacedName{Name: "test-agent-a2a-callout", Namespace: "test-ns"}
+	if err := cl.Get(ctx, depKey, dep); err != nil {
+		t.Fatalf("get callout Deployment: %v", err)
+	}
+	dep.Status.Replicas = 2
+	dep.Status.ReadyReplicas = 2
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("update callout status: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile with the callout ready: %v", err)
+	}
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition); cond == nil ||
+		cond.Status != metav1.ConditionTrue {
+		t.Fatalf("precondition: want BusCredentialsReady=True before the refusal, got %+v", cond)
+	}
+
+	// Now the two events that make the condition a lie: the callout loses
+	// every replica, and the CR picks up a refusal that returns above the step
+	// which would have noticed.
+	if err := cl.Get(ctx, depKey, dep); err != nil {
+		t.Fatalf("re-get callout Deployment: %v", err)
+	}
+	dep.Status.ReadyReplicas = 0
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("zero the ready replicas: %v", err)
+	}
+	fresh.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{
+			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+		},
+	}
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("introduce the refusal: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile under the refusal: %v", err)
+	}
+
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition)
+	if cond == nil {
+		t.Fatal("BusCredentialsReady removed by a refusal; the callout is still deployed")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != busCredsReasonUnavailable {
+		t.Errorf("condition = %s/%s (%q) with no callout replica ready; the refusal above the "+
+			"bus step left the last value standing", cond.Status, cond.Reason, cond.Message)
 	}
 }

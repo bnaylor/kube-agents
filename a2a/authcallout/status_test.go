@@ -23,7 +23,7 @@ func TestStatusReportsTheServedVersionAndUsers(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	code, body := get(t, StatusHandler(s), StatusPath)
+	code, body := get(t, StatusHandler(s, nil), StatusPath)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
@@ -50,7 +50,7 @@ func TestStatusReportsTheServedVersionAndUsers(t *testing.T) {
 // rather than hopeful. A callout with no map must fail it.
 func TestReadinessFailsUntilAMapIsServed(t *testing.T) {
 	s := quietStore()
-	h := StatusHandler(s)
+	h := StatusHandler(s, nil)
 
 	code, body := get(t, h, ReadyPath)
 	if code != http.StatusServiceUnavailable {
@@ -82,7 +82,7 @@ func TestARefusedUpdateIsVisibleWhileStillServing(t *testing.T) {
 	}
 	_ = s.Update([]byte(`{"version":"broken","identities":[]}`))
 
-	h := StatusHandler(s)
+	h := StatusHandler(s, nil)
 	code, _ := get(t, h, ReadyPath)
 	if code != http.StatusOK {
 		t.Errorf("readiness = %d, want 200: the previous map is still being served", code)
@@ -106,7 +106,51 @@ func TestARefusedUpdateIsVisibleWhileStillServing(t *testing.T) {
 // map it already had and cannot make the API server answer sooner.
 func TestLivenessDoesNotDependOnTheMap(t *testing.T) {
 	s := quietStore()
-	if code, _ := get(t, StatusHandler(s), LivePath); code != http.StatusOK {
+	if code, _ := get(t, StatusHandler(s, nil), LivePath); code != http.StatusOK {
 		t.Errorf("liveness = %d with no map, want 200", code)
+	}
+}
+
+// Readiness needs both halves, and the map was the only one it had. A callout
+// detached from the bus answers nothing, and answers it while holding a
+// perfectly good map -- so nothing about the map can report that state.
+func TestReadinessFailsWhenDetachedFromTheBusEvenWithAMap(t *testing.T) {
+	s := quietStore()
+	if err := s.Update([]byte(mapWithVersion("v9", "gateway"))); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	attached := true
+	h := StatusHandler(s, func() bool { return attached })
+
+	// The control. Without it a 503 below is consistent with a probe that is
+	// simply never ready.
+	if code, _ := get(t, h, ReadyPath); code != http.StatusOK {
+		t.Fatalf("readiness = %d with a map and a live connection, want 200", code)
+	}
+
+	attached = false
+	code, body := get(t, h, ReadyPath)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("readiness = %d while detached from the bus, want 503", code)
+	}
+	if !strings.Contains(body, "bus") {
+		t.Errorf("readiness body = %q; it must name the bus, since a missing map produces "+
+			"the same symptom for every client and is fixed somewhere else", body)
+	}
+	if !s.Ready() {
+		t.Error("precondition lost: the store stopped serving, so this proves nothing " +
+			"about the connection")
+	}
+}
+
+// Liveness stays out of it, for the same reason it stays out of the map: the
+// process is running and the operator's answer to a detached callout is a
+// restart driven by the process exiting, not by the kubelet killing a pod
+// mid-TokenReview.
+func TestLivenessDoesNotDependOnTheBusEither(t *testing.T) {
+	s := quietStore()
+	h := StatusHandler(s, func() bool { return false })
+	if code, _ := get(t, h, LivePath); code != http.StatusOK {
+		t.Errorf("liveness = %d while detached from the bus, want 200", code)
 	}
 }

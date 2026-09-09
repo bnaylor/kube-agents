@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -85,18 +86,76 @@ const (
 	busCredsReasonAbsent      = "CalloutAbsent"
 )
 
-// setBusCredentialsReady writes the condition from the callout Deployment's
-// state. mapVersion is what this reconcile rendered, carried into the message
-// so an operator can compare it against what the callout reports.
-func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, mapVersion string) error {
+// syncBusCredentialsReady brings the condition into line with what is on the
+// cluster, and is called on the way out of Reconcile rather than at a point in
+// its sequence.
+//
+// The sequence has no point that works. Four refusals of today's stack return
+// above the bus step -- ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
+// RuntimeClassNotFound, EgressAllowlistRefused -- and the bus step cannot move
+// above them, because it renders on top of what they withhold. Written after
+// them, the condition is skipped on those paths; and skipped is not absent,
+// because updateStatusDegraded writes Ready alone and preserves every other
+// condition. The last value stands unchallenged for as long as the refusal
+// does, so a CR goes on reporting a callout serving a named map version
+// through a Deployment that has since lost every replica. Absent is a gap
+// somebody notices. Stale reads as healthy.
+//
+// Which is why the answer is not a better position in the sequence. Whatever
+// the reconcile decided, the callout Deployment is on the cluster or it is
+// not, and this reads it and says so. Deferred, it also lands after
+// updateStatusReady and updateStatusDegraded, so it is not racing either of
+// them for the object's resourceVersion.
+//
+// wantNext decides only the absent case: a next install with no callout says
+// so, a today install carries no condition at all. It deliberately does not
+// decide the present case. A CR flipped to today whose refusal also withheld
+// cleanupA2A still has a callout running, and removing the condition there
+// would report a component gone while it is still authenticating the bus.
+//
+// mapVersion is what this reconcile rendered, or empty on a pass that returned
+// before rendering -- in which case the version is read back off the ConfigMap
+// the callout watches, since that is the map actually being served.
+func (r *PlatformAgentReconciler) syncBusCredentialsReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wantNext bool, mapVersion string) error {
 	dep := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, dep)
+	if client.IgnoreNotFound(err) != nil {
+		return err
+	}
+	if err != nil && !wantNext {
+		if r.clearBusCredentialsReady(agent) {
+			return r.Status().Update(ctx, agent)
+		}
+		return nil
+	}
+	if mapVersion == "" {
+		mapVersion = r.renderedAuthMapVersion(ctx, agent)
+	}
+	return r.setBusCredentialsReady(ctx, agent, dep, err != nil, mapVersion)
+}
 
+// renderedAuthMapVersion reads the version off the ConfigMap the callout
+// watches. Best effort: the caller only needs it for the condition's message,
+// and a message naming no version is better than a reconcile that fails
+// because it could not read one.
+func (r *PlatformAgentReconciler) renderedAuthMapVersion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}, cm); err != nil {
+		return "(unknown)"
+	}
+	if v := cm.Annotations[a2aAuthMapVersionAnnotation]; v != "" {
+		return v
+	}
+	return "(unknown)"
+}
+
+// setBusCredentialsReady writes the condition from the callout Deployment's
+// state. mapVersion is the map being served, carried into the message so an
+// operator can compare it against what the callout reports.
+func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment, absent bool, mapVersion string) error {
 	condition := metav1.Condition{Type: busCredentialsReadyCondition, LastTransitionTime: metav1.Now()}
 	switch {
-	case client.IgnoreNotFound(err) != nil:
-		return err
-	case err != nil:
+	case absent:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = busCredsReasonAbsent
 		condition.Message = "the auth callout is not deployed; nothing can authenticate to the bus"
@@ -116,7 +175,12 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 			dep.Status.ReadyReplicas, dep.Status.Replicas)
 	}
 
-	meta.SetStatusCondition(&agent.Status.Conditions, condition)
+	// Only when something changed. This runs on every exit from every
+	// reconcile, and an unconditional Status().Update would be a write per
+	// pass on a resource the operator already resyncs on a timer.
+	if !meta.SetStatusCondition(&agent.Status.Conditions, condition) {
+		return nil
+	}
 	return r.Status().Update(ctx, agent)
 }
 

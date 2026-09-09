@@ -355,7 +355,12 @@ dispatcher that would is the intended reader, so the condition is deliberately b
 ahead of its consumer rather than being dead code; but until that consumer exists the
 ordering is a published signal an operator can watch, not a gate. **Amended 9/8.** It asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
-served, that means every replica is serving one. Reasons are `CalloutServing`,
+served AND the replica is attached to the bus, that means every replica is serving one
+and can be reached to answer with it. The bus half of that probe was added after the
+first version of this paragraph: a replica holding a good map with a dead connection
+answers no authorization request, and it was the one state no health signal represented,
+so the Deployment stayed Available and this condition stayed true while the bus
+authorized nobody. Reasons are `CalloutServing`,
 `CalloutUnavailable` and `CalloutAbsent`, and the message names the rendered map version.
 It does **not** confirm that a named replica has observed a named version: a sub-second
 window after a re-render can report ready while a replica still serves the previous map.
