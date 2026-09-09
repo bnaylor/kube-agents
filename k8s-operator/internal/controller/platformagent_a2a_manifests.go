@@ -1306,6 +1306,40 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 	return r.ungatedDNSClusterIPs(ctx, agent)
 }
 
+// reconcileA2ANetworkFences applies the two NetworkPolicies that fence the
+// next stack: the bus's ingress policy and the session pods' egress one.
+//
+// Separate from the rest of reconcileA2A because a NetworkPolicy is not
+// rendering, it is a guardrail, and #1247 settled what that distinction costs:
+// a policy that stops being reconciled is one an operator can delete
+// permanently, and nothing selecting a Pod does not leave it restricted, it
+// leaves NetworkPolicy permitting all egress. Every refusal path in Reconcile
+// returns before reconcileA2A is reached, so the fences needed the same rescue
+// reconcileAgentNetworkGuardrails already gives <name>-gateway-netpol and
+// <name>-sandbox-metadata-deny — which is the caller that reaches this on a
+// refusal.
+//
+// The session fence is the one that makes this worth the split. A session pod
+// runs worker code the model steers, and buildA2ASessionNetworkPolicy is the
+// whole of what confines it: deny-all ingress, and an egress allowlist of DNS,
+// the bus, and LiteLLM. Delete it while the CR sits Degraded over an unrelated
+// bad CIDR and the confinement is gone from pods that are still running, with
+// the status naming the CIDR and saying nothing about the fence.
+func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for _, np := range []*networkingv1.NetworkPolicy{
+		buildA2ANATSNetworkPolicy(agent),
+		buildA2ASessionNetworkPolicy(agent, r.a2aSessionDNSClusterIPs(ctx, agent)),
+	} {
+		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, np); err != nil {
+			return fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
+		}
+	}
+	return nil
+}
+
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
 // function assumes the answer was ModeNext.
 func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
@@ -1340,20 +1374,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
-	// Both fences ride this function so they appear and disappear with the
-	// stack they fence — including the skew freeze, where a frozen, running
-	// bus keeps its ingress policy and the workers on it keep their egress
-	// one.
-	for _, np := range []*networkingv1.NetworkPolicy{
-		buildA2ANATSNetworkPolicy(agent),
-		buildA2ASessionNetworkPolicy(agent, r.a2aSessionDNSClusterIPs(ctx, agent)),
-	} {
-		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
-			return state, err
-		}
-		if err := r.applyManaged(ctx, agent, np); err != nil {
-			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
-		}
+	// Both fences ride reconcileA2ANetworkFences so they appear and disappear
+	// with the stack they fence — including the skew freeze, where a frozen,
+	// running bus keeps its ingress policy and the workers on it keep their
+	// egress one.
+	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		return state, err
 	}
 
 	// The session-pod quota, the enforcement half of the bound whose

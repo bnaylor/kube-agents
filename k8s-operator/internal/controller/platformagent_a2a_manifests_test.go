@@ -1727,3 +1727,107 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 		t.Errorf("a credential rotation did not roll the bus: hash stayed %q", before)
 	}
 }
+
+// TestARefusalDoesNotSuspendTheA2AFences is #1247's assertion extended to the
+// two policies this branch's stack depends on.
+//
+// #1247 established the hazard and the rescue for <name>-gateway-netpol and
+// <name>-sandbox-metadata-deny: a refusal withholds the workload, and a policy
+// that stops being reconciled is one an operator can delete permanently, after
+// which nothing selects the Pod and NetworkPolicy permits all egress. The A2A
+// fences were outside that rescue for a positional reason rather than a
+// considered one — every refusal path returns before reconcileA2A is reached,
+// and reconcileA2A is where the fences were applied.
+//
+// The session fence is why that mattered enough to move. A session pod runs
+// worker code the model steers, and buildA2ASessionNetworkPolicy is the whole
+// of its confinement. An install sitting Degraded over one bad control-plane
+// CIDR would stop re-asserting it, and the deletion would stick against pods
+// that are still running, with the status naming the CIDR and nothing naming
+// the fence.
+//
+// The mode: today subtest is the control that stops this passing for the wrong
+// reason: reconcileA2ANetworkFences is gated, so a fence appearing there would
+// mean the guardrail path had started rendering the next stack on installs
+// that never asked for it.
+func TestARefusalDoesNotSuspendTheA2AFences(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     *string
+		expected bool
+	}{
+		{"mode next", ptr.To(string(ModeNext)), true},
+		{"mode today", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Mode = tc.mode
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			})
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
+			// Without the refusal the ordinary path would render the fences and
+			// this would assert nothing.
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			var gotReason string
+			for _, condition := range stored.Status.Conditions {
+				if condition.Type == "Ready" {
+					gotReason = condition.Reason
+				}
+			}
+			if gotReason != reasonEgressAllowlistRefused {
+				t.Fatalf("the spec was not refused, so this test proves nothing; got reason %q", gotReason)
+			}
+
+			for _, fence := range []types.NamespacedName{
+				{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
+				{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+			} {
+				err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{})
+				if !tc.expected {
+					if err == nil {
+						t.Errorf("%s was rendered outside mode next; the guardrail path must not "+
+							"bring up the next stack's fences on an install that never asked for it", fence.Name)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("the refusal withheld %s: %v", fence.Name, err)
+				}
+
+				// Written once before the spec went bad is not the same as
+				// maintained, and only the second is a guardrail.
+				if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+					ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
+				}); err != nil {
+					t.Fatalf("failed to delete %s for the restore check: %v", fence.Name, err)
+				}
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("second Reconcile failed: %v", err)
+				}
+				if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
+					t.Fatalf("while the spec was refused %s stopped being reconciled, so deleting it "+
+						"stuck; the pods it fences keep running unconfined: %v", fence.Name, err)
+				}
+			}
+		})
+	}
+}
