@@ -33,6 +33,18 @@ import (
 // cannot authenticate through the thing it is.
 const a2aCalloutConfUser = "callout"
 
+// The columns the rendered blocks sit at. nats.conf nests a user block three
+// levels deep - accounts { <ACCOUNT> { users [ ... - and a permissions block's
+// publish/subscribe lists two levels further in. Only the parser's whitespace,
+// but a2aConfigRolloutHash digests this render byte for byte, so either value
+// changing changes the hash and rolls the NATS StatefulSet. That is a reason to
+// name them once here rather than to leave them mid-function where a reader
+// fixing the layout cannot see what else it moves.
+const (
+	a2aUserBlockIndent   = "      "
+	a2aSubjectListIndent = a2aUserBlockIndent + "    "
+)
+
 // renderA2AStaticUsers renders the user blocks for one account.
 //
 // pw rather than the creds Secret, and that is a constraint rather than a
@@ -54,25 +66,24 @@ func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string
 
 func renderA2AStaticUser(id a2aIdentity, password string) string {
 	var b strings.Builder
-	const indent = "      "
 
 	for _, line := range strings.Split(id.comment, "\n") {
-		b.WriteString(indent + "# " + line + "\n")
+		b.WriteString(a2aUserBlockIndent + "# " + line + "\n")
 	}
-	b.WriteString(indent + "{\n")
-	b.WriteString(indent + "  user: " + id.user + "\n")
-	b.WriteString(indent + `  password: "` + password + "\"\n")
+	b.WriteString(a2aUserBlockIndent + "{\n")
+	b.WriteString(a2aUserBlockIndent + "  user: " + id.user + "\n")
+	b.WriteString(a2aUserBlockIndent + `  password: "` + password + "\"\n")
 
 	// $SYS's user holds the system account's own privileges and carries no
 	// subject lists; a permissions block with empty allow lists would deny it
 	// everything.
 	if len(id.publish) > 0 || len(id.subscribe) > 0 {
-		b.WriteString(indent + "  permissions {\n")
-		b.WriteString(renderA2ASubjectList(indent+"    ", "publish", id.publish))
-		b.WriteString(renderA2ASubjectList(indent+"    ", "subscribe", id.subscribe))
-		b.WriteString(indent + "  }\n")
+		b.WriteString(a2aUserBlockIndent + "  permissions {\n")
+		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "publish", id.publish))
+		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "subscribe", id.subscribe))
+		b.WriteString(a2aUserBlockIndent + "  }\n")
 	}
-	b.WriteString(indent + "}\n")
+	b.WriteString(a2aUserBlockIndent + "}\n")
 	return b.String()
 }
 
