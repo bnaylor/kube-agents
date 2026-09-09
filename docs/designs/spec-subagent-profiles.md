@@ -178,7 +178,7 @@ so "one dispatcher" and "exactly one final event" are elected properties, not de
 accidents. Scaling the operator for HA changes nothing here: followers hold no
 consumers. Only a
 task-starting submission renders a Job: before creating, the dispatcher checks the
-task's `…events` subject, and empty means new task. A task with events already is not
+task's `…events` and `…supervisor` subjects, and both empty means new task. A task with events already is not
 the dispatcher's business - follow-ups, steers, and cancels for a live task belong to
 the in-pod adapter, and `…in` traffic for a task with a terminal event is acked with a
 warning and no Job. Without that check, a follow-up or cancel arriving after
@@ -357,11 +357,16 @@ lands in the warn-and-drop path like any other post-final event.
 This is the dispatcher's half of the payload spec's orphaned-task answer; the gateway
 sweeps its own chat sessions the same way (the ratified 8/24 split - every task's
 supervisor is its janitor). The janitor's grant is publish on its own profiles'
-`…events` subjects - subject-level, since NATS permissions cannot see the envelope
-`kind`; that a janitor emits only terminal `status-update` is a conformance assertion,
-not a connect-time control. The grant is in the identity-to-permissions map like every
-other, and synthesized events carry the janitor's own identity in `from`, so replay
-always distinguishes "the worker said failed" from "the janitor declared it dead."
+`…supervisor` subjects (the 9/9 split; before it, `…events`, which made every
+executor's subject two-writer) - subject-level, since NATS permissions cannot see the
+envelope `kind`; that a janitor emits only terminal `status-update` is a conformance
+assertion (payload spec 22), not a connect-time control. The grant is in the
+identity-to-permissions map like every other. Replay distinguishes "the worker said
+failed" from "the janitor declared it dead" by which subject the terminal is on, and
+consumers check `from` for agreement with that subject rather than trusting it. Until
+the dispatcher exists there is no janitor principal for profile-addressed tasks; the
+Hermes bridge's startup sweep is the executor finalising its own predecessor's orphan and
+writes on `…events` as itself.
 
 **What is deliberately absent: automatic retry.** Today the board charges a retry
 budget, forgives infrastructure deaths, and trips a breaker on repeat offenders. This

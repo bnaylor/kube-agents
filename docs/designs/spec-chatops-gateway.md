@@ -89,8 +89,11 @@ One user turn is one A2A task. On each inbound chat message the gateway:
    `authority` block.
 3. Publishes `kind: message` to `a2a.tasks.{session}.{taskId}.in` - the session is the
    addressee - with the conversation's `contextId` and the authority block below.
-4. Subscribes to the task's events subject and relays status and artifact updates back
-   into the conversation.
+4. Subscribes to the task's `…events` and `…supervisor` subjects (one durable, both
+   filters - the gateway holds the unscoped consumer-create grant that puts a filter list
+   in the request body) and relays status and artifact updates back into the
+   conversation. Its own supervisor terminals arrive through the same relay and retire
+   the task exactly as an executor's terminal does.
 
 The backend-native message id is recorded against the `correlationId` in the gateway's
 ingress log, so the audit chain runs chat message -> correlationId -> every hop -> change.
@@ -243,7 +246,9 @@ the supervisor rule below is what keeps that from being a silent stop.
 **One rule for every pod the gateway deletes itself** (stated once here because four
 paths reach it - reap, Sweep, Delegate, and any future one): if the pod is running a
 DETACHED task, the gateway publishes that task's terminal event before deleting, as
-the supervisor of the sessions it spawns. The state is `canceled`, not `failed`:
+the supervisor of the sessions it spawns - on the task's `…supervisor` subject, which
+only the gateway's grant reaches (the 9/9 split), never on its `…events`. The state is
+`canceled`, not `failed`:
 every task this rule reaches is detached, and detached means a `stop` already
 published a cancel, so the gateway is finishing the cancel the requester asked for
 rather than reporting an error. That keeps assertion 13's enumeration intact
@@ -258,8 +263,9 @@ the idle TTL from the last user message, so which fires first is a property of t
 independently tunable numbers, not a guarantee.
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
-gateway replays the context's tasks from JetStream, folds them into a transcript primer,
-and hands it to the new pod as its first input. If the harness's own session file
+gateway replays the context's tasks from JetStream - `tasks/get`, which folds each
+task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
+the new pod as its first input. If the harness's own session file
 happens to survive (it usually won't), `--resume` is a shortcut - correctness never
 depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a
@@ -268,7 +274,8 @@ that suddenly remembers June. If review disagrees, the fix is a compacted transc
 topic, not longer task retention.
 
 **Sweep**, as in the demo: a pod in a terminal phase whose task never emitted a final
-event gets a terminal event published by the gateway, then deleted. This is the
+event gets a terminal event published by the gateway on the task's `…supervisor`
+subject, then deleted. This is the
 gateway's half of the payload spec's orphaned-task answer - it is the supervisor for
 sessions it spawned; the dispatcher's janitor is the other half (settled 8/24). The
 state follows the same rule as every other supervisor publish below: `failed` for a

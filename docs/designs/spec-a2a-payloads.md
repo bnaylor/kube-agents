@@ -6,7 +6,9 @@
 - **Supersedes:** the demo protocol (`a2a-jetstream/0.1`). 0.2 was this doc's
   pre-amendment draft, never implemented; 0.3 added the ratified `authority` rules; 0.4
   moves the addressee into the task subjects, which is what makes connection-time
-  authorization expressible on the task plane.
+  authorization expressible on the task plane. Amended 9/9 without a version bump: the
+  supervisor gets its own task subject, and the identity half of the consumer rule flips
+  to subject-derived identity (the Verified identity section).
 
 ## Purpose
 
@@ -130,20 +132,20 @@ lacked.
 
 ### Field rules
 
-| Field                  | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `protocol`             | Required. Major.minor; bump major on breaking change. Consumers MUST reject unknown majors and MUST ignore unknown envelope fields within a major.                                                                                                                                                                                                                                                                                                                            |
-| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once. The dedup window is bounded - an LRU or time window sized to the redelivery horizon (`MaxAckPending` × ack wait, plus margin), never an unbounded set that grows for the life of the process.                                                                                        |
-| `correlationId`        | Required. Minted once by the gateway at the user interaction that starts a task. Copied verbatim on every hop; never re-minted by an intermediary. A task spawned in service of another task inherits its parent's value, and a follow-up or steer to a running task carries the task's original value - the steer is attributed by its own envelope and `authority` block, not by a new correlation. This is the identifier that spans question, hops, and resulting change. |
-| `traceparent`          | Optional. W3C trace context, for OTel tooling. `correlationId` is authoritative; `traceparent` is a convenience and may be re-parented per span.                                                                                                                                                                                                                                                                                                                              |
-| `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                  |
-| `ts`                   | Required. ISO-8601 UTC.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `from`                 | Required. Routing and display only. `from.profile` (optional, added 8/24) names the AgentProfile a worker runs as, so renderers don't parse session names. Until the identity work lands the whole field is publisher-asserted and MUST NOT be used for authorization - a compromised publisher can claim any value here.                                                                                                                                                     |
-| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere.                                                                                                                                                                                                                                                                                                                                                        |
-| `identity`             | **Reserved.** See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Field                  | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `protocol`             | Required. Major.minor; bump major on breaking change. Consumers MUST reject unknown majors and MUST ignore unknown envelope fields within a major.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once. The dedup window is bounded - an LRU or time window sized to the redelivery horizon (`MaxAckPending` × ack wait, plus margin), never an unbounded set that grows for the life of the process.                                                                                                                                                                    |
+| `correlationId`        | Required. Minted once by the gateway at the user interaction that starts a task. Copied verbatim on every hop; never re-minted by an intermediary. A task spawned in service of another task inherits its parent's value, and a follow-up or steer to a running task carries the task's original value - the steer is attributed by its own envelope and `authority` block, not by a new correlation. This is the identifier that spans question, hops, and resulting change.                                                                             |
+| `traceparent`          | Optional. W3C trace context, for OTel tooling. `correlationId` is authoritative; `traceparent` is a convenience and may be re-parented per span.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                                                                                              |
+| `ts`                   | Required. ISO-8601 UTC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `from`                 | Required. Never the source of identity or authority - both come from the subject an envelope was delivered on (Verified identity, below). On an identity-bearing subject `from` MUST agree with the writer the subject implies, and a disagreement is a protocol error: the envelope is refused, not re-attributed. `from.profile` names the AgentProfile a worker runs as; mandatory (9/9) for a profile-addressed executor's events and on the directory, where it is the profile binding, optional elsewhere. Display reads it; nothing decides on it. |
+| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere. On `…in` it MUST agree with the subject's addressee token (assertion 4); on the event subjects it names the requester and is not an identity check.                                                                                                                                                                                                                                                                                |
+| `identity`             | **Reserved and permanently null** (decided 9/9). Verified identity is a property of the delivery, not a field. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 One rule spanning three fields: `correlationId`, `taskId`, and `contextId` are minted as
 opaque random tokens and MUST NOT embed backend identifiers, thread titles, emails, or
@@ -154,11 +156,16 @@ content on the bus.
 
 ### Reserved fields: `identity` and `authority`
 
-The security work is parked, but adding these fields later is a protocol rev and reserving
-them now is two names. So they are reserved now.
+Reserved in 0.2 as two names, so that filling them later would not be a protocol rev.
+One of them is now decided the other way.
 
-- `identity` will carry the verified identity of the publisher - the real one, bound to the
-  authenticated connection, as opposed to the advisory `from`.
+- `identity` stays **null, permanently** (decided 9/9, `round_2/a3-decision.md`). The
+  verified identity of a publisher is the principal the subject implies - NATS enforces
+  publish permissions at the connection, the server cannot stamp an identity into a
+  message (measured, 8/24), and any identity bytes a publisher can set are advisory by
+  definition, which is the property being refused. So the library exposes verified
+  identity as a property of the delivery, never as a field it parses. The rules are in
+  the Verified identity section below.
 - `authority` will carry a _reference_ to an attenuating capability held in KV - who
   originally asked, what scope they hold, what this hop is permitted to do, each further
   hop a strict subset - per the capability envelope design
@@ -166,14 +173,19 @@ them now is two names. So they are reserved now.
   envelope, the message carries a lookup id. The A2A `auth-required` task state is
   reserved alongside it.
 
-Rules until then (**amended 8/24**, ratified from the gateway design): `identity` MUST NOT
-be populated by anyone. `authority` is populated by the chatops gateway at ingress and by
-nothing else - the verified requester and the audience snapshot, carried for audit and
-parity testing. It is advisory: until connection-bound publisher identity arms, nothing
-stops a bus client from inventing an `authority` block, so consumers MUST NOT make any
-authorization decision on either field. Libraries MUST pass both through untouched. The
-open question on where `identity` actually lives (header vs signed claim) is at the end of
-this doc.
+Rules (**amended 8/24**, ratified from the gateway design; **the identity half flipped
+9/9**): `identity` MUST NOT be populated by anyone, and an emitter that populates it is
+non-conforming. `authority` is populated by the chatops gateway at ingress and by nothing
+else - the verified requester and the audience snapshot, carried for audit and parity
+testing. It is advisory: nothing yet stops a bus client from inventing an `authority`
+block, so consumers MUST NOT make any authorization decision on it, and libraries MUST
+pass it through untouched. Consumers MAY decide on the **subject-derived identity** of an
+envelope on the task plane, under exactly the conditions the Verified identity section
+states; that is the identity half of the old "neither field" rule, and it is the only
+half that has flipped. The authority half flips when the capability envelope arms
+(`docs/architecture/09-capability-envelope.md`) and not before: a flip that read as
+covering both would license consumers to trust `authority.grants` while it is still
+null.
 
 ### Kinds and payload types
 
@@ -206,12 +218,13 @@ starting it.
 
 ### Subjects
 
-| Subject                                   | Carries                                                                                                                                                                                                                                                              |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `a2a.tasks.{addressee}.{taskId}.in`       | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels). |
-| `a2a.tasks.{addressee}.{taskId}.events`   | `status-update` and `artifact-update`, executor to anyone                                                                                                                                                                                                            |
-| `a2a.agents.{profile}`                    | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                 |
-| `agents.hb.{agentType}.{owner}.{session}` | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                              |
+| Subject                                     | Carries                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `a2a.tasks.{addressee}.{taskId}.in`         | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels).                                                                                                                                                   |
+| `a2a.tasks.{addressee}.{taskId}.events`     | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                      |
+| `a2a.tasks.{addressee}.{taskId}.supervisor` | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence. |
+| `a2a.agents.{profile}`                      | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                   |
+| `agents.hb.{agentType}.{owner}.{session}`   | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                |
 
 **The addressee token (added in 0.4) is the authorization seam.** `{addressee}` is the
 executor's name - a profile, or a chat session. With it in the subject, connection-time
@@ -235,25 +248,26 @@ the one submission.)
 A2A 1.0 defines its operations as JSON-RPC methods. On a bus, most of them stop being
 calls and become properties of the stream:
 
-| A2A operation                    | On the bus                                                                                                                                                                                                        |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it. |
-| `message/stream`                 | The same publish, plus subscribe to the `events` subject. Streaming is not an optional capability here; it is how the bus works.                                                                                  |
-| `tasks/get`                      | Replay the `events` subject from sequence 1 and fold the events into a `Task`. No live executor required - this is the durability payoff.                                                                         |
-| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                  |
-| `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                             |
-| push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                            |
+| A2A operation                    | On the bus                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it.                                                                                                                            |
+| `message/stream`                 | The same publish, plus subscribe to the `events` subject. Streaming is not an optional capability here; it is how the bus works.                                                                                                                                                                                                             |
+| `tasks/get`                      | Replay the `events` and `supervisor` subjects from sequence 1, in stream order, and fold them into a `Task`. No live executor required - this is the durability payoff. The two subjects share the stream sequence, so the fold needs no merge; whichever terminal the stream holds first is the task's, and the other is a post-final drop. |
+| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                                                                                                                                             |
+| `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                                                                                                                                                        |
+| push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                                                                                                                                                       |
 
 ### Event ordering rules
 
 - The first event on a task is a `status-update` with state `submitted`, published by the
   executor on accepting the message. (The Synadia `ack` chunk collapses into this.)
-- Exactly one event carries `final: true`, and it is a terminal `status-update`.
-- Nothing follows the final event. An event after `final` is a protocol error the
-  library must surface, not ignore - and surface means a structured warning and a
-  metric, with the late event dropped. It MUST NOT terminate the consumer: a zombie
-  worker flushing its buffer after the supervisor's terminal event must not be able to
-  crash a gateway or dispatcher.
+- Exactly one event carries `final: true`, and it is a terminal `status-update` - counted
+  across the task's `…events` and `…supervisor` subjects together (9/9), in stream order.
+- Nothing follows the final event, on either subject. An event after `final` is a
+  protocol error the library must surface, not ignore - and surface means a structured
+  warning and a metric, with the late event dropped. It MUST NOT terminate the consumer:
+  a zombie worker flushing its buffer onto `…events` after the supervisor's terminal
+  landed on `…supervisor` must not be able to crash a gateway or dispatcher.
 - `input-required` flow: executor publishes `status-update` with state `input-required`
   carrying an A2A message that asks for the input. The requester publishes a follow-up
   `kind: message` with the same `taskId` to `…in`. Executor resumes and publishes
@@ -289,7 +303,20 @@ calls and become properties of the stream:
   that died mid-work, but where the supervisor is finishing a cancel the requester
   already published - the executor is being torn down deliberately, on that cancel -
   the terminal is `canceled`. The supervisor writes what happened, and assertion 13's
-  enumeration holds for every path a cancel can take.
+  enumeration holds for every path a cancel can take. **The supervisor writes it on
+  `…supervisor`, never on `…events`** (ratified 9/9, `round_2/events-super-ratification.md`).
+  Until 9/9 the two shared `…events` and this doc said `from` was how replay told them
+  apart; `from` is publisher-asserted, so a hostile executor could end its own task
+  wearing the supervisor's identity and the record read as infrastructure. The split
+  buys attribution, not prevention: an executor can still terminate its own task on its
+  own `…events`, and what changes is that it now reads as the executor doing so, which
+  is detectable. Where no supervisor principal exists yet - profile-addressed tasks
+  until the dispatcher lands - an executor finalising its predecessor incarnation's
+  orphan (the Hermes bridge's startup sweep) is the executor finishing its own task,
+  writes on `…events` as itself, and is not a supervisor write. **Migration:** `TASKS`
+  keeps 72h, so for one retention window after an install takes the split its stream
+  still holds legitimate supervisor terminals on `…events`; the writer-class check on
+  `…events` (Verified identity, below) is advisory until that window has passed.
 
 ### Reserved artifact names
 
@@ -305,6 +332,61 @@ artifact, and four names are reserved so renderers and audit tooling can rely on
 
 Artifact names are data, so the set can grow without touching the envelope; only these
 four carry reserved semantics.
+
+## Verified identity (added 9/9)
+
+**An envelope's publisher is the principal implied by the subject it arrived on** - the
+stored subject, on replay - and that implication is decision-grade exactly where two
+conditions hold. No signed claim, no signing key on the hot path, no key registry at
+replay: every check is a field-to-token comparison, plus the one supervisor name a
+consumer is configured with. The decision and the alternatives it beat are in
+`round_2/a3-decision.md` (three hostile review rounds); this section is the contract.
+
+**Condition 1 - the writer set.** The subject's writer set equals the principals its
+tokens name, counted over the full write surface: publish grants, and every JetStream
+route by which stored bytes can be made to land on a subject (deliver-subject
+redirection, `RePublish`, transforms, sources, `STREAM.RESTORE`, message delete and
+purge). Writer sets are permissions invariants and live in `tests/conformance/`.
+
+**Condition 2 - the envelope agrees with the subject**, checked per subject class,
+closed-world on kind: on an identity-bearing subject only the kinds enumerated for its
+class are admissible, and any other kind - `topic-update` included - is a disagreement.
+Disagreement on any applicable check is a protocol error and the message carries no
+identity. A consumer checks it at delivery, a publisher's library refuses it at the
+source, and replay skips and counts it.
+
+| Subject class                        | Admissible kinds                   | `taskId` | Writer the subject implies, and the check                                                                                                                                                                                                           |
+| ------------------------------------ | ---------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory for one retention window after the split, then hard.                                       |
+| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee. |
+| `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee - plus assertion 4: `to` equals the addressee token.                                                                                   |
+| `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                           |
+| `agents.hb.>`, `$KV.session-state.>` | no envelope                        | -        | Condition 2 is inapplicable; condition 1 carries them alone. Heartbeat identity is live-only - no stream, no replay, no audit record.                                                                                                               |
+
+Topics are deliberately outside this enumeration. Agent-scoped topics already have
+exclusive writers and could join by the same rule; shared topics are multi-writer by
+design and their attribution stays `from`-advisory.
+
+**What is decision-grade today, and what is not.** Session-pod tasks: `…events` is
+written by the session's own derived grant and `…supervisor` by the gateway, and both
+are refused at the server for every other principal - decision-grade. Profile-addressed
+tasks: the static `worker` credential the Hermes bridge still holds publishes
+`…events` for every addressee until it is retired (A5), so `…events` identity for a
+profile is not yet single-writer in the render, and the conformance suite records that
+as a known violation rather than a pass. The directory: the profile binding closes the
+direct forge, and what remains is relocation of stored bytes through a browser
+credential's consumer-create grant, which only the account split closes; directory
+identity is not decision-grade until then. `$KV.session-state.>` likewise waits on the
+account split. **A consumer MUST NOT treat identity as decision-grade on a class this
+paragraph does not name as such.**
+
+**Two residues, named so they are not rediscovered.** A stored non-final event
+re-injected onto its own subject after the dedup window, on a still-running task, folds
+as a genuine-looking transition with valid derived identity; the candidate bound is a
+monotonicity check in the fold (a relocated copy arrives at a later stream sequence with
+an older `ts`), not built. And identity ends at a bridge: the bridge is the publisher,
+and a chat user's identity is the gateway's `authority` block, which is the capability
+envelope's to make decision-grade.
 
 ## Topics
 
@@ -381,8 +463,9 @@ Envelope:
    ingress path; every other producer emits it null. Inbound values are passed through
    byte-identical and are not consulted for any decision.
 4. A consumer on a wildcard ignores envelopes whose `to` names another session, and an
-   envelope whose `to` disagrees with its subject's addressee token is surfaced as a
-   protocol error.
+   envelope on `…in` whose `to` disagrees with its subject's addressee token is surfaced
+   as a protocol error. (Scoped to `…in` 9/9: on the event subjects `to` names the
+   requester, and the identity checks there are assertion 23's.)
 5. A redelivered envelope (same `envelopeId`) reaches the application at most once.
 
 Payloads:
@@ -396,11 +479,15 @@ Payloads:
 
 Lifecycle:
 
-9. The first event on every task is a `status-update` with state `submitted`.
-10. Exactly one event has `final: true`, its state is terminal, and any event after it
+9. The first event on every task is a `status-update` with state `submitted`, on
+   `…events`. A task whose only event is its supervisor's terminal (the executor never
+   ran) is the one exception, and it is terminal at its first event.
+10. Exactly one event has `final: true` across the task's `…events` and `…supervisor`
+    subjects together, its state is terminal, and any event after it on either subject
     is surfaced as a protocol error - warn-and-drop, with the consumer loop surviving.
-11. A `tasks/get` materialized by replay yields the same terminal state and artifact set a
-    live subscriber saw.
+11. A `tasks/get` materialized by replay of both subjects yields the same terminal state
+    and artifact set a live subscriber of both saw, and a task whose supervisor terminal
+    predates the split (stored on `…events`) still replays to that terminal.
 12. A follow-up message with the same `taskId` resumes an `input-required` task, and the
     next status event is `working`. A follow-up during `working` is delivered to the
     executor and does not by itself change task state.
@@ -440,22 +527,37 @@ Steering delivery (added 8/25, with the dual-reader rule):
     a stub harness that echoes its stdin - proving "reached the harness stdin" needs the
     adapter, not the library alone.
 
+Verified identity (added 9/9):
+
+22. A supervisor emits only terminal `status-update`, and only on `…supervisor`. A
+    non-final or non-status envelope on a supervisor subject is a protocol error; a
+    supervisor terminal on an executor's `…events` is a writer-class disagreement.
+23. Envelope-subject agreement, per class and closed-world on kind, as the Verified
+    identity table states: a relocated envelope whose kind, `taskId`, `to` (on `…in`)
+    or writer class disagrees with its subject is a protocol error at delivery and at
+    publish, and is skipped and counted on replay. A legitimate card is never refused
+    for lacking a `taskId`.
+24. The writer sets themselves - `…events` the executor only, `…supervisor` the
+    supervisor only, `…in` requesters only with the executor's grant never reaching it,
+    and no principal outside the trust root holding a server-originated write route onto
+    an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
+    live in `tests/conformance/` rather than in the library suite. The suite records the
+    static `worker` grant as a known violation of the first until A5 retires it.
+
 ## Open Questions
 
 Calls for @bnaylor, not silently resolved here:
 
-- **Where does verified identity live?** If the NATS server can stamp the authenticated
-  connection identity into a message header the publisher cannot set, the reserved
-  `identity` field becomes a header and no per-message signing is needed. If it cannot,
-  the payload gets signed. Needs verification against the NATS docs before the security
-  rev - the answer changes the shape of the reserved field.
-  **Update 8/24:** verified, it cannot - tested empirically on v2.10.29, docs and source
-  swept through v2.14.5. `identity` is not a header. The
-  one exception (`Nats-Request-Info`, unforgeable but only on cross-account service
-  imports, and stripped on JetStream ingest) doesn't apply to our single-account stage 1.
-  Remaining choice: signed claim in the envelope vs subject-derived identity where
-  publish permissions are exclusive - and the 0.4 addressee-scoped subjects widen
-  exactly that exclusive surface, which strengthens the subject-derived option.
+- ~~**Where does verified identity live?**~~ Decided 9/9: in the subject, not in a field
+  (the Verified identity section). The server cannot stamp an identity into a message
+  (verified 8/24 on v2.10.29, docs and source swept through v2.14.5; `Nats-Request-Info`
+  is unforgeable only on cross-account service imports and is stripped on JetStream
+  ingest), so the signer would have been the client - a key resident in a session pod
+  running model output against untrusted input, exfiltratable and usable offline. The
+  subject-derived option keeps enforcement at the server and has no canonicalization
+  surface, no second key directory, and no cryptography at replay. `identity` stays
+  null forever; the supervisor subject is the one structural change the decision
+  needed.
 - ~~**Large artifact storage.**~~ Decided 8/24: JetStream Object Store, object TTL
   tracking W for task artifacts, 128KiB inline threshold as the dev default. An external
   bucket is a stage 2 pluggable alongside the audit exporter - an option, never a
