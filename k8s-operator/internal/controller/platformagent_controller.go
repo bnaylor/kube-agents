@@ -241,7 +241,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
-func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
 
 	instance := &agentv1alpha1.PlatformAgent{}
@@ -320,6 +320,45 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	_, modeErr := resolveMode(instance)
 	if modeErr != nil {
 		log.Info("Unrecognized spec.mode; rendering today's stack and reporting Degraded", "error", modeErr.Error())
+	}
+
+	// 2d. BusCredentialsReady, written on the way out rather than at a point in
+	// the sequence below.
+	//
+	// It was at the bottom, under everything, which meant a reconcile that
+	// parked Degraded above it neither wrote it nor cleared it. Moving it up to
+	// just after the bus step fixed two of those parks and left four: the
+	// refusals of today's stack at 9b, 9c, 10 and 11e all return above the bus
+	// step, and the bus step cannot move above them because it renders on top
+	// of what they withhold. There is no position in the sequence that works,
+	// so this is not a position in the sequence.
+	//
+	// Skipping the write is worse than it sounds, and the reason is
+	// updateStatusDegraded: it writes Ready alone and preserves every other
+	// condition, so the last BusCredentialsReady stands unchallenged for as
+	// long as the refusal does. The CR reports a callout serving a named map
+	// version through a Deployment that may since have lost every replica.
+	//
+	// Version skew is the one case with nothing to say. renderMode fails closed
+	// to today while cleanupA2A is deliberately not run (see the mode gate
+	// below), so the bus a newer CRD rendered is still standing; clearing the
+	// condition would report it gone, and rewriting it would claim this binary
+	// knows what it describes. Both are worse than leaving it.
+	busCredsMapVersion := ""
+	if modeErr == nil {
+		wantNext := renderMode(instance, "nats") == ModeNext
+		defer func() {
+			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
+				if retErr == nil {
+					retErr = err
+					return
+				}
+				// The reconcile is already failing and will requeue. Losing
+				// this write is not what to report about that pass, but it is
+				// not nothing either: the condition is a pass behind.
+				log.Error(err, "could not write BusCredentialsReady")
+			}
+		}()
 	}
 
 	// 3. Reconcile Service Account (with Workload Identity annotation)
@@ -532,39 +571,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// BusCredentialsReady, here rather than at the bottom of Reconcile: this
-	// is the first point at which it is known, and everything below it can
-	// return early.
-	//
-	// It was written last, and that was wrong in both directions. A next
-	// install whose shell sandbox keypair has not been generated parks
-	// Degraded at step 13 and returned above the write, so the condition never
-	// appeared however healthy the callout was — on an ordinary install, not a
-	// broken one. And once written it outlived what it described: a flip back
-	// to today runs cleanupA2A just above, but any early return between there
-	// and the bottom skipped the clear, leaving the CR reporting that a
-	// callout it no longer has is serving a map. updateStatusDegraded writes
-	// only Ready and preserves the rest, so the stale condition survives every
-	// subsequent pass. Both are pinned in platformagent_a2a_buscreds_test.go.
-	//
-	// The condition is about the bus, and none of the steps below it are. A
-	// reconcile that parks Degraded for an unrelated reason is exactly when
-	// someone reads conditions, so it is when this one most needs to be true.
-	//
-	// Guarded on modeErr rather than on a2aNext alone. Under version skew the
-	// operator deliberately leaves a bus a newer CRD rendered standing — see
-	// cleanupA2A above — so the condition describing it must stand too;
-	// clearing it there would report the bus gone while it is still serving.
-	if modeErr == nil {
-		if a2aNext {
-			if err := r.setBusCredentialsReady(ctx, instance, a2aState.AuthMapVersion); err != nil {
-				return ctrl.Result{}, err
-			}
-		} else if r.clearBusCredentialsReady(instance) {
-			if err := r.Status().Update(ctx, instance); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
+	// The version this pass rendered, for the deferred write at 2d. Empty on
+	// every path that did not get here, where the write reads it back off the
+	// ConfigMap the callout watches instead.
+	if a2aNext {
+		busCredsMapVersion = a2aState.AuthMapVersion
 	}
 
 	// 9. Update status phase. While the mode is unrecognized the phase is

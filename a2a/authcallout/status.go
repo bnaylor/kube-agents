@@ -21,8 +21,8 @@ const (
 	StatusPath = "/status"
 
 	// ReadyPath is the readiness probe. It answers 503 until a map is being
-	// served, so a callout that cannot read its map is taken out of the
-	// Service rather than left to refuse every connection it is handed.
+	// served AND the bus connection is up, so a callout that can answer
+	// nothing is taken out of the Service rather than left in it.
 	ReadyPath = "/readyz"
 
 	// LivePath is the liveness probe. It answers as long as the process is
@@ -70,7 +70,16 @@ func StatusOf(s *Store) Status {
 }
 
 // StatusHandler serves the status, readiness and liveness paths for a store.
-func StatusHandler(s *Store) http.Handler {
+//
+// busAttached reports whether the callout is currently subscribed to
+// $SYS.REQ.USER.AUTH on a live connection. It is separate from the store
+// because the two fail independently and for unrelated reasons: the map comes
+// from the API server, the connection from nats-server. Readiness needs both,
+// since a replica missing either answers nothing.
+//
+// A nil busAttached means the caller has no connection to report on — the
+// in-process tests of the map surface, and nothing that runs in a cluster.
+func StatusHandler(s *Store, busAttached func() bool) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(StatusPath, func(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +91,15 @@ func StatusHandler(s *Store) http.Handler {
 	})
 
 	mux.HandleFunc(ReadyPath, func(w http.ResponseWriter, r *http.Request) {
+		if busAttached != nil && !busAttached() {
+			// Named as the bus rather than as a generic failure: a callout
+			// detached from the bus and a callout with no map produce the
+			// same symptom for every client — refused connections — and
+			// the two are fixed in completely different places.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not attached to the bus; no authorization request can be answered\n"))
+			return
+		}
 		if !s.Ready() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			if e := s.LastError(); e != "" {

@@ -303,7 +303,12 @@ says X" is checkable against the running system rather than against the rendered
 condition is on the `PlatformAgent`, not on an `AgentProfile`, because neither the CRD
 nor the dispatcher exists yet. It asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
-served, that means every replica is serving one. Reasons are `CalloutServing`,
+served AND the replica is attached to the bus, that means every replica is serving one
+and can be reached to answer with it. The bus half of that probe was added after the
+first version of this paragraph: a replica holding a good map with a dead connection
+answers no authorization request, and it was the one state no health signal represented,
+so the Deployment stayed Available and this condition stayed true while the bus
+authorized nobody. Reasons are `CalloutServing`,
 `CalloutUnavailable` and `CalloutAbsent`, and the message names the rendered map version.
 It does **not** confirm that a named replica has observed a named version: a sub-second
 window after a re-render can report ready while a replica still serves the previous map.

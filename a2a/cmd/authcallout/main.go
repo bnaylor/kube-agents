@@ -17,6 +17,8 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -141,9 +143,17 @@ func run(log *slog.Logger) error {
 	if statusAddr == "" {
 		statusAddr = defaultStatusAddr
 	}
+	// busConn is set once the connection is up and read by the readiness
+	// probe. Nil until then, which is the honest answer: a callout that has
+	// not attached to the bus yet answers no authorization request either.
+	var busConn atomic.Pointer[nats.Conn]
+	busAttached := func() bool {
+		nc := busConn.Load()
+		return nc != nil && nc.IsConnected()
+	}
 	statusSrv := &http.Server{
 		Addr:              statusAddr,
-		Handler:           authcallout.StatusHandler(store),
+		Handler:           authcallout.StatusHandler(store, busAttached),
 		ReadHeaderTimeout: statusReadTimeout,
 		WriteTimeout:      statusWriteTimeout,
 	}
@@ -172,24 +182,57 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("waiting for the identity map: %w", err)
 	}
 
-	nc, err := connectToBus(log)
+	// Buffered and fired at most once: the deferred Close below also runs the
+	// handler, and a shutdown must not look like a failure.
+	busClosed := make(chan struct{})
+	var closeOnce sync.Once
+	nc, err := connectToBus(log, func() { closeOnce.Do(func() { close(busClosed) }) })
 	if err != nil {
 		return err
 	}
 	defer nc.Close()
 
+	busConn.Store(nc)
+
 	if _, err := svc.Subscribe(nc); err != nil {
 		return err
 	}
 
-	<-ctx.Done()
-	log.Info("shutting down")
-	return nil
+	// Exit rather than sit here detached. Both halves of that are deliberate.
+	//
+	// Sitting here was the old behaviour and it is the worst of the options:
+	// the process stays up, the pod stays Ready — readiness now says
+	// otherwise, but the Deployment still holds a Pod that will never recover
+	// — and nothing on the cluster says the bus has stopped authorizing
+	// anyone. A component whose whole job is on one connection should not
+	// outlive it.
+	//
+	// And restarting is not merely a way to retry. The connection ends for
+	// good on a repeated authorization failure, whose live cause is a rotated
+	// callout password; the password is read from the environment at startup,
+	// so the new one reaches this process only through a new process. Retrying
+	// in place would loop on the old credential forever.
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down")
+		return nil
+	case <-busClosed:
+		return errors.New("the bus connection ended and will not recover in this process; " +
+			"restarting to re-read the callout credential")
+	}
 }
 
 // connectToBus dials as the callout's own statically-authenticated user. It
 // cannot authenticate through itself, so nats.conf's auth_users exempts it.
-func connectToBus(log *slog.Logger) (*nats.Conn, error) {
+//
+// onClosed fires if the connection ends for good. MaxReconnects(-1) does not
+// make that unreachable: nats.go aborts its own reconnect loop when the same
+// server answers with the same authorization error twice running
+// (processAuthError, nats.go v1.53.1), which is exactly what a rotated
+// callout password looks like — and the password is read from the environment
+// at startup, so no amount of retrying in this process would pick up the new
+// one. See run for what the callout does about it.
+func connectToBus(log *slog.Logger, onClosed func()) (*nats.Conn, error) {
 	url := os.Getenv(envNATSURL)
 	if url == "" {
 		return nil, fmt.Errorf("%s is required", envNATSURL)
@@ -217,7 +260,8 @@ func connectToBus(log *slog.Logger) (*nats.Conn, error) {
 			log.Info("reconnected to the bus", "url", c.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
-			log.Error("bus connection closed")
+			log.Error("bus connection closed for good; the callout can no longer authorize anything")
+			onClosed()
 		}),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
 			log.Error("bus error", "error", err)

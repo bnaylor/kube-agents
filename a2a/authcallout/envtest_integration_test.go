@@ -68,6 +68,7 @@ type liveHarness struct {
 	nats      *natsserver.Server
 	store     *Store
 	status    *httptest.Server
+	svcConn   *nats.Conn
 }
 
 func startLiveHarness(t *testing.T) *liveHarness {
@@ -221,10 +222,15 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	status := httptest.NewServer(StatusHandler(store))
+	// The readiness probe reads the real connection, not a stand-in, so the
+	// live tests below exercise both halves of it against a real server.
+	status := httptest.NewServer(StatusHandler(store, svcConn.IsConnected))
 	t.Cleanup(status.Close)
 
-	return &liveHarness{k8s: admin, namespace: envtestNamespace, nats: srv, store: store, status: status}
+	return &liveHarness{
+		k8s: admin, namespace: envtestNamespace, nats: srv,
+		store: store, status: status, svcConn: svcConn,
+	}
 }
 
 // mintToken asks the API server for a real, signed, audience-bound token for a
@@ -451,4 +457,56 @@ func TestLiveAMapEditReachesTheCalloutAndChangesNewGrants(t *testing.T) {
 	if !publishRefused(t, nc, violations, "agents.hb.claude-code.owner.session") {
 		t.Error("a connection made after the narrowing still holds the removed grant")
 	}
+}
+
+// The state readiness exists to report and did not: a callout holding a
+// perfectly good map with no connection to the bus. It answers no
+// authorization request, so every non-exempt client is refused — and until the
+// probe read the connection, the pod stayed in the Service through all of it,
+// its Deployment stayed Available, and BusCredentialsReady stayed True.
+//
+// Measured against a real nats-server rather than a stub, because the claim is
+// about what the connection does, not about a boolean.
+func TestLiveReadinessFailsWhenTheCalloutIsDetachedFromTheBus(t *testing.T) {
+	h := startLiveHarness(t)
+
+	// Precondition, and the control: the same probe with the same map says
+	// ready while the connection is up. Without it, the 503 below is
+	// consistent with a probe that never says ready at all.
+	if code, _ := getStatus(t, h.status.URL+ReadyPath); code != http.StatusOK {
+		t.Fatalf("precondition: readiness = %d with a map and a live connection, want 200", code)
+	}
+
+	h.svcConn.Close()
+	if h.svcConn.IsConnected() {
+		t.Fatal("the callout connection is still up after Close")
+	}
+
+	code, body := getStatus(t, h.status.URL+ReadyPath)
+	switch {
+	case code == http.StatusOK:
+		t.Error("readiness = 200 with the bus connection closed; the pod stays in the Service " +
+			"answering no authorization request, and nothing on the cluster says so")
+	case !strings.Contains(body, "bus"):
+		t.Errorf("readiness body %q does not say the bus is what is wrong; a missing map "+
+			"produces the same symptom for every client and is fixed somewhere else", body)
+	}
+
+	// The map is still there, which is the point: the two failures are
+	// independent, and only one of them was represented.
+	if !h.store.Ready() {
+		t.Error("precondition lost: the store stopped serving its map, so the 503 above " +
+			"proves nothing about the connection")
+	}
+}
+
+func getStatus(t *testing.T, url string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
 }
