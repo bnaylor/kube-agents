@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"path"
 	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1114,17 +1115,33 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// whether the UID the pod imposes can chdir into it.
 		imageWorkDir string
 		traversable  bool
+		// usable is the set of directories measured usable by this pod's UID
+		// on this image. Whether a path is traversable is a fact about the
+		// image, which the PodSpec cannot show, so it gets pinned here rather
+		// than derived. Keep it to paths someone has actually looked at.
+		usable []string
+		// wantWritable says the container needs a cwd it can write to, not
+		// merely enter. Under ReadOnlyRootFilesystem the only writable paths
+		// are the container's own non-ReadOnly mounts, so that is checkable
+		// from the spec -- and it is a separate question from `usable`, which
+		// a literal pin alone would not answer if the mount went away.
+		wantWritable bool
 	}{
 		// nats:2.10-alpine -- WORKDIR /, mode 0755, so UID 1000 is fine and
 		// the render owes nothing.
-		{"nats", "nats", sts.Spec.Template.Spec, "/", true},
+		{render: "nats", container: "nats", spec: sts.Spec.Template.Spec,
+			imageWorkDir: "/", traversable: true},
 		// natsio/nats-box:0.14.5 -- WORKDIR /root, no USER, and /root is
-		// drwx------ root:root. This is #1259.
-		{"provision", "provision", job.Spec.Template.Spec, "/root", false},
+		// drwx------ root:root. This is #1259. The cwd is also the nats CLI's
+		// HOME, so it has to be writable, which leaves the emptyDir.
+		{render: "provision", container: "provision", spec: job.Spec.Template.Spec,
+			imageWorkDir: "/root", usable: []string{a2aProvisionWritablePath}, wantWritable: true},
 		// distroless static nonroot -- WORKDIR /home/nonroot, drwx------
 		// owned by 65532, and the pod runs as 1000. Latent rather than broken
-		// because the gateway binary never stats ".".
-		{"gateway", "gateway", dep.Spec.Template.Spec, "/home/nonroot", false},
+		// because the gateway binary never stats ".". It writes nothing, so
+		// traversable is enough, and "/" is 0755 on that image.
+		{render: "gateway", container: "gateway", spec: dep.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	} {
 		t.Run(tc.render, func(t *testing.T) {
 			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
@@ -1148,16 +1165,38 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 				t.Fatalf("container %s inherits the image's WORKDIR (%s) while the pod runs as %s, "+
 					"which cannot chdir into it", c.Name, tc.imageWorkDir, uid)
 			}
-			// A WorkingDir that names one of the container's own mounts has to
-			// name a writable one: the hardened context sets
-			// ReadOnlyRootFilesystem, so a read-only mount is no better than
-			// the read-only root it sits on. A path that is not a mount is
-			// taken on the image's terms -- "/" is 0755 on all three.
-			for _, m := range c.VolumeMounts {
-				if m.MountPath == c.WorkingDir && m.ReadOnly {
-					t.Errorf("container %s: WorkingDir %q is mount %q, which is ReadOnly",
-						c.Name, c.WorkingDir, m.Name)
-				}
+			// Non-empty is not the assertion. #1259 was a WorkingDir the
+			// image supplied and the pod's UID could not enter, so the check
+			// that matters is which directory, against the ones measured
+			// usable on this image.
+			dir := path.Clean(c.WorkingDir)
+			if !slices.Contains(tc.usable, dir) {
+				t.Errorf("container %s: WorkingDir %q is not one of the directories measured "+
+					"usable by this pod's UID on this image (%v). The image ships WORKDIR %s, "+
+					"which is why this container declares one at all. If %q really is usable, "+
+					"measure it and add it to the row.",
+					c.Name, c.WorkingDir, tc.usable, tc.imageWorkDir, c.WorkingDir)
+			}
+			if !tc.wantWritable {
+				return
+			}
+			// A writable cwd under ReadOnlyRootFilesystem means one of the
+			// container's own mounts, and a ReadOnly mount is no better than
+			// the read-only root it sits on. Checked separately from the pin
+			// above so that dropping the mount fails here even though the
+			// literal still matches.
+			mount := slices.IndexFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+				return path.Clean(m.MountPath) == dir
+			})
+			if mount < 0 {
+				t.Errorf("container %s: WorkingDir %q has to be writable -- it is also the "+
+					"nats CLI's HOME -- but it names no mount, and the hardened context makes "+
+					"everything else read-only", c.Name, c.WorkingDir)
+				return
+			}
+			if m := c.VolumeMounts[mount]; m.ReadOnly {
+				t.Errorf("container %s: WorkingDir %q is mount %q, which is ReadOnly",
+					c.Name, c.WorkingDir, m.Name)
 			}
 		})
 	}
