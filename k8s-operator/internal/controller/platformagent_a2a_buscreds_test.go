@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -39,10 +40,10 @@ import (
 // callout is absent or not fully ready; true, naming the rendered map version,
 // once every replica is serving.
 // sandboxKeysSecret satisfies the reconcile step that reports a missing shell
-// sandbox keypair. Without it the reconcile parks Degraded and returns before
-// any status condition below that point is written — including this one — so a
-// status test that omits it is testing the early return rather than the
-// condition. On a working install the Secret exists.
+// sandbox keypair, so that the tests using it exercise a Ready install rather
+// than a Degraded one. It no longer has to exist for BusCredentialsReady to be
+// written — that was the defect the two tests at the bottom of this file pin —
+// but Ready=True is the state most of these assertions are about.
 func sandboxKeysSecret(agent *agentv1alpha1.PlatformAgent) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -161,5 +162,113 @@ func TestBusCredentialsReadyIsAbsentUnderToday(t *testing.T) {
 	}
 	if cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition); cond != nil {
 		t.Errorf("BusCredentialsReady survives a flip to today: %+v", cond)
+	}
+}
+
+// Both tests below are the same defect from its two ends: the condition was
+// written at the very bottom of Reconcile, under every early return, so a
+// reconcile that parked Degraded above it neither wrote it nor cleared it.
+//
+// The workaround is visible in this file's own history: sandboxKeysSecret
+// exists so the tests above reach the write at all. A helper that exists to
+// step over an early return is evidence about the production path, not just
+// about the fixture -- an install with no sandbox keypair is an ordinary
+// install, not a broken one.
+
+// A missing shell sandbox keypair parks the reconcile Degraded. It must not
+// also decide whether anything can be dispatched onto the bus: those are
+// unrelated components, and the condition is the only thing that says whether
+// the callout can authenticate. Reported here even while Ready is False --
+// especially then, since that is when someone is reading conditions.
+func TestBusCredentialsReadyIsWrittenEvenWhenAnEarlierStepParksDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	// Deliberately no sandboxKeysSecret: this is the install the helper above
+	// exists to avoid, and it is a supported one.
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if ready := meta.FindStatusCondition(fresh.Status.Conditions, "Ready"); ready == nil ||
+		ready.Status != metav1.ConditionFalse {
+		t.Fatalf("precondition: want Ready=False from the missing keypair, got %+v", ready)
+	}
+	if meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition) == nil {
+		t.Error("no BusCredentialsReady condition on a next install parked Degraded by an " +
+			"unrelated step; nothing downstream can tell whether the bus can authenticate")
+	}
+}
+
+// The other end: a condition already written must not survive the component it
+// describes. A flip back to today tears the callout down, and if the same
+// reconcile parks Degraded above the clear, the CR goes on reporting that a
+// callout which no longer exists is serving a map -- which reads as healthy.
+func TestBusCredentialsReadyIsClearedOnAFlipToTodayThatAlsoParksDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	keys := sandboxKeysSecret(agent)
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, keys).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// Twice: the first pass creates the callout objects, the second observes
+	// them, which is when the condition is written.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition) == nil {
+		t.Fatal("precondition: no BusCredentialsReady under next")
+	}
+
+	// Flip to today and remove the keypair in the same step, so the reconcile
+	// that tears the callout down is also one that parks Degraded.
+	fresh.Spec.Mode = ptr.To("today")
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("flip mode: %v", err)
+	}
+	if err := cl.Delete(ctx, keys); err != nil {
+		t.Fatalf("delete keypair: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after flip: %v", err)
+	}
+
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition); cond != nil {
+		t.Errorf("BusCredentialsReady survived the flip to today as %s/%s (%q); "+
+			"the CR describes a callout it no longer has",
+			cond.Status, cond.Reason, cond.Message)
 	}
 }

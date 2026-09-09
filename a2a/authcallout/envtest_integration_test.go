@@ -75,7 +75,9 @@ type liveHarness struct {
 func startLiveHarness(t *testing.T) *liveHarness {
 	t.Helper()
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		t.Skip("KUBEBUILDER_ASSETS is unset; run with the envtest binaries (make -C k8s-operator setup-envtest)")
+		t.Skip("KUBEBUILDER_ASSETS is unset; install the envtest binaries with " +
+			"`make -C ../k8s-operator setup-envtest` from a2a/, then set it from " +
+			"`make -C ../k8s-operator -s envtest-path`")
 	}
 
 	env := &envtest.Environment{}
