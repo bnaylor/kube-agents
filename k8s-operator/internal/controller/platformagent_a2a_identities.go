@@ -295,7 +295,25 @@ func workerIdentity() a2aIdentity {
 			"a2a.topics.agent.platform.upgrade-readiness",
 			"a2a.topics.shared.blueprint",
 			"a2a.topics.shared.annotations",
-			"a2a.agents.>",
+			// No a2a.agents.> publish. The directory is the identity
+			// plane: a2a.agents.{profile} is last-value, so one publish
+			// REPLACES a profile's card, and an agent-closed tombstone
+			// retires it. The payload spec says cards are "published by
+			// the profile's owner (the operator once profiles are CRs),
+			// not by workers", and nothing in the tree publishes one --
+			// this grant had no caller and let the least-trusted
+			// principal in the deployment forge any profile's card. The
+			// gateway keeps SUBSCRIBE on the same subjects, which is the
+			// read discovery actually needs. Removed on main by #1313;
+			// carried across this merge by hand, because A1 moved these
+			// lists out of the nats.conf template and git could not see
+			// that the two edits were the same edit.
+			//
+			// This closes forgery, not reach: $JS.API.> below still
+			// covers STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
+			// STREAM.DELETE.DIRECTORY, so worker can still erase the
+			// whole directory in one call. Scoping that wildcard the way
+			// #1306 scopes seed's is #1316, a separate change.
 			"agents.hb.>",
 			"$KV.runtime-state.>",
 			"$JS.API.>",

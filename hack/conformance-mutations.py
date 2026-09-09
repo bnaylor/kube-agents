@@ -352,7 +352,9 @@ Mutation(
         # autopush-redeploy-agent.yml was deleted by #1199, which consolidated
         # the autopush deploys; every run of the whole sweep has crashed on
         # the missing path since. autopush-deploy.yml is the replacement and
-        # carries the same predicate, once.
+        # carries the same predicate, once. This branch and #1310 found and
+        # fixed that independently -- hence the missing-file case handled
+        # below, which turns a crash into one stale mutation.
         "B4-workflow-run-gate",
         ".github/workflows/autopush-deploy.yml",
         ("github.event.workflow_run.head_branch == 'main'", "true"),
@@ -774,7 +776,10 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
+        # rule renders only above one replica, and the HA fixture is the only
+        # golden that sets it.
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
         ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
          "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
@@ -1071,6 +1076,10 @@ def main() -> int:
     verdicts = []
     for mutation in selected:
         path = REPO / mutation.path
+        if not path.exists():
+            verdicts.append((mutation, "STALE", []))
+            print(f"STALE    {mutation.id}: {mutation.path} does not exist")
+            continue
         original = path.read_text()
         old, new = mutation.edit
         if old not in original:
