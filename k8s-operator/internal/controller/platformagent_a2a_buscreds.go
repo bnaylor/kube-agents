@@ -141,28 +141,60 @@ func (r *PlatformAgentReconciler) syncBusCredentialsReady(ctx context.Context, a
 func (r *PlatformAgentReconciler) renderedAuthMapVersion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}, cm); err != nil {
-		return "(unknown)"
+		return a2aAuthMapVersionUnknown
 	}
 	if v := cm.Annotations[a2aAuthMapVersionAnnotation]; v != "" {
 		return v
 	}
-	return "(unknown)"
+	return a2aAuthMapVersionUnknown
 }
 
 // setBusCredentialsReady writes the condition from the callout Deployment's
 // state. mapVersion is the map being served, carried into the message so an
 // operator can compare it against what the callout reports.
 func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment, absent bool, mapVersion string) error {
+	// The count the operator asked for, not the pods that happen to exist.
+	// Status.Replicas counts non-terminated pods matching the selector, which
+	// is a different number from the desired one on both sides: the rendered
+	// Deployment rolls at MaxSurge 1 over MaxUnavailable 0, so a routine
+	// image or config-hash roll spends its whole duration at three pods with
+	// two ready, and a callout coming up or missing a reaped pod spends its
+	// window at one pod that is ready. Comparing ready against it therefore
+	// reports an outage through every healthy rollout -- the surge strategy
+	// being precisely what keeps the ready count from dropping -- and reports
+	// serving on half a callout. Spec.Replicas is the question being asked;
+	// nil is one, the API's default.
+	desired := int32(1)
+	if dep.Spec.Replicas != nil {
+		desired = *dep.Spec.Replicas
+	}
+	// Status describes whichever spec the Deployment controller has acted on.
+	// While ObservedGeneration lags Generation the counts below are true of a
+	// Deployment that no longer exists, so a spec change that will take pods
+	// down still reads as fully ready for as long as the controller takes to
+	// notice it. That is the stale-reads-as-healthy failure the rest of this
+	// file is written against, arriving through the Deployment instead of
+	// through the reconcile.
+	observed := dep.Status.ObservedGeneration >= dep.Generation
+
 	condition := metav1.Condition{Type: busCredentialsReadyCondition, LastTransitionTime: metav1.Now()}
 	switch {
 	case absent:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = busCredsReasonAbsent
 		condition.Message = "the auth callout is not deployed; nothing can authenticate to the bus"
-	case dep.Status.ReadyReplicas > 0 && dep.Status.ReadyReplicas == dep.Status.Replicas:
+	case observed && dep.Status.ReadyReplicas > 0 && dep.Status.ReadyReplicas >= desired:
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = busCredsReasonServing
 		condition.Message = "the auth callout is serving identity map " + mapVersion
+	case !observed:
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = busCredsReasonUnavailable
+		condition.Message = fmt.Sprintf(
+			"the auth callout is rolling: generation %d is not yet observed, and the last reported "+
+				"%d of %d replicas ready describes the spec before it; new connections to the bus "+
+				"may be refused",
+			dep.Generation, dep.Status.ReadyReplicas, desired)
 	default:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = busCredsReasonUnavailable
@@ -172,7 +204,7 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 		// accepting no new client at all.
 		condition.Message = fmt.Sprintf(
 			"the auth callout has %d of %d replicas ready; new connections to the bus may be refused",
-			dep.Status.ReadyReplicas, dep.Status.Replicas)
+			dep.Status.ReadyReplicas, desired)
 	}
 
 	// Only when something changed. This runs on every exit from every

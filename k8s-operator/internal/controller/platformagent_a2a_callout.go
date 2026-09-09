@@ -293,11 +293,11 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Name:  "callout",
 						Image: a2aCalloutImage(),
 						Env: []corev1.EnvVar{
-							{Name: "NATS_URL", Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)},
+							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: a2aCalloutConfUser},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-								Key:                  "callout-password",
+								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+								Key:                  a2aCalloutPasswordKey,
 							}}},
 							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
 								FieldPath: "metadata.namespace",

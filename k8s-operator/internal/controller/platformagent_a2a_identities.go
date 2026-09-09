@@ -151,7 +151,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"from this render. Moving the identity before the program that uses it\n" +
 			"would refuse the gateway at connect on every install.",
 		auth:     a2aAuthStatic,
-		credsKey: "gateway-password",
+		credsKey: a2aGatewayPasswordKey,
 		// $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
 		// explicit ack is a publish to $JS.ACK.<stream>.<consumer>...,
 		// and push flow control answers on $JS.FC.>. Without them a
@@ -348,7 +348,7 @@ func workerIdentity() a2aIdentity {
 			"still authenticates here is the hand-applied seed tooling's twin and the\n" +
 			"agent-side workloads that have not moved, so the password stays until they do.",
 		auth:     a2aAuthStatic,
-		credsKey: "worker-password",
+		credsKey: a2aWorkerPasswordKey,
 		publish: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.topics.agent.platform.upgrade-readiness",
@@ -393,7 +393,7 @@ func seedIdentity() a2aIdentity {
 		user:     "seed",
 		account:  a2aAccountApp,
 		auth:     a2aAuthStatic,
-		credsKey: "seed-password",
+		credsKey: a2aSeedPasswordKey,
 		comment: "hand-applied seed tooling. STATIC because it is applied rather than\n" +
 			"rendered: it exists on installs today, and removing its user would refuse\n" +
 			"it at connect the next time it ran. The rendered provisioner beside it\n" +
@@ -438,7 +438,7 @@ func webIdentity() a2aIdentity {
 			"a subject list - JetStream puts the reach in the request BODY - so the JS\n" +
 			"API grants are enumerated per stream and there is no ack grant.",
 		auth:     a2aAuthStatic,
-		credsKey: "web-password",
+		credsKey: a2aWebPasswordKey,
 		publish: []string{
 			"$JS.API.INFO",
 			"$JS.API.STREAM.INFO.TASKS",
@@ -479,7 +479,7 @@ func sysIdentity() a2aIdentity {
 		comment: "human operators and monitoring. No agent ever authenticates here.\n" +
 			"STATIC: the holder is a person with a port-forward or a scrape config.",
 		auth:     a2aAuthStatic,
-		credsKey: "sys-password",
+		credsKey: a2aSysPasswordKey,
 	}
 }
 

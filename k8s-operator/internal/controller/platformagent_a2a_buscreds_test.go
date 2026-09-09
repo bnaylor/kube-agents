@@ -412,3 +412,116 @@ func TestBusCredentialsReadyIsNotLeftStaleByARefusalAboveTheBusStep(t *testing.T
 			"bus step left the last value standing", cond.Status, cond.Reason, cond.Message)
 	}
 }
+
+// The condition must read the callout's DESIRED replica count, not the number
+// of pods that happen to exist, because those two differ on every rollout.
+//
+// The rendered Deployment is `Replicas: 2, MaxUnavailable: 0, MaxSurge: 1`
+// (platformagent_a2a_callout.go), so a routine image or config-hash roll
+// surges to three pods: two old ones still ready, one new one starting.
+// Status.Replicas counts non-terminated pods matching the selector, so that
+// window reads 2 of 3 — and a condition comparing ready against it reports
+// CalloutUnavailable, "new connections to the bus may be refused", through a
+// rollout whose entire purpose is that the ready count never drops. The
+// surge strategy is the redundancy; a monitor that reads it as an outage is
+// worse than no monitor, because it teaches people the alarm is noise.
+//
+// The same comparison fails the other way, which is the one that matters:
+// while a callout is coming up, or after a node takes a pod, one pod that
+// exists and is ready satisfies ReadyReplicas == Status.Replicas and the
+// condition reports CalloutServing on half a callout.
+func TestBusCredentialsReadyReadsTheDesiredReplicaCountNotThePodsThatExist(t *testing.T) {
+	agent := a2aTestAgent()
+
+	cases := []struct {
+		name       string
+		desired    int32
+		replicas   int32
+		ready      int32
+		generation int64
+		observed   int64
+		want       metav1.ConditionStatus
+		wantReason string
+		why        string
+	}{
+		{
+			name: "a surging rollout is not an outage",
+			// maxSurge:1 over two ready pods. Nothing is degraded.
+			desired: 2, replicas: 3, ready: 2, generation: 4, observed: 4,
+			want: metav1.ConditionTrue, wantReason: busCredsReasonServing,
+			why: "every desired replica is ready; the third pod is the surge",
+		},
+		{
+			name: "one pod up out of two wanted is not serving",
+			// The window a fresh install and a lost pod both pass through.
+			desired: 2, replicas: 1, ready: 1, generation: 4, observed: 4,
+			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
+			why: "half the callout is a single point of failure in front of every new connection",
+		},
+		{
+			name:    "steady state, both replicas ready",
+			desired: 2, replicas: 2, ready: 2, generation: 4, observed: 4,
+			want: metav1.ConditionTrue, wantReason: busCredsReasonServing,
+			why: "the state the condition exists to report",
+		},
+		{
+			name:    "no pod ready at all",
+			desired: 2, replicas: 2, ready: 0, generation: 4, observed: 4,
+			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
+			why: "the bus accepts no new client",
+		},
+		{
+			name: "a spec change the Deployment controller has not seen yet",
+			// Status still describes the previous spec. Reporting Serving
+			// off it is the stale read this whole file was written against:
+			// the counts are true of a Deployment that no longer exists.
+			desired: 2, replicas: 2, ready: 2, generation: 5, observed: 4,
+			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
+			why: "these counts belong to the spec before the roll",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			cr := a2aTestAgent()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(cr).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+			dep := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       a2aCalloutName(agent),
+					Namespace:  agent.Namespace,
+					Generation: tc.generation,
+				},
+				Spec: appsv1.DeploymentSpec{Replicas: ptr.To(tc.desired)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: tc.observed,
+					Replicas:           tc.replicas,
+					ReadyReplicas:      tc.ready,
+				},
+			}
+			if err := r.setBusCredentialsReady(context.Background(), cr, dep, false, "v-under-test"); err != nil {
+				t.Fatalf("setBusCredentialsReady: %v", err)
+			}
+			cond := meta.FindStatusCondition(cr.Status.Conditions, busCredentialsReadyCondition)
+			if cond == nil {
+				t.Fatal("no BusCredentialsReady condition written")
+			}
+			if cond.Status != tc.want || cond.Reason != tc.wantReason {
+				t.Errorf("desired=%d replicas=%d ready=%d generation=%d/%d: condition = %s/%s, want %s/%s\n%s\nmessage: %s",
+					tc.desired, tc.replicas, tc.ready, tc.observed, tc.generation,
+					cond.Status, cond.Reason, tc.want, tc.wantReason, tc.why, cond.Message)
+			}
+			// A message that reports a count nobody asked for is the same
+			// defect in the operator's own words.
+			if tc.want == metav1.ConditionFalse && !strings.Contains(cond.Message, "of 2") {
+				t.Errorf("message %q does not size the callout against the 2 replicas it wants", cond.Message)
+			}
+		})
+	}
+}
