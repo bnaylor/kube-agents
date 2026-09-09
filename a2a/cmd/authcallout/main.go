@@ -46,6 +46,22 @@ const (
 	statusReadTimeout  = 5 * time.Second
 	statusWriteTimeout = 5 * time.Second
 	shutdownGrace      = 5 * time.Second
+
+	// natsClientName is what this process calls itself on the bus. It is
+	// what `nats server report connections` shows, so it is the string
+	// somebody debugging an authorization outage searches for.
+	natsClientName = "a2a-auth-callout"
+
+	// reconnectJitter and reconnectJitterTLS are the upper bounds of the
+	// random delay added to each reconnect attempt, raised from the client
+	// defaults of 100ms and 1s. Both replicas plus every other bus client
+	// come back at once after a restart, and the callout is the one that
+	// must not arrive inside that burst: while it is disconnected the server
+	// authorizes nobody, so it is contending for the connection everything
+	// else is waiting on. Same NR-6 reasoning as the callout's own
+	// grantTTLJitter, one layer down.
+	reconnectJitter    = 500 * time.Millisecond
+	reconnectJitterTLS = 2 * time.Second
 )
 
 func main() {
@@ -185,7 +201,7 @@ func connectToBus(log *slog.Logger) (*nats.Conn, error) {
 
 	nc, err := nats.Connect(url,
 		nats.UserInfo(user, password),
-		nats.Name("a2a-auth-callout"),
+		nats.Name(natsClientName),
 		// The callout must survive a bus restart, and it is the component
 		// where failing to is worst: while it is disconnected the server
 		// authorizes nobody. Retry forever rather than exiting, and jitter
@@ -193,7 +209,7 @@ func connectToBus(log *slog.Logger) (*nats.Conn, error) {
 		// arrive together (NR-6).
 		nats.RetryOnFailedConnect(true),
 		nats.MaxReconnects(-1),
-		nats.ReconnectJitter(500*time.Millisecond, 2*time.Second),
+		nats.ReconnectJitter(reconnectJitter, reconnectJitterTLS),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			log.Warn("disconnected from the bus; no new connection can be authorized until this recovers", "error", err)
 		}),
