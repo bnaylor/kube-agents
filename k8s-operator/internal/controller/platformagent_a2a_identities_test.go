@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -374,5 +375,39 @@ func TestTheSupervisorSubjectHasExactlyOneWriterAndItIsNotAnEventsWriter(t *test
 	}
 	if !slices.Equal(supervisorWriters, []string{"gateway"}) {
 		t.Errorf("principals whose publish grants reach %s: %v, want exactly [gateway]", supervisorProbe, supervisorWriters)
+	}
+}
+
+// The `…events` writer-class check ships advisory and must be tightenable
+// without a new gateway image, one retention window after an install takes
+// the supervisor split. That makes the rendered env var the mechanism, so it
+// is rendered explicitly at its default and honours the controller override.
+func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
+	agent := a2aTestAgent()
+	strictEnv := func() *corev1.EnvVar {
+		t.Helper()
+		dep := buildA2AGatewayDeployment(agent)
+		for i := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e := &dep.Spec.Template.Spec.Containers[0].Env[i]; e.Name == "A2A_STRICT_EVENTS_WRITER" {
+				return e
+			}
+		}
+		return nil
+	}
+	e := strictEnv()
+	if e == nil {
+		t.Fatal("the gateway Deployment does not render A2A_STRICT_EVENTS_WRITER; the advisory check has no flip")
+	}
+	if e.Value != "false" {
+		t.Errorf("A2A_STRICT_EVENTS_WRITER defaults to %q, want \"false\" - a strict default refuses pre-split supervisor terminals", e.Value)
+	}
+	t.Setenv("A2A_STRICT_EVENTS_WRITER", "true")
+	if got := strictEnv().Value; got != "true" {
+		t.Errorf("the controller override did not reach the gateway: %q", got)
+	}
+	// Anything that is not exactly "true" relaxes rather than tightens.
+	t.Setenv("A2A_STRICT_EVENTS_WRITER", "TRUE")
+	if got := strictEnv().Value; got != "false" {
+		t.Errorf("a near-miss value tightened the check: %q", got)
 	}
 }

@@ -106,6 +106,18 @@ func checkTaskAgreement(subject, addressee, taskID, class string, env *Envelope,
 	if env.TaskID != taskID {
 		return disagree(subject, "taskId %q does not match the subject's %q", env.TaskID, taskID)
 	}
+	// Class-independent, and deliberately broader than assertion 4. The docs
+	// scope that assertion to `…in`, because that is the only class where `to`
+	// is meaningful and the only one where its absence is worth asserting
+	// about. But the check this replaces refused a disagreeing `to` on ANY
+	// task subject, at publish and at delivery both, and an event carrying
+	// another session's `to` has no legitimate producer - so the rule stays
+	// where it was rather than narrowing to match the assertion's scope.
+	// Events carry no `to` at all, so this is unreachable for them in
+	// practice; that is the point.
+	if env.To != nil && env.To.Session != addressee {
+		return disagree(subject, "to %q disagrees with the subject's addressee %q", env.To.Session, addressee)
+	}
 	switch class {
 	case TaskClassEvents:
 		if env.Kind != KindStatusUpdate && env.Kind != KindArtifactUpdate {
@@ -137,12 +149,7 @@ func checkTaskAgreement(subject, addressee, taskID, class string, env *Envelope,
 		if env.Kind != KindMessage && env.Kind != KindCancel {
 			return disagree(subject, "kind %q is not an in kind", env.Kind)
 		}
-		// Assertion 4, adopted as an identity check: the subject names the
-		// addressee and so must `to`.
-		if env.To != nil && env.To.Session != addressee {
-			return disagree(subject, "to %q disagrees with the subject's addressee %q", env.To.Session, addressee)
-		}
-		// The negative form. The subject names the addressee, not the
+		// `to` is checked above, for every class. The negative form. The subject names the addressee, not the
 		// requester, so "a requester" is not computable from the tokens;
 		// what is computable is that the executor is not one.
 		if namesAddressee(env.From, addressee) {

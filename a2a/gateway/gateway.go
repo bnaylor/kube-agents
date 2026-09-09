@@ -53,14 +53,25 @@ const (
 // it dead" without trusting a field the publisher writes.
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 
-// supervisorAgreement is the envelope-subject agreement policy for the
-// gateway's own consumers: it is the supervisor for every session it spawned,
-// so the `…supervisor` writer check is exact rather than the negative form.
-var supervisorAgreement = lib.AgreementPolicy{Supervisor: gatewayParty.Session}
-
-// SupervisorAgreement is the policy main hands the bus client, so tasks/get
-// replay and the relay agree about who the supervisor is.
-func SupervisorAgreement() lib.AgreementPolicy { return supervisorAgreement }
+// SupervisorAgreement is the envelope-subject agreement policy for the
+// gateway's own consumers, and the one main hands the bus client so that
+// tasks/get replay and the relay agree about who the supervisor is. The
+// gateway is the supervisor for every session it spawned, so the
+// `…supervisor` writer check is exact rather than the negative form.
+//
+// The strict flag is config, not code, on purpose. The `…events` writer-class
+// check ships advisory because for one TASKS retention window after an
+// install takes the supervisor split the stream still holds legitimate
+// supervisor terminals on `…events`. Tightening it is then a Deployment env
+// change (A2A_STRICT_EVENTS_WRITER=true) an operator can make - and revert -
+// without an image, which is what makes "flip it 72h later" an instruction
+// someone can actually carry out.
+func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
+	return lib.AgreementPolicy{
+		Supervisor:         gatewayParty.Session,
+		StrictEventsWriter: cfg != nil && cfg.StrictEventsWriter,
+	}
+}
 
 // Gateway wires the adapter, the session manager, and the bus client.
 type Gateway struct {
@@ -227,12 +238,13 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// pinned grant would not; the durable already exists on every install
 	// with the single filter, and rebinding it to the pair is an update the
 	// server accepts (lib's rebind test).
+	agreement := SupervisorAgreement(g.cfg)
 	sub, err := g.client.SubscribeDurable(ctx, lib.SubscribeConfig{
 		Stream:    lib.TasksStream,
 		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
 		Durable:   g.relayDurable,
 		Session:   gatewayParty.Session,
-		Agreement: &supervisorAgreement,
+		Agreement: &agreement,
 	}, func(env *lib.Envelope) { g.relayEvent(ctx, env) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)

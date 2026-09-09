@@ -13,6 +13,7 @@ package lib
 // class, per subject class, with the one advisory check called out.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -245,6 +246,14 @@ func TestRelocatedEnvelopeIsAProtocolError(t *testing.T) {
 	selfSteer.From = Party{Session: addressee}
 	misaddressed := cloneEnvelope(origin)
 	misaddressed.To = &Party{Session: "someone-else"}
+	// Events carry no `to`; one that does, naming another session, is what
+	// the check this replaced refused on every task subject.
+	misaddressedEvent := cloneEnvelope(working)
+	misaddressedEvent.To = &Party{Session: "someone-else"}
+	misaddressedTerminal := cloneEnvelope(supervisorTerminal(t, taskID, StateFailed, true))
+	misaddressedTerminal.To = &Party{Session: "someone-else"}
+	addressedEvent := cloneEnvelope(working)
+	addressedEvent.To = &Party{Session: addressee}
 	card, err := NewAgentCardEnvelope(Party{Session: "operator", Profile: "platform"}, "corr-card", json.RawMessage(`{"name":"platform"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -289,6 +298,11 @@ func TestRelocatedEnvelopeIsAProtocolError(t *testing.T) {
 		{"in: requester cancel agrees", in, cancel, strict, true, false},
 		{"in: status-update kind is not an in kind", in, working, strict, false, false},
 		{"in: to disagrees with the addressee", in, misaddressed, strict, false, false},
+		// The `to` rule is not scoped to `…in`: it held on every task subject
+		// before this change and still does.
+		{"events: to disagrees with the addressee", events, misaddressedEvent, strict, false, false},
+		{"events: to naming the addressee is fine", events, addressedEvent, strict, true, false},
+		{"supervisor: to disagrees with the addressee", sup, misaddressedTerminal, strict, false, false},
 		{"in: the executor writing its own in subject", in, selfSteer, strict, false, false},
 		{"directory: a bound card agrees", AgentSubject("platform"), card, strict, true, false},
 		{"directory: a card relocated onto another profile", AgentSubject("other-profile"), card, strict, false, false},
@@ -585,4 +599,80 @@ func cloneEnvelope(e *Envelope) *Envelope {
 		c.To = &to
 	}
 	return &c
+}
+
+// TestSubscribeDurable_RetriesABindThatRacesStreamRecovery models the live
+// failure that this retry exists for: a server accepting connections before
+// its JetStream state is current, so the first bind is answered against state
+// that is not there yet. Here the stream is simply absent when the bind
+// starts and appears while it retries.
+func TestSubscribeDurable_RetriesABindThatRacesStreamRecovery(t *testing.T) {
+	s := startServer(t)
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("relay"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	got := &collector{}
+	type result struct {
+		sub Subscription
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sub, err := c.SubscribeDurable(ctx, SubscribeConfig{
+			Stream:   TasksStream,
+			Subjects: []string{"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor"},
+			Durable:  "relay-recovery-race", Session: agreementSupervisor,
+			Agreement: &AgreementPolicy{Supervisor: agreementSupervisor},
+		}, got.handle)
+		done <- result{sub, err}
+	}()
+
+	// The bind is already failing against a stream that does not exist.
+	select {
+	case r := <-done:
+		t.Fatalf("SubscribeDurable returned before the stream existed: sub=%v err=%v", r.sub, r.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	provisionTasksStream(t, clientURL(s))
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("the bind did not recover once the stream appeared: %v", r.err)
+		}
+		defer r.sub.Stop()
+	case <-time.After(20 * time.Second):
+		t.Fatal("SubscribeDurable never returned after the stream appeared")
+	}
+	replayFixture(t, clientURL(s), "task-recovery-race", []TaskState{StateSubmitted})
+	waitFor(t, 5*time.Second, "the recovered durable delivers", func() bool { return got.count() == 1 })
+}
+
+// TestSubscribeDurable_GivesUpOnABindTheServerWillNeverAccept: the retry is
+// bounded, and the caller's context bounds it too. A consumer config no
+// server will accept must fail the process, not hang it.
+func TestSubscribeDurable_GivesUpOnABindTheServerWillNeverAccept(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := Connect(context.Background(), clientURL(s), WithName("relay"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	start := time.Now()
+	// No stream, ever.
+	if _, err := c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream: TasksStream, Subject: "a2a.tasks.*.*.events",
+		Durable: "relay-never", Session: agreementSupervisor,
+	}, func(*Envelope) {}); err == nil {
+		t.Fatal("SubscribeDurable succeeded against a stream that does not exist")
+	}
+	if elapsed := time.Since(start); elapsed > subscribeBindWindow {
+		t.Errorf("the bind outlived its own window: %v", elapsed)
+	}
 }

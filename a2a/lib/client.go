@@ -91,6 +91,10 @@ const dialTimeout = 10 * time.Second
 const (
 	backoffBase = 200 * time.Millisecond
 	backoffCap  = 5 * time.Second
+
+	// subscribeBindWindow bounds how long the FIRST bind of a durable retries
+	// before the error reaches the caller; see durableSub.startWithRetry.
+	subscribeBindWindow = 45 * time.Second
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -507,11 +511,50 @@ func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, hand
 	c.subs = append(c.subs, s)
 	js := c.js
 	c.mu.Unlock()
-	if err := s.start(ctx, js); err != nil {
+	if err := s.startWithRetry(ctx, js); err != nil {
 		s.Stop()
 		return nil, err
 	}
 	return s, nil
+}
+
+// startWithRetry is the first bind's version of what resubscribe does for
+// every later one. A nats-server that has just restarted accepts client
+// connections before it has finished recovering a stream's consumers - it
+// logs "Server is ready" ahead of "Recovering N consumers for stream" - and a
+// bind landing in that window can be answered against state the server has
+// not caught up to. Observed live: a gateway rolled alongside its server
+// exited at Run four milliseconds after connecting, ten seconds into the
+// server's restart, reporting that its two-filter relay consumer was
+// unsupported; the same bind succeeded unchanged thirty seconds later, and
+// the same single-to-multi filter update succeeds every time against that
+// server once it is settled.
+//
+// Bounded, unlike the rebuild path's retry: there the process is already up
+// and serving and giving up would leave it silently deaf, while here a
+// consumer config the server will never accept must still fail the process
+// rather than hang it. Every attempt is logged, so the delay is never silent.
+func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
+	deadline := time.Now().Add(subscribeBindWindow)
+	for attempt := 1; ; attempt++ {
+		err := s.start(ctx, js)
+		if err == nil {
+			if attempt > 1 {
+				s.c.log.Info("durable bound after retry", "durable", s.cfg.Durable, "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
+			return err
+		}
+		s.c.log.Warn("durable bind failed; retrying",
+			"durable", s.cfg.Durable, "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(fullJitterBackoff(attempt)):
+		}
+	}
 }
 
 type durableSub struct {
