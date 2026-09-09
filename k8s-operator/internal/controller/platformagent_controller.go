@@ -532,6 +532,41 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// BusCredentialsReady, here rather than at the bottom of Reconcile: this
+	// is the first point at which it is known, and everything below it can
+	// return early.
+	//
+	// It was written last, and that was wrong in both directions. A next
+	// install whose shell sandbox keypair has not been generated parks
+	// Degraded at step 13 and returned above the write, so the condition never
+	// appeared however healthy the callout was — on an ordinary install, not a
+	// broken one. And once written it outlived what it described: a flip back
+	// to today runs cleanupA2A just above, but any early return between there
+	// and the bottom skipped the clear, leaving the CR reporting that a
+	// callout it no longer has is serving a map. updateStatusDegraded writes
+	// only Ready and preserves the rest, so the stale condition survives every
+	// subsequent pass. Both are pinned in platformagent_a2a_buscreds_test.go.
+	//
+	// The condition is about the bus, and none of the steps below it are. A
+	// reconcile that parks Degraded for an unrelated reason is exactly when
+	// someone reads conditions, so it is when this one most needs to be true.
+	//
+	// Guarded on modeErr rather than on a2aNext alone. Under version skew the
+	// operator deliberately leaves a bus a newer CRD rendered standing — see
+	// cleanupA2A above — so the condition describing it must stand too;
+	// clearing it there would report the bus gone while it is still serving.
+	if modeErr == nil {
+		if a2aNext {
+			if err := r.setBusCredentialsReady(ctx, instance, a2aState.AuthMapVersion); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if r.clearBusCredentialsReady(instance) {
+			if err := r.Status().Update(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
 	// 9. Update status phase. While the mode is unrecognized the phase is
 	// Degraded with a named reason — silently rendering today at that point
 	// would leave nothing in `kubectl describe` saying the cluster runs
@@ -574,21 +609,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-
-	// BusCredentialsReady, after the Ready write so the two do not race each
-	// other's resourceVersion. Under today it is removed rather than set
-	// false: a normal install must not carry a condition describing a
-	// component it does not have, which is the darkness property reaching
-	// status and not only objects.
-	if a2aNext {
-		if err := r.setBusCredentialsReady(ctx, instance, a2aState.AuthMapVersion); err != nil {
-			return ctrl.Result{}, err
-		}
-	} else if r.clearBusCredentialsReady(instance) {
-		if err := r.Status().Update(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
 	}
 
 	// A plugin image that cannot be pulled only surfaces on the pod seconds after the
