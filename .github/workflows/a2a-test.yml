@@ -10,7 +10,10 @@ name: A2A Module Tests
 # all: a token minted and validated by a real API server is the only way that
 # assertion is about Kubernetes rather than about a stub this repository also
 # wrote. Those tests SKIP when KUBEBUILDER_ASSETS is unset, so without this step
-# they would run nowhere and the job would still report green.
+# they would run nowhere and the job would still report green. The nats CLI the
+# step below installs is the same shape of dependency with the same failure
+# mode. Both are checked before the tests run, because these are the only two
+# things this job arms that a test quietly does without.
 #
 # The trigger arrangement is k8s-operator-test.yml's, for the reasons its
 # header comment gives: on a pull request the job always starts and the
@@ -89,12 +92,27 @@ jobs:
           # Guarded, because the failure this prevents is silent. Every test
           # that needs a real API server skips when KUBEBUILDER_ASSETS is unset
           # or wrong, and the job still reports green - so an empty or
-          # multi-line value here would quietly un-arm the eight tests the two
-          # steps above exist to arm.
+          # multi-line value here would quietly un-arm the envtest-backed
+          # tests the step above exists to arm.
           if [ ! -x "$ASSETS/kube-apiserver" ]; then
             echo "::error::envtest-path gave '$ASSETS', which holds no kube-apiserver. The envtest-backed tests would skip and this job would pass regardless."
             exit 1
           fi
+          # The same guard for the other tool this job installs, and the same
+          # reason. natscli_test.go resolves the binary from $NATS_CLI or, if
+          # that is unset, from PATH, and SKIPS when it finds neither - so an
+          # install that landed anywhere other than the directory the tests
+          # look in un-arms its three tests and the job still reports green.
+          # Resolved the way `go install` resolves it, GOBIN first, and handed
+          # to the tests by name below: the guard and the tests then agree on
+          # one file rather than on a PATH they each work out separately.
+          GO_BIN_DIR="$(go env GOBIN)"
+          [ -n "$GO_BIN_DIR" ] || GO_BIN_DIR="$(go env GOPATH)/bin"
+          NATS_CLI="$GO_BIN_DIR/nats"
+          if [ ! -x "$NATS_CLI" ]; then
+            echo "::error::the nats CLI install did not produce an executable at '$NATS_CLI'. The three CLI-backed tests would skip and this job would pass regardless."
+            exit 1
+          fi
           cd a2a
           go vet ./...
-          KUBEBUILDER_ASSETS="$ASSETS" PATH="$(go env GOPATH)/bin:$PATH" go test -race ./...
+          KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race ./...
