@@ -1194,6 +1194,10 @@ type AgentStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
+	// ObservedGeneration is the .metadata.generation the status was last computed from.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Address is the fully qualified domain name (FQDN) of the agent service.
 	// +optional
 	Address string `json:"address,omitempty"`

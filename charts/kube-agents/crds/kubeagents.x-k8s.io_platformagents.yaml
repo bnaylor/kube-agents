@@ -10571,6 +10571,12 @@ spec:
                       format: int32
                       type: integer
                   type: object
+                observedGeneration:
+                  description:
+                    ObservedGeneration is the .metadata.generation the status
+                    was last computed from.
+                  format: int64
+                  type: integer
                 phase:
                   description:
                     Phase is the overall state (Pending, Provisioning, Ready,
