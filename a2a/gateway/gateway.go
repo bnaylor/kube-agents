@@ -187,6 +187,10 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.FirstEventGrace <= 0 {
 		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
+	o.Config.defaultCapabilityCeiling()
+	if err := o.Config.validateCapabilityCeiling(); err != nil {
+		return nil, err
+	}
 	g := &Gateway{
 		cfg:            o.Config,
 		client:         o.Client,
@@ -593,7 +597,7 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 
 // startTask mints the identifiers, publishes the submission, and posts the
 // placeholder the relay will edit.
-func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, principal string, authority []byte) {
+func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, principal string, authority Authority) {
 	taskID := "task-" + randHex(taskIDHexWidth)
 	// correlationId is minted here and nowhere else — the originating user
 	// interaction (payload spec field rule).
@@ -610,6 +614,22 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		"conversation", msg.Conversation,
 		"addressee", rec.Addressee)
 
+	// The root capability, minted before anything is published. The
+	// gateway allocates the taskId and the addressee in the same breath, so
+	// the entry can name the principal that will serve the request before
+	// that principal's credential exists — which is the property 09 §5 says
+	// both delegate rules need and nothing in the design set provided.
+	//
+	// A mint that fails refuses the turn. The alternative is a submission
+	// with no capability, which the executor refuses anyway, one round trip
+	// and a pod later, with the reason in a different component's log.
+	capRef, err := g.mintCapability(ctx, taskID, rec.Addressee)
+	if err != nil {
+		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
+		g.post(rec.Key, "⚠️ not started: could not mint this task's capability")
+		return
+	}
+
 	payload, err := messagePayload(msg.Text, taskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
@@ -617,7 +637,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(capRef)))
 	if err != nil {
 		g.log.Error("envelope build failed", "err", err)
 		return
@@ -634,7 +654,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
-		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now()}
+		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
 	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee})
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -676,16 +696,19 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
 // steer is attributed by its own envelope and authority block.
-func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, authority []byte) {
+func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, authority Authority) {
 	active := rec.ActiveTask
 	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)
 		return
 	}
+	// One task, one capability: the steer rides the reference minted at
+	// submission rather than a fresh one. A second root for the same request
+	// would be a second thing to revoke.
 	env, err := lib.NewMessageEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID, payload,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(active.Capability)))
 	if err != nil {
 		g.log.Error("steer envelope build failed", "err", err)
 		return
@@ -714,11 +737,11 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // would otherwise wedge the conversation forever. The gateway never forges a
 // terminal event for a task it doesn't supervise; it just stops letting that
 // task serialize new ones.
-func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority []byte) {
+func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority Authority) {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(active.Capability)))
 	if err != nil {
 		g.log.Error("cancel envelope build failed", "err", err)
 		return
