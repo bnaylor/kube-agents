@@ -498,10 +498,20 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
-							// The seeds. This Deployment is the only thing
-							// that mounts them, and the issuer is the key
-							// that decides what every connection on this bus
-							// may do.
+							// The seeds. This Deployment is the only
+							// thing that reads them, and the issuer is the
+							// key that decides what every connection on
+							// this bus may do.
+							//
+							// They arrive as environment variables, which
+							// is weaker than a projected file: secretKeyRef
+							// keeps the value out of the pod spec and out
+							// of `describe`, but env is inherited by every
+							// child process and lands in core dumps. A
+							// projected 0400 file is the shape this wants;
+							// changing it is a custody fix of its own and
+							// is tracked with the rotation gap, not done
+							// here.
 							{Name: "A2A_ISSUER_SEED", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCalloutKeysName(agent)},
 								Key:                  a2aCalloutIssuerSeedKey,
