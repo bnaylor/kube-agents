@@ -227,7 +227,9 @@ var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-passwor
 // DELETE / MSG.DELETE / RESTORE / SNAPSHOT on every stream, STREAM.CREATE,
 // enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST),
 // account INFO (jetstream.New never asks for it), and CONSUMER.INFO (nothing
-// on the path binds to an existing consumer by name).
+// on the path binds to an existing consumer by name, and on nats.go v1.53.1
+// no consumer re-verifies itself with it after a reconnect either --
+// TestWorkerConsumersSurviveABusRestart holds that across a server restart).
 //
 // CONSUMER.DELETE on TASKS is withheld deliberately, and it is the one subject
 // nats.go does emit here without a grant. The only emitter is the ordered

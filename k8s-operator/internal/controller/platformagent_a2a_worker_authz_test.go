@@ -21,9 +21,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -99,8 +101,20 @@ func (l *a2aServerLog) refusedPublish(user, subject string) bool {
 // (a temp dir). Accounts, users and permissions are the render's own.
 func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2aServerLog) {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "nats.conf")
+	s, log := a2aStartRenderedServerAt(t, conf, -1, filepath.Join(t.TempDir(), "store"))
+	t.Cleanup(func() {
+		s.Shutdown()
+		s.WaitForShutdown()
+	})
+	return s, log
+}
+
+// a2aStartRenderedServerAt is the same on a fixed port and store directory,
+// so a second start is the same bus coming back with the same streams. The
+// caller owns shutdown.
+func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string) (*natsserver.Server, *a2aServerLog) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -108,10 +122,10 @@ func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2a
 	if err != nil {
 		t.Fatalf("the rendered nats.conf does not parse: %v", err)
 	}
-	opts.Port = -1
+	opts.Port = port
 	opts.HTTPPort = 0
 	opts.Websocket.Port = 0
-	opts.StoreDir = filepath.Join(dir, "store")
+	opts.StoreDir = store
 	opts.NoSigs = true
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -126,10 +140,6 @@ func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2a
 	// The evidence names the server it came from: the module pin here and
 	// the image tag the operator deploys are independent, and the tag floats.
 	t.Logf("embedded nats-server %s (the operator deploys %s)", natsserver.VERSION, defaultA2ANATSImage)
-	t.Cleanup(func() {
-		s.Shutdown()
-		s.WaitForShutdown()
-	})
 	return s, log
 }
 
@@ -538,4 +548,178 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 		}
 		t.Log("DIRECTORY is gone; only a re-run of the provision Job brings it back")
 	})
+}
+
+// TestWorkerConsumersSurviveABusRestart is the reconnect canary for the grant.
+// The question review asked: does the scoped list starve a client's own
+// recovery path? An older nats.go re-verified a consumer with CONSUMER.INFO
+// after every reconnect, and the worker holds no CONSUMER.INFO. In the pinned
+// nats.go (a2a/go.mod), Consume re-issues its pull on CONNECTED, Messages
+// resets its counters, and the ordered consumer re-creates itself through
+// CONSUMER.CREATE; none of them asks for consumer info. This test is what
+// holds that: the bridge's durable under Consume, an ordered Messages
+// iterator (TasksGet's replay) and the sweep's kv.Keys all cross a server
+// shutdown and restart on the same port and store, connected as worker, and
+// the only publish violation the restarted server logs is the ordered
+// consumer's fire-and-forget CONSUMER.DELETE.TASKS.* -- the one subject the
+// grant withholds on purpose. A nats.go bump that brings a CONSUMER.INFO
+// re-verify back fails here with the subject named.
+func TestWorkerConsumersSurviveABusRestart(t *testing.T) {
+	creds := a2aFullCreds("a", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds).Data["nats.conf"])
+	workerPW := string(creds.Data["worker-password"])
+	seedPW := string(creds.Data["seed-password"])
+	gatewayPW := string(creds.Data["gateway-password"])
+
+	// A port the restarted server can come back on.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	store := t.TempDir()
+	url := "nats://127.0.0.1:" + strconv.Itoa(port)
+
+	first, firstLog := a2aStartRenderedServerAt(t, conf, port, store)
+	a2aProvisionLikeTheScript(t, url, seedPW)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// The lib's reconnect posture (MaxReconnects -1), with a short wait so
+	// the test is not paced by backoff.
+	reconnected := make(chan struct{}, 4)
+	worker, err := nats.Connect(url,
+		nats.UserInfo("worker", workerPW), nats.CustomInboxPrefix("_INBOX.worker"), nats.Name("worker"),
+		nats.MaxReconnects(-1), nats.ReconnectWait(200*time.Millisecond),
+		nats.ReconnectHandler(func(*nats.Conn) { reconnected <- struct{}{} }),
+		nats.ErrorHandler(func(*nats.Conn, *nats.Subscription, error) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	js, err := jetstream.New(worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The bridge's durable under Consume, and an ordered Messages iterator
+	// left open across the bounce.
+	cons, err := js.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
+		Durable: "bridge-platform", FilterSubject: "a2a.tasks.platform.*.in", AckPolicy: jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed := make(chan string, 16)
+	cc, err := cons.Consume(func(m jetstream.Msg) {
+		consumed <- string(m.Data())
+		_ = m.Ack()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Stop()
+	oc, err := js.OrderedConsumer(ctx, "TASKS", jetstream.OrderedConsumerConfig{FilterSubjects: []string{"a2a.tasks.platform.t1.events"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := oc.Messages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Stop()
+	replayed := make(chan string, 16)
+	go func() {
+		for {
+			m, err := it.Next()
+			if err != nil {
+				return
+			}
+			replayed <- string(m.Data())
+		}
+	}()
+
+	submitAsGateway := func(body string) {
+		t.Helper()
+		nc, err := nats.Connect(url, nats.UserInfo("gateway", gatewayPW), nats.CustomInboxPrefix("_INBOX.gateway"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nc.Close()
+		gw, err := jetstream.New(nc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := gw.Publish(ctx, "a2a.tasks.platform.t1.in", []byte(body)); err != nil {
+			t.Fatalf("gateway submission %q: %v", body, err)
+		}
+	}
+	expect := func(ch chan string, want string) {
+		t.Helper()
+		select {
+		case got := <-ch:
+			if got != want {
+				t.Fatalf("received %q, want %q", got, want)
+			}
+			t.Logf("received %q", want)
+		case <-time.After(20 * time.Second):
+			t.Fatalf("did not receive %q within 20s", want)
+		}
+	}
+
+	submitAsGateway("before-restart")
+	expect(consumed, "before-restart")
+	if _, err := js.Publish(ctx, "a2a.tasks.platform.t1.events", []byte("event-before-restart")); err != nil {
+		t.Fatal(err)
+	}
+	expect(replayed, "event-before-restart")
+
+	first.Shutdown()
+	first.WaitForShutdown()
+	second, secondLog := a2aStartRenderedServerAt(t, conf, port, store)
+	defer func() {
+		second.Shutdown()
+		second.WaitForShutdown()
+	}()
+	select {
+	case <-reconnected:
+		t.Log("worker reconnected to the restarted server")
+	case <-time.After(20 * time.Second):
+		t.Fatal("worker did not reconnect")
+	}
+
+	submitAsGateway("after-restart")
+	expect(consumed, "after-restart")
+	if _, err := js.Publish(ctx, "a2a.tasks.platform.t1.events", []byte("event-after-restart")); err != nil {
+		t.Fatal(err)
+	}
+	expect(replayed, "event-after-restart")
+	kv, err := js.KeyValue(ctx, "runtime-state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, "bridge.platform.t1", []byte("platform-bridge")); err != nil {
+		t.Fatal(err)
+	}
+	if keys, err := kv.Keys(ctx); err != nil || !reflect.DeepEqual(keys, []string{"bridge.platform.t1"}) {
+		t.Fatalf("kv.Keys after the restart: %q, %v", keys, err)
+	}
+
+	// The reset's fire-and-forget delete has no reply to wait for; give the
+	// server a moment to log it before reading.
+	time.Sleep(2 * time.Second)
+	if v := firstLog.publishViolations("worker"); len(v) != 0 {
+		t.Errorf("violations before the restart: %q", v)
+	}
+	for _, line := range secondLog.publishViolations("worker") {
+		switch {
+		case strings.Contains(line, "$JS.API.CONSUMER.DELETE.TASKS."):
+			t.Logf("expected after the restart, the ordered reset's best-effort delete: %s", line)
+		case strings.Contains(line, "$JS.API.CONSUMER.INFO."):
+			t.Errorf("the client re-verified a consumer with CONSUMER.INFO after the reconnect, which the grant withholds: %s", line)
+		default:
+			t.Errorf("unexpected violation after the restart: %s", line)
+		}
+	}
 }
