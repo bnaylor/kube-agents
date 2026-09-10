@@ -107,6 +107,7 @@ const (
 	sharedStateSetupEnvVar = "AGENT_SHARED_STATE_SETUP"
 	sharedStateSetupOwner  = "owner"
 	sharedStateSetupSkip   = "skip"
+	envHermesOtelEnabled   = "HERMES_OTEL_ENABLED"
 )
 
 // Which Hermes profile the gateway runs as, when it is not the default one.
@@ -1028,7 +1029,11 @@ func pluginMountPath(homeDir string, plugin *agentv1alpha1.AgentPlugin) string {
 }
 
 // buildPluginStagingInitContainer builds an init container that extracts a plugin's container image
-// into an emptyDir volume on clusters where ImageVolumeSource is unsupported or restricted (e.g. GKE Autopilot).
+// into an emptyDir volume on clusters where ImageVolumeSource is unsupported or restricted:
+// - GKE Autopilot clusters always use staging (Warden admission controller blocks ImageVolumeSource).
+// - GKE Standard < 1.35 clusters use staging as a version fallback since native ImageVolumeSource requires K8s 1.35+.
+// Custom plugin images deployed on these clusters must contain a minimal shell (/bin/sh, e.g. busybox or alpine)
+// to execute the extraction script, otherwise the init container will crash-loop the main agent pod.
 func buildPluginStagingInitContainer(homeDir string, plugin *agentv1alpha1.AgentPlugin) corev1.Container {
 	mountPath := pluginMountPath(homeDir, plugin)
 	pullPolicy := corev1.PullIfNotPresent
@@ -1883,6 +1888,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// credentialed deployments before the agent sandbox can mount the PVC.
 	initContainers = append([]corev1.Container{buildSandboxCredentialCleanup(image, pullPolicy)}, initContainers...)
 
+	// When ImageVolumeSource is unavailable (GKE Autopilot where Warden blocks image volumes,
+	// or GKE Standard < 1.35 clusters without native image volume support), stage plugin files
+	// via an init container copying into an emptyDir volume.
 	if !opts.imageVolumeSupported {
 		for _, plugin := range agentPlugins {
 			initContainers = append(initContainers, buildPluginStagingInitContainer(homeDir, plugin))
@@ -2368,6 +2376,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				},
 			})
 		} else {
+			// On clusters without ImageVolumeSource support (GKE Autopilot or GKE Standard < 1.35),
+			// back the plugin mount with an emptyDir populated by the stage-<plugin> init container.
 			volumes = append(volumes, corev1.Volume{
 				Name: buildPluginVolumeName(plugin.Name),
 				VolumeSource: corev1.VolumeSource{
@@ -2653,6 +2663,15 @@ func dropTmpScratchIfClaimed(defaults, userMounts []corev1.VolumeMount) []corev1
 //
 // Anything a container needs on top — a different user, a writable path — belongs on that
 // container, not here. This is the floor, not the whole context.
+//
+// The working directory is one of those, and it is the one that has bitten us. An image's
+// WORKDIR is chosen for the user that image expects, so a render that overrides the user
+// owns the working directory too. #1259: the A2A provision container runs natsio/nats-box
+// as UID 1000, the image ships WORKDIR /root with no USER because it expects to be root,
+// and every provisioning run died on "stat .: permission denied" — a healthy bus with no
+// streams and nothing in the render to blame, because the render was right and the kubelet
+// was the one refusing. Check the image's WORKDIR against the UID the pod imposes, and set
+// WorkingDir explicitly when they disagree.
 func hardenedSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
@@ -3227,6 +3246,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
+		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
@@ -3242,6 +3262,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		}
 	}
 	return result
+}
+
+// isHermesOtelForced checks whether spec.deployment.env explicitly force-enables the hermes_otel plugin.
+func isHermesOtelForced(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, env := range agent.Spec.Deployment.Env {
+		if env.Name == envHermesOtelEnabled && strings.EqualFold(strings.TrimSpace(env.Value), "true") {
+			return true
+		}
+	}
+	return false
 }
 
 // buildEventWatcherKubeconfigVolume is the kubeconfig the broker writes for the
@@ -4212,6 +4245,47 @@ func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptio
 
 // buildPlatformLeaderRole generates the Role manifest for leader election leases in the agent namespace
 func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	rules := []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{"coordination.k8s.io"},
+			Resources: []string{"leases"},
+			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+		},
+	}
+
+	// pods get/patch has exactly one caller: leader_elect.py's update_pod_label,
+	// which stamps kubeagents.io/is-leader on its OWN pod so the Service selector
+	// routes to the active leader.
+	//
+	// That wrapper only runs above one replica. At one replica the operator puts
+	// the gateway command straight into the container's args and leader_elect.py
+	// never executes -- so on a single-replica install, which is the default, the
+	// grant sat on the agent's ServiceAccount with nothing to use it. It is not
+	// idle capability: the API server accepts a container-image patch, so a holder
+	// could swap the code inside any pod in the namespace, and once session pods
+	// carry a pod-bound identity the bus authenticates, that means inheriting an
+	// attested identity rather than just restarting something.
+	//
+	// The condition is the same expression that arms the wrapper's env in
+	// buildPodTemplateSpec, deliberately: a grant and its consumer keyed on two
+	// separately-maintained conditions is exactly the drift this pairing prevents,
+	// and TestLeaderRolePodsRuleTracksLeaderElectionArming asserts they agree.
+	//
+	// Residual, above one replica: this is still namespace-wide. RBAC cannot say
+	// "only your own pod", so narrowing further needs admission -- a
+	// ValidatingAdmissionPolicy holding the agent's ServiceAccount to the
+	// is-leader label on pods of its own Deployment. Nothing today does that:
+	// the two policies in config/admission/agent-rbac-policy.yaml govern the
+	// content of a Role and the subject of a RoleBinding, not the objects a
+	// bound identity may then reach.
+	if replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment); replicas > 1 {
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get", "patch"},
+		})
+	}
+
 	return &rbacv1.Role{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -4221,18 +4295,7 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
 			Namespace: agent.Namespace,
 		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"coordination.k8s.io"},
-				Resources: []string{"leases"},
-				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"pods"},
-				Verbs:     []string{"get", "patch"},
-			},
-		},
+		Rules: rules,
 	}
 }
 
@@ -4737,7 +4800,12 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// either, though not always — a collector Service exposing only gRPC 4317 is rejected
 	// by otlpHTTPEndpointForService and also resolves to None, and there the namespace is
 	// real. The rule is dropped in both cases, because neither one exports.
-	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" && !otlpDisabled {
+	//
+	// Exception: when HERMES_OTEL_ENABLED=true is set in spec.deployment.env (#933),
+	// the plugin force-exports traces to the baked collector fallback even if the
+	// SDK metric exporter was disabled by otlpSourceNone, so egress must be admitted.
+	hermesForced := isHermesOtelForced(agent)
+	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" && (!otlpDisabled || hermesForced) {
 		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4317))},
@@ -4967,7 +5035,7 @@ func buildPluginVolumeName(pluginName string) string {
 // into pod metadata without a slash prefix. The Kubernetes annotation name length limit is 63 bytes,
 // so any container name longer than 35 bytes causes admission rejection.
 func buildPluginStagingContainerName(pluginName string) string {
-	name := "stage-" + pluginName
+	name := pluginStagingContainerPrefix + pluginName
 	if len(name) > maxAutopilotContainerNameLen {
 		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(pluginName)))[:8]
 		name = name[:maxAutopilotContainerNameLen-9] + "-" + hash

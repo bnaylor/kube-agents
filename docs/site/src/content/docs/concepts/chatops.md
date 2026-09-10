@@ -17,6 +17,7 @@ Google Chat is the reference channel. Setup is automated by the install: the [`c
 
 - A **Pub/Sub topic** and **subscription** are created in the target GCP project.
 - Your Google Chat app (configured separately in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com)) publishes events to the topic.
+  A GCP project holds only one Chat app, so a project already running one cannot also run this — see [Prerequisites](/kube-agents/install/prerequisites/).
 - The Planning Agent (the pod's `default` Hermes profile) consumes the subscription through Hermes' bundled Google Chat adapter, configured by the `platforms.google_chat` block of [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
 - Environment variables `GOOGLE_CHAT_PROJECT_ID` and `GOOGLE_CHAT_SUBSCRIPTION_NAME` are wired into the pod by the operator.
 
@@ -28,7 +29,7 @@ Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separat
 
 `spec.integration.googleChat.homeChannel` on the PlatformAgent (surfaced to the pod as `GOOGLE_CHAT_HOME_CHANNEL`) is the space a notification lands in when there is no thread to reply into — which is every alert-driven investigation, since nobody started the conversation.
 
-Unlike Slack's, this one is not covered by `/sethome`. That command writes the **Planning Agent** profile, which is enough for the gateway's own delivery, but a specialist runs as a kanban worker against its own profile and reads the value from the pod environment instead. Set the field on the resource. The installer does not collect it today, so on a stock install it is empty and alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
+Unlike Slack's, this one is not covered by `/sethome`. That command writes the **Planning Agent** profile, which is enough for the gateway's own delivery, but a specialist runs as a kanban worker against its own profile and reads the value from the pod environment instead. Set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (or pass `--google-chat-home-channel`), or configure `spec.integration.googleChat.homeChannel` on the `PlatformAgent` resource. If left unset, alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
 
 ### What it looks like end to end
 

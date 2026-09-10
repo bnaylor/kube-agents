@@ -237,6 +237,13 @@ image pins mirror `images.json`; `hindsight.postgresql.storage` sizes the
 volumeClaimTemplate (immutable once the StatefulSet exists), and the PVC —
 which **is** the memory — survives uninstall.
 
+`hindsight.api.rollingUpdate.maxUnavailable` defaults to `0` to keep the
+existing Pod serving while the replacement pulls its image and loads models (up
+to the 5-minute `startupProbe` budget). Set it to `1` on installs with strict
+namespace `ResourceQuota` that lack room for a surge Pod, accepting that memory
+recall will be offline during the rollout. `values.yaml` states the trade-off in
+full.
+
 ### GitHub token minter
 
 `githubMinter.*` renders the minty Deployment, Service, NetworkPolicy,
@@ -301,7 +308,9 @@ finds none — a plain `gke-cluster` module cluster has no `gke-managed-otel`
 namespace — the operator gives the agent no endpoint and sets
 `OTEL_SDK_DISABLED=true` itself. `status.telemetry.otlpEndpointSource` reads
 `None`, and the operator re-probes every 15 minutes, so installing a collector
-later turns export back on without a restart.
+later turns export back on without a restart. `None` also silences the
+`hermes_otel` plugin (`enabled: false`, `backends: []`), so neither metrics nor
+agent trace spans are exported to a missing collector.
 
 The manual switch is still there for the cases the operator will not decide:
 discovery switched off with `OTEL_COLLECTOR_DISCOVERY=false`, an endpoint pinned
@@ -317,12 +326,22 @@ platformAgent:
         value: "true"
 ```
 
-Setting that value to `"false"` re-enables the SDK on a cluster where discovery
-found nothing, but on its own it does not produce a working exporter: the
+To turn off agent trace spans specifically without disabling the OpenTelemetry
+SDK metrics, set `HERMES_OTEL_ENABLED="false"`. Both variables are on the agent
+container environment allowlist.
+
+Conversely, on a cluster where discovery resolved `None`, setting
+`HERMES_OTEL_ENABLED="true"` in `platformAgent.deployment.env` force-enables
+trace export via `hermes_otel` using the baked fallback collector endpoint, and
+the operator retains the ports 4317/4318 collector egress rule in the gateway
+NetworkPolicy.
+
+Setting `OTEL_SDK_DISABLED="false"` on its own re-enables the SDK on a cluster
+where discovery found nothing, but does not produce a working exporter: the
 operator emitted no endpoint, so the SDK falls back to `http://localhost:4318`,
-and the NetworkPolicy it renders for a `None` agent carries no collector egress
-rule. Pair it with `telemetry.otlpEndpoint` if you want the export to land
-somewhere.
+and unless `HERMES_OTEL_ENABLED="true"` is set, the NetworkPolicy it renders for
+a `None` agent carries no collector egress rule. Pair it with
+`telemetry.otlpEndpoint` if you want the export to land somewhere.
 
 Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 
@@ -560,6 +579,12 @@ helm uninstall kube-agents -n kubeagents-system
     cluster-wide. Two releases with webhooks on therefore both intercept every
     PlatformAgent in the cluster; under `Fail` an outage of either one blocks
     writes for both. Run webhooks from one release.
+  - **`operator.rollingUpdate.maxUnavailable` defaults to `0`** to hold the
+    existing operator Pod until the replacement passes readiness checks on
+    `:10250`, preventing admission webhook outages during upgrades when
+    `failurePolicy` is `Fail`. Setting it to `1` replaces in place under a tight
+    `ResourceQuota`, but PlatformAgent writes will be rejected (under `Fail`) or
+    unvalidated (under `Ignore`) until the new Pod is ready.
 
 - **CRDs** live in `crds/` and are installed by Helm on first install but never
   upgraded (a Helm limitation) — apply `k8s-operator/config/crd/bases/`

@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"path"
 	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1084,6 +1085,126 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	}
 }
 
+// TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse is the other half
+// of the hardening above, and the half #1211 did not carry. #1259 found it on a
+// real cluster: the provision pod runs nats-box as UID 1000, and nats-box ships
+// WORKDIR /root with no USER because it expects to be root. Inheriting that
+// WORKDIR killed every provisioning run on "stat .: permission denied" after it
+// printed its JSON -- a healthy bus with no streams at all, and a client seeing
+// "stream TOPICS-STATE: not found" with nothing in the render to blame.
+//
+// Neither unit tests nor goldens could see it, because the render was right and
+// the kubelet was the one refusing. That is the argument for asserting it here
+// anyway: the render is where the decision lives, even when the failure lands
+// somewhere else.
+//
+// imageWorkDir is measured, not assumed -- `crane config <pinned tag>` on each
+// of the three, recorded here so a reader can check the premise without pulling
+// anything. All three pods override the user, so wherever the image's WORKDIR
+// is not traversable by the UID the pod imposes, the render owes an explicit
+// WorkingDir. A fourth A2A container needs a row, and fails here until it has
+// one -- the same shape as the hardening test above, deliberately.
+func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
+	agent := newTestPlatformAgent()
+	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
+	job := buildA2AProvisionJob(agent)
+	dep := buildA2AGatewayDeployment(agent)
+
+	for _, tc := range []struct {
+		render    string
+		container string
+		spec      corev1.PodSpec
+		// imageWorkDir is what the pinned image ships, and traversable says
+		// whether the UID the pod imposes can chdir into it.
+		imageWorkDir string
+		traversable  bool
+		// usable is the set of directories measured usable by this pod's UID
+		// on this image. Whether a path is traversable is a fact about the
+		// image, which the PodSpec cannot show, so it gets pinned here rather
+		// than derived. Keep it to paths someone has actually looked at.
+		usable []string
+		// wantWritable says the container needs a cwd it can write to, not
+		// merely enter. Under ReadOnlyRootFilesystem the only writable paths
+		// are the container's own non-ReadOnly mounts, so that is checkable
+		// from the spec -- and it is a separate question from `usable`, which
+		// a literal pin alone would not answer if the mount went away.
+		wantWritable bool
+	}{
+		// nats:2.10-alpine -- WORKDIR /, mode 0755, so UID 1000 is fine and
+		// the render owes nothing.
+		{render: "nats", container: "nats", spec: sts.Spec.Template.Spec,
+			imageWorkDir: "/", traversable: true},
+		// natsio/nats-box:0.14.5 -- WORKDIR /root, no USER, and /root is
+		// drwx------ root:root. This is #1259. The cwd is also the nats CLI's
+		// HOME, so it has to be writable, which leaves the emptyDir.
+		{render: "provision", container: "provision", spec: job.Spec.Template.Spec,
+			imageWorkDir: "/root", usable: []string{a2aProvisionWritablePath}, wantWritable: true},
+		// distroless static nonroot -- WORKDIR /home/nonroot, drwx------
+		// owned by 65532, and the pod runs as 1000. Latent rather than broken
+		// because the gateway binary never stats ".". It writes nothing, so
+		// traversable is enough, and "/" is 0755 on that image.
+		{render: "gateway", container: "gateway", spec: dep.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+	} {
+		t.Run(tc.render, func(t *testing.T) {
+			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
+			if len(all) == 0 {
+				t.Fatalf("%s: no containers, so this test would pass vacuously", tc.render)
+			}
+			idx := slices.IndexFunc(all, func(c corev1.Container) bool { return c.Name == tc.container })
+			if idx < 0 {
+				t.Fatalf("%s: no container named %q; the table is stale", tc.render, tc.container)
+			}
+			c := all[idx]
+
+			if tc.traversable {
+				return
+			}
+			if c.WorkingDir == "" {
+				uid := "the pod's user"
+				if tc.spec.SecurityContext != nil && tc.spec.SecurityContext.RunAsUser != nil {
+					uid = fmt.Sprintf("UID %d", *tc.spec.SecurityContext.RunAsUser)
+				}
+				t.Fatalf("container %s inherits the image's WORKDIR (%s) while the pod runs as %s, "+
+					"which cannot chdir into it", c.Name, tc.imageWorkDir, uid)
+			}
+			// Non-empty is not the assertion. #1259 was a WorkingDir the
+			// image supplied and the pod's UID could not enter, so the check
+			// that matters is which directory, against the ones measured
+			// usable on this image.
+			dir := path.Clean(c.WorkingDir)
+			if !slices.Contains(tc.usable, dir) {
+				t.Errorf("container %s: WorkingDir %q is not one of the directories measured "+
+					"usable by this pod's UID on this image (%v). The image ships WORKDIR %s, "+
+					"which is why this container declares one at all. If %q really is usable, "+
+					"measure it and add it to the row.",
+					c.Name, c.WorkingDir, tc.usable, tc.imageWorkDir, c.WorkingDir)
+			}
+			if !tc.wantWritable {
+				return
+			}
+			// A writable cwd under ReadOnlyRootFilesystem means one of the
+			// container's own mounts, and a ReadOnly mount is no better than
+			// the read-only root it sits on. Checked separately from the pin
+			// above so that dropping the mount fails here even though the
+			// literal still matches.
+			mount := slices.IndexFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+				return path.Clean(m.MountPath) == dir
+			})
+			if mount < 0 {
+				t.Errorf("container %s: WorkingDir %q has to be writable -- it is also the "+
+					"nats CLI's HOME -- but it names no mount, and the hardened context makes "+
+					"everything else read-only", c.Name, c.WorkingDir)
+				return
+			}
+			if m := c.VolumeMounts[mount]; m.ReadOnly {
+				t.Errorf("container %s: WorkingDir %q is mount %q, which is ReadOnly",
+					c.Name, c.WorkingDir, m.Name)
+			}
+		})
+	}
+}
+
 // TestA2AProvisionJobConditionsDriveStatus exercises the three branches the Job
 // condition scan feeds: done, failed (which the controller turns into a Degraded
 // phase with A2AProvisionFailed), and neither (which requeues). All three shipped
@@ -1263,6 +1384,92 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 	}
 	if lists != 0 {
 		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
+	}
+}
+
+// TestNoWorkerCanPublishToTheDirectory pins the identity plane against its least
+// trusted principal.
+//
+// a2a.agents.{profile} is last-value, so a single publish REPLACES a profile's
+// card and an agent-closed tombstone retires it. The payload spec assigns that to
+// the profile's owner explicitly -- "not by workers" -- and nothing in the tree
+// publishes a card at all today, so the grant this removes had no caller.
+//
+// Asserted against the worker's publish list specifically rather than the whole
+// config: the gateway keeps SUBSCRIBE on the same subjects, which is the read
+// discovery needs, and a test that just greps the file for "a2a.agents" would
+// fail on that legitimate line.
+// a2aGrantSubjects returns the subjects in one user's publish or subscribe
+// allow-list, parsed the way the server reads them.
+//
+// Parsed rather than grepped, for two reasons this test hit directly. A
+// rationale comment left in place of a removed grant names the subject it
+// removes, so raw text reports the comment as the grant -- which it did, on
+// the first run. And the reverse: commenting a grant out is the house style
+// for disabling one here, so a control asserting a grant is present has to
+// see the comment marker too, or it passes against a config that lost the
+// grant.
+func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
+	t.Helper()
+
+	start := strings.Index(conf, "user: "+user)
+	if start < 0 {
+		t.Fatalf("no %s user in the rendered config", user)
+	}
+	entry := conf[start:]
+	if next := strings.Index(entry[1:], "user: "); next >= 0 {
+		entry = entry[:next+1]
+	}
+	openIdx := strings.Index(entry, section+" { allow = [")
+	if openIdx < 0 {
+		t.Fatalf("%s has no %s allow-list", user, section)
+	}
+	closeIdx := strings.Index(entry[openIdx:], "] }")
+	if closeIdx < 0 {
+		t.Fatalf("%s's %s allow-list is unterminated", user, section)
+	}
+
+	var subjects []string
+	for _, line := range strings.Split(entry[openIdx:openIdx+closeIdx], "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
+		if !strings.HasPrefix(line, `"`) {
+			continue
+		}
+		subjects = append(subjects, strings.Trim(line, `"`))
+	}
+	if len(subjects) == 0 {
+		t.Fatalf("%s's %s allow-list parsed empty", user, section)
+	}
+	return subjects
+}
+
+func TestNoWorkerCanPublishToTheDirectory(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	// Asked as the server would ask it, not as a substring scan would. A grant
+	// need not spell the subject to authorize it: "a2a.*.*" covers
+	// a2a.agents.platform and contains no "a2a.agents" to grep for, and
+	// consolidating the worker's three exact topic grants into one wildcard is
+	// the plausible way that arrives.
+	const card = "a2a.agents.platform"
+	for _, grant := range a2aGrantSubjects(t, conf, "worker", "publish") {
+		if subjectMatches(grant, card) {
+			t.Errorf("worker can publish %s via grant %q; one publish replaces a profile's "+
+				"card, and the payload spec assigns cards to the profile owner, not workers",
+				card, grant)
+		}
+	}
+
+	// The control: the gateway's READ of the directory must survive, or this
+	// test would pass just as well against a config that broke discovery.
+	var gatewayReads bool
+	for _, grant := range a2aGrantSubjects(t, conf, "gateway", "subscribe") {
+		if subjectMatches(grant, card) {
+			gatewayReads = true
+		}
+	}
+	if !gatewayReads {
+		t.Error("the gateway lost subscribe on the directory; discovery reads it")
 	}
 }
 
@@ -1548,42 +1755,6 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	}
 	if after := hashNow(t); after == before {
 		t.Errorf("a credential rotation did not roll the bus: hash stayed %q", before)
-	}
-}
-
-// TestTheProvisionJobDeclaresItsOwnWorkingDirectory pins the half of the
-// hardening above that #1211 did not carry, and that #1259 found on a real
-// cluster: the pod runs nats-box as UID 1000, and nats-box ships WORKDIR /root
-// with no USER because it expects to be root. Inheriting that WORKDIR killed
-// every provisioning run on "stat .: permission denied" after it printed its
-// JSON -- a healthy bus with no streams at all, and a client seeing
-// "stream TOPICS-STATE: not found" with nothing in the render to blame.
-//
-// Neither unit tests nor goldens could see it, because the render was right and
-// the kubelet was the one refusing. That is the argument for asserting it here
-// anyway: the render is where the decision lives, even when the failure lands
-// somewhere else.
-//
-// The general rule, for whoever adds the fourth A2A container: an image's
-// WORKDIR is chosen for the user that image expects, so a render that overrides
-// the user owns the working directory too. Asserted against the container's
-// mounts rather than the literal "/tmp", so moving the writable volume cannot
-// leave this green while pointing somewhere unwritable.
-func TestTheProvisionJobDeclaresItsOwnWorkingDirectory(t *testing.T) {
-	job := buildA2AProvisionJob(newTestPlatformAgent())
-	spec := job.Spec.Template.Spec
-	c := spec.Containers[0]
-
-	if c.WorkingDir == "" {
-		t.Fatalf("provision container inherits the image's WORKDIR (/root on nats-box) "+
-			"while the pod runs as UID %d, which cannot stat it", *spec.SecurityContext.RunAsUser)
-	}
-	if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-		return m.MountPath == c.WorkingDir
-	}) {
-		t.Errorf("WorkingDir %q is not one of the container's mounts %v; the hardened "+
-			"context sets ReadOnlyRootFilesystem, so an unmounted path is unwritable",
-			c.WorkingDir, c.VolumeMounts)
 	}
 }
 
