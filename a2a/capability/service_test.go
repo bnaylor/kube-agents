@@ -61,7 +61,7 @@ func serveVerifier(t *testing.T, s Store) *nats.Conn {
 // about what a caller can put in the parts of a request it controls.
 func rawAskBytes(t *testing.T, nc *nats.Conn, caller string, body []byte) []byte {
 	t.Helper()
-	reply := "_INBOX." + caller + ".probe"
+	reply := ReplyPrefix + caller + ".probe"
 	sub, err := nc.SubscribeSync(reply)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
@@ -170,11 +170,11 @@ func TestARequestOffTheCallerScopedNamespaceIsRefused(t *testing.T) {
 		VerifyPrefix + podB + ".extra",
 		"a2a.cap.verify",
 	} {
-		sub, err := nc.SubscribeSync("_INBOX.probe.>")
+		sub, err := nc.SubscribeSync(ReplyPrefix + "probe.>")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := nc.PublishRequest(subj, "_INBOX.probe.1", body); err != nil {
+		if err := nc.PublishRequest(subj, ReplyPrefix+"probe.1", body); err != nil {
 			t.Fatal(err)
 		}
 		_ = nc.Flush()
@@ -205,12 +205,12 @@ func TestTheVerifierWillNotAnswerIntoAnotherPrincipalsInbox(t *testing.T) {
 	nc := serveVerifier(t, s)
 	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C"})
 
-	victim, err := nc.SubscribeSync("_INBOX." + podB + ".>")
+	victim, err := nc.SubscribeSync(ReplyPrefix + podB + ".>")
 	if err != nil {
 		t.Fatal(err)
 	}
 	subj, _ := VerifySubject(podEvil)
-	if err := nc.PublishRequest(subj, "_INBOX."+podB+".stolen", body); err != nil {
+	if err := nc.PublishRequest(subj, ReplyPrefix+podB+".stolen", body); err != nil {
 		t.Fatal(err)
 	}
 	_ = nc.Flush()

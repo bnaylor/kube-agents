@@ -37,7 +37,44 @@ const (
 	// VerifyQueue lets the verifier scale horizontally without duplicating
 	// answers.
 	VerifyQueue = "cap-verifier"
+
+	// ReplyPrefix is the answer namespace, and it is deliberately NOT
+	// _INBOX.
+	//
+	// The verifier answers wherever the caller says, and the caller set is
+	// every broker on the bus, so its publish grant cannot be narrowed to
+	// one inbox. Under _INBOX that grant would be `_INBOX.>`: the verifier
+	// could publish into the gateway's inbox, which is where the gateway
+	// reads its JetStream API replies. A component whose whole job is to
+	// answer questions would have been able to forge a stream-create
+	// acknowledgement to the component that creates streams.
+	//
+	// A namespace of its own costs one subscribe grant on each caller and
+	// buys the verifier a publish grant — `a2a.cap.reply.>` — that reaches
+	// nothing but capability answers.
+	ReplyPrefix = "a2a.cap.reply."
+	// ReplyPublish is the verifier's whole publish grant on this path.
+	ReplyPublish = ReplyPrefix + ">"
 )
+
+// ReplySubject is where one request's answer goes. The caller's own name is
+// the second token, so the verifier can check that a caller is not asking to
+// be answered into somebody else's namespace, and so each caller subscribes to
+// its own answers and no one else's.
+func ReplySubject(caller string) (string, error) {
+	if err := checkToken("caller", caller); err != nil {
+		return "", err
+	}
+	return ReplyPrefix + caller + "." + nuid.Next(), nil
+}
+
+// ReplySubscribe is the one subscribe grant a broker needs to hear answers.
+func ReplySubscribe(caller string) (string, error) {
+	if err := checkToken("caller", caller); err != nil {
+		return "", err
+	}
+	return ReplyPrefix + caller + ".>", nil
+}
 
 // VerifySubject is where a caller asks. The caller's own name is the subject's
 // last token, and the server is what makes that true.
@@ -181,12 +218,13 @@ func (s *Service) Serve(ctx context.Context, nc *nats.Conn) error {
 func (s *Service) handle(ctx context.Context, m *nats.Msg) {
 	caller, cerr := callerFromSubject(m.Subject)
 	// The reply subject is chosen by the caller, and the verifier's publish
-	// grant is broader than any one inbox. Answering wherever asked would
-	// let a broker have the verifier deliver into another principal's
-	// inbox. session.go documents the same shape on the JetStream path;
+	// grant covers the whole reply namespace. Answering wherever asked
+	// would let one broker have the verifier deliver into another's reply
+	// namespace — a forged verdict, from the one component every broker
+	// believes. session.go documents the same shape on the JetStream path;
 	// this is the one place on the capability path where it would apply, so
 	// it is closed here rather than inherited.
-	if cerr == nil && !strings.HasPrefix(m.Reply, "_INBOX."+caller+".") {
+	if cerr == nil && !strings.HasPrefix(m.Reply, ReplyPrefix+caller+".") {
 		if s.Log != nil {
 			s.Log.Warn("verify request asked for a reply outside the caller's inbox; dropped",
 				"caller", caller)
@@ -243,13 +281,16 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// The reply inbox is spelled here rather than taken from the
-	// connection's prefix. The verifier answers only into the caller's own
-	// inbox, and a broker that had connected without
-	// nats.CustomInboxPrefix would otherwise ask from a default inbox, be
-	// dropped, and read the drop as the verifier being down — a
-	// fail-closed bug, but one that would take a deployment out silently.
-	reply := "_INBOX." + c.self + "." + nuid.Next()
+	// The reply subject is spelled here rather than taken from the
+	// connection's inbox prefix. Answers ride their own namespace, not
+	// _INBOX (see ReplyPrefix), so nats.Request would ask from a subject
+	// the verifier drops — and the client would read the drop as the
+	// verifier being down, a fail-closed bug that would take a deployment
+	// out silently.
+	reply, err := ReplySubject(c.self)
+	if err != nil {
+		return err
+	}
 	sub, err := c.nc.SubscribeSync(reply)
 	if err != nil {
 		return refuse("the verifier could not be reached")
