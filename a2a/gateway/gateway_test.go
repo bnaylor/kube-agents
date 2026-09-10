@@ -2120,3 +2120,58 @@ func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
 		t.Fatal("the ack does not name the default addressee")
 	}
 }
+
+// assertRootCapability is the DoD's first clause in unit form: grants is not
+// null, it names the key the gateway minted for this task, and the entry is
+// really there at the pinned revision with the addressee as its delegate.
+//
+// It resolves through the same Resolver the verifier runs, against the same
+// real bucket, so what is under test is the write the gateway performed and
+// not the struct it marshalled.
+func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate string) {
+	t.Helper()
+	if string(auth.Grants) == "null" || len(auth.Grants) == 0 {
+		t.Fatalf("grants is null; the task carries no capability")
+	}
+	var grants AuthorityGrants
+	if err := json.Unmarshal(auth.Grants, &grants); err != nil {
+		t.Fatalf("grants: %v", err)
+	}
+	ref := grants.Capability
+	if want := "cap.root." + taskID; ref.Key != want {
+		t.Fatalf("capability key = %q, want %q", ref.Key, want)
+	}
+	if ref.Revision == 0 {
+		t.Fatalf("capability reference is not pinned to a revision: %+v", ref)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store, err := capability.NewStore(ctx, r.client.JetStream())
+	if err != nil {
+		t.Fatalf("cap store: %v", err)
+	}
+	res := &capability.Resolver{Store: store}
+
+	entry, err := res.Resolve(ctx, delegate, ref)
+	if err != nil {
+		t.Fatalf("the delegate could not resolve its own capability: %v", err)
+	}
+	if entry.Delegate != delegate {
+		t.Fatalf("delegate = %q, want %q", entry.Delegate, delegate)
+	}
+	if entry.Tier != capability.TierDeveloperTeam {
+		t.Fatalf("tier = %q, want the narrow default", entry.Tier)
+	}
+	if entry.Scope == "" {
+		t.Fatal("scope is empty; the ceiling was never applied")
+	}
+
+	// Same reference, wrong holder. The block travels on a bus other
+	// principals read, so possession of the reference must not be the test.
+	if _, err := res.Resolve(ctx, "somebody-else", ref); err == nil {
+		t.Fatal("a principal the root does not name resolved it anyway")
+	} else if !errors.Is(err, capability.ErrRefused) {
+		t.Fatalf("wrong holder refused for the wrong reason: %v", err)
+	}
+}
