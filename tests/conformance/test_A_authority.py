@@ -380,31 +380,80 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         to report as absent while the served config still carried it.
         """
         source = h.text("a2a_identities")
+        consts = dict(re.findall(r'(?:^|\s)(\w+)\s*=\s*"([^"]*)"', source))
         grants = {}
         for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
             body = h.go_function_body(source, builder)
-            user = re.search(r'user:\s*"([^"]+)"', body)
+            user = re.search(r"\n\t\tuser:\s*(\S+?),", body)
             if user is None:
                 raise AssertionError(f"{builder} renders no user name")
+            name = cls._go_string(user.group(1), consts)
+            if name is None:
+                raise AssertionError(f"{builder} names its user as `{user.group(1)}`, which this test cannot resolve")
             field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
             if field is None:
-                grants[user.group(1)] = ([], True)
+                grants[name] = ([], True)
             elif field.group(1).startswith("[]string{"):
-                grants[user.group(1)] = (re.findall(r'"([^"]+)"', field.group(1)), True)
+                grants[name] = cls._go_string_list(field.group(1), consts)
             else:
-                name = field.group(1)
+                var = field.group(1)
                 regions = re.findall(
-                    rf"\n\t{name} :?= (?:append\({name}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
+                    rf"\n\t{var} :?= (?:append\({var}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
                     body,
                     re.DOTALL,
                 )
                 if not regions:
-                    raise AssertionError(f"{builder} builds `{name}` in a shape this test cannot read")
+                    raise AssertionError(f"{builder} builds `{var}` in a shape this test cannot read")
                 # Comments inside these blocks quote the very subjects they
                 # explain the absence of, so they are stripped before reading.
                 bare = [re.sub(r"//[^\n]*", "", r) for r in regions]
-                grants[user.group(1)] = ([g for r in bare for g in re.findall(r'"([^"]+)"', r)], False)
+                grants[name] = ([g for r in bare for g in re.findall(r'"([^"]+)"', r)], False)
         return grants
+
+    @staticmethod
+    def _go_string(expr: str, consts: dict[str, str]) -> str | None:
+        """A Go string expression, evaluated, or None if it cannot be.
+
+        Handles a literal, a file-local string constant, and a `+` chain of
+        those -- which is how this file spells an inbox prefix
+        (`"_INBOX." + a2aVerifierUser + ".>"`) and how it names the users that
+        two packages have to agree on. Anything else, a function call most of
+        all, returns None so the caller can report the list as partial instead
+        of reporting a fragment as a grant.
+        """
+        out = []
+        for token in expr.split("+"):
+            token = token.strip()
+            literal = re.fullmatch(r'"([^"]*)"', token)
+            if literal is not None:
+                out.append(literal.group(1))
+            elif token in consts:
+                out.append(consts[token])
+            else:
+                return None
+        return "".join(out)
+
+    @classmethod
+    def _go_string_list(cls, literal: str, consts: dict[str, str]) -> tuple[list[str], bool]:
+        """A `[]string{...}` literal's entries, and whether all of them read.
+
+        Entry by entry rather than by scraping every quoted run out of the
+        block, because a concatenated entry scraped that way yields its
+        fragments -- `_INBOX.` and `.>` as two separate "grants", neither of
+        which is a subject anything holds.
+        """
+        body = re.sub(r"//[^\n]*", "", literal[literal.index("{") + 1 : literal.rindex("}")])
+        entries = [e.strip() for e in body.split(",")]
+        out, complete = [], True
+        for entry in entries:
+            if not entry:
+                continue
+            resolved = cls._go_string(entry, consts)
+            if resolved is None:
+                complete = False
+                continue
+            out.append(resolved)
+        return out, complete
 
     @classmethod
     def _conf_publish_grants(cls) -> dict[str, list[str]]:
@@ -419,8 +468,16 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """
         conf = h.text("a2a_rendered_nats_conf")
         grants = {}
+        # The allow list alone, terminated on its own `]` rather than on the
+        # close of the `publish` block: a principal with a deny list has a
+        # second bracketed list inside that block, and reading to the block's
+        # end would report every denied subject as a grant. Subjects never
+        # contain `]`, so the character class cannot run past the list it is
+        # reading. Denies narrow what follows, so ignoring them can only
+        # over-report writers, and an over-report of this set fails loudly
+        # rather than passing quietly.
         for block in re.finditer(
-            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[(.*?)\]\s*\}", conf, re.DOTALL
+            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[([^\]]*)\]", conf, re.DOTALL
         ):
             grants[block.group(1)] = re.findall(r'"([^"]+)"', block.group(2))
         return grants

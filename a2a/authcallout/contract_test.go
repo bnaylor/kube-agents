@@ -48,12 +48,17 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// particular list that means a workload either lost its grants or
 	// silently gained some.
 	//
-	// Two names: the provisioning Job, and now the session pod, which is the
-	// second workload the operator renders an a2a-bus token for. The platform
-	// agent pod is still not here: its only bus client is the Hermes bridge
-	// sidecar, which authenticates as static `worker`, so a principal keyed on
-	// the agent ServiceAccount would be a grant nothing can present.
-	want := map[string]bool{"provision": true, "session": true}
+	// Three names, and each has a rendered workload that mounts an a2a-bus
+	// token: the provisioning Job, a spawned session pod, and the capability
+	// verifier Deployment. The platform agent pod is deliberately not here —
+	// its only bus client is the Hermes bridge sidecar, which authenticates as
+	// static `worker`, so a principal keyed on the agent ServiceAccount would
+	// be a grant nothing can present.
+	//
+	// `verifier` is the one entry here whose grants include a read that no
+	// other principal on the bus holds, so its arrival or departure from this
+	// list is worth a deliberate edit rather than a fixture regeneration.
+	want := map[string]bool{"provision": true, "session": true, "verifier": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)

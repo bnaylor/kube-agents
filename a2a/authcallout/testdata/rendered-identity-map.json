@@ -1,5 +1,5 @@
 {
-  "version": "c9d0e6f571c76efa",
+  "version": "69da845da231a3f3",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -44,6 +44,24 @@
         "subscribe": null
       },
       "narrowing": "pod"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
+      "user": "verifier",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.cap.reply.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.DIRECT.GET.KV_cap",
+          "$JS.API.STREAM.MSG.GET.KV_cap",
+          "_INBOX.verifier.>"
+        ],
+        "subscribe": [
+          "a2a.cap.verify.*",
+          "_INBOX.verifier.>"
+        ]
+      }
     }
   ]
 }

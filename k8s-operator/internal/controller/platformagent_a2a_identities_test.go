@@ -222,7 +222,14 @@ func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 			got = append(got, id.user)
 		}
 	}
-	want := []string{"provision", "session"}
+	// The order is a2aIdentities' order. Each name has a workload that
+	// mounts an a2a-bus token for the ServiceAccount the entry is keyed on:
+	// the provisioning Job, through a2aBusTokenVolumeSource; a spawned
+	// session pod, through the projection the gateway builds in
+	// a2a/gateway/spawn.go; and the capability verifier Deployment, through
+	// a2aBusTokenVolumeSource again — asserted directly rather than only
+	// promised, in TestTheVerifierDeploymentPresentsTheTokenItsGrantsAreKeyedOn.
+	want := []string{"provision", "session", "verifier"}
 	if !slices.Equal(got, want) {
 		t.Errorf("callout principals = %v, want %v.\nA new callout principal needs a rendered workload that mounts an a2a-bus token for its ServiceAccount (a2aBusTokenVolumeSource / a2aBusTokenVolumeMount). Without one the entry authorizes nobody and misreports who authenticates.", got, want)
 	}

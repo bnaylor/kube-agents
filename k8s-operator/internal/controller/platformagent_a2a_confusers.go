@@ -79,11 +79,30 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 	// everything.
 	if len(id.publish) > 0 || len(id.subscribe) > 0 {
 		b.WriteString(a2aUserBlockIndent + "  permissions {\n")
-		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "publish", id.publish))
-		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "subscribe", id.subscribe))
+		b.WriteString(renderA2APermission(a2aSubjectListIndent, "publish", id.publish, id.denyPublish))
+		b.WriteString(renderA2APermission(a2aSubjectListIndent, "subscribe", id.subscribe, id.denySubscribe))
 		b.WriteString(a2aUserBlockIndent + "  }\n")
 	}
 	b.WriteString(a2aUserBlockIndent + "}\n")
+	return b.String()
+}
+
+// renderA2APermission renders one direction's allow list and, when the
+// principal has one, the deny list subtracted from it. A deny with no allow is
+// not rendered: NATS would read the empty allow as "everything", so a block
+// carrying only a deny would silently widen the principal to the whole subject
+// space minus a few names — the exact opposite of what writing a deny means.
+func renderA2APermission(indent, kind string, allow, deny []string) string {
+	if len(allow) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(indent + kind + " {\n")
+	b.WriteString(renderA2ASubjectList(indent+"  ", "allow", allow))
+	if len(deny) > 0 {
+		b.WriteString(renderA2ASubjectList(indent+"  ", "deny", deny))
+	}
+	b.WriteString(indent + "}\n")
 	return b.String()
 }
 
@@ -92,7 +111,7 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(indent + kind + " { allow = [\n")
+	b.WriteString(indent + kind + " = [\n")
 	for i, s := range subjects {
 		comma := ","
 		if i == len(subjects)-1 {
@@ -100,7 +119,7 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 		}
 		b.WriteString(indent + `  "` + s + `"` + comma + "\n")
 	}
-	b.WriteString(indent + "] }\n")
+	b.WriteString(indent + "]\n")
 	return b.String()
 }
 
