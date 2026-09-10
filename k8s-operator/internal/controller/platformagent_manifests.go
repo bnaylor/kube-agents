@@ -1958,8 +1958,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 	}
 
-	// The two exceptions to "no credentials in the sandbox", both of them
-	// pod-scoped and useless outside this pod's loopback interface:
+	// Two of the three exceptions to "no credentials in the sandbox", and the
+	// two that are pod-scoped — useless outside this pod's loopback interface:
 	//
 	//   SESSION_KV_API_KEY  authenticates callers of the Session KV server on
 	//                       127.0.0.1:8699. This container both serves it and
@@ -1971,6 +1971,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	//
 	// Neither grants access to any cloud API, any repository, or anything
 	// outside the pod, which is the property the isolation boundary protects.
+	//
+	// The third is NATS_PASSWORD, appended further down under mode: next, and
+	// it is the one that does not have that property: it authenticates to the
+	// A2A bus over the cluster network. Do not reason about what this Pod
+	// holds from this block alone.
 	// See docs/credential-isolation-design.md.
 	envVars = append(envVars,
 		corev1.EnvVar{
@@ -2495,11 +2500,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			// No ShareProcessNamespace. Nothing in this Pod holds a credential
-			// any more, so the field is not load-bearing here — it stays unset
-			// because a Pod that shares its process namespace hands every
-			// container's /proc/<pid>/environ to every other one, and the next
-			// container added here should not inherit that by default.
+			// No ShareProcessNamespace, and under mode: next the field is
+			// load-bearing rather than a default. The agent container carries
+			// the A2A bus credential there (NATS_PASSWORD, by SecretKeyRef
+			// above), and a Pod that shares its process namespace hands every
+			// container's /proc/<pid>/environ — that value included — to every
+			// other container in it, spec.deployment.sidecars entries among
+			// them. Under mode: today the credential is absent and only the
+			// weaker reason applies: the next container added here should not
+			// inherit a shared namespace by default. Do not set this field on
+			// the strength of that weaker reason alone.
 			// See docs/security-requirements.md.
 			RuntimeClassName: runtimeClassName,
 			InitContainers:   initContainers,
@@ -2512,8 +2522,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			AutomountServiceAccountToken: ptr.To(false),
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup: ptr.To(agentFSGroup),
-				// Every container in this Pod runs as the agent image's user;
-				// none of them holds a credential.
+				// Every container in this Pod runs as the agent image's user.
 				RunAsUser:      ptr.To(sandboxUID),
 				RunAsGroup:     ptr.To(agentFSGroup),
 				RunAsNonRoot:   ptr.To(true),
