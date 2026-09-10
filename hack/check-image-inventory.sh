@@ -143,12 +143,15 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
-# The two a2a images. Both parameterize their bases now: the auth callout on
-# this branch, the gateway on main in #1334.
+# The a2a images. All four parameterize their bases: the auth callout and the
+# gateway already did, the worker arrived with #1334, and the capability
+# verifier is added here.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.verifier GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.verifier DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
 check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 
@@ -202,6 +205,7 @@ check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
