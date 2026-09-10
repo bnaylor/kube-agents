@@ -20,7 +20,9 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `tools/` — operator-run scripts that are neither tasks nor tests. `live_check_fleet_safeguards.py` drives every `fleet_resource_property` check in the cluster-debugging cases against a live cluster, through the real verifier, without running an agent.
 
 To add a task or plug in a different agent, see
-[CUSTOM-TASKS.md](CUSTOM-TASKS.md).
+[CUSTOM-TASKS.md](CUSTOM-TASKS.md). To contribute a case to this repository — the format
+it is held to, the fixture-sanitization rule, who owns it when it flakes, and how it earns a
+seat on the merge-blocking roster — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Domain coverage.** `docs/designs/domains.yaml` lists eleven domains and an `allowlist` of the ones known to be uncovered; `scripts/test_domain_coverage.py` fails the build both for an uncovered domain missing from that list and for a listed domain that is in fact covered, so the list cannot rot in either direction. A domain counts as covered only when a task carries its `domain:` slug **and** a non-empty `verification_spec` **and** is an **uncommented** entry in `hack/ci-eval-pr.sh`'s `TASKS` array — covered means running.
 
@@ -41,7 +43,7 @@ This is the stock `devops-bench` CLI — there is no wrapper command. `source` i
 
 ## The gate
 
-devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it: the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when its step-0 revalidation has not already reused the pull request's prior green verdict): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
 
 ```bash
 uv run bench-gate case --task ./tasks/<id>/task.yaml \

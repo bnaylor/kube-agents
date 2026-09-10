@@ -27,7 +27,7 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, ensure_profile, overlay_template
+from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -47,6 +47,8 @@ SANDBOX_MIRROR = Path(
 # Comfortably past the mirror's own `--wait 30` plus one SSH round trip per
 # cluster profile, so this timeout only fires when the mirror itself is stuck.
 SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
+ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
+ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
 
@@ -186,14 +188,23 @@ def _pin_otel_endpoint(home: Path, name: str) -> None:
         if not config.exists():
             return
         source = SHARED_PLUGINS_DIR / "hermes_otel" / "config.yaml"
+        hermes_otel_env = os.environ.get(ENV_HERMES_OTEL_ENABLED, "").strip().lower()
+        if hermes_otel_env == "false":
+            disabled = True
+        elif hermes_otel_env == "true":
+            disabled = False
+        else:
+            disabled = os.environ.get(ENV_OTEL_SDK_DISABLED, "").strip().lower() == "true"
+
         apply(
             config,
             service_name=os.environ.get("OTEL_SERVICE_NAME") or None,
             endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
             source_path=source if source.exists() else None,
+            disabled=disabled,
         )
     except Exception as e:  # noqa: BLE001 - telemetry must not fail the scaffold
-        log(f"{name}: pinning the OpenTelemetry endpoint failed ({e}); traces go to the image default")
+        log(f"{name}: configuring OpenTelemetry failed ({e}); telemetry config unchanged")
 
 
 def kubeconfig_landed(kubeconfig: Path) -> bool:
@@ -280,6 +291,12 @@ def create_profile(project: str, cluster: str, location: str) -> str:
 
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
     overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)
+
+    # 2-bis. Backfill default legacy risk onto any unannotated jobs in the profile's
+    # cron store if one exists on the volume (e.g. on profile re-scaffold).
+    cluster_cron = home / "cron" / "jobs.json"
+    if cluster_cron.is_file():
+        backfill_cron_file(cluster_cron)
 
     # 2a. Repoint the plugin copy the overlay just made at the resolved collector.
     _pin_otel_endpoint(home, name)
