@@ -122,6 +122,111 @@ func TestBusCredentialsReadyTracksTheCallout(t *testing.T) {
 	}
 }
 
+// TestTheBusConditionMessageNamesOnlyWhatItCanKnow pins each branch's message
+// against what the CRD reference says the condition reports.
+//
+// The reference used to say the message "names the rendered map version and,
+// when not ready, the replica counts", which read as though every message
+// carried both. Only CalloutServing names the version, only the two
+// CalloutUnavailable branches carry counts, and CalloutAbsent carries neither
+// because there is no Deployment to read either from -- and someone building an
+// alert on the version string would have found that out at the moment the
+// callout went away.
+//
+// So the docs now state it per reason, and this is what keeps the two together:
+// a branch that starts or stops naming one of them reds here.
+func TestTheBusConditionMessageNamesOnlyWhatItCanKnow(t *testing.T) {
+	// Distinctive, so "the message does not name the version" is an assertion
+	// rather than a coincidence of the version being a common substring.
+	const mapVersion = "map-version-sentinel-7"
+
+	depWith := func(generation, observed int64, ready int32) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       a2aCalloutName(a2aTestAgent()),
+				Namespace:  "test-ns",
+				Generation: generation,
+			},
+			Spec: appsv1.DeploymentSpec{Replicas: ptr.To(int32(2))},
+			Status: appsv1.DeploymentStatus{
+				ObservedGeneration: observed,
+				Replicas:           ready,
+				ReadyReplicas:      ready,
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name        string
+		dep         *appsv1.Deployment
+		absent      bool
+		wantReason  string
+		wantVersion bool
+		wantCounts  string
+	}{
+		{
+			name:       "no callout deployed",
+			dep:        &appsv1.Deployment{},
+			absent:     true,
+			wantReason: busCredsReasonAbsent,
+		},
+		{
+			name:        "every replica serving",
+			dep:         depWith(3, 3, 2),
+			wantReason:  busCredsReasonServing,
+			wantVersion: true,
+		},
+		{
+			name:       "spec not yet observed",
+			dep:        depWith(4, 3, 2),
+			wantReason: busCredsReasonUnavailable,
+			wantCounts: "2 of 2",
+		},
+		{
+			name:       "short of the replicas asked for",
+			dep:        depWith(3, 3, 1),
+			wantReason: busCredsReasonUnavailable,
+			wantCounts: "1 of 2",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := a2aTestAgent()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+			if err := r.setBusCredentialsReady(context.Background(), agent, tc.dep, tc.absent, mapVersion); err != nil {
+				t.Fatalf("setBusCredentialsReady: %v", err)
+			}
+			cond := meta.FindStatusCondition(agent.Status.Conditions, busCredentialsReadyCondition)
+			if cond == nil {
+				t.Fatal("no BusCredentialsReady condition written")
+			}
+			if cond.Reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q (message: %s)", cond.Reason, tc.wantReason, cond.Message)
+			}
+
+			if got := strings.Contains(cond.Message, mapVersion); got != tc.wantVersion {
+				t.Errorf("names the map version = %v, want %v; the CRD reference's per-reason table says otherwise: %q",
+					got, tc.wantVersion, cond.Message)
+			}
+			hasCounts := strings.Contains(cond.Message, "replicas ready")
+			if hasCounts != (tc.wantCounts != "") {
+				t.Errorf("names replica counts = %v, want %v; the CRD reference's per-reason table says otherwise: %q",
+					hasCounts, tc.wantCounts != "", cond.Message)
+			}
+			if tc.wantCounts != "" && !strings.Contains(cond.Message, tc.wantCounts) {
+				t.Errorf("message %q does not carry %q -- ready against the count asked for is the number an operator sizes the outage by",
+					cond.Message, tc.wantCounts)
+			}
+		})
+	}
+}
+
 // The darkness property reaches status. A today install must not carry a
 // condition describing a component it does not have — a reviewer reading
 // `kubectl describe` on a normal install would see the feature named.
