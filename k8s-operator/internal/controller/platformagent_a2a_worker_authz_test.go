@@ -233,6 +233,13 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 // naming worker and the exact subject -- not from the client's timeout. The
 // streams are then re-read as seed to show nothing underneath changed.
 //
+// Two subtests then measure what the refusal table structurally cannot: the
+// routes that run over subjects the grant PERMITS, and so leave no violation
+// to read. The deliver-subject one is the consumer-create residue #1316 asked
+// about; the create-as-update one is what CONSUMER.CREATE reaches on a shared
+// stream, because the verb is create-or-update by name and the server has no
+// ownership concept for a consumer name.
+//
 // A final subtest puts the wildcard back into the render and shows the same
 // PURGE and DELETE succeeding and DIRECTORY gone: the control that says the
 // refusals above are authorization rather than a broken API, and the issue
@@ -433,22 +440,28 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 	// to TASKS, but a push consumer's deliver_subject is a body field no
 	// subject grant can see: the server delivers TASKS messages onto it, and
 	// a stream whose subjects cover it stores them under their ORIGINAL
-	// subjects. Delivery starts only once a literal subscription exists on
-	// the deliver subject, which splits the streams in two, so three
-	// measurements:
+	// subjects. Delivery starts only once a subscription exists whose subject
+	// is EXACTLY the deliver subject, which splits the streams in two, so
+	// four measurements -- the fourth is what makes "exactly" a measurement
+	// rather than a generalisation from three literal cases:
 	//
-	//  1. A wildcard-subject stream with no literal subscriber: the consumer
-	//     is created, delivers nothing, and DIRECTORY stays empty. Asserted.
+	//  1. A wildcard-subject stream with no subscriber: the consumer is
+	//     created, delivers nothing, and DIRECTORY stays empty. Asserted.
 	//  2. A literal-subject stream: TOPICS-STATE's own ingest on the
 	//     writerless probe topic is the interest, and the write lands with no
 	//     subscription from anyone. This route predates the change, survives
 	//     it, and is recorded in a2aWorkerJetStreamGrants; what is asserted
 	//     is the property that does hold -- the stored messages keep their
 	//     a2a.tasks.* subjects, so a topic read by subject never sees them.
-	//  3. A wildcard-subject stream with another principal's literal
-	//     subscription: a card subject under the gateway's `a2a.agents.>`
-	//     grant, which nothing in the tree opens today. Measured and logged.
-	t.Run("a push consumer's deliver subject writes only where a literal subscriber exists", func(t *testing.T) {
+	//  3. A wildcard-subject stream with another principal holding a WILDCARD
+	//     subscription that covers the deliver subject -- `a2a.agents.>`,
+	//     which is the gateway's whole subscribe grant. Asserted to deliver
+	//     nothing, which is what bounds the residue below.
+	//  4. A wildcard-subject stream with another principal's subscription on
+	//     the deliver subject itself: a card subject under the gateway's
+	//     `a2a.agents.>` grant, which nothing in the tree opens today.
+	//     Measured and logged.
+	t.Run("a push consumer's deliver subject writes only where a subscriber holds it exactly", func(t *testing.T) {
 		create := func(name, deliver string) {
 			t.Helper()
 			body := fmt.Sprintf(`{"stream_name":"TASKS","config":{"name":%q,"deliver_subject":%q,"deliver_policy":"all","ack_policy":"none"}}`, name, deliver)
@@ -500,7 +513,63 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 			t.Errorf("a read of the probe topic by subject sees something after the diverted consumer: %v", err)
 		}
 
-		// 3. DIRECTORY with the gateway holding a literal card subscription.
+		// 3. DIRECTORY with a principal holding a WILDCARD subscription that
+		// covers the deliver subject: `a2a.agents.>`, which is exactly the
+		// gateway's subscribe grant (web's `a2a.>` covers it too), and the
+		// subscription a directory watcher opens. Ordinary NATS interest
+		// matching resolves wildcards, so nothing about case 4 below answers
+		// for this one and it decides how large the residue is: a wildcard
+		// watcher is a configuration the operator supports, whereas nothing
+		// in the tree opens a literal card subscription.
+		//
+		// It does not supply interest, and that is a property of the
+		// mechanism rather than of these three streams. A push consumer's
+		// deliver subject is registered through Sublist.registerNotification
+		// (server/consumer.go, "If push mode, register for notifications on
+		// interest"), which walks the match set and takes interest only from
+		// a subscription whose subject is byte-equal to the deliver subject
+		// -- `if string(sub.subject) == subject`, with the method's own
+		// doc comment saying "this interest needs to be exact and ...
+		// wildcards will not trigger the notifications". Identical in
+		// 2.10.29 and 2.14.5. That is also why case 1 above found nothing:
+		// DIRECTORY's own ingest subscription is the wildcard `a2a.agents.>`,
+		// while TOPICS-STATE's in case 2 is the literal probe subject.
+		//
+		// The baseline is read BEFORE the subscription opens, and case 1's
+		// `divert` consumer is deliberately still alive: interest appearing
+		// later starts an existing push consumer too, so a baseline taken
+		// after the subscribe would absorb exactly the delivery this case is
+		// looking for. Measured -- with a literal subscription substituted
+		// here, that ordering made the case pass while DIRECTORY filled.
+		beforeWild := streamInfo("DIRECTORY").State.Msgs
+		if beforeWild != 0 {
+			t.Fatalf("DIRECTORY holds %d messages before the wildcard subscriber case; the baseline "+
+				"has to be empty for this case to be able to see a delivery", beforeWild)
+		}
+		wildNC, _ := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
+		wildSub, err := wildNC.SubscribeSync("a2a.agents.>")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = wildNC.Flush()
+		create("divertwild", "a2a.agents.platform")
+		time.Sleep(time.Second)
+		afterWild := streamInfo("DIRECTORY").State.Msgs
+		t.Logf("wildcard-subject stream, a principal subscribed to a2a.agents.> (not the deliver subject itself): DIRECTORY %d -> %d",
+			beforeWild, afterWild)
+		if afterWild != beforeWild {
+			t.Errorf("a subscription on a2a.agents.> supplied interest for deliver subject "+
+				"a2a.agents.platform: DIRECTORY went %d -> %d. registerNotification's exactness is what "+
+				"bounds this residue to a principal subscribed to a card subject itself; if it no longer "+
+				"holds, a2aWorkerJetStreamGrants's comment and docs/designs/spec-nats-deployment.md both "+
+				"understate the residue", beforeWild, afterWild)
+		}
+		if err := wildSub.Unsubscribe(); err != nil {
+			t.Fatal(err)
+		}
+		_ = wildNC.Flush()
+
+		// 4. DIRECTORY with the gateway holding a literal card subscription.
 		gwNC, _ := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
 		gwSub, err := gwNC.SubscribeSync("a2a.agents.platform")
 		if err != nil {
@@ -518,6 +587,103 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 		t.Logf("residue: with the gateway holding a literal card subscription, DIRECTORY msgs=%d, %d under a2a.tasks.* subjects", info.State.Msgs, underTaskSubjects)
 		if info.State.Msgs != underTaskSubjects {
 			t.Errorf("DIRECTORY holds %d messages but only %d sit under a2a.tasks.* subjects; a card subject was written", info.State.Msgs, underTaskSubjects)
+		}
+	})
+
+	// CONSUMER.CREATE is create-OR-UPDATE by name, which the refusal table
+	// above cannot see: it measures the subjects the grant withholds, and
+	// this route uses a subject the grant permits. The server has no
+	// ownership concept for a consumer name, so within a stream the worker
+	// may create consumers on, every consumer on that stream is the worker's
+	// to reconfigure -- the gateway's relay durable included. Two outcomes,
+	// both measured here rather than argued, because withholding
+	// CONSUMER.DELETE.TASKS.* is only worth what this subtest says it is
+	// worth.
+	//
+	// This is the residue the `web` block in the render and
+	// docs/designs/spec-nats-deployment.md already record for `web`; the
+	// worker holds it on TASKS for the same reason and, unlike web, has
+	// another principal's durable on the stream to aim at. It is not a
+	// regression -- $JS.API.> permitted all of it -- and there is no narrower
+	// grant: nats.go's ordered consumers take server-generated names, so the
+	// last token has to be `>`, and NATS wildcards match whole tokens, so a
+	// prefix grant is not available either.
+	t.Run("CONSUMER.CREATE on TASKS is create-or-update, so it reaches the gateway's durable", func(t *testing.T) {
+		const relaySubject = "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay"
+		// The relay's config as the gateway created it. An update carries the
+		// whole config, not a patch: a body naming only filter_subject is
+		// refused by the SERVER (not by the grant) with "ack policy can not
+		// be updated", because the zero value of ack_policy is `none`. That
+		// is a JSON-assembly detail, not a boundary, so the bodies below are
+		// what a real caller sends.
+		relayConfig := func(extra string) []byte {
+			return fmt.Appendf(nil, `{"stream_name":"TASKS","config":{"durable_name":"gateway-relay","name":"gateway-relay",`+
+				`"ack_policy":"explicit","deliver_policy":"all","replay_policy":"instant",%s}}`, extra)
+		}
+		update := func(what string, body []byte) {
+			t.Helper()
+			msg, err := worker.Request(relaySubject, body, 2*time.Second)
+			if err != nil {
+				t.Fatalf("%s: no reply (%v); server violations for worker: %q", what, err, log.publishViolations("worker"))
+			}
+			if log.refusedPublish("worker", relaySubject) {
+				t.Fatalf("%s: the server refused %s", what, relaySubject)
+			}
+			var resp struct {
+				Error *struct {
+					Description string `json:"description"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(msg.Data, &resp); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			if resp.Error != nil {
+				t.Fatalf("%s: server rejected the update: %s", what, resp.Error.Description)
+			}
+			t.Logf("%-58s ALLOWED by the grant and applied by the server", what)
+		}
+
+		// 1. Retune another principal's durable: the gateway stops seeing
+		// task events, and no permissions violation is logged anywhere,
+		// because the call is inside the allow-list.
+		update("retune gateway-relay's filter_subject", relayConfig(`"filter_subject":"a2a.tasks.none"`))
+		relay, err := gw.Consumer(ctx, "TASKS", "gateway-relay")
+		if err != nil {
+			t.Fatalf("gateway-relay after the worker's update: %v", err)
+		}
+		if got := relay.CachedInfo().Config.FilterSubject; got != "a2a.tasks.none" {
+			t.Errorf("gateway-relay's filter subject is %q; the worker's create-as-update did not take. "+
+				"If the server has gained an ownership check, a2aWorkerJetStreamGrants's comment can stop "+
+				"recording this residue", got)
+		}
+
+		// 2. Delete it without naming CONSUMER.DELETE. inactive_threshold is
+		// a config field, so the same permitted subject sets it and the
+		// server reaps the durable -- the outcome withholding
+		// CONSUMER.DELETE.TASKS.* is meant to prevent.
+		update("set gateway-relay's inactive_threshold to 1s", relayConfig(
+			`"filter_subject":"a2a.tasks.*.*.events","inactive_threshold":1000000000`))
+		deadline := time.Now().Add(30 * time.Second)
+		var gone bool
+		for time.Now().Before(deadline) {
+			if _, err := gw.Consumer(ctx, "TASKS", "gateway-relay"); errors.Is(err, jetstream.ErrConsumerNotFound) {
+				gone = true
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if !gone {
+			t.Error("gateway-relay survived a 1s inactive_threshold set through CONSUMER.CREATE; " +
+				"if that is now true, withholding CONSUMER.DELETE.TASKS.* closes the route rather than raising its price")
+		} else {
+			t.Log("gateway-relay was reaped by the threshold the worker set; the ack floor went with it")
+		}
+		// The contrast, in one assertion: the table above had this same
+		// worker refused on CONSUMER.DELETE.TASKS.gateway-relay, and the
+		// durable is gone anyway.
+		if !log.refusedPublish("worker", "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay") {
+			t.Error("the refusal table above no longer measures CONSUMER.DELETE.TASKS.gateway-relay, " +
+				"so this row has nothing to contrast the create-as-update route with")
 		}
 	})
 

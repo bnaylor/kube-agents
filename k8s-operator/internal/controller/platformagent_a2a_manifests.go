@@ -237,17 +237,32 @@ var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-passwor
 // no consumer re-verifies itself with it after a reconnect either --
 // TestWorkerConsumersSurviveABusRestart holds that across a server restart).
 //
-// CONSUMER.DELETE on TASKS is withheld deliberately, and it is the one subject
-// nats.go does emit here without a grant. The only emitter is the ordered
-// consumer's reset path, which fires DeleteConsumer in a goroutine and ignores
-// the result; an ephemeral it could not delete is reaped by its own five-minute
-// inactive threshold. Granting it would let the worker delete the gateway's
-// relay durable by name -- within a shared stream, consumer names are the
-// caller's choice, so no grant can tell the two apart -- which drops that
-// consumer's ack floor and replays every pending task. CREATE and MSG.NEXT on
-// the same stream already let the worker read from another principal's
-// consumer; DELETE is the destructive half, and it stays out until the auth
-// callout gives each principal its own user.
+// CONSUMER.DELETE on TASKS is withheld, and it is the one subject nats.go
+// does emit here without a grant. The only emitter is the ordered consumer's
+// reset path, which fires DeleteConsumer in a goroutine and ignores the
+// result; an ephemeral it could not delete is reaped by its own five-minute
+// inactive threshold.
+//
+// Withholding it raises the price of reaching another principal's durable and
+// does not close the route, which is the correction to what this comment said
+// first. CONSUMER.CREATE is create-OR-UPDATE by name -- the request's `action`
+// field is empty for both, and the server has no ownership concept for a
+// consumer name -- so within a stream the worker may create consumers on,
+// every consumer on that stream is the worker's to reconfigure. Measured
+// against this render, on the gateway's relay durable: one permitted
+// $JS.API.CONSUMER.CREATE.TASKS.gateway-relay carrying the durable's own
+// config with filter_subject changed retunes it, and the gateway stops seeing
+// task events with no permissions violation logged anywhere; the same subject
+// carrying inactive_threshold has the server reap the durable, ack floor and
+// all, while CONSUMER.DELETE is refused in the same run. That is the residue
+// the web block below already records for web, on the one stream where
+// another principal has a durable to aim at. It is not new -- $JS.API.>
+// permitted all of it -- and no narrower grant exists: nats.go's ordered
+// consumers take server-generated names, so the last token has to be `>`, and
+// NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
+// literally named that. What closes it is the auth callout giving each
+// principal its own user. DELETE stays out as the one destructive verb here
+// that nothing on the worker path needs.
 //
 // One route this list narrows but cannot close, because it lives in a request
 // body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the
@@ -256,19 +271,28 @@ var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-passwor
 // stores them -- under their ORIGINAL subjects, so this is not forgery (a
 // topic or card read by subject never sees them) but it is a persisted write
 // into a stream the worker has no publish grant for, and with discard=old an
-// eviction lever against it. The server delivers only once a literal
-// subscription exists on the deliver subject, and measured on 2.10.29 and
-// 2.14.5 that condition splits the streams in two: TOPICS-STATE and
-// TOPICS-JOURNAL have literal subjects, so their own ingest is the interest
-// and the write lands with no help (three TASKS messages arrived in
-// TOPICS-STATE under a2a.tasks.* subjects); DIRECTORY, TASKS and the buckets
-// have wildcard subjects, so they need a literal client subscription, which
-// for the directory means another principal holding one on a card subject --
-// the gateway's `a2a.agents.>` subscribe grant permits it, nothing in the tree
-// opens one. The wildcard this replaces had the same route with every stream
-// as a source; what closes it is the worker not holding CONSUMER.CREATE at
-// all, which is a pre-created consumer per task (the stage-3 dispatcher),
-// not a grant. The server test measures all three cases.
+// eviction lever against it. The server delivers only once a subscription
+// exists whose subject is EXACTLY the deliver subject: a push consumer
+// registers through Sublist.registerNotification, which takes interest only
+// from a match whose `sub.subject` is byte-equal to the deliver subject, and
+// says so in its own doc comment ("this interest needs to be exact and ...
+// wildcards will not trigger the notifications"). Identical in 2.10.29 and
+// 2.14.5, and it is what bounds the residue: a principal watching the whole
+// plane is not enough, and neither is a stream's own wildcard ingest.
+// Measured on both versions, that splits the streams in two. TOPICS-STATE and
+// TOPICS-JOURNAL have literal subjects, so their own ingest subscription IS
+// the exact match and the write lands with no help (three TASKS messages
+// arrived in TOPICS-STATE under a2a.tasks.* subjects). DIRECTORY, TASKS and
+// the buckets have wildcard subjects, so a client has to hold a subscription
+// on the deliver subject itself -- for the directory, another principal
+// subscribed to one card subject. The gateway's `a2a.agents.>` and web's
+// `a2a.>` subscribe grants permit that but do not supply it: a subscription
+// on either wildcard leaves DIRECTORY empty, measured. Nothing in the tree
+// opens a literal card subscription today. The wildcard this replaces had the
+// same route with every stream as a source; what closes it is the worker not
+// holding CONSUMER.CREATE at all, which is a pre-created consumer per task
+// (the stage-3 dispatcher), not a grant. The server test measures all four
+// cases.
 func a2aWorkerJetStreamGrants() []string {
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
 	return []string{

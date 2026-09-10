@@ -206,15 +206,24 @@ Layout:
   it holds no grant to ack - endless redeliveries, churn against the server, and an
   amplifier for the deliver-subject write below; within the four
   granted streams consumer names are the caller's choice, so `web` can pull a delivery
-  off another reader's consumer or retune it through create-as-update; and a consumer's
+  off another reader's consumer or retune it through create-as-update - a route that
+  reaches the gateway's relay durable from `worker` too, measured on the render: one
+  permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
+  one carrying `inactive_threshold` has the server reap it, ack floor and all, with
+  `CONSUMER.DELETE` refused in the same run; and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
   a persisted write under the messages' original subjects - not forgery, since a read by
   subject never sees them, but an eviction lever against the capturing stream. Delivery
-  needs a literal subscription on the deliver subject, and that splits the streams
+  needs a subscription whose subject is **exactly** the deliver subject - a push consumer
+  registers through `Sublist.registerNotification`, which takes interest only from a match
+  that is byte-equal, so a wildcard subscription covering the deliver subject supplies
+  none - and that splits the streams
   (measured on 2.10.29 and 2.14.5): the topic streams have literal subjects, so their own
   ingest is the interest and the write lands unaided; DIRECTORY, TASKS and the buckets
-  have wildcard subjects and need a literal client subscription first, so reaching
-  `a2a.agents.>` (the identity plane) takes a principal holding one on a card subject.
+  have wildcard subjects, so reaching
+  `a2a.agents.>` (the identity plane) takes a principal subscribed to a card subject
+  itself. A watcher on `a2a.agents.>` - exactly `gateway`'s subscribe grant, and inside
+  `web`'s `a2a.>` - is not that principal: measured, DIRECTORY stayed empty.
   This survives per-stream scoping of any user that may create consumers at all, the
   worker included; the closure is not holding `CONSUMER.CREATE`, which is a consumer
   created per task by the dispatcher. Per-name scoping is **not** available as a
