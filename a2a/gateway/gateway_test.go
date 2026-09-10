@@ -1273,7 +1273,7 @@ func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate
 		t.Fatalf("grants: %v", err)
 	}
 	ref := grants.Capability
-	if want := "cap.root." + taskID; ref.Key != want {
+	if want := "root." + taskID; ref.Key != want {
 		t.Fatalf("capability key = %q, want %q", ref.Key, want)
 	}
 	if ref.Revision == 0 {

@@ -103,7 +103,7 @@ func TestAForgedCapabilityReferenceIsRefused(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
 	const session, taskID = "chat-ibex-cap3", "task-cap-forged"
-	forged := capability.Ref{Key: "cap.root." + taskID + "-forged", Revision: 1}
+	forged := capability.Ref{Key: "root." + taskID + "-forged", Revision: 1}
 	submitWithAuthority(t, c, session, taskID, "do the thing", authorityFor(t, forged))
 
 	refuseAndFold(t, url, c, session, taskID, adapterConfig(url, taskID, session, noHarness))
@@ -178,7 +178,7 @@ func TestTheMixedVersionKnobDoesNotRelaxAPresentCapability(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
 	const session, taskID = "chat-ibex-cap8", "task-cap-optional-present"
-	forged := capability.Ref{Key: "cap.root." + taskID + "-forged", Revision: 1}
+	forged := capability.Ref{Key: "root." + taskID + "-forged", Revision: 1}
 	submitWithAuthority(t, c, session, taskID, "do the thing", authorityFor(t, forged))
 
 	cfg := adapterConfig(url, taskID, session, noHarness)
@@ -209,7 +209,7 @@ func TestAnUnauthorizedTaskIsRefusedBeforeItsContentIsJudged(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
 	const session, taskID = "chat-ibex-cap10", "task-cap-order"
-	forged := capability.Ref{Key: "cap.root." + taskID + "-forged", Revision: 1}
+	forged := capability.Ref{Key: "root." + taskID + "-forged", Revision: 1}
 	submitWithAuthority(t, c, session, taskID, "", authorityFor(t, forged)) // data-only parts
 
 	refuseAndFold(t, url, c, session, taskID, adapterConfig(url, taskID, session, noHarness))
@@ -225,7 +225,7 @@ func TestTheRefusalQuotesNothingTheCallerSupplied(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
 	const session, taskID = "chat-ibex-cap11", "task-cap-oracle"
-	const marker = "cap.root.task-cap-oracle-forged"
+	const marker = "root.task-cap-oracle-forged"
 	submitWithAuthority(t, c, session, taskID, "do the thing",
 		authorityFor(t, capability.Ref{Key: marker, Revision: 77}))
 
@@ -245,7 +245,7 @@ func TestAMissingCapabilityAndSomebodyElsesAreIndistinguishable(t *testing.T) {
 
 	const sessionA, taskA = "chat-ibex-cap12", "task-cap-absent"
 	submitWithAuthority(t, c, sessionA, taskA, "go",
-		authorityFor(t, capability.Ref{Key: "cap.root." + taskA + "-nope", Revision: 1}))
+		authorityFor(t, capability.Ref{Key: "root." + taskA + "-nope", Revision: 1}))
 	refuseAndFold(t, url, c, sessionA, taskA, adapterConfig(url, taskA, sessionA, noHarness))
 
 	const sessionB, taskB = "chat-ibex-cap13", "task-cap-present"
