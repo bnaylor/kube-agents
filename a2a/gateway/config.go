@@ -219,15 +219,16 @@ type Config struct {
 	AuthorityTier  capability.Tier
 	AuthorityScope capability.Scope
 
-	// CapabilityRequired governs the one case that can be relaxed: an
-	// envelope arriving with no capability at all.
+	// CapabilityOptional relaxes exactly one thing: what happens when this
+	// gateway cannot mint. Zero value — the safe one — refuses the turn.
+	// Set, a mint failure logs and the envelope goes out with `grants: null`,
+	// which is the pre-A3b shape, for an install whose bus has no `cap`
+	// bucket yet. The executor has the matching knob and the operator renders
+	// both from A2A_CAPABILITY_REQUIRED, so the two halves cannot drift.
 	//
-	// Enforcement of a capability that IS present is not a knob. This is,
-	// because a task submitted before the gateway rolled carries
-	// `grants: null` and a new executor would otherwise refuse it — a
-	// rollout window, not a policy. Set it false for that window and back
-	// afterwards; the executor logs loudly while it is off.
-	CapabilityRequired bool
+	// It is NOT a switch for enforcement. A capability that exists is always
+	// checked, and no configuration makes a refused verb run.
+	CapabilityOptional bool
 
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
@@ -275,7 +276,7 @@ func FromEnv() (*Config, error) {
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
 		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
-		CapabilityRequired:    os.Getenv("A2A_CAPABILITY_REQUIRED") != "false",
+		CapabilityOptional:    os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -416,14 +417,6 @@ func envOr(key, def string) string {
 	return def
 }
 
-// noNamespaceScope is the scope an embedder gets when it supplies neither a
-// scope nor a namespace. "-" is a legal subject-free scope segment and is not
-// a legal DNS-1123 namespace name, so nothing real is ever inside it: a
-// gateway configured this way can mint, and every capability it mints permits
-// work on nothing. FromEnv never reaches it — POD_NAMESPACE has a default
-// there — so in the deployment this is unreachable and in a test it is inert.
-const noNamespaceScope = capability.Scope("namespace/-")
-
 // defaultCapabilityCeiling fills the tier and scope the gateway mints under.
 // Tests and embedders build Config directly, bypassing FromEnv, and the
 // ceiling is inherited by every hop of every task, so the unset value has to
@@ -433,14 +426,9 @@ func (c *Config) defaultCapabilityCeiling() {
 	if c.AuthorityTier == "" {
 		c.AuthorityTier = capability.TierDeveloperTeam
 	}
-	if c.AuthorityScope != "" {
-		return
+	if c.AuthorityScope == "" {
+		c.AuthorityScope = capability.NamespaceScope(c.Namespace)
 	}
-	if c.Namespace == "" {
-		c.AuthorityScope = noNamespaceScope
-		return
-	}
-	c.AuthorityScope = capability.Scope("namespace/" + c.Namespace)
 }
 
 // validateCapabilityCeiling runs the ceiling through the same validation a
