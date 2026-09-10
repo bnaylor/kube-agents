@@ -47,12 +47,11 @@ func serveVerifier(t *testing.T, s Store) *nats.Conn {
 	svc := &Service{Resolver: &Resolver{Store: s}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = svc.Serve(ctx, nc) }()
-	// The subscription is asynchronous; flush so the first request cannot
-	// race it into a timeout that would read as a refusal.
-	if err := nc.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
+	sub, err := svc.Subscribe(ctx, nc)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
 	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
 	return nc
 }
 
@@ -113,9 +112,13 @@ func TestTheServiceAnswersTheDelegateAndRefusesEveryoneElse(t *testing.T) {
 		VerbTaskExecute, "project/P/cluster/C"); err != nil {
 		t.Fatalf("the named delegate should be permitted: %v", err)
 	}
+	// Over the wire the rule that fired is not disclosed: every walk
+	// refusal is the same sentence, so a caller cannot learn from the
+	// verifier whether the key it named exists. The rule itself is asserted
+	// against the Resolver in attack_test.go, and logged by the service.
 	err := clientAs(t, nc, podEvil).Check(context.Background(), hop,
 		VerbTaskExecute, "project/P/cluster/C")
-	mustRefuse(t, err, "does not name the caller as its delegate")
+	mustRefuse(t, err, WalkRefused, podEvil, podB, hop.Key)
 }
 
 func TestTheCallerIdentityComesFromTheSubjectAndNotFromThePayload(t *testing.T) {
@@ -139,8 +142,15 @@ func TestTheCallerIdentityComesFromTheSubjectAndNotFromThePayload(t *testing.T) 
 	if resp.Allowed {
 		t.Fatal("the payload named podB as the caller and the verifier believed it")
 	}
-	if !strings.Contains(resp.Reason, "does not name the caller as its delegate") {
+	if resp.Reason != WalkRefused {
 		t.Fatalf("refused for the wrong reason: %s", resp.Reason)
+	}
+
+	// The positive half, and it is what makes the negative half mean
+	// something. Byte-identical payload, asked from podB's subject: now it
+	// is allowed. The only thing that changed is the part the server owns.
+	if allowed := rawAsk(t, nc, podB, body); !allowed.Allowed {
+		t.Fatalf("the same payload from the real delegate's subject was refused: %s", allowed.Reason)
 	}
 }
 

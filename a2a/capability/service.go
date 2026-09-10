@@ -92,30 +92,84 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 	if err := json.Unmarshal(data, &req); err != nil {
 		return Response{Reason: "the request is not well-formed"}
 	}
-	switch err := s.Resolver.Check(ctx, caller, req.Ref, req.Verb, req.Resource); {
+	// The walk and the verb check are answered differently on purpose, and
+	// the split is the whole anti-oracle argument.
+	//
+	// Every way the WALK can fail tells the caller something about a chain
+	// it has not shown any right to: "no entry at the pinned revision" says
+	// the key is not there, "the entry does not name the caller as its
+	// delegate" says it is. Request ids are not secrets, but a verifier that
+	// answers "does this one exist" to anyone who can name one is a lookup
+	// service for live requests. So every walk refusal is one sentence, and
+	// the rule that actually fired goes to the verifier's own log.
+	//
+	// The VERB check is the other side of that line. Reaching it means the
+	// walk succeeded, which means this caller is the principal the chain
+	// names — it already knows the capability exists, because it holds it.
+	// Telling it which verb or which scope was out of bounds gives away
+	// nothing it did not bring, and it is the difference between a
+	// debuggable refusal and a mystery.
+	leaf, err := s.Resolver.Resolve(ctx, caller, req.Ref)
+	switch {
 	case err == nil:
-		return Response{Allowed: true}
 	case errors.Is(err, ErrRefused):
-		// The caller learns which rule fired and nothing else. It never
-		// learns whether the key existed: a verifier that distinguished
-		// "no such entry" from "not yours" would confirm which request
-		// ids are live to anyone who can name one.
-		return Response{Reason: Reason(err)}
+		if s.Log != nil {
+			s.Log.Info("capability walk refused",
+				"caller", caller, "key", clip(req.Ref.Key), "revision", req.Ref.Revision,
+				"rule", Reason(err))
+		}
+		return Response{Reason: WalkRefused}
 	default:
 		// Store trouble is not a denial, but it is answered as one. The
 		// operator's signal is the log line; the caller's is a verdict.
 		if s.Log != nil {
 			s.Log.Error("capability store unavailable; failing closed", "err", err)
 		}
-		return Response{Reason: "the capability store could not be read"}
+		return Response{Reason: WalkRefused}
 	}
+	if err := Permits(leaf, req.Verb, req.Resource); err != nil {
+		return Response{Reason: Reason(err)}
+	}
+	return Response{Allowed: true}
+}
+
+// WalkRefused is the single answer every chain-walk refusal gets. One string
+// for the whole class, so a caller cannot tell a key that is not there from
+// one that is not its own.
+const WalkRefused = "the capability does not authorize this caller"
+
+// clip bounds a caller-supplied value on its way into the verifier's log. The
+// key is chosen by whoever sent the request and the log is not.
+func clip(s string) string {
+	const max = 96
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// Subscribe starts answering and returns as soon as the subscription is
+// established on the server. Callers that want to block should use Serve;
+// this exists so a caller can know the verifier is listening before it lets
+// anything ask, because a request that races the subscription is answered by
+// the client's timeout, and the client reads a timeout as a denial.
+func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscription, error) {
+	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
+		s.handle(ctx, m)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := nc.Flush(); err != nil {
+		_ = sub.Unsubscribe()
+		return nil, err
+	}
+	return sub, nil
 }
 
 // Serve subscribes and answers until ctx is done.
 func (s *Service) Serve(ctx context.Context, nc *nats.Conn) error {
-	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
-		s.handle(ctx, m)
-	})
+	sub, err := s.Subscribe(ctx, nc)
 	if err != nil {
 		return err
 	}

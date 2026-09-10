@@ -114,6 +114,13 @@ func mustRefuse(t *testing.T, err error, wantRule string, tainted ...string) {
 	if err == nil {
 		t.Fatalf("expected a refusal, got none")
 	}
+	// A refusal and a broken store are both denials, but they are not the
+	// same thing: Answer converges one into a verdict and escalates the
+	// other to the operator. A test that only matched the text would not
+	// notice a rule turning into an infrastructure error.
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("expected a refusal, got a non-refusal error: %v", err)
+	}
 	if !strings.Contains(err.Error(), wantRule) {
 		t.Fatalf("refusal does not name the rule that fired:\n  got:  %s\n  want: %s", err, wantRule)
 	}
@@ -517,27 +524,37 @@ func (r recordingStore) GetRevision(ctx context.Context, key string, rev uint64)
 }
 
 func TestAMissingEntryAndARefusedEntryAreNotDistinguishable(t *testing.T) {
-	// Request ids are not secrets, but the verifier should not become the
-	// thing that confirms which ones exist. A caller that is refused learns
-	// the rule, not whether the key was there.
+	// Request ids are not secrets, but the verifier must not become the
+	// thing that confirms which ones exist. The Resolver's own errors name
+	// the rule — they are for the operator and the tests — so the
+	// convergence is at the wire boundary, in Service.Answer, and this test
+	// asserts it there.
 	s := newStore()
 	root := s.write(t, rootKey(t, gwTask), Entry{
 		Tier: TierPlatform, Scope: "project/P", Delegate: podA,
 	})
-	_, missing := resolver(s).Resolve(context.Background(), podEvil,
-		Ref{Key: rootKey(t, "task-000000000000000000000000000fff"), Revision: 999})
-	_, present := resolver(s).Resolve(context.Background(), podEvil, root)
-	if missing == nil || present == nil {
-		t.Fatal("both should refuse")
+	svc := &Service{Resolver: resolver(s)}
+	ctx := context.Background()
+	subject, err := VerifySubject(podEvil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(missing, ErrRefused) || !errors.Is(present, ErrRefused) {
-		t.Fatalf("both refusals should be ErrRefused: %v / %v", missing, present)
+	ask := func(ref Ref) Response {
+		b, err := json.Marshal(Request{Ref: ref, Verb: VerbTaskExecute, Resource: "project/P"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return svc.Answer(ctx, subject, b)
 	}
-	if Reason(missing) == Reason(present) {
-		// Not a leak by itself — the rules differ and the caller may know
-		// which rule fired. This test exists to keep the DISTINCTION
-		// deliberate: if the two ever need to converge, converge them
-		// here rather than discovering the oracle in review.
-		t.Log("the two reasons coincide; nothing to keep deliberate")
+	missing := ask(Ref{Key: rootKey(t, "task-000000000000000000000000000fff"), Revision: 999})
+	present := ask(root)
+	if missing.Allowed || present.Allowed {
+		t.Fatalf("both should refuse: %+v / %+v", missing, present)
+	}
+	if missing.Reason != present.Reason {
+		t.Fatalf("the verifier says whether the key existed:\n  missing %q\n  present %q", missing.Reason, present.Reason)
+	}
+	if missing.Reason != WalkRefused {
+		t.Fatalf("reason = %q, want the one converged walk refusal", missing.Reason)
 	}
 }

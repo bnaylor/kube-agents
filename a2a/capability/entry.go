@@ -268,3 +268,19 @@ func Narrows(parent, child Entry) error {
 	}
 	return nil
 }
+
+// NamespaceScope is the scope a component defaults to when nothing told it a
+// better one: its own namespace, which is the narrowest thing certainly true
+// of it. The gateway mints under it and the executor checks against it, so
+// they have to spell it the same way — hence one function rather than two
+// string concatenations that agree until somebody edits one.
+//
+// An empty namespace yields "namespace/-". "-" is a legal scope segment and
+// is not a legal DNS-1123 namespace name, so nothing real is ever inside it:
+// a component defaulted this way can mint and check, and permits nothing.
+func NamespaceScope(namespace string) Scope {
+	if namespace == "" {
+		return Scope("namespace/-")
+	}
+	return Scope("namespace/" + namespace)
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -81,6 +82,32 @@ type Config struct {
 	// HarnessEnv is the complete environment for the harness subprocess.
 	HarnessEnv []string
 
+	// Namespace is the pod's own namespace (POD_NAMESPACE), used only to
+	// default Scope the same way the gateway defaults its ceiling.
+	Namespace string
+
+	// Scope is the resource path this executor operates in, and it is what
+	// the capability is checked against: not "may this capability do
+	// anything" but "may it execute here". A capability the gateway
+	// narrowed below this pod's scope — or one a hop narrowed elsewhere —
+	// fails that question, which is the whole point of asking it.
+	//
+	// It comes from A2A_AUTHORITY_SCOPE, rendered by the operator with the
+	// same value it gives the gateway, because nothing in the CRDs carries
+	// a cluster identity yet. Unset means the gateway's unset default.
+	Scope capability.Scope
+
+	// CapabilityOptional governs exactly one thing: what a submission with
+	// no capability at all means. Zero value — the safe one — refuses it.
+	// Set, it executes and says so at WARN. That is the mixed-version
+	// window: a gateway that predates the mint in front of an executor
+	// that enforces it, and nothing else.
+	//
+	// It is NOT a switch for enforcement. A capability that is present is
+	// always checked and its refusal is always honoured; there is no
+	// configuration in which this executor runs work a verifier refused.
+	CapabilityOptional bool
+
 	// TaskDeadline bounds the harness wall clock below the pod's own
 	// activeDeadlineSeconds so the failure is ours to report, not the
 	// enforcer's.
@@ -133,6 +160,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.Scope == "" {
+		c.Scope = capability.NamespaceScope(c.Namespace)
 	}
 }
 
@@ -358,6 +388,15 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
 			return Result{}, fmt.Errorf("publish submitted: %w", err)
 		}
+	}
+
+	// Authorization comes before content. The capability the gateway minted
+	// for this task has to permit this executor to execute it, at this
+	// executor's own scope, and the verifier is the only thing that can say
+	// so. Refused is terminal rejected, before any model spend.
+	if reason := a.capabilityRefusal(ctx, nc, origin); reason != "" {
+		state := lib.StateRejected
+		return Result{State: state}, a.finalize(state, reason, "")
 	}
 
 	// The deliverable prompt is the message's text parts. A submission with
