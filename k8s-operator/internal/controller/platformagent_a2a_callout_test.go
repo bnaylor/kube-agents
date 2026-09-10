@@ -138,61 +138,6 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 	}
 }
 
-// Label-blind teardown sweep: the check that catches an object nobody
-// remembered to delete.
-//
-// TestA2ACalloutIsGatedByMode asserts each object it knows about by name, which
-// is exactly the wrong shape for the failure that actually happens — someone
-// adds a ninth object to the render and not to cleanupA2A, and every
-// named-object test still passes. This enumerates the namespace by kind instead
-// and asks whether anything at all is still labelled as part of the next stack.
-//
-// The documented residue is deliberate and small: the per-user creds Secret
-// (re-enabling must not re-roll credentials a running pod may have cached) and
-// the JetStream PVC (the file store is the audit substrate). Everything else
-// must be gone. The PVC does not appear here because the fake client does not
-// run the StatefulSet controller, so no PVC is ever created.
-// The callout container declares a working directory its UID can enter.
-//
-// This is #1259's shape on a fourth A2A container. The image is built on
-// distroless static nonroot, whose WORKDIR is /home/nonroot, 0700 owned by
-// 65532; the Deployment imposes runAsUser 1000. Measured with `crane config`
-// rather than assumed, on both the built image and the base:
-//
-//	WorkingDir: "/home/nonroot"  User: "nonroot"
-//
-// Latent rather than broken - the binary never stats "." and this Deployment
-// has been observed 2/2 on a cluster - which is exactly why it wants a test
-// rather than a shrug. "Latent" describes today's code, and the change that
-// ends it would not announce itself.
-//
-// PROVISIONAL. #1272 generalises this into a table over every A2A container,
-// each row carrying that image's measured WORKDIR and the directories usable
-// under the UID the pod imposes, and it fails on absence - a fourth container
-// with no row fails it. When that lands and this branch merges main, delete
-// this test and add the row: imageWorkDir "/home/nonroot", usable ["/"],
-// wantWritable false. Do not keep both.
-func TestTheCalloutLandsInAWorkingDirectoryItsUserCanEnter(t *testing.T) {
-	dep := buildA2ACalloutDeployment(a2aTestAgent())
-
-	spec := dep.Spec.Template.Spec
-	if spec.SecurityContext == nil || spec.SecurityContext.RunAsUser == nil {
-		t.Fatal("no pod-level RunAsUser, so this test cannot say which UID has to enter the cwd")
-	}
-	uid := *spec.SecurityContext.RunAsUser
-
-	for _, c := range spec.Containers {
-		// "/" is the only directory measured usable by UID 1000 on this
-		// image. Asserting non-empty would pass against /home/nonroot spelled
-		// out, which is the bug rather than the fix.
-		if c.WorkingDir != "/" {
-			t.Errorf("container %s: WorkingDir = %q, want \"/\" - the image ships WORKDIR "+
-				"/home/nonroot, 0700 owned by 65532, and this pod runs as UID %d, which "+
-				"cannot chdir into it", c.Name, c.WorkingDir, uid)
-		}
-	}
-}
-
 // rbacBindingKinds are the kinds that carry a Subjects list. A builder
 // returning one of these grants something to somebody, which is what the test
 // below is about.
@@ -283,6 +228,20 @@ func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T
 	}
 }
 
+// Label-blind teardown sweep: the check that catches an object nobody
+// remembered to delete.
+//
+// TestA2ACalloutIsGatedByMode asserts each object it knows about by name, which
+// is exactly the wrong shape for the failure that actually happens — someone
+// adds a ninth object to the render and not to cleanupA2A, and every
+// named-object test still passes. This enumerates the namespace by kind instead
+// and asks whether anything at all is still labelled as part of the next stack.
+//
+// The documented residue is deliberate and small: the per-user creds Secret
+// (re-enabling must not re-roll credentials a running pod may have cached) and
+// the JetStream PVC (the file store is the audit substrate). Everything else
+// must be gone. The PVC does not appear here because the fake client does not
+// run the StatefulSet controller, so no PVC is ever created.
 func TestNothingA2ALabelledSurvivesAFlipToToday(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()

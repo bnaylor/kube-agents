@@ -1108,26 +1108,75 @@ func TestA2ASessionQuotaGatedByMode(t *testing.T) {
 	}
 }
 
+// assertEveryA2APodBearingBuilderHasARow ties a table of A2A pods to the
+// package, so the table cannot narrow silently.
+//
+// Two tables below say a fourth A2A container "fails here until it has a row".
+// Typed out, neither did: a builder nobody listed renders a pod nothing
+// reaches, which is exactly how the auth callout arrived with a row in neither.
+// This reads the package source instead and requires every buildA2A* function
+// returning a pod-bearing kind to be named. Same mechanism as
+// TestTheWalkCallsEveryPodBearingBuilder, narrowed to the A2A stack: the other
+// pod-bearing builders in this package are the agent's, and that walk covers
+// them.
+func assertEveryA2APodBearingBuilderHasARow(t *testing.T, rows []string) {
+	t.Helper()
+
+	covered := map[string]bool{}
+	for _, row := range rows {
+		covered[row] = true
+	}
+
+	found := 0
+	for builder, kind := range buildersReturning(t, podBearingKinds) {
+		if !strings.HasPrefix(builder, "buildA2A") {
+			continue
+		}
+		found++
+		if !covered[builder] {
+			t.Errorf("%s renders a %s and has no row in this table, so its containers are asserted nowhere", builder, kind)
+		}
+	}
+	if found == 0 {
+		t.Fatal("no A2A pod-bearing builder found in this package, so this table's coverage check passed vacuously")
+	}
+	// The other direction. A builder with no row is reported by name above;
+	// this catches the reverse, a row left behind after its builder was
+	// renamed or removed, which would otherwise sit there asserting nothing.
+	if found < len(rows) {
+		t.Errorf("the table has %d rows but the package has %d buildA2A* pod-bearing builders; a row names one that is gone", len(rows), found)
+	}
+}
+
 // TestEveryA2AContainerHasAHardenedSecurityContext is the mode-next half of
 // TestEveryContainerHasAHardenedSecurityContext, which walks the agent Pod and
-// stops there. These three containers are rendered by their own builders and
-// sit outside that walk, which is how all three shipped without the helper --
-// the provision container with no SecurityContext at all. One list, so a fourth
-// A2A container has somewhere to be added and fails here until it is.
+// stops there. These containers are rendered by their own builders and sit
+// outside that walk, which is how the first three shipped without the helper --
+// the provision container with no SecurityContext at all.
 func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	agent := newTestPlatformAgent()
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent)
 
-	for _, tc := range []struct {
-		render string
-		spec   corev1.PodSpec
+	cases := []struct {
+		render  string
+		builder string
+		spec    corev1.PodSpec
 	}{
-		{"nats", sts.Spec.Template.Spec},
-		{"provision", job.Spec.Template.Spec},
-		{"gateway", dep.Spec.Template.Spec},
-	} {
+		{"nats", "buildA2ANATSStatefulSet", sts.Spec.Template.Spec},
+		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
+		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
+		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
+	}
+	builders := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		builders = append(builders, tc.builder)
+	}
+	assertEveryA2APodBearingBuilderHasARow(t, builders)
+
+	for _, tc := range cases {
 		t.Run(tc.render, func(t *testing.T) {
 			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
 			if len(all) == 0 {
@@ -1177,19 +1226,22 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 // somewhere else.
 //
 // imageWorkDir is measured, not assumed -- `crane config <pinned tag>` on each
-// of the three, recorded here so a reader can check the premise without pulling
-// anything. All three pods override the user, so wherever the image's WORKDIR
-// is not traversable by the UID the pod imposes, the render owes an explicit
-// WorkingDir. A fourth A2A container needs a row, and fails here until it has
-// one -- the same shape as the hardening test above, deliberately.
+// image, recorded here so a reader can check the premise without pulling
+// anything. Every one of these pods overrides the user, so wherever the image's
+// WORKDIR is not traversable by the UID the pod imposes, the render owes an
+// explicit WorkingDir. A fourth A2A container needs a row and fails here until
+// it has one -- enumerated rather than asserted, by the same coverage check the
+// hardening test above uses.
 func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	agent := newTestPlatformAgent()
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent)
 
-	for _, tc := range []struct {
+	cases := []struct {
 		render    string
+		builder   string
 		container string
 		spec      corev1.PodSpec
 		// imageWorkDir is what the pinned image ships, and traversable says
@@ -1210,20 +1262,37 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	}{
 		// nats:2.10-alpine -- WORKDIR /, mode 0755, so UID 1000 is fine and
 		// the render owes nothing.
-		{render: "nats", container: "nats", spec: sts.Spec.Template.Spec,
+		{render: "nats", builder: "buildA2ANATSStatefulSet", container: "nats", spec: sts.Spec.Template.Spec,
 			imageWorkDir: "/", traversable: true},
 		// natsio/nats-box:0.14.5 -- WORKDIR /root, no USER, and /root is
 		// drwx------ root:root. This is #1259. The cwd is also the nats CLI's
 		// HOME, so it has to be writable, which leaves the emptyDir.
-		{render: "provision", container: "provision", spec: job.Spec.Template.Spec,
+		{render: "provision", builder: "buildA2AProvisionJob", container: "provision", spec: job.Spec.Template.Spec,
 			imageWorkDir: "/root", usable: []string{a2aProvisionWritablePath}, wantWritable: true},
 		// distroless static nonroot -- WORKDIR /home/nonroot, drwx------
 		// owned by 65532, and the pod runs as 1000. Latent rather than broken
 		// because the gateway binary never stats ".". It writes nothing, so
 		// traversable is enough, and "/" is 0755 on that image.
-		{render: "gateway", container: "gateway", spec: dep.Spec.Template.Spec,
+		{render: "gateway", builder: "buildA2AGatewayDeployment", container: "gateway", spec: dep.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
-	} {
+		// The same distroless static nonroot base as the gateway, measured
+		// with `crane config` on both the built image and the base: WorkingDir
+		// /home/nonroot, User nonroot, and this pod imposes UID 1000. Latent
+		// in the same way -- the binary never stats "." and the Deployment has
+		// been observed 2/2 on a cluster -- which is why it wants a row rather
+		// than a shrug. "Latent" describes today's code, and the change that
+		// ends it would not announce itself. The callout writes nothing, so
+		// traversable is enough.
+		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+	}
+	builders := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		builders = append(builders, tc.builder)
+	}
+	assertEveryA2APodBearingBuilderHasARow(t, builders)
+
+	for _, tc := range cases {
 		t.Run(tc.render, func(t *testing.T) {
 			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
 			if len(all) == 0 {
