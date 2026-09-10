@@ -155,7 +155,7 @@ identifier appears, add its source here.
 | Paths baked into the agent image (`/opt/defaults/...`) | `deploy/docker/Dockerfile` |
 | Image-patch module names and the behaviour they add | the module's own docstring under `deploy/docker/patches/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
 | Bundled Hermes platform plugins the image installs (no patch) | the plugin's own `adapter.py` docstring under `deploy/docker/plugins/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
-| Slack bot token scopes an install must grant | upstream `_build_full_manifest` in `hermes_cli/slack_cli.py` as patched by `deploy/docker/patches/apply_slack_reactions_scope.py`; the prose copies in `INSTALL.md` and `scripts/installer/print_instructions_slack.sh` must match it and each other |
+| Slack bot token scopes an install must grant | upstream `_build_full_manifest` in `hermes_cli/slack_cli.py` as patched by `deploy/docker/patches/apply_slack_reactions_scope.py`; the one prose copy, in `INSTALL.md`, must match it (`scripts/installer/print_instructions_slack.sh` defers to `hermes slack manifest` and carries no copy) |
 | What pod start-up force-syncs from the image vs. preserves on the PV | `deploy/shared/docker-entrypoint.sh` |
 | Shared agent defaults (`approvals.*`, `security.*`) | `deploy/shared/defaults/config.yaml` and `renderConfigYAML()` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go` |
