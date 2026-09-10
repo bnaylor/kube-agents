@@ -12,6 +12,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -38,6 +39,12 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// Capability pins this task's root entry in the `cap` bucket: the key
+	// and the revision the mint returned. Every envelope the gateway sends
+	// toward this task carries it, and it is on the record rather than in
+	// memory so a gateway restart does not orphan a running task from its
+	// own authority.
+	Capability *capability.Ref `json:"capability,omitempty"`
 	// Detached means the user said stop but no terminal event has arrived
 	// (the executor may be dead and platform tasks have no janitor yet, W3
 	// retarget). A detached task no longer serializes the session; its events,
