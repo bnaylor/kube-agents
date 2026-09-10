@@ -132,7 +132,9 @@ tooling is applied rather than rendered and dropping its user would refuse an ob
 already running; and `sys`, a human
 at a port-forward.
 
-Two of those are permanent and the rest are waiting on something nameable. The single
+Three of those are permanent - the callout, which cannot authenticate through itself;
+`web`, because a browser never can; and `sys`, which is a human rather than a workload -
+and the rest are waiting on something nameable. The single
 source for all of it - the config's static user blocks, the callout's map, and the
 `NATS_USER` a client is handed so it can set its inbox prefix - is
 `platformagent_a2a_identities.go`; before the callout those three lived in a config
@@ -369,6 +371,21 @@ connects, which means no new tasks and no new workers - the fabric is dark to ne
 not gracefully degraded. Established sessions and the resilience contract below are
 what make that acceptable at this stage; a hardened HA callout is production posture,
 not part of the dev toggle.
+
+**The throughput ceiling, so it is known rather than discovered.** A replica answers
+authorization requests one at a time: the subscription is a queue-group subscription with
+an async handler, the client library dispatches one subscription's callbacks from one
+goroutine, and the handler does its TokenReview round trip inline. Two replicas is
+therefore two authorizations in flight for the whole fabric, and a slow API server sets
+the rate directly: two divided by the TokenReview latency, which is about 20 connections a
+second at a 100ms round trip. The queue behind it is bounded by the same under-two-second
+budget as everything else on this path. Measured, not read off the code, by
+`TestTheCalloutAnswersOneAuthorizationAtATime` in `a2a/authcallout`, which makes the
+TokenReview slow and observes that no two overlap. It is adequate for the connection rate
+this stage has - connections are rare compared to messages - and it is the first thing to
+look at if a fleet reconnecting at once is slow to come back. Raising it means handling
+each request in its own goroutine with a bound, which is a change to make against a
+measurement rather than in advance of one.
 
 ## Observability and audit
 

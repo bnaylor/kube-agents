@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,9 +83,12 @@ type harness struct {
 // tokenReviewer maps a presented token to the ServiceAccount the cluster would
 // vouch for, and refuses anything else — the shape of a real TokenReview
 // answer, including the audience the validator insists on.
-func tokenReviewer(tokenToSA map[string]string) *fake.Clientset {
+func tokenReviewer(tokenToSA map[string]string, onReview func() func()) *fake.Clientset {
 	c := fake.NewSimpleClientset()
 	c.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if onReview != nil {
+			defer onReview()()
+		}
 		req := action.(k8stesting.CreateAction).GetObject().(*authnv1.TokenReview)
 		sa, ok := tokenToSA[req.Spec.Token]
 		if !ok {
@@ -101,10 +105,30 @@ func tokenReviewer(tokenToSA map[string]string) *fake.Clientset {
 	return c
 }
 
+// harnessOption tweaks one harness. There is one so far; see onTokenReview.
+type harnessOption func(*harnessOptions)
+
+type harnessOptions struct {
+	// onTokenReview is called on entry to every TokenReview the callout makes
+	// and its result on exit, so a test can watch how many are in flight at
+	// once and how long each one takes.
+	onTokenReview func() func()
+}
+
+// watchingTokenReviews wraps every TokenReview the callout performs.
+func watchingTokenReviews(around func() func()) harnessOption {
+	return func(o *harnessOptions) { o.onTokenReview = around }
+}
+
 // startHarness renders a real nats.conf with an auth_callout block, starts a
 // server from it, and connects the callout service.
-func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string) *harness {
+func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string, tweaks ...harnessOption) *harness {
 	t.Helper()
+
+	var options harnessOptions
+	for _, tweak := range tweaks {
+		tweak(&options)
+	}
 
 	// The issuer is an ACCOUNT keypair: the server holds the public half and
 	// the callout signs with the seed. A user or curve key here is refused by
@@ -181,7 +205,7 @@ func startHarness(t *testing.T, identityMap string, tokenToSA map[string]string)
 		t.Fatalf("loading the identity map: %v", err)
 	}
 
-	validator, err := NewTokenValidator(tokenReviewer(tokenToSA), testAudience)
+	validator, err := NewTokenValidator(tokenReviewer(tokenToSA, options.onTokenReview), testAudience)
 	if err != nil {
 		t.Fatalf("NewTokenValidator: %v", err)
 	}
@@ -465,6 +489,92 @@ func TestIssuedUsersLandInTheAccountTheirMapEntryNames(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("the gateway connection was not visible to Connz")
+	}
+}
+
+// TestTheCalloutAnswersOneAuthorizationAtATime measures the throughput ceiling
+// a replica has, so the number in the deployment spec is a measurement rather
+// than a reading of the code.
+//
+// Subscribe joins the queue group with an async handler, and the client library
+// dispatches one subscription's callbacks from one goroutine. handle does the
+// TokenReview round trip inline, so a replica answers connections strictly one
+// at a time, and each one holds the line for as long as the API server takes.
+// Two replicas is therefore two authorizations in flight for the whole fabric,
+// not two hundred. Nothing here is wrong today -- connections are rare compared
+// to messages, and the queue group means the second replica does take the next
+// one -- but it is a property worth knowing before a fleet reconnects at once.
+//
+// Measured by making the TokenReview slow and watching how many are open at the
+// same moment, which is the only way to tell serial dispatch from a race that
+// happened not to overlap.
+func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
+	const clients = 4
+	// Long enough that concurrent handling would overlap unmistakably, short
+	// enough that four in series stay inside authDecisionBudget and well
+	// inside the server's first-ping timer.
+	const reviewCost = 120 * time.Millisecond
+
+	var mu sync.Mutex
+	inFlight, peak, reviews := 0, 0, 0
+
+	h := startHarness(t, twoIdentityMap, defaultTokens(), watchingTokenReviews(func() func() {
+		mu.Lock()
+		inFlight++
+		reviews++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+
+		time.Sleep(reviewCost)
+
+		return func() {
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}
+	}))
+
+	failures := make(chan error, clients)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nc, err := nats.Connect(h.url, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+			if err != nil {
+				failures <- err
+				return
+			}
+			nc.Close()
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(failures)
+	for err := range failures {
+		t.Fatalf("a client could not connect: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if reviews != clients {
+		t.Fatalf("TokenReviews = %d for %d connections; the measurement below is not of what it claims", reviews, clients)
+	}
+	if peak != 1 {
+		t.Errorf("peak concurrent authorizations = %d, want 1.\n"+
+			"A replica now answers more than one at a time, which is better than what shipped -- "+
+			"update the per-replica ceiling in docs/designs/spec-nats-deployment.md rather than this number.", peak)
+	}
+	// The consequence, stated as time rather than as a count: the last client
+	// waits behind all the others. Three costs, not four, so a slow scheduler
+	// cannot make this flake.
+	if floor := (clients - 1) * reviewCost; elapsed < floor {
+		t.Errorf("%d connections at %v of TokenReview each took %v, less than the %v serial handling implies; "+
+			"either dispatch is no longer serial or the measurement is not reaching the handler", clients, reviewCost, elapsed, floor)
 	}
 }
 
