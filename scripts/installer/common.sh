@@ -782,8 +782,17 @@ register_host_label() {
 confirm_action() {
   local warning_msg=$1
   shift
-  
-  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+
+  # Only explicit intent gets past a destruction prompt: --no-confirm/-y (or
+  # an exported NO_CONFIRM=1, the same intent spelled as a variable), or
+  # --dry-run, under which nothing is destroyed. CI is deliberately not on
+  # this list. GitHub Actions and GitLab CI set CI=true on their own, so
+  # reading it as "yes" let an inherited variable authorise a delete nobody
+  # asked for (#557). is_non_interactive still
+  # consults CI, and that is right: a value prompt asks "can anyone answer",
+  # and taking the default there is what an unattended run wants. This prompt
+  # asks "did someone authorise this", which an inherited variable cannot say.
+  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
   
@@ -798,9 +807,16 @@ confirm_action() {
   echo -e "${C_YELLOW}==============================================================================${C_RESET}"
   echo ""
   echo -ne "  ${C_CYAN}Are you sure you want to proceed? (y/N): ${C_RESET}"
-  read -r -n 1 REPLY
+  # `|| REPLY=""`: read returns 1 at EOF, and the callers run under set -e, so
+  # a run with no terminal used to die mid-prompt with nothing said. Say what
+  # is missing and what to pass instead, the way uninstall.sh does.
+  read -r -n 1 REPLY || REPLY=""
   echo
   if ! is_truthy "$REPLY"; then
+      if [ ! -t 0 ]; then
+        print_error "No interactive terminal is available. Re-run with --no-confirm only after reviewing the target above."
+        exit 1
+      fi
       echo -e "  ${C_YELLOW}ℹ Aborted.${C_RESET}"
       exit 0
   fi
