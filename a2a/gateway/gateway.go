@@ -994,8 +994,16 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	capRef, err := g.mintCapability(ctx, taskID, rec.Addressee)
 	if err != nil {
 		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
-		g.post(rec.Key, "⚠️ not started: could not mint this task's capability")
-		return
+		if !g.cfg.CapabilityOptional {
+			g.post(rec.Key, "⚠️ not started: could not mint this task's capability")
+			return
+		}
+		// The mixed-version window, and the only path that reaches an
+		// executor with grants null. Loud: an install left here has the
+		// control switched off on both sides at once.
+		g.log.Warn("A2A_CAPABILITY_REQUIRED=false; sending this task with no capability",
+			"taskId", taskID, "addressee", rec.Addressee)
+		capRef = nil
 	}
 
 	payload, err := messagePayload(msg.Text, taskID, rec.ContextID)
