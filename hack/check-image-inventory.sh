@@ -109,11 +109,12 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
-# The a2a auth callout. Its sibling Dockerfile.gateway still hardcodes its
-# bases and so is not listed here; it predates this and moving it is its own
-# change.
+# The two a2a images. Both parameterize their bases now: the auth callout on
+# this branch, the gateway on main in #1334.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
@@ -164,6 +165,7 @@ check_go_directive() {
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
