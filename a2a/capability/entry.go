@@ -101,18 +101,31 @@ type Entry struct {
 }
 
 // Key prefixes. A bucket key does not live at its bare name: bucket `cap` is
-// stream `KV_cap` on `$KV.cap.>`. These are the key names; the subject
-// permissions that make them mean anything are rendered by the operator and
-// asserted by the conformance suite.
+// stream `KV_cap` on `$KV.cap.>`, and the key is appended to that prefix. These
+// are the key names; the subject permissions that make them mean anything are
+// rendered by the operator and asserted by the conformance suite.
+//
+// The bucket's own name is deliberately NOT repeated here. 09 spells the key
+// `cap.root.<request-id>` in its worked example and the permission
+// `$KV.cap.root.*` in §4, and those two cannot both be true: a key of
+// `cap.root.x` in bucket `cap` is the subject `$KV.cap.cap.root.x`, which that
+// permission does not match. §4 is the half that is load-bearing — it is the
+// security control — so the key drops the bucket name and the subject comes out
+// exactly as §4 writes it. The conformance suite in a2a/authcallout is what
+// found this, by minting through a real permission set; every test in this
+// package passed with the stutter in place, because none of them crossed a
+// server. 09 §7's worked example is amended to match.
 const (
-	// RootPrefix is the gateway's namespace and only the gateway's.
-	RootPrefix = "cap.root."
-	// HopPrefix is followed by the writing principal's own name.
-	HopPrefix = "cap.hop."
+	// RootPrefix is the gateway's namespace and only the gateway's. On the
+	// wire: `$KV.cap.root.<request-id>`.
+	RootPrefix = "root."
+	// HopPrefix is followed by the writing principal's own name. On the
+	// wire: `$KV.cap.hop.<principal>.<n>`.
+	HopPrefix = "hop."
 )
 
 // MaxDepth bounds the chain walk. The bound is not a performance cushion: a
-// broker holds publish across `cap.hop.<its-own-name>.*`, so it can write two
+// broker holds publish across `$KV.cap.hop.<its-own-name>.*`, so it can write two
 // entries in its own namespace naming each other as parent, each naming itself
 // as delegate, with identical payloads. Every other rule holds — both writes
 // are inside its permitted subject, each entry's parent names it as delegate,
@@ -161,21 +174,21 @@ func HopKey(principal string, n int) (string, error) {
 // forging a write under another principal's prefix means publishing on a
 // subject the server refuses you.
 //
-// A root's writer is the gateway, structurally: `cap.root.*` is the gateway's
-// namespace and nobody else's, and the key does not name it.
+// A root's writer is the gateway, structurally: `$KV.cap.root.*` is the
+// gateway's namespace and nobody else's, and the key does not name it.
 func writerOf(key string) (principal string, isRoot bool, err error) {
 	switch {
 	case strings.HasPrefix(key, RootPrefix):
 		rest := strings.TrimPrefix(key, RootPrefix)
 		if rest == "" || strings.Contains(rest, ".") {
-			return "", false, refuse("root key is not `cap.root.<request-id>`")
+			return "", false, refuse("root key is not `root.<request-id>`")
 		}
 		return "", true, nil
 	case strings.HasPrefix(key, HopPrefix):
 		rest := strings.TrimPrefix(key, HopPrefix)
 		name, idx, ok := strings.Cut(rest, ".")
 		if !ok || name == "" || idx == "" || strings.Contains(idx, ".") {
-			return "", false, refuse("hop key is not `cap.hop.<principal>.<n>`")
+			return "", false, refuse("hop key is not `hop.<principal>.<n>`")
 		}
 		return name, false, nil
 	default:

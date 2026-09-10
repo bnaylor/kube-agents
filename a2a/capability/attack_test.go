@@ -174,7 +174,7 @@ func TestABrokerCannotDescendFromARootThatNamesSomebodyElse(t *testing.T) {
 	forged := s.write(t, hopKey(t, podEvil, 1), Entry{
 		Tier: TierPlatform, Scope: "project/P", Delegate: podEvil, Parent: &root,
 	})
-	// Every other check passes: the root is under cap.root.*, the child
+	// Every other check passes: the root is under `root.*`, the child
 	// narrows (by equality), and the key's prefix correctly proves podEvil
 	// wrote it. Only "the parent names its delegate" catches this.
 	_, err := resolver(s).Resolve(context.Background(), podEvil, forged)
@@ -398,7 +398,7 @@ func TestAReferenceThatIsNotPinnedIsRefused(t *testing.T) {
 
 func TestAHopEntryWithNoParentIsNotARoot(t *testing.T) {
 	// An orphan: a broker writes a terminal entry in its own namespace and
-	// presents it. Only "the chain terminates under cap.root.*" catches it,
+	// presents it. Only "the chain terminates under `root.*`" catches it,
 	// and without that check a broker mints its own authority from nothing.
 	s := newStore()
 	orphan := s.write(t, hopKey(t, podEvil, 1), Entry{

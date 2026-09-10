@@ -79,7 +79,7 @@ type Resolver struct {
 //  1. the entry names the caller as its delegate;
 //  2. every reference is pinned and resolves at exactly its pinned revision;
 //  3. the walk is bounded in depth and revisits nothing;
-//  4. the chain terminates under cap.root.*, and only there;
+//  4. the chain terminates under `root.*`, and only there;
 //  5. each link was written by the principal its parent named as delegate;
 //  6. each link is no wider than its parent.
 func (r *Resolver) Resolve(ctx context.Context, caller string, ref Ref) (Entry, error) {
