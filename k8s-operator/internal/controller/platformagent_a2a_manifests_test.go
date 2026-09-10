@@ -237,9 +237,16 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		// grant on the shared TASKS stream cannot distinguish consumers, so
 		// granting one would let a session +TERM the gateway's deliveries.
 		"session": nil,
-		"seed":    nil,
-		"web":     nil,
-		"sys":     nil,
+		// The verifier consumes nothing. It reads the cap bucket with
+		// direct get and stream msg get, which are request/reply against
+		// the JetStream API rather than a consumer delivery, so there is no
+		// ack to hold — and a consumer on KV_cap is precisely the thing its
+		// grants are shaped to forbid, because one would be a live feed of
+		// every capability in flight.
+		"verifier": nil,
+		"seed":     nil,
+		"web":      nil,
+		"sys":      nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -944,6 +951,7 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{"app": "test-agent-a2a-callout"},
 		{"app": "test-agent-gateway"},
 		{"app": "test-agent-a2a-gateway"},
+		{"app": "test-agent-a2a-verifier"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
