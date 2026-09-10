@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -828,14 +829,44 @@ func textFromParts(parts []lib.Part) string {
 	return strings.Join(texts, "\n\n")
 }
 
+// chunkString splits the deliverable into publishable pieces, cutting on rune
+// boundaries rather than byte ones. Same rule as truncate and truncateRunes,
+// and here for a harder reason: those two trim a log line and a status
+// message, while this one is on the load-bearing publish. Each chunk becomes a
+// text Part that is json.Marshalled, and encoding/json does not error on
+// invalid UTF-8 -- it substitutes U+FFFD. A byte cut through a multi-byte
+// sequence therefore yields a replacement character at the tail of one chunk
+// and another at the head of the next, lib.Task.mergeArtifact concatenates
+// them, and the character the user asked for is gone from the answer the
+// gateway relays into chat, with nothing saying so.
+//
+// A rune wider than size has no boundary inside the budget. It is emitted
+// whole -- over budget by at most utf8.UTFMax-1 bytes -- because the
+// alternative is a cut at zero and a loop that never advances. size is
+// resultChunkSize (256 KiB) against a 4-byte worst case, so the overshoot
+// cannot reach the bus ceiling resultChunkSize leaves headroom under.
 func chunkString(s string, size int) []string {
 	if s == "" {
 		return []string{""}
 	}
 	var chunks []string
 	for len(s) > size {
-		chunks = append(chunks, s[:size])
-		s = s[size:]
+		cut := size
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		if cut == 0 {
+			// One rune, wider than the whole budget.
+			_, cut = utf8.DecodeRuneInString(s)
+		}
+		chunks = append(chunks, s[:cut])
+		s = s[cut:]
 	}
-	return append(chunks, s)
+	// The remainder, unless walking back an unsplittable rune consumed the
+	// input exactly -- appending "" there would publish an empty trailing
+	// chunk the byte-cutting version never produced.
+	if s != "" || len(chunks) == 0 {
+		chunks = append(chunks, s)
+	}
+	return chunks
 }
