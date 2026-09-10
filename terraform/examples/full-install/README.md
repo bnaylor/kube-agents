@@ -26,8 +26,8 @@ install without the interview.
   module): a service account (`kubeagents-platform-gsa` by default; a second
   install in the same project sets `agent_service_account_id` to avoid the
   name collision), its read-only project roles, and the Workload Identity
-  binding to the `kubeagents-platform-agent` KSA (see
-  [IAM roles](#iam-roles-permission_set-and-project_roles) below).
+  binding to the agent KSA (`agent_ksa_name`, `kubeagents-platform-agent` by
+  default; see [IAM roles](#iam-roles-permission_set-and-project_roles) below).
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
   subscription, and Chat integration wiring.
@@ -142,24 +142,34 @@ plans the whole composition as new and reads as total drift. A gitignored
 `backend_override.tf` points Terraform at
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
-installs in one project keep separate state. State is only half of the
-second-install story: set `agent_service_account_id` too, or the installs
-collide on the agent GSA's fixed default name halfway through the second
-install's first apply. Through the installer front doors that means a
-`TF_VAR_agent_service_account_id=...` line in `install.env` - every front
-door sources it with `set -a`, so the line persists and exports on each
-run. Do not rely on a shell `export` instead: it dies with the shell, and
-the next front-door run resolves the variable back to the default name and
-plans the GSA's destroy-and-recreate under `-auto-approve`. And do not
-hand-edit `terraform.tfvars`: install.sh, upgrade.sh and uninstall.sh
-regenerate it on every run, silently dropping the line (Terraform reads
-`TF_VAR_*` only where the file is silent, and on this key it stays silent).
-And a distinct name un-collides creation, not identity: the Workload
-Identity principal names a namespace and KSA project-wide, no cluster, so
-both installs bind the same principal and each agent can mint the other's
-GSA tokens. The `agent_service_account_id` description in `variables.tf`
-carries the limits to read before relying on this. Versioning is the
-recovery story:
+installs in one project keep separate state. State is only part of the
+second-install story: set `agent_service_account_id` and `agent_ksa_name` too.
+Without the first, the installs collide on the agent GSA's fixed default name
+halfway through the second install's first apply. Without the second, they
+share one identity however differently the GSAs are named: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so two
+installs with the default KSA name bind the same principal and each agent can
+mint the other's GSA tokens. `agent_ksa_name` feeds both the module's binding
+and the chart's `serviceAccountName`, so the pod and the binding move
+together, and it must end in `-agent`: the `kube-agents-agent-binding-scope`
+admission policy the chart ships selects the bindings it governs by that
+suffix on the bound ServiceAccount, so a name outside it would leave this
+install's agent bindings unselected by that policy and by any validation it
+gains; the validation in `variables.tf` refuses the plan instead, and the
+variable's description says what the policy does and does not deny today.
+Through the installer front doors both values are
+`TF_VAR_agent_service_account_id=...` and `TF_VAR_agent_ksa_name=...` lines in
+`install.env` - every front door sources it with `set -a`, so the lines
+persist and export on each run. Do not rely on a shell `export` instead: it
+dies with the shell, and the next front-door run resolves the variables back
+to their defaults and plans the GSA's destroy-and-recreate under
+`-auto-approve` (`lifecycle.sh` refuses that one; nothing refuses the KSA
+moving back, which re-shares the identity silently). And do not hand-edit
+`terraform.tfvars`: install.sh, upgrade.sh and uninstall.sh regenerate it on
+every run, silently dropping the lines (Terraform reads `TF_VAR_*` only where
+the file is silent, and on these keys it stays silent). The
+`agent_service_account_id` description in `variables.tf` carries the limits
+that remain. Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
