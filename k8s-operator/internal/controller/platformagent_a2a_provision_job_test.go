@@ -141,8 +141,14 @@ func TestA2AProvisionJobNameTracksTheScript(t *testing.T) {
 		t.Errorf("script changed and the name is still %q", got)
 	}
 
+	// Derived from what the render produced, not written as a literal. This
+	// case was a literal "/tmp" until #1272 moved the rendered WorkingDir to
+	// /tmp, which made the assignment a no-op and left the check below
+	// comparing a spec against itself. Appending keeps it a real edit
+	// wherever the render moves next, the same way the script case above
+	// appends rather than substituting.
 	workdir := job.DeepCopy()
-	workdir.Spec.Template.Spec.Containers[0].WorkingDir = "/tmp"
+	workdir.Spec.Template.Spec.Containers[0].WorkingDir += "/subdir"
 	if got := a2aProvisionJobName(agent, workdir.Spec); got == base {
 		t.Errorf("WorkingDir changed and the name is still %q; this is the #1259 fix the old digest could not deliver", got)
 	}
