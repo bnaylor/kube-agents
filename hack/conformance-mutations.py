@@ -239,6 +239,31 @@ MUTATIONS: list[Mutation] = [
         "role does not carry -- one delivery path quietly grows a ceiling",
     ),
     Mutation(
+        # The chart half was three literal string scans until #1319; this is
+        # the spelling that walked past them. Flow style is not exotic -- it is
+        # what `helm create` scaffolds and what a hand-edit reaches for.
+        "A4-chart-impersonate-flow-style",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("    resources:\n      - events\n    verbs:\n      - create\n      - patch",
+         "    resources:\n      - events\n    verbs: [impersonate, create, patch]"),
+        "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
+        "give the chart's leader-election Role impersonate, written in flow "
+        "style: the object is outside the generated block so chart-sync leaves "
+        "it, and `- impersonate` as a substring does not appear",
+    ),
+    Mutation(
+        # The kustomize half read role.yaml alone. leader_election_role.yaml is
+        # listed beside it in the same kustomization and installs just as
+        # readily.
+        "A4-leader-election-escalate",
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("    resources:\n      - events\n    verbs:\n      - create\n      - patch",
+         "    resources:\n      - events\n    verbs:\n      - escalate\n      - create\n      - patch"),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "add escalate to the operator's OTHER Role -- the leader-election one, "
+        "which the same kustomization installs and A4 did not read",
+    ),
+    Mutation(
         "A4-inject-assertion-renamed",
         "tests/conformance/test_A_authority.py",
         ("    def test_A3_the_session_inject_endpoint_authenticates_its_caller(self) -> None:",

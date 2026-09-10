@@ -306,8 +306,85 @@ RBAC_GROUP = "rbac.authorization.k8s.io"
 BINDABLE_CLUSTER_ROLES = frozenset({"system:auth-delegator"})
 
 
+def rbac_rules(documents: tuple[dict, ...]) -> list[tuple[str, dict]]:
+    """Every rule in every Role and ClusterRole, tagged with where it came from.
+
+    Both, not just ClusterRole. A4 read `role.yaml` alone for a long time, and
+    a kustomize install ships `leader_election_role.yaml` beside it and a Helm
+    install ships the same Role in the chart -- an escalation verb written into
+    either installs exactly as readily as one written into the ClusterRole.
+    """
+    collected = []
+    for document in documents:
+        if document.get("kind") not in ("Role", "ClusterRole"):
+            continue
+        name = (document.get("metadata") or {}).get("name", "<unnamed>")
+        for rule in document.get("rules") or []:
+            collected.append((f"{document['kind']} {name}", rule))
+    return collected
+
+
 class A4DelegationAttenuates(unittest.TestCase):
     """A4: a delegated token is a strict subset, and triggering is delegation."""
+
+    def assert_rule_cannot_escalate(self, where: str, rule: dict) -> None:
+        """The A4 ceiling as one predicate, applied to one parsed RBAC rule.
+
+        One function called from both delivery paths, because two copies is
+        what the drift was: the kustomize half applied this to every rule and
+        the chart half was three literal string scans over the template text.
+        Anything spelled differently from those three strings -- flow-style
+        `verbs: [impersonate, get]`, or any verb at all in the chart's
+        leader-election Role, which no parse reached -- installed clean.
+        """
+        # Shape before content. Every check below reads these four fields as
+        # lists, and `set("bind")` is a set of four characters that contains
+        # no "bind" -- so a rule whose verbs arrived as a scalar passes
+        # everything while granting whatever it grants. A chart template can
+        # produce exactly that (`verbs: {{ .Values.x | toJson }}` reads as one
+        # string), and so can a hand-written typo.
+        for field in ("apiGroups", "resources", "resourceNames", "verbs"):
+            value = rule.get(field)
+            if value is not None and not isinstance(value, list):
+                self.fail(f"{where}: {field} is {value!r}, not a list of strings")
+
+        verbs = set(rule.get("verbs") or [])
+        groups = set(rule.get("apiGroups") or [])
+        with self.subTest(where=where, rule=rule):
+            self.assertNotIn("escalate", verbs, where)
+            self.assertNotIn("impersonate", verbs, where)
+            if "bind" in verbs:
+                names = rule.get("resourceNames") or []
+                self.assertTrue(
+                    names,
+                    f"{where}: an unrestricted bind lets the operator attach "
+                    "any existing role -- cluster-admin included -- to an "
+                    "agent; bind must carry resourceNames",
+                )
+                self.assertLessEqual(
+                    set(names),
+                    BINDABLE_CLUSTER_ROLES,
+                    f"{where}: bind names a ClusterRole outside the reviewed "
+                    "set; add it to BINDABLE_CLUSTER_ROLES with a note on what "
+                    "it grants, or scope the rule down",
+                )
+            # A wildcard is not a third thing. `*` in apiGroups matches every
+            # group including the RBAC one, and `*` in verbs matches escalate,
+            # impersonate and an unscoped bind at once -- so the three named
+            # checks above, which read the literal spelling, all read past it.
+            # This reads what the rule authorizes.
+            #
+            # Bounded to rules that can reach RBAC on purpose. A wildcard verb
+            # on, say, `apps/deployments` is a least-privilege question and a
+            # loud one, but it confers no escalate, impersonate or bind, so it
+            # is not A4's -- A4 is about delegation attenuating. The `*`
+            # apiGroup is covered because it includes the RBAC group.
+            if "*" in verbs and ("*" in groups or RBAC_GROUP in groups):
+                self.fail(
+                    f"{where}: a wildcard verb reaching the RBAC API group is "
+                    "escalate, impersonate and an unrestricted bind under one "
+                    "asterisk; enumerate the verbs"
+                )
 
     def test_A4_the_operator_cannot_escalate_its_own_grants(self) -> None:
         """The controller holds full CRUD on RBAC objects, so `escalate` is the line.
@@ -334,56 +411,57 @@ class A4DelegationAttenuates(unittest.TestCase):
         test edit, and the invariant was never the identity of the role. It is
         that the scope exists and names roles whose grants are bounded and
         known.
-        """
-        documents = h.yaml_documents("operator_clusterrole")
-        cluster_roles = h.objects_of_kind(documents, "ClusterRole")
-        self.assertTrue(cluster_roles, "no ClusterRole in config/rbac/role.yaml")
 
-        for role in cluster_roles:
-            for rule in role.get("rules") or []:
-                verbs = set(rule.get("verbs") or [])
-                groups = set(rule.get("apiGroups") or [])
-                with self.subTest(role=role["metadata"]["name"], rule=rule):
-                    self.assertNotIn("escalate", verbs)
-                    self.assertNotIn("impersonate", verbs)
-                    if "bind" in verbs:
-                        names = rule.get("resourceNames") or []
-                        self.assertTrue(
-                            names,
-                            "an unrestricted bind lets the operator attach any "
-                            "existing role -- cluster-admin included -- to an "
-                            "agent; bind must carry resourceNames",
-                        )
-                        self.assertLessEqual(
-                            set(names),
-                            BINDABLE_CLUSTER_ROLES,
-                            "bind names a ClusterRole outside the reviewed set; "
-                            "add it to BINDABLE_CLUSTER_ROLES with a note on "
-                            "what it grants, or scope the rule down",
-                        )
-                    # A wildcard is not a third thing. `*` in apiGroups
-                    # matches every group including the RBAC one, and `*` in
-                    # verbs matches escalate, impersonate and an unscoped bind
-                    # at once -- so the three named checks above, which read
-                    # the literal spelling, all read past it. This reads what
-                    # the rule authorizes.
-                    if "*" in verbs and (
-                        "*" in groups or RBAC_GROUP in groups
-                    ):
-                        self.fail(
-                            "a wildcard verb reaching the RBAC API group is "
-                            "escalate, impersonate and an unrestricted bind "
-                            "under one asterisk; enumerate the verbs"
-                        )
+        Reads both RBAC objects a kustomize install ships, not just
+        `role.yaml`. `leader_election_role.yaml` is listed beside it in
+        config/rbac/kustomization.yaml and was read by nothing; an escalation
+        verb added there installs exactly as readily.
+        """
+        cluster_role_rules = rbac_rules(h.yaml_documents("operator_clusterrole"))
+        self.assertTrue(cluster_role_rules, "no ClusterRole rule in config/rbac/role.yaml")
+        # The other Role the same kustomization installs. It grants the
+        # leader-election recorder its event verbs today and nothing
+        # structural keeps an escalation verb out of it.
+        leader_election_rules = rbac_rules(
+            h.yaml_documents("operator_leader_election_role")
+        )
+        self.assertTrue(
+            leader_election_rules,
+            "no Role rule in config/rbac/leader_election_role.yaml",
+        )
+
+        for where, rule in cluster_role_rules + leader_election_rules:
+            self.assert_rule_cannot_escalate(where, rule)
 
     def test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role(self) -> None:
-        """Two delivery paths, one ceiling.
+        """Two delivery paths, one ceiling -- read with one predicate.
 
-        The chart carries a generated copy of the operator ClusterRole. A
-        ceiling asserted on one install path and not the other is a ceiling for
-        whoever happened to install the tested way.
+        The chart carries a generated copy of the operator ClusterRole, and a
+        leader-election Role that is not generated. A ceiling asserted on one
+        install path and not the other is a ceiling for whoever happened to
+        install the tested way.
+
+        "Same ceiling" was, until this test grew a parse, two different
+        predicates: the kustomize half applied a rule predicate to every rule,
+        and this half was three literal scans over the template text plus a
+        parse of the generated block alone. Measured against the chart as it
+        ships, three shapes installed green:
+
+          - `verbs: ["bind"]` in flow style past the end marker, where
+            `chart-sync` leaves it and the block parse does not reach;
+          - `verbs: [impersonate, create, patch]` anywhere, because the scan
+            is for the block-sequence spelling `- impersonate`;
+          - `verbs: ["*"]` on the RBAC group in the leader-election Role,
+            which sits outside the generated block and no parse read at all.
+
+        All three are the same defect -- a text scan standing in for a parse --
+        so the fix is the parse, over every Role and ClusterRole in the file,
+        with the predicate the kustomize half uses.
         """
         chart = h.text("chart_operator_rbac")
+        # Kept as a backstop, not as the defence. A bare-substring scan catches
+        # a spelling the parse would also catch, one step earlier and with the
+        # whole file in the failure message, and it costs nothing.
         self.assertNotIn("escalate", chart)
         self.assertNotIn("- impersonate", chart)
         # Parity on `bind` is asserted as agreement, not as a fixed count. The
@@ -396,20 +474,17 @@ class A4DelegationAttenuates(unittest.TestCase):
         def bind_rules(rules: list) -> list:
             return [r for r in rules if "bind" in set(r.get("verbs") or [])]
 
-        # The chart's copy is not parseable as a whole -- its metadata is Helm
-        # expressions -- but the block `make chart-sync` writes is plain YAML,
-        # and it is the block parity is about. Read it out between its own
-        # markers rather than templating the chart.
+        # The generated block, sliced out by its own markers. Parity is about
+        # this block specifically -- it is the copy of role.yaml -- and it is
+        # also the yardstick for the vacuity check below, which asks whether
+        # the whole-file parse reached anything the block does not carry.
         begin = chart.index("# BEGIN GENERATED RULES")
         end = chart.index("# END GENERATED RULES")
-        # Everything below parses the generated block, and `make chart-check`
-        # already gates that block byte-for-byte against role.yaml. What
-        # neither of them can see is a rule written into one of the chart's
-        # OTHER RBAC objects, or hand-added past the end marker: it is not
-        # generated, so chart-sync leaves it alone, and it is outside the
-        # slice, so the parse never reaches it. The scan for `escalate` and
-        # `- impersonate` above covers the whole file for exactly this reason;
-        # `bind` gets the same treatment before the slice narrows things.
+        # A bind past the end marker is caught by the whole-file parse further
+        # down whatever it is spelled like. This scan stays because it is the
+        # only check that reports the LINE, and "grants bind outside the
+        # generated block" is a different and more actionable complaint than
+        # "the two paths bind different sets of roles".
         offset = 0
         for lineno, line in enumerate(chart.splitlines(keepends=True), start=1):
             if line.strip() == "- bind":
@@ -422,19 +497,44 @@ class A4DelegationAttenuates(unittest.TestCase):
                 )
             offset += len(line)
         block = chart[chart.index("\n", begin) + 1 : chart.rindex("\n", begin, end)]
-        chart_rules = yaml.safe_load(textwrap.dedent(block))
+        generated_rules = yaml.safe_load(textwrap.dedent(block))
         self.assertIsInstance(
-            chart_rules, list, "the chart's generated rules block is not a rule list"
+            generated_rules, list, "the chart's generated rules block is not a rule list"
         )
 
-        config_rules = [
-            rule
-            for role in h.objects_of_kind(
-                h.yaml_documents("operator_clusterrole"), "ClusterRole"
-            )
-            for rule in role.get("rules") or []
-        ]
-        chart_binds = bind_rules(chart_rules)
+        # The whole template, read as the object set it renders. h.yaml_documents
+        # refuses this file -- its metadata is Helm expressions -- so this is
+        # the neutralizing parse, and the obligation that comes with it is
+        # discharged below: no rule field may be templated.
+        chart_rbac = rbac_rules(h.helm_documents("chart_operator_rbac"))
+        self.assertGreater(
+            len(chart_rbac),
+            len(generated_rules),
+            "the parse found no RBAC rule outside the generated block. That "
+            "block is already gated byte-for-byte by `make chart-check`, so "
+            "the coverage this parse adds is the chart's OTHER RBAC objects -- "
+            "the leader-election Role, and anything hand-added past the end "
+            "marker. Reaching only the block is this assertion passing "
+            "vacuously",
+        )
+        for where, rule in chart_rbac:
+            for field in ("apiGroups", "resources", "resourceNames", "verbs"):
+                # repr, not a walk over the elements: a field that is entirely
+                # one expression parses as a scalar, and walking a scalar
+                # string walks its characters, none of which is the
+                # placeholder. That spelling was measured to pass an
+                # element-wise version of this check.
+                self.assertNotIn(
+                    h.HELM_PLACEHOLDER,
+                    repr(rule.get(field)),
+                    f"{where}: {field} is templated, so what this rule grants "
+                    "depends on a value this parse cannot see and the "
+                    "predicate below would be reading a placeholder",
+                )
+            self.assert_rule_cannot_escalate(where, rule)
+
+        config_rules = [rule for _, rule in rbac_rules(h.yaml_documents("operator_clusterrole"))]
+        chart_binds = bind_rules([rule for _, rule in chart_rbac])
         config_binds = bind_rules(config_rules)
         self.assertEqual(
             sorted(
@@ -445,8 +545,12 @@ class A4DelegationAttenuates(unittest.TestCase):
             ),
             "the two delivery paths grant bind over different sets of roles",
         )
-        # And each is still scoped -- so the two paths agreeing on an
-        # unrestricted bind cannot pass this as parity.
+        # Each is still scoped -- so the two paths agreeing on an unrestricted
+        # bind cannot pass this as parity. Both sets have already been through
+        # assert_rule_cannot_escalate, which says the same thing and more; this
+        # is left in place because parity is asserted between two lists, and a
+        # reader should not have to go and check that both were separately
+        # walked to know the agreed-on value is a legal one.
         for rule in chart_binds + config_binds:
             with self.subTest(rule=rule):
                 self.assertTrue(
