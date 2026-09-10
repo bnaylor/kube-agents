@@ -40,6 +40,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -66,6 +67,20 @@ const (
 	// a2aComponentLabel distinguishes the pieces for targeted cleanup — the
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
+
+	// The streams the worker's JetStream API grant names, spelled as the
+	// provision script creates them. A KV bucket is a stream called
+	// KV_<bucket>, so the bucket name and the prefix are held apart.
+	a2aTasksStream         = "TASKS"
+	a2aTopicsStateStream   = "TOPICS-STATE"
+	a2aTopicsJournalStream = "TOPICS-JOURNAL"
+	a2aRuntimeStateBucket  = "runtime-state"
+	a2aKVStreamPrefix      = "KV_"
+
+	// a2aNATSConfGrantLine renders one allow-list entry at the depth of
+	// accounts.APP.users[].permissions.publish in the nats.conf template
+	// below: twelve spaces, the quoted subject, a trailing comma.
+	a2aNATSConfGrantLine = "            %q,"
 
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
 	defaultA2ANATSImage     = "nats:2.10-alpine"
@@ -160,6 +175,120 @@ func randomA2APassword() (string, error) {
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
 var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
 
+// a2aWorkerJetStreamGrants is the worker's publish allow-list for the
+// JetStream API, replacing the `$JS.API.>` wildcard this user shipped with
+// (gke-labs/kube-agents#1316).
+//
+// worker is the least-trusted principal in the deployment: it is the identity
+// a session pod runs as, executing model output against untrusted input. The
+// wildcard covered STREAM.PURGE, STREAM.UPDATE, STREAM.DELETE and
+// STREAM.MSG.DELETE on every stream, DIRECTORY included. One PURGE empties the
+// directory for every profile and nothing repopulates it; DELETE leaves only a
+// re-run of the provision Job to bring the stream back.
+//
+// The list is what the worker-side binaries emit, read out of nats.go and then
+// measured against a real server running this render
+// (TestWorkerJetStreamGrantOnARealServer). Per stream:
+//
+//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet and the bridge's sweep),
+//     CONSUMER.CREATE (the bridge's durable through CreateOrUpdateConsumer, and
+//     the replay's ordered consumer; nats.go puts the filter subject in the API
+//     subject, so the grant ends in `>`), CONSUMER.MSG.NEXT (every pull), and
+//     DIRECT.GET (GetLastMsgForSubject: the replay horizon and the sweep's CAS
+//     baseline). Acks are $JS.ACK.TASKS.>, granted beside this list.
+//   - KV_runtime-state, the bridge's in-flight registry: STREAM.INFO
+//     (js.KeyValue binds a bucket by reading its stream), and CONSUMER.CREATE
+//     with CONSUMER.DELETE (kv.Keys is a push ordered consumer that nats.go
+//     creates and then deletes on Unsubscribe, and the sweep runs it at every
+//     bridge start). Put and Delete are publishes on $KV.runtime-state.>,
+//     granted beside this list. No DIRECT.GET: nothing on the path calls
+//     kv.Get -- the bridge puts, deletes and lists, and the worker adapter
+//     touches no bucket -- and when a caller appears the grant is
+//     DIRECT.GET.KV_runtime-state.>, with the server test as the place its
+//     absence shows.
+//   - TOPICS-STATE and TOPICS-JOURNAL: STREAM.INFO and DIRECT.GET, reads only.
+//     `a2a topics read` and `list` are js.Stream, Stream.Info and
+//     GetLastMsgForSubject on these two streams (lib.ReadTopicLatest,
+//     lib.TopicRegistry), and the CLI dials with whatever NATS_USER its pod
+//     carries; the worker credential is what a gateway-spawned session pod
+//     gets. The writes are the three exact topic subjects above this list.
+//
+// Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
+// provision script creates has allow_direct set: the script says
+// --allow-direct on each `stream add` (natscli's default too, stated so the
+// grant does not rest on one), a KV bucket always has it, and the live store
+// shows it on all seven. nats.go picks the route from the stream's own config,
+// so the fallback is never emitted and is not granted.
+//
+// What the wildcard granted that nothing on the worker path uses, and this
+// list now refuses: every verb on DIRECTORY (no STREAM.INFO, no consumer, no
+// DIRECT.GET -- the gateway keeps subscribe on the cards, which is the read
+// discovery needs), every verb on KV_session-state and KV_cap, PURGE / UPDATE /
+// DELETE / MSG.DELETE / RESTORE / SNAPSHOT on every stream, STREAM.CREATE,
+// enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST),
+// account INFO (jetstream.New never asks for it), and CONSUMER.INFO (nothing
+// on the path binds to an existing consumer by name).
+//
+// CONSUMER.DELETE on TASKS is withheld deliberately, and it is the one subject
+// nats.go does emit here without a grant. The only emitter is the ordered
+// consumer's reset path, which fires DeleteConsumer in a goroutine and ignores
+// the result; an ephemeral it could not delete is reaped by its own five-minute
+// inactive threshold. Granting it would let the worker delete the gateway's
+// relay durable by name -- within a shared stream, consumer names are the
+// caller's choice, so no grant can tell the two apart -- which drops that
+// consumer's ack floor and replays every pending task. CREATE and MSG.NEXT on
+// the same stream already let the worker read from another principal's
+// consumer; DELETE is the destructive half, and it stays out until the auth
+// callout gives each principal its own user.
+//
+// One route this list narrows but cannot close, because it lives in a request
+// body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the
+// KV bucket) lets the worker ask the server to deliver that stream's messages
+// onto any subject, and a stream whose subjects cover the deliver subject
+// stores them -- under their ORIGINAL subjects, so this is not forgery (a
+// topic or card read by subject never sees them) but it is a persisted write
+// into a stream the worker has no publish grant for, and with discard=old an
+// eviction lever against it. The server delivers only once a literal
+// subscription exists on the deliver subject, and measured on 2.10.29 and
+// 2.14.5 that condition splits the streams in two: TOPICS-STATE and
+// TOPICS-JOURNAL have literal subjects, so their own ingest is the interest
+// and the write lands with no help (three TASKS messages arrived in
+// TOPICS-STATE under a2a.tasks.* subjects); DIRECTORY, TASKS and the buckets
+// have wildcard subjects, so they need a literal client subscription, which
+// for the directory means another principal holding one on a card subject --
+// the gateway's `a2a.agents.>` subscribe grant permits it, nothing in the tree
+// opens one. The wildcard this replaces had the same route with every stream
+// as a source; what closes it is the worker not holding CONSUMER.CREATE at
+// all, which is a pre-created consumer per task (the stage-3 dispatcher),
+// not a grant. The server test measures all three cases.
+func a2aWorkerJetStreamGrants() []string {
+	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
+	return []string{
+		"$JS.API.STREAM.INFO." + a2aTasksStream,
+		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
+		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
+		"$JS.API.STREAM.INFO." + kvRuntimeState,
+		"$JS.API.CONSUMER.CREATE." + kvRuntimeState + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvRuntimeState + ".*",
+		"$JS.API.STREAM.INFO." + a2aTopicsStateStream,
+		"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".>",
+		"$JS.API.STREAM.INFO." + a2aTopicsJournalStream,
+		"$JS.API.DIRECT.GET." + a2aTopicsJournalStream + ".>",
+	}
+}
+
+// a2aNATSConfGrantLines renders grants as nats.conf allow-list entries at the
+// depth of a user's publish or subscribe list, one per line, for splicing
+// into the template below.
+func a2aNATSConfGrantLines(grants []string) string {
+	lines := make([]string, 0, len(grants))
+	for _, g := range grants {
+		lines = append(lines, fmt.Sprintf(a2aNATSConfGrantLine, g))
+	}
+	return strings.Join(lines, "\n")
+}
+
 // a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
 // security check, not tidiness: buildA2ANATSConfigSecret interpolates these
 // values into nats.conf inside double quotes, so a value carrying a quote and
@@ -248,8 +377,10 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // decides who may say what before a message is read. Deny-by-default — a
 // permissions block with allow lists denies everything else — with per-user
 // _INBOX prefixes so the reply path cannot leak what the subject grants
-// withheld. $JS.API.> on every app user is playground posture; production
-// narrows it to the per-stream API subjects when the callout arms.
+// withheld. The worker's JetStream API grant is scoped to the streams it uses,
+// by name and by verb (a2aWorkerJetStreamGrants). A user that still holds
+// $JS.API.> here holds playground posture, and narrowing it is the same change
+// on that principal with its own table of what it emits.
 //
 // pw is a parameter rather than a closure over the creds Secret because two
 // callers walk this template: buildA2ANATSConfigSecret with the real lookup,
@@ -393,16 +524,14 @@ accounts {
             # forge any profile's card. The gateway keeps SUBSCRIBE on the
             # same subjects, which is the read discovery actually needs.
             #
-            # This closes forgery, not reach: $JS.API.> below still covers
-            # STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
-            # STREAM.DELETE.DIRECTORY, so worker can still erase the whole
-            # directory in one call. Scoping that wildcard the way #1306
-            # scopes seed's is gke-labs/kube-agents#1316, and it is a
-            # separate change: the worker's JetStream use is TASKS and the
-            # KV bucket, and narrowing to those wants its own live proof.
+            # Closing forgery is not closing reach: the JetStream API grant
+            # below is what decides whether the worker can PURGE or DELETE
+            # the directory instead, so it is scoped by stream and by verb.
+            # a2aWorkerJetStreamGrants is the list and the argument for each
+            # entry; nothing in it names DIRECTORY.
             "agents.hb.>",
             "$KV.runtime-state.>",
-            "$JS.API.>",
+` + a2aNATSConfGrantLines(a2aWorkerJetStreamGrants()) + `
             "$JS.ACK.TASKS.>",
             "$JS.FC.>",
             "_INBOX.worker.>"
@@ -792,14 +921,19 @@ NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
 # message streams are limits-based with an age window; replay is a read.
 # Every stream carries a hard max_bytes with discard old so a flood degrades
 # replay oldest-first instead of filling the PV and stalling JetStream.
+#
+# --allow-direct is stated on every stream even though it is the CLI's
+# default: the worker's JetStream API grant is written for the direct-get
+# route (nats.go picks DIRECT.GET or STREAM.MSG.GET from the stream's own
+# config), so the bit the grant rests on is set here, not inherited.
 
 # TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
-$NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS \
+$NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
   --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
-$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY \
+$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
@@ -819,14 +953,14 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY \
 # topic the fleet actually reads - and "it cannot happen while the grants
 # hold" is the assumption the web user already broke once. A writerless
 # subject makes the failure mode land nowhere.
-$NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE \
+$NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
   --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
 # Journal-class topics: annotations.
-$NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL \
+$NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
   --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
 

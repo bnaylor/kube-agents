@@ -1,0 +1,541 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// a2aServerLog is a nats-server Logger that keeps every line, so a refusal can
+// be asserted from the server's side. A NATS permissions violation reaches the
+// client only as a missing reply, and a missing reply on its own proves
+// nothing: a slow server produces the same timeout.
+type a2aServerLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *a2aServerLog) record(format string, v ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *a2aServerLog) Noticef(format string, v ...any) { l.record(format, v...) }
+func (l *a2aServerLog) Warnf(format string, v ...any)   { l.record(format, v...) }
+func (l *a2aServerLog) Fatalf(format string, v ...any)  { l.record(format, v...) }
+func (l *a2aServerLog) Errorf(format string, v ...any)  { l.record(format, v...) }
+func (l *a2aServerLog) Debugf(format string, v ...any)  { l.record(format, v...) }
+func (l *a2aServerLog) Tracef(format string, v ...any)  { l.record(format, v...) }
+
+// publishViolations returns the server's Publish Violation lines for user. The
+// line names the user in the client prefix (`user:worker` on 2.11+, `User
+// "worker"` on 2.10), so both spellings are accepted.
+func (l *a2aServerLog) publishViolations(user string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, line := range l.lines {
+		if !strings.Contains(line, "Publish Violation") {
+			continue
+		}
+		if strings.Contains(line, "user:"+user) || strings.Contains(line, fmt.Sprintf("User %q", user)) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// refusedPublish reports whether the server logged a publish violation for
+// user on exactly subject. It waits briefly: the line is written on the
+// server's read loop, and the caller has only seen its own request time out.
+func (l *a2aServerLog) refusedPublish(user, subject string) bool {
+	needle := fmt.Sprintf("Subject %q", subject)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		for _, line := range l.publishViolations(user) {
+			if strings.Contains(line, needle) {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// a2aStartRenderedServer runs an embedded nats-server on conf, the nats.conf
+// the operator renders, changing only what a test process cannot honour: the
+// listen ports (random), the websocket listener (off) and the store directory
+// (a temp dir). Accounts, users and permissions are the render's own.
+func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2aServerLog) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nats.conf")
+	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := natsserver.ProcessConfigFile(path)
+	if err != nil {
+		t.Fatalf("the rendered nats.conf does not parse: %v", err)
+	}
+	opts.Port = -1
+	opts.HTTPPort = 0
+	opts.Websocket.Port = 0
+	opts.StoreDir = filepath.Join(dir, "store")
+	opts.NoSigs = true
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("nats-server refused the rendered config: %v", err)
+	}
+	log := &a2aServerLog{}
+	s.SetLoggerV2(log, false, false, false)
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("embedded nats-server did not come up")
+	}
+	// The evidence names the server it came from: the module pin here and
+	// the image tag the operator deploys are independent, and the tag floats.
+	t.Logf("embedded nats-server %s (the operator deploys %s)", natsserver.VERSION, defaultA2ANATSImage)
+	t.Cleanup(func() {
+		s.Shutdown()
+		s.WaitForShutdown()
+	})
+	return s, log
+}
+
+// a2aConnectAs dials the embedded server as one of the rendered users, with
+// the inbox prefix that user's subscribe grant requires. These are the two
+// options every worker-side binary sets (lib.WithUserPassword); a client
+// without the prefix authenticates, publishes, and then times out on its first
+// reply.
+func a2aConnectAs(t *testing.T, url, user, password string) (*nats.Conn, jetstream.JetStream) {
+	t.Helper()
+	nc, err := nats.Connect(url,
+		nats.UserInfo(user, password),
+		nats.CustomInboxPrefix("_INBOX."+user),
+		nats.Name(user),
+		// The default handler prints to stderr; the server log is the
+		// evidence this test reads, so the client side stays quiet.
+		nats.ErrorHandler(func(*nats.Conn, *nats.Subscription, error) {}),
+	)
+	if err != nil {
+		t.Fatalf("connect as %s: %v", user, err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nc, js
+}
+
+// a2aProvisionLikeTheScript creates what the provision Job creates, as seed,
+// with the flags the script passes to natscli translated to StreamConfig: four
+// message streams and three KV buckets. AllowDirect is set because the script
+// says --allow-direct on every `stream add` (and a KV bucket always has it);
+// it decides which API subject a last-message read uses, and the worker's
+// grant is written for the direct route.
+func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
+	t.Helper()
+	_, js := a2aConnectAs(t, url, "seed", seedPassword)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streams := []jetstream.StreamConfig{
+		{Name: "TASKS", Subjects: []string{"a2a.tasks.>"},
+			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
+			MaxAge: 72 * time.Hour, MaxBytes: 21474836480, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
+			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
+			MaxMsgsPerSubject: 1, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
+			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
+			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
+			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
+			MaxAge: 720 * time.Hour, MaxBytes: 5368709120, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+	}
+	for _, cfg := range streams {
+		if _, err := js.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("provision %s as seed: %v", cfg.Name, err)
+		}
+	}
+	for _, bucket := range []string{"runtime-state", "session-state", "cap"} {
+		_, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+			Bucket: bucket, History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 268435456,
+		})
+		if err != nil {
+			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
+		}
+	}
+}
+
+// TestWorkerJetStreamGrantOnARealServer is the refusal proof for the worker's
+// JetStream API grant, measured the way gke-labs/kube-agents#1316 measured the
+// hole: the config the operator renders, run by an embedded nats-server, the
+// streams provisioned as the provision Job provisions them, and a client
+// connected as worker.
+//
+// Two tables. The first is every JetStream operation the worker-side binaries
+// perform -- the bridge's durable consumer on TASKS with a pull and an ack, a
+// task-event publish and the sweep's compare-and-swap publish, the replay's
+// horizon read and ordered consumer, the in-flight registry's put / keys /
+// delete on runtime-state, and the CLI's topic reads -- each of which must
+// succeed, with zero publish violations logged for worker across the lot. A
+// grant missing from a2aWorkerJetStreamGrants shows up here as the exact
+// subject the server refused, which is #1306's STREAM.NAMES lesson applied
+// before the deploy instead of after it.
+//
+// The second is the destructive and out-of-scope surface: every verb on
+// DIRECTORY, PURGE / UPDATE / DELETE / MSG.DELETE / RESTORE / SNAPSHOT on
+// TASKS, CONSUMER.DELETE and CONSUMER.INFO on the gateway's relay durable,
+// KV_session-state, enumeration, account INFO and STREAM.CREATE. Each must be
+// refused, and "refused" is read from the server's log -- a Publish Violation
+// naming worker and the exact subject -- not from the client's timeout. The
+// streams are then re-read as seed to show nothing underneath changed.
+//
+// A final subtest puts the wildcard back into the render and shows the same
+// PURGE and DELETE succeeding and DIRECTORY gone: the control that says the
+// refusals above are authorization rather than a broken API, and the issue
+// reproduced on this server.
+func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
+	creds := a2aFullCreds("a", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds).Data["nats.conf"])
+	workerPW := string(creds.Data["worker-password"])
+	seedPW := string(creds.Data["seed-password"])
+	gatewayPW := string(creds.Data["gateway-password"])
+
+	s, log := a2aStartRenderedServer(t, conf)
+	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
+	_, gw := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
+	worker, js := a2aConnectAs(t, s.ClientURL(), "worker", workerPW)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		inSubject     = "a2a.tasks.platform.t1.in"
+		eventsSubject = "a2a.tasks.platform.t1.events"
+	)
+	bridgeDurable := jetstream.ConsumerConfig{
+		Durable: "bridge-platform", FilterSubject: "a2a.tasks.platform.*.in", AckPolicy: jetstream.AckExplicitPolicy,
+	}
+
+	// The gateway's own durable, so the CONSUMER.DELETE refusal below is
+	// measured against a real consumer another principal owns; and a
+	// submission for the worker to consume, from the principal that may
+	// publish one.
+	if _, err := gw.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
+		Durable: "gateway-relay", FilterSubject: "a2a.tasks.*.*.events", AckPolicy: jetstream.AckExplicitPolicy,
+	}); err != nil {
+		t.Fatalf("gateway relay durable: %v", err)
+	}
+	if _, err := gw.Publish(ctx, inSubject, []byte(`{"kind":"message"}`)); err != nil {
+		t.Fatalf("gateway submission: %v", err)
+	}
+
+	// Table 1: the worker's own operations, in the order the bridge performs
+	// them. Fatal on the first refusal, because everything after it depends on
+	// the object it did not get.
+	allowed := func(op string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%-64s REFUSED: %v\nserver log for worker: %q", op, err, log.publishViolations("worker"))
+		}
+		t.Logf("%-64s allowed", op)
+	}
+
+	stream, err := js.Stream(ctx, "TASKS")
+	allowed("STREAM.INFO TASKS (js.Stream)", err)
+
+	cons, err := js.CreateOrUpdateConsumer(ctx, "TASKS", bridgeDurable)
+	allowed("CONSUMER.CREATE TASKS durable bridge-platform (SubscribeDurable)", err)
+	_, err = js.CreateOrUpdateConsumer(ctx, "TASKS", bridgeDurable)
+	allowed("CONSUMER.CREATE TASKS same durable again (the rebuild path)", err)
+
+	batch, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
+	allowed("CONSUMER.MSG.NEXT TASKS (Fetch)", err)
+	var delivered jetstream.Msg
+	for m := range batch.Messages() {
+		delivered = m
+	}
+	if delivered == nil {
+		t.Fatalf("the pull delivered nothing: %v", batch.Error())
+	}
+	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
+	// The ack landed, read from the gateway's side because worker holds no
+	// CONSUMER.INFO.
+	relayView, err := gw.Consumer(ctx, "TASKS", "bridge-platform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := relayView.Info(ctx); err != nil || info.AckFloor.Consumer != 1 {
+		t.Fatalf("ack floor after the worker's ack: %+v (%v)", info, err)
+	}
+
+	_, err = js.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update"}`), jetstream.WithMsgID("e1"))
+	allowed("publish a2a.tasks.platform.t1.events (JetStream, dedup id)", err)
+	last, err := stream.GetLastMsgForSubject(ctx, eventsSubject)
+	allowed("DIRECT.GET TASKS last-for-subject (replay horizon)", err)
+	_, err = js.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update","final":true}`),
+		jetstream.WithMsgID("e2"), jetstream.WithExpectLastSequencePerSubject(last.Sequence))
+	allowed("publish events with expected last sequence (sweep CAS)", err)
+
+	oc, err := js.OrderedConsumer(ctx, "TASKS", jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{eventsSubject}, DeliverPolicy: jetstream.DeliverAllPolicy,
+	})
+	allowed("CONSUMER.CREATE TASKS ordered (TasksGet replay)", err)
+	it, err := oc.Messages()
+	allowed("ordered consumer Messages()", err)
+	for i := 1; i <= 2; i++ {
+		_, err := it.Next()
+		allowed(fmt.Sprintf("CONSUMER.MSG.NEXT TASKS ordered, replay message %d", i), err)
+	}
+	it.Stop()
+
+	kv, err := js.KeyValue(ctx, "runtime-state")
+	allowed("STREAM.INFO KV_runtime-state (js.KeyValue)", err)
+	_, err = kv.Put(ctx, "bridge.platform.t1", []byte("platform-bridge"))
+	allowed("$KV.runtime-state put (markInFlight)", err)
+	keys, err := kv.Keys(ctx)
+	allowed("CONSUMER.CREATE + CONSUMER.DELETE KV_runtime-state (kv.Keys, the sweep)", err)
+	if !reflect.DeepEqual(keys, []string{"bridge.platform.t1"}) {
+		t.Fatalf("sweep keys = %q", keys)
+	}
+	allowed("$KV.runtime-state delete (clearInFlight)", kv.Delete(ctx, "bridge.platform.t1"))
+
+	for _, tp := range []struct{ stream, subject string }{
+		{"TOPICS-STATE", "a2a.topics.shared.blueprint"},
+		{"TOPICS-JOURNAL", "a2a.topics.shared.annotations"},
+	} {
+		st, err := js.Stream(ctx, tp.stream)
+		allowed("STREAM.INFO "+tp.stream+" (TopicRegistry)", err)
+		_, err = st.Info(ctx, jetstream.WithSubjectFilter("a2a.topics.>"))
+		allowed("STREAM.INFO "+tp.stream+" with subject filter (TopicRegistry)", err)
+		_, err = js.Publish(ctx, tp.subject, []byte(`{"kind":"topic-entry"}`))
+		allowed("publish "+tp.subject, err)
+		_, err = st.GetLastMsgForSubject(ctx, tp.subject)
+		allowed("DIRECT.GET "+tp.stream+" (ReadTopicLatest)", err)
+	}
+
+	if v := log.publishViolations("worker"); len(v) != 0 {
+		t.Errorf("the worker's own operations tripped %d publish violations; each is a grant a2aWorkerJetStreamGrants is missing:\n%s",
+			len(v), strings.Join(v, "\n"))
+	}
+
+	// Table 2: what the wildcard allowed and the grant refuses. The bodies are
+	// what a real caller would send; the server never reads them, because the
+	// permission check runs before the request is parsed.
+	type call struct{ subject, body string }
+	refused := []call{
+		{"$JS.API.STREAM.INFO.DIRECTORY", ""},
+		{"$JS.API.STREAM.PURGE.DIRECTORY", ""},
+		{"$JS.API.STREAM.UPDATE.DIRECTORY", `{"name":"DIRECTORY","subjects":["a2a.agents.>","a2a.tasks.>"]}`},
+		{"$JS.API.STREAM.DELETE.DIRECTORY", ""},
+		{"$JS.API.STREAM.MSG.DELETE.DIRECTORY", `{"seq":1}`},
+		{"$JS.API.CONSUMER.CREATE.DIRECTORY.peek", `{"stream_name":"DIRECTORY","config":{"name":"peek","deliver_subject":"_INBOX.worker.peek"}}`},
+		{"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform", ""},
+		{"$JS.API.STREAM.PURGE.TASKS", ""},
+		{"$JS.API.STREAM.UPDATE.TASKS", `{"name":"TASKS","subjects":["a2a.tasks.>","a2a.agents.>"]}`},
+		{"$JS.API.STREAM.DELETE.TASKS", ""},
+		{"$JS.API.STREAM.MSG.DELETE.TASKS", `{"seq":1}`},
+		{"$JS.API.STREAM.RESTORE.TASKS", ""},
+		{"$JS.API.STREAM.SNAPSHOT.TASKS", `{"deliver_subject":"_INBOX.worker.snap"}`},
+		{"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay", ""},
+		{"$JS.API.CONSUMER.INFO.TASKS.gateway-relay", ""},
+		{"$JS.API.DIRECT.GET.KV_runtime-state.$KV.runtime-state.bridge.platform.t1", ""},
+		{"$JS.API.STREAM.INFO.KV_session-state", ""},
+		{"$JS.API.CONSUMER.CREATE.KV_session-state.peek", `{"stream_name":"KV_session-state","config":{"name":"peek","deliver_subject":"_INBOX.worker.peek"}}`},
+		{"$JS.API.DIRECT.GET.KV_session-state.$KV.session-state.k", ""},
+		{"$JS.API.STREAM.INFO.KV_cap", ""},
+		{"$JS.API.INFO", ""},
+		{"$JS.API.STREAM.NAMES", ""},
+		{"$JS.API.STREAM.LIST", ""},
+		{"$JS.API.CONSUMER.NAMES.TASKS", ""},
+		{"$JS.API.STREAM.CREATE.EVIL", `{"name":"EVIL","subjects":["evil.>"]}`},
+	}
+	for _, c := range refused {
+		// A short client wait is safe: "refused" is decided by the server's
+		// log below, and a reply that arrives late fails the run as ALLOWED
+		// only if it arrives at all.
+		msg, err := worker.Request(c.subject, []byte(c.body), 250*time.Millisecond)
+		if err == nil {
+			t.Errorf("%-64s ALLOWED: %s", c.subject, msg.Data)
+			continue
+		}
+		if !log.refusedPublish("worker", c.subject) {
+			t.Errorf("%-64s no reply (%v), but the server logged no publish violation for it", c.subject, err)
+			continue
+		}
+		t.Logf("%-64s refused (server: Publish Violation)", c.subject)
+	}
+
+	// Nothing underneath changed: DIRECTORY is as provisioned, TASKS still
+	// holds the submission and both events, the relay durable is still there.
+	_, seedJS := a2aConnectAs(t, s.ClientURL(), "seed", seedPW)
+	dir, err := seedJS.Stream(ctx, "DIRECTORY")
+	if err != nil {
+		t.Fatalf("DIRECTORY after the refused calls: %v", err)
+	}
+	if got := dir.CachedInfo(); !reflect.DeepEqual(got.Config.Subjects, []string{"a2a.agents.>"}) || got.State.Msgs != 0 {
+		t.Errorf("DIRECTORY changed under the worker: subjects %q, %d msgs", got.Config.Subjects, got.State.Msgs)
+	}
+	tasks, err := seedJS.Stream(ctx, "TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tasks.CachedInfo().State.Msgs; got != 3 {
+		t.Errorf("TASKS holds %d messages after the refused calls, want 3", got)
+	}
+	if _, err := gw.Consumer(ctx, "TASKS", "gateway-relay"); err != nil {
+		t.Errorf("the gateway's relay durable after the worker's refused DELETE: %v", err)
+	}
+
+	// The consumer-create case #1316 asked about. CONSUMER.CREATE is scoped
+	// to TASKS, but a push consumer's deliver_subject is a body field no
+	// subject grant can see: the server delivers TASKS messages onto it, and
+	// a stream whose subjects cover it stores them under their ORIGINAL
+	// subjects. Delivery starts only once a literal subscription exists on
+	// the deliver subject, which splits the streams in two, so three
+	// measurements:
+	//
+	//  1. A wildcard-subject stream with no literal subscriber: the consumer
+	//     is created, delivers nothing, and DIRECTORY stays empty. Asserted.
+	//  2. A literal-subject stream: TOPICS-STATE's own ingest on the
+	//     writerless probe topic is the interest, and the write lands with no
+	//     subscription from anyone. This route predates the change, survives
+	//     it, and is recorded in a2aWorkerJetStreamGrants; what is asserted
+	//     is the property that does hold -- the stored messages keep their
+	//     a2a.tasks.* subjects, so a topic read by subject never sees them.
+	//  3. A wildcard-subject stream with another principal's literal
+	//     subscription: a card subject under the gateway's `a2a.agents.>`
+	//     grant, which nothing in the tree opens today. Measured and logged.
+	t.Run("a push consumer's deliver subject writes only where a literal subscriber exists", func(t *testing.T) {
+		create := func(name, deliver string) {
+			t.Helper()
+			body := fmt.Sprintf(`{"stream_name":"TASKS","config":{"name":%q,"deliver_subject":%q,"deliver_policy":"all","ack_policy":"none"}}`, name, deliver)
+			if _, err := worker.Request("$JS.API.CONSUMER.CREATE.TASKS."+name, []byte(body), 2*time.Second); err != nil {
+				t.Fatalf("consumer create %s: %v", name, err)
+			}
+		}
+		streamInfo := func(name string, opts ...jetstream.StreamInfoOpt) *jetstream.StreamInfo {
+			t.Helper()
+			st, err := seedJS.Stream(ctx, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := st.Info(ctx, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return info
+		}
+
+		// 1. DIRECTORY (a2a.agents.>), nobody subscribed to the card subject.
+		create("divert", "a2a.agents.platform")
+		time.Sleep(time.Second)
+		if n := streamInfo("DIRECTORY").State.Msgs; n != 0 {
+			t.Errorf("DIRECTORY holds %d messages with no literal subscriber on the deliver subject", n)
+		}
+		t.Log("wildcard-subject stream, no literal subscriber: consumer created, DIRECTORY msgs=0")
+
+		// 2. TOPICS-STATE, whose probe subject is literal and writerless.
+		before := streamInfo("TOPICS-STATE").State.Msgs
+		create("probewrite", "a2a.topics.shared.probe")
+		time.Sleep(time.Second)
+		info := streamInfo("TOPICS-STATE", jetstream.WithSubjectFilter("a2a.tasks.>"))
+		var underTaskSubjects uint64
+		for _, n := range info.State.Subjects {
+			underTaskSubjects += n
+		}
+		t.Logf("residue: literal-subject stream, no subscriber anywhere: TOPICS-STATE grew %d -> %d, %d of them under a2a.tasks.* subjects",
+			before, info.State.Msgs, underTaskSubjects)
+		if info.State.Msgs-before != underTaskSubjects {
+			t.Errorf("TOPICS-STATE gained %d messages but only %d sit under a2a.tasks.* subjects; the deliver-subject route rewrote a subject, which would be forgery",
+				info.State.Msgs-before, underTaskSubjects)
+		}
+		st, err := seedJS.Stream(ctx, "TOPICS-STATE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.GetLastMsgForSubject(ctx, "a2a.topics.shared.probe"); !errors.Is(err, jetstream.ErrMsgNotFound) {
+			t.Errorf("a read of the probe topic by subject sees something after the diverted consumer: %v", err)
+		}
+
+		// 3. DIRECTORY with the gateway holding a literal card subscription.
+		gwNC, _ := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
+		gwSub, err := gwNC.SubscribeSync("a2a.agents.platform")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = gwSub.Unsubscribe() }()
+		_ = gwNC.Flush()
+		create("divert2", "a2a.agents.platform")
+		time.Sleep(time.Second)
+		info = streamInfo("DIRECTORY", jetstream.WithSubjectFilter("a2a.tasks.>"))
+		underTaskSubjects = 0
+		for _, n := range info.State.Subjects {
+			underTaskSubjects += n
+		}
+		t.Logf("residue: with the gateway holding a literal card subscription, DIRECTORY msgs=%d, %d under a2a.tasks.* subjects", info.State.Msgs, underTaskSubjects)
+		if info.State.Msgs != underTaskSubjects {
+			t.Errorf("DIRECTORY holds %d messages but only %d sit under a2a.tasks.* subjects; a card subject was written", info.State.Msgs, underTaskSubjects)
+		}
+	})
+
+	t.Run("the wildcard this replaces let the worker delete the directory", func(t *testing.T) {
+		before := strings.Replace(conf, a2aNATSConfGrantLines(a2aWorkerJetStreamGrants()), fmt.Sprintf(a2aNATSConfGrantLine, "$JS.API.>"), 1)
+		if before == conf {
+			t.Fatal("could not put $JS.API.> back into the worker block; the control is gone")
+		}
+		s, log := a2aStartRenderedServer(t, before)
+		a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
+		worker, _ := a2aConnectAs(t, s.ClientURL(), "worker", workerPW)
+		for _, subject := range []string{"$JS.API.STREAM.PURGE.DIRECTORY", "$JS.API.STREAM.DELETE.DIRECTORY"} {
+			msg, err := worker.Request(subject, nil, 2*time.Second)
+			if err != nil {
+				t.Fatalf("%s under $JS.API.>: %v (violations %q)", subject, err, log.publishViolations("worker"))
+			}
+			var resp struct {
+				Success bool `json:"success"`
+			}
+			if err := json.Unmarshal(msg.Data, &resp); err != nil || !resp.Success {
+				t.Fatalf("%s under $JS.API.> answered %s", subject, msg.Data)
+			}
+			t.Logf("%-64s ALLOWED under $JS.API.>: %s", subject, msg.Data)
+		}
+		_, seedJS := a2aConnectAs(t, s.ClientURL(), "seed", seedPW)
+		if _, err := seedJS.Stream(ctx, "DIRECTORY"); !errors.Is(err, jetstream.ErrStreamNotFound) {
+			t.Fatalf("DIRECTORY should be gone after the worker's DELETE under the wildcard; got %v", err)
+		}
+		t.Log("DIRECTORY is gone; only a re-run of the provision Job brings it back")
+	})
+}
