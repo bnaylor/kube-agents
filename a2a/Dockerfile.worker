@@ -7,8 +7,26 @@
 # in the specs (auth callout, Vertex/WI per profile); none of them gates
 # "Adam can play." Static creds are the playground, not the product.
 
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.worker -t <registry>/worker-next:<tag> .
+
+# Bases come from images.json, the repo's image inventory, spelled the way
+# a2a/Dockerfile.gateway spells them so `make mirror-images` and the pinning
+# there cover this build too. The exemption in the header above is for the four
+# PUBLISHED a2a images, whose registry is a stage-1 dev one; it does not reach
+# the bases they are built from, which a mirrored or air-gapped build has to be
+# able to resolve like any other.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG NODE_IMAGE=node
+ARG NODE_VERSION=22-slim
+
 # --- adapter build stage ---
-FROM golang:1.27 AS build
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name: without this, a
+# substituted GOLANG_IMAGE older than a2a/go.mod's `go` directive silently
+# fetches a newer one instead of failing the build (#1138).
+ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -17,7 +35,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-w -s" -o /out/worker-adapter ./cmd/worker-adapter
 
 # --- runtime ---
-FROM node:22-slim
+FROM ${NODE_IMAGE}:${NODE_VERSION}
 
 WORKDIR /app
 # The agent SDK's platform package carries the harness as a native binary at
