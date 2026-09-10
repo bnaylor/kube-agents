@@ -113,7 +113,8 @@ func (m *Minter) Write(ctx context.Context, key string, e Entry) (Ref, error) {
 	return Ref{Key: key, Revision: ack.Sequence}, nil
 }
 
-// Mint is the gateway's call: a root under cap.root.<request-id>, from the
+// Mint is the gateway's call: a root at key `root.<request-id>` — subject
+// `$KV.cap.root.<request-id>`, the gateway's whole grant — from the
 // requester's own authority, naming the principal the gateway is about to
 // dispatch to. The gateway allocates the request id and the principal's name in
 // the same breath, which is what makes the delegate predictable before the
