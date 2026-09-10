@@ -55,9 +55,11 @@ Two tiers, meant to be read in order **01 → 09**:
 - **Foundational (north star) — 01–04, 09:** _what_ we are building and _why_.
 - **Buildable (bridging) — 05–08:** _how_ it is assembled.
 
-09 sits in the first tier rather than the second because it presumes agents are separate workloads,
-and that topology does not exist yet. It is agreed as the design; it is not in the build sequence
-below and nothing in it is built.
+09 sits in the first tier rather than the second because it presumes agents are separate workloads.
+**Amended 9/9:** one hop of that topology now exists — the chatops gateway spawns a session pod per
+task — and 09's mechanism is built and enforcing across it. The multi-hop fan-out 09 draws still
+does not exist, so attenuation ships with no production caller. 09 §0 states the boundary; read it
+before taking any section of 09 as either a plan or a fact.
 
 | #   | Document                                                       | Covers                                                                                                                                                                                                                                           |
 | --- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -71,7 +73,7 @@ below and nothing in it is built.
 | 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
 | 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
 |     | _Buildable (bridging) above · north star below_                |                                                                                                                                                                                                                                                  |
-| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why it needs no cryptographic key. **Not built** — no such topology yet                         |
+| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why it needs no cryptographic key. **Armed on the a2a plane 9/9** — see §0 for what shipped     |
 
 Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section and a
 **Verification** section of concrete, mostly-runnable checks.
