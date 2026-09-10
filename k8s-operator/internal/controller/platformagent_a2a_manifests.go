@@ -1354,68 +1354,24 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	return state, nil
 }
 
-// cleanupA2A returns the dark stack to dark when the mode is not next. The
-// creds Secret stays (inert data; re-enabling must not re-roll credentials)
-// and so does the StatefulSet's PVC (JetStream's file store is the audit
-// substrate — flipping a mode is not license to destroy evidence).
-//
-// Session pods — spawned by the gateway once the worker PR arms spawning —
-// are the gateway's, not the operator's: every spawned pod carries an
-// ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
-// deleting the gateway here hands any stragglers to Kubernetes GC, with no
-// operator exception to the IsControlledBy refusal below.
-func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	// The early exit. This path runs on every reconcile of every install that
-	// is not `next` — forever, on installs that have never rendered an A2A
-	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Three reads answer it instead of nine:
-	//
-	//   - the StatefulSet, which is deleted LAST below, so its absence means an
-	//     earlier pass ran to completion rather than dying partway,
-	//   - the gateway Deployment, which the render creates last and this
-	//     function deletes first, so it catches a pass that failed immediately,
-	//   - the config Secret, which is the only object the render creates BEFORE
-	//     the StatefulSet, so it is what a render that died in between leaves
-	//     behind. Without it the exit would step over that Secret and leave an
-	//     A2A object on a `today` install, which is the darkness property.
-	//
-	// The first two are Owns kinds and free. The Secret read is the only
-	// uncached one, and it happens only when the free two both miss.
-	sentinels := []struct {
-		obj    client.Object
-		reader client.Reader
-	}{
-		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
-	}
-	anyPresent := false
-	for _, s := range sentinels {
-		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
-		if err == nil {
-			anyPresent = true
-			break
-		}
-		if client.IgnoreNotFound(err) != nil {
-			return err
-		}
-	}
-	if !anyPresent {
-		return nil
-	}
+// a2aTeardownEntry is one namespaced object cleanupA2A removes, with the reader
+// that can see it: the Owns() kinds come from the cache, the rest go through
+// a2aReader so no cluster-wide informer starts for a kind nothing watches.
+type a2aTeardownEntry struct {
+	obj    client.Object
+	reader client.Reader
+}
 
-	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
-	// those kinds are already watched (Owns, see SetupWithManager) so the reads
-	// are free. Secret, Role/RoleBinding, ResourceQuota and Job reads go through
-	// a2aReader: a cached read would start a cluster-wide informer for a kind
-	// this controller otherwise never watches, on every install.
-	//
-	// Those uncached reads are the standing cost of this path, which runs on
-	// every reconcile of every today install — see the note on the sweep below.
-	named := []struct {
-		obj    client.Object
-		reader client.Reader
-	}{
+// a2aNamespacedTeardown is the ordered list of namespaced objects cleanupA2A
+// deletes by name. The order is load-bearing: see the sentinel argument in
+// cleanupA2A below.
+//
+// A function rather than a literal inside cleanupA2A so its length is readable
+// from a test. That is what lets the cost test assert the early exit is cheaper
+// than the walk it skips, instead of restating how long the walk is and going
+// stale the next time the render grows a step.
+func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so it stops answering while there is still a server to
@@ -1450,7 +1406,77 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		// end", which is only true while nothing is deleted after it.
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 	}
-	for _, entry := range named {
+}
+
+// cleanupA2A returns the dark stack to dark when the mode is not next. The
+// creds Secret stays (inert data; re-enabling must not re-roll credentials)
+// and so does the StatefulSet's PVC (JetStream's file store is the audit
+// substrate — flipping a mode is not license to destroy evidence).
+//
+// Session pods — spawned by the gateway once the worker PR arms spawning —
+// are the gateway's, not the operator's: every spawned pod carries an
+// ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
+// deleting the gateway here hands any stragglers to Kubernetes GC, with no
+// operator exception to the IsControlledBy refusal below.
+func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// The early exit. This path runs on every reconcile of every install that
+	// is not `next` — forever, on installs that have never rendered an A2A
+	// object — so proving "nothing to do" one object at a time is a standing
+	// cost for a no-op. Four reads answer it instead of nineteen:
+	//
+	//   - the StatefulSet, which is deleted LAST below, so its absence means an
+	//     earlier pass ran to completion rather than dying partway,
+	//   - the gateway Deployment, which the render creates last and this
+	//     function deletes first, so it catches a pass that failed immediately,
+	//   - the callout keys Secret, which is the FIRST deletable object
+	//     reconcileA2A creates — the per-user creds Secret is created before it
+	//     and deliberately survives — so a render that died anywhere leaves this
+	//     one behind. It covers the identity-map ConfigMap created right after
+	//     it for the same reason,
+	//   - the config Secret, which held that role before the callout existed.
+	//     Kept for the install whose partial render predates the keys Secret:
+	//     an operator upgraded across this change and then flipped to `today`
+	//     would otherwise step over a config Secret no later object accompanies.
+	//
+	// Without the third and fourth the exit would step over those objects and
+	// leave an A2A object on a `today` install, which is the darkness property.
+	// The first two are Owns kinds and free; the two Secret reads are uncached
+	// and happen only when the free two both miss.
+	//
+	// Adding an object to reconcileA2A ahead of the keys Secret means adding it
+	// here. TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
+	// prefix of the render and is what makes forgetting it red rather than
+	// silent: without the keys Secret below, its writes 3 and 4 fail.
+	sentinels := []a2aTeardownEntry{
+		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
+	}
+	anyPresent := false
+	for _, s := range sentinels {
+		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
+		if err == nil {
+			anyPresent = true
+			break
+		}
+		if client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+	if !anyPresent {
+		return nil
+	}
+
+	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
+	// those kinds are already watched (Owns, see SetupWithManager) so the reads
+	// are free. Secret, Role/RoleBinding, ResourceQuota and Job reads go through
+	// a2aReader: a cached read would start a cluster-wide informer for a kind
+	// this controller otherwise never watches, on every install.
+	//
+	// Those uncached reads are the standing cost of this path, which runs on
+	// every reconcile of every today install — see the note on the sweep below.
+	for _, entry := range r.a2aNamespacedTeardown(agent) {
 		obj := entry.obj
 		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			if client.IgnoreNotFound(err) != nil {

@@ -1349,10 +1349,12 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
-// early exit. The exit reads three sentinels and returns when all are absent,
+// early exit. The exit reads four sentinels and returns when all are absent,
 // which is only sound while nothing it deletes can outlive them: the
-// StatefulSet is deleted last, the gateway Deployment first, and the config
-// Secret is the one object the render creates before the StatefulSet.
+// StatefulSet is deleted last, the gateway Deployment first, and the callout
+// keys and config Secrets are the deletable objects the render creates first.
+// TestTheEarlyExitSeesEveryObjectTheRenderCreatesFirst holds that soundness
+// one object at a time; this one holds it across a pass that dies partway.
 //
 // The failure this pins is the one the optimisation invites — a pass that dies
 // partway leaves objects behind, and the NEXT pass steps over them because its
@@ -1426,11 +1428,11 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean measures the thing the
+// TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean measures the thing the
 // change was for. Counting is the only honest check here: the early exit is a
 // cost optimisation, and a correctness test passes just as well with the reads
 // still happening one object at a time.
-func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -1454,14 +1456,121 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Three sentinel Gets and nothing else: no per-object walk, and in
+	// Four sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
-	if gets != 3 {
-		t.Errorf("Gets = %d, want 3 (the sentinels); the per-object walk is running on a no-op", gets)
+	//
+	// The literal moved 3 -> 4 when the callout keys Secret joined the
+	// sentinels. Raising it is a real decision — every today install pays it
+	// on every reconcile, forever — so it is spelled out rather than derived.
+	// The inequality below is the part that must hold whatever the literal is:
+	// the exit is only worth having while it costs less than the walk.
+	if gets != 4 {
+		t.Errorf("Gets = %d, want 4 (the sentinels); the per-object walk is running on a no-op", gets)
+	}
+	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
+		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
 	}
 	if lists != 0 {
 		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
+	}
+}
+
+// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
+// half of the optimisation the test above prices.
+//
+// cleanupA2A answers "is there anything to tear down?" from four objects. That
+// is sound only while every render that leaves residue leaves at least one of
+// the four, and the case that breaks it is not a full render -- it is a render
+// that died partway. Miss it and an A2A object stays alive on a today install,
+// which is the darkness property.
+//
+// The reachable partial renders are the prefixes of reconcileA2A's own order,
+// so that is what this walks: fail the Nth object the render writes, for every
+// N, then flip to today and require the namespace to come back clean. Derived
+// from the render rather than listed here, so an object inserted anywhere in
+// reconcileA2A -- including ahead of the current first sentinel, which is the
+// way this breaks -- gets a case for free and reds until the exit can see it.
+func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
+	// The one documented survivor: the per-user creds Secret is created before
+	// anything the teardown deletes and is meant to outlive a flip.
+	const residue = "test-agent-a2a-nats-creds"
+
+	// buildClient returns a client whose Nth object write fails. failAt 0 never
+	// fails, which is how the render's length is measured.
+	buildClient := func(agent *agentv1alpha1.PlatformAgent, failAt int, writes *int) client.WithWatch {
+		ssa := fakeServerSideApplyInterceptors().Patch
+		stop := func() error {
+			*writes++
+			if *writes == failAt {
+				return fmt.Errorf("injected: the render dies on write %d", failAt)
+			}
+			return nil
+		}
+		return fake.NewClientBuilder().
+			WithScheme(setupScheme()).
+			WithObjects(agent.DeepCopy()).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if err := stop(); err != nil {
+						return err
+					}
+					return cl.Create(ctx, obj, opts...)
+				},
+				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if err := stop(); err != nil {
+						return err
+					}
+					return ssa(ctx, cl, obj, patch, opts...)
+				},
+			}).
+			Build()
+	}
+
+	scheme := setupScheme()
+	next := a2aTestAgent()
+
+	full := 0
+	unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &full), Scheme: scheme}
+	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy()); err != nil {
+		t.Fatalf("unobstructed render: %v", err)
+	}
+	if full == 0 {
+		t.Fatal("the render wrote nothing; every case below would be vacuous")
+	}
+
+	for n := 1; n <= full; n++ {
+		t.Run(fmt.Sprintf("render_dies_on_write_%d_of_%d", n, full), func(t *testing.T) {
+			writes := 0
+			cl := buildClient(next, n, &writes)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+				t.Fatal("want the injected error, got nil: the render did not die where this case says it did")
+			}
+
+			today := next.DeepCopy()
+			today.Spec.Mode = nil
+			if err := r.cleanupA2A(ctx, today); err != nil {
+				t.Fatalf("cleanupA2A after a partial render: %v", err)
+			}
+
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				if kind == "Secret" && name == residue {
+					return
+				}
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("a render that died on write %d leaves these on a today install: %v\n"+
+					"The early exit returned before the walk because none of its sentinels was present. "+
+					"Add the object to the sentinel list in cleanupA2A, or key the exit on something "+
+					"that does not have to be re-derived every time the render grows a step.", n, leftovers)
+			}
+		})
 	}
 }
 
