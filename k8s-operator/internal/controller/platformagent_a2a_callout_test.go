@@ -193,6 +193,96 @@ func TestTheCalloutLandsInAWorkingDirectoryItsUserCanEnter(t *testing.T) {
 	}
 }
 
+// rbacBindingKinds are the kinds that carry a Subjects list. A builder
+// returning one of these grants something to somebody, which is what the test
+// below is about.
+var rbacBindingKinds = map[string]bool{
+	"RoleBinding":        true,
+	"ClusterRoleBinding": true,
+}
+
+// TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs is the subject
+// half of the RBAC assertions on this stack. The roleRef half was already
+// covered -- TestA2ACalloutIsGatedByMode checks the ClusterRoleBinding binds
+// system:auth-delegator -- and a roleRef assertion alone says what power the
+// binding hands out without saying who receives it.
+//
+// The cluster-scoped one is where that matters most. It carries TokenReview,
+// which is the callout's whole authority to say a connection is who it claims
+// to be, and it is the one object on this stack that is not namespaced: a
+// second subject appended here would grant TokenReview to a principal in any
+// namespace and nothing else in the tree would notice. So: exactly one subject,
+// a ServiceAccount, in this agent's namespace, and the same one the workload
+// the binding exists for actually runs as -- a binding naming a ServiceAccount
+// no pod uses is dead weight, and one naming a different ServiceAccount is a
+// grant to somebody who was not supposed to have it.
+//
+// Enumerated against the package rather than hand-listed. Every buildA2A*
+// function returning a binding must appear below, so a fourth binding added to
+// this stack fails here until somebody says who it is for. (The generic
+// buildRoleBinding/buildClusterRoleBinding helpers on the agent path are out of
+// scope: they take the subject as an argument and have their own coverage.)
+func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T) {
+	agent := a2aTestAgent()
+	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.ServiceAccountName
+	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.ServiceAccountName
+
+	cases := []struct {
+		builder  string
+		subjects []rbacv1.Subject
+		// runAs is read off the pod the binding exists for, not typed out, so
+		// renaming a ServiceAccount cannot leave the two halves disagreeing
+		// while this test still passes.
+		runAs string
+	}{
+		{"buildA2ACalloutClusterRoleBinding", buildA2ACalloutClusterRoleBinding(agent).Subjects, callout},
+		{"buildA2ACalloutRoleBinding", buildA2ACalloutRoleBinding(agent).Subjects, callout},
+		{"buildA2AGatewayRoleBinding", buildA2AGatewayRoleBinding(agent).Subjects, gateway},
+	}
+
+	covered := map[string]bool{}
+	for _, tc := range cases {
+		covered[tc.builder] = true
+		t.Run(tc.builder, func(t *testing.T) {
+			if tc.runAs == "" {
+				t.Fatal("the workload this binding is for declares no serviceAccountName, so there is nothing to compare against")
+			}
+			if len(tc.subjects) != 1 {
+				t.Fatalf("subjects = %+v, want exactly one; every extra subject is another principal holding this role", tc.subjects)
+			}
+			got := tc.subjects[0]
+			if got.Kind != "ServiceAccount" {
+				t.Errorf("subject kind = %q, want ServiceAccount", got.Kind)
+			}
+			if got.Name != tc.runAs {
+				t.Errorf("subject names %q but the workload runs as %q", got.Name, tc.runAs)
+			}
+			if got.Namespace != agent.Namespace {
+				t.Errorf("subject namespace = %q, want %q -- a ServiceAccount subject with the wrong namespace names a different principal entirely",
+					got.Namespace, agent.Namespace)
+			}
+		})
+	}
+
+	builders := buildersReturning(t, rbacBindingKinds)
+	if len(builders) == 0 {
+		t.Fatal("no binding builder found in this package, so the coverage check below passed vacuously")
+	}
+	found := 0
+	for builder, kind := range builders {
+		if !strings.HasPrefix(builder, "buildA2A") {
+			continue
+		}
+		found++
+		if !covered[builder] {
+			t.Errorf("%s renders a %s and has no case above, so nothing says who it grants that role to", builder, kind)
+		}
+	}
+	if found != len(cases) {
+		t.Errorf("found %d buildA2A* binding builders in the package but %d cases above; a case names a builder that no longer exists", found, len(cases))
+	}
+}
+
 func TestNothingA2ALabelledSurvivesAFlipToToday(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
