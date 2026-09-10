@@ -149,13 +149,13 @@ variable "scoped_clusters" {
 }
 
 variable "agent_service_account_id" {
-  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs this variable does not reach (the minter's authorization rule does track it — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so a distinct GSA name un-collides creation, not identity: set agent_ksa_name too, or installs sharing the agent namespace can each mint the other's tokens."
+  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs, named by litellm_service_account_id and github_minter_service_account_id rather than by this variable (the minter's authorization rule does track this one — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so a distinct GSA name un-collides creation, not identity: set agent_ksa_name too, or installs sharing the agent namespace can each mint the other's tokens."
   type        = string
   default     = null
 }
 
 variable "agent_ksa_name" {
-  description = "Kubernetes ServiceAccount the agent pod runs as, and the KSA half of its Workload Identity binding. The Workload Identity principal is project/namespace/KSA with no cluster in it, so two installs in one project that share the namespace and this name bind one principal and each agent can mint the other's GSA tokens however differently the GSAs are named; give a second install its own name here. One variable feeds both consumers — the composition passes it to the kube-agents-iam module's ksa_name and to the chart's platformAgent.security.serviceAccountName — so the binding and the pod cannot name different KSAs. The default is the name both consumers defaulted to before this variable existed, so an install that never sets it does not move. Through the installer front doors, set it as a TF_VAR_agent_ksa_name=... line in install.env, on the same terms as agent_service_account_id."
+  description = "Kubernetes ServiceAccount the agent pod runs as, and the KSA half of its Workload Identity binding. The Workload Identity principal is project/namespace/KSA with no cluster in it, so two installs in one project that share the namespace and this name bind one principal and each agent can mint the other's GSA tokens however differently the GSAs are named; give a second install its own name here. One variable feeds both consumers — the composition passes it to the kube-agents-iam module's ksa_name and to the chart's platformAgent.security.serviceAccountName — so the binding and the pod cannot name different KSAs. The default is the name both consumers defaulted to before this variable existed, so an install that never sets it does not move. Through the installer front doors, set it as a TF_VAR_agent_ksa_name=... line in install.env: unlike agent_service_account_id, which the front doors now name with PLATFORM_AGENT_GSA_NAME, this has no install.env key of its own yet, and the generator writes no agent_ksa_name into terraform.tfvars, so the TF_VAR_ passthrough is what Terraform reads."
   type        = string
   nullable    = false
   default     = "kubeagents-platform-agent"
@@ -186,6 +186,18 @@ variable "agent_ksa_name" {
     condition     = endswith(var.agent_ksa_name, "-agent")
     error_message = "agent_ksa_name must end in \"-agent\": the kube-agents-agent-binding-scope ValidatingAdmissionPolicy (k8s-operator/config/admission/agent-rbac-policy.yaml, shipped by the chart) selects the bindings it governs by matchCondition binds-agent-sa, s.name.endsWith('-agent'), so a name outside the suffix drops this install's agent bindings out of the policy rather than failing them."
   }
+}
+
+variable "github_minter_service_account_id" {
+  description = "IAM service account ID for the GitHub token minter's GSA. Null selects the module default (kubeagents-github-minter-gsa), which is one fixed name per project like agent_service_account_id, and a second install in the same project that enables the minter must set its own for the same reason."
+  type        = string
+  default     = null
+}
+
+variable "litellm_service_account_id" {
+  description = "IAM service account ID for the LiteLLM gateway's Vertex AI GSA (model_provider = vertex_ai only). One fixed name per project, so a second Vertex install in the same project must set its own. A real default rather than null: the module it reaches (kube-agents-iam) defaults to the AGENT's name, which a null would select."
+  type        = string
+  default     = "kubeagents-litellm-gsa"
 }
 
 variable "image_tag" {
