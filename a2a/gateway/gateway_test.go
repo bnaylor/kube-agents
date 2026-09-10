@@ -679,7 +679,7 @@ func TestStaleActiveTaskHealsInsteadOfSteering(t *testing.T) {
 func seedTasklessDelegate(t *testing.T, r *rig, conv string, age time.Duration) *SessionRecord {
 	t.Helper()
 	rec := &SessionRecord{
-		Key: conv, ContextID: "ctx-taskless", Kind: "group", LastActivity: time.Now().UTC(),
+		Key: conv, ContextID: "ctx-taskless-" + randHex(4), Kind: "group", LastActivity: time.Now().UTC(),
 		BusSession: "chat-otter-dead", Addressee: "chat-otter-dead",
 		ActiveTask: &ActiveTask{TaskID: "task-never", CorrelationID: "corr-never",
 			Ask: "write a haiku", SubmittedAt: time.Now().Add(-age)},
@@ -713,12 +713,12 @@ func TestTasklessActiveTaskPastGraceHealsIntoNewDelegation(t *testing.T) {
 	}
 	var told bool
 	for _, p := range r.adapter.postTexts() {
-		if strings.Contains(p, "task-never") && strings.Contains(p, "never started") {
+		if strings.Contains(p, "task-never") && strings.Contains(p, "produced nothing") {
 			told = true
 		}
 	}
 	if !told {
-		t.Fatalf("the conversation was not told the task never started: %q", r.adapter.postTexts())
+		t.Fatalf("the conversation was not told the task produced nothing: %q", r.adapter.postTexts())
 	}
 	rec, err := r.g.reg.Get(context.Background(), conv)
 	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != call.TaskID {
@@ -729,33 +729,70 @@ func TestTasklessActiveTaskPastGraceHealsIntoNewDelegation(t *testing.T) {
 // TestTasklessActiveTaskInsideGraceStillSteers: the same record younger than
 // the grace is a task that may simply not have started yet — a cold pod, a
 // slow pull — and clearing it would start a second task under the first.
-// The message steers, as before, and nothing is released.
+// The message steers, as before, and nothing is released. A record with no
+// SubmittedAt at all has no age to judge and is left alone the same way.
 func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
-	conv := "discord:g1/thread-taskless-young"
-	seedTasklessDelegate(t, r, conv, time.Minute)
+	for name, age := range map[string]time.Duration{"discord:g1/thread-taskless-young": time.Minute, "discord:g1/thread-taskless-unaged": 0} {
+		conv := name
+		rec := seedTasklessDelegate(t, r, conv, age)
+		if age == 0 {
+			rec.ActiveTask.SubmittedAt = time.Time{}
+			if err := r.g.reg.Put(context.Background(), rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+			AuthorID: "1001", MessageID: "t-" + conv, Text: "make it about otters"}
+		waitFor(t, "steer published to the pending task for "+conv, func() bool {
+			for _, e := range inSubjectEnvelopes(t, r.url, "chat-otter-dead") {
+				if e.Kind == lib.KindMessage && e.TaskID == "task-never" && e.ContextID == rec.ContextID {
+					return true
+				}
+			}
+			return false
+		})
+		if got := len(spawn.calls()); got != 0 {
+			t.Fatalf("%s: a task inside the grace was released: %d spawns", conv, got)
+		}
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "produced nothing") {
+				t.Fatalf("%s: released a task still inside the grace: %q", conv, p)
+			}
+		}
+		got, err := r.g.reg.Get(context.Background(), conv)
+		if err != nil || got == nil || got.ActiveTask == nil || got.ActiveTask.TaskID != "task-never" {
+			t.Fatalf("%s: record no longer serializes on the pending task: %+v (err=%v)", conv, got, err)
+		}
+	}
+}
+
+// TestTasklessHealPersistsAcrossCapRefusal: the release is written when the
+// heal fires, not at the end of the turn — a Delegate refused at the session
+// cap returns before the end-of-turn write, and the conversation must not be
+// told it is released while the record still says otherwise.
+func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	spawn.setLive(1)
+	conv := "discord:g1/thread-taskless-cap"
+	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
 
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
-		AuthorID: "1001", MessageID: "t-2", Text: "make it about otters"}
-	waitFor(t, "steer published to the pending task", func() bool {
-		for _, e := range inSubjectEnvelopes(t, r.url, "chat-otter-dead") {
-			if e.Kind == lib.KindMessage && e.TaskID == "task-never" {
+		AuthorID: "1001", MessageID: "t-3", Text: "Delegate: write a haiku about otters"}
+	waitFor(t, "cap refusal posted", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "cap 1") {
 				return true
 			}
 		}
 		return false
 	})
-	if got := len(spawn.calls()); got != 0 {
-		t.Fatalf("a task inside the grace was released: %d spawns", got)
-	}
-	for _, p := range r.adapter.postTexts() {
-		if strings.Contains(p, "never started") {
-			t.Fatalf("released a task still inside the grace: %q", p)
-		}
-	}
 	rec, err := r.g.reg.Get(context.Background(), conv)
-	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != "task-never" {
-		t.Fatalf("record no longer serializes on the pending task: %+v (err=%v)", rec, err)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if rec.ActiveTask != nil {
+		t.Fatalf("release announced but not written: %+v", rec.ActiveTask)
 	}
 }
 

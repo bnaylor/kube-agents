@@ -25,8 +25,9 @@ const relayDurable = "gateway-relay"
 
 // neverStartedNotice is what the conversation sees when the heal releases a
 // task that produced no first event inside FirstEventGrace: the task id,
-// the grace, and what happens to the message that triggered it.
-const neverStartedNotice = "⚠️ task `%s` never started — nothing on its event stream after %s — so this conversation is released and this message is handled as a new turn"
+// the grace, and what happens to the message that triggered it. It states
+// the evidence (nothing on the stream in that long), not the inference.
+const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
 
 // Hex-suffix widths for the ids the gateway mints. Context and correlation
 // ids are wider than task and message ids: they outlive one task and join
@@ -281,24 +282,38 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// way, with a plain line instead of a status card (there is no status
 	// to replay). Only TaskNotFound qualifies: a transport failure cannot
 	// rule out events, so it heals nothing, as everywhere else the
-	// supervisor paths consult the stream. The task's own closure is not
-	// this branch's — the spawn-failure and Sweep paths publish terminals
-	// on evidence, and a heal on age alone could race a first event that
-	// is merely late.
+	// supervisor paths consult the stream. No terminal is published here:
+	// age alone is not evidence, a first event that is merely late could
+	// still arrive, and no supervisor path ever sees a task with no pod —
+	// so a task released here ages out with the stream's retention, the
+	// residue Session lifecycle names. The task index stays, as in the
+	// terminal case, so a late start still renders; its key is retired
+	// only if the task ever terminates.
 	if active := rec.ActiveTask; active != nil && !active.Detached {
 		task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
+		healed := false
 		switch {
 		case err == nil && task.Final:
 			g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
 			g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
-			rec.ActiveTask = nil
+			healed = true
 		case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 			time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
-			g.log.Info("healing an active task that never produced a first event",
+			g.log.Info("healing an active task with no first event inside the grace",
 				"conversation", rec.Key, "taskId", active.TaskID, "addressee", rec.Addressee,
 				"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
 			g.post(rec.Key, fmt.Sprintf(neverStartedNotice, active.TaskID, g.cfg.FirstEventGrace))
+			healed = true
+		}
+		if healed {
 			rec.ActiveTask = nil
+			// Write the release now, not at the end of the turn: a turn that
+			// returns early — a cap refusal, on exactly the Delegate that
+			// follows a wedge — would otherwise announce a release it never
+			// wrote and announce it again on the next turn.
+			if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+				g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+			}
 		}
 	}
 

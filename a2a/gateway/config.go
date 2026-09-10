@@ -124,8 +124,8 @@ type Config struct {
 	// the two publishes, a gateway restart mid-turn) has no events for the
 	// heal in handleInbound to see a terminal in, and the record steers every
 	// later message into it. Past this grace the heal treats "no events" as
-	// "never started" and releases the serialization; the task itself is
-	// left to the supervisor paths, which only ever act on evidence. Unset
+	// "never started" and releases the serialization; it publishes no
+	// terminal for the task, because age alone is not evidence. Unset
 	// means 10 minutes: the spec's cold start is 5-10s and the pod deadline's
 	// pre-start budget (podDeadlineGrace, the image pull before the process
 	// starts) is 10 minutes, so a task still legitimately pre-first-event at
@@ -133,7 +133,7 @@ type Config struct {
 	// releasing a slow-starting worker's task out from under it — the next
 	// turn then starts a second task while the first may still emit;
 	// raising it is how long a user waits before the conversation answers
-	// again.
+	// again. Values under 1m are refused at boot.
 	FirstEventGrace time.Duration
 
 	// OwnerDeployment names the gateway's own Deployment
