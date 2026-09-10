@@ -670,6 +670,95 @@ func TestStaleActiveTaskHealsInsteadOfSteering(t *testing.T) {
 	})
 }
 
+// seedTasklessDelegate writes the record #1318 observed: a Delegate whose
+// task is on the serialization record but produced NOTHING on its events
+// subject — no pod (PodName empty), no terminal for the heal to find, and
+// not even a `submitted` for Sweep or the relay to act on. Nothing is
+// published to the stream here on purpose; a task with events would pass
+// the old heal whether or not the no-events case is handled.
+func seedTasklessDelegate(t *testing.T, r *rig, conv string, age time.Duration) *SessionRecord {
+	t.Helper()
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-taskless", Kind: "group", LastActivity: time.Now().UTC(),
+		BusSession: "chat-otter-dead", Addressee: "chat-otter-dead",
+		ActiveTask: &ActiveTask{TaskID: "task-never", CorrelationID: "corr-never",
+			Ask: "write a haiku", SubmittedAt: time.Now().Add(-age)},
+		Tasks: []TaskRef{{ID: "task-never", Addressee: "chat-otter-dead"}},
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+// TestTasklessActiveTaskPastGraceHealsIntoNewDelegation (#1318): an active
+// task older than FirstEventGrace with no events at all must release the
+// conversation — the next "Delegate:" is a NEW delegation (fresh task, fresh
+// session, a spawn), not a steer into the task that never started, and the
+// conversation is told why.
+func TestTasklessActiveTaskPastGraceHealsIntoNewDelegation(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-taskless-old"
+	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "t-1", Text: "Delegate: write a haiku about otters"}
+	waitFor(t, "a fresh delegation spawned", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	if call.TaskID == "task-never" || call.Session == "chat-otter-dead" {
+		t.Fatalf("delegation reused the dead task or session: %+v", call)
+	}
+	if steers := inSubjectEnvelopes(t, r.url, "chat-otter-dead"); len(steers) != 0 {
+		t.Fatalf("the message was steered into the task that never started: %+v", steers)
+	}
+	var told bool
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "task-never") && strings.Contains(p, "never started") {
+			told = true
+		}
+	}
+	if !told {
+		t.Fatalf("the conversation was not told the task never started: %q", r.adapter.postTexts())
+	}
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != call.TaskID {
+		t.Fatalf("record does not serialize on the new task: %+v (err=%v)", rec, err)
+	}
+}
+
+// TestTasklessActiveTaskInsideGraceStillSteers: the same record younger than
+// the grace is a task that may simply not have started yet — a cold pod, a
+// slow pull — and clearing it would start a second task under the first.
+// The message steers, as before, and nothing is released.
+func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-taskless-young"
+	seedTasklessDelegate(t, r, conv, time.Minute)
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "t-2", Text: "make it about otters"}
+	waitFor(t, "steer published to the pending task", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, "chat-otter-dead") {
+			if e.Kind == lib.KindMessage && e.TaskID == "task-never" {
+				return true
+			}
+		}
+		return false
+	})
+	if got := len(spawn.calls()); got != 0 {
+		t.Fatalf("a task inside the grace was released: %d spawns", got)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "never started") {
+			t.Fatalf("released a task still inside the grace: %q", p)
+		}
+	}
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != "task-never" {
+		t.Fatalf("record no longer serializes on the pending task: %+v (err=%v)", rec, err)
+	}
+}
+
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread8"

@@ -235,6 +235,11 @@ limit, and the `ask` copy outlives the stream copy its justification rests on. T
 same missing field closes both, and until it does the gateway owes the record an
 independent bound (a bucket TTL, or clearing an active task whose pod no longer
 exists) rather than a justification that assumes a terminal that may not come. The
+no-events case has that bound: an active task with nothing on its events subject past
+the first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default) is released from
+the serialization at the conversation's next turn, with one line in the conversation
+saying so; the task's own terminal stays with the spawn-failure and Sweep paths, which
+publish on evidence. The
 terminal event this chain guarantees is also what deletes the active-task record (and
 the `ask` copy riding it). A detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
