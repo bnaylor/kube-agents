@@ -226,7 +226,10 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // A comment that names a set is a comment that needs a test naming the same
 // set, which is what this is. Seed came off the list the same way, in
 // gke-labs#1306: its $JS.API grant is now a2aSeedJetStreamGrants(), CREATE and
-// INFO on the streams provisioning names.
+// INFO on the streams provisioning names. Worker came off it in #1393, the same
+// way: a2aWorkerJetStreamGrants(), INFO/CONSUMER/DIRECT.GET on the four streams
+// it touches. Gateway is the last one, and it is the one that cannot narrow on
+// this branch's terms -- it has no client presenting a token yet.
 //
 // Failing here means one of two things and they want opposite responses. An
 // identity dropping off the list is the callout doing its job — narrow the
@@ -237,7 +240,7 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // own comment for why it cannot be enumerated instead.
 func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
 	const bare = "$JS.API.>"
-	expected := []string{"gateway", "worker"}
+	expected := []string{"gateway"}
 
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {

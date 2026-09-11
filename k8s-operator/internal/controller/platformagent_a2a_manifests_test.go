@@ -2448,7 +2448,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 //     interest for a push consumer's deliver_subject, so widening it is a
 //     review conversation for the same reason widening publish is.
 func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, "worker", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
