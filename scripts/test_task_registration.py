@@ -881,12 +881,14 @@ class TestTheSanitizer(unittest.TestCase):
         # The loader runs the redactor outside the import system, which is
         # cheap until the file pairs a dataclass with `from __future__ import
         # annotations`. Every annotation is a string then, and dataclasses
-        # resolves an unqualified one through sys.modules[cls.__module__] --
-        # unguarded, so a module never registered there dies on None, inside
-        # dataclasses and nowhere near the shapes this scan wants.
-        # gke-labs/kube-agents#1364 added RedactionRule and reded every test in
-        # this file. Both halves matter, so both are here; a fixture of our own
-        # keeps this a test of the loader after the redactor's contents move on.
+        # probes an unqualified one for KW_ONLY through
+        # sys.modules[cls.__module__] -- unguarded, so a module never
+        # registered there dies on None, inside dataclasses and nowhere near
+        # the shapes this scan wants. gke-labs/kube-agents#1364 added
+        # RedactionRule and reded every test in this file. Both halves matter,
+        # so both are here; a fixture of our own keeps this a test of the
+        # loader after the redactor's contents move on.
+        self.addCleanup(sys.modules.pop, validator.REDACTOR_MODULE_NAME, None)
         source = textwrap.dedent(
             '''
             from __future__ import annotations
@@ -912,8 +914,14 @@ class TestTheSanitizer(unittest.TestCase):
                     self.assertEqual(
                         set(validator.credential_patterns()), {"a token"}
                     )
-        # ..and the loader leaves the import system as it found it.
-        self.assertNotIn(validator.REDACTOR_MODULE_NAME, sys.modules)
+            # ..and it is still registered afterwards, the way the gateway's
+            # loader in charts/kube-agents/files/litellm_redaction_callback.py
+            # leaves it. Asserting the name is *absent* would be no test at
+            # all -- that passes on the broken version too, which never
+            # registers anything.
+            loaded = sys.modules.get(validator.REDACTOR_MODULE_NAME)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(pathlib.Path(loaded.__file__), path)
 
     def test_main_exits_non_zero_on_a_sanitization_finding(self):
         # main() scans the named case's directory, so a scratch draft is
