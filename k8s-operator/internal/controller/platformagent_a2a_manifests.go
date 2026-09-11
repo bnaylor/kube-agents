@@ -36,6 +36,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -135,6 +136,15 @@ const (
 
 	// a2aCredsSecretSuffix is appended to the NATS object name.
 	a2aCredsSecretSuffix = "-creds"
+
+	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
+	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
+	// the hex digest follows it. Eight characters is a change detector, the
+	// same role the annotation above plays, and it is what
+	// a2aPasswordDigestNeedles in the tests assumes when it checks that no
+	// credential digest reaches a rendered name.
+	a2aProvisionJobNameInfix      = "-a2a-provision-"
+	a2aProvisionJobNameHashLength = 8
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
@@ -964,28 +974,43 @@ echo "a2a provisioning complete"
 }
 
 // buildA2AProvisionJob runs the provisioning script against the rendered NATS.
-// The name carries a hash of the script so a changed payload is a new Job —
-// Jobs are immutable — and completed runs clean themselves up via TTL. The
-// TTL has a known cost, chosen not overlooked: once it removes the completed
-// Job, the next reconcile's create-if-absent re-runs the (idempotent) script
-// under the same name, so a standing next install re-proves its provisioning
-// roughly daily. That churn is one short-lived pod a day; the alternative — a
-// completed Job kept forever as the done-marker — trades it for permanent
-// clutter and a stale-looking object in every kubectl listing.
+// The name carries a digest of the rendered spec (a2aProvisionJobName) so a
+// changed render is a new Job — Jobs are immutable — and completed runs clean
+// themselves up via TTL. The TTL has a known cost, chosen not overlooked: once
+// it removes the completed Job, the next reconcile's create-if-absent re-runs
+// the (idempotent) script under the same name, so a standing next install
+// re-proves its provisioning roughly daily. That churn is one short-lived pod
+// a day; the alternative — a completed Job kept forever as the done-marker —
+// trades it for permanent clutter and a stale-looking object in every kubectl
+// listing.
 //
-// Creation is create-only convergence: the script's `info || add` lines make
-// re-runs clean but do NOT edit a stream that already exists, so a retention
-// or subject change in a later payload reaches fresh installs only. Migrating
-// an existing install is a manual `nats stream edit` — stage 1 accepts that
-// and says it here rather than implying the hash-rename re-provisions.
+// The digest covers everything this function renders into the spec: the
+// script, the image, the uid and security contexts, env, volumes, mounts,
+// backoffLimit and the TTL. A superseded Job is not deleted here, and how it
+// leaves depends on how far it got. A completed one leaves by TTL; one whose
+// pod ran and failed runs out its backoffLimit and then leaves by TTL; one
+// whose pod never ran — an unpullable image, an unschedulable pod, an
+// admission refusal — has no terminal condition for the TTL to start from
+// and stays until the mode flips or the agent is deleted, holding one slot
+// in the namespace pod quota the whole time. That last case is the image
+// override scenario this digest exists for, so deleting superseded
+// generations by label is owed, not merely nice. What holds today: the
+// status scan in reconcileA2A reads the current name only, so a stale
+// failure does not park the phase, and cleanupA2A deletes by label, so a
+// mode flip removes every generation at once.
+//
+// What the digest does not cover is what is on the bus. Creation is
+// create-only convergence: the script's `info || add` lines make re-runs
+// clean but do NOT edit a stream that already exists, so a retention or
+// subject change in a later payload reaches fresh installs only. Migrating an
+// existing install is a manual `nats stream edit` — stage 1 accepts that and
+// says it here rather than implying the digest-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 	script := a2aProvisionScript(agent)
-	sum := sha256.Sum256([]byte(script))
-	name := fmt.Sprintf("%s-a2a-provision-%s", agent.Name, hex.EncodeToString(sum[:])[:8])
 
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"},
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, "provision")},
+		ObjectMeta: metav1.ObjectMeta{Namespace: agent.Namespace, Labels: a2aLabels(agent, "provision")},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(20)),
 			TTLSecondsAfterFinished: ptr.To(int32(86400)),
@@ -1056,6 +1081,38 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			},
 		},
 	}
+	job.Name = a2aProvisionJobName(agent, job.Spec)
+	return job
+}
+
+// a2aProvisionJobName derives the provision Job's name from a digest of its
+// rendered spec. The name is the only lever the operator has on this object:
+// a Job's pod template is immutable and reconcileA2A creates the Job only when
+// nothing exists under that name, so a rendered change reaches an existing
+// install only by producing a new name. Until #1347 the digest covered the
+// script alone, and a change to anything else in the pod spec — the image,
+// the uid, a securityContext field, env, a mount, WorkingDir — rendered a Job
+// with the name already on the cluster and silently never took effect; the
+// #1259 WorkingDir fix sat undelivered on a live install until someone deleted
+// the Job by hand. The digest is over the whole JobSpec rather than the
+// template alone because backoffLimit and the TTL are exactly as unreachable
+// under create-only convergence.
+//
+// json.Marshal is the serializer because it is deterministic for these
+// types: struct fields in declaration order, map keys sorted (the template's
+// labels are the only map), and nothing in the render is time- or
+// randomness-derived — the one Secret reference is by name and key, not by
+// value. Determinism is the property that matters most here: a digest that
+// moved between two renders of the same agent would create a Job on every
+// reconcile, which TestA2AProvisionJobNameIsDeterministic pins. No error
+// return, for the reason scopedSAPoolJSON gives: every field is an API type
+// the server itself round-trips through JSON, a builder has nowhere to put an
+// error, and a Marshal failure would show up as every render digesting the
+// same bytes, which TestA2AProvisionJobNameTracksThePodSpec catches.
+func a2aProvisionJobName(agent *agentv1alpha1.PlatformAgent, spec batchv1.JobSpec) string {
+	rendered, _ := json.Marshal(spec)
+	sum := sha256.Sum256(rendered)
+	return agent.Name + a2aProvisionJobNameInfix + hex.EncodeToString(sum[:])[:a2aProvisionJobNameHashLength]
 }
 
 // defaultA2AMaxSessions is spec.harness.tuning.maxSessions when unset; the
@@ -1377,7 +1434,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
-	// content-hashed name; a payload change is a new name and a fresh run.
+	// spec-digested name; a changed render — script or pod spec — is a new
+	// name and a fresh run, and the superseded Job is left to its TTL.
 	job := buildA2AProvisionJob(agent)
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
@@ -1585,7 +1643,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		return err
 	}
 
-	// Provision Jobs carry a content hash in the name; find them by label.
+	// Provision Jobs carry a spec digest in the name, one per generation
+	// that has been rendered here; find them all by label.
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
 		a2aComponentLabel: "provision",
