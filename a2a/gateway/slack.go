@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -186,6 +187,14 @@ func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter
 // holds the websocket open until ctx is done. It does not return until the
 // event pump it starts has exited, so a caller that has seen Run return
 // knows no handler call is still in flight.
+//
+// That guarantee covers the handler INVOCATION and nothing downstream of it.
+// The gateway's handler is keyedQueue.enqueue, which appends under a mutex
+// and returns, leaving a "go q.run(key)" worker to do the actual task
+// dispatch and Web API writes; and Gateway.Run returns this Run's error
+// directly (gateway.go) without waiting on those workers, on reapLoop or on
+// sweepLoop. So "Run returned" means the pump is finished — not that the
+// gateway is.
 func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	// Deferred calls run LIFO, so the order these two are REGISTERED in is
 	// the reverse of the order they run in, and it matters: wg.Wait is
@@ -228,9 +237,20 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			case evt = <-s.sm.Events:
 			}
 			if evt.Type != socketmode.EventTypeEventsAPI {
-				// Not ours to ack. hello and disconnect do carry a Request,
-				// but one whose EnvelopeID is empty — acking those would
-				// write a junk frame back up the socket.
+				// Everything that is not an EventsAPI envelope is dropped
+				// here, unacked. socketmode's parseEvent attaches a Request
+				// to all five request types it knows
+				// (socketmode/socket_mode_managed_conn.go): hello and
+				// disconnect carry one whose EnvelopeID is empty — acking
+				// those would write a junk frame back up the socket — while
+				// slash_commands and interactive carry a real, non-empty one
+				// that this continue throws away.
+				//
+				// Which is fine only because the app subscribes to neither,
+				// so neither ever arrives. Turning on slash commands or
+				// interactivity means acking them here first: Slack wants the
+				// envelope acked inside three seconds, and an unacked one
+				// redelivers and shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -247,7 +267,31 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			// anyway — the socket is going away and Slack redelivers.
 			if evt.Request != nil {
 				if err := s.sm.AckCtx(ctx, evt.Request.EnvelopeID, nil); err != nil {
-					s.log.Warn("socket mode ack failed", "err", err)
+					// context.Canceled here is the pod terminating with
+					// envelopes still sitting in the 50-deep Events buffer —
+					// routine, and a WARN on every SIGTERM is a false
+					// positive for anything alerting on logs. Anything else
+					// is a real failure to write the ack and stays at WARN.
+					if errors.Is(err, context.Canceled) {
+						s.log.Debug("socket mode ack abandoned; shutting down", "err", err)
+					} else {
+						s.log.Warn("socket mode ack failed", "err", err)
+					}
+					// And DROP the turn — do not fall through and handle it.
+					// That reads like throwing away a user's message and is
+					// the opposite. An envelope we did not ack is one Slack
+					// redelivers, and redelivery is the safe half of
+					// at-least-once: the copy that comes back is either
+					// suppressed by alreadySeen or handled exactly once by
+					// whichever instance receives it. Handling it HERE as
+					// well is what makes it unsafe — SIGTERM cancels ctx, the
+					// ack fails, we start or steer a task anyway, the process
+					// exits with nothing acked on the wire, and Slack
+					// redelivers to the next instance, whose alreadySeen map
+					// is fresh and cannot suppress it. One user message, two
+					// turns. The next reader will be tempted to "recover"
+					// here by handling it anyway; that recovery is the bug.
+					continue
 				}
 			}
 			e, ok := evt.Data.(slackevents.EventsAPIEvent)
@@ -414,7 +458,18 @@ func (s *SlackAdapter) isSessionRoot(ctx context.Context, channel, threadTS stri
 		ChannelID: channel, Timestamp: threadTS, Limit: 1, Inclusive: true,
 	})
 	if err != nil || len(msgs) == 0 {
-		s.log.Warn("thread root lookup failed; reply not delivered", "channel", channel, "thread", threadTS, "err", err)
+		// Canceled, and only Canceled, is demoted: that is the pod going away
+		// mid-read on shutdown, not an operational problem. Deliberately NOT
+		// DeadlineExceeded — at this site that means slackRepliesTimeout
+		// genuinely expired on a slow conversations.replies, which cost a
+		// user their reply and is the signal worth alerting on. A nil err
+		// with no messages back is not a context error either, and also
+		// stays at WARN.
+		if errors.Is(err, context.Canceled) {
+			s.log.Debug("thread root lookup abandoned on shutdown; reply not delivered", "channel", channel, "thread", threadTS, "err", err)
+		} else {
+			s.log.Warn("thread root lookup failed; reply not delivered", "channel", channel, "thread", threadTS, "err", err)
+		}
 		return false
 	}
 	root := slackMentionsBot(msgs[0].Text, s.botUserID)
@@ -459,7 +514,16 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			Kind:         "dm",
 			AuthorID:     m.User,
 			MessageID:    m.TimeStamp,
-			Text:         slackUnescaper.Replace(text),
+			// Decoding also changes what the affordance matchers see. That is
+			// intended, and it is not obvious: normalize (text.go) strips
+			// every non-alphanumeric, so a typed "<stop>" — on the wire as
+			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
+			// nothing, and decoded first it normalizes to "stop" and is a
+			// hard task cancel. Matching what the user typed beats matching
+			// Slack's entity mangling, so this is the right way round. The
+			// same shift makes normalized text shorter, so an ask that
+			// decodes can newly fall under isStatusQuery's wideMatchLenCap.
+			Text: slackUnescaper.Replace(text),
 		}, true
 	}
 	mentioned := slackMentionsBot(text, s.botUserID)
@@ -504,7 +568,8 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		MessageID:    m.TimeStamp,
 		// Decoded last, after the mention match and strip above: both key on
 		// Slack's raw "<@U…>" form, which decoding would have turned into
-		// plain text they no longer recognize.
+		// plain text they no longer recognize. Carries the same deliberate
+		// effect on normalize and the affordance matchers as the DM path.
 		Text: slackUnescaper.Replace(text),
 	}, true
 }

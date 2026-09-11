@@ -2,10 +2,12 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,14 +68,68 @@ func (f *fakeSlackAPI) OpenConversation(params *slack.OpenConversationParameters
 	return ch, false, false, nil
 }
 
+// GetConversationRepliesContext honours ctx the way the real client does —
+// a cancelled or expired context comes back as ctx.Err() and no messages —
+// so tests can drive the shutdown and timeout paths of isSessionRoot.
 func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
 	f.repliesCalls++
+	if err := ctx.Err(); err != nil {
+		return nil, false, "", err
+	}
 	return f.replies[params.ChannelID+"/"+params.Timestamp], false, "", nil
 }
 
 func newTestSlackAdapter(api *fakeSlackAPI) *SlackAdapter {
 	return &SlackAdapter{api: api, log: slog.Default(), botUserID: "UBOT",
 		sessionRoots: map[string]bool{}, seen: map[string]bool{}}
+}
+
+// recordingHandler captures log records so a test can assert on the LEVEL a
+// message came out at, not only on its text — the shutdown-path filters are
+// entirely about level, and a test that only matched the words would pass
+// against the WARN-on-every-SIGTERM behaviour they exist to remove. Mutexed
+// because the pump logs from its own goroutine.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// level reports the level of the first record whose message contains sub.
+func (h *recordingHandler) level(sub string) (slog.Level, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if strings.Contains(r.Message, sub) {
+			return r.Level, true
+		}
+	}
+	return 0, false
+}
+
+// slackEnvelope builds the socketmode.Event shape a real EventsAPI delivery
+// has, Request and all — the field TestSlackRunAwaitsPumpGoroutine leaves nil
+// and so routes around the ack entirely.
+func slackEnvelope(envelopeID string, m *slackevents.MessageEvent) socketmode.Event {
+	return socketmode.Event{
+		Type:    socketmode.EventTypeEventsAPI,
+		Request: &socketmode.Request{EnvelopeID: envelopeID},
+		Data: slackevents.EventsAPIEvent{
+			Type:       slackevents.CallbackEvent,
+			InnerEvent: slackevents.EventsAPIInnerEvent{Data: m},
+		},
+	}
 }
 
 func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevents.MessageEvent {
@@ -371,11 +427,21 @@ func TestSlackAskEchoIsNotDoubleEscaped(t *testing.T) {
 // reply is dropped either way, so it must not pay for the thread-root read
 // first. That read runs on the event pump's goroutine under
 // slackRepliesTimeout, and the next envelope's ack waits behind it — a
-// two-second stall spent to discard the message. The control case in the
-// same thread proves the guard itself still reads when the answer matters.
+// two-second stall spent to discard the message. The control case — a reply
+// with text, in a thread of its OWN — proves the guard still reads when the
+// answer matters.
+//
+// The control's thread is separate on purpose. Sharing 300.1 with the empty
+// cases made the final count assertion worthless: with the guard removed the
+// attachment case does the read and caches the answer, the whitespace and
+// control cases then both hit that cache, and repliesCalls lands on exactly
+// the 1 the test wanted. It passed on a cache hit while claiming to prove a
+// read. In its own uncached thread the control has to spend the call, so the
+// same "want 1" now reads 2 the moment the guard goes.
 func TestSlackEmptyTurnSkipsRootLookup(t *testing.T) {
 	api := &fakeSlackAPI{replies: map[string][]slack.Message{
 		"C1/300.1": {{Msg: slack.Msg{Text: "<@UBOT> watch the rollout", User: "U1"}}},
+		"C1/310.1": {{Msg: slack.Msg{Text: "<@UBOT> and this one too", User: "U1"}}},
 	}}
 	a := newTestSlackAdapter(api)
 
@@ -397,13 +463,13 @@ func TestSlackEmptyTurnSkipsRootLookup(t *testing.T) {
 		t.Errorf("whitespace reply made %d conversations.replies calls, want 0", api.repliesCalls)
 	}
 
-	// Control: the same uncached thread, with text. The read must happen,
-	// and the reply must deliver.
-	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "steer it", "303.0", "300.1")); !ok {
+	// Control: a different thread, uncached by anything above, with text.
+	// The read must happen, and the reply must deliver.
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "steer it", "313.0", "310.1")); !ok {
 		t.Error("an unmentioned reply in a bot-rooted thread must deliver")
 	}
 	if api.repliesCalls != 1 {
-		t.Errorf("non-empty reply made %d conversations.replies calls, want 1", api.repliesCalls)
+		t.Errorf("made %d conversations.replies calls, want 1 — only the control should read", api.repliesCalls)
 	}
 }
 
@@ -584,5 +650,183 @@ func TestSlackRunAwaitsPumpGoroutine(t *testing.T) {
 	}
 	if !pumpFinishedHandler {
 		t.Error("Run returned before the pump finished")
+	}
+}
+
+// TestSlackPumpDropsATurnItCouldNotAck is the duplicate-turn guard. An
+// envelope we failed to ack is one Slack will redeliver; handling it here as
+// well turns that safe redelivery into two turns from one user message,
+// because the instance that gets the redelivery has an empty alreadySeen map
+// and cannot suppress it. So a failed ack must drop the turn, not log and
+// carry on.
+//
+// The ack failure is forced without racing a context cancellation: socketmode
+// refuses to write a Socket Mode response of 20KB or more (Slack silently
+// drops those), so AckCtx on an oversized envelope ID fails deterministically,
+// before the response ever reaches the send channel. A second, ackable
+// envelope behind it proves the drop is a drop and not a dead pump — and,
+// since Events is FIFO and the pump is single-threaded, seeing the second turn
+// means the first was already decided.
+func TestSlackPumpDropsATurnItCouldNotAck(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+	}))
+	defer srv.Close()
+
+	logs := &recordingHandler{}
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.log = slog.New(logs)
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	delivered := make(chan InboundMessage, 4)
+
+	a.sm.Events <- slackEnvelope(strings.Repeat("E", 32*1024), slackMsg("im", "D1", "U1", "unacked", "600.0", ""))
+	a.sm.Events <- slackEnvelope("Env-ok", slackMsg("im", "D1", "U1", "acked", "601.0", ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(ctx, func(m InboundMessage) { delivered <- m }) }()
+
+	select {
+	case m := <-delivered:
+		if m.MessageID == "600.0" {
+			t.Fatalf("the unacked turn reached the handler: %+v — Slack will redeliver it, so this is the duplicate", m)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the ackable turn never reached the handler")
+	}
+	select {
+	case m := <-delivered:
+		t.Errorf("a second turn reached the handler: %+v", m)
+	default:
+	}
+
+	// An ack that failed for anything other than shutdown is a real failure
+	// and keeps its WARN.
+	if lvl, ok := logs.level("ack failed"); !ok || lvl != slog.LevelWarn {
+		t.Errorf("oversized-envelope ack logged at %v (found=%v), want WARN", lvl, ok)
+	}
+
+	cancel()
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned")
+	}
+}
+
+// TestSlackAckCtxFailsOnACancelledContext pins the premise the shutdown filter
+// rests on: AckCtx really does come back context.Canceled once the context is
+// done and the response channel cannot take the write. Plain Ack could not —
+// it passes context.TODO(), and marshalling a forty-byte struct does not fail
+// — which is why the error branch was unreachable before the switch to AckCtx
+// and is now hit on every termination.
+func TestSlackAckCtxFailsOnACancelledContext(t *testing.T) {
+	sm := socketmode.New(slack.New("xoxb-stub"))
+	// socketModeResponses is 20 deep and its drain goroutine only runs under
+	// RunContext, so twenty sends leave the buffer full and ctx.Done the only
+	// ready case in AckCtx's select.
+	for i := 0; i < 20; i++ {
+		if err := sm.Send(socketmode.Response{EnvelopeID: "filler"}); err != nil {
+			t.Fatalf("filling the response buffer: %v", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sm.AckCtx(ctx, "Env-1", nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("AckCtx on a cancelled context = %v, want context.Canceled", err)
+	}
+}
+
+// TestSlackRootLookupLogLevels: the thread-root read fires on every
+// unmentioned thread reply, so its failure log is the noisiest thing in the
+// adapter and a WARN on every pod termination is a false positive for anything
+// alerting on logs. Cancelled is demoted. DeadlineExceeded is NOT — at this
+// site that is slackRepliesTimeout genuinely expiring on a slow
+// conversations.replies, which cost a user their reply and is the real
+// operational signal a blanket "any context error" filter would swallow.
+func TestSlackRootLookupLogLevels(t *testing.T) {
+	// Shutdown: the parent context is already cancelled.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	shutdown := &recordingHandler{}
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.log = slog.New(shutdown)
+	if a.isSessionRoot(cancelled, "C1", "700.1") {
+		t.Error("a failed lookup must report false")
+	}
+	if lvl, ok := shutdown.level("thread root lookup"); !ok || lvl != slog.LevelDebug {
+		t.Errorf("cancelled lookup logged at %v (found=%v), want DEBUG", lvl, ok)
+	}
+
+	// The timeout, modelled with a parent whose deadline has already passed
+	// so the derived context reports DeadlineExceeded rather than Canceled.
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	timedOut := &recordingHandler{}
+	b := newTestSlackAdapter(&fakeSlackAPI{})
+	b.log = slog.New(timedOut)
+	if b.isSessionRoot(expired, "C1", "700.2") {
+		t.Error("a timed-out lookup must report false")
+	}
+	if lvl, ok := timedOut.level("thread root lookup"); !ok || lvl != slog.LevelWarn {
+		t.Errorf("timed-out lookup logged at %v (found=%v), want WARN — slackRepliesTimeout expiring is a dropped reply", lvl, ok)
+	}
+
+	// And a plain empty answer, with no context involved at all, still warns.
+	empty := &recordingHandler{}
+	c := newTestSlackAdapter(&fakeSlackAPI{})
+	c.log = slog.New(empty)
+	if c.isSessionRoot(context.Background(), "C1", "700.3") {
+		t.Error("an unknown thread root must report false")
+	}
+	if lvl, ok := empty.level("thread root lookup"); !ok || lvl != slog.LevelWarn {
+		t.Errorf("empty root lookup logged at %v (found=%v), want WARN", lvl, ok)
+	}
+}
+
+// TestSlackDecodedTextDrivesTheAffordances pins a consequence of decoding the
+// inbound entities that nothing else in the suite notices. normalize() drops
+// every non-alphanumeric, so the entity escaping used to survive it as
+// letters: "&lt;stop&gt;" normalized to "ltstopgt" and matched nothing.
+// Decoded first, the same wire text normalizes to "stop" — a hard task cancel.
+// Kept deliberately: the affordances should match what the user typed, not
+// what Slack's transport did to it. The same shift shortens normalized text,
+// so an ask can newly fall under isStatusQuery's wideMatchLenCap.
+func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+
+	// What Slack puts on the wire when a user types "<stop>".
+	const stopWire = "&lt;stop&gt;"
+	if got := normalize(stopWire); got != "ltstopgt" || isStop(stopWire) {
+		t.Fatalf("premise: normalize(%q) = %q, isStop = %v", stopWire, got, isStop(stopWire))
+	}
+	msg, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", stopWire, "800.0", ""))
+	if !ok {
+		t.Fatal("dm must deliver")
+	}
+	if msg.Text != "<stop>" {
+		t.Fatalf("inbound text = %q, want the decoded form", msg.Text)
+	}
+	if !isStop(msg.Text) {
+		t.Error("a typed <stop> must cancel: the decode is what lets normalize see \"stop\"")
+	}
+
+	// The length half. Same words, entity-encoded and not.
+	const pokeWire = "any update on the &lt;prod&gt; rollout &amp; the canary?"
+	if isStatusQuery(pokeWire, true) {
+		t.Errorf("premise: the wire form normalizes to %d chars, over the %d cap", len(normalize(pokeWire)), wideMatchLenCap)
+	}
+	poke, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", pokeWire, "801.0", ""))
+	if !ok {
+		t.Fatal("dm must deliver")
+	}
+	if !isStatusQuery(poke.Text, true) {
+		t.Errorf("decoded %q normalizes to %d chars and must read as a status poke", poke.Text, len(normalize(poke.Text)))
 	}
 }
