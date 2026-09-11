@@ -183,8 +183,26 @@ func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter
 }
 
 // Run resolves the bot's own identity, consumes Socket Mode events, and
-// holds the websocket open until ctx is done.
+// holds the websocket open until ctx is done. It does not return until the
+// event pump it starts has exited, so a caller that has seen Run return
+// knows no handler call is still in flight.
 func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	// Deferred calls run LIFO, so the order these two are REGISTERED in is
+	// the reverse of the order they run in, and it matters: wg.Wait is
+	// registered first so that it runs last, after cancel has told the pump
+	// to stop. Registered the other way round — cancel first, Wait second —
+	// Run would block in Wait on a pump whose context is still live and
+	// deadlock. Everything the pump can block on inside this file is
+	// ctx-bounded — the Events receive selects on ctx.Done, isSessionRoot's
+	// Web API read is capped at slackRepliesTimeout and takes this ctx, and
+	// the ack below is AckCtx rather than Ack for exactly this reason — so
+	// the wait is finite for any handler that is. The gateway's handler is a
+	// non-blocking enqueue (keyedQueue.enqueue takes a mutex and returns);
+	// an embedder passing a handler that can block forever gets a Run that
+	// blocks with it, which is the honest reading of "the pump is finished".
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	// The pump below exits only on ctx, so derive our own: any return from
 	// Run — a failed auth.test, or RunContext giving up on an invalid token
 	// or an unrecoverable connection error while the parent ctx is still
@@ -197,7 +215,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	}
 	s.botUserID = auth.UserID
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		// socketmode never closes Events; exiting on ctx keeps embedders and
 		// the live test from leaking this goroutine past Run.
 		for {
@@ -217,8 +237,16 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			// seconds, so a payload we fail to parse would redeliver forever.
 			// Per-conversation ordering is the gateway queue's job, not the
 			// socket's.
+			//
+			// AckCtx, not Ack: Ack passes context.TODO() and hands the
+			// response to a 20-deep buffered channel drained by a sender
+			// goroutine that itself exits on ctx. Once that sender is gone a
+			// full buffer makes Ack block forever, and with Run now waiting
+			// on this goroutine that is a hung shutdown rather than a leaked
+			// one. Failing the ack on a cancelled ctx is the right answer
+			// anyway — the socket is going away and Slack redelivers.
 			if evt.Request != nil {
-				if err := s.sm.Ack(*evt.Request); err != nil {
+				if err := s.sm.AckCtx(ctx, evt.Request.EnvelopeID, nil); err != nil {
 					s.log.Warn("socket mode ack failed", "err", err)
 				}
 			}
@@ -448,11 +476,25 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// unmentioned reply needn't re-read it from the API.
 		threadTS = m.TimeStamp
 		s.markSessionRoot(m.Channel+"/"+threadTS, true)
-	} else if !mentioned && !s.isSessionRoot(ctx, m.Channel, threadTS) {
-		return InboundMessage{}, false
 	}
 	if text == "" {
 		// A bare mention has nothing to run; same shape as Discord's rule.
+		//
+		// Checked before the thread-root lookup below, not after it. An
+		// attachment-only (file_share with no caption) or whitespace-only
+		// reply in an uncached thread is discarded either way, and
+		// isSessionRoot can spend slackRepliesTimeout on a
+		// conversations.replies read with the event pump — and so the next
+		// envelope's ack — blocked behind it. Nothing is lost by skipping
+		// that read: sessionRoots is a pure lookup cache with no reader
+		// outside isSessionRoot itself, and its value is derived from the
+		// root message's text, so the next reply in the thread fills it
+		// with the same answer. The markSessionRoot above is deliberately
+		// still reached — a bare "@bot" roots a thread whose later replies
+		// are turns, and recording that costs no API call.
+		return InboundMessage{}, false
+	}
+	if isReply && !mentioned && !s.isSessionRoot(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{

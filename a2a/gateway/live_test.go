@@ -777,5 +777,8 @@ func TestLiveSlackAdapter(t *testing.T) {
 	}
 
 	cancel()
-	<-errCh // RunContext returns on cancel; any error here is the shutdown's
+	// RunContext returns on cancel; any error here is the shutdown's. Run
+	// also waits on its event pump now, so this receive is the live proof
+	// that the goroutine is gone rather than merely told to go.
+	<-errCh
 }

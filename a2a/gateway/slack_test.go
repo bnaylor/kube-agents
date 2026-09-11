@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
+	"github.com/slack-go/slack/socketmode"
 )
 
 // fakeSlackAPI fakes the six Web API calls the adapter makes; tests assert
@@ -21,6 +24,10 @@ type fakeSlackAPI struct {
 	members  []string
 	cursor   string
 	openedIM string
+	// repliesCalls counts conversations.replies reads. That call is the one
+	// synchronous Web API round trip made on the event pump's own goroutine,
+	// so tests assert on how often it happens, not only on its answer.
+	repliesCalls int
 }
 
 func (f *fakeSlackAPI) AuthTest() (*slack.AuthTestResponse, error) {
@@ -60,6 +67,7 @@ func (f *fakeSlackAPI) OpenConversation(params *slack.OpenConversationParameters
 }
 
 func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
+	f.repliesCalls++
 	return f.replies[params.ChannelID+"/"+params.Timestamp], false, "", nil
 }
 
@@ -356,5 +364,225 @@ func TestSlackAskEchoIsNotDoubleEscaped(t *testing.T) {
 	}
 	if strings.Contains(wire, "&amp;gt;") || strings.Contains(wire, "&amp;amp;") {
 		t.Errorf("status card echo is double-escaped: %q", wire)
+	}
+}
+
+// TestSlackEmptyTurnSkipsRootLookup: an attachment-only or whitespace-only
+// reply is dropped either way, so it must not pay for the thread-root read
+// first. That read runs on the event pump's goroutine under
+// slackRepliesTimeout, and the next envelope's ack waits behind it — a
+// two-second stall spent to discard the message. The control case in the
+// same thread proves the guard itself still reads when the answer matters.
+func TestSlackEmptyTurnSkipsRootLookup(t *testing.T) {
+	api := &fakeSlackAPI{replies: map[string][]slack.Message{
+		"C1/300.1": {{Msg: slack.Msg{Text: "<@UBOT> watch the rollout", User: "U1"}}},
+	}}
+	a := newTestSlackAdapter(api)
+
+	// A file_share reply with no caption, in a thread nothing has cached.
+	attachment := slackMsg("channel", "C1", "U2", "", "301.0", "300.1")
+	attachment.SubType = "file_share"
+	if _, ok := a.inbound(context.Background(), attachment); ok {
+		t.Error("an empty reply is not a turn")
+	}
+	if api.repliesCalls != 0 {
+		t.Errorf("empty reply made %d conversations.replies calls, want 0", api.repliesCalls)
+	}
+
+	whitespace := slackMsg("channel", "C1", "U2", "   \n\t ", "302.0", "300.1")
+	if _, ok := a.inbound(context.Background(), whitespace); ok {
+		t.Error("a whitespace-only reply is not a turn")
+	}
+	if api.repliesCalls != 0 {
+		t.Errorf("whitespace reply made %d conversations.replies calls, want 0", api.repliesCalls)
+	}
+
+	// Control: the same uncached thread, with text. The read must happen,
+	// and the reply must deliver.
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "steer it", "303.0", "300.1")); !ok {
+		t.Error("an unmentioned reply in a bot-rooted thread must deliver")
+	}
+	if api.repliesCalls != 1 {
+		t.Errorf("non-empty reply made %d conversations.replies calls, want 1", api.repliesCalls)
+	}
+}
+
+// TestSlackBareMentionStillRootsTheThread pins the side effect the empty-text
+// check above must not skip past. A bare "@bot" is not a turn, but it does
+// root a thread, and recording that costs no API call — so the first real
+// reply under it delivers from cache rather than spending
+// slackRepliesTimeout re-reading a root we already saw.
+func TestSlackBareMentionStillRootsTheThread(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT>", "400.0", "")); ok {
+		t.Fatal("a bare mention has nothing to run")
+	}
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "here is the ask", "401.0", "400.0")); !ok {
+		t.Error("a reply under a bare mention must deliver: the root mentioned the bot")
+	}
+	// api.replies is empty, so a lookup would have answered false and
+	// dropped the reply. Delivering proves it came from the cache fill.
+	if api.repliesCalls != 0 {
+		t.Errorf("root was re-read %d times; the bare mention should have cached it", api.repliesCalls)
+	}
+}
+
+// TestToMrkdwnEscapesAmpersandsInsideLinkURLs pins behaviour that reads like
+// a bug and is not one: the ampersand in a link's query string goes out as
+// "&amp;", inside the <url|label> form.
+//
+// That is what Slack asks for and what Slack itself emits. Slack's formatting
+// spec names exactly three characters to entity-encode — &, < and > — with no
+// carve-out for the URL portion of a control sequence, and the archived
+// version of that page states the invariant from the other side: "Because the
+// ampersands and angled brackets are already escaped, no further translation
+// need take place (for a web-client). The server ensures that no extra
+// un-escaped angled brackets or ampersands are included in the message."
+// (slackhq/slack-api-docs, page_formatting.md; the live page is
+// docs.slack.dev/messaging/formatting-message-text.) The rendering algorithm
+// on that same page — find <(.*?)>, split on the pipe, treat the head as a
+// URL — runs over the already-escaped text, so the client decodes the entity
+// when it builds the href.
+//
+// Confirmed from the other direction by slackapi/bolt-js#2103, where an app
+// posted a link containing a RAW "&" and Slack's own server normalised it to
+// "&amp;" in the stored message; Slack staff labelled the resulting broken
+// link a "server-side-issue" in the iOS client, not a sender error, and
+// desktop and web resolved the same link correctly. Emitting a bare "&" here
+// would therefore be re-escaped by Slack anyway.
+//
+// So: do not "fix" this by leaving the URL unescaped. Anything that stops
+// escaping inside <...> also stops escaping <!channel>, which is the reason
+// slackEscaper exists — see the case below.
+func TestToMrkdwnEscapesAmpersandsInsideLinkURLs(t *testing.T) {
+	cases := map[string]string{
+		"[Trace](https://monitor.local/query?a=1&b=2)": "<https://monitor.local/query?a=1&amp;b=2|Trace>",
+		"[Logs](https://x.example/l?a=1&b=2&c=3)":      "<https://x.example/l?a=1&amp;b=2&amp;c=3|Logs>",
+		// A bare URL is not rewritten; Slack auto-links it. The ampersand
+		// is still escaped, for the same reason.
+		"see https://x.example/l?a=1&b=2": "see https://x.example/l?a=1&amp;b=2",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnNeutralisesControlSequences is the property the escaping exists
+// for and the one no link-handling change may cost us. Relayed text is
+// executor output — model output — so a prompt-injected result containing
+// <!channel> must reach Slack as inert characters, not as an @channel ping to
+// the whole room. Same for <!here>, <!everyone>, a user mention, and a
+// subteam handle. Held alongside a link in the same string, since a link fix
+// is the plausible way to break it.
+func TestToMrkdwnNeutralisesControlSequences(t *testing.T) {
+	cases := map[string]string{
+		"<!channel> deploy done":  "&lt;!channel&gt; deploy done",
+		"<!here> heads up":        "&lt;!here&gt; heads up",
+		"<!everyone> all hands":   "&lt;!everyone&gt; all hands",
+		"<!subteam^S123|@sre> up": "&lt;!subteam^S123|@sre&gt; up",
+		"ping <@U999> now":        "ping &lt;@U999&gt; now",
+		"join <#C123|general>":    "join &lt;#C123|general&gt;",
+		// The mixed case: a real link is rewritten, the injected control
+		// sequence beside it is not.
+		"<!channel> see [Trace](https://monitor.local/q?a=1&b=2)": "&lt;!channel&gt; see <https://monitor.local/q?a=1&amp;b=2|Trace>",
+	}
+	for in, want := range cases {
+		got := toMrkdwn(in)
+		if got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+		// Belt and braces, independent of the table: the only control
+		// sequences left on the wire are URL links. No mention, channel
+		// link or special command survives as one.
+		for _, opener := range []string{"<!", "<@", "<#"} {
+			if strings.Contains(got, opener) {
+				t.Errorf("toMrkdwn(%q) = %q leaves a live %q control sequence", in, got, opener)
+			}
+		}
+	}
+}
+
+// TestSlackRunAwaitsPumpGoroutine: Run must not return while the event pump
+// it started is still working. Before the WaitGroup it did — RunContext
+// returning (an invalid token, an unrecoverable socket error) unblocked Run
+// while a handler call was mid-flight, so an embedder that treats "Run
+// returned" as "this adapter is finished" could tear down state the pump was
+// still writing to.
+//
+// The sequence is forced, not timed: apps.connections.open blocks until the
+// test releases it, so the pump is guaranteed to be inside handler before
+// RunContext fails. Then the test asserts Run is still blocked, releases the
+// handler, and reads a variable the pump wrote with no synchronisation of its
+// own — under -race, only Run's wg.Wait can order that write before this
+// read.
+func TestSlackRunAwaitsPumpGoroutine(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	// A real socketmode client, pointed at the stub: its Events channel is
+	// the pump's input, and its connect fails fatally (invalid_auth is one
+	// of the four errors socketmode does not retry) as soon as we release.
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	var pumpFinishedHandler bool // deliberately unsynchronised; see above
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	handler := func(InboundMessage) {
+		close(entered)
+		<-proceed
+		pumpFinishedHandler = true
+	}
+
+	// Queue one real turn for the pump before Run starts; Events is buffered.
+	a.sm.Events <- socketmode.Event{
+		Type: socketmode.EventTypeEventsAPI,
+		Data: slackevents.EventsAPIEvent{
+			Type: slackevents.CallbackEvent,
+			InnerEvent: slackevents.EventsAPIInnerEvent{
+				Data: slackMsg("im", "D1", "U1", "hello", "500.0", ""),
+			},
+		},
+	}
+
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(context.Background(), handler) }()
+
+	select {
+	case <-entered:
+	case err := <-returned:
+		t.Fatalf("Run returned before the pump reached the handler: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("pump never reached the handler")
+	}
+
+	// RunContext can now fail, which sends Run into its deferred cancel and
+	// wait while the handler is still parked.
+	close(release)
+	select {
+	case err := <-returned:
+		t.Fatalf("Run returned with the pump still in the handler: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(proceed)
+	select {
+	case err := <-returned:
+		if err == nil {
+			t.Error("Run should surface the connect failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned; the deferred cancel and wait are out of order")
+	}
+	if !pumpFinishedHandler {
+		t.Error("Run returned before the pump finished")
 	}
 }
