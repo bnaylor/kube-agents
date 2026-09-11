@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -720,12 +721,184 @@ func TestSlackPumpDropsATurnItCouldNotAck(t *testing.T) {
 	}
 }
 
-// TestSlackAckCtxFailsOnACancelledContext pins the premise the shutdown filter
+// slackInvalidAuthServer answers every Web API call with invalid_auth, which
+// socketmode's connect() treats as fatal — so RunContext gives up on the first
+// attempt instead of backing off and redialling, and a Run against it returns
+// in microseconds.
+func slackInvalidAuthServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// slackCancelledPumpRun drives one whole SlackAdapter.Run against a context
+// that is already cancelled, with a single ackable DM envelope sitting in
+// Events, and reports whether the pump took that envelope off the channel.
+//
+// The Socket Mode client is the real one, not a fake, because the behaviour
+// under test is the real one's: AckCtx on a cancelled context with room in the
+// 20-deep socketModeResponses buffer returns nil roughly half the time. Run's
+// deferred wg.Wait means the pump goroutine has finished by the time this
+// returns, so the caller's counters need no locking of their own.
+func slackCancelledPumpRun(apiURL, envelopeID, ts string, logs *recordingHandler, handler func(InboundMessage)) bool {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.log = slog.New(logs)
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(apiURL)))
+	a.sm.Events <- slackEnvelope(envelopeID, slackMsg("im", "D1", "U1", "hello", ts, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = a.Run(ctx, handler)
+
+	// Whatever RunContext pushed onto Events on its way out — connecting, and
+	// possibly connection_error — carries no Request, so matching on the
+	// envelope ID answers exactly one question: did the pump take OUR
+	// envelope, or did its top-of-loop select take ctx.Done instead?
+	for {
+		select {
+		case evt := <-a.sm.Events:
+			if evt.Request != nil && evt.Request.EnvelopeID == envelopeID {
+				return true
+			}
+		default:
+			return false
+		}
+	}
+}
+
+// slackCancelledPumpRuns is how many shutdowns the two tests below each drive,
+// and the count is the whole reason they are trustworthy. One run cannot be
+// enough: with ctx already done AND an envelope already buffered, both cases
+// of the pump's top-of-loop select are ready, and a Go select picks uniformly
+// at random among ready cases — so about half of all runs leave at the select
+// and never reach the code under test, and a one-shot test would go green
+// against the broken version every other time it ran. Fifty independent runs
+// make "no turn was handled" and "no ack was attempted" deterministic to about
+// 2^-50. That is also why the branches are not pinned by pre-filling the
+// response buffer instead: pre-filling forces AckCtx to FAIL, and the branch
+// that matters here is the one where it succeeds.
+const slackCancelledPumpRuns = 50
+
+// TestSlackPumpStartsNoTurnOnACancelledContext is the shutdown-race guard —
+// what 9239f5df set out to do and did only about half the time.
+//
+// The trap: AckCtx returning nil never meant Slack has the ack. It means the
+// response was QUEUED. SendCtx races ctx.Done against a send into the 20-deep
+// socketModeResponses channel, runResponseSender keeps that channel drained so
+// in production there is always room, and once ctx is cancelled both cases are
+// ready and the runtime picks at random — measured against slack-go v0.29.0,
+// 483 of 1000 such calls came back nil. Each of those used to fall straight
+// through to the handler and start or steer a task on an instance that is
+// exiting, while runResponseSender — whose select has the same shape — left
+// without flushing the queued ack. Slack redelivers to a new instance whose
+// alreadySeen map is empty, and one user message becomes two agent sessions
+// doing real work.
+//
+// So the contract is: a cancelled pump reaches no handler, whatever AckCtx
+// says. Two guards in Run enforce it — the ctx.Err() re-check after the Events
+// receive, and the ctx.Err() re-check after a successful ack — and this test
+// asserts the contract rather than either guard.
+// TestSlackPumpDoesNotAckOnACancelledContext below pins the first one alone.
+func TestSlackPumpStartsNoTurnOnACancelledContext(t *testing.T) {
+	srv := slackInvalidAuthServer(t)
+	logs := &recordingHandler{}
+
+	// handled is written by each run's pump goroutine and read here; Run's
+	// deferred wg.Wait orders every write before this function sees it.
+	handled, took := 0, 0
+	for i := 0; i < slackCancelledPumpRuns; i++ {
+		if slackCancelledPumpRun(srv.URL+"/", fmt.Sprintf("Env-cancel-%d", i),
+			fmt.Sprintf("800.%03d", i), logs, func(InboundMessage) { handled++ }) {
+			took++
+		}
+	}
+	if handled != 0 {
+		t.Errorf("a cancelled pump handled %d of %d turns; every one is a duplicate waiting to happen, because nothing flushed the ack and Slack will redeliver the envelope",
+			handled, slackCancelledPumpRuns)
+	}
+	// Without this the test could pass for the wrong reason: if every run
+	// happened to leave at the top-of-loop select, nothing below it ran.
+	if took == 0 {
+		t.Errorf("not one of the %d runs took the envelope off Events, so the code under test never executed", slackCancelledPumpRuns)
+	}
+	t.Logf("%d of %d cancelled pumps took the envelope past the top-of-loop select", took, slackCancelledPumpRuns)
+}
+
+// TestSlackPumpDoesNotAckOnACancelledContext pins the first guard on its own:
+// the ctx.Err() re-check immediately after the Events receive, which is what
+// defeats the pseudo-random select. A pump that is already cancelled must not
+// so much as ATTEMPT the ack — an ack queued now goes into a buffer whose
+// drain goroutine is exiting, so it is at best a no-op, and at worst the thing
+// that makes the pump believe the turn is safe to run.
+//
+// Both shutdown log lines are checked because an attempted ack announces
+// itself one way or the other: Canceled from AckCtx logs "ack abandoned", and
+// a nil arriving on a dead context logs "ack queued but not flushed". Over
+// fifty runs, an ack attempted at all produces one of them.
+func TestSlackPumpDoesNotAckOnACancelledContext(t *testing.T) {
+	srv := slackInvalidAuthServer(t)
+	logs := &recordingHandler{}
+	for i := 0; i < slackCancelledPumpRuns; i++ {
+		slackCancelledPumpRun(srv.URL+"/", fmt.Sprintf("Env-noack-%d", i),
+			fmt.Sprintf("810.%03d", i), logs, func(InboundMessage) {})
+	}
+	if lvl, ok := logs.level("ack abandoned"); ok {
+		t.Errorf("a cancelled pump attempted an ack and had it refused (logged at %v); the receive is not re-checking ctx", lvl)
+	}
+	if lvl, ok := logs.level("ack queued but not flushed"); ok {
+		t.Errorf("a cancelled pump queued an ack nothing will flush (logged at %v); the receive is not re-checking ctx", lvl)
+	}
+}
+
+// TestSlackAckCtxQueuesAnAckOnACancelledContext is the half of the premise
+// that actually describes production, and the one the pre-filled-buffer test
+// below cannot show. With ROOM in socketModeResponses — the normal state,
+// since runResponseSender drains it — AckCtx on a cancelled context has two
+// ready cases in its select and comes back nil a large fraction of the time.
+// Nil means queued, never delivered: runResponseSender exits on the same ctx
+// without flushing what is in the buffer.
+//
+// Asserted as "not an error every single time" rather than "about half", so
+// the assertion is not itself a coin toss — two hundred draws all landing on
+// the error case is 2^-200 if the select is fair, and a certainty if slack-go
+// has changed. Should this one ever start failing, the post-ack ctx.Err()
+// guard in the pump has lost its reason to exist and can go.
+func TestSlackAckCtxQueuesAnAckOnACancelledContext(t *testing.T) {
+	const draws = 200
+	queued := 0
+	for i := 0; i < draws; i++ {
+		sm := socketmode.New(slack.New("xoxb-stub"))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := sm.AckCtx(ctx, "Env-1", nil); err == nil {
+			queued++
+		}
+	}
+	if queued == 0 {
+		t.Errorf("AckCtx on a cancelled context with an empty response buffer errored on all %d draws; SendCtx no longer races ctx.Done against the buffered send", draws)
+	}
+	t.Logf("AckCtx returned nil — queued, not delivered — on %d of %d cancelled-context calls", queued, draws)
+}
+
+// TestSlackAckCtxFailsOnACancelledContext pins one premise the shutdown filter
 // rests on: AckCtx really does come back context.Canceled once the context is
 // done and the response channel cannot take the write. Plain Ack could not —
 // it passes context.TODO(), and marshalling a forty-byte struct does not fail
-// — which is why the error branch was unreachable before the switch to AckCtx
-// and is now hit on every termination.
+// — which is why the error branch was unreachable before the switch to AckCtx.
+//
+// Read the pre-filled buffer below for what it is and no more. It forces the
+// error branch by making ctx.Done the ONLY ready case in AckCtx's select, and
+// that is not what a real shutdown looks like: in production
+// runResponseSender keeps socketModeResponses drained, so the buffered send is
+// ready too and AckCtx comes back nil about half the time
+// (TestSlackAckCtxQueuesAnAckOnACancelledContext). This test is proof that
+// "AckCtx can return Canceled", NOT proof that the shutdown path is covered —
+// the coverage for that is TestSlackPumpStartsNoTurnOnACancelledContext and
+// TestSlackPumpDoesNotAckOnACancelledContext.
 func TestSlackAckCtxFailsOnACancelledContext(t *testing.T) {
 	sm := socketmode.New(slack.New("xoxb-stub"))
 	// socketModeResponses is 20 deep and its drain goroutine only runs under

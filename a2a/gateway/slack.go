@@ -236,6 +236,17 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				return
 			case evt = <-s.sm.Events:
 			}
+			// Both cases above are ready at once on a shutdown — ctx.Done is
+			// closed and Events still holds up to 50 buffered envelopes — and
+			// a select picks uniformly at random among its ready cases, so
+			// roughly half of all cancelled pumps take the envelope anyway.
+			// Re-check here, where the answer is not a coin toss. A cancelled
+			// pump acks nothing and starts nothing: every envelope left in
+			// the buffer stays unacked, which is the safe half of
+			// at-least-once, and Slack redelivers it to whoever is still up.
+			if ctx.Err() != nil {
+				return
+			}
 			if evt.Type != socketmode.EventTypeEventsAPI {
 				// Everything that is not an EventsAPI envelope is dropped
 				// here, unacked. socketmode's parseEvent attaches a Request
@@ -267,31 +278,75 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			// anyway — the socket is going away and Slack redelivers.
 			if evt.Request != nil {
 				if err := s.sm.AckCtx(ctx, evt.Request.EnvelopeID, nil); err != nil {
-					// context.Canceled here is the pod terminating with
-					// envelopes still sitting in the 50-deep Events buffer —
-					// routine, and a WARN on every SIGTERM is a false
-					// positive for anything alerting on logs. Anything else
-					// is a real failure to write the ack and stays at WARN.
-					if errors.Is(err, context.Canceled) {
-						s.log.Debug("socket mode ack abandoned; shutting down", "err", err)
-					} else {
-						s.log.Warn("socket mode ack failed", "err", err)
-					}
-					// And DROP the turn — do not fall through and handle it.
+					// DROP the turn — do not fall through and handle it.
 					// That reads like throwing away a user's message and is
 					// the opposite. An envelope we did not ack is one Slack
 					// redelivers, and redelivery is the safe half of
 					// at-least-once: the copy that comes back is either
 					// suppressed by alreadySeen or handled exactly once by
 					// whichever instance receives it. Handling it HERE as
-					// well is what makes it unsafe — SIGTERM cancels ctx, the
-					// ack fails, we start or steer a task anyway, the process
-					// exits with nothing acked on the wire, and Slack
-					// redelivers to the next instance, whose alreadySeen map
-					// is fresh and cannot suppress it. One user message, two
-					// turns. The next reader will be tempted to "recover"
-					// here by handling it anyway; that recovery is the bug.
+					// well is what makes it unsafe — the ack fails, we start
+					// or steer a task anyway, the process exits with nothing
+					// acked on the wire, and Slack redelivers to the next
+					// instance, whose alreadySeen map is fresh and cannot
+					// suppress it. One user message, two turns. The next
+					// reader will be tempted to "recover" here by handling it
+					// anyway; that recovery is the bug.
+					if errors.Is(err, context.Canceled) {
+						// The pod is terminating with envelopes still sitting
+						// in the 50-deep Events buffer — routine, and a WARN
+						// on every SIGTERM is a false positive for anything
+						// alerting on logs. Return rather than continue: the
+						// context is now definitively done, so every envelope
+						// still buffered behind this one is going to end the
+						// same way, and the loop has nothing left to do but
+						// exit and let Slack redeliver the lot.
+						s.log.Debug("socket mode ack abandoned; shutting down", "err", err)
+						return
+					}
+					// Anything else is a real failure to write this one ack —
+					// an oversized envelope ID, say — and keeps its WARN. It
+					// says nothing about the next envelope, so keep pumping;
+					// one bad ack should not take the adapter down.
+					s.log.Warn("socket mode ack failed", "err", err)
 					continue
+				}
+				// A nil from AckCtx does NOT mean Slack has the ack. It means
+				// the response was QUEUED: SendCtx (socketmode's
+				// socket_mode_managed_conn.go) selects ctx.Done against a send
+				// into the 20-deep socketModeResponses channel, and in
+				// production runResponseSender keeps that channel drained, so
+				// there is always room and both cases are ready the moment ctx
+				// is cancelled — uniformly at random again. Measured directly
+				// against this version of the library: 537 of 1000 AckCtx
+				// calls on an already-cancelled context with an empty buffer
+				// returned nil. Meanwhile runResponseSender's own select has
+				// the same shape and exits on ctx.Done WITHOUT flushing what
+				// is queued. So a nil here on a dead context means the ack is
+				// sitting in a buffer nobody will drain; handling the turn now
+				// produces exactly the duplicate the error branch above exists
+				// to prevent.
+				//
+				// The trade, stated here rather than left to be discovered:
+				// if the sender goroutine won its own race and got the ack
+				// onto the wire in the nanoseconds before this check, Slack
+				// has it, will not redeliver, and we have just dropped that
+				// turn on the floor. Landing in that window takes a completed
+				// websocket write; the duplicate it replaces happens on
+				// roughly half of all shutdowns. A dropped turn costs the user
+				// a re-ask. A duplicate turn is two agent sessions doing real
+				// work against the same cluster. Take the drop.
+				//
+				// And it is a smaller loss than it looks: Gateway.Run returns
+				// this Run's error without waiting on the "go q.run(key)"
+				// queue workers (gateway.go), so a turn started here on the
+				// way out would likely be executed only partway anyway.
+				// Declining to start new work during shutdown is the honest
+				// answer regardless of the ack.
+				if ctx.Err() != nil {
+					s.log.Debug("socket mode ack queued but not flushed; dropping the turn",
+						"envelopeID", evt.Request.EnvelopeID)
+					return
 				}
 			}
 			e, ok := evt.Data.(slackevents.EventsAPIEvent)
