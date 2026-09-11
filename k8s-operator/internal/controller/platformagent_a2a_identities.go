@@ -280,6 +280,46 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 // The seed Job (hand-applied, `a2a/deploy/seed.yaml`) also authenticates here
 // for the same reason; it is the artifact nothing owns.
 func workerIdentity() a2aIdentity {
+	// The JetStream API grant is a2aWorkerJetStreamGrants() rather than the
+	// $JS.API.> this user shipped with: INFO, CONSUMER and DIRECT.GET on the
+	// four streams it actually touches, by name and by verb. #1393 scoped it
+	// against the nats.conf template; A1 moved the subject lists out of that
+	// template and into this one, so — exactly like seed above, and like the
+	// directory removal below — the scoping is carried here by hand, because
+	// git cannot see that the two edits are the same edit. The argument for
+	// every verb it holds and every verb it refuses is on
+	// a2aWorkerJetStreamGrants itself.
+	publish := []string{
+		"a2a.tasks.*.*.events",
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+		// No a2a.agents.> publish. The directory is the identity plane:
+		// a2a.agents.{profile} is last-value, so one publish REPLACES a
+		// profile's card, and an agent-closed tombstone retires it. The
+		// payload spec says cards are "published by the profile's owner
+		// (the operator once profiles are CRs), not by workers", and
+		// nothing in the tree publishes one -- this grant had no caller
+		// and let the least-trusted principal in the deployment forge any
+		// profile's card. The gateway keeps SUBSCRIBE on the same
+		// subjects, which is the read discovery actually needs. Removed on
+		// main by #1313, carried across that merge by hand for the same
+		// reason the JetStream scoping is carried here.
+		//
+		// That closed forgery. Reach was still open until #1393: the bare
+		// $JS.API.> below covered STREAM.PURGE.DIRECTORY,
+		// STREAM.UPDATE.DIRECTORY and STREAM.DELETE.DIRECTORY, so worker
+		// could erase the whole directory in one call.
+		"agents.hb.>",
+		"$KV.runtime-state.>",
+	}
+	publish = append(publish, a2aWorkerJetStreamGrants()...)
+	publish = append(publish,
+		"$JS.ACK.TASKS.>",
+		"$JS.FC.>",
+		"_INBOX.worker.>",
+	)
+
 	return a2aIdentity{
 		user:    "worker",
 		account: a2aAccountApp,
@@ -290,37 +330,7 @@ func workerIdentity() a2aIdentity {
 			"than end it, so this closes when each session gets its own principal.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aWorkerPasswordKey,
-		publish: []string{
-			"a2a.tasks.*.*.events",
-			"a2a.topics.agent.platform.upgrade-readiness",
-			"a2a.topics.shared.blueprint",
-			"a2a.topics.shared.annotations",
-			// No a2a.agents.> publish. The directory is the identity
-			// plane: a2a.agents.{profile} is last-value, so one publish
-			// REPLACES a profile's card, and an agent-closed tombstone
-			// retires it. The payload spec says cards are "published by
-			// the profile's owner (the operator once profiles are CRs),
-			// not by workers", and nothing in the tree publishes one --
-			// this grant had no caller and let the least-trusted
-			// principal in the deployment forge any profile's card. The
-			// gateway keeps SUBSCRIBE on the same subjects, which is the
-			// read discovery actually needs. Removed on main by #1313;
-			// carried across this merge by hand, because A1 moved these
-			// lists out of the nats.conf template and git could not see
-			// that the two edits were the same edit.
-			//
-			// This closes forgery, not reach: $JS.API.> below still
-			// covers STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
-			// STREAM.DELETE.DIRECTORY, so worker can still erase the
-			// whole directory in one call. Scoping that wildcard the way
-			// #1306 scopes seed's is #1316, a separate change.
-			"agents.hb.>",
-			"$KV.runtime-state.>",
-			"$JS.API.>",
-			"$JS.ACK.TASKS.>",
-			"$JS.FC.>",
-			"_INBOX.worker.>",
-		},
+		publish:  publish,
 		subscribe: []string{
 			"a2a.tasks.>",
 			"a2a.topics.>",
