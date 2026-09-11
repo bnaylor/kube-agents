@@ -36,6 +36,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -68,6 +69,38 @@ const (
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
 
+	// a2aNATSClientPort is the bus client port, named here because the
+	// session-pod fence grants it and a fence and a listener that disagree
+	// about a port fail as a timeout rather than as a refusal.
+	a2aNATSClientPort = int32(4222)
+
+	// The LiteLLM ports the session fence grants, for the reason
+	// buildAgentEgressNetworkPolicy's LiteLLM rule states in full: a Pod
+	// selector matches after the ClusterIP translation, so the container port
+	// is the one that must be named. 8080 is what this repository's chart and
+	// integration config render; 80 covers an endpoint listening on the
+	// Service port directly and 4000 is LiteLLM's upstream default.
+	a2aLiteLLMServicePort   = int32(80)
+	a2aLiteLLMUpstreamPort  = int32(4000)
+	a2aLiteLLMContainerPort = int32(8080)
+
+	// a2aDNSPort is name resolution, granted on both protocols.
+	a2aDNSPort = int32(53)
+
+	// The streams the worker's JetStream API grant names, spelled as the
+	// provision script creates them. A KV bucket is a stream called
+	// KV_<bucket>, so the bucket name and the prefix are held apart.
+	a2aTasksStream         = "TASKS"
+	a2aTopicsStateStream   = "TOPICS-STATE"
+	a2aTopicsJournalStream = "TOPICS-JOURNAL"
+	a2aRuntimeStateBucket  = "runtime-state"
+	a2aKVStreamPrefix      = "KV_"
+
+	// a2aNATSConfGrantLine renders one allow-list entry at the depth of
+	// accounts.APP.users[].permissions.publish in the nats.conf template
+	// below: twelve spaces, the quoted subject, a trailing comma.
+	a2aNATSConfGrantLine = "            %q,"
+
 	// a2aProvisionWritablePath is the one writable path the provision
 	// container has: the emptyDir mount, the nats CLI's HOME and
 	// XDG_CONFIG_HOME, and its working directory. Four references that have to
@@ -84,12 +117,22 @@ const (
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
 	//
-	// None of the three images above are in images.json, deliberately: the
+	// None of the four A2A images are in images.json, deliberately: the
 	// inventory documents what a SUPPORTED install pulls, and mode next is an
 	// unsupported dev toggle. That exemption is graduation debt alongside the
 	// registry move — a mirrored or air-gapped install that flips next must
-	// override all three via the env vars until then.
+	// override all four via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
+
+	// The session-pod image, on the same terms as the three above. The
+	// gateway binary carries this same default of its own (gateway/config.go),
+	// which is what a gateway run outside the operator falls back to; the
+	// operator renders the env unconditionally so that the override exists
+	// wherever the operator is what installed the gateway. Arming spawning
+	// without it would mean an install that flips next pulls an image no
+	// operator input can redirect.
+	a2aWorkerImageEnvVar  = "A2A_WORKER_IMAGE"
+	defaultA2AWorkerImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
@@ -107,6 +150,15 @@ const (
 	// a2aConfigHashLength is how much of the hex digest rides the pod-template
 	// annotation. The annotation is a change detector, not an identifier.
 	a2aConfigHashLength = 16
+
+	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
+	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
+	// the hex digest follows it. Eight characters is a change detector, the
+	// same role the annotation above plays, and it is what
+	// a2aPasswordDigestNeedles in the tests assumes when it checks that no
+	// credential digest reaches a rendered name.
+	a2aProvisionJobNameInfix      = "-a2a-provision-"
+	a2aProvisionJobNameHashLength = 8
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
@@ -136,6 +188,13 @@ func a2aGatewayImage() string {
 		return override
 	}
 	return defaultA2AGatewayImage
+}
+
+func a2aWorkerImage() string {
+	if override := os.Getenv(a2aWorkerImageEnvVar); override != "" {
+		return override
+	}
+	return defaultA2AWorkerImage
 }
 
 func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Name + "-a2a-nats" }
@@ -236,12 +295,142 @@ func a2aSeedJetStreamGrants() []string {
 	return grants
 }
 
-// a2aSeedJetStreamGrantLines renders those grants as nats.conf allow-list
-// entries at the seed block's indentation.
-func a2aSeedJetStreamGrantLines() string {
-	lines := make([]string, 0, len(a2aSeedJetStreamGrants()))
-	for _, g := range a2aSeedJetStreamGrants() {
-		lines = append(lines, fmt.Sprintf("            %q,", g))
+// a2aWorkerJetStreamGrants is the worker's publish allow-list for the
+// JetStream API, replacing the `$JS.API.>` wildcard this user shipped with
+// (gke-labs/kube-agents#1316).
+//
+// worker is the least-trusted principal in the deployment: it is the identity
+// a session pod runs as, executing model output against untrusted input. The
+// wildcard covered STREAM.PURGE, STREAM.UPDATE, STREAM.DELETE and
+// STREAM.MSG.DELETE on every stream, DIRECTORY included. One PURGE empties the
+// directory for every profile and nothing repopulates it; DELETE leaves only a
+// re-run of the provision Job to bring the stream back.
+//
+// The list is what the worker-side binaries emit, read out of nats.go and then
+// measured against a real server running this render
+// (TestWorkerJetStreamGrantOnARealServer). Per stream:
+//
+//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet and the bridge's sweep),
+//     CONSUMER.CREATE (the bridge's durable through CreateOrUpdateConsumer, and
+//     the replay's ordered consumer; nats.go puts the filter subject in the API
+//     subject, so the grant ends in `>`), CONSUMER.MSG.NEXT (every pull), and
+//     DIRECT.GET (GetLastMsgForSubject: the replay horizon and the sweep's CAS
+//     baseline). Acks are $JS.ACK.TASKS.>, granted beside this list.
+//   - KV_runtime-state, the bridge's in-flight registry: STREAM.INFO
+//     (js.KeyValue binds a bucket by reading its stream), and CONSUMER.CREATE
+//     with CONSUMER.DELETE (kv.Keys is a push ordered consumer that nats.go
+//     creates and then deletes on Unsubscribe, and the sweep runs it at every
+//     bridge start). Put and Delete are publishes on $KV.runtime-state.>,
+//     granted beside this list. No DIRECT.GET: nothing on the path calls
+//     kv.Get -- the bridge puts, deletes and lists, and the worker adapter
+//     touches no bucket -- and when a caller appears the grant is
+//     DIRECT.GET.KV_runtime-state.>, with the server test as the place its
+//     absence shows.
+//   - TOPICS-STATE and TOPICS-JOURNAL: STREAM.INFO and DIRECT.GET, reads only.
+//     `a2a topics read` and `list` are js.Stream, Stream.Info and
+//     GetLastMsgForSubject on these two streams (lib.ReadTopicLatest,
+//     lib.TopicRegistry), and the CLI dials with whatever NATS_USER its pod
+//     carries; the worker credential is what a gateway-spawned session pod
+//     gets. The writes are the three exact topic subjects above this list.
+//
+// Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
+// provision script creates has allow_direct set: the script says
+// --allow-direct on each `stream add` (natscli's default too, stated so the
+// grant does not rest on one), a KV bucket always has it, and the live store
+// shows it on all seven. nats.go picks the route from the stream's own config,
+// so the fallback is never emitted and is not granted.
+//
+// What the wildcard granted that nothing on the worker path uses, and this
+// list now refuses: every verb on DIRECTORY (no STREAM.INFO, no consumer, no
+// DIRECT.GET -- the gateway keeps subscribe on the cards, which is the read
+// discovery needs), every verb on KV_session-state and KV_cap, PURGE / UPDATE /
+// DELETE / MSG.DELETE / RESTORE / SNAPSHOT on every stream, STREAM.CREATE,
+// enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST),
+// account INFO (jetstream.New never asks for it), and CONSUMER.INFO (nothing
+// on the path binds to an existing consumer by name, and on nats.go v1.53.1
+// no consumer re-verifies itself with it after a reconnect either --
+// TestWorkerConsumersSurviveABusRestart holds that across a server restart).
+//
+// CONSUMER.DELETE on TASKS is withheld, and it is the one subject nats.go
+// does emit here without a grant. The only emitter is the ordered consumer's
+// reset path, which fires DeleteConsumer in a goroutine and ignores the
+// result; an ephemeral it could not delete is reaped by its own five-minute
+// inactive threshold.
+//
+// Withholding it raises the price of reaching another principal's durable and
+// does not close the route, which is the correction to what this comment said
+// first. CONSUMER.CREATE is create-OR-UPDATE by name -- the request's `action`
+// field is empty for both, and the server has no ownership concept for a
+// consumer name -- so within a stream the worker may create consumers on,
+// every consumer on that stream is the worker's to reconfigure. Measured
+// against this render, on the gateway's relay durable: one permitted
+// $JS.API.CONSUMER.CREATE.TASKS.gateway-relay carrying the durable's own
+// config with filter_subject changed retunes it, and the gateway stops seeing
+// task events with no permissions violation logged anywhere; the same subject
+// carrying inactive_threshold has the server reap the durable, ack floor and
+// all, while CONSUMER.DELETE is refused in the same run. That is the residue
+// the web block below already records for web, on the one stream where
+// another principal has a durable to aim at. It is not new -- $JS.API.>
+// permitted all of it -- and no narrower grant exists: nats.go's ordered
+// consumers take server-generated names, so the last token has to be `>`, and
+// NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
+// literally named that. What closes it is the auth callout giving each
+// principal its own user. DELETE stays out as the one destructive verb here
+// that nothing on the worker path needs.
+//
+// One route this list narrows but cannot close, because it lives in a request
+// body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the
+// KV bucket) lets the worker ask the server to deliver that stream's messages
+// onto any subject, and a stream whose subjects cover the deliver subject
+// stores them -- under their ORIGINAL subjects, so this is not forgery (a
+// topic or card read by subject never sees them) but it is a persisted write
+// into a stream the worker has no publish grant for, and with discard=old an
+// eviction lever against it. The server delivers only once a subscription
+// exists whose subject is EXACTLY the deliver subject: a push consumer
+// registers through Sublist.registerNotification, which takes interest only
+// from a match whose `sub.subject` is byte-equal to the deliver subject, and
+// says so in its own doc comment ("this interest needs to be exact and ...
+// wildcards will not trigger the notifications"). Identical in 2.10.29 and
+// 2.14.5, and it is what bounds the residue: a principal watching the whole
+// plane is not enough, and neither is a stream's own wildcard ingest.
+// Measured on both versions, that splits the streams in two. TOPICS-STATE and
+// TOPICS-JOURNAL have literal subjects, so their own ingest subscription IS
+// the exact match and the write lands with no help (three TASKS messages
+// arrived in TOPICS-STATE under a2a.tasks.* subjects). DIRECTORY, TASKS and
+// the buckets have wildcard subjects, so a client has to hold a subscription
+// on the deliver subject itself -- for the directory, another principal
+// subscribed to one card subject. The gateway's `a2a.agents.>` and web's
+// `a2a.>` subscribe grants permit that but do not supply it: a subscription
+// on either wildcard leaves DIRECTORY empty, measured. Nothing in the tree
+// opens a literal card subscription today. The wildcard this replaces had the
+// same route with every stream as a source; what closes it is the worker not
+// holding CONSUMER.CREATE at all, which is a pre-created consumer per task
+// (the stage-3 dispatcher), not a grant. The server test measures all four
+// cases.
+func a2aWorkerJetStreamGrants() []string {
+	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
+	return []string{
+		"$JS.API.STREAM.INFO." + a2aTasksStream,
+		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
+		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
+		"$JS.API.STREAM.INFO." + kvRuntimeState,
+		"$JS.API.CONSUMER.CREATE." + kvRuntimeState + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvRuntimeState + ".*",
+		"$JS.API.STREAM.INFO." + a2aTopicsStateStream,
+		"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".>",
+		"$JS.API.STREAM.INFO." + a2aTopicsJournalStream,
+		"$JS.API.DIRECT.GET." + a2aTopicsJournalStream + ".>",
+	}
+}
+
+// a2aNATSConfGrantLines renders grants as nats.conf allow-list entries at the
+// depth of a user's publish or subscribe list, one per line, for splicing
+// into the template below.
+func a2aNATSConfGrantLines(grants []string) string {
+	lines := make([]string, 0, len(grants))
+	for _, g := range grants {
+		lines = append(lines, fmt.Sprintf(a2aNATSConfGrantLine, g))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -334,10 +523,12 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // decides who may say what before a message is read. Deny-by-default — a
 // permissions block with allow lists denies everything else — with per-user
 // _INBOX prefixes so the reply path cannot leak what the subject grants
-// withheld. Seed's JetStream API grant is scoped to the streams it provisions,
-// by name and by verb. Gateway and worker still hold $JS.API.>, which is
-// playground posture; narrowing those is gke-labs#1316 and wants its own live
-// proof, because unlike seed they create consumers.
+// withheld. Seed's JetStream API grant is scoped to the streams it provisions
+// and the worker's to the streams it uses, both by name and by verb
+// (a2aSeedJetStreamGrants, a2aWorkerJetStreamGrants). Gateway alone still
+// holds $JS.API.>, which is playground posture; narrowing it is the same
+// change again with its own table of what it emits, and it wants its own live
+// proof because it owns the relay durable and the session registry.
 //
 // pw is a parameter rather than a closure over the creds Secret because two
 // callers walk this template: buildA2ANATSConfigSecret with the real lookup,
@@ -481,16 +672,14 @@ accounts {
             # forge any profile's card. The gateway keeps SUBSCRIBE on the
             # same subjects, which is the read discovery actually needs.
             #
-            # This closes forgery, not reach: $JS.API.> below still covers
-            # STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
-            # STREAM.DELETE.DIRECTORY, so worker can still erase the whole
-            # directory in one call. Scoping that wildcard the way #1306
-            # scopes seed's is gke-labs/kube-agents#1316, and it is a
-            # separate change: the worker's JetStream use is TASKS and the
-            # KV bucket, and narrowing to those wants its own live proof.
+            # Closing forgery is not closing reach: the JetStream API grant
+            # below is what decides whether the worker can PURGE or DELETE
+            # the directory instead, so it is scoped by stream and by verb.
+            # a2aWorkerJetStreamGrants is the list and the argument for each
+            # entry; nothing in it names DIRECTORY.
             "agents.hb.>",
             "$KV.runtime-state.>",
-            "$JS.API.>",
+` + a2aNATSConfGrantLines(a2aWorkerJetStreamGrants()) + `
             "$JS.ACK.TASKS.>",
             "$JS.FC.>",
             "_INBOX.worker.>"
@@ -527,7 +716,7 @@ accounts {
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
-` + a2aSeedJetStreamGrantLines() + `
+` + a2aNATSConfGrantLines(a2aSeedJetStreamGrants()) + `
             "_INBOX.seed.>"
           ] }
           subscribe { allow = [
@@ -786,13 +975,109 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 // session pod it creates, paired with part-of: a2aPartOf under the STANDARD
 // app.kubernetes.io/component key (the spawner is a client of the cluster, not
 // the operator, so it uses the standard key; operator-rendered pieces carry
-// a2aComponentLabel). Session-pod spawning arms in the worker PR; the bus
-// fence below enumerates the pair now so it is already correct when the first
-// session pod exists.
+// a2aComponentLabel). Three things select on this pair and must agree: the
+// bus fence's session peer, the session fence's own podSelector, and the
+// gateway's session cap and sweeper, which count and list pods by it.
 const a2aSessionComponent = "a2a-session"
 
 func a2aNATSNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-nats-netpol"
+}
+
+func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-session-netpol"
+}
+
+// buildA2ASessionNetworkPolicy fences the pods the gateway spawns. Nothing
+// selected them before this policy, so a session pod's egress was open while
+// the agent pod it works for was fenced by buildAgentEgressNetworkPolicy —
+// the delegation path was the way around the agent's own allowlist.
+//
+// Deny-by-default with three destinations, which is the whole of a worker's
+// job description:
+//
+//	DNS       — name resolution for the two peers below, same peer set the
+//	            agent's egress policy uses so the two cannot drift on what DNS
+//	            means.
+//	NATS 4222 — the bus, by pod label rather than CIDR: a pod IP does not
+//	            survive a restart and a policy pinned to one stops matching
+//	            silently.
+//	LiteLLM   — the model path. Ports 80/4000/8080 for the reason
+//	            buildAgentEgressNetworkPolicy's LiteLLM rule states: a Pod
+//	            selector matches after the ClusterIP translation, so the port
+//	            that must be granted is the container's.
+//
+// There is no API-server rule, no 443 and no metadata rule beyond DNS, because
+// a session pod carries no ServiceAccount and no Workload Identity (spawn.go
+// sets AutomountServiceAccountToken: false and names none). A worker that
+// needs the internet is a design change, not a policy widening.
+//
+// PolicyTypes carries Ingress with no rules on purpose: nothing dials a
+// session pod, so a listener in a worker is an accident and an accident should
+// be unreachable. kubectl exec and logs ride the kubelet API rather than the
+// pod network, so debugging is unaffected.
+func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
+	// clusterDNSPeers is the one definition of "DNS" this package has — the
+	// gateway policy and the shell sandbox's policy already share it, and
+	// sharing it here is what keeps a correction from landing on two of the
+	// three. Its own comment argues each peer; the part that matters for a
+	// session pod is that port 53 to the Cloud DNS resolver address reaches
+	// no credential, because the token API is on :80 pre-NAT and :988
+	// post-NAT and the only rule below naming 80 is LiteLLM's, whose peer is
+	// a Pod selector that no link-local address matches.
+	dnsPeers := clusterDNSPeers(dnsClusterIPs)
+
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aSessionNetpolName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "session-netpol"),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			// No instance label, unlike the rest of what the operator
+			// renders, because the spawner stamps none — the selector can
+			// only name what the pods carry. Two PlatformAgents in one
+			// namespace would each fence the other's session pods with an
+			// identical rule set, so the effect is a duplicate fence rather
+			// than a gap; the bus grants still separate them at auth.
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					labelPartOf:                   a2aPartOf,
+					"app.kubernetes.io/component": a2aSessionComponent,
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
+					To:    dnsPeers,
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
+					To: []networkingv1.NetworkPolicyPeer{
+						namespacedPodPeer(agent.Namespace, map[string]string{
+							labelPartOf:       a2aPartOf,
+							a2aComponentLabel: "nats",
+						}),
+					},
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						tcpPort(a2aLiteLLMServicePort),
+						tcpPort(a2aLiteLLMUpstreamPort),
+						tcpPort(a2aLiteLLMContainerPort),
+					},
+					To: []networkingv1.NetworkPolicyPeer{
+						namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
+					},
+				},
+			},
+		},
+	}
 }
 
 // buildA2ANATSNetworkPolicy governs ingress to the NATS pod. Without it every
@@ -887,14 +1172,19 @@ NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
 # message streams are limits-based with an age window; replay is a read.
 # Every stream carries a hard max_bytes with discard old so a flood degrades
 # replay oldest-first instead of filling the PV and stalling JetStream.
+#
+# --allow-direct is stated on every stream even though it is the CLI's
+# default: the worker's JetStream API grant is written for the direct-get
+# route (nats.go picks DIRECT.GET or STREAM.MSG.GET from the stream's own
+# config), so the bit the grant rests on is set here, not inherited.
 
 # TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
-$NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS \
+$NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
   --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
-$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY \
+$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
@@ -914,14 +1204,14 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY \
 # topic the fleet actually reads - and "it cannot happen while the grants
 # hold" is the assumption the web user already broke once. A writerless
 # subject makes the failure mode land nowhere.
-$NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE \
+$NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
   --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
 # Journal-class topics: annotations.
-$NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL \
+$NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
   --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
 
@@ -942,28 +1232,43 @@ echo "a2a provisioning complete"
 }
 
 // buildA2AProvisionJob runs the provisioning script against the rendered NATS.
-// The name carries a hash of the script so a changed payload is a new Job —
-// Jobs are immutable — and completed runs clean themselves up via TTL. The
-// TTL has a known cost, chosen not overlooked: once it removes the completed
-// Job, the next reconcile's create-if-absent re-runs the (idempotent) script
-// under the same name, so a standing next install re-proves its provisioning
-// roughly daily. That churn is one short-lived pod a day; the alternative — a
-// completed Job kept forever as the done-marker — trades it for permanent
-// clutter and a stale-looking object in every kubectl listing.
+// The name carries a digest of the rendered spec (a2aProvisionJobName) so a
+// changed render is a new Job — Jobs are immutable — and completed runs clean
+// themselves up via TTL. The TTL has a known cost, chosen not overlooked: once
+// it removes the completed Job, the next reconcile's create-if-absent re-runs
+// the (idempotent) script under the same name, so a standing next install
+// re-proves its provisioning roughly daily. That churn is one short-lived pod
+// a day; the alternative — a completed Job kept forever as the done-marker —
+// trades it for permanent clutter and a stale-looking object in every kubectl
+// listing.
 //
-// Creation is create-only convergence: the script's `info || add` lines make
-// re-runs clean but do NOT edit a stream that already exists, so a retention
-// or subject change in a later payload reaches fresh installs only. Migrating
-// an existing install is a manual `nats stream edit` — stage 1 accepts that
-// and says it here rather than implying the hash-rename re-provisions.
+// The digest covers everything this function renders into the spec: the
+// script, the image, the uid and security contexts, env, volumes, mounts,
+// backoffLimit and the TTL. A superseded Job is not deleted here, and how it
+// leaves depends on how far it got. A completed one leaves by TTL; one whose
+// pod ran and failed runs out its backoffLimit and then leaves by TTL; one
+// whose pod never ran — an unpullable image, an unschedulable pod, an
+// admission refusal — has no terminal condition for the TTL to start from
+// and stays until the mode flips or the agent is deleted, holding one slot
+// in the namespace pod quota the whole time. That last case is the image
+// override scenario this digest exists for, so deleting superseded
+// generations by label is owed, not merely nice. What holds today: the
+// status scan in reconcileA2A reads the current name only, so a stale
+// failure does not park the phase, and cleanupA2A deletes by label, so a
+// mode flip removes every generation at once.
+//
+// What the digest does not cover is what is on the bus. Creation is
+// create-only convergence: the script's `info || add` lines make re-runs
+// clean but do NOT edit a stream that already exists, so a retention or
+// subject change in a later payload reaches fresh installs only. Migrating an
+// existing install is a manual `nats stream edit` — stage 1 accepts that and
+// says it here rather than implying the digest-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 	script := a2aProvisionScript(agent)
-	sum := sha256.Sum256([]byte(script))
-	name := fmt.Sprintf("%s-a2a-provision-%s", agent.Name, hex.EncodeToString(sum[:])[:8])
 
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"},
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, "provision")},
+		ObjectMeta: metav1.ObjectMeta{Namespace: agent.Namespace, Labels: a2aLabels(agent, "provision")},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(20)),
 			TTLSecondsAfterFinished: ptr.To(int32(86400)),
@@ -1022,6 +1327,38 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			},
 		},
 	}
+	job.Name = a2aProvisionJobName(agent, job.Spec)
+	return job
+}
+
+// a2aProvisionJobName derives the provision Job's name from a digest of its
+// rendered spec. The name is the only lever the operator has on this object:
+// a Job's pod template is immutable and reconcileA2A creates the Job only when
+// nothing exists under that name, so a rendered change reaches an existing
+// install only by producing a new name. Until #1347 the digest covered the
+// script alone, and a change to anything else in the pod spec — the image,
+// the uid, a securityContext field, env, a mount, WorkingDir — rendered a Job
+// with the name already on the cluster and silently never took effect; the
+// #1259 WorkingDir fix sat undelivered on a live install until someone deleted
+// the Job by hand. The digest is over the whole JobSpec rather than the
+// template alone because backoffLimit and the TTL are exactly as unreachable
+// under create-only convergence.
+//
+// json.Marshal is the serializer because it is deterministic for these
+// types: struct fields in declaration order, map keys sorted (the template's
+// labels are the only map), and nothing in the render is time- or
+// randomness-derived — the one Secret reference is by name and key, not by
+// value. Determinism is the property that matters most here: a digest that
+// moved between two renders of the same agent would create a Job on every
+// reconcile, which TestA2AProvisionJobNameIsDeterministic pins. No error
+// return, for the reason scopedSAPoolJSON gives: every field is an API type
+// the server itself round-trips through JSON, a builder has nowhere to put an
+// error, and a Marshal failure would show up as every render digesting the
+// same bytes, which TestA2AProvisionJobNameTracksThePodSpec catches.
+func a2aProvisionJobName(agent *agentv1alpha1.PlatformAgent, spec batchv1.JobSpec) string {
+	rendered, _ := json.Marshal(spec)
+	sum := sha256.Sum256(rendered)
+	return agent.Name + a2aProvisionJobNameInfix + hex.EncodeToString(sum[:])[:a2aProvisionJobNameHashLength]
 }
 
 // defaultA2AMaxSessions is spec.harness.tuning.maxSessions when unset; the
@@ -1093,15 +1430,44 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 	}
 }
 
-// buildA2AGatewayRole carries exactly what the gateway's boot needs today.
-// The session-spawn verbs (pods create/get/list/watch/delete) arrive with the
-// worker PR that arms spawning — RBAC lands with its consumer, so a reviewer
-// never sees a pod-lifecycle grant with nothing spawning pods.
+// buildA2AGatewayRole carries exactly what the gateway's boot and its session
+// spawning need, and nothing else. Both rules arrive with their consumer: the
+// owner read shipped with the Deployment that reads it, and the pod verbs ship
+// here, with the worker image and the A2A_SPAWN_SESSIONS that make the gateway
+// use them. A pod-lifecycle grant with nothing spawning pods would be a
+// standing grant nobody can point at a caller for.
+//
+// Namespaced, and pods only. The gateway creates and reaps one pod per
+// delegated task in its own namespace; it reads no Secret, no ConfigMap and no
+// other namespace.
+//
+// What it does NOT bound, stated because the next reader will otherwise take
+// this rule for a ceiling: `create` on pods is a privilege-escalation
+// primitive wherever admission does not constrain the PodSpec, and nothing in
+// this repository constrains it here. A gateway that is compromised or
+// prompt-steered into building its own PodSpec can name any ServiceAccount in
+// the namespace — including the platform agent's, whose Workload Identity
+// binding then resolves for that pod — mount any Secret in it, and stamp
+// labels no NetworkPolicy selects. spawn.go declining to do any of that is
+// what the gateway CHOOSES, not what this grant PERMITS, and the two are not
+// the same claim. Narrowing it takes a ValidatingAdmissionPolicy on pod create
+// by this subject (no serviceAccountName, no secret volumes,
+// automountServiceAccountToken false); that policy does not exist yet and is
+// named in this change's PR body as the follow-up it owes.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
 		Rules: []rbacv1.PolicyRule{
+			// Session pods: create one per delegated task, watch it to
+			// completion, delete it on cancel or sweep. No `patch` and no
+			// `update` — the gateway never edits a running session pod, and
+			// pods/exec is absent, so this is not a route into a worker.
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"create", "get", "list", "watch", "delete"},
+			},
 			// One read, on one named object: the gateway resolves its own
 			// Deployment's UID at boot to build the ownerReference its
 			// spawned pods carry (an ownerReference is name+UID, and the UID
@@ -1194,6 +1560,28 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// the same one the session quota was sized above,
 							// so the two halves cannot drift apart silently.
 							{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+							// Arms the spawner. The gateway shipped its
+							// session-spawn path dark behind this flag; the
+							// worker image it spawns and the Role that lets
+							// it are in this same change, so the flag flips
+							// where all three become true together.
+							{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+							// The image those sessions run. Rendered even
+							// when it matches the gateway's own default, so
+							// the operator-side override reaches it.
+							{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
+							// The Secret the spawner projects the bus
+							// password from. The gateway's baked default
+							// spells it for a CR named platform-agent, so on
+							// any install that renames the CR every session
+							// pod would wedge in CreateContainerConfigError
+							// on a Secret that does not exist — and wedge
+							// silently, because a pod that never runs never
+							// reaches a terminal phase for the sweeper to
+							// find, holding its session slot until the
+							// deadline. Same travel-together rule as the
+							// namespace and the owner.
+							{Name: "A2A_NATS_CREDS_SECRET", Value: a2aNATSName(agent) + "-creds"},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
 							// reads the gateway's own Deployment in THIS
@@ -1248,6 +1636,53 @@ type a2aProvisionState struct {
 	message string
 }
 
+// a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
+// fence's DNS rule. Ungated through the shared helper: spec.networkPolicy
+// .enabled withholds the agent's own gateway policy and nothing else, so a
+// profile that returned early on that flag would pin this rule to the
+// fallback VIP and discard a documented override on a policy that is still
+// enforcing. Nor does the flag switch the fence off — it is a knob about the
+// agent pod's policy, and reading it as permission to unfence the workers
+// would make delegation the way around the agent's own allowlist, which is
+// the hole this fence closes.
+func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
+	return r.ungatedDNSClusterIPs(ctx, agent)
+}
+
+// reconcileA2ANetworkFences applies the two NetworkPolicies that fence the
+// next stack: the bus's ingress policy and the session pods' egress one.
+//
+// Separate from the rest of reconcileA2A because a NetworkPolicy is not
+// rendering, it is a guardrail, and #1247 settled what that distinction costs:
+// a policy that stops being reconciled is one an operator can delete
+// permanently, and nothing selecting a Pod does not leave it restricted, it
+// leaves NetworkPolicy permitting all egress. Every refusal path in Reconcile
+// returns before reconcileA2A is reached, so the fences needed the same rescue
+// reconcileAgentNetworkGuardrails already gives <name>-gateway-netpol and
+// <name>-sandbox-metadata-deny — which is the caller that reaches this on a
+// refusal.
+//
+// The session fence is the one that makes this worth the split. A session pod
+// runs worker code the model steers, and buildA2ASessionNetworkPolicy is the
+// whole of what confines it: deny-all ingress, and an egress allowlist of DNS,
+// the bus, and LiteLLM. Delete it while the CR sits Degraded over an unrelated
+// bad CIDR and the confinement is gone from pods that are still running, with
+// the status naming the CIDR and saying nothing about the fence.
+func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for _, np := range []*networkingv1.NetworkPolicy{
+		buildA2ANATSNetworkPolicy(agent),
+		buildA2ASessionNetworkPolicy(agent, r.a2aSessionDNSClusterIPs(ctx, agent)),
+	} {
+		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, np); err != nil {
+			return fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
+		}
+	}
+	return nil
+}
+
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
 // function assumes the answer was ModeNext.
 func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
@@ -1282,15 +1717,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
-	// The bus fence rides this function so it appears and disappears with the
-	// stack it fences — including the skew freeze, where a frozen, running bus
-	// keeps its ingress policy.
-	np := buildA2ANATSNetworkPolicy(agent)
-	if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
+	// Both fences ride reconcileA2ANetworkFences so they appear and disappear
+	// with the stack they fence — including the skew freeze, where a frozen,
+	// running bus keeps its ingress policy and the workers on it keep their
+	// egress one.
+	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		return state, err
-	}
-	if err := r.applyManaged(ctx, agent, np); err != nil {
-		return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
 	}
 
 	// The session-pod quota, the enforcement half of the bound whose
@@ -1305,7 +1737,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
-	// content-hashed name; a payload change is a new name and a fresh run.
+	// spec-digested name; a changed render — script or pod spec — is a new
+	// name and a fresh run, and the superseded Job is left to its TTL.
 	job := buildA2AProvisionJob(agent)
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
@@ -1431,8 +1864,18 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
-		// cached read is free.
+		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The session fence goes after the gateway Deployment above, which is
+		// what stops new pods being spawned. It does not close the window:
+		// Delete returns as soon as the API server accepts it, and the pods
+		// already running are reaped asynchronously by GC through their
+		// ownerReference, then by their termination grace. So a flip to today
+		// with sessions in flight leaves those workers unfenced for seconds,
+		// not for their lifetimes — ordering shortens that window rather than
+		// removing it, and removing it would take a foreground delete and a
+		// wait this reconcile has no reason to block on.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with
@@ -1460,7 +1903,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		}
 	}
 
-	// Provision Jobs carry a content hash in the name; find them by label.
+	// Provision Jobs carry a spec digest in the name, one per generation
+	// that has been rendered here; find them all by label.
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
 		a2aComponentLabel: "provision",
