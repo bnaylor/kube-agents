@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -46,6 +47,12 @@ var slackEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 // tool (gateway design, roster cap decision).
 const slackRosterPage = 200
 
+// slackRepliesTimeout bounds the one synchronous Web API read the event
+// pump makes on its own goroutine (the thread-root lookup). Envelopes are
+// acked before it runs, but the pump reads the next envelope only after it
+// returns, so a stalled Slack call must not stall the reader indefinitely.
+const slackRepliesTimeout = 5 * time.Second
+
 // Slack token prefixes, checked at construction so a swapped pair fails at
 // boot with a message instead of as an opaque 401 from the first API call.
 const (
@@ -61,7 +68,7 @@ type slackAPI interface {
 	UpdateMessage(channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
 	GetUsersInConversation(params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
-	GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
+	GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -158,6 +165,12 @@ func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter
 // Run resolves the bot's own identity, consumes Socket Mode events, and
 // holds the websocket open until ctx is done.
 func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	// The pump below exits only on ctx, so derive our own: any return from
+	// Run — a failed auth.test, or RunContext giving up on an invalid token
+	// or an unrecoverable connection error while the parent ctx is still
+	// live — must signal it rather than leak it for the process's lifetime.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	auth, err := s.api.AuthTest()
 	if err != nil {
 		return fmt.Errorf("slack auth.test: %w", err)
@@ -175,19 +188,23 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			case evt = <-s.sm.Events:
 			}
 			if evt.Type != socketmode.EventTypeEventsAPI {
+				// Not ours to ack. hello and disconnect do carry a Request,
+				// but one whose EnvelopeID is empty — acking those would
+				// write a junk frame back up the socket.
 				continue
 			}
-			e, ok := evt.Data.(slackevents.EventsAPIEvent)
-			if !ok {
-				continue
-			}
-			// Ack immediately: unacked envelopes redeliver in seconds, and
-			// per-conversation ordering is the gateway queue's job, not the
+			// Ack before parsing, not after: unacked envelopes redeliver in
+			// seconds, so a payload we fail to parse would redeliver forever.
+			// Per-conversation ordering is the gateway queue's job, not the
 			// socket's.
 			if evt.Request != nil {
 				if err := s.sm.Ack(*evt.Request); err != nil {
 					s.log.Warn("socket mode ack failed", "err", err)
 				}
+			}
+			e, ok := evt.Data.(slackevents.EventsAPIEvent)
+			if !ok {
+				continue
 			}
 			if e.Type != slackevents.CallbackEvent {
 				continue
@@ -196,7 +213,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			if !ok {
 				continue
 			}
-			if msg, ok := s.inbound(m); ok {
+			if msg, ok := s.inbound(ctx, m); ok {
 				handler(msg)
 			}
 		}
@@ -330,10 +347,12 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 }
 
 // isSessionRoot reports whether a thread's root message mentions the bot,
-// via cache or one conversations.replies read. An API failure reports
-// false without caching: dropping is safe (the user can @mention), and the
-// next reply retries.
-func (s *SlackAdapter) isSessionRoot(channel, threadTS string) bool {
+// via cache or one conversations.replies read. That read happens on the
+// event pump's goroutine, so it is bounded by slackRepliesTimeout as well
+// as by ctx. An API failure — the timeout included — reports false without
+// caching: dropping is safe (the user can @mention), and the next reply
+// retries.
+func (s *SlackAdapter) isSessionRoot(ctx context.Context, channel, threadTS string) bool {
 	key := channel + "/" + threadTS
 	s.mu.Lock()
 	if v, ok := s.sessionRoots[key]; ok {
@@ -341,7 +360,9 @@ func (s *SlackAdapter) isSessionRoot(channel, threadTS string) bool {
 		return v
 	}
 	s.mu.Unlock()
-	msgs, _, _, err := s.api.GetConversationReplies(&slack.GetConversationRepliesParameters{
+	ctx, cancel := context.WithTimeout(ctx, slackRepliesTimeout)
+	defer cancel()
+	msgs, _, _, err := s.api.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
 		ChannelID: channel, Timestamp: threadTS, Limit: 1, Inclusive: true,
 	})
 	if err != nil || len(msgs) == 0 {
@@ -372,7 +393,7 @@ func (s *SlackAdapter) markSessionRoot(key string, isRoot bool) {
 // thread's root (Slack threads are implicit); a thread reply is a turn when
 // it mentions the bot or the thread root did. Everything else — bots, our
 // own posts, edits and other subtypes, redeliveries — is not a turn.
-func (s *SlackAdapter) inbound(m *slackevents.MessageEvent) (InboundMessage, bool) {
+func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
@@ -407,7 +428,7 @@ func (s *SlackAdapter) inbound(m *slackevents.MessageEvent) (InboundMessage, boo
 		// unmentioned reply needn't re-read it from the API.
 		threadTS = m.TimeStamp
 		s.markSessionRoot(m.Channel+"/"+threadTS, true)
-	} else if !mentioned && !s.isSessionRoot(m.Channel, threadTS) {
+	} else if !mentioned && !s.isSessionRoot(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
 	if text == "" {

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
@@ -56,7 +57,7 @@ func (f *fakeSlackAPI) OpenConversation(params *slack.OpenConversationParameters
 	return ch, false, false, nil
 }
 
-func (f *fakeSlackAPI) GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
+func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
 	return f.replies[params.ChannelID+"/"+params.Timestamp], false, "", nil
 }
 
@@ -164,7 +165,7 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		{"bare mention drops", slackMsg("channel", "C1", "U1", "<@UBOT>", "7.0", ""), false, "", "", ""},
 	}
 	for _, c := range cases {
-		got, ok := a.inbound(c.m)
+		got, ok := a.inbound(context.Background(), c.m)
 		if ok != c.want {
 			t.Errorf("%s: delivered=%v want %v", c.name, ok, c.want)
 			continue
@@ -178,30 +179,30 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 
 func TestSlackInboundFilters(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
-	if _, ok := a.inbound(slackMsg("im", "D1", "UBOT", "self", "1.0", "")); ok {
+	if _, ok := a.inbound(context.Background(), slackMsg("im", "D1", "UBOT", "self", "1.0", "")); ok {
 		t.Error("own messages must drop")
 	}
 	bot := slackMsg("im", "D1", "U9", "from an app", "2.0", "")
 	bot.BotID = "B123"
-	if _, ok := a.inbound(bot); ok {
+	if _, ok := a.inbound(context.Background(), bot); ok {
 		t.Error("bot messages must drop")
 	}
 	edited := slackMsg("im", "D1", "U1", "edited", "3.0", "")
 	edited.SubType = "message_changed"
-	if _, ok := a.inbound(edited); ok {
+	if _, ok := a.inbound(context.Background(), edited); ok {
 		t.Error("non-empty subtypes must drop")
 	}
 	dup := slackMsg("im", "D1", "U1", "once", "4.0", "")
-	if _, ok := a.inbound(dup); !ok {
+	if _, ok := a.inbound(context.Background(), dup); !ok {
 		t.Fatal("first delivery expected")
 	}
-	if _, ok := a.inbound(dup); ok {
+	if _, ok := a.inbound(context.Background(), dup); ok {
 		t.Error("socket mode is at-least-once; a duplicate (channel,ts) must drop")
 	}
-	if _, ok := a.inbound(slackMsg("channel", "", "U1", "<@UBOT> x", "5.0", "")); ok {
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "", "U1", "<@UBOT> x", "5.0", "")); ok {
 		t.Error("empty channel must drop")
 	}
-	if _, ok := a.inbound(slackMsg("im", "D1", "", "ghost", "6.0", "")); ok {
+	if _, ok := a.inbound(context.Background(), slackMsg("im", "D1", "", "ghost", "6.0", "")); ok {
 		t.Error("empty user must drop")
 	}
 }
@@ -281,13 +282,13 @@ func TestSlackTurnSubtypes(t *testing.T) {
 
 	broadcast := slackMsg("channel", "C1", "U2", "also try the east cluster", "8.0", "100.1")
 	broadcast.SubType = "thread_broadcast"
-	if _, ok := a.inbound(broadcast); !ok {
+	if _, ok := a.inbound(context.Background(), broadcast); !ok {
 		t.Error("thread_broadcast reply in a bot-rooted thread must deliver")
 	}
 
 	file := slackMsg("im", "D1", "U1", "here is the manifest", "9.0", "")
 	file.SubType = "file_share"
-	if _, ok := a.inbound(file); !ok {
+	if _, ok := a.inbound(context.Background(), file); !ok {
 		t.Error("file_share with text must deliver")
 	}
 }
