@@ -505,7 +505,16 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 			t.Errorf("TOPICS-STATE gained %d messages but only %d sit under a2a.tasks.* subjects; the deliver-subject route rewrote a subject, which would be forgery",
 				info.State.Msgs-before, underTaskSubjects)
 		}
-		st, err := seedJS.Stream(ctx, "TOPICS-STATE")
+		// Read back through the gateway rather than seed. Every other
+		// read here is a STREAM.INFO, which seed still holds, but this one
+		// asks for a stored message and #1306 scoped seed's grant to
+		// STREAM.CREATE and STREAM.INFO on the streams it provisions --
+		// reading content is not the provisioning identity's to do. Gateway
+		// still holds $JS.API.> (a2aWorkerJetStreamGrants records why), so
+		// it is the identity that can answer this. Asking as seed does not
+		// fail, it hangs: a refused request is not an error nats.go reports,
+		// so the call waits out ctx instead.
+		st, err := gw.Stream(ctx, "TOPICS-STATE")
 		if err != nil {
 			t.Fatal(err)
 		}
