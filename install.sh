@@ -32,6 +32,7 @@ kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones 
 MINTY_CLI_REPO_URL="https://github.com/abcxyz/github-token-minter.git"
 MINTY_CLI_GIT_TAG="v2.7.1"
 MINTY_CLI_MANUAL_CLONE_DIR="/tmp/minty"
+SPINNER_INTERVAL_SECS="0.2"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -322,6 +323,7 @@ fi
 
 # ─── Agentic & Automation Parameter States ────────────────────────────────────
 PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
+PARAM_GENERATE_ONLY="${GENERATE_ONLY:-false}"
 PARAM_DRY_RUN="${DRY_RUN:-false}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
@@ -411,6 +413,8 @@ PARAM_THIRD_PARTY_REGISTRY_PREFIX="${THIRD_PARTY_REGISTRY_PREFIX:-}"
 # google_chat_enabled = false and plan the Pub/Sub topic and subscription away.
 PARAM_ENABLE_GOOGLE_CHAT="${GOOGLE_CHAT_ENABLED:-}"
 PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
+PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
+CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
@@ -425,6 +429,9 @@ Usage:
 
 Flags for AI Agents & Automation:
   -y, --yes, --non-interactive  Run in non-interactive mode (use flags/defaults)
+  --generate-only               Generate install.env and terraform.tfvars, run
+                                pre-apply checks, print lifecycle commands, and
+                                exit without applying
   --dry-run                     Validate prerequisites & output config/plan without creating resources
   --project-id=ID               Target GCP Project ID
   --region=REGION               Target GCP Region (default: install.defaults.env
@@ -507,6 +514,9 @@ Flags for AI Agents & Automation:
   --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat
                                 (default: DEFAULT_CHAT_TOPIC_NAME,
                                 currently platform-agent-chat-events)
+  --chat-sub-name=SUB           Pub/Sub subscription name for Google Chat
+                                (default: derived as <topic>-sub when --chat-topic-name
+                                is custom; DEFAULT_CHAT_SUB_NAME on default topic)
   --google-chat-mode=MODE       Google Chat output mode: default | debug
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
@@ -534,6 +544,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --generate-only) PARAM_GENERATE_ONLY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
@@ -568,6 +579,7 @@ parse_args() {
       --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
       --allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+      --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
       --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
       --migrate-node-pools=*)
@@ -1000,7 +1012,7 @@ warn_unrecorded_interview_answers() {
   local key recorded current drifted=""
   for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
@@ -1329,9 +1341,117 @@ resolve_shared_defaults() {
   PARAM_ENABLE_GOOGLE_CHAT="${PARAM_ENABLE_GOOGLE_CHAT:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   PARAM_GOOGLE_CHAT_MODE="${PARAM_GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+  PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
   PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+}
+
+# Run a command or function in the background, animating a spinner with elapsed
+# time and the command's latest output line. Output is streamed to log_file.
+# Falls back to direct execution when stdout is not a terminal (CI, piped logs).
+# Returns the command's exit status and leaves error presentation to callers.
+run_with_spinner() {
+  local msg="$1"
+  local log_file="$2"
+  shift 2
+
+  if [ ! -t 1 ]; then
+    print_info "$msg..."
+    local rc=0
+    "$@" 2>&1 | tee "$log_file" || rc=${PIPESTATUS[0]}
+    return "$rc"
+  fi
+
+  # Everything the handler reads is given a value before the handler can run,
+  # because `set -u` would otherwise kill it on an unbound variable instead of
+  # letting it restore the cursor and reap the job.
+  local task_pid=0
+  local term_width=0
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local frame=0
+  local started=$SECONDS
+  local status_line=""
+
+  on_spinner_interrupt() {
+    local sig="$1"
+    trap - INT TERM
+    # Reap the children before the job itself. When "$@" is a shell function
+    # bash forks a subshell, so task_pid is that subshell and the process doing
+    # the work -- terraform, for the dry-run caller -- is its child; signalling
+    # only task_pid leaves that child running, detached, against the same
+    # .terraform directory the next run reads. Nothing else will clean it up:
+    # with job control off bash sets SIGINT to SIG_IGN for `&` children and the
+    # disposition survives both fork and exec, so the terminal's own Ctrl-C
+    # never reaches either process.
+    if [ "$task_pid" -ne 0 ]; then
+      pkill -TERM -P "$task_pid" 2>/dev/null || true
+      kill -TERM "$task_pid" 2>/dev/null || true
+    fi
+    tput cnorm 2>/dev/null || true
+    printf '\r%*s\r' "$term_width" ''
+    if [ -s "$log_file" ]; then
+      echo -e "\n  ${C_CYAN}ℹ Interrupted. Command output saved to: ${log_file}${C_RESET}" >&2
+    else
+      rm -f -- "$log_file"
+    fi
+    exit "$sig"
+  }
+
+  # Armed before the job exists, not after. Arming afterwards leaves a window in
+  # which the worker is already running while SIGINT still has its default
+  # disposition here: the shell dies, and the worker -- which inherited SIG_IGN
+  # for SIGINT as a `&` child -- outlives it with nothing left to reap it.
+  trap 'on_spinner_interrupt 130' INT
+  trap 'on_spinner_interrupt 143' TERM
+
+  "$@" >"$log_file" 2>&1 &
+  task_pid=$!
+
+  term_width="$(get_term_width)"
+  # Everything except the status line: two spaces, spinner, message, "(NNNs)",
+  # separators. Keep one column spare so the line never wraps.
+  local status_width=$((term_width - ${#msg} - 15))
+  if [ "$status_width" -lt 10 ]; then
+    status_width=10
+  fi
+  tput civis 2>/dev/null || true
+  while kill -0 "$task_pid" 2>/dev/null; do
+    # Both of these fork a child, and SIGINT from a terminal goes to the whole
+    # foreground group, so on Ctrl-C the child dies of it and the command
+    # reports 130. Unguarded under `set -Ee` that fires the ERR trap, and
+    # on_error exits the shell before bash dispatches the pending INT trap --
+    # so the handler below never runs, the worker is orphaned, the cursor stays
+    # hidden, and the cancellation is recorded as a FAILED install report.
+    # `|| true` keeps errexit out of the loop and leaves the INT trap the only
+    # way out of it.
+    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")" || status_line=""
+    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
+      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$msg" \
+      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
+    frame=$((frame + 1))
+    sleep "$SPINNER_INTERVAL_SECS" || true
+  done
+  tput cnorm 2>/dev/null || true
+  printf '\r%*s\r' "$term_width" ''
+
+  trap - INT TERM
+  local rc=0
+  wait "$task_pid" || rc=$?
+  return "$rc"
+}
+
+# The dry run's Terraform check. At file scope, rather than inside main(), so the
+# test suite can source install.sh and drive this exact function instead of its
+# own copy of the chain -- a copy asserts that the copy short-circuits, which is
+# true of any string. Runs in whatever directory the caller has cd'd into.
+#
+# The && is load-bearing: `terraform validate` against an uninitialised directory
+# reports init's failure as a configuration error, so an unchained pair blames
+# the composition for what is really a provider download that did not happen.
+validate_tf_config() {
+  terraform init -backend=false -input=false &&
+    terraform validate
 }
 
 # Wait for one deployment to roll out, animating a spinner with the elapsed time
@@ -1342,48 +1462,28 @@ wait_for_rollout() {
   local namespace="$2"
   local timeout_secs="$3"
 
-  if [ ! -t 1 ]; then
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s"
-    return $?
-  fi
-
+  local started=$SECONDS
   local log_file=""
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
-  kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" \
-    >"$log_file" 2>&1 &
-  local kubectl_pid=$!
-
-  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-  local frame=0
-  local started=$SECONDS
-  local status_line=""
-  local term_width=0
-  term_width="$(get_term_width)"
-  # Everything except the kubectl line: two spaces, spinner, name, "(NNNs)",
-  # separators. Keep one column spare so the line never wraps — a wrapped line
-  # cannot be rewritten with \r and would scroll the spinner down the screen.
-  local status_width=$((term_width - ${#deployment} - 15))
-  if [ "$status_width" -lt 10 ]; then
-    status_width=10
-  fi
-  tput civis 2>/dev/null || true
-  while kill -0 "$kubectl_pid" 2>/dev/null; do
-    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")"
-    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
-      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$deployment" \
-      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
-    frame=$((frame + 1))
-    sleep 0.2
-  done
-  tput cnorm 2>/dev/null || true
-  printf '\r%*s\r' "$term_width" ''
 
   local rc=0
-  wait "$kubectl_pid" || rc=$?
+  run_with_spinner "$deployment" "$log_file" \
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
+
+  # Published for the caller's failure message. How long the wait actually ran is
+  # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
+  # different problem from one that used the whole budget, and the timeout
+  # constant cannot tell them apart.
+  ROLLOUT_ELAPSED_SECS=$((SECONDS - started))
+
   if [ "$rc" -eq 0 ]; then
-    print_success "$deployment rolled out in $((SECONDS - started))s"
-  else
-    tail -n 3 "$log_file" | tr -d '\r' | while IFS= read -r line; do
+    print_success "$deployment rolled out in ${ROLLOUT_ELAPSED_SECS}s"
+  elif [ -t 1 ]; then
+    # Only the spinner branch withholds the command's output. The non-TTY branch
+    # of run_with_spinner has already streamed it through tee, so echoing the
+    # tail there prints the same failure twice -- and on stdout, since the 2>&1
+    # that branch needs has already folded kubectl's stderr into it.
+    tail -n 3 "$log_file" 2>/dev/null | tr -d '\r' | while IFS= read -r line; do
       [ -n "$line" ] && print_info "$line"
     done
   fi
@@ -1703,6 +1803,7 @@ write_json_report() {
 {
   "status": "$(json_escape "$status")",
   "dry_run": ${PARAM_DRY_RUN},
+  "generate_only": ${PARAM_GENERATE_ONLY},
   "non_interactive": ${PARAM_NON_INTERACTIVE},
   "project_id": "$(json_escape "${project_id:-}")",
   "project_number": "$(json_escape "${project_number:-}")",
@@ -1744,6 +1845,70 @@ handle_pipeline_status() {
   elif [ "$rc_tee" -ne 0 ]; then
     on_error "$rc_tee" "$LINENO" "tee \"$log_file\""
   fi
+}
+
+# Prints out-of-Terraform prerequisites, lifecycle commands with state bucket
+# and prefix, and post-apply steps when running with --generate-only.
+print_generate_only_handoff() {
+  local repo_dir="$1" project_id="$2" cluster_name="$3" region="$4" tfvars_file="$5"
+  local kms_loc key_resource keyring key minter_keyring minter_key state_bkt state_pfx
+
+  kms_loc="$(derive_kms_location "$region")"
+  keyring="${GKE_DB_KMS_KEYRING:-$DEFAULT_GKE_DB_KMS_KEYRING}"
+  key="${GKE_DB_KMS_KEY:-$DEFAULT_GKE_DB_KMS_KEY}"
+  key_resource="projects/${project_id}/locations/${kms_loc}/keyRings/${keyring}/cryptoKeys/${key}"
+  minter_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  minter_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
+  state_bkt="$(tf_state_bucket)"
+  state_pfx="$(tf_state_prefix)"
+
+  print_step "Generation Complete — Operator Handoff"
+  print_success "Configuration generated and validated without touching GCP resources."
+  echo ""
+  echo -e "  • ${C_CYAN}Install configuration:${C_RESET} ${INSTALL_ENV_FILE}"
+  echo -e "  • ${C_CYAN}Terraform input:${C_RESET} ${tfvars_file}"
+  echo ""
+  echo -e "${C_BOLD}Next steps for the operator to apply manually:${C_RESET}"
+  echo ""
+  echo -e "${C_BOLD}1. Out-of-Terraform prerequisites (run if applicable to your cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}CMEK Database Encryption (pre-existing cluster without CMEK):${C_RESET}"
+  echo -e "    # Note: the two KMS create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${keyring} --location=${kms_loc} --project=${project_id}"
+  echo -e "    gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_loc} --purpose=encryption --project=${project_id}"
+  echo -e "    gcloud beta services identity create --service=container.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keys add-iam-policy-binding ${key} --keyring=${keyring} --location=${kms_loc} \\\\"
+  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\" \\\\"
+  echo -e "      --role=\"roles/cloudkms.cryptoKeyEncrypterDecrypter\" --project=${project_id} --quiet"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --database-encryption-key=${key_resource} --project ${project_id}"
+  echo ""
+  echo -e "  • ${C_CYAN}Workload Identity Pool (pre-existing Standard cluster):${C_RESET}"
+  echo -e "    # Note: Migrating node pools to GKE_METADATA recreates nodes and restarts workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --workload-pool=${project_id}.svc.id.goog"
+  echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
+  echo ""
+  echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
+  echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
+  echo ""
+  echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
+  echo -e "    # Note: the two create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${minter_keyring} --location=${kms_loc} --project=${project_id}"
+  echo -e "    gcloud kms keys create ${minter_key} --keyring=${minter_keyring} --location=${kms_loc} \\\\"
+  echo -e "      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \\\\"
+  echo -e "      --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+  echo -e "    git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR}"
+  echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
+  echo ""
+  echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  cd ${repo_dir}/terraform/examples/full-install"
+  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo ""
+  echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 }
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
@@ -2432,7 +2597,19 @@ run_menu_system() {
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-  local chat_sub_name="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+  local chat_sub_name="${CHAT_SUB_NAME:-}"
+  if [ "$google_chat_enabled" = "true" ]; then
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+    fi
+    if [ -n "$state_sub" ]; then
+      chat_sub_name="$state_sub"
+    elif [ -z "$chat_sub_name" ] || [ "$chat_sub_name" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
+  fi
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
@@ -2650,6 +2827,10 @@ run_menu_system() {
 # ─── Main Installer Procedure ──────────────────────────────────────────────────
 main() {
   parse_args "$@"
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_error "--dry-run and --generate-only are different modes and cannot be combined."
+    return 2
+  fi
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
@@ -2669,6 +2850,9 @@ main() {
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     print_info "Execution Mode: ${C_BOLD}Non-Interactive / AI Agent Automated Mode${C_RESET} 🤖"
     export CLOUDSDK_CORE_DISABLE_PROMPTS="1"
+  fi
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Execution Mode: ${C_BOLD}Generate-Only Mode (stopping before apply)${C_RESET} 📄"
   fi
 
   local image_tag=""
@@ -2971,7 +3155,7 @@ main() {
     allowed_users_hint="empty list"
   fi
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
-  local chat_sub_name="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+  local chat_sub_name="${PARAM_CHAT_SUB_NAME:-}"
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
     print_error "--google-chat-mode must be either 'default' or 'debug'."
@@ -3027,6 +3211,25 @@ main() {
     prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
       allowed_users "$allowed_users" false "$allowed_users_hint"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
+
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+    fi
+
+    local default_sub
+    if [ -n "$state_sub" ]; then
+      default_sub="$state_sub"
+    elif [ -n "${CLI_CHAT_SUB_NAME:-}" ]; then
+      default_sub="$CLI_CHAT_SUB_NAME"
+    elif [ -n "${PARAM_CHAT_SUB_NAME:-}" ] && [ "$PARAM_CHAT_SUB_NAME" != "$DEFAULT_CHAT_SUB_NAME" ]; then
+      default_sub="$PARAM_CHAT_SUB_NAME"
+    else
+      default_sub="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
+    chat_sub_name="$default_sub"
+    prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
     prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
       google_chat_home_channel "$google_chat_home_channel"
   }
@@ -3653,10 +3856,30 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
-      terraform init -backend=false -input=false >/dev/null
-      terraform validate >/dev/null
+      local tf_log=""
+      tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
+      local rc=0
+      run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        print_success "Terraform configuration is valid."
+        rm -f -- "$tf_log"
+      else
+        # Only the spinner branch withheld the output; the non-TTY branch already
+        # streamed it through tee, where repeating it doubles the log. The two
+        # messages differ so the non-TTY one does not end on a colon promising
+        # output that never follows. An `if` rather than `[ -t 1 ] &&`, which
+        # under `set -e` would exit the subshell with the test's own status
+        # instead of the validation's.
+        if [ -t 1 ]; then
+          print_error "Terraform validation failed (exit code $rc):"
+          cat "$tf_log" >&2
+        else
+          print_error "Terraform validation failed (exit code $rc); its output is above."
+        fi
+        rm -f -- "$tf_log"
+        exit "$rc"
+      fi
     )
-    print_success "Terraform configuration is valid."
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
       local np_status=0
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
@@ -3700,18 +3923,44 @@ main() {
   # Refuse before the confirmation checkpoint and before any cluster mutations
   # if adopting an existing cluster lacking required node pool migration or NetworkPolicy
   # without explicit opt-in.
+  #
+  # Generate-only is held to the same bar, for two reasons. The tfvars that mode
+  # exists to produce cannot apply against a cluster enforcing no NetworkPolicy --
+  # the gke-cluster module's postcondition refuses them -- so emitting a handoff
+  # that calls those inputs validated hands the operator a plan already known to
+  # fail. And the refusals name the opt-in flags (--enable-network-policy,
+  # --migrate-node-pools) that the apply needs regardless, so an operator who
+  # wants tfvars for such a cluster gets them by passing what they were going to
+  # have to pass anyway. Running here also keeps --generate-only and the
+  # interactive `g` the same choice, which install-kube-agents/SKILL.md says
+  # they are: this sits above the (Y/n/g) prompt, so both routes cross it.
   check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
   check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
 
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
-    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n)" confirm_choice "y"
-    if [[ ! "$confirm_choice" =~ ^[Yy]$ ]]; then
-      print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
-      print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
-      write_json_report "PAUSED"
-      exit 0
-    fi
+    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
+    case "$confirm_choice" in
+      [Yy])
+        ;;
+      [Gg])
+        PARAM_GENERATE_ONLY="true"
+        ;;
+      *)
+        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        write_json_report "PAUSED"
+        exit 0
+        ;;
+    esac
+  fi
+
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
+    check_github_org_is_organization "${GITOPS_ORG:-}"
+    print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
+    write_json_report "GENERATE_ONLY_SUCCESS"
+    exit 0
   fi
 
   # 12. Execute the Terraform Engine
@@ -3823,7 +4072,7 @@ main() {
     # the chat links and port-forward command.
     if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
       slow_rollouts+=("$deployment")
-      print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."
+      print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi
   done
   if [ "${#slow_rollouts[@]}" -eq 0 ]; then

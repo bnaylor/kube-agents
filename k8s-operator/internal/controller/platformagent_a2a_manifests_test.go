@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"net"
 	"path"
 	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -632,11 +633,6 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	for _, e := range pod.Containers[0].Env {
 		env[e.Name] = e
 	}
-	// Spawning stays dark until the worker PR renders the arming: the switch
-	// env must not appear here at all.
-	if _, armed := env["A2A_SPAWN_SESSIONS"]; armed {
-		t.Error("A2A_SPAWN_SESSIONS rendered before the worker PR arms spawning")
-	}
 	ns := env["POD_NAMESPACE"]
 	if ns.ValueFrom == nil || ns.ValueFrom.FieldRef == nil || ns.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
 		t.Errorf("POD_NAMESPACE = %+v", ns)
@@ -655,12 +651,12 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 1 {
-		t.Fatalf("gateway Role has %d rules, want exactly the pinned owner get", len(role.Rules))
+	if len(role.Rules) != 2 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule plus the pinned owner get", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
-	owner := role.Rules[0]
+	owner := role.Rules[1]
 	if len(owner.APIGroups) != 1 || owner.APIGroups[0] != "apps" ||
 		len(owner.Resources) != 1 || owner.Resources[0] != "deployments" ||
 		len(owner.Verbs) != 1 || owner.Verbs[0] != "get" ||
@@ -871,6 +867,180 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 // The bus fence rides the mode switch exactly like the rest of the next
 // stack: rendered by reconcileA2A under next, torn down by cleanupA2A on the
 // flip back, absent from a today render entirely.
+// The three halves of arming, asserted together because shipping any one
+// without the others is the failure this PR's scoping exists to avoid: the
+// flag without the verbs is a gateway that refuses every delegation, and the
+// verbs without the flag are a standing pod-lifecycle grant with no caller.
+func TestBuildA2AGatewaySpawnArming(t *testing.T) {
+	agent := a2aTestAgent()
+
+	env := map[string]corev1.EnvVar{}
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	if env["A2A_SPAWN_SESSIONS"].Value != "true" {
+		t.Errorf("A2A_SPAWN_SESSIONS = %+v, want the spawner armed", env["A2A_SPAWN_SESSIONS"])
+	}
+	// Rendered unconditionally, so that an install pulling from a mirror can
+	// redirect the image the arming just started pulling.
+	if env["A2A_WORKER_IMAGE"].Value != a2aWorkerImage() {
+		t.Errorf("A2A_WORKER_IMAGE = %+v, want the resolved worker image", env["A2A_WORKER_IMAGE"])
+	}
+	t.Setenv(a2aWorkerImageEnvVar, "registry.example/mirror/worker:pinned")
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "A2A_WORKER_IMAGE" && e.Value != "registry.example/mirror/worker:pinned" {
+			t.Errorf("the operator override did not reach the spawner: %+v", e)
+		}
+	}
+
+	// The spawner projects the bus password from this Secret; the gateway's
+	// baked default is right only for a CR named platform-agent.
+	if env["A2A_NATS_CREDS_SECRET"].Value != "test-agent-a2a-nats-creds" {
+		t.Errorf("A2A_NATS_CREDS_SECRET = %+v, want the Secret this CR's render actually creates", env["A2A_NATS_CREDS_SECRET"])
+	}
+
+	pods := buildA2AGatewayRole(agent).Rules[0]
+	if len(pods.APIGroups) != 1 || pods.APIGroups[0] != "" ||
+		len(pods.Resources) != 1 || pods.Resources[0] != "pods" {
+		t.Fatalf("session-pod rule targets %v/%v, want the core group's pods", pods.APIGroups, pods.Resources)
+	}
+	// Exactly the spawn-and-reap verbs. patch and update would let the
+	// gateway edit a running session pod; pods/exec would be a route into
+	// one. Neither is something the spawner does, so neither is granted.
+	wantVerbs := []string{"create", "get", "list", "watch", "delete"}
+	if !reflect.DeepEqual(pods.Verbs, wantVerbs) {
+		t.Errorf("session-pod verbs = %v, want exactly %v", pods.Verbs, wantVerbs)
+	}
+	if len(pods.ResourceNames) != 0 {
+		t.Errorf("session-pod rule is pinned by name (%v) — the pods do not exist yet when it creates them", pods.ResourceNames)
+	}
+}
+
+func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
+	np := buildA2ASessionNetworkPolicy(a2aTestAgent(), []string{"10.96.0.10"})
+
+	if np.Name != "test-agent-a2a-session-netpol" {
+		t.Errorf("unexpected name %q", np.Name)
+	}
+	// Selects exactly the labels the spawner stamps (a2a/gateway/spawn.go),
+	// which is also what the bus fence's session peer names.
+	wantSel := map[string]string{
+		labelPartOf:                   a2aPartOf,
+		"app.kubernetes.io/component": a2aSessionComponent,
+	}
+	if !reflect.DeepEqual(np.Spec.PodSelector.MatchLabels, wantSel) {
+		t.Errorf("pod selector = %v, want %v", np.Spec.PodSelector.MatchLabels, wantSel)
+	}
+
+	// Both policy types. The empty ingress list is the assertion: nothing
+	// dials a session pod, so a listener in a worker is an accident and an
+	// accident should be unreachable.
+	wantTypes := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
+	if !reflect.DeepEqual(np.Spec.PolicyTypes, wantTypes) {
+		t.Errorf("policy types = %v, want %v", np.Spec.PolicyTypes, wantTypes)
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("session policy grants ingress: %+v", np.Spec.Ingress)
+	}
+
+	if len(np.Spec.Egress) != 3 {
+		t.Fatalf("expected exactly 3 egress rules (DNS, bus, LiteLLM), got %d: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	}
+
+	// Rule 1: DNS on 53 only, and to named destinations. A DNS rule with a
+	// nil To is port-53 egress to every address, which is a tunnel rather
+	// than name resolution.
+	dns := np.Spec.Egress[0]
+	if len(dns.Ports) != 2 ||
+		*dns.Ports[0].Protocol != corev1.ProtocolUDP || dns.Ports[0].Port.IntVal != 53 ||
+		*dns.Ports[1].Protocol != corev1.ProtocolTCP || dns.Ports[1].Port.IntVal != 53 {
+		t.Errorf("DNS rule ports = %+v, want udp+tcp 53", dns.Ports)
+	}
+	if len(dns.To) == 0 {
+		t.Fatal("DNS rule has no peer, which permits port 53 to every destination")
+	}
+	// Port 53 to an unbounded destination is an exfiltration channel, not
+	// name resolution — the one rule here that names addresses is the one
+	// that has to be bounded. Every peer is either a named pod or a host
+	// route.
+	for _, peer := range dns.To {
+		if peer.IPBlock == nil {
+			continue
+		}
+		if _, network, err := net.ParseCIDR(peer.IPBlock.CIDR); err != nil {
+			t.Errorf("DNS peer %q is not a CIDR", peer.IPBlock.CIDR)
+		} else if ones, bits := network.Mask.Size(); ones != bits {
+			t.Errorf("DNS peer %q is a range, not a host: port 53 to a range is a tunnel", peer.IPBlock.CIDR)
+		}
+		if len(peer.IPBlock.Except) != 0 {
+			t.Errorf("DNS peer %q carries an except block, which only ever widens a host route", peer.IPBlock.CIDR)
+		}
+	}
+
+	// Rule 2: the bus, by pod label rather than IPBlock — a pod IP does not
+	// survive a restart and a policy pinned to one stops matching silently.
+	bus := np.Spec.Egress[1]
+	if len(bus.Ports) != 1 || bus.Ports[0].Port.IntVal != 4222 || *bus.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("bus rule is not exactly TCP 4222: %+v", bus.Ports)
+	}
+	if len(bus.To) != 1 || bus.To[0].PodSelector == nil ||
+		bus.To[0].PodSelector.MatchLabels[a2aComponentLabel] != "nats" ||
+		bus.To[0].PodSelector.MatchLabels[labelPartOf] != a2aPartOf {
+		t.Errorf("bus peer does not select the NATS pods by label: %+v", bus.To)
+	}
+
+	// Rule 3: LiteLLM, the workers' only model path — they hold no API key
+	// and no Workload Identity, so there is no direct 443 to a provider.
+	llm := np.Spec.Egress[2]
+	if len(llm.Ports) != 3 || llm.Ports[0].Port.IntVal != 80 || llm.Ports[1].Port.IntVal != 4000 || llm.Ports[2].Port.IntVal != 8080 {
+		t.Errorf("LiteLLM rule ports = %+v, want tcp 80+4000+8080", llm.Ports)
+	}
+	if len(llm.To) != 1 || llm.To[0].PodSelector == nil || llm.To[0].PodSelector.MatchLabels["app"] != "litellm" {
+		t.Errorf("LiteLLM peer = %+v, want app=litellm", llm.To)
+	}
+
+	// The refusal, stated as a refusal: outside the DNS rule nothing reaches
+	// an address, only a labelled pod. An IPBlock on the bus or model rule
+	// would be the widening this fence exists to prevent, and every peer that
+	// names a namespace must name this agent's own.
+	for i, rule := range np.Spec.Egress[1:] {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil {
+				t.Errorf("egress rule %d carries an IPBlock peer: %+v", i+1, peer)
+			}
+			if peer.NamespaceSelector != nil &&
+				peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "test-ns" {
+				t.Errorf("egress rule %d crosses namespaces: %+v", i+1, peer)
+			}
+		}
+	}
+}
+
+// The session fence must not inherit the agent policy's off switch: that flag
+// withholds the agent pod's own gateway policy, and reading it as permission
+// to unfence the workers would make delegation the way around the very
+// allowlist it governs.
+func TestSessionNetworkPolicySurvivesNetworkPolicyDisabled(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.NetworkPolicy = &agentv1alpha1.NetworkPolicySpec{
+		Enabled:       ptr.To(false),
+		DNSClusterIPs: []string{"10.1.2.3"},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+
+	ips := r.a2aSessionDNSClusterIPs(context.Background(), agent)
+	if !reflect.DeepEqual(ips, []string{"10.1.2.3"}) {
+		t.Errorf("DNS cluster IPs = %v, want the operator's documented override honoured", ips)
+	}
+
+	np := buildA2ASessionNetworkPolicy(agent, ips)
+	if len(np.Spec.Egress) != 3 || len(np.Spec.Ingress) != 0 {
+		t.Errorf("the fence changed shape when spec.networkPolicy.enabled=false: %+v", np.Spec)
+	}
+}
+
 func TestA2ANATSNetworkPolicyGatedByMode(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
@@ -898,8 +1068,12 @@ func TestA2ANATSNetworkPolicyGatedByMode(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-netpol", Namespace: "test-ns"}, nats); err != nil {
 		t.Errorf("NATS NetworkPolicy not rendered under next: %v", err)
 	}
+	session := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-netpol", Namespace: "test-ns"}, session); err != nil {
+		t.Errorf("session NetworkPolicy not rendered under next: %v", err)
+	}
 
-	// Flip to today: the fence goes back to dark, and the agent's own netpol
+	// Flip to today: both fences go back to dark, and the agent's own netpol
 	// stays.
 	fresh := &agentv1alpha1.PlatformAgent{}
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
@@ -914,6 +1088,9 @@ func TestA2ANATSNetworkPolicyGatedByMode(t *testing.T) {
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-netpol", Namespace: "test-ns"}, nats); !errors.IsNotFound(err) {
 		t.Errorf("NATS NetworkPolicy still present under today (err=%v)", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-session-netpol", Namespace: "test-ns"}, session); !errors.IsNotFound(err) {
+		t.Errorf("session NetworkPolicy still present under today (err=%v)", err)
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, &networkingv1.NetworkPolicy{}); err != nil {
 		t.Errorf("the agent's own NetworkPolicy vanished with the A2A cleanup: %v", err)
@@ -1987,6 +2164,110 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	}
 }
 
+// TestARefusalDoesNotSuspendTheA2AFences is #1247's assertion extended to the
+// two policies this branch's stack depends on.
+//
+// #1247 established the hazard and the rescue for <name>-gateway-netpol and
+// <name>-sandbox-metadata-deny: a refusal withholds the workload, and a policy
+// that stops being reconciled is one an operator can delete permanently, after
+// which nothing selects the Pod and NetworkPolicy permits all egress. The A2A
+// fences were outside that rescue for a positional reason rather than a
+// considered one — every refusal path returns before reconcileA2A is reached,
+// and reconcileA2A is where the fences were applied.
+//
+// The session fence is why that mattered enough to move. A session pod runs
+// worker code the model steers, and buildA2ASessionNetworkPolicy is the whole
+// of its confinement. An install sitting Degraded over one bad control-plane
+// CIDR would stop re-asserting it, and the deletion would stick against pods
+// that are still running, with the status naming the CIDR and nothing naming
+// the fence.
+//
+// The mode: today subtest is the control that stops this passing for the wrong
+// reason: reconcileA2ANetworkFences is gated, so a fence appearing there would
+// mean the guardrail path had started rendering the next stack on installs
+// that never asked for it.
+func TestARefusalDoesNotSuspendTheA2AFences(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     *string
+		expected bool
+	}{
+		{"mode next", ptr.To(string(ModeNext)), true},
+		{"mode today", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Mode = tc.mode
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			})
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
+			// Without the refusal the ordinary path would render the fences and
+			// this would assert nothing.
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			var gotReason string
+			for _, condition := range stored.Status.Conditions {
+				if condition.Type == "Ready" {
+					gotReason = condition.Reason
+				}
+			}
+			if gotReason != reasonEgressAllowlistRefused {
+				t.Fatalf("the spec was not refused, so this test proves nothing; got reason %q", gotReason)
+			}
+
+			for _, fence := range []types.NamespacedName{
+				{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
+				{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+			} {
+				err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{})
+				if !tc.expected {
+					if err == nil {
+						t.Errorf("%s was rendered outside mode next; the guardrail path must not "+
+							"bring up the next stack's fences on an install that never asked for it", fence.Name)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("the refusal withheld %s: %v", fence.Name, err)
+				}
+
+				// Written once before the spec went bad is not the same as
+				// maintained, and only the second is a guardrail.
+				if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+					ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
+				}); err != nil {
+					t.Fatalf("failed to delete %s for the restore check: %v", fence.Name, err)
+				}
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("second Reconcile failed: %v", err)
+				}
+				if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
+					t.Fatalf("while the spec was refused %s stopped being reconciled, so deleting it "+
+						"stuck; the pods it fences keep running unconfined: %v", fence.Name, err)
+				}
+			}
+		})
+	}
+}
+
 // TestSeedGrantsAndProvisionScriptNameTheSameStreams pins the pair. seed's
 // $JS.API allow-list renders from a2aProvisionedStreams; the provision script
 // does NOT -- each create line there carries its own subjects, retention and
@@ -2152,6 +2433,173 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		if !allowedShapes[grant] {
 			t.Errorf("seed holds JetStream API grant %q, which is neither account discovery "+
 				"nor CREATE/INFO on a provisioned stream", grant)
+		}
+	}
+}
+
+// TestWorkerHoldsNoWholesaleJetStreamAPI is the shape check for the worker's
+// JetStream API grant; the refusal proof is TestWorkerJetStreamGrantOnARealServer,
+// which asks a server. This one keeps the wildcard from coming back by
+// accident, and asks three questions, none by substring -- the web user's test
+// above records why: `$JS.API.STREAM.>` contains none of the words a blocklist
+// would think to name.
+//
+//  1. The publish allow-list is pinned exactly: the task-events subject, the
+//     three topic subjects, heartbeats, the runtime-state bucket, the grants
+//     a2aWorkerJetStreamGrants renders, the TASKS ack, flow control, and the
+//     worker's own inbox. Any other entry, in any spelling, is a diff.
+//  2. Every destructive or out-of-scope route -- a concrete subject per verb,
+//     on every provisioned stream, not one sample per verb -- is run through
+//     subjectMatches against every rendered entry. That is the question the
+//     server asks, so a wildcard cannot grant a route without naming it.
+//  3. The grant function's own output is bounded by shape, because want in (1)
+//     is built from that same function and cannot see an entry added inside it.
+//  4. The subscribe list is pinned exactly too: a subscribe grant is delivery
+//     interest for a push consumer's deliver_subject, so widening it is a
+//     review conversation for the same reason widening publish is.
+func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	got := a2aGrantSubjects(t, conf, "worker", "publish")
+
+	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
+		t.Errorf("worker subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
+	}
+
+	want := []string{
+		"a2a.tasks.*.*.events",
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+		"agents.hb.>",
+		"$KV.runtime-state.>",
+	}
+	want = append(want, a2aWorkerJetStreamGrants()...)
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.worker.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("worker publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// Verbs no worker path uses, against every stream the provision script
+	// creates. A named grant only widens the stream it names, so a verb
+	// sampled on TASKS says nothing about the same verb on DIRECTORY.
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	forbiddenVerbs := []string{
+		"$JS.API.STREAM.CREATE.",
+		"$JS.API.STREAM.UPDATE.",
+		"$JS.API.STREAM.DELETE.",
+		"$JS.API.STREAM.PURGE.",
+		"$JS.API.STREAM.MSG.DELETE.",
+		"$JS.API.STREAM.MSG.GET.",
+		"$JS.API.STREAM.RESTORE.",
+		"$JS.API.STREAM.SNAPSHOT.",
+		"$JS.API.CONSUMER.NAMES.",
+		"$JS.API.CONSUMER.LIST.",
+	}
+	var forbidden []string
+	for _, s := range provisioned {
+		for _, verb := range forbiddenVerbs {
+			forbidden = append(forbidden, verb+s)
+		}
+		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
+	}
+	// Streams the worker has no business on at all: not a read, not a
+	// consumer, not a direct get. The directory is the identity plane; the
+	// session registry is the gateway's; cap is the capability envelope's.
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap"} {
+		forbidden = append(forbidden,
+			"$JS.API.STREAM.INFO."+s,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.CREATE."+s+".x.a2a.agents.platform",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.CONSUMER.MSG.NEXT."+s+".x",
+			"$JS.API.CONSUMER.DELETE."+s+".x",
+			"$JS.API.DIRECT.GET."+s+".a2a.agents.platform",
+			"$JS.API.DIRECT.GET."+s,
+		)
+	}
+	forbidden = append(forbidden,
+		// The gateway's relay durable: CREATE and MSG.NEXT on a shared stream
+		// are conceded, DELETE is not (see a2aWorkerJetStreamGrants).
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		// The registry is put, listed and deleted, never read by key.
+		"$JS.API.DIRECT.GET.KV_runtime-state.$KV.runtime-state.k",
+		// Topic streams are read by direct get, never consumed.
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.x",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.x",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.x",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.x",
+		// Account discovery and enumeration.
+		"$JS.API.INFO",
+		"$JS.API.STREAM.NAMES",
+		"$JS.API.STREAM.LIST",
+		// A stream nobody provisions, for the verbs the worker does hold.
+		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
+		"$JS.API.CONSUMER.CREATE.NOT-PROVISIONED.x",
+		"$JS.API.DIRECT.GET.NOT-PROVISIONED.x",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("worker grant %q permits %q; nothing on the worker path uses it", grant, subject)
+			}
+		}
+	}
+
+	// The other direction, and the one a forbidden list cannot cover: an
+	// entry added inside a2aWorkerJetStreamGrants is invisible to the
+	// DeepEqual above. Anything outside these shapes has to be argued for in
+	// that function's comment rather than added quietly.
+	allowedShapes := map[string]bool{}
+	for _, s := range []string{"TASKS", "KV_runtime-state", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		allowedShapes["$JS.API.STREAM.INFO."+s] = true
+	}
+	for _, s := range []string{"TASKS", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		allowedShapes["$JS.API.DIRECT.GET."+s+".>"] = true
+	}
+	for _, s := range []string{"TASKS", "KV_runtime-state"} {
+		allowedShapes["$JS.API.CONSUMER.CREATE."+s+".>"] = true
+	}
+	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
+	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	for _, grant := range a2aWorkerJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("worker holds JetStream API grant %q, which is outside the shapes a2aWorkerJetStreamGrants argues for", grant)
+		}
+	}
+}
+
+// TestWorkerGrantNamesStreamsTheProvisionScriptCreates pins the pair. The
+// worker's grants render from the stream-name constants; the provision script
+// spells each name itself, because every create line carries its own subjects,
+// retention and caps. Rename a stream on one side only and the worker holds
+// grants on a name that does not exist -- an authorization failure at runtime
+// with a green suite -- so the script's create lines are held to the constants
+// here. Anchored to the create itself, not the bare name, for the reason
+// #1306's pairing test records: the script's prose mentions every name too.
+func TestWorkerGrantNamesStreamsTheProvisionScriptCreates(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	for _, create := range []string{
+		"stream add " + a2aTasksStream + " ",
+		"stream add " + a2aTopicsStateStream + " ",
+		"stream add " + a2aTopicsJournalStream + " ",
+		"kv add " + a2aRuntimeStateBucket + " ",
+	} {
+		if !strings.Contains(script, create) {
+			t.Errorf("the provision script has no %q; the worker's grant names a stream nothing creates", strings.TrimSpace(create))
+		}
+	}
+	// Every grant names one of those constants, so the check above covers
+	// the whole list rather than the four names this test happens to know.
+	known := []string{a2aTasksStream, a2aTopicsStateStream, a2aTopicsJournalStream, a2aKVStreamPrefix + a2aRuntimeStateBucket}
+	for _, grant := range a2aWorkerJetStreamGrants() {
+		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
+			t.Errorf("worker grant %q names a stream outside the constants the provision script is held to", grant)
+		}
+	}
+	// And the direct-get route the grants assume: every stream add says so.
+	for _, line := range strings.Split(script, "\n") {
+		if strings.Contains(line, "stream add ") && !strings.Contains(line, "--allow-direct") {
+			t.Errorf("provision line %q does not set --allow-direct; the worker's grant is written for DIRECT.GET, not STREAM.MSG.GET", strings.TrimSpace(line))
 		}
 	}
 }
