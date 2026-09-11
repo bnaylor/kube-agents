@@ -234,6 +234,83 @@ var a2aCredsKeys = []string{
 	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 }
 
+// a2aProvisionedStreams is every JetStream stream the provision Job creates, and
+// the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
+// KV_<bucket>, so they belong in the same list.
+//
+// The seed grant in nats.conf renders from this slice. The provision script
+// does not: each stream's create line carries its own subjects, retention and
+// caps, so the script names the streams itself, in a2aProvisionScript. The two
+// are a pair — a grant that does not name a stream makes that create time out
+// on a refused API request, and a script that creates a stream the grant does
+// not name is the same bug from the other side — and what holds them together
+// is TestSeedGrantsAndProvisionScriptNameTheSameStreams, which reads the
+// script's `stream add` / `kv add` lines and checks both directions against
+// this list. Add a stream to one side and that test says so.
+//
+// Since the callout armed, the rendered Job authenticates as `provision` rather
+// than as seed, and provisionIdentity enumerates the same objects for itself
+// rather than from this slice. So the refusal the pair describes is provision's
+// to hit now; seed keeps the scoped grant because the hand-applied seed tooling
+// still connects with it. Nothing yet binds that third spelling to this list.
+var a2aProvisionedStreams = []string{
+	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
+	"KV_runtime-state", "KV_session-state", "KV_cap",
+}
+
+// a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
+// replacing the `$JS.API.>` wildcard this user shipped with.
+//
+// seed was the identity the provision Job ran under, and it is still the one the
+// hand-applied seed tooling connects with — the rendered Job has moved to the
+// callout-authenticated `provision` principal — so this is defence in depth
+// rather than a boundary. It is worth having anyway, because the seed password
+// lives in the creds Secret for the life of the CR and deliberately survives a
+// flip back to today, so the blast radius of a leak is not bounded by anything
+// else.
+//
+// What the wildcard granted that provisioning never uses, and this list now
+// refuses: STREAM.RESTORE (arbitrary messages with arbitrary stored subjects),
+// STREAM.MSG.DELETE and PURGE (selective editing of the audit substrate),
+// CONSUMER.CREATE (deliver-subject redirection, the server-originated write onto
+// a subject nobody granted), and STREAM.DELETE.
+//
+// UPDATE is absent deliberately, and it is the interesting one. The script
+// guards every create with an info check (`stream info X || stream add X`), so
+// it never updates an existing stream — which means seed cannot set RePublish on
+// one either. RePublish is a stream-config field settable at CREATE and UPDATE,
+// and CREATE on an existing stream either returns that stream unchanged (when
+// the config it carries is identical) or fails with JSStreamNameExistErr (when
+// it differs). A RePublish edit is a differing config, so it takes the second
+// branch. The one write route that survives a name-scoped allow-list in general
+// is therefore closed here by the script's own idempotence. If a
+// future script ever needs UPDATE, that reopens RePublish and the grant should
+// say so out loud rather than quietly gaining a verb.
+func a2aSeedJetStreamGrants() []string {
+	// Account-level JetStream discovery. `stream add` asks for it
+	// (IsStreamMaxBytesRequired -> JetStreamAccountInfo) and so does the
+	// legacy CreateKeyValue path, which is what `kv add` runs.
+	//
+	// STREAM.NAMES is the one that is easy to miss and expensive to omit.
+	// natscli's selectStream falls through to mgr.StreamNames(nil) when
+	// LoadStream fails, which is exactly the first-run case the CREATE grants
+	// exist for: every `stream info X || stream add X` guard on a fresh store
+	// asks for it. A refused request is not an error the client sees -- nats.go
+	// only records it and fires the async callback -- so the CLI waits out its
+	// 5s timeout instead. Four streams, four timeouts, and four Publish
+	// Violations in the same log the install is verified from. It is a
+	// read-only listing of names the seed already knows, so granting it costs
+	// nothing the CREATE and INFO grants above do not already concede.
+	grants := []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES"}
+	for _, s := range a2aProvisionedStreams {
+		grants = append(grants,
+			`$JS.API.STREAM.CREATE.`+s,
+			`$JS.API.STREAM.INFO.`+s,
+		)
+	}
+	return grants
+}
+
 // a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
 // security check, not tidiness: buildA2ANATSConfigSecret interpolates these
 // values into nats.conf inside double quotes, so a value carrying a quote and
@@ -324,19 +401,22 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // _INBOX prefixes so the reply path cannot leak what the subject grants
 // withheld.
 //
-// A bare $JS.API.> is playground posture and this render still contains three
-// of them. This comment used to say "on every app user", which was a summary
-// worth replacing with the count: it was not true when it was written either,
-// because web has carried the enumerated per-stream subjects since before the
-// callout existed. Of the five APP identities in a2aIdentities today, provision
-// has moved to the callout and holds the enumerated subjects too, and gateway,
-// worker and seed still hold the bare grant. Each is static for a reason its own
-// identity comment argues and none of them is that the grant is right - the
-// gateway has no client that presents a token yet, a session pod carries no
-// Kubernetes identity to present, and the seed is applied by hand rather than
-// rendered. The narrowing is per identity as each stops being static, not one
-// switch that arming the callout throws, so this comment is only true of the
-// identity table below it: read that, not this.
+// A bare $JS.API.> is playground posture and this render still contains two of
+// them. This comment used to say "on every app user", which was a summary worth
+// replacing with the count: it was not true when it was written either, because
+// web has carried the enumerated per-stream subjects since before the callout
+// existed. Of the five APP identities in a2aIdentities today, provision has
+// moved to the callout and holds the enumerated subjects too, and seed's
+// JetStream API grant is scoped to the streams provisioning creates, by name
+// and by verb (gke-labs#1306). Gateway and worker are the two that still hold
+// the bare grant. Each is static for a reason its own identity comment argues
+// and neither reason is that the grant is right - the gateway has no client
+// that presents a token yet, and a session pod carries no Kubernetes identity
+// to present. Narrowing those two is gke-labs#1316 and wants its own live proof,
+// because unlike seed they create consumers. The narrowing is per identity as
+// each stops being static, not one switch that arming the callout throws, so
+// this comment is only true of the identity table below it: read that, not
+// this.
 //
 // pw is a parameter rather than a closure over the creds Secret because two
 // callers walk this template: buildA2ANATSConfigSecret with the real lookup,

@@ -224,7 +224,9 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // per-stream subjects since before the callout existed, so "every" was never
 // true, and provision moved to the callout, so the set changed underneath it.
 // A comment that names a set is a comment that needs a test naming the same
-// set, which is what this is.
+// set, which is what this is. Seed came off the list the same way, in
+// gke-labs#1306: its $JS.API grant is now a2aSeedJetStreamGrants(), CREATE and
+// INFO on the streams provisioning names.
 //
 // Failing here means one of two things and they want opposite responses. An
 // identity dropping off the list is the callout doing its job — narrow the
@@ -235,7 +237,7 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // own comment for why it cannot be enumerated instead.
 func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
 	const bare = "$JS.API.>"
-	expected := []string{"gateway", "seed", "worker"}
+	expected := []string{"gateway", "worker"}
 
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {

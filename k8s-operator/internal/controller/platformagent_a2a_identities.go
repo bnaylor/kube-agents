@@ -347,6 +347,22 @@ func workerIdentity() a2aIdentity {
 // goes away when the seed content becomes a render or ships with the gateway,
 // which is an open question elsewhere and not this change's to answer.
 func seedIdentity() a2aIdentity {
+	// The JetStream API grant is a2aSeedJetStreamGrants() rather than the
+	// $JS.API.> this user shipped with: CREATE and INFO on the streams the
+	// provisioning names, plus account discovery, and nothing else. #1306
+	// scoped it against the nats.conf template; A1 moved the subject lists
+	// out of that template and into this list, so the scoping is carried
+	// here by hand. The argument for every verb it holds and every verb it
+	// refuses is on a2aSeedJetStreamGrants itself, and
+	// TestSeedHoldsNoWholesaleJetStreamAPI pins the rendered result.
+	publish := []string{
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+	}
+	publish = append(publish, a2aSeedJetStreamGrants()...)
+	publish = append(publish, "_INBOX.seed.>")
+
 	return a2aIdentity{
 		user:     "seed",
 		account:  a2aAccountApp,
@@ -355,14 +371,19 @@ func seedIdentity() a2aIdentity {
 		comment: "hand-applied seed tooling. STATIC because it is applied rather than\n" +
 			"rendered: it exists on installs today, and removing its user would refuse\n" +
 			"it at connect the next time it ran. The rendered provisioner beside it\n" +
-			"does the same job through the callout.",
-		publish: []string{
-			"a2a.topics.agent.platform.upgrade-readiness",
-			"a2a.topics.shared.blueprint",
-			"a2a.topics.shared.annotations",
-			"$JS.API.>",
-			"_INBOX.seed.>",
-		},
+			"does the same job through the callout.\n" +
+			"Its $JS.API grant is scoped to the streams that provisioning creates, by\n" +
+			"name and by verb (#1306): CREATE and INFO on those and nothing else, so no\n" +
+			"RESTORE, no MSG.DELETE or PURGE, no CONSUMER.CREATE and no STREAM.DELETE.\n" +
+			"No ack grant either - seed creates no consumers, so one would be pure\n" +
+			"unused capability to +TERM other principals' deliveries (the same deletion\n" +
+			"the web user got).\n" +
+			"Seed also reads no topics. \"a2a topics read\" is a stream API call\n" +
+			"(GetLastMsgForSubject, so $JS.API.DIRECT.GET.<stream>.<subject> on these\n" +
+			"streams, or STREAM.MSG.GET as the fallback) and the scoped grant below\n" +
+			"refuses both. Nothing runs it as seed: the seed tooling does writes and\n" +
+			"info checks only, and the a2a CLI runs in the agent pod as worker.",
+		publish: publish,
 		subscribe: []string{
 			"a2a.topics.>",
 			"_INBOX.seed.>",
