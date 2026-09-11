@@ -456,10 +456,11 @@ principal.
 
 Google Chat stays the supported production ingress, for the trust-domain reason above -
 it is the first real adapter, specified in its own section below. ~~Slack follows when a
-customer asks, with the mapping table as a hard prerequisite.~~ **Update 9/4:** Slack was
-resequenced ahead of the order this doc stated and built first, with the mapping table
-built as part of the card rather than as a later chore; gchat followed on 9/5. Each has
-its own section below, and those sections are the design of record for that adapter.
+customer asks, with the mapping table as a hard prerequisite.~~ **Update 9/4:** Slack did
+not wait for a customer to ask - it was resequenced against the order stated here and
+written ahead of gchat (which followed on 9/5), with the mapping table built as part of
+the card rather than left as a later chore. Both adapters now have a section below, and
+those sections are the design of record for each.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
