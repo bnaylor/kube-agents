@@ -1,5 +1,5 @@
-// The a2a chatops gateway: chat in (Slack or Discord, one per process),
-// tasks on the bus out.
+// The a2a chatops gateway: chat in (Google Chat, Slack or Discord, one
+// backend per process), tasks on the bus out.
 //
 // PLAYGROUND POSTURE: static per-component NATS users instead of the auth
 // callout, bot token as a plain Secret, no exporter, no breaker, gateway
@@ -55,18 +55,20 @@ func main() {
 	}
 	defer client.Close()
 
-	// FromEnv guarantees exactly one backend is configured (one relay
-	// durable, one backend per gateway process).
+	// FromEnv already enforced exactly one backend (one relay durable, one
+	// backend per gateway process).
 	var adapter gateway.Adapter
 	backend := cfg.Backend()
 	switch backend {
+	case "gchat":
+		adapter, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
 	case "slack":
 		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}
 	if err != nil {
-		log.Error(backend, "err", err)
+		log.Error("adapter", "backend", backend, "err", err)
 		os.Exit(1)
 	}
 

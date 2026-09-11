@@ -28,6 +28,16 @@ const attributionSaltLen = 32
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultGchatTokenPath is where the operator projects the gateway's
+// relay-audience ServiceAccount token when the gchat backend is armed.
+const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
+
+// The display-mode values, matching the GoogleChatSpec.Mode enum.
+const (
+	displayModeDefault = "default"
+	displayModeDebug   = "debug"
+)
+
 // defaultTaskDeadline is what TaskDeadline means when unset — the worker
 // adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
 // 1800s), restated here because the two halves of one contract must agree.
@@ -63,6 +73,29 @@ type Config struct {
 	// PrincipalMapPath is the mounted principal map — Discord's test
 	// ConfigMap or Slack's admin-owned Secret; same on-disk shape either way.
 	PrincipalMapPath string
+
+	// GchatRelayURL is the credential proxy's relay base URL — the gchat
+	// backend's transport. Setting it selects the Google Chat adapter.
+	GchatRelayURL string
+	// GchatTokenPath is the projected ServiceAccount token (a2a-chat audience)
+	// the adapter authenticates to the relay with.
+	GchatTokenPath string
+	// GchatAllowedUsers is the ingress allowlist for the gchat backend —
+	// the same gate the legacy path enforces as GOOGLE_CHAT_ALLOWED_USERS.
+	// gchat has no mapping table (the Google-asserted email IS the
+	// principal), so the allowlist is the whole verification config.
+	GchatAllowedUsers []string
+	// GchatAllowAllUsers disables the allowlist, stated explicitly —
+	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
+	GchatAllowAllUsers bool
+
+	// DisplayMode is the existing Chat integration's default-vs-debug split
+	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
+	// under "default" the rolling line carries the state but never the
+	// turn-by-turn narration; "debug" is the gateway's historical verbose
+	// behaviour and the value an unset env resolves to, so installs that
+	// predate the knob render exactly as before.
+	DisplayMode string
 
 	// DefaultAddressee is where every conversation's tasks route until a
 	// per-conversation override says otherwise. Retarget 8/26: the first
@@ -183,12 +216,18 @@ type Config struct {
 	MaxSessions int
 }
 
-// Backend names the chat backend this config arms: "slack" or "discord".
+// Backend names the chat backend this config arms: "gchat", "slack" or
+// "discord". FromEnv refuses more than one, so the order only decides what a
+// hand-built Config means.
 func (c *Config) Backend() string {
-	if c.SlackBotToken != "" {
-		return "slack"
+	switch {
+	case c.GchatRelayURL != "":
+		return gchatBackend
+	case c.SlackBotToken != "":
+		return slackBackend
+	default:
+		return "discord"
 	}
-	return "discord"
 }
 
 // FromEnv loads the config from the environment.
@@ -207,20 +246,48 @@ func FromEnv() (*Config, error) {
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
 		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
 	}
+	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
+	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
+	for _, u := range strings.Split(os.Getenv("A2A_GCHAT_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.GchatAllowedUsers = append(cfg.GchatAllowedUsers, u)
+		}
+	}
+	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
+	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
+		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	// One backend per gateway process, chosen by which credential is set.
 	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
-	// choice, so it refuses rather than silently running Discord.
+	// choice, so it refuses rather than silently running another backend.
 	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
 		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
 	}
-	switch {
-	case cfg.SlackBotToken != "" && cfg.DiscordToken != "":
-		return nil, fmt.Errorf("both DISCORD_TOKEN and the SLACK_*_TOKEN pair are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
-	case cfg.SlackBotToken == "" && cfg.DiscordToken == "":
-		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
+	// One backend per gateway process, chosen by which credential is set. A
+	// silent default here would make a two-backend misconfiguration a working
+	// Discord gateway that quietly never consumes Chat — refuse both
+	// directions instead. Counted rather than enumerated pairwise: with three
+	// backends the pairs are the easy thing to leave a hole in, and a fourth
+	// backend must not be addable with a combination nobody checked.
+	var armed []string
+	if cfg.GchatRelayURL != "" {
+		armed = append(armed, "A2A_GCHAT_RELAY_URL")
+	}
+	if cfg.SlackBotToken != "" {
+		armed = append(armed, "the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
+	}
+	if cfg.DiscordToken != "" {
+		armed = append(armed, "DISCORD_TOKEN")
+	}
+	switch len(armed) {
+	case 1:
+	case 0:
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
+	default:
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend", strings.Join(armed, ", "))
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs

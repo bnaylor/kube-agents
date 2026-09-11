@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,9 @@ const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event s
 // ids are wider than task and message ids: they outlive one task and join
 // records across surfaces, so a collision costs more.
 const (
+	// droppedNoticesCap bounds the once-per-sender drop-notice memory; one
+	// entry per unverified sender, evicted wholesale rather than leaked.
+	droppedNoticesCap     = 4096
 	taskIDHexWidth        = 8
 	messageIDHexWidth     = 8
 	contextIDHexWidth     = 12
@@ -73,19 +77,22 @@ type Gateway struct {
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
-	// droppedNotices dedupes the unmapped-sender notice per sender for the
-	// life of the process: the drop stays visible (a silent drop of a real
-	// user is a support burden) while a repeat-typer cannot make the
-	// gateway spam the room. Per sender, NOT per conversation — a channel
-	// mention mints a fresh conversation every time, so a conversation-
-	// scoped key would be no bound at all. Growth is bounded by workspace
-	// membership; the backend authenticated the id.
-	droppedNotices map[string]bool
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
 
 	// backend names the chat backend for authority blocks.
 	backend string
+	// gchatAllowed and gchatAllowAll gate the gchat backend's identity
+	// resolution (Config.GchatAllowedUsers, lowercased at build).
+	gchatAllowed  map[string]bool
+	gchatAllowAll bool
+	// droppedNotices records which unverifiable senders have been told so —
+	// the drop is visible once per sender, not once per message. Per
+	// sender, NOT per conversation: a channel mention mints a fresh
+	// conversation every time, so a conversation-scoped key would be no
+	// bound at all. Bounded by droppedNoticesCap, so an unverified sender
+	// cannot grow it without bound either.
+	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
 }
@@ -121,13 +128,27 @@ func New(o Options) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
-	if pm.Len() == 0 {
+	backend := o.Backend
+	if backend == "" {
+		// Derived from the same config that selects the adapter, so a
+		// caller that sets one and not the other cannot pair a gchat
+		// relay with principal-map resolution.
+		backend = o.Config.Backend()
+	}
+	// gchat resolves identity from the Google-asserted email, not from the
+	// map — an empty map is only a lockout on the backends that use one.
+	if backend != gchatBackend && pm.Len() == 0 {
 		log.Warn("principal map is empty; every inbound message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
 	}
-	backend := o.Backend
-	if backend == "" {
-		backend = "discord"
+	gchatAllowed := map[string]bool{}
+	for _, u := range o.Config.GchatAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			gchatAllowed[strings.ToLower(u)] = true
+		}
+	}
+	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
+		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	if o.RelayDurable == "" {
 		o.RelayDurable = relayDurable
@@ -157,9 +178,11 @@ func New(o Options) (*Gateway, error) {
 		runCtx:         context.Background(),
 		sessionLocks:   map[string]*sync.Mutex{},
 		taskSessions:   map[string]string{},
-		droppedNotices: map[string]bool{},
 		relays:         map[string]*relayState{},
 		backend:        backend,
+		gchatAllowed:   gchatAllowed,
+		gchatAllowAll:  o.Config.GchatAllowAllUsers,
+		droppedNotices: map[string]bool{},
 		relayDurable:   o.RelayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
@@ -224,25 +247,33 @@ func (g *Gateway) lockSession(key string) *sync.Mutex {
 // and route the message — status query by replay, stop, steer, or a new
 // task. Runs on the conversation's inbox worker, in arrival order.
 func (g *Gateway) handleInbound(msg InboundMessage) {
-	// Verify against the backend's identity mechanism — for Discord, the
-	// test mapping table — and drop the message if we can't (gateway design,
-	// turns-and-tasks step 1).
-	principal := g.pm.Resolve(msg.AuthorID)
+	// Verify against the backend's identity mechanism — the mapping table
+	// on Discord, the Google-asserted email gated by the allowlist on gchat
+	// — and drop the message if we can't (gateway design, turns-and-tasks
+	// step 1). The drop is visible once per sender: a silent drop of a real
+	// user is a support burden. The notice names the sender's own
+	// backend-asserted id — their own identity, in their own conversation,
+	// which is what the admin needs to add and is not an oracle over
+	// anything the sender does not already see.
+	principal := g.resolvePrincipal(msg.AuthorID)
 	if principal == "" {
-		g.log.Warn("dropping message from unmapped sender",
+		g.log.Warn("dropping message from unverified sender",
 			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
-		// Say so visibly: a silent drop of a real user is a support burden
-		// (chat-adapters card). A deterministic template over facts the
-		// gateway owns, inside the no-model rule; the per-sender dedupe
-		// bounds what an unverified sender can make the gateway post (see
-		// the droppedNotices field for why it is not per conversation).
+		// Keyed case-folded (an asserted address that varies in case is one
+		// person) and bounded the way the adapters bound their own maps:
+		// wholesale eviction at the cap, which at worst repeats a notice.
+		key := strings.ToLower(msg.AuthorID)
 		g.mu.Lock()
-		notified := g.droppedNotices[msg.AuthorID]
-		g.droppedNotices[msg.AuthorID] = true
+		if len(g.droppedNotices) >= droppedNoticesCap {
+			g.droppedNotices = map[string]bool{}
+		}
+		notified := g.droppedNotices[key]
+		g.droppedNotices[key] = true
 		g.mu.Unlock()
 		if !notified {
 			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+
-				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to the principal map.")
+				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
+				unverifiedRemedyFor(g.backend)+".")
 		}
 		return
 	}
@@ -491,18 +522,6 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 	}
-}
-
-// verifiedByFor names the ingress verification mechanism per backend — the
-// authority block should say what was actually checked, not just "the map".
-// Slack: Slack authenticated the sender over the Socket Mode connection and
-// asserted the immutable user_id; the install's mapping table joined it to
-// a principal. Discord (and anything unlisted): the test mapping table.
-func verifiedByFor(backend string) string {
-	if backend == "slack" {
-		return "slack-socket-mode+principal-map"
-	}
-	return "principal-map"
 }
 
 // mintSession is first contact with a conversation: contextId is minted

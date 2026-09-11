@@ -74,6 +74,17 @@ const slackRosterPage = 200
 // on the next reply.
 const slackRepliesTimeout = 2 * time.Second
 
+const (
+	// slackBackend names the backend in authority blocks and config.
+	slackBackend = "slack"
+	// slackVerifiedBy names what ingress verification actually checked:
+	// Slack authenticated the sender over the Socket Mode connection and
+	// asserted the immutable user_id, and the install's mapping table
+	// joined that id to a principal. Both halves, because either alone
+	// would overstate it.
+	slackVerifiedBy = "slack-socket-mode+principal-map"
+)
+
 // Slack token prefixes, checked at construction so a swapped pair fails at
 // boot with a message instead of as an opaque 401 from the first API call.
 const (
