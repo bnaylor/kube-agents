@@ -42,6 +42,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import textwrap
 import unittest
 import unittest.mock
 
@@ -875,6 +876,44 @@ class TestTheSanitizer(unittest.TestCase):
         ):
             with self.assertRaises(validator.CaseError):
                 validator.credential_patterns()
+
+    def test_the_redactor_loads_even_though_it_defines_a_dataclass(self):
+        # The loader runs the redactor outside the import system, which is
+        # cheap until the file pairs a dataclass with `from __future__ import
+        # annotations`. Every annotation is a string then, and dataclasses
+        # resolves an unqualified one through sys.modules[cls.__module__] --
+        # unguarded, so a module never registered there dies on None, inside
+        # dataclasses and nowhere near the shapes this scan wants.
+        # gke-labs/kube-agents#1364 added RedactionRule and reded every test in
+        # this file. Both halves matter, so both are here; a fixture of our own
+        # keeps this a test of the loader after the redactor's contents move on.
+        source = textwrap.dedent(
+            '''
+            from __future__ import annotations
+
+            import re
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Rule:
+                name: str
+
+            class AuditRedactor:
+                A_TOKEN = re.compile(r"tok-[0-9]+")
+            '''
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "redactor.py"
+            path.write_text(source, encoding="utf-8")
+            with unittest.mock.patch.object(validator, "REDACTOR_FILE", path):
+                with unittest.mock.patch.dict(
+                    validator.CREDENTIAL_SHAPES, {"A_TOKEN": "a token"}, clear=True
+                ):
+                    self.assertEqual(
+                        set(validator.credential_patterns()), {"a token"}
+                    )
+        # ..and the loader leaves the import system as it found it.
+        self.assertNotIn(validator.REDACTOR_MODULE_NAME, sys.modules)
 
     def test_main_exits_non_zero_on_a_sanitization_finding(self):
         # main() scans the named case's directory, so a scratch draft is
