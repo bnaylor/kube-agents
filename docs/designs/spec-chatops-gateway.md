@@ -621,9 +621,14 @@ DM is one conversation, a channel is not a session, a thread in it is.
 
 **Which messages become turns.** DMs carry every message. A channel message must
 mention the bot, and the ask roots the session thread. A thread reply is a turn when it
-mentions the bot or the thread root did - that is what lets a session thread carry
-every message (the Discord parity) without making every thread in a joined channel a
-session. Two subtypes count as turns besides plain messages: `thread_broadcast` (a
+mentions the bot or the thread is already a session thread - and a mention in a thread
+makes it one, whoever rooted it. That is what lets a session thread carry every message
+(the Discord parity) without making every thread in a joined channel a session. The
+rule used to read "or the thread root did", which was narrower than the sessions it
+described: mentioning the bot inside someone else's thread mints a session keyed on
+that thread and starts a task there, and the follow-ups - a steer, "stop" - arrive
+unmentioned, so a rule that only ever looked at the root message dropped them silently
+while the task ran on. Two subtypes count as turns besides plain messages: `thread_broadcast` (a
 thread reply with "also send to channel" checked - dropping it would eat a steer
 silently) and `file_share` (an ask with an attachment). Everything else drops in the
 adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs

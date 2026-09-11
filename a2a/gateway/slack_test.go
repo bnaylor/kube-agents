@@ -71,7 +71,7 @@ func (f *fakeSlackAPI) OpenConversation(params *slack.OpenConversationParameters
 
 // GetConversationRepliesContext honours ctx the way the real client does —
 // a cancelled or expired context comes back as ctx.Err() and no messages —
-// so tests can drive the shutdown and timeout paths of isSessionRoot.
+// so tests can drive the shutdown and timeout paths of isSessionThread.
 func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
 	f.repliesCalls++
 	if err := ctx.Err(); err != nil {
@@ -82,7 +82,7 @@ func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params
 
 func newTestSlackAdapter(api *fakeSlackAPI) *SlackAdapter {
 	return &SlackAdapter{api: api, log: slog.Default(), botUserID: "UBOT",
-		sessionRoots: map[string]bool{}, seen: map[string]bool{}}
+		sessionThreads: map[string]bool{}, seen: map[string]bool{}}
 }
 
 // recordingHandler captures log records so a test can assert on the LEVEL a
@@ -205,12 +205,19 @@ func TestSlackOpenDirect(t *testing.T) {
 // TestSlackInboundAffordanceRule pins which messages become turns: DMs
 // always; channel messages only when they mention the bot (the ask roots
 // the session thread); thread replies when they mention the bot or the
-// thread root did (bot-rooted threads carry every message — the parity
-// with Discord's bot-created threads).
+// thread is already a session thread (session threads carry every message —
+// the parity with Discord's bot-created threads).
+//
+// The cases run in order against one adapter, because the rule is stateful:
+// a mention in a thread makes that thread a session thread for the cases
+// after it. 200.1 is the thread the bot is pulled into mid-conversation and
+// 300.1 the one it is never addressed in, and they are separate threads for
+// exactly that reason.
 func TestSlackInboundAffordanceRule(t *testing.T) {
 	api := &fakeSlackAPI{replies: map[string][]slack.Message{
 		"C1/100.1": {{Msg: slack.Msg{Text: "<@UBOT> check the nodes", User: "U1"}}},
 		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
+		"C1/300.1": {{Msg: slack.Msg{Text: "anyone seen the changelog?", User: "U2"}}},
 	}}
 	a := newTestSlackAdapter(api)
 
@@ -227,8 +234,12 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		{"channel mention roots a thread on the ask", slackMsg("channel", "C1", "U1", "<@UBOT> do a thing", "3.5", ""), true, "slack:C1/3.5", "group", "do a thing"},
 		{"display-name mention form strips", slackMsg("channel", "C1", "U1", "<@UBOT|kage> do it", "3.6", ""), true, "slack:C1/3.6", "group", "do it"},
 		{"thread reply with mention delivers", slackMsg("channel", "C1", "U1", "<@UBOT> and this", "4.0", "200.1"), true, "slack:C1/200.1", "group", "and this"},
+		// The mention above minted a session on slack:C1/200.1, so that
+		// thread now carries every message — the follow-up the user expects
+		// to be able to steer or stop with.
+		{"unmentioned follow-up in an adopted thread delivers", slackMsg("channel", "C1", "U1", "stop", "4.5", "200.1"), true, "slack:C1/200.1", "group", "stop"},
 		{"reply in bot-rooted thread delivers unmentioned", slackMsg("channel", "C1", "U3", "steer it", "5.0", "100.1"), true, "slack:C1/100.1", "group", "steer it"},
-		{"reply in plain thread drops", slackMsg("channel", "C1", "U3", "chatter", "6.0", "200.1"), false, "", "", ""},
+		{"reply in plain thread drops", slackMsg("channel", "C1", "U3", "chatter", "6.0", "300.1"), false, "", "", ""},
 		{"bare mention drops", slackMsg("channel", "C1", "U1", "<@UBOT>", "7.0", ""), false, "", "", ""},
 		// Slack transmits &, < and > entity-encoded; the ask must reach the
 		// executor as the user typed it.
@@ -930,7 +941,7 @@ func TestSlackRootLookupLogLevels(t *testing.T) {
 	shutdown := &recordingHandler{}
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.log = slog.New(shutdown)
-	if a.isSessionRoot(cancelled, "C1", "700.1") {
+	if a.isSessionThread(cancelled, "C1", "700.1") {
 		t.Error("a failed lookup must report false")
 	}
 	if lvl, ok := shutdown.level("thread root lookup"); !ok || lvl != slog.LevelDebug {
@@ -944,7 +955,7 @@ func TestSlackRootLookupLogLevels(t *testing.T) {
 	timedOut := &recordingHandler{}
 	b := newTestSlackAdapter(&fakeSlackAPI{})
 	b.log = slog.New(timedOut)
-	if b.isSessionRoot(expired, "C1", "700.2") {
+	if b.isSessionThread(expired, "C1", "700.2") {
 		t.Error("a timed-out lookup must report false")
 	}
 	if lvl, ok := timedOut.level("thread root lookup"); !ok || lvl != slog.LevelWarn {
@@ -955,7 +966,7 @@ func TestSlackRootLookupLogLevels(t *testing.T) {
 	empty := &recordingHandler{}
 	c := newTestSlackAdapter(&fakeSlackAPI{})
 	c.log = slog.New(empty)
-	if c.isSessionRoot(context.Background(), "C1", "700.3") {
+	if c.isSessionThread(context.Background(), "C1", "700.3") {
 		t.Error("an unknown thread root must report false")
 	}
 	if lvl, ok := empty.level("thread root lookup"); !ok || lvl != slog.LevelWarn {
@@ -1001,5 +1012,117 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	}
 	if !isStatusQuery(poke.Text, true) {
 		t.Errorf("decoded %q normalizes to %d chars and must read as a status poke", poke.Text, len(normalize(poke.Text)))
+	}
+}
+
+// TestSlackMidThreadMentionAdoptsThread pins the sequence that mints a
+// session in a thread the bot did not root: a user mentions the bot in
+// someone else's thread, which delivers a turn keyed on that thread, and
+// then follows up unmentioned — a steer, or "stop". That follow-up has to
+// reach the gateway, because a session is already running there. Before the
+// adapter recorded the mention, the follow-up hit the root check, the root
+// read found a message with no mention, and the message was discarded
+// without even a drop notice: nothing reached handleInbound.
+//
+// Every shape that can carry a mention into a foreign thread is here, since
+// the bug is "a session minted at a key the adapter never recorded" and a
+// plain reply is only one way to reach it.
+func TestSlackMidThreadMentionAdoptsThread(t *testing.T) {
+	mention := func(text, ts, thread string) *slackevents.MessageEvent {
+		return slackMsg("channel", "C1", "U1", text, ts, thread)
+	}
+	broadcast := func(text, ts, thread string) *slackevents.MessageEvent {
+		m := mention(text, ts, thread)
+		m.SubType = "thread_broadcast"
+		return m
+	}
+	fileShare := func(text, ts, thread string) *slackevents.MessageEvent {
+		m := mention(text, ts, thread)
+		m.SubType = "file_share"
+		return m
+	}
+	cases := []struct {
+		name string
+		msg  func(text, ts, thread string) *slackevents.MessageEvent
+	}{
+		{"plain reply", mention},
+		{"thread_broadcast", broadcast},
+		{"file_share", fileShare},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			api := &fakeSlackAPI{replies: map[string][]slack.Message{
+				"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
+			}}
+			a := newTestSlackAdapter(api)
+
+			got, ok := a.inbound(context.Background(), c.msg("<@UBOT> drain node 3", "4.0", "200.1"))
+			if !ok || got.Conversation != "slack:C1/200.1" {
+				t.Fatalf("mention in a foreign thread: delivered=%v conv=%q", ok, got.Conversation)
+			}
+			got, ok = a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "5.0", "200.1"))
+			if !ok || got.Conversation != "slack:C1/200.1" {
+				t.Fatalf("unmentioned follow-up in the session's own thread: delivered=%v conv=%q", ok, got.Conversation)
+			}
+			if got.Text != "stop" {
+				t.Errorf("follow-up text = %q, want the affordance word intact", got.Text)
+			}
+		})
+	}
+}
+
+// TestSlackBareMentionAdoptsForeignThread: a bare "@bot" is not a turn
+// (nothing to run), but it is still the user addressing the bot in that
+// thread, so the ask that follows it unmentioned is one. Same rule as the
+// channel case, where a bare mention roots a thread whose later replies are
+// turns; the thread being someone else's does not change it.
+func TestSlackBareMentionAdoptsForeignThread(t *testing.T) {
+	api := &fakeSlackAPI{replies: map[string][]slack.Message{
+		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
+	}}
+	a := newTestSlackAdapter(api)
+
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT>", "4.0", "200.1")); ok {
+		t.Fatal("a bare mention has nothing to run and must not deliver")
+	}
+	if api.repliesCalls != 0 {
+		t.Errorf("bare mention made %d conversations.replies reads, want 0", api.repliesCalls)
+	}
+	got, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "drain node 3", "5.0", "200.1"))
+	if !ok || got.Conversation != "slack:C1/200.1" {
+		t.Fatalf("the ask after a bare mention: delivered=%v conv=%q", ok, got.Conversation)
+	}
+	if api.repliesCalls != 0 {
+		t.Errorf("the recorded mention should have answered from cache; %d replies reads", api.repliesCalls)
+	}
+}
+
+// TestSlackMentionUnpoisonsCachedFalse: the root check caches its answer, so
+// an unmentioned reply that arrives BEFORE the bot is pulled into the thread
+// leaves a false behind. A later mention has to overwrite it, or the thread
+// is dropped for the life of the cache entry — including the "stop" for the
+// session that mention started.
+func TestSlackMentionUnpoisonsCachedFalse(t *testing.T) {
+	api := &fakeSlackAPI{replies: map[string][]slack.Message{
+		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
+	}}
+	a := newTestSlackAdapter(api)
+
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U3", "chatter", "3.0", "200.1")); ok {
+		t.Fatal("chatter in a thread the bot is not in must drop")
+	}
+	if v, cached := a.sessionThreads["C1/200.1"]; !cached || v {
+		t.Fatalf("want a cached false for the thread; cached=%v value=%v", cached, v)
+	}
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT> drain node 3", "4.0", "200.1")); !ok {
+		t.Fatal("mention in the thread must deliver")
+	}
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "5.0", "200.1")); !ok {
+		t.Fatal("the cached false outlived the session it silenced")
+	}
+	// One entry, one eviction slot: the overwrite must not double-book the
+	// ring or the cache would evict short of its cap.
+	if n := len(a.threadsOrder); n != 1 {
+		t.Errorf("threadsOrder = %d entries, want 1", n)
 	}
 }

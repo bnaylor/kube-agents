@@ -24,10 +24,10 @@ const slackDMPrefix = "slack:dm/"
 // re-deliveries dropped. Sized to roughly a busy hour of messages.
 const slackSeenCap = 2048
 
-// slackRootsCap bounds the thread-root cache the same way; one entry
+// slackThreadsCap bounds the session-thread cache the same way; one entry
 // accrues per distinct thread replied to, and a busy workspace should not
 // grow the gateway forever.
-const slackRootsCap = 2048
+const slackThreadsCap = 2048
 
 // slackTurnSubtypes are the message subtypes that are genuine user turns.
 // Plain messages have no subtype; thread_broadcast is a thread reply with
@@ -119,12 +119,17 @@ type SlackAdapter struct {
 	botUserID string
 
 	mu sync.Mutex
-	// sessionRoots caches whether a thread's root message mentions the bot
-	// — the rule that lets a bot-rooted thread carry every message without
-	// making every thread in a joined channel a session. rootsOrder gives
-	// it the same eviction ring as seen.
-	sessionRoots map[string]bool
-	rootsOrder   []string
+	// sessionThreads caches whether a thread is a SESSION thread — one the
+	// bot has been addressed in, whether by its root message or by a later
+	// reply — which is the rule that lets such a thread carry every message
+	// without making every thread in a joined channel a session. Not "the
+	// root mentions the bot", which is only how the answer is DERIVED for a
+	// thread the adapter has not already seen a mention in: a session can be
+	// minted on a reply that mentions the bot inside a thread someone else
+	// rooted, and that thread has to carry the follow-ups too. threadsOrder
+	// gives it the same eviction ring as seen.
+	sessionThreads map[string]bool
+	threadsOrder   []string
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
 	seen      map[string]bool
 	seenOrder []string
@@ -186,11 +191,11 @@ func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter
 	}
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	return &SlackAdapter{
-		api:          api,
-		sm:           socketmode.New(api),
-		log:          log,
-		sessionRoots: map[string]bool{},
-		seen:         map[string]bool{},
+		api:            api,
+		sm:             socketmode.New(api),
+		log:            log,
+		sessionThreads: map[string]bool{},
+		seen:           map[string]bool{},
 	}, nil
 }
 
@@ -213,7 +218,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// to stop. Registered the other way round — cancel first, Wait second —
 	// Run would block in Wait on a pump whose context is still live and
 	// deadlock. Everything the pump can block on inside this file is
-	// ctx-bounded — the Events receive selects on ctx.Done, isSessionRoot's
+	// ctx-bounded — the Events receive selects on ctx.Done, isSessionThread's
 	// Web API read is capped at slackRepliesTimeout and takes this ctx, and
 	// the ack below is AckCtx rather than Ack for exactly this reason — so
 	// the wait is finite for any handler that is. The gateway's handler is a
@@ -504,16 +509,25 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 	return false
 }
 
-// isSessionRoot reports whether a thread's root message mentions the bot,
-// via cache or one conversations.replies read. That read happens on the
+// isSessionThread reports whether a thread carries every message: from the
+// cache when a mention has already been seen in it (inbound records that)
+// or when an earlier read answered, and otherwise from one
+// conversations.replies read of the root message. That read happens on the
 // event pump's goroutine, so it is bounded by slackRepliesTimeout as well
 // as by ctx. An API failure — the timeout included — reports false without
 // caching: dropping is safe (the user can @mention), and the next reply
 // retries.
-func (s *SlackAdapter) isSessionRoot(ctx context.Context, channel, threadTS string) bool {
+//
+// A false cached here is not permanent, and must not be. A later mention in
+// the same thread calls markSessionThread(key, true), which overwrites it,
+// so a thread that becomes a session mid-conversation stops dropping its
+// unmentioned messages from that mention on. Without the overwrite the
+// negative entry would outlive — and silence — the very session it was
+// cached before.
+func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS string) bool {
 	key := channel + "/" + threadTS
 	s.mu.Lock()
-	if v, ok := s.sessionRoots[key]; ok {
+	if v, ok := s.sessionThreads[key]; ok {
 		s.mu.Unlock()
 		return v
 	}
@@ -539,29 +553,35 @@ func (s *SlackAdapter) isSessionRoot(ctx context.Context, channel, threadTS stri
 		return false
 	}
 	root := slackMentionsBot(msgs[0].Text, s.botUserID)
-	s.markSessionRoot(key, root)
+	s.markSessionThread(key, root)
 	return root
 }
 
-func (s *SlackAdapter) markSessionRoot(key string, isRoot bool) {
+// markSessionThread records the answer for a thread. Overwriting an
+// existing entry deliberately does NOT re-append to threadsOrder: the
+// eviction ring holds one position per key, and a flip from false to true
+// must not move a key's place in it or let it hold two.
+func (s *SlackAdapter) markSessionThread(key string, isSession bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.sessionRoots[key]; !exists {
-		s.rootsOrder = append(s.rootsOrder, key)
-		if len(s.rootsOrder) > slackRootsCap {
-			delete(s.sessionRoots, s.rootsOrder[0])
-			s.rootsOrder = s.rootsOrder[1:]
+	if _, exists := s.sessionThreads[key]; !exists {
+		s.threadsOrder = append(s.threadsOrder, key)
+		if len(s.threadsOrder) > slackThreadsCap {
+			delete(s.sessionThreads, s.threadsOrder[0])
+			s.threadsOrder = s.threadsOrder[1:]
 		}
 	}
-	s.sessionRoots[key] = isRoot
+	s.sessionThreads[key] = isSession
 }
 
 // inbound normalizes one message event, or reports it not-a-turn. The
 // affordance rule, deterministic: DMs carry every message; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
-// it mentions the bot or the thread root did. Everything else — bots, our
-// own posts, edits and other subtypes, redeliveries — is not a turn.
+// it mentions the bot or the thread is already a session thread — and a
+// mention in a thread MAKES it one, whoever rooted it. Everything else —
+// bots, our own posts, edits and other subtypes, redeliveries — is not a
+// turn.
 func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
@@ -602,29 +622,47 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		if !mentioned {
 			return InboundMessage{}, false
 		}
-		// The ask roots the session thread; remember that so the first
-		// unmentioned reply needn't re-read it from the API.
+		// Slack threads are implicit, so the ask's own ts is the root of the
+		// thread the session will live in.
 		threadTS = m.TimeStamp
-		s.markSessionRoot(m.Channel+"/"+threadTS, true)
+	}
+	if mentioned {
+		// Addressing the bot in a thread makes that thread a session thread,
+		// and this is the one place that is recorded — for the channel ask
+		// above, whose own ts is the root, and equally for a mention inside
+		// a thread someone else started. The second case is why this is not
+		// inside the !isReply branch: the gateway mints a session on the
+		// key below either way and starts a task there, and a session whose
+		// thread does not carry every message is one the user cannot steer
+		// or "stop" without re-@mentioning for each message. Discord, which
+		// this is parity with, has no root condition at all.
+		//
+		// It also un-poisons the cache: an earlier unmentioned reply in this
+		// thread will have read the root, found no mention and cached false,
+		// and markSessionThread overwrites that rather than leaving the
+		// thread dropped for the life of the entry.
+		s.markSessionThread(m.Channel+"/"+threadTS, true)
 	}
 	if text == "" {
 		// A bare mention has nothing to run; same shape as Discord's rule.
 		//
-		// Checked before the thread-root lookup below, not after it. An
+		// Checked before the session-thread lookup below, not after it. An
 		// attachment-only (file_share with no caption) or whitespace-only
 		// reply in an uncached thread is discarded either way, and
-		// isSessionRoot can spend slackRepliesTimeout on a
+		// isSessionThread can spend slackRepliesTimeout on a
 		// conversations.replies read with the event pump — and so the next
 		// envelope's ack — blocked behind it. Nothing is lost by skipping
-		// that read: sessionRoots is a pure lookup cache with no reader
-		// outside isSessionRoot itself, and its value is derived from the
-		// root message's text, so the next reply in the thread fills it
-		// with the same answer. The markSessionRoot above is deliberately
-		// still reached — a bare "@bot" roots a thread whose later replies
-		// are turns, and recording that costs no API call.
+		// that read: sessionThreads is a pure lookup cache with no reader
+		// outside isSessionThread itself, and for a thread with no mention
+		// in it the answer is derived from the root message's text, so the
+		// next reply in the thread fills it with the same answer. The
+		// markSessionThread above is deliberately still reached — a bare
+		// "@bot" addresses the bot in that thread whether the user typed it
+		// as a channel message or as a reply, later messages there are the
+		// ask, and recording it costs no API call.
 		return InboundMessage{}, false
 	}
-	if isReply && !mentioned && !s.isSessionRoot(ctx, m.Channel, threadTS) {
+	if isReply && !mentioned && !s.isSessionThread(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
