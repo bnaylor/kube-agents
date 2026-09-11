@@ -41,6 +41,20 @@ var slackTurnSubtypes = map[string]bool{"": true, "thread_broadcast": true, "fil
 // <!channel> would ping the room.
 var slackEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
+// slackUnescaper reverses that same escaping on the way in. Slack's Events
+// API delivers message text with &, < and > already replaced by &amp;, &lt;
+// and &gt; — the encoding side of the control sequences slackEscaper writes
+// — so an ask of "get pods && describe node <name>" arrives entity-encoded,
+// reaches the executor that way, and comes back double-escaped in the status
+// card's echo of the user's own words.
+//
+// One Replacer, not three passes: it scans the input once and never rescans
+// what it wrote, so a literally-typed "&lt;" (on the wire as "&amp;lt;")
+// decodes back to "&lt;" rather than collapsing to "<". These three and no
+// more — html.UnescapeString would also decode &copy;, &#123; and the rest
+// of the HTML5 entity set, which Slack never produces and a user may type.
+var slackUnescaper = strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">")
+
 // slackRosterPage is one conversations.members page; a channel past it is
 // reported rosterComplete=false, not paged — rosterCap (32) truncates far
 // below it anyway, and larger rooms are live-read territory for the LCD
@@ -49,9 +63,15 @@ const slackRosterPage = 200
 
 // slackRepliesTimeout bounds the one synchronous Web API read the event
 // pump makes on its own goroutine (the thread-root lookup). Envelopes are
-// acked before it runs, but the pump reads the next envelope only after it
-// returns, so a stalled Slack call must not stall the reader indefinitely.
-const slackRepliesTimeout = 5 * time.Second
+// acked before it runs, but the pump reads the NEXT envelope only after it
+// returns, so this value is the worst-case delay to that envelope's ack, and
+// it has to sit under Slack's delivery deadline. The Events API docs require
+// "an HTTP 2xx within three seconds" or the delivery is retried, and Socket
+// Mode inherits that window for the envelope_id ack. Two seconds leaves
+// headroom for the ack write and the rest of inbound; a lookup slower than
+// that reports false, which is safe (the user can @mention) and is retried
+// on the next reply.
+const slackRepliesTimeout = 2 * time.Second
 
 // Slack token prefixes, checked at construction so a swapped pair fails at
 // boot with a message instead of as an opaque 401 from the first API call.
@@ -411,7 +431,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			Kind:         "dm",
 			AuthorID:     m.User,
 			MessageID:    m.TimeStamp,
-			Text:         text,
+			Text:         slackUnescaper.Replace(text),
 		}, true
 	}
 	mentioned := slackMentionsBot(text, s.botUserID)
@@ -440,6 +460,9 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		Kind:         "group",
 		AuthorID:     m.User,
 		MessageID:    m.TimeStamp,
-		Text:         text,
+		// Decoded last, after the mention match and strip above: both key on
+		// Slack's raw "<@U…>" form, which decoding would have turned into
+		// plain text they no longer recognize.
+		Text: slackUnescaper.Replace(text),
 	}, true
 }

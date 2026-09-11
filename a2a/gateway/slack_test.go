@@ -5,7 +5,9 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
@@ -163,6 +165,11 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		{"reply in bot-rooted thread delivers unmentioned", slackMsg("channel", "C1", "U3", "steer it", "5.0", "100.1"), true, "slack:C1/100.1", "group", "steer it"},
 		{"reply in plain thread drops", slackMsg("channel", "C1", "U3", "chatter", "6.0", "200.1"), false, "", "", ""},
 		{"bare mention drops", slackMsg("channel", "C1", "U1", "<@UBOT>", "7.0", ""), false, "", "", ""},
+		// Slack transmits &, < and > entity-encoded; the ask must reach the
+		// executor as the user typed it.
+		{"entities decode in a dm", slackMsg("im", "D1", "U1", "get pods -n foo &amp;&amp; describe node &lt;name&gt;", "10.0", ""), true, "slack:dm/D1", "dm", "get pods -n foo && describe node <name>"},
+		{"entities decode after the mention strip", slackMsg("channel", "C1", "U1", "<@UBOT> scale web if cpu &gt; 80%", "11.0", ""), true, "slack:C1/11.0", "group", "scale web if cpu > 80%"},
+		{"entities decode in a thread steer", slackMsg("channel", "C1", "U3", "and &lt;this&gt; too", "12.0", "100.1"), true, "slack:C1/100.1", "group", "and <this> too"},
 	}
 	for _, c := range cases {
 		got, ok := a.inbound(context.Background(), c.m)
@@ -290,5 +297,64 @@ func TestSlackTurnSubtypes(t *testing.T) {
 	file.SubType = "file_share"
 	if _, ok := a.inbound(context.Background(), file); !ok {
 		t.Error("file_share with text must deliver")
+	}
+}
+
+// TestSlackUnescaper: the decode is the exact inverse of Slack's own inbound
+// escaping and nothing wider. The literal cases are the reason this is one
+// strings.Replacer and not a sequence of ReplaceAll calls — a Replacer scans
+// the input once and never rescans its own output, so "&amp;lt;" (what Slack
+// sends for a typed "&lt;") comes back as "&lt;" instead of collapsing to
+// "<" the way &amp;-then-&lt; passes would leave it.
+func TestSlackUnescaper(t *testing.T) {
+	cases := []struct {
+		name string
+		wire string
+		want string
+	}{
+		{"plain text untouched", "restart the api deployment", "restart the api deployment"},
+		{"ampersand", "get pods -n foo &amp;&amp; describe node", "get pods -n foo && describe node"},
+		{"angles", "describe node &lt;name&gt;", "describe node <name>"},
+		{"greater than in a condition", "scale web if cpu &gt; 80%", "scale web if cpu > 80%"},
+		{"typed &lt; survives", "type &amp;lt; for a left angle", "type &lt; for a left angle"},
+		{"typed &amp; survives", "write &amp;amp; not &amp;", "write &amp; not &"},
+		{"typed &gt; survives", "the &amp;gt; entity", "the &gt; entity"},
+		{"non-slack entities are left alone", "&copy; 2026 &#123; &nbsp;", "&copy; 2026 &#123; &nbsp;"},
+		{"bare ampersand is not an entity", "cats & dogs", "cats & dogs"},
+		{"round trip through the outbound escaper", slackEscaper.Replace("a & b < c > d"), "a & b < c > d"},
+	}
+	for _, c := range cases {
+		if got := slackUnescaper.Replace(c.wire); got != c.want {
+			t.Errorf("%s: slackUnescaper(%q) = %q, want %q", c.name, c.wire, got, c.want)
+		}
+	}
+}
+
+// TestSlackAskEchoIsNotDoubleEscaped: the inbound text becomes ActiveTask.Ask
+// and formatTaskStatus echoes it back through Post -> toMrkdwn, which escapes
+// again. Decoding on the way in is what keeps that one escape rather than
+// two, so the user sees their own words and not "cpu &amp;gt; 80%".
+func TestSlackAskEchoIsNotDoubleEscaped(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	msg, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "scale web if cpu &gt; 80% &amp;&amp; nodes ok", "20.0", ""))
+	if !ok {
+		t.Fatal("dm must deliver")
+	}
+	ask := truncateRunes(msg.Text, askCap)
+	if ask != "scale web if cpu > 80% && nodes ok" {
+		t.Fatalf("ask = %q", ask)
+	}
+	card := formatTaskStatus(&lib.Task{ID: "t-1", State: lib.StateWorking}, ask, time.Time{})
+	if _, err := a.Post(msg.Conversation, card); err != nil {
+		t.Fatal(err)
+	}
+	wire := api.posted[0].text
+	// One escape on the wire, which Slack renders back as the typed text.
+	if !strings.Contains(wire, "cpu &gt; 80% &amp;&amp; nodes ok") {
+		t.Errorf("status card echo = %q", wire)
+	}
+	if strings.Contains(wire, "&amp;gt;") || strings.Contains(wire, "&amp;amp;") {
+		t.Errorf("status card echo is double-escaped: %q", wire)
 	}
 }
