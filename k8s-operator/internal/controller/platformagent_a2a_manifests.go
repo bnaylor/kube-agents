@@ -801,11 +801,19 @@ authorization {
     #
     # This is a bypass and not a fallback — a listed user with a wrong
     # password is refused statically and never reaches the callout at all.
-    # Every name here is a principal that cannot present a ServiceAccount
-    # token: the callout itself (it cannot authenticate through itself), the
-    # session workers (a session pod carries no Kubernetes identity yet), the
-    # browser-facing read user (a browser never can), and the operator's own
-    # $SYS login.
+    # The list is the callout itself, which cannot authenticate through
+    # itself, plus every identity marked STATIC above. The session entry is
+    # absent exactly because it is not one: a session pod presents a
+    # pod-bound ServiceAccount token and the callout scopes it to its own
+    # task, so worker is no longer the credential a session holds. Do not
+    # read this list as the session path.
+    #
+    # A name is here for one of two reasons, and each identity's own comment
+    # above says which. It can hold no projected token at all — the browser
+    # read user, the $SYS login held by a person, the seed tooling that is
+    # applied rather than run. Or it could and has not moved yet: the
+    # agent-side workloads still on worker, and gateway. The first group is
+    # permanent; the second is the remaining migration.
     auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
   }
 }
