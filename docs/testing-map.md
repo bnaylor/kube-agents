@@ -57,8 +57,10 @@ that ran no tests". A change that breaks an operator contract from outside `k8s-
 green `Run Controller Tests` that compiled nothing.
 
 **In `a2a/`, the tests that prove the bus's authorization model are the ones that skip.**
-The auth callout's suite has three tiers and only the first runs everywhere. Fake-clientset
-tests need nothing. Tests that stand up a real `nats-server` need the `nats` CLI on `PATH`.
+The auth callout's suite has three tiers and only the first runs everywhere. Tests that
+stand up an embedded `nats-server` against a fake clientset need nothing, and that includes
+the end-to-end connect through the callout. Tests that need the `nats` CLI on `PATH` are the
+JetStream-API escape probes.
 Tests that stand up a real API server — the pod-bound token claims, the end-to-end connect
 through the callout, a whole session run under its own derived grants — need
 `KUBEBUILDER_ASSETS`, and they `t.Skip` without it. `make verify` sets neither, so it reports

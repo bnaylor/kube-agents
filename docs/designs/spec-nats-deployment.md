@@ -176,7 +176,9 @@ Layout:
 - **One user per agent identity** inside the account. Permissions are exact subject
   lists, deny by default: publish only to the subjects its role emits on, subscribe only
   to its own addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the
-  shared topics it is granted. The addressee token in the task subjects (payload spec
+  shared topics it is granted. That is an upper bound, not the shape every principal has:
+  a pull-only principal may hold no task-subject subscribe at all, which is what the
+  session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
@@ -266,8 +268,11 @@ Layout:
   This survives per-stream scoping of any user that may create consumers at all, the
   worker included; the closure is not holding `CONSUMER.CREATE`, which is a consumer
   created per task by the dispatcher. Per-name scoping is **not** available as a
-  mitigation: NATS wildcards match whole tokens, so a `web-*` grant matches a consumer
-  literally named `web-*` and nothing else - measured, not assumed. The real close is a
+  mitigation _where the caller chooses its own consumer names_: NATS wildcards match whole
+  tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing else -
+  measured, not assumed. The session principal is the case where it does work, and why:
+  its consumer names are derived from the pod the API server attested rather than chosen
+  by the client, so the grant can name them exactly instead of by prefix. The real close is a
   separate account with an export/import, which stays open.
 
   **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`

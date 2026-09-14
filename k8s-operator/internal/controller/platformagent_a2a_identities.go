@@ -34,11 +34,12 @@ import (
 // hardest failure in this deployment to read from the outside, and the one W6
 // found twice.
 //
-// Deny-by-default is unchanged and so are the subject lists: arming the callout
-// changes who vouches for an identity, not what that identity may say. No
-// principal's grants move in this change, and no principal moves off the shared
-// worker credential in it either — see the note where the agent principal is
-// not, below.
+// Deny-by-default is unchanged: arming the callout changed who vouches for an
+// identity, not what that identity may say. What this change does move is the
+// session: it is a principal of its own now, it authenticates through the
+// callout, and it is off the shared worker credential. `worker` survives below
+// as a shrinking residue rather than the session story, and there is still no
+// `agent` principal — see the note where it is not, below.
 
 // a2aAuthMode says how a principal proves who it is.
 type a2aAuthMode int

@@ -116,7 +116,8 @@ func (m *IdentityMap) validate() error {
 		return fmt.Errorf("identity map has no version")
 	}
 	// An empty map is never intentional. The operator always renders at
-	// least the agent and the provisioner, so zero entries means the render
+	// least the provisioner and the session principal, so zero entries
+	// means the render
 	// produced nothing — and serving it would refuse every
 	// connection on a callout that reports itself perfectly healthy. Refuse
 	// it here so the previous map keeps serving and the reason is logged.

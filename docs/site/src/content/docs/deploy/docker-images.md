@@ -20,7 +20,7 @@ stack graduates; until then a mirrored or air-gapped install that flips `next` h
 all five — and missing the callout is the expensive one to miss, since nothing authenticates to
 the bus without it.
 
-The exemption covers those four published images, not the bases they are built from. `golang` and
+The exemption covers those five published images, not the bases they are built from. `golang` and
 `node` in the build-time table below carry `a2a/Dockerfile.gateway` and `a2a/Dockerfile.worker`
 alongside every other builder, because an override of `A2A_WORKER_IMAGE` names an image someone
 still has to build, and a build in a mirrored environment has to resolve its bases like any other.
