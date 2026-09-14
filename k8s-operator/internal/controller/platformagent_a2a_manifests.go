@@ -1277,18 +1277,23 @@ echo "a2a provisioning complete"
 //
 // The digest covers everything this function renders into the spec: the
 // script, the image, the uid and security contexts, env, volumes, mounts,
-// backoffLimit and the TTL. A superseded Job is not deleted here, and how it
-// leaves depends on how far it got. A completed one leaves by TTL; one whose
+// backoffLimit and the TTL. What becomes of the generation the render has
+// moved past depends on how far that generation got, and one case is why the
+// rename on its own is not enough. A completed one leaves by TTL; one whose
 // pod ran and failed runs out its backoffLimit and then leaves by TTL; one
 // whose pod never ran — an unpullable image, an unschedulable pod, an
 // admission refusal — has no terminal condition for the TTL to start from
-// and stays until the mode flips or the agent is deleted, holding one slot
-// in the namespace pod quota the whole time. That last case is the image
-// override scenario this digest exists for, so deleting superseded
-// generations by label is owed, not merely nice. What holds today: the
-// status scan in reconcileA2A reads the current name only, so a stale
-// failure does not park the phase, and cleanupA2A deletes by label, so a
-// mode flip removes every generation at once.
+// and would sit in Pending until the mode flips or the agent is deleted,
+// holding one slot in the namespace pod quota the whole time. That last case
+// is the image override scenario this digest exists for, and it is why
+// reconcileA2A sweeps superseded generations by label, keeping only the
+// current render's name (deleteA2AProvisionJobs), after ensuring the Job this
+// function builds rather than before it — so a reconcile leaves N+1 of them
+// for a moment, never zero. Two things hold alongside that sweep: the status
+// scan in reconcileA2A reads the current name only, so a Failed condition on
+// a generation the sweep is about to remove never reaches the phase, and
+// cleanupA2A calls the same function keeping nothing, so a mode flip removes
+// every generation at once.
 //
 // What the digest does not cover is what is on the bus. Creation is
 // create-only convergence: the script's `info || add` lines make re-runs
