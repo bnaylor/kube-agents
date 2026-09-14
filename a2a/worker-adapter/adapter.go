@@ -146,11 +146,24 @@ const (
 	// reaped session leaves three consumers on TASKS forever, and the
 	// successor incarnation — which mints a fresh name — leaves three more.
 	//
-	// nats.go's ordered consumers use five seconds. The same number is used
-	// here for the same reason: the adapter holds every consumer it creates
-	// open for the whole task, so the threshold only ever fires after it is
-	// gone.
+	// nats.go's ordered consumers use five seconds and the same number is
+	// used here, but NOT because the threshold only fires after the pod is
+	// gone -- an earlier version of this comment claimed that and it is not
+	// true. A disconnect longer than five seconds reaps these consumers with
+	// the adapter still very much alive, and because they are MemoryStorage
+	// with Replicas 1 a nats-server restart destroys them outright. Both are
+	// routine. What makes the short threshold safe is not that the window
+	// never opens; it is that consumeIn supervises its own consumer and
+	// rebuilds it when it does.
 	consumerInactiveThreshold = 5 * time.Second
+
+	// inRecreateAttempts and inRecreateBackoff bound the in consumer's
+	// recovery after the server drops it. Five seconds apart for a minute is
+	// sized against the thing being waited for -- a nats-server restart, not
+	// a network blip -- and against the alternative, which is a task that
+	// runs to its 30-minute deadline with steer and cancel silently dead.
+	inRecreateAttempts = 12
+	inRecreateBackoff  = 5 * time.Second
 
 	// originFetchDeadline bounds the wait for the submitting envelope; a pod
 	// that starts before its own task message is the case it exists for.
@@ -930,23 +943,186 @@ func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error
 	}
 }
 
-// consumeIn opens the executor's ephemeral consumer on the task's in subject
-// just after the submission - the dual-reader rule's executor half. Steers
-// (kind:message) and cancel land here. Delivery to the harness is exactly
-// once per envelopeId (assertion 21): the ordered consumer replays without
-// acks, and the dedup set absorbs republished duplicates.
+// consumeIn opens the executor's consumer on the task's in subject just after
+// the submission - the dual-reader rule's executor half. Steers (kind:message)
+// and cancel land here. Delivery to the harness is exactly once per envelopeId
+// (assertion 21): the consumer reads without acks, and the dedup set absorbs
+// republished duplicates, including the ones a reconnect replays.
+//
+// It supervises its own consumer, which a named consumer needs and an ordered
+// one does not. sessionConsumer explains why these cannot be ordered; the cost
+// of that is here. nats.go's ordered consumers reset themselves on
+// ErrConsumerDeleted, ErrNoHeartbeat and reconnect (ordered.go), recreating at
+// the last delivered sequence. A named pull consumer gets the opposite
+// treatment: pull.go classifies ErrConsumerDeleted as terminal and, with no
+// ConsumeErrHandler set, calls Stop() on the subscription and returns --
+// silently, with nothing logged and nothing closed that the caller can select
+// on. The raw nats.Conn reconnects, the harness keeps running to TaskDeadline,
+// and every steer and cancel published meanwhile sits unread in TASKS while
+// finalize publishes a clean terminal over the top. A lost cancel that looks
+// like a completed task is the worst shape this failure could take.
+//
+// It is not an exotic case. These consumers are MemoryStorage with Replicas 1,
+// so a nats-server restart destroys them outright, and InactiveThreshold is
+// five seconds, so any disconnect longer than that reaps them without one.
+// Server restarts are routine by spec-nats-deployment.md, and NR-4 wants the
+// recreate-or-bind decision after a reconnect made explicitly. This is that
+// decision: recreate, from the sequence after the last message actually
+// handled, so nothing between the old consumer's death and the new one's start
+// is skipped. Redelivery across the seam is what the dedup set is for.
 func (a *adapter) consumeIn(ctx context.Context, startSeq uint64, originEnvelopeID string, steerCh chan<- string, cancelCh chan<- struct{}) (func(), error) {
 	subject := lib.TaskInSubject(a.cfg.Addressee(), a.cfg.TaskID)
+	seen := map[string]bool{originEnvelopeID: true}
+	var seenMu sync.Mutex
+	// nextSeq is the resume point: one past the last message handled, so a
+	// recreate picks up where the dead consumer left off rather than at the
+	// task's start. Guarded because the supervisor reads it while the
+	// Consume callback writes it.
+	var seqMu sync.Mutex
+	nextSeq := startSeq
+	handler := func(msg jetstream.Msg) {
+		if md, mdErr := msg.Metadata(); mdErr == nil {
+			seqMu.Lock()
+			if md.Sequence.Stream >= nextSeq {
+				nextSeq = md.Sequence.Stream + 1
+			}
+			seqMu.Unlock()
+		}
+		a.handleInMsg(msg, subject, seen, &seenMu, steerCh, cancelCh)
+	}
+
+	// The first consumer is created synchronously: a task whose in subject
+	// cannot be opened at all has not started, and the caller needs that as
+	// an error rather than as a goroutine that fails later.
 	cons, err := a.sessionConsumer(ctx, lib.SessionConsumerIn, subject, jetstream.ConsumerConfig{
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
-		OptStartSeq:   startSeq,
+		OptStartSeq:   nextSeq,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("in consumer: %w", err)
 	}
-	seen := map[string]bool{originEnvelopeID: true}
-	var seenMu sync.Mutex
-	cc, err := cons.Consume(func(msg jetstream.Msg) {
+
+	superCtx, stopSuper := context.WithCancel(ctx)
+	// Buffered by one: the error handler must never block the nats.go
+	// callback it runs on, and only the first terminal error of a given
+	// consumer matters -- the supervisor replaces the whole thing.
+	dead := make(chan error, 1)
+	errHandler := func(_ jetstream.ConsumeContext, cErr error) {
+		// Non-terminal errors reach here too (missed heartbeats that
+		// recovered, leadership changes). They are worth a line and not a
+		// recreate; only the terminal ones take the consumer down, and
+		// pull.go has already stopped the subscription by the time we see
+		// one, so the supervisor's job is to notice, not to race it.
+		if errors.Is(cErr, jetstream.ErrConsumerDeleted) || errors.Is(cErr, jetstream.ErrConsumerNotFound) ||
+			errors.Is(cErr, jetstream.ErrNoHeartbeat) || errors.Is(cErr, nats.ErrNoResponders) {
+			select {
+			case dead <- cErr:
+			default:
+			}
+			return
+		}
+		a.log.Warn("in consumer reported a non-terminal error", "task", a.cfg.TaskID, "err", cErr)
+	}
+
+	cc, err := cons.Consume(handler, jetstream.ConsumeErrHandler(errHandler))
+	if err != nil {
+		stopSuper()
+		return nil, fmt.Errorf("consume in subject: %w", err)
+	}
+
+	var ccMu sync.Mutex
+	current := cc
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-superCtx.Done():
+				return
+			case cErr := <-dead:
+				seqMu.Lock()
+				resume := nextSeq
+				seqMu.Unlock()
+				// Loud on purpose. The silence is the defect; a steer
+				// dropped while this recovers must at least be findable
+				// afterwards.
+				a.log.Error("in consumer died; recreating",
+					"task", a.cfg.TaskID, "resumeSeq", resume, "err", cErr)
+				ccMu.Lock()
+				current.Stop()
+				ccMu.Unlock()
+				next, rErr := a.recreateIn(superCtx, subject, resume, handler, errHandler)
+				if rErr != nil {
+					if superCtx.Err() != nil {
+						return
+					}
+					// Nothing left to try that would not be a second
+					// implementation of the retry above it. Say so once,
+					// at the level that says steers are gone.
+					a.log.Error("in consumer could not be recreated; steer and cancel are dead for this task",
+						"task", a.cfg.TaskID, "err", rErr)
+					return
+				}
+				ccMu.Lock()
+				current = next
+				ccMu.Unlock()
+				a.log.Info("in consumer recreated", "task", a.cfg.TaskID, "resumeSeq", resume)
+			}
+		}
+	}()
+
+	return func() {
+		stopSuper()
+		<-done
+		ccMu.Lock()
+		current.Stop()
+		ccMu.Unlock()
+	}, nil
+}
+
+// recreateIn rebuilds the in consumer after the server dropped it, retrying
+// while the task is still running.
+//
+// The retry budget is the reconnect budget: a consumer is most often lost
+// because the server went away, so the first several attempts are expected to
+// fail with no responders and the useful behaviour is to keep asking until the
+// bus is back. It is bounded rather than infinite so that a permission change
+// mid-task -- a revoked CONSUMER.CREATE grant -- produces a log line and a
+// stop instead of a goroutine hammering the bus for the rest of the deadline.
+func (a *adapter) recreateIn(ctx context.Context, subject string, resume uint64, handler jetstream.MessageHandler, errHandler jetstream.ConsumeErrHandlerFunc) (jetstream.ConsumeContext, error) {
+	var lastErr error
+	for attempt := range inRecreateAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(inRecreateBackoff):
+			}
+		}
+		cons, err := a.sessionConsumer(ctx, lib.SessionConsumerIn, subject, jetstream.ConsumerConfig{
+			DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+			OptStartSeq:   resume,
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		cc, err := cons.Consume(handler, jetstream.ConsumeErrHandler(errHandler))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return cc, nil
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", inRecreateAttempts, lastErr)
+}
+
+// handleInMsg is the body of the in subject's Consume callback, lifted out so
+// that the consumer can be recreated around it without the handler being
+// rebuilt: the dedup set has to survive the recreate, or a redelivered steer
+// is applied twice.
+func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string]bool, seenMu *sync.Mutex, steerCh chan<- string, cancelCh chan<- struct{}) {
+	{
 		env, err := lib.ParseEnvelope(msg.Data())
 		if err != nil {
 			a.log.Error("a2a envelope rejected on in subject", "subject", subject, "err", err)
@@ -996,11 +1172,7 @@ func (a *adapter) consumeIn(ctx context.Context, startSeq uint64, originEnvelope
 		default:
 			a.log.Warn("unexpected kind on in subject", "kind", env.Kind)
 		}
-	})
-	if err != nil {
-		return nil, fmt.Errorf("consume in subject: %w", err)
 	}
-	return cc.Stop, nil
 }
 
 // promptFromOrigin joins the submission's text parts into the opening
