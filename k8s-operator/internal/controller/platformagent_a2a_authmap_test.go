@@ -21,6 +21,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -353,5 +354,96 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 				t.Error("the render accepted a map the callout refuses, so BusCredentialsReady would report a version that was never served")
 			}
 		})
+	}
+}
+
+// a2aIdentityMapSchemaKeys is the JSON shape each schema version promises: every
+// key the renderer may emit anywhere in the document, sorted.
+//
+// The callout parses with DisallowUnknownFields, so a key added here that a
+// running callout does not know is a map it refuses -- while keeping its
+// readiness probe green and its previous map in service. The pod template
+// carries a2aIdentityMapSchema so that addition rolls the callout; this table
+// is what makes the constant load-bearing rather than decorative, since a field
+// added without a bump is otherwise invisible until an upgrade in the field.
+var a2aIdentityMapSchemaKeys = map[string][]string{
+	"1": {"account", "grants", "identities", "publish", "serviceAccount", "subscribe", "user", "version"},
+	"2": {"account", "grants", "identities", "narrowing", "publish", "serviceAccount", "subscribe", "user", "version"},
+}
+
+// a2aJSONKeys walks a decoded document and collects every object key in it.
+func a2aJSONKeys(v any, into map[string]bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, sub := range t {
+			into[k] = true
+			a2aJSONKeys(sub, into)
+		}
+	case []any:
+		for _, sub := range t {
+			a2aJSONKeys(sub, into)
+		}
+	}
+}
+
+// The rendered map's shape matches the schema version the callout pod template
+// pins, and that version rolls the callout when it changes.
+//
+// Adding a field to the identity map is expected to fail this test once. The
+// failure is the review: either the new key is safe for an old callout to
+// ignore -- it is not, DisallowUnknownFields means every key is breaking -- or
+// a2aIdentityMapSchema needs a bump so the upgrade rolls the pods that cannot
+// read it.
+func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
+	agent := a2aTestAgent()
+
+	cm, _, err := buildA2AAuthMapConfigMap(agent)
+	if err != nil {
+		t.Fatalf("rendering the auth map: %v", err)
+	}
+	var doc any
+	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
+		t.Fatalf("decoding the rendered auth map: %v", err)
+	}
+	seen := map[string]bool{}
+	a2aJSONKeys(doc, seen)
+	got := make([]string, 0, len(seen))
+	for k := range seen {
+		got = append(got, k)
+	}
+	slices.Sort(got)
+
+	want, ok := a2aIdentityMapSchemaKeys[a2aIdentityMapSchema]
+	if !ok {
+		t.Fatalf("a2aIdentityMapSchema is %q, which a2aIdentityMapSchemaKeys does not describe; a bump needs its key set recorded beside it", a2aIdentityMapSchema)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("the rendered identity map's keys are %v, and schema %s promises %v.\n"+
+			"A key the running callout does not know is a map it refuses while its readiness probe stays green, "+
+			"so a field addition needs a2aIdentityMapSchema bumped (which rolls the callout) and a new row in a2aIdentityMapSchemaKeys.",
+			got, a2aIdentityMapSchema, want)
+	}
+
+	// The constant is only worth anything if it reaches the pod template,
+	// which is the thing that actually rolls.
+	dep := buildA2ACalloutDeployment(agent)
+	if got := dep.Spec.Template.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; got != a2aIdentityMapSchema {
+		t.Errorf("the callout pod template's %s annotation is %q, want %q; without it on the TEMPLATE a schema bump changes no pod spec and the old callout is never rolled",
+			a2aIdentityMapSchemaAnnotation, got, a2aIdentityMapSchema)
+	}
+}
+
+// The annotation is on the pod template and not merely on the Deployment: only
+// the template is part of the pod spec the Deployment controller diffs, so an
+// annotation one level up would look like a fix and roll nothing.
+func TestTheSchemaAnnotationIsOnThePodTemplateNotTheDeployment(t *testing.T) {
+	dep := buildA2ACalloutDeployment(a2aTestAgent())
+	if _, onDeployment := dep.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; onDeployment {
+		if _, onTemplate := dep.Spec.Template.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; !onTemplate {
+			t.Error("the schema annotation is on the Deployment but not its pod template; changing it would roll nothing")
+		}
+	}
+	if len(dep.Spec.Template.ObjectMeta.Annotations) == 0 {
+		t.Fatal("the callout pod template carries no annotations at all, so no schema change can roll it")
 	}
 }
