@@ -88,7 +88,7 @@ callout has armed and session pods authenticate as themselves, so the shared sta
 is no longer "the playground" — it is a residue, and this program is one of the reasons
 it survives. `cmd/hermes-bridge/main.go` sets `nats.UserInfo` from the environment and
 has no token path, so it cannot present a projected ServiceAccount token even though the
-callout would resolve one. Note what it would present it *as*: there is no `agent`
+callout would resolve one. Note what it would present it _as_: there is no `agent`
 principal in the rendered map and deliberately so, so moving the bridge means giving it
 an identity of its own rather than reaching for one already waiting.
 
