@@ -1,5 +1,5 @@
 {
-  "version": "795c7002dba9c91c",
+  "version": "c9d0e6f571c76efa",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",

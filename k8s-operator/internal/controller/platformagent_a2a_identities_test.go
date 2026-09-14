@@ -205,6 +205,15 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 //
 // So the set is pinned by name rather than by shape. Adding a principal here
 // means saying, at review, which rendered workload presents its token.
+//
+// `session` is the second name, and answering the question for it needs a
+// pointer out of this module: the workload that mounts its token is the session
+// pod, and the gateway's spawner builds that pod (a2a/gateway/spawn.go), not the
+// operator. So a2aBusTokenVolumeSource and a2aBusTokenVolumeMount still have one
+// caller each and no assertion here can reach the other side of the pair. What
+// holds it is tests/conformance's C1, which reads the spawner and this package's
+// RBAC together for exactly that reason. If the spawner ever stops projecting the
+// token, this test keeps passing and C1 is what fails.
 func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {
@@ -212,7 +221,7 @@ func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 			got = append(got, id.user)
 		}
 	}
-	want := []string{"provision"}
+	want := []string{"provision", "session"}
 	if !slices.Equal(got, want) {
 		t.Errorf("callout principals = %v, want %v.\nA new callout principal needs a rendered workload that mounts an a2a-bus token for its ServiceAccount (a2aBusTokenVolumeSource / a2aBusTokenVolumeMount). Without one the entry authorizes nobody and misreports who authenticates.", got, want)
 	}
