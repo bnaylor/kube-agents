@@ -176,6 +176,28 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 	// file is written against, arriving through the Deployment instead of
 	// through the reconcile.
 	observed := dep.Status.ObservedGeneration >= dep.Generation
+	// Ready is not enough: a ready replica may be ready on the PREVIOUS pod
+	// template, still serving the previous map. UpdatedReplicas counts the
+	// ones running the current template, so requiring both is the difference
+	// between "two pods are up" and "two pods are up on the spec that renders
+	// this map version".
+	//
+	// This is what makes the identity-map schema annotation load-bearing. A
+	// callout too old to parse the rendered map refuses it, and a pod that
+	// refuses its first map never becomes ready -- but MaxUnavailable 0 keeps
+	// the old ready pods up while the new one fails, so ReadyReplicas alone
+	// stays at the desired count for as long as the roll is wedged, and the
+	// condition would go on naming a version no replica ever accepted. That
+	// is the failure this file exists to prevent, arriving through a stuck
+	// rollout instead of a stale read.
+	//
+	// The cost is that a HEALTHY roll now reports False for its duration
+	// rather than True throughout. That is the honest answer and not a
+	// regression in meaning: while the roll is in flight some replicas are
+	// still serving the old map, so "serving identity map <new>" is not yet
+	// true of the callout as a whole. The ObservedGeneration branch below
+	// already reports a roll that way; this extends it to the rest of one.
+	updated := dep.Status.UpdatedReplicas >= desired
 
 	condition := metav1.Condition{Type: busCredentialsReadyCondition, LastTransitionTime: metav1.Now()}
 	switch {
@@ -183,7 +205,7 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = busCredsReasonAbsent
 		condition.Message = "the auth callout is not deployed; nothing can authenticate to the bus"
-	case observed && dep.Status.ReadyReplicas > 0 && dep.Status.ReadyReplicas >= desired:
+	case observed && updated && dep.Status.ReadyReplicas > 0 && dep.Status.ReadyReplicas >= desired:
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = busCredsReasonServing
 		condition.Message = "the auth callout is serving identity map " + mapVersion
@@ -202,9 +224,17 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 		// every new connection is the first thing someone will want to size:
 		// one replica of two is a degraded rollout, zero of two is the bus
 		// accepting no new client at all.
+		// Ready and updated are reported separately because they fail for
+		// different reasons and want different responses: short of ready is
+		// a callout that is not up, while ready but short of updated is a
+		// callout that is up on the wrong spec -- most often one whose new
+		// pods cannot parse the map this version renders, which no amount of
+		// waiting resolves.
 		condition.Message = fmt.Sprintf(
-			"the auth callout has %d of %d replicas ready; new connections to the bus may be refused",
-			dep.Status.ReadyReplicas, desired)
+			"the auth callout has %d of %d replicas ready and %d of %d on the current spec; "+
+				"new connections to the bus may be refused, and any that succeed are "+
+				"authorized against whichever map the serving replicas last accepted",
+			dep.Status.ReadyReplicas, desired, dep.Status.UpdatedReplicas, desired)
 	}
 
 	// Only when something changed. This runs on every exit from every
