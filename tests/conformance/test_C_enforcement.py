@@ -507,8 +507,7 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         # The identity itself. `a2a_spawner` names the ServiceAccount from
         # config; the operator is what decides whether that name has any
-        # permissions, and the only RBAC the A2A stack renders is the
-        # callout's. A subject naming the session account means the pod's
+        # permissions. A subject naming the session account means the pod's
         # token stopped being inert.
         self.assertIn(
             "ServiceAccountName: s.cfg.SessionServiceAccount",
@@ -517,13 +516,33 @@ class C1IsolationIsStructural(unittest.TestCase):
             "config, so the operator-side half of this check may be pointed at "
             "the wrong account",
         )
+        # Both files that render A2A RBAC, not just the callout's: the gateway's
+        # Role and RoleBinding live in the manifests file, so a scan of the
+        # callout file alone would miss a binding added there. `\s+` after the
+        # colon because gofmt aligns the field when it shares a struct literal
+        # with a longer name, and a scan that only matches one space silently
+        # stops matching when a sibling field is renamed.
         callout = h.text("a2a_callout_rbac")
         session_sa = "a2aSessionServiceAccountName"
-        for match in re.finditer(r"Subjects: \[\]rbacv1\.Subject\{(.+?)\}\}", callout, re.DOTALL):
-            with self.subTest(subject=match.group(1).strip()[:80]):
+        subjects = []
+        for source in ("a2a_callout_rbac", "a2a_session_fence"):
+            subjects += re.findall(
+                r"Subjects:\s+\[\]rbacv1\.Subject\{(.+?)\}\}", h.text(source), re.DOTALL
+            )
+        # Without this the whole scan passes by matching nothing, which is how
+        # a guard like this dies: not by being deleted but by being reformatted
+        # out from under its own pattern.
+        self.assertGreaterEqual(
+            len(subjects),
+            3,
+            "the RBAC subject scan matched fewer bindings than the A2A stack "
+            "renders, so it is passing vacuously rather than checking anything",
+        )
+        for subject in subjects:
+            with self.subTest(subject=subject.strip()[:80]):
                 self.assertNotIn(
                     session_sa,
-                    match.group(1),
+                    subject,
                     "an RBAC binding names the session ServiceAccount, so a "
                     "session pod's token now authorises something at the API "
                     "server and the fence's rule set no longer covers it",

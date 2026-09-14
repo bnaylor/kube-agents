@@ -1088,6 +1088,18 @@ Mutation(
         "Go test in either can see both",
     ),
     Mutation(
+        "C1-session-account-gets-rbac-in-the-sibling-file",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("""\t\tSubjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: agent.Namespace}},""",
+         """\t\tSubjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}},"""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "the same grant as the mutation above, in the other file that renders "
+        "A2A RBAC. The scan used to read only the callout's file and to match "
+        "one literal space after `Subjects:`, so a binding added here -- where "
+        "gofmt aligns the field -- passed it twice over. Both halves of that "
+        "hole are what this mutation holds shut",
+    ),
+    Mutation(
         "harness-fixture-emptied",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("\nkind: StatefulSet\n", "\nkind: StatefulSetXX\n"),

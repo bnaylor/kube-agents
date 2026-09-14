@@ -44,7 +44,7 @@ const (
 // Enumerated from what the worker adapter actually does (publish its own
 // events; three named consumers on TASKS over its own subjects; replies on its
 // own inbox) and closed under JetStream's body-field escapes the way A1 closed
-// them for the agent and web principals:
+// them for the callout principals and for web:
 //
 //   - Consumer names are exact. A wildcard in MSG.NEXT or DELETE would let a
 //     session drain or destroy the gateway's task-plane durable, or another

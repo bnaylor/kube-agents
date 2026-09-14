@@ -205,6 +205,36 @@ func TestAnAdapterRefusesAPodNameAndSessionThatDisagree(t *testing.T) {
 	}
 }
 
+// The quiet half of the case above. An unset A2A_SESSION is not a disagreement
+// the eye catches: Addressee falls back to Profile, so the adapter publishes as
+// `chat` while the callout derived its grants from the pod. Every publish is
+// refused and no reply ever arrives, which is the failure mode this check
+// exists to convert into a startup error.
+func TestAnAdapterRefusesAPodNameWithNoSessionAtAll(t *testing.T) {
+	h := startHarness(t, sessionMap, sessionTokens())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, err := workeradapter.Run(ctx, workeradapter.Config{
+		NATSURL:        h.url,
+		BusTokenFile:   tokenFile(t, tokenPodA),
+		PodName:        podA,
+		TaskID:         "task-e2e-4",
+		Profile:        "chat",
+		HarnessCommand: harnessStub(t, `echo '{"type":"result","subtype":"success","result":"x"}'`),
+		HarnessEnv:     os.Environ(),
+		TaskDeadline:   10 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("the adapter started with a bus token and no session name, so it would have published as its profile")
+	}
+	// The addressee it would have used, not the empty string: the error has to
+	// name the wrong thing it was about to be.
+	if !strings.Contains(err.Error(), podA) || !strings.Contains(err.Error(), "chat") {
+		t.Errorf("the error names neither the pod it is bound to nor the addressee it would have used: %v", err)
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 // safeBuffer is a bytes.Buffer the async error handler and the test goroutine

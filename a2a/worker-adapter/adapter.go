@@ -97,9 +97,14 @@ func (c Config) validate() error {
 	if c.PodName == "" {
 		return fmt.Errorf("a bus token file is set but %s is not; the inbox prefix the callout grants is named for the pod, and without it every reply times out", lib.EnvPodName)
 	}
-	if c.Session != "" && c.Session != c.PodName {
+	// Empty is the same failure as mismatched, and quieter: Addressee falls
+	// back to Profile, so the adapter publishes as `chat` while its grants are
+	// derived from the pod. The spawner always sets A2A_SESSION, which is why
+	// this is defence in depth rather than a live bug -- but it is the one
+	// combination where the wrong addressee is a default rather than a typo.
+	if c.Session != c.PodName {
 		return fmt.Errorf("%s is %q but A2A_SESSION is %q; the callout derives this session's grants from the pod name, so publishing as %q would be refused and replies would never arrive",
-			lib.EnvPodName, c.PodName, c.Session, c.Session)
+			lib.EnvPodName, c.PodName, c.Session, c.Addressee())
 	}
 	return nil
 }
