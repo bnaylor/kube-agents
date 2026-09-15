@@ -90,24 +90,29 @@ One user turn is one A2A task. On each inbound chat message the gateway:
 3. Publishes `kind: message` to `a2a.tasks.{session}.{taskId}.in` - the session is the
    addressee - with the conversation's `contextId` and the authority block below.
 4. Subscribes to the task's `…events` and `…supervisor` subjects (one durable, both
-   filters - the gateway holds the unscoped consumer-create grant that puts a filter list
-   in the request body) and relays status and artifact updates back into the
-   conversation. Its own supervisor terminals arrive through the same relay and retire
-   the task exactly as an executor's terminal does.
+   filters) and relays status and artifact updates back into the conversation. Its own
+   supervisor terminals arrive through the same relay and retire the task exactly as an
+   executor's terminal does.
 
-   A constraint this puts on later work, named because nothing else records it: a
-   multi-filter consumer cannot be created under the enumerated
-   `$JS.API.CONSUMER.CREATE.TASKS.<name>` grants that `spec-nats-deployment.md` uses to
-   take `web` off `$JS.API.>`, because the filter list travels in the request body rather
-   than the subject. That document calls a user still holding `$JS.API.>` playground
-   posture; narrowing the gateway the same way therefore has to keep this one grant,
-   split the relay into two durables, or move the pair onto a shared prefix.
+   What that costs in grant terms, named because nothing else records it - and stated
+   backwards in an earlier draft of this section. A single filter subject rides the
+   CONSUMER.CREATE request SUBJECT (`…CREATE.<stream>.<name>.<filter>`, nats.go's
+   `apiConsumerCreateWithFilterSubjectT`); a filter LIST travels in the request BODY,
+   where no subject permission can see it. So the per-stream enumeration
+   `spec-nats-deployment.md` uses to take `web` off `$JS.API.>` -
+   `$JS.API.CONSUMER.CREATE.TASKS.>` - would PERMIT this relay, because the bare subject
+   matches. What such a grant cannot do is CONSTRAIN which subjects the durable ends up
+   reading. Narrowing the gateway the same way is therefore available and costs the relay
+   nothing; what it does not buy is any bound on the filters, and that is the honest
+   reason the gateway's consumer reach is still wide.
 
-   The session pod is not a later problem but a live one, because it is ALREADY narrowed
-   that way. `sessionGrants` issues three consumers by exact name with the filter riding
-   the CREATE subject, pinned to the pod's own `…in` and `…events`; there is no supervisor
-   filter among them and no unscoped `CONSUMER.CREATE`, and the pod's only subscribe grant
-   is its inbox. So a session pod can create neither a supervisor-filtered consumer nor a
+   The form that does refuse a multi-filter consumer is the one that pins the filter into
+   the grant, and the session pod is ALREADY on it. `sessionGrants` issues three consumers
+   by exact name with the filter riding the CREATE subject, pinned to the pod's own `…in`
+   and `…events`; there is no supervisor filter among them and no unscoped
+   `CONSUMER.CREATE`, and the pod's only subscribe grant is its inbox. Pinning and
+   multi-filter are mutually exclusive by construction: the pin lives in the subject and
+   the list does not. So a session pod can create neither a supervisor-filtered consumer nor a
    two-filter one, and cannot core-subscribe the subject either. `message/stream`'s "both
    subjects" is unmeetable for it today, and the narrower consequence is already shipping:
    the worker adapter's respawn check reads `…events` alone, so it cannot see a terminal
