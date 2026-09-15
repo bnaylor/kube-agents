@@ -586,10 +586,11 @@ Verified identity (added 9/9):
     supervisor only, `…in` requesters only with the executor's grant never reaching it,
     and no principal outside the trust root holding a server-originated write route onto
     an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
-    belong in `tests/conformance/` rather than in the library suite, and that is where
-    they live. One of the three is a known violation rather than a pass: the static
-    `worker` user holds publish on every addressee's `…events`, so that writer set is
-    not yet single-writer, and it closes when `worker` is retired.
+    belong in `tests/conformance/` rather than in the library suite. That is a placement
+    rule and not a pointer to existing coverage: read `tests/conformance/` itself before
+    relying on any of them being asserted. One of the three cannot pass as stated in any
+    case - the static `worker` user holds publish on every addressee's `…events`, so
+    that writer set is not yet single-writer, and it closes when `worker` is retired.
 
 ## Open Questions
 
