@@ -101,18 +101,39 @@ func refuseAll(subjects []string) map[string]bool {
 // holds, not a consumer, not a snapshot, and not the bucket's own subject
 // space.
 //
-// The three static principals here each hold `$JS.API.>`, the whole JetStream
-// API on every stream. That wildcard is a standing debt (gke-labs#1306) and
-// this test is what stops it from also being the capability design's undoing:
-// the deny subtracted from it is the only thing between a broker and every
-// capability in flight, and it is asserted here rather than read.
+// `gateway` holds `$JS.API.>`, the whole JetStream API on every stream. That
+// wildcard is a standing debt (gke-labs#1306) and this test is what stops it
+// from also being the capability design's undoing: the deny subtracted from it
+// is the only thing between a broker and every capability in flight, and it is
+// asserted here rather than read. `worker` and `seed` were wildcards too until
+// gke-labs#1316 enumerated them, and they are still asked the same question —
+// an enumerated list is narrower by construction but only until someone adds a
+// line to it.
 func TestNoBrokerCanReadTheCapabilityStore(t *testing.T) {
 	h, serverLog := startHarnessWithServerLogMap(t, capMap(t), capTokens())
 
 	for _, user := range []string{"gateway", "worker", "seed"} {
 		t.Run(user, func(t *testing.T) {
 			nc, violations := connectStatic(t, h, user, "pw-"+user)
-			checkPublish(t, nc, violations, refuseAll(capReadSubjects()))
+			want := refuseAll(capReadSubjects())
+			if user == "seed" {
+				// The one exception in this whole test, and it is asserted
+				// as an allow rather than dropped, so that taking it away
+				// fails here instead of in an install.
+				//
+				// seed PROVISIONS this bucket. `kv info cap || kv add cap`
+				// is the provision script's idempotency guard, so STREAM.INFO
+				// on the bucket is a grant it has to hold. What that returns
+				// is stream state — a message count, a subject list, a first
+				// and last sequence — and none of it is a capability. Every
+				// subject that does return one (DIRECT.GET, STREAM.MSG.GET,
+				// each CONSUMER verb), the copies (SNAPSHOT), the destructive
+				// ones and the subscribe on the bucket's subject space all
+				// stay refused below, which is what makes this a carve-out
+				// and not a hole.
+				want["$JS.API.STREAM.INFO."+capability.Stream] = false
+			}
+			checkPublish(t, nc, violations, want)
 			if !subscribeRefused(t, nc, violations, capability.SubjectPrefix+">") {
 				t.Errorf("%s may subscribe to %s>; it would see every capability as it is minted",
 					user, capability.SubjectPrefix)

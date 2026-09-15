@@ -102,18 +102,38 @@ type a2aIdentity struct {
 	// is a wildcard broad enough to cover something it must not reach.
 	//
 	// A deny is strictly worse than a narrow allow and is not a substitute
-	// for one. It is here because three principals hold `$JS.API.>` — the
-	// whole JetStream API, on every stream — and narrowing that is a change
-	// to how the gateway, the bridge sidecar and the seed tooling each talk
-	// to JetStream, which is gke-labs#1306's work and not this card's. What
-	// this card cannot ship without is the one subtraction the capability
-	// design rests on: nobody but the verifier reads the cap bucket. So the
-	// deny is scoped to that bucket, and the wide allow it carves out of
-	// stays a recorded debt rather than becoming invisible.
+	// for one. It is here because `gateway` holds `$JS.API.>` — the whole
+	// JetStream API, on every stream — and narrowing that is a change to how
+	// the gateway talks to JetStream, which is gke-labs#1306's work and not
+	// this card's. What this card cannot ship without is the one subtraction
+	// the capability design rests on: nobody but the verifier reads the cap
+	// bucket. So the deny is scoped to that bucket, and the wide allow it
+	// carves out of stays a recorded debt rather than becoming invisible.
+	//
+	// `worker` carries the same pair as defence in depth. #1316 enumerated
+	// that principal by stream name, so nothing in its allow list reaches the
+	// cap bucket today and the deny subtracts nothing — which is precisely
+	// why it is written down: #1306 will be asked to widen these lists, and a
+	// widening must not be able to hand the capability store out on the way
+	// past.
+	//
+	// `seed` deliberately has NO deny, and the reason is the one thing a
+	// positional deny cannot express. Its entries match on stream name at a
+	// fixed depth, so `$JS.API.STREAM.CREATE.KV_cap` is denied by the same
+	// pattern as `$JS.API.STREAM.INFO.KV_cap` — and seed is a PROVISIONER.
+	// a2aSeedJetStreamGrants grants it CREATE and INFO on every provisioned
+	// stream so the `kv info cap || kv add cap` guard in the provision script
+	// works on a fresh store; a deny there does not make that guard fail
+	// loudly, it makes each refused request wait out natscli's 5s timeout,
+	// which is the failure mode that function's own comment was written
+	// about. Nothing is given up: post-#1316 seed's allow list holds no
+	// DIRECT.GET, no STREAM.MSG.GET and no CONSUMER verb on any bucket, and
+	// its subscribe list is two exact prefixes, so it cannot read an entry
+	// with or without the deny.
 	//
 	// Rendered only for static principals. No callout principal needs one:
-	// provision's JetStream grants are enumerated, the session's are derived
-	// at mint time, and the verifier is the reader.
+	// provision's JetStream grants are enumerated the same way seed's are,
+	// the session's are derived at mint time, and the verifier is the reader.
 	denyPublish   []string
 	denySubscribe []string
 }
@@ -706,11 +726,13 @@ func bridgeIdentity() a2aIdentity {
 			"$KV.runtime-state.>",
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
-		// The one subtraction from `$JS.API.>` above. Nobody but the
-		// verifier reads the cap bucket, and a wildcard that wide would
-		// otherwise hand this principal every capability in flight through
-		// the JetStream API. See a2aCapBucketReadDeny; the wide allow it
-		// carves out of is gke-labs#1306's to narrow.
+		// Defence in depth rather than a live subtraction. #1316 replaced
+		// this principal's `$JS.API.>` with a2aWorkerJetStreamGrants(), so
+		// nothing above reaches the cap bucket and this pair denies nothing
+		// today. It is here for the widening #1306 will be asked to make:
+		// see a2aCapBucketReadDeny, and the deny is pinned by
+		// TestWorkerHoldsNoWholesaleJetStreamAPI so that "it subtracts
+		// nothing" cannot become the argument for deleting it.
 		denyPublish:   capDenyPublish,
 		denySubscribe: capDenySubscribe,
 	}
@@ -775,13 +797,11 @@ func seedIdentity() a2aIdentity {
 			"a2a.topics.>",
 			"_INBOX.seed.>",
 		},
-		// The one subtraction from `$JS.API.>` above. Nobody but the
-		// verifier reads the cap bucket, and a wildcard that wide would
-		// otherwise hand this principal every capability in flight through
-		// the JetStream API. See a2aCapBucketReadDeny; the wide allow it
-		// carves out of is gke-labs#1306's to narrow.
-		denyPublish:   capDenyPublish,
-		denySubscribe: capDenySubscribe,
+		// No deny, unlike gateway and worker. This principal PROVISIONS the
+		// cap bucket, and a positional deny cannot tell
+		// `STREAM.CREATE.KV_cap` from `STREAM.INFO.KV_cap` -- they sit at
+		// the same depth. See the denyPublish field's comment for the full
+		// argument, and for why nothing is given up by leaving it off.
 	}
 }
 
