@@ -101,11 +101,12 @@ run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
 currently fails.
 
 > **The cited documents are not in this repository.**
-> `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md` and
-> `overnight-b/findings.md` live in a separate working repository that is not
-> published, so those citations do not resolve for a reader here. The table
-> below is the vendored summary: it states each invariant's assertion in full,
-> so nothing in the suite depends on being able to open the source document.
+> `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
+> `overnight-b/findings.md` and `round_2/` live in a separate working
+> repository that is not published, so those citations do not resolve for a
+> reader here. The table below is the vendored summary: it states each
+> invariant's assertion in full, so nothing in the suite depends on being able
+> to open the source document.
 > A citation identifies _where a finding was first written down_, so that the
 > suite and the findings record can be reconciled by someone who has both —
 > not a link a reader is expected to follow.
