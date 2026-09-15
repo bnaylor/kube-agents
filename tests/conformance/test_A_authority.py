@@ -429,21 +429,29 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
     def _rendered_publish_grants(cls) -> dict[str, list[str]]:
         """Every rendered principal's publish list, keyed by NATS user.
 
-        The served config for everything NATS authenticates from a file, the
-        Go map for the callout principals that are in no file. Read over every
-        principal rather than one expected entry, so a grant added to any of
-        them is examined.
+        The UNION of both readings, per principal. Neither alone is safe to
+        assert on. The served config is the only place `worker` and `seed`
+        can be read in full, because their Go lists concatenate constants; but
+        it is a generated file, so a mutation of the Go source does not move
+        it, and reading it alone let a mutation that puts the gateway's
+        terminals back on `…events` survive with every test green. The union
+        is also the honest reading of a containment invariant: a subject is
+        reachable if EITHER the map we edit or the config we serve grants it,
+        and the two disagreeing is itself a finding the precondition below
+        raises.
         """
-        served = cls._conf_publish_grants()
-        grants = {user: list(allow) for user, allow in served.items() if user != "callout"}
+        grants = {
+            user: list(allow)
+            for user, allow in cls._conf_publish_grants().items()
+            if user != "callout"
+        }
         for user, (allow, complete) in cls._go_publish_grants().items():
-            if user in grants:
-                continue
-            if not complete:
+            if user not in grants and not complete:
                 raise AssertionError(
                     f"{user} is in no served config and its Go publish list cannot be read in full"
                 )
-            grants[user] = allow
+            merged = grants.setdefault(user, [])
+            merged.extend(g for g in allow if g not in merged)
         return grants
 
     @classmethod

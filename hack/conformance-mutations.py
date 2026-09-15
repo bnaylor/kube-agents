@@ -1113,8 +1113,8 @@ Mutation(
     Mutation(
         "A3-second-supervisor-writer",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\t\t"a2a.tasks.*.*.events",\n\t\t\t"a2a.topics.agent.platform.upgrade-readiness",',
-         '\t\t\t"a2a.tasks.*.*.events",\n\t\t\t"a2a.tasks.*.*.supervisor",\n\t\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
+        ('\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",',
+         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "grant the static worker publish on the supervisor subject, the shape "
         "a bridge-side janitor written against the shared credential would "
