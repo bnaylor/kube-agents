@@ -341,8 +341,8 @@ stored subject, on replay - and that implication is decision-grade exactly where
 conditions hold. No signed claim, no signing key on the hot path, no key registry at
 replay: every check is a field-to-token comparison, plus the one supervisor name a
 consumer is configured with. The alternatives this beat - a signed claim per envelope,
-a server-stamped header, a key registry consulted at replay - were taken through three
-hostile review rounds before it was ratified; this section is the contract, and the
+a server-stamped header, a key registry consulted at replay - were taken through
+successive hostile review rounds before it was ratified; this section is the contract, and the
 reasoning that is load-bearing for reading it is restated here rather than cited.
 
 **Condition 1 - the writer set.** The subject's writer set equals the principals its
@@ -362,9 +362,17 @@ source, and replay skips and counts it.
 | ------------------------------------ | ---------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory for one retention window after the split, then hard.                                       |
 | `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee. |
-| `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee - plus assertion 4: `to` equals the addressee token.                                                                                   |
+| `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is additionally REQUIRED here; see the note below on where it is checked.                                                        |
 | `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                           |
 | `agents.hb.>`, `$KV.session-state.>` | no envelope                        | -        | Condition 2 is inapplicable; condition 1 carries them alone. Heartbeat identity is live-only - no stream, no replay, no audit record.                                                                                                               |
+
+**Where `to` is checked, since the table splits it.** Presence is an `…in` rule only -
+event envelopes carry no `to` and requiring one would make every legitimate event a
+protocol error. CHECKING a `to` that is present is every task subject's rule, `…events`
+and `…supervisor` included: it must equal the subject's addressee token, and a
+disagreement is a protocol error like any other. Assertion 4 states the same split; a
+consumer that reads the `…in` row alone and skips the check on the other two classes has
+implemented the narrower of the two and is the reason this is spelled out here.
 
 Topics are deliberately outside this enumeration. Agent-scoped topics already have
 exclusive writers and could join by the same rule; shared topics are multi-writer by
@@ -372,13 +380,19 @@ design and their attribution stays `from`-advisory.
 
 **What is decision-grade today, and what is not.** `…supervisor`, for every addressee:
 the gateway is the only principal in the render holding publish on it and every other
-principal is refused at the server - decision-grade. `…events`, for every addressee
+principal is refused at the server - decision-grade on the publish half of Condition 1.
+The redirection half is argued rather than measured: the gateway's relay is a pull
+consumer delivering into an inbox, so no core subscription exists on a task subject for a
+deliver-subject to be pointed at, but `web` and `worker` both hold `CONSUMER.CREATE` on
+`TASKS` and no conformance assertion pins that for `a2a.tasks.*.*.supervisor` the way
+`spec-nats-deployment.md` pins it for `a2a.agents.>`. Treat that as the open edge. `…events`, for every addressee
 _including a session pod_: not yet. The session's own grant is derived per incarnation
 and reaches only its own pod's subjects, but the static `worker` credential the Hermes
 bridge still holds publishes `a2a.tasks.*.*.events` - a wildcard over the addressee
-token, so it reaches a session's `…events` exactly as it reaches a profile's. Until
-`worker` is retired (A5) that subject has two writers on both classes, and the
-conformance suite records it as a known violation rather than a pass. What the derived
+token, so it reaches a session's `…events` exactly as it reaches a profile's. Until the shared
+`worker` credential is retired - the Hermes bridge is the last holder - that subject has
+two writers on both classes, and the conformance suite records it as a known violation
+rather than a pass. What the derived
 grant buys in the meantime is a bound on what a _session_ can forge - it cannot write
 another session's subject - which is not the same property as a consumer being able to
 read the writer off the subject. The directory: the profile binding closes the
@@ -388,7 +402,7 @@ identity is not decision-grade until then. `$KV.session-state.>` likewise waits 
 account split. **A consumer MUST NOT treat identity as decision-grade on a class this
 paragraph does not name as such.**
 
-**Two residues, named so they are not rediscovered.** A stored non-final event
+**The residues, named so they are not rediscovered.** A stored non-final event
 re-injected onto its own subject after the dedup window, on a still-running task, folds
 as a genuine-looking transition with valid derived identity; the candidate bound is a
 monotonicity check in the fold (a relocated copy arrives at a later stream sequence with
@@ -550,10 +564,10 @@ Verified identity (added 9/9):
     supervisor only, `…in` requesters only with the executor's grant never reaching it,
     and no principal outside the trust root holding a server-originated write route onto
     an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
-    belong in `tests/conformance/` rather than in the library suite. They arrive with
-    the change that implements this section, one of them as a known violation: the
-    static `worker` user holds publish on every addressee's `…events`, so that writer
-    set is not yet single-writer, and it closes when `worker` is retired.
+    belong in `tests/conformance/` rather than in the library suite, and that is where
+    they live. One of the three is a known violation rather than a pass: the static
+    `worker` user holds publish on every addressee's `…events`, so that writer set is
+    not yet single-writer, and it closes when `worker` is retired.
 
 ## Open Questions
 

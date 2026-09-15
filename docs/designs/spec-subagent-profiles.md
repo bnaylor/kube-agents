@@ -101,8 +101,11 @@ either answer.
 ### What the CRD deliberately does not hold: task state
 
 There is no `AgentTask` CR and no task status mirrored into the API server. Tasks live
-on the bus: submission on `a2a.tasks.{profile}.{taskId}.in`, every event on
-`a2a.tasks.{profile}.{taskId}.events`, status answered by replay. Mirroring that into etcd would create a second source of truth
+on the bus: submission on `a2a.tasks.{profile}.{taskId}.in`, the executor's events on
+`a2a.tasks.{profile}.{taskId}.events` and its supervisor's terminal on
+`a2a.tasks.{profile}.{taskId}.supervisor`, status answered by replaying both. Both, not
+just the first: a status-by-replay built on `…events` alone never terminates a task the
+supervisor declared dead. Mirroring that into etcd would create a second source of truth
 that is guaranteed to lag the first, plus an API-server write per status event. The
 kanban board is a task database bolted to the side of the harness. The durable stream is
 the task database now, and it comes with the audit story attached. The only Kubernetes

@@ -95,6 +95,14 @@ One user turn is one A2A task. On each inbound chat message the gateway:
    conversation. Its own supervisor terminals arrive through the same relay and retire
    the task exactly as an executor's terminal does.
 
+   A constraint this puts on later work, named because nothing else records it: a
+   multi-filter consumer cannot be created under the enumerated
+   `$JS.API.CONSUMER.CREATE.TASKS.<name>` grants that `spec-nats-deployment.md` uses to
+   take `web` off `$JS.API.>`, because the filter list travels in the request body rather
+   than the subject. That document calls a user still holding `$JS.API.>` playground
+   posture; narrowing the gateway the same way therefore has to keep this one grant,
+   split the relay into two durables, or move the pair onto a shared prefix.
+
 The backend-native message id is recorded against the `correlationId` in the gateway's
 ingress log, so the audit chain runs chat message -> correlationId -> every hop -> change.
 
@@ -241,8 +249,9 @@ no terminal to wait for, and the record carries an independent bound for each ra
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is older than `A2A_ASK_TTL` (24 hours by default,
 under the stream's retention, which is what the content posture below needs). A task
-with nothing on its events subject at all - no pod, or a pod that never ran - is
-released from the serialization at the conversation's next turn once it is older than
+with nothing on either of its event subjects - no pod, or a pod that never ran; the fold
+reads `…events` and `…supervisor` together, and assertion 9 exists because a task whose
+only event is its supervisor's terminal is not empty - is released from the serialization at the conversation's next turn once it is older than
 the first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line
 in the conversation saying so. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
@@ -493,10 +502,13 @@ The first real adapter, and the production ingress. What makes it that is the id
 property above: the sender email Google Chat asserts is the same string as the cloud
 principal and the RBAC subject, so there is no mapping table and no impersonation
 surface in one. Same string, not same enforcement yet: the email rides the authority block,
-which is advisory until publisher identity arms (the signed-claim-vs-subject-derived
-decision "Requester identity" above leaves with the deployment spec and the authority
-work) — nothing authorizes on it today, and when the requester does become
-enforceable, this adapter is already carrying the string that decision needs. What the adapter costs is inheriting the existing Chat
+and `authority.requester` is advisory — permanently so, as far as the envelope is
+concerned. The signed-claim-vs-subject-derived question this paragraph used to leave open
+was answered on 9/9, and the answer is subject-derived identity (Verified identity, in
+`spec-a2a-payloads.md`): a property of the subject a message arrived on, which says
+nothing about a chat sender. Making the requester enforceable is the capability
+envelope's job rather than `identity`'s. Nothing authorizes on the email today, and when
+that lands this adapter is already carrying the string it needs. What the adapter costs is inheriting the existing Chat
 integration's operational surface, and this section records how it sits on it.
 
 **Ingress topology: the existing app registration and topic, a dedicated A2A
