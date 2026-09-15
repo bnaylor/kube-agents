@@ -109,10 +109,18 @@ const (
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aKVStreamPrefix      = "KV_"
 
-	// a2aNATSConfGrantLine renders one allow-list entry at the depth of
-	// accounts.APP.users[].permissions.publish in the nats.conf template
-	// below: twelve spaces, the quoted subject, a trailing comma.
-	a2aNATSConfGrantLine = "            %q,"
+	// a2aNATSConfGrantLine renders one allow-list entry at the depth
+	// renderA2APermission puts them: the subject-list indent, two more for
+	// the bracketed list inside the direction's block, the quoted subject, a
+	// trailing comma.
+	//
+	// Derived rather than spelled, because it was spelled once and the depth
+	// moved under it. Adding deny lists wrapped every allow list in a block
+	// of its own and pushed the entries two spaces right; the literal still
+	// compiled, still looked like a grant line, and simply stopped matching
+	// the render -- which took out the one control that proves the worker's
+	// enumerated grants are narrower than the `$JS.API.>` they replaced.
+	a2aNATSConfGrantLine = a2aSubjectListIndent + "    " + "%q,"
 
 	// a2aProvisionWritablePath is the one writable path the provision
 	// container has: the emptyDir mount, the nats CLI's HOME and

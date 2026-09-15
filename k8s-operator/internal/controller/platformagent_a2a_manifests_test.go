@@ -1368,6 +1368,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
+	verifier := buildA2AVerifierDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1378,6 +1379,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
 		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
 		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
+		{"verifier", "buildA2AVerifierDeployment", verifier.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1447,6 +1449,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
+	verifier := buildA2AVerifierDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1493,6 +1496,13 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// ends it would not announce itself. The callout writes nothing, so
 		// traversable is enough.
 		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The third pod on that same distroless static nonroot base, same
+		// shape and same row: WorkingDir /home/nonroot in the image, UID 1000
+		// imposed by the pod, and a binary that writes nothing and never stats
+		// ".". It arrived without the WorkingDir the other two carry, and this
+		// table is what said so.
+		{render: "verifier", builder: "buildA2AVerifierDeployment", container: "verifier", spec: verifier.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -2106,6 +2116,36 @@ func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
 func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
 	t.Helper()
 
+	subjects, ok := a2aGrantList(t, conf, user, section, "allow")
+	if !ok {
+		t.Fatalf("%s has no %s allow-list", user, section)
+	}
+	return subjects
+}
+
+// a2aGrantDenials returns one user's publish or subscribe deny-list, and
+// whether the principal has one at all. Most do not: a deny is written only
+// where an allow is wider than the principal's job (see a2aCapBucketReadDeny).
+func a2aGrantDenials(t *testing.T, conf, user, section string) ([]string, bool) {
+	t.Helper()
+
+	return a2aGrantList(t, conf, user, section, "deny")
+}
+
+// a2aGrantList reads one bracketed list out of one user's permission block.
+//
+// The block the server reads is `<section> { allow = [ … ] deny = [ … ] }`,
+// spread over lines. Terminating on the list's own `]` rather than on the
+// close of the block is the whole reason this is a function: a principal that
+// carries a deny would otherwise report every DENIED subject as a grant, which
+// is the reading that inverts the control the deny exists to be. The earlier
+// version of this helper scanned to `] }` and so could only be written while
+// no principal had a deny -- and the first one that did made three tests fail
+// with "has no publish allow-list" rather than with a wrong answer, which is
+// the only reason it was caught here.
+func a2aGrantList(t *testing.T, conf, user, section, list string) ([]string, bool) {
+	t.Helper()
+
 	start := strings.Index(conf, "user: "+user)
 	if start < 0 {
 		t.Fatalf("no %s user in the rendered config", user)
@@ -2114,17 +2154,28 @@ func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
 	if next := strings.Index(entry[1:], "user: "); next >= 0 {
 		entry = entry[:next+1]
 	}
-	openIdx := strings.Index(entry, section+" { allow = [")
-	if openIdx < 0 {
-		t.Fatalf("%s has no %s allow-list", user, section)
+	blockIdx := strings.Index(entry, section+" {")
+	if blockIdx < 0 {
+		return nil, false
 	}
-	closeIdx := strings.Index(entry[openIdx:], "] }")
+	// Bounded to this direction. `publish` and `subscribe` sit side by side
+	// in one permissions block, so a search that ran past this block's close
+	// would answer with the other direction's list.
+	block := entry[blockIdx:]
+	if end := strings.Index(block, "\n"+a2aSubjectListIndent+"}"); end >= 0 {
+		block = block[:end]
+	}
+	openIdx := strings.Index(block, list+" = [")
+	if openIdx < 0 {
+		return nil, false
+	}
+	closeIdx := strings.Index(block[openIdx:], "]")
 	if closeIdx < 0 {
-		t.Fatalf("%s's %s allow-list is unterminated", user, section)
+		t.Fatalf("%s's %s %s-list is unterminated", user, section, list)
 	}
 
 	var subjects []string
-	for _, line := range strings.Split(entry[openIdx:openIdx+closeIdx], "\n") {
+	for _, line := range strings.Split(block[openIdx:openIdx+closeIdx], "\n") {
 		line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
 		if !strings.HasPrefix(line, `"`) {
 			continue
@@ -2132,9 +2183,9 @@ func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
 		subjects = append(subjects, strings.Trim(line, `"`))
 	}
 	if len(subjects) == 0 {
-		t.Fatalf("%s's %s allow-list parsed empty", user, section)
+		t.Fatalf("%s's %s %s-list parsed empty", user, section, list)
 	}
-	return subjects
+	return subjects, true
 }
 
 func TestNoWorkerCanPublishToTheDirectory(t *testing.T) {
@@ -2650,26 +2701,10 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Seed's publish allow-list exactly, not the span to the next user: the
 	// following block's explanatory comment names grants of its own, and a
 	// sloppier cut reads them as seed's. It did, on this test's first run.
-	start := strings.Index(conf, "user: seed")
-	if start < 0 {
-		t.Fatal("no seed user in the rendered config")
-	}
-	openIdx := strings.Index(conf[start:], "publish { allow = [")
-	if openIdx < 0 {
-		t.Fatal("seed has no publish allow-list")
-	}
-	openIdx += start
-	closeIdx := strings.Index(conf[openIdx:], "] }")
-	if closeIdx < 0 {
-		t.Fatal("seed's publish allow-list is unterminated")
-	}
-	var got []string
-	for _, line := range strings.Split(conf[openIdx:openIdx+closeIdx], "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			got = append(got, strings.Trim(line, `"`))
-		}
-	}
+	// a2aGrantSubjects is that cut, made once — this test used to carry its
+	// own copy, and the copy is how it came to be the last of the three to
+	// learn that a permission block can hold a deny.
+	got := a2aGrantSubjects(t, conf, "seed", "publish")
 
 	want := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
@@ -2764,12 +2799,19 @@ func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, "worker", "publish")
 
-	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
+	// a2a.cap.reply.> is the verifier's answer coming back. Wildcarded on the
+	// reply token rather than scoped to a request id, because this credential
+	// is the executor for any addressee already; see the publish side below.
+	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "a2a.cap.reply.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("worker subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
 
 	want := []string{
 		"a2a.tasks.*.*.events",
+		// Asking the verifier. It is the question, not the answer: the
+		// verifier holds the read on the bucket and this principal does
+		// not, which is the whole point of asking.
+		"a2a.cap.verify.*",
 		"a2a.topics.agent.platform.upgrade-readiness",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
@@ -2780,6 +2822,30 @@ func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.worker.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("worker publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// The deny is pinned because it is a control and not an optimisation.
+	// Nothing in the allow-list above reaches KV_cap today -- #1316 enumerated
+	// this principal by stream name -- so the deny is redundant right now, and
+	// a redundant control is exactly the kind that gets deleted as dead
+	// weight. It is here so that re-widening the allow-list, which is a thing
+	// #1306 will be asked to do, cannot quietly hand this credential the
+	// capability store on the way past.
+	for _, tc := range []struct {
+		section string
+		want    []string
+	}{
+		{"publish", capDenyPublish},
+		{"subscribe", capDenySubscribe},
+	} {
+		deny, ok := a2aGrantDenials(t, conf, "worker", tc.section)
+		if !ok {
+			t.Errorf("worker has no %s deny-list; the cap bucket is no longer subtracted from it", tc.section)
+			continue
+		}
+		if !reflect.DeepEqual(deny, tc.want) {
+			t.Errorf("worker %s deny-list changed.\n got: %q\nwant: %q", tc.section, deny, tc.want)
+		}
 	}
 
 	// Verbs no worker path uses, against every stream the provision script
@@ -3343,11 +3409,21 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 
 	kvSessionState := a2aKVStreamPrefix + "session-state"
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
+	kvCap := a2aKVStreamPrefix + a2aCapBucket
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
 				a2aTasksStream: {"ACK"},
 				kvSessionState: {"KV"},
+				// Minting, and only minting. The grant is
+				// `$KV.cap.root.*` -- the root namespace, one token
+				// deep, so one request id and no reach into the hop
+				// namespace. It is a write on the bucket's subject
+				// space and not a read of the store: the row for
+				// KV_cap that carries read verbs is the verifier's,
+				// and this principal's deny names KV_cap precisely so
+				// that its $JS.API.> cannot become one.
+				kvCap: {"KV"},
 			},
 			wholesale: true,
 		},
@@ -3382,6 +3458,18 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			// recorded here would reach every session pod at once.
 			callout:       true,
 			perConnection: true,
+		},
+		"verifier": {
+			// The only principal with read on the capability store, and
+			// the reason every other principal wide enough to reach it
+			// carries a deny that names it. Three read verbs and no
+			// consumer verb: a consumer on KV_cap is a live feed of every
+			// capability as it is minted, which is the thing this design
+			// exists not to have. Its grants are enumerated rather than
+			// per-connection because there is one verifier Deployment,
+			// not one per caller.
+			callout: true,
+			streams: map[string][]string{kvCap: {"STREAM.INFO", "DIRECT.GET", "STREAM.MSG.GET"}},
 		},
 	}
 	var staticRows, calloutRows []string
