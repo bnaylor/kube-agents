@@ -2,7 +2,11 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** draft, for review
+- **Status:** draft, for review. The task-subject-classes bullet below is a 9/9 amendment
+  describing the render that lands in gke-labs#1617, which this document merges behind
+  (`do-not-merge/hold`). Before that PR `gatewayIdentity` holds no
+  `a2a.tasks.*.*.supervisor` publish and the golden `rendered-nats.conf` grants that
+  subject to nobody.
 - **Companion:** the A2A payload spec (`spec-a2a-payloads.md`) - owns subjects and message shape
 
 ## Purpose
@@ -184,7 +188,7 @@ Layout:
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
-  spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
+  spec 0.4; the render lands in gke-labs#1617 - see Status). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
   publisher from the subject, so a class with two rendered writers derives nothing. A
   supervisor terminal sitting on the executor's subject is exactly what a hostile executor

@@ -2,7 +2,12 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription). Amended 9/9 for the supervisor
+  subject split: step 4's two-filter relay and the gateway's own terminals on
+  `…supervisor` describe the render and library that land in gke-labs#1617, which this
+  document merges behind (`do-not-merge/hold`). Before it, `a2a/gateway/gateway.go`
+  subscribes the relay durable to `a2a.tasks.*.*.events` alone and
+  `publishSupervisorTerminal` writes through `lib.TaskEventsSubject`
 
 ## Purpose
 
@@ -114,10 +119,13 @@ One user turn is one A2A task. On each inbound chat message the gateway:
    multi-filter are mutually exclusive by construction: the pin lives in the subject and
    the list does not. So a session pod can create neither a supervisor-filtered consumer nor a
    two-filter one, and cannot core-subscribe the subject either. `message/stream`'s "both
-   subjects" is unmeetable for it today, and the narrower consequence is already shipping:
-   the worker adapter's respawn check reads `…events` alone, so it cannot see a terminal
-   its own predecessor's supervisor declared. Closing this means one more enumerated
-   filter, not a wildcard.
+   subjects" is unmeetable for it today, and the narrower consequence arrives with the
+   split itself rather than being already shipping: the worker adapter's respawn check
+   reads `…events` alone, so once the supervisor's terminal moves off that subject the
+   adapter stops seeing a terminal its own predecessor's supervisor declared. On a
+   pre-split tree it does see it, because the terminal is still on `…events` - which is
+   the same reason the writer-class check ships advisory. Closing this means one more
+   enumerated filter, not a wildcard.
 
 The backend-native message id is recorded against the `correlationId` in the gateway's
 ingress log, so the audit chain runs chat message -> correlationId -> every hop -> change.
