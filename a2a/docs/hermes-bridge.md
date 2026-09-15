@@ -131,7 +131,9 @@ gateway spawns session pods and finalizes tasks it did not execute, so it publis
 finalizes an orphan it is finishing its OWN task across a restart, as itself, so its
 terminal stays on `…events` where every other event it writes goes, and its `from`
 agrees with that subject like any executor's. Profile-addressed tasks have no
-supervisor principal at all until the dispatcher lands; that is a gap the profiles
+supervisor ROLE until the dispatcher lands - though the gateway's rendered grant is an
+addressee wildcard and reaches their `…supervisor` regardless, which the profiles spec
+spells out; that is a gap the profiles
 spec names, not one this sweep fills. Two failure classes:
 
 - **The subprocess dies under a live bridge.** The runner sees the exit and publishes

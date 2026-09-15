@@ -141,7 +141,7 @@ lacked.
 | `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                                                                                              |
 | `ts`                   | Required. ISO-8601 UTC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `from`                 | Required. Never the source of identity or authority - both come from the subject an envelope was delivered on (Verified identity, below). On an identity-bearing subject `from` MUST agree with the writer the subject implies, and a disagreement is a protocol error: the envelope is refused, not re-attributed. `from.profile` names the AgentProfile a worker runs as; mandatory (9/9) for a profile-addressed executor's events and on the directory, where it is the profile binding, optional elsewhere. Display reads it; nothing decides on it. |
-| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere. Where it is present on ANY task subject it MUST agree with that subject's addressee token; on `…in` assertion 4 additionally requires it to be there. Event envelopes carry no `to`.                                                                                                                                                                                                                                               |
+| `to`                   | Optional. Addresses an envelope to a named session. Consumers on a wildcard MUST ignore envelopes addressed elsewhere. Optional on every class - nothing requires it to be present. Where it IS present on any task subject it MUST agree with that subject's addressee token. Event envelopes carry no `to`.                                                                                                                                                                                                                                             |
 | `identity`             | **Reserved and permanently null** (decided 9/9). Verified identity is a property of the delivery, not a field. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
@@ -249,14 +249,14 @@ the one submission.)
 A2A 1.0 defines its operations as JSON-RPC methods. On a bus, most of them stop being
 calls and become properties of the stream:
 
-| A2A operation                    | On the bus                                                                                                                                                                                                                                                                                                                                   |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it.                                                                                                                            |
-| `message/stream`                 | The same publish, plus subscribe to BOTH the `events` and `supervisor` subjects. Streaming is not an optional capability here; it is how the bus works. A subscriber to `events` alone is not wrong about anything it sees, but it never sees the terminal a supervisor declares, so it waits out a task the bus has already ended.          |
-| `tasks/get`                      | Replay the `events` and `supervisor` subjects from sequence 1, in stream order, and fold them into a `Task`. No live executor required - this is the durability payoff. The two subjects share the stream sequence, so the fold needs no merge; whichever terminal the stream holds first is the task's, and the other is a post-final drop. |
-| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                                                                                                                                             |
-| `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                                                                                                                                                        |
-| push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                                                                                                                                                       |
+| A2A operation                    | On the bus                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`. The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it.                                                                                                                                                                                                               |
+| `message/stream`                 | The same publish, plus subscribe to BOTH the `events` and `supervisor` subjects - which a session pod cannot do today under its derived grants; see spec-chatops-gateway.md. Streaming is not an optional capability here; it is how the bus works. A subscriber to `events` alone is not wrong about anything it sees, but it never sees the terminal a supervisor declares, so it waits out a task the bus has already ended. |
+| `tasks/get`                      | Replay the `events` and `supervisor` subjects from sequence 1, in stream order, and fold them into a `Task`. No live executor required - this is the durability payoff. The two subjects share the stream sequence, so the fold needs no merge; whichever terminal the stream holds first is the task's, and the other is a post-final drop.                                                                                    |
+| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                                                                                                                                                                                                                                |
+| `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                                                                                                                                                                                                                                           |
+| push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                                                                                                                                                                                                                                          |
 
 ### Event ordering rules
 
@@ -317,7 +317,12 @@ calls and become properties of the stream:
   writes on `…events` as itself, and is not a supervisor write. **Migration:** `TASKS`
   keeps 72h, so for one retention window after an install takes the split its stream
   still holds legitimate supervisor terminals on `…events`; the writer-class check on
-  `…events` (Verified identity, below) is advisory until that window has passed.
+  `…events` (Verified identity, below) ships advisory. It does not harden when the window
+  passes. Hardening is one deliberate operator flip - `A2A_STRICT_EVENTS_WRITER=true` in
+  the gateway's environment, default false - and nothing arms it on a schedule or reverts
+  it. An install that never sets it counts advisories for the life of the install, which
+  is the part worth naming: a retention window is the earliest the flip is SAFE, not a
+  date on which it happens.
 
 ### Reserved artifact names
 
@@ -360,19 +365,24 @@ source, and replay skips and counts it.
 
 | Subject class                        | Admissible kinds                   | `taskId` | Writer the subject implies, and the check                                                                                                                                                                                                           |
 | ------------------------------------ | ---------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory for one retention window after the split, then hard.                                       |
+| `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory as shipped; hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`.               |
 | `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee. |
-| `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is additionally REQUIRED here; see the note below on where it is checked.                                                        |
+| `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is conventionally present here and checked when it is, but is not required; see the note below.                                  |
 | `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                           |
 | `agents.hb.>`, `$KV.session-state.>` | no envelope                        | -        | Condition 2 is inapplicable; condition 1 carries them alone. Heartbeat identity is live-only - no stream, no replay, no audit record.                                                                                                               |
 
-**Where `to` is checked, since the table splits it.** Presence is an `…in` rule only -
-event envelopes carry no `to` and requiring one would make every legitimate event a
-protocol error. CHECKING a `to` that is present is every task subject's rule, `…events`
-and `…supervisor` included: it must equal the subject's addressee token, and a
-disagreement is a protocol error like any other. Assertion 4 states the same split; a
-consumer that reads the `…in` row alone and skips the check on the other two classes has
-implemented the narrower of the two and is the reason this is spelled out here.
+**Where `to` is checked, since the table splits it.** There is no presence rule, on any
+class. An earlier draft of this section said `to` was REQUIRED on `…in`; no assertion
+states that and `a2a/lib` implements no such check, so the claim is withdrawn rather than
+promoted - event envelopes carry no `to`, and requiring one would make every legitimate
+event a protocol error, which is why the field stayed optional in the first place. What IS
+a rule, on every task subject, is CHECKING a `to` that is present: it must equal the
+subject's addressee token, `…events` and `…supervisor` included, and a disagreement is a
+protocol error like any other. That is assertion 4's second clause, and the library applies
+it class-independently, at publish and at delivery both, because an event carrying another
+session's `to` has no legitimate producer. A consumer that reads the `…in` row alone and
+skips the check on the other two classes has implemented the narrower of the two and is the
+reason this is spelled out here.
 
 Topics are deliberately outside this enumeration. Agent-scoped topics already have
 exclusive writers and could join by the same rule; shared topics are multi-writer by
@@ -381,11 +391,18 @@ design and their attribution stays `from`-advisory.
 **What is decision-grade today, and what is not.** `…supervisor`, for every addressee:
 the gateway is the only principal in the render holding publish on it and every other
 principal is refused at the server - decision-grade on the publish half of Condition 1.
-The redirection half is argued rather than measured: the gateway's relay is a pull
-consumer delivering into an inbox, so no core subscription exists on a task subject for a
-deliver-subject to be pointed at, but `web` and `worker` both hold `CONSUMER.CREATE` on
-`TASKS` and no conformance assertion pins that for `a2a.tasks.*.*.supervisor` the way
-`spec-nats-deployment.md` pins it for `a2a.agents.>`. Treat that as the open edge. `…events`, for every addressee
+The redirection half rests on a measured property, not on an absence of subscribers: a
+consumer's deliver subject can aim replay of stored messages at another stream's subject,
+but the bytes arrive under their ORIGINAL subject, so a consumer that reads the subject it
+was delivered on is not fooled (`spec-nats-deployment.md` measures this; assertion 23
+pins it). Do not read that as "nothing can reach the subject." Core subscriptions on task
+subjects do exist and are the exposed party - `web` subscribes `a2a.>` and `worker`
+`a2a.tasks.>`, both covering `a2a.tasks.*.*.supervisor` - and both hold `CONSUMER.CREATE`
+on `TASKS` unscoped. No conformance assertion pins the redirection route for
+`a2a.tasks.*.*.supervisor` the way `spec-nats-deployment.md` pins it for `a2a.agents.>`,
+and the credential published to a browser is inside that gap. Treat that as the open edge,
+and scope its closure to `web` and `worker` - closing it on the gateway's relay alone
+would leave it open. `…events`, for every addressee
 _including a session pod_: not yet. The session's own grant is derived per incarnation
 and reaches only its own pod's subjects, but the static `worker` credential the Hermes
 bridge still holds publishes `a2a.tasks.*.*.events` - a wildcard over the addressee
@@ -486,9 +503,9 @@ Envelope:
    byte-identical and are not consulted for any decision.
 4. A consumer on a wildcard ignores envelopes whose `to` names another session, and an
    envelope whose `to` disagrees with its subject's addressee token is surfaced as a
-   protocol error. (Refined 9/9: requiring `to` to be PRESENT is an `…in` rule, since
-   event envelopes carry none; checking a `to` that is present is every task subject's
-   rule, which is where it already was.)
+   protocol error. (Refined 9/9: checking a `to` that is present is every task subject's
+   rule, `…events` and `…supervisor` included, which is where it already was. Nothing
+   requires `to` to be present on any class, and event envelopes carry none.)
 5. A redelivered envelope (same `envelopeId`) reaches the application at most once.
 
 Payloads:
@@ -508,6 +525,11 @@ Lifecycle:
 10. Exactly one event has `final: true` across the task's `…events` and `…supervisor`
     subjects together, its state is terminal, and any event after it on either subject
     is surfaced as a protocol error - warn-and-drop, with the consumer loop surviving.
+    One case of this is expected rather than hostile, and an operator alerting on the
+    violation counter has to know it: per-subject CAS cannot span two subjects, so the
+    janitor's terminal on `…supervisor` is no longer serialized against the executor's own
+    terminal on `…events`. A genuine race produces exactly one counted post-final drop, and
+    the counter does not distinguish it from a forged one.
 11. A `tasks/get` materialized by replay of both subjects yields the same terminal state
     and artifact set a live subscriber of both saw, and a task whose supervisor terminal
     predates the split (stored on `…events`) still replays to that terminal.

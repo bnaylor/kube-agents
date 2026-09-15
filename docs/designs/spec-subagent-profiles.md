@@ -388,9 +388,16 @@ assertion (payload spec 22), not a connect-time control. The grant is in the
 identity-to-permissions map like every other. Replay distinguishes "the worker said
 failed" from "the janitor declared it dead" by which subject the terminal is on, and
 consumers check `from` for agreement with that subject rather than trusting it. Until
-the dispatcher exists there is no janitor principal for profile-addressed tasks; the
-Hermes bridge's startup sweep is the executor finalising its own predecessor's orphan and
-writes on `…events` as itself.
+the dispatcher exists there is no janitor ROLE for profile-addressed tasks; the Hermes
+bridge's startup sweep is the executor finalising its own predecessor's orphan and writes
+on `…events` as itself. No role is not the same as no writer, and the render is the thing
+to read: the gateway's supervisor grant is `a2a.tasks.*.*.supervisor`, a wildcard over the
+addressee, so the gateway can write every profile's supervisor subject even though nothing
+asks it to. Production would scope that grant to the sessions the gateway spawned; a static
+render cannot express it. A consumer with no configured supervisor name falls back to the
+negative form - `from` is not the addressee - which a gateway-credentialled terminal
+satisfies. So do not model a profile task's `…supervisor` as unreachable, and do not treat
+an envelope arriving there as impossible.
 
 **What is deliberately absent: automatic retry.** Today the board charges a retry
 budget, forgives infrastructure deaths, and trips a breaker on repeat offenders. This

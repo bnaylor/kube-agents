@@ -189,13 +189,17 @@ Layout:
   publisher from the subject, so a class with two rendered writers derives nothing. The
   gateway holds publish on `…in` and `…supervisor` and **not** on `…events`, because a
   supervisor terminal sitting on the executor's subject is exactly what a hostile
-  executor would forge. A session's grant is derived per incarnation by the auth callout
+  executor would forge. That `…supervisor` grant is `a2a.tasks.*.*.supervisor` - a
+  wildcard over the addressee, not a scope to the sessions the gateway spawned, which a
+  static render cannot express - so it reaches every profile's supervisor subject too. A session's grant is derived per incarnation by the auth callout
   and reaches only its own pod's `…events`. The one class that is not yet single-writer
   is `…events`, and the holder is the static `worker` credential the Hermes bridge
   authenticates with: its `a2a.tasks.*.*.events` wildcards the addressee token, so it
   reaches session and profile subjects alike until that credential is retired. This
-  document is canonical for that writer set; `spec-a2a-payloads.md` states the consumer
-  rule that rests on it.
+  document is canonical for the grant LISTS; `spec-a2a-payloads.md` states the consumer
+  rule that rests on them and enumerates what is not yet decision-grade - including a
+  redirection route onto `…supervisor` that no assertion pins. Canonical is not the same
+  as complete: read that section before treating any class as closed.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is

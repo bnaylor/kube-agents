@@ -103,6 +103,17 @@ One user turn is one A2A task. On each inbound chat message the gateway:
    posture; narrowing the gateway the same way therefore has to keep this one grant,
    split the relay into two durables, or move the pair onto a shared prefix.
 
+   The session pod is not a later problem but a live one, because it is ALREADY narrowed
+   that way. `sessionGrants` issues three consumers by exact name with the filter riding
+   the CREATE subject, pinned to the pod's own `…in` and `…events`; there is no supervisor
+   filter among them and no unscoped `CONSUMER.CREATE`, and the pod's only subscribe grant
+   is its inbox. So a session pod can create neither a supervisor-filtered consumer nor a
+   two-filter one, and cannot core-subscribe the subject either. `message/stream`'s "both
+   subjects" is unmeetable for it today, and the narrower consequence is already shipping:
+   the worker adapter's respawn check reads `…events` alone, so it cannot see a terminal
+   its own predecessor's supervisor declared. Closing this means one more enumerated
+   filter, not a wildcard.
+
 The backend-native message id is recorded against the `correlationId` in the gateway's
 ingress log, so the audit chain runs chat message -> correlationId -> every hop -> change.
 
@@ -249,11 +260,12 @@ no terminal to wait for, and the record carries an independent bound for each ra
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is older than `A2A_ASK_TTL` (24 hours by default,
 under the stream's retention, which is what the content posture below needs). A task
-with nothing on either of its event subjects - no pod, or a pod that never ran; the fold
-reads `…events` and `…supervisor` together, and assertion 9 exists because a task whose
-only event is its supervisor's terminal is not empty - is released from the serialization at the conversation's next turn once it is older than
-the first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line
-in the conversation saying so. That release publishes no terminal: age alone is not
+with nothing on either of its event subjects - no pod, or a pod that never ran - is
+released from the serialization at the conversation's next turn once it is older than the
+first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
+conversation saying so. Both subjects, not just `…events`: the fold reads them together,
+and assertion 9 exists because a task whose only event is its supervisor's terminal is not
+empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. Otherwise the terminal event this chain
