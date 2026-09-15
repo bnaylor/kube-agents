@@ -260,6 +260,10 @@ module "kube_agents_iam" {
   project_roles      = local.agent_project_roles
   scoped_clusters    = var.scoped_clusters
   service_account_id = var.agent_service_account_id
+  # The KSA half of the Workload Identity member; the same variable is the
+  # chart's platformAgent.security.serviceAccountName below. The variable's
+  # description in variables.tf says why it exists and what bounds it.
+  ksa_name = var.agent_ksa_name
 
   # module.gke_cluster, and not only the API enablements, because the module's
   # workload_identity binding names the pool as an interpolated string
@@ -293,7 +297,7 @@ module "litellm_vertex_iam" {
   count  = local.use_vertex ? 1 : 0
 
   project_id         = var.project_id
-  service_account_id = "kubeagents-litellm-gsa"
+  service_account_id = var.litellm_service_account_id
   display_name       = "Kube-Agents LiteLLM Vertex AI Service Account"
   namespace          = var.namespace
   ksa_name           = local.litellm_ksa
@@ -343,11 +347,12 @@ module "github_minter" {
   source = "../../modules/github-minter"
   count  = var.enable_github_minter ? 1 : 0
 
-  project_id       = var.project_id
-  location         = var.location
-  namespace        = var.namespace
-  kms_keyring_name = var.github_minter_kms_keyring
-  kms_key_name     = var.github_minter_kms_key
+  project_id         = var.project_id
+  location           = var.location
+  namespace          = var.namespace
+  service_account_id = var.github_minter_service_account_id
+  kms_keyring_name   = var.github_minter_kms_keyring
+  kms_key_name       = var.github_minter_kms_key
 
   depends_on = [google_project_service.required]
 }
@@ -583,6 +588,9 @@ resource "helm_release" "kube_agents" {
         # With annotations set, the OPERATOR creates and manages the KSA (see
         # the chart README's ServiceAccount-ownership section); this one wires
         # Workload Identity to the GSA the kube-agents-iam module created.
+        # The KSA module.kube_agents_iam bound above -- one variable, so the
+        # binding cannot name a KSA the pod does not run as.
+        serviceAccountName = var.agent_ksa_name
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
@@ -636,21 +644,31 @@ resource "helm_release" "kube_agents" {
     # module.github_minter above. The App private key still has to be imported
     # into the module's KMS key before the Deployment goes Ready — see the
     # github-minter module README.
-    githubMinter = {
-      enabled = var.enable_github_minter
-      org     = local.github_org
-      repo    = local.github_repo_name
-      appId   = var.github_app_id
-      # The minty rule's only gate on platform-agent-scope is assertion.email
-      # against this value; left unset the chart falls back to the fixed
-      # kubeagents-platform-gsa name, so an install that overrides
-      # agent_service_account_id would annotate one GSA and allowlist another.
-      allowedServiceAccount = module.kube_agents_iam.service_account_email
-      kms = {
-        keyring = var.github_minter_kms_keyring
-        key     = var.github_minter_kms_key
-      }
-    }
+    githubMinter = merge(
+      {
+        enabled = var.enable_github_minter
+        org     = local.github_org
+        repo    = local.github_repo_name
+        appId   = var.github_app_id
+        # The minty rule's only gate on platform-agent-scope is assertion.email
+        # against this value; left unset the chart falls back to the fixed
+        # kubeagents-platform-gsa name, so an install that overrides
+        # agent_service_account_id would annotate one GSA and allowlist another.
+        allowedServiceAccount = module.kube_agents_iam.service_account_email
+        kms = {
+          keyring = var.github_minter_kms_keyring
+          key     = var.github_minter_kms_key
+        }
+      },
+      # The chart annotates the minter KSA with gsaName and otherwise falls back
+      # to the fixed kubeagents-github-minter-gsa, so an install that sets
+      # github_minter_service_account_id would create one GSA and have the pod
+      # impersonate another. Only when the module exists: a null here would
+      # be a Helm null, which deletes the chart default instead of keeping it.
+      var.enable_github_minter ? {
+        gsaName = module.github_minter[0].service_account_id
+      } : {}
+    )
     plugins = {
       pubsubPlatform = merge(
         {

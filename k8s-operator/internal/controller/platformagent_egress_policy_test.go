@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -33,13 +34,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// dnsPort is the one port on which the rendered policy is allowed to name a
-// metadata address; see permitsBeyondDNS.
-const dnsPort = 53
+// dnsPort is declared in platformagent_litellm_policy.go; it is the one port
+// on which the rendered policy is allowed to name a metadata address; see permitsBeyondDNS.
 
 // egressPolicyAgent is an agent with the allowlist on.
 func egressPolicyAgent(mutate ...func(*agentv1alpha1.PlatformAgent)) *agentv1alpha1.PlatformAgent {
@@ -1237,6 +1238,117 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 	}
 }
 
+// TestRefusalStillUpdatesStatusWhenGuardrailReconcileFails covers the failure mode
+// where reconciling network guardrails errors on a refusal path: the status must still
+// record Degraded with the refusal reason rather than returning early without updating status.
+func TestRefusalStillUpdatesStatusWhenGuardrailReconcileFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.PlatformAgent)
+		reason string
+	}{
+		{
+			name:   "EgressAllowlistRefused",
+			reason: reasonEgressAllowlistRefused,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			},
+		},
+		{
+			name:   "ForbiddenVolumeMount",
+			reason: reasonForbiddenVolumeMount,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+					ExtraVolumeMounts: []corev1.VolumeMount{
+						{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
+					},
+				}
+			},
+		},
+		{
+			name:   "ShellSandboxCannotBeDisabled",
+			reason: reasonShellSandboxCannotBeDisabled,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{
+					ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+				}
+			},
+		},
+		{
+			name:   "RuntimeClassNotFound",
+			reason: reasonRuntimeClassNotFound,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("non-existent-runtime"),
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(tc.mutate)
+
+			injectedErr := errors.New("injected networkpolicy apply error")
+			ssa := ssaApplyInterceptor()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if np, ok := obj.(*networkingv1.NetworkPolicy); ok && np.Name == agent.Name+"-gateway-netpol" {
+							return injectedErr
+						}
+						if ssa.Create != nil {
+							return ssa.Create(ctx, cl, obj, opts...)
+						}
+						return cl.Create(ctx, obj, opts...)
+					},
+					Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if np, ok := obj.(*networkingv1.NetworkPolicy); ok && np.Name == agent.Name+"-gateway-netpol" {
+							return injectedErr
+						}
+						if ssa.Patch != nil {
+							return ssa.Patch(ctx, cl, obj, patch, opts...)
+						}
+						return cl.Patch(ctx, obj, patch, opts...)
+					},
+				}).
+				Build()
+
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			_, err := r.Reconcile(ctx, req)
+			if err == nil {
+				t.Fatal("expected Reconcile to return the guardrail error, got nil")
+			}
+
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			if stored.Status.Phase != "Degraded" {
+				t.Errorf("expected Status.Phase to be Degraded despite guardrail error, got %q", stored.Status.Phase)
+			}
+			var gotReason string
+			for _, condition := range stored.Status.Conditions {
+				if condition.Type == "Ready" {
+					gotReason = condition.Reason
+				}
+			}
+			if gotReason != tc.reason {
+				t.Errorf("expected Ready condition reason %q, got %q", tc.reason, gotReason)
+			}
+		})
+	}
+}
+
 // TestTheFlagAddedToARunningAgentRendersTheGuardrail covers the case the
 // reference page describes in prose and no other test reaches: the field is
 // set on an agent that is already running, rather than being present when the
@@ -1607,5 +1719,91 @@ func TestTheReconciledOTelRuleFollowsTheResolvedEndpoint(t *testing.T) {
 				t.Errorf("the two policies selecting the agent Pod disagree about the collector namespace")
 			}
 		})
+	}
+}
+
+// The Allowlist policy and the gateway policy are rendered independently and
+// either can be the only one present, so the bus rule has to exist in both:
+// an agent Pod handed NATS credentials under `next` but fenced by a policy
+// with no 4222 rule does not refuse the dial, it hangs it to the client
+// timeout on an install whose CR reads Ready. Today's render must not carry
+// the rule — the dark-stack promise is that a normal install cannot tell the
+// feature exists, and this policy is part of a normal install's surface.
+func TestAgentEgressPolicyBusRuleGatedOnMode(t *testing.T) {
+	findBusRule := func(policy *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
+		for i := range policy.Spec.Egress {
+			for _, p := range policy.Spec.Egress[i].Ports {
+				if p.Port != nil && p.Port.IntVal == 4222 {
+					return &policy.Spec.Egress[i]
+				}
+			}
+		}
+		return nil
+	}
+
+	today, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, managedOTelCollectorNamespace)
+	if rule := findBusRule(today); rule != nil {
+		t.Errorf("mode absent rendered a bus egress rule on the Allowlist policy: %+v", rule)
+	}
+
+	next, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(func(agent *agentv1alpha1.PlatformAgent) {
+		agent.Spec.Mode = ptr.To("next")
+	}), nil, managedOTelCollectorNamespace)
+	rule := findBusRule(next)
+	if rule == nil {
+		t.Fatal("mode next rendered no 4222 rule on the Allowlist policy; the bus dial hangs to the timeout")
+	}
+	if len(rule.To) != 1 || rule.To[0].PodSelector == nil || rule.To[0].IPBlock != nil {
+		t.Fatalf("the bus rule must select the NATS pods by label and nothing else: %+v", rule.To)
+	}
+	if rule.To[0].PodSelector.MatchLabels[labelPartOf] != a2aPartOf ||
+		rule.To[0].PodSelector.MatchLabels[a2aComponentLabel] != "nats" {
+		t.Errorf("the bus rule does not pin the NATS pod labels: %+v", rule.To[0].PodSelector.MatchLabels)
+	}
+
+	// Skew preserves the surface, matching the gateway policy's rule — the
+	// reconciler freezes a running next stack rather than cleaning it up.
+	skewed, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(func(agent *agentv1alpha1.PlatformAgent) {
+		agent.Spec.Mode = ptr.To("quantum")
+	}), nil, managedOTelCollectorNamespace)
+	if findBusRule(skewed) == nil {
+		t.Error("skew removed the Allowlist policy's bus rule while the bus keeps running")
+	}
+}
+
+// TestALiteLLMFailureDoesNotSuspendTheAgentGuardrails pins the ordering
+// reconcileAgentNetworkGuardrails promises. litellm-policy selects a different
+// Pod, so an error on its side — here a failing Get on Deployment/litellm —
+// must leave neither of the agent Pod's own policies unreconciled, and must
+// still surface from the joined result rather than be swallowed.
+func TestALiteLLMFailureDoesNotSuspendTheAgentGuardrails(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent()
+	injectedErr := errors.New("injected litellm deployment get error")
+	funcs := ssaApplyInterceptor()
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*appsv1.Deployment); ok && key.Name == litellmDeploymentName {
+			return injectedErr
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	err := r.reconcileAgentNetworkGuardrails(ctx, agent)
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected the LiteLLM error to surface from the joined result, got %v", err)
+	}
+	for _, name := range []string{agent.Name + "-gateway-netpol", agentEgressPolicyName(agent)} {
+		var np networkingv1.NetworkPolicy
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, &np); err != nil {
+			t.Errorf("%s was not reconciled behind the LiteLLM failure: %v", name, err)
+		}
 	}
 }

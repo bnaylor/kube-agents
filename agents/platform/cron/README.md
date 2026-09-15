@@ -35,8 +35,8 @@ delivery, so routing it through a card loses the run. A poller is the inverse: i
 has nothing to deliver on almost every tick, its product goes to GitHub, and it
 owes a model turn only when real work exists — which is why `github-repo-watcher`
 is a `no_agent` script that costs nothing when idle and files a card when it
-finds something. It still names an audible `deliver` for itself — `"chat"`, like
-every other entry here — so a sweep that cannot run still says so. Being
+finds something. It still names an audible `deliver` for itself — `"chat"` — like
+every other report-producing entry here, so a sweep that cannot run still says so. Being
 `no_agent` changes what it delivers, not whether it does: a clean tick prints
 nothing and relays nothing, and only a sweep that failed produces text.
 
@@ -68,6 +68,32 @@ accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
 and nothing. A tighter interval buys nothing against that rate and spends an SSH
 round trip per tick.
 
+## `kanban-board-health` asks whether the board is wedged
+
+The same shape as the collector above: housekeeping that needs the board, which
+is on the agent pod at `<agent home>/kanban.db`. `kanban_board_health.py` reads
+that file read-only, asks `hermes kanban diagnostics` for the shipped rule
+engine's findings, and prints only when something is wrong. One finding is
+reported whatever the severity floor says: a card `blocked` for more than a day
+with no comment or unblock since. A worker's or operator's block is sticky by
+design, nothing retries it, and #656 was a finished report parked that way for
+weeks because nothing periodically asked. Each such line carries the card's
+kind, reason and age, read from the board, and the `hermes kanban unblock` and
+`archive` commands, because the engine's JSON has neither the kind nor the
+reason and a line that names a stuck card without saying how to move it is a
+line the room learns to skip.
+
+Daily, and it repeats: the rule is stateless, so a card still blocked is named
+every morning until someone unblocks, comments on, or archives it. That is the
+intended nag, the same rule `findings-morning-nudge` keeps, and the reason a
+finer cadence buys nothing: the engine's threshold is a day. It fires at 12:35
+UTC, half an hour after that nudge, for the same reason the nudge sits at 12:00:
+an earlier UTC hour is the middle of the night in the US, not a morning.
+
+It sits here rather than on the Chat Agent's roster because that roster delivers
+`local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
+under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two
@@ -75,20 +101,30 @@ rosters both carrying one id is that audit running twice per schedule,
 concurrently with itself, writing its ledger issue twice. The per-job lock
 (`cron/.job-<id>.lock`) is per profile directory, so it does not stop this.
 
-## `deliver` is never `"local"`
+## `deliver` is `"local"` on exactly one job
 
-Every enabled job here sets `deliver` to `"chat"` (`"all"` is the other audible
-value). `cron/scheduler.py::_resolve_delivery_targets` returns an **empty target list**
-for `"local"` — the outcome is written to `last_output` and delivered nowhere. A
-watchdog whose run failed would then be indistinguishable from a quiet fleet.
-Both audible values carry a failure: the scheduler builds one with
-`_summarize_cron_failure_for_delivery` and delivers it on the same leg.
+Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
+values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+returns an **empty target list** for `"local"` — the outcome is written to
+`last_output` and delivered nowhere. A watchdog whose run failed would then be
+indistinguishable from a quiet fleet. Both audible values carry a failure: the
+scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
+on the same leg.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
+The exception is `chat-delivery-watch`, whose job is to notice that the chat leg
+itself is down. Its product is a GitHub ledger issue and an `ALERT` line in
+`logs/chat_delivery_watch.log` that fluent-bit ships to Cloud Logging, neither of
+which passes through chat, and a chat delivery for it would be circular. The
+design is in
+[`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md)
+under "Detecting a broken leg".
+
 `test_every_watchdog_declares_all_delivery` in
-`../skills/fleet-audit/scripts/test_audit_report.py` enforces this.
+`../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
+the exemption by name, pinned to a `no_agent` entry whose script exists.
 
 ## `deliver: "chat"` — reporting through the Chat Agent
 
@@ -106,8 +142,9 @@ reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install a job left on `"all"` is now heard twice on _each_ of them
-rather than twice in one place. Every entry here names `"chat"`, so this reaches
-only a runtime-created job or a hand-edited roster.
+rather than twice in one place. Two entries here name `"all"`
+(`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
+the rest name `"chat"`.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -122,7 +159,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every job here names `"chat"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start
@@ -180,6 +217,66 @@ stop.
 Their SOPs under `../governance/` are deliberately left in place: an SOP is
 inert without a job to run it, and keeping them makes reviving a watchdog a
 roster edit rather than an archaeology exercise.
+
+## Adding a watchdog: the repository steps
+
+The site's [Autonomous watchdogs](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md#adding-a-watchdog)
+page lists what an entry needs. Two steps belong to this repository rather than
+to an install:
+
+- Run `make docs-generate` after editing either roster. The site's cron
+  reference table is generated from both, and a cron expression missing from
+  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
+- For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
+  the agent image without a release; `./upgrade.sh --upgrade-mode=harness
+--image-tag=<ref>` is the path for an installed cluster.
+
+## How the Planning Agent's roster reaches the volume
+
+The Planning Agent is the `default` profile, which is not scaffolded: it lives
+at `$HERMES_HOME` directly and the entrypoint seeds it with
+`cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
+step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
+`AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
+`scripts/` — and since the
+scheduler writes `last_run` into the volume's copy on every tick, that copy's
+timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
+
+Step 2c-bis closes that gap: `cron_jobs_sync.py` reconciles
+`$HERMES_HOME/cron/jobs.json` against the shipped roster by job id, per key,
+under the rule `merge_cron_store` applies on this roster — the image wins every
+key it ships, `enabled` among them, and a key it ships nothing for stays as the
+volume had it. Two rosters obeying opposite merge rules would be a trap for
+whoever edits either. The cron-retirement step 2c (the entrypoint labels two
+steps `2c`; this is the one immediately before 2c-bis) forces exactly one id
+(`--cron-jobs "profile-cron-tick"`); that narrowness is a deliberate subset of
+the same rule rather than a second policy for the same file, because 2c is the
+call that also carries `--cron-retire` and an unfiltered merge there would
+resurrect the two onboarding jobs `bootstrap_delivery.py` deletes once the
+first-run report lands. What stops 2c-bis resurrecting them is a ledger instead:
+`$HERMES_HOME/.cron_jobs_installed` records every id the script has installed,
+so an id missing from the volume that the ledger already knows about was removed
+on purpose, not shipped new, and is never reinstalled.
+
+## Incidents behind the roster's shape
+
+Three rules on the site page came from measured failures, recorded here so the
+rule outlives the memory of why:
+
+- **On-demand runs are marked due, never re-enacted in the requesting session.**
+  On 2026-08-03 a session asked to run several audits at once crammed them into
+  one turn budget and produced five hand-typed empty findings documents and a
+  fleet-wide all-clear, having issued no `kubectl` at all. That is why the
+  Platform Agent marks the job due for the next tick instead of running the SOP
+  itself.
+- **Overlap is held per job, not per profile.** Holding the profile lock across
+  execution — the upstream default — meant a fleet audit blocked every dispatch
+  for its whole run; three `github-issue-resolver` firings were measured 418s,
+  179s and 1142s late behind one, each recovering within seconds of the audit
+  finishing. The per-job `cron/.job-<id>.lock` is the fix.
+- **Pollers are `no_agent` scripts.** As a prompt job, `github-issue-resolver`
+  ran a third as often as its replacement and still spent 48 model turns a day
+  to be told "nothing to do" 47 times.
 
 ## Hard-coded line numbers in prompts
 

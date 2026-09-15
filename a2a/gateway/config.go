@@ -28,6 +28,16 @@ const attributionSaltLen = 32
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultGchatTokenPath is where the operator projects the gateway's
+// relay-audience ServiceAccount token when the gchat backend is armed.
+const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
+
+// The display-mode values, matching the GoogleChatSpec.Mode enum.
+const (
+	displayModeDefault = "default"
+	displayModeDebug   = "debug"
+)
+
 // defaultTaskDeadline is what TaskDeadline means when unset — the worker
 // adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
 // 1800s), restated here because the two halves of one contract must agree.
@@ -36,6 +46,10 @@ const defaultTaskDeadline = 30 * time.Minute
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
+
+// defaultFirstEventGrace is what FirstEventGrace means when unset; the
+// field's comment carries the sizing rationale.
+const defaultFirstEventGrace = 10 * time.Minute
 
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
@@ -49,6 +63,29 @@ type Config struct {
 	// PrincipalMapPath is the mounted principal-map ConfigMap.
 	PrincipalMapPath string
 
+	// GchatRelayURL is the credential proxy's relay base URL — the gchat
+	// backend's transport. Setting it selects the Google Chat adapter.
+	GchatRelayURL string
+	// GchatTokenPath is the projected ServiceAccount token (a2a-chat audience)
+	// the adapter authenticates to the relay with.
+	GchatTokenPath string
+	// GchatAllowedUsers is the ingress allowlist for the gchat backend —
+	// the same gate the legacy path enforces as GOOGLE_CHAT_ALLOWED_USERS.
+	// gchat has no mapping table (the Google-asserted email IS the
+	// principal), so the allowlist is the whole verification config.
+	GchatAllowedUsers []string
+	// GchatAllowAllUsers disables the allowlist, stated explicitly —
+	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
+	GchatAllowAllUsers bool
+
+	// DisplayMode is the existing Chat integration's default-vs-debug split
+	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
+	// under "default" the rolling line carries the state but never the
+	// turn-by-turn narration; "debug" is the gateway's historical verbose
+	// behaviour and the value an unset env resolves to, so installs that
+	// predate the knob render exactly as before.
+	DisplayMode string
+
 	// DefaultAddressee is where every conversation's tasks route until a
 	// per-conversation override says otherwise. Retarget 8/26: the first
 	// shipped configuration routes everything to "platform" (the W7 bridge
@@ -57,9 +94,11 @@ type Config struct {
 	DefaultAddressee string
 
 	// SpawnSessions arms the session-pod path (spawn/rehydrate/sweep with
-	// client-go). Off until W4's worker image exists; the gateway pod has no
-	// service-account token until this arms, so the k8s client is built
-	// lazily.
+	// client-go). The gateway pod now always mounts a service-account token
+	// (it needs one to create pods at all), so this is a rollout switch
+	// rather than a capability one: off, the gateway routes every task to
+	// DefaultAddressee and creates nothing. The k8s client is still built
+	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
 	// IdleTTL is the reap threshold since the last user message (decided
@@ -111,6 +150,27 @@ type Config struct {
 	// a status card can echo the ask.
 	AskTTL time.Duration
 
+	// FirstEventGrace bounds how long an active task with NOTHING on its
+	// events subject may hold a conversation's serialization
+	// (A2A_FIRST_EVENT_GRACE). Every other bound assumes a pod: the adapter's
+	// deadline runs from task start inside the worker, the pod deadline from
+	// pod start, and Sweep watches pod phases — so a task whose executor
+	// never came up (a spawn that never happened, a bus that dropped between
+	// the two publishes, a gateway restart mid-turn) has no events for the
+	// heal in handleInbound to see a terminal in, and the record steers every
+	// later message into it. Past this grace the heal treats "no events" as
+	// "never started" and releases the serialization; it publishes no
+	// terminal for the task, because age alone is not evidence. Unset
+	// means 10 minutes: the spec's cold start is 5-10s and the pod deadline's
+	// pre-start budget (podDeadlineGrace, the image pull before the process
+	// starts) is 10 minutes, so a task still legitimately pre-first-event at
+	// this age is a pod that will not be coming up. Lowering it risks
+	// releasing a slow-starting worker's task out from under it — the next
+	// turn then starts a second task while the first may still emit;
+	// raising it is how long a user waits before the conversation answers
+	// again. Values under 1m are refused at boot.
+	FirstEventGrace time.Duration
+
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
 	// When set, every spawned session pod carries an ownerReference to it,
@@ -120,11 +180,21 @@ type Config struct {
 	// unowned pods, the pre-S9 posture.
 	OwnerDeployment string
 
-	// Namespace, WorkerImage, and NATSCredsSecret configure the dark spawn
-	// path; the secret holds the worker user's password for spawned pods.
-	Namespace       string
-	WorkerImage     string
-	NATSCredsSecret string
+	// Namespace and WorkerImage configure the dark spawn path.
+	Namespace   string
+	WorkerImage string
+
+	// SessionServiceAccount is the ServiceAccount every session pod runs
+	// as, rendered by the operator as <agent>-a2a-session and passed here
+	// so the two cannot disagree. It carries no RBAC; its only purpose is
+	// to be the identity the kubelet mints the pod-bound bus token against,
+	// and the identity the callout's map is keyed on.
+	//
+	// There is no default. A wrong or absent name spawns pods whose token
+	// the callout has no entry for, which fails as every session refused at
+	// connect — a boot-time refusal here is the same information, hours
+	// earlier and in one place.
+	SessionServiceAccount string
 
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
@@ -147,6 +217,14 @@ type Config struct {
 	MaxSessions int
 }
 
+// Backend names the chat backend this config arms: "gchat" or "discord".
+func (c *Config) Backend() string {
+	if c.GchatRelayURL != "" {
+		return gchatBackend
+	}
+	return "discord"
+}
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -159,13 +237,38 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
-		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
+
+		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
+	}
+	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
+	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
+	for _, u := range strings.Split(os.Getenv("A2A_GCHAT_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.GchatAllowedUsers = append(cfg.GchatAllowedUsers, u)
+		}
+	}
+	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
+	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
+		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	if cfg.DiscordToken == "" {
-		return nil, fmt.Errorf("DISCORD_TOKEN is required (W0's discord-bot Secret)")
+	// A silent default here would make a two-backend misconfiguration a
+	// working Discord gateway that quietly never consumes Chat — refuse
+	// both directions instead.
+	switch {
+	case cfg.GchatRelayURL != "" && cfg.DiscordToken != "":
+		return nil, fmt.Errorf("both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
+	case cfg.GchatRelayURL == "" && cfg.DiscordToken == "":
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or A2A_GCHAT_RELAY_URL (the credential proxy's chat relay)")
+	}
+	// Only when the spawn path is armed: a gateway that spawns nothing has
+	// no session identity to name, and demanding one would break every
+	// bridge-only install.
+	if cfg.SpawnSessions && cfg.SessionServiceAccount == "" {
+		return nil, fmt.Errorf("A2A_SESSION_SERVICE_ACCOUNT is required when A2A_SPAWN_SESSIONS is true; session pods authenticate to the bus as it, and there is no safe default")
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
@@ -212,6 +315,16 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_ASK_TTL %q is under the 1m floor; it would erase the ask from status cards while the task runs", askTTL)
 	}
 	cfg.AskTTL = at
+
+	grace := envOr("A2A_FIRST_EVENT_GRACE", defaultFirstEventGrace.String())
+	fg, err := time.ParseDuration(grace)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q: %w", grace, err)
+	}
+	if fg < time.Minute {
+		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q is under the 1m floor; it would release a task still cold-starting", grace)
+	}
+	cfg.FirstEventGrace = fg
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 

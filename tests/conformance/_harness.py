@@ -58,6 +58,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 
+# The name the gateway redactor is registered under in sys.modules when a test
+# imports it by path. Distinct from the callback's own registration name so
+# the two copies never shadow each other inside one interpreter.
+GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+
 
 @dataclass(frozen=True)
 class Source:
@@ -144,17 +149,32 @@ SOURCES: dict[str, Source] = {
         ("DefaultPlatformAgentVersion",),
     ),
     "operator_clusterrole": Source(
-        # The second anchor was "resourceNames", proving the bind-to-view
-        # restriction. #387 removed the bind rule outright — the operator no
-        # longer binds agents to the built-in view role at all, a narrowing —
-        # so the restriction has nothing to anchor to and A4 asserts bind's
-        # absence instead.
+        # "resourceNames" is back as an anchor, and it is the load-bearing one.
+        # #387 removed the operator's only bind rule (bind-to-view), and for a
+        # while A4 asserted bind's absence, so there was nothing for it to
+        # anchor to. The auth callout reintroduces bind, over exactly one name
+        # (system:auth-delegator), and A4 is once again a statement about how
+        # that bind is bounded rather than about its absence. Deleting the
+        # scoping is the mutation this anchor exists to make loud.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings",),
+        ("clusterrolebindings", "resourceNames"),
+    ),
+    # The other Role a kustomize install ships. role.yaml is the operator's
+    # ClusterRole and was for a long time the only RBAC A4 read; this one is
+    # listed beside it in config/rbac/kustomization.yaml and grants the
+    # leader-election recorder its event verbs. An escalation verb added here
+    # installs exactly as readily as one added there.
+    "operator_leader_election_role": Source(
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("kind: Role", "leader-election-role"),
     ),
     "chart_operator_rbac": Source(
         "charts/kube-agents/templates/operator-rbac.yaml",
-        ("END GENERATED RULES",),
+        # The end marker bounds the generated block. The leader-election Role
+        # is anchored too because it is the chart's RBAC object OUTSIDE that
+        # block -- the one `make chart-sync` does not manage and a
+        # block-scoped parse never reached.
+        ("END GENERATED RULES", "operator-leader-election-role"),
     ),
     "admission_policy": Source(
         "k8s-operator/config/admission/agent-rbac-policy.yaml",
@@ -201,6 +221,52 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/testing/testdata/platform/expected/"
         "platformagent-ha.yaml",
         ("kind: Deployment", "kubeagents:leader:", "- pods"),
+    ),
+    # C1's cross-module pair. The session fence is rendered by the operator
+    # (Go module k8s-operator) and its selector has to match the labels the
+    # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
+    # can compare them, and a NetworkPolicy that selects nothing is
+    # indistinguishable from one that is working.
+    "a2a_session_fence": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
+    ),
+    # labelPartOf lives here rather than beside the fence, so resolving the
+    # operator's side of the pair needs both files.
+    "operator_labels": Source(
+        "k8s-operator/internal/controller/manifest_helpers.go",
+        ("labelPartOf",),
+    ),
+    "a2a_spawner": Source(
+        "a2a/gateway/spawn.go",
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+    ),
+    # --- model egress -----------------------------------------------------
+    # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
+    # the chat plugin's module, and tests/test_litellm_redaction.py keeps the
+    # two identical; C1 reads this one because this one is what runs at the
+    # egress point. The anchors are the pattern names and the exemption the
+    # two C1 tests exercise, so a rename fails the self-check rather than
+    # letting the assertions pass against a module that no longer redacts.
+    "gateway_redactor": Source(
+        "charts/kube-agents/files/redactor.py",
+        (
+            "GCP_OAUTH_TOKEN_PATTERN",
+            "GCP_API_KEY_PATTERN",
+            "JWT_PATTERN",
+            "PRIVATE_KEY_PATTERN",
+            "SECRET_BLOCK_PATTERN",
+            "gserviceaccount",
+            "def redact_text(",
+        ),
+    ),
+    # The operator half of C1's identity check. The spawner names a session
+    # ServiceAccount; this file is where that account is built and where every
+    # RBAC binding the A2A stack renders lives, so it is what decides whether
+    # the name the spawner uses authorises anything.
+    "a2a_callout_rbac": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
@@ -283,6 +349,39 @@ def yaml_documents(name: str) -> tuple[dict, ...]:
     return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
 
 
+#: What an inline Helm expression becomes in helm_documents(). Not a name any
+#: RBAC verb, group or resource has a reason to contain, so a caller can assert
+#: it did not land in a field the caller is reading.
+HELM_PLACEHOLDER = "helm-expression"
+
+_HELM_EXPRESSION = re.compile(r"\{\{-?.*?-?\}\}")
+
+
+@functools.lru_cache(maxsize=None)
+def helm_documents(name: str) -> tuple[dict, ...]:
+    """Every YAML document in a chart template, with expressions neutralized.
+
+    yaml_documents() refuses a source carrying an inline `{{ }}`, on the
+    grounds that an expression inside a value changes what the object says and
+    dropping it silently would let a chart assert something the cluster never
+    sees. That is right for a template whose values are the assertion. It is
+    wrong for one where the fields under test are plain and only the names
+    around them are templated -- an RBAC rule's verbs next to a
+    `{{ .Release.Name }}` in metadata -- because refusing there means not
+    reading the object at all, which is how the chart's leader-election Role
+    came to be parsed by nothing.
+
+    So the expression becomes HELM_PLACEHOLDER instead of an exception, and
+    the obligation the refusal used to discharge moves to the caller: check
+    that the placeholder is not sitting in a field you are about to trust.
+    """
+    body = "\n".join(
+        line for line in text(name).splitlines() if not _HELM_DIRECTIVE.match(line)
+    )
+    body = _HELM_EXPRESSION.sub(HELM_PLACEHOLDER, body)
+    return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
+
+
 def golden_documents() -> dict[str, tuple[dict, ...]]:
     """The rendered PlatformAgent object sets, keyed by fixture name.
 
@@ -307,6 +406,26 @@ def containers_of(document: dict) -> list[dict]:
     """Every container and init container in a Deployment document."""
     spec = document.get("spec", {}).get("template", {}).get("spec", {})
     return list(spec.get("initContainers") or []) + list(spec.get("containers") or [])
+
+
+def gateway_redactor_module():
+    """The redactor the gateway runs, imported from the chart's copy by path.
+
+    By path rather than through the chat plugin package, because the chart's
+    file is the one mounted into the LiteLLM pod; a test of what leaves the
+    estate has to read the artifact that does the leaving.
+    """
+    import importlib.util
+
+    path = path_of("gateway_redactor")
+    spec = importlib.util.spec_from_file_location(GATEWAY_REDACTOR_MODULE_NAME, path)
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution, as the import system does: the module
+    # declares a dataclass, and dataclasses resolve the defining module through
+    # sys.modules while the class body is being processed.
+    sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def go_function_body(source: str, name: str) -> str:

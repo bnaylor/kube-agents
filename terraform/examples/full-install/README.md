@@ -24,9 +24,10 @@ install without the interview.
   [`gke-backup-plan`](../../modules/gke-backup-plan) for the release namespace.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
   module): a service account (`kubeagents-platform-gsa` by default; a second
-  install in the same project sets `agent_service_account_id` to avoid the
-  name collision), its read-only project roles, and the Workload Identity
-  binding to the `kubeagents-platform-agent` KSA (see
+  install in the same project sets `agent_service_account_id` — see
+  [Remote state](#remote-state)), its read-only project roles, and the Workload
+  Identity binding to the agent KSA (`agent_ksa_name`,
+  `kubeagents-platform-agent` by default; see
   [IAM roles](#iam-roles-permission_set-and-project_roles) below).
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
@@ -143,23 +144,48 @@ plans the whole composition as new and reads as total drift. A gitignored
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
 installs in one project keep separate state. State is only half of the
-second-install story: set `agent_service_account_id` too, or the installs
-collide on the agent GSA's fixed default name halfway through the second
-install's first apply. Through the installer front doors that means a
-`TF_VAR_agent_service_account_id=...` line in `install.env` - every front
-door sources it with `set -a`, so the line persists and exports on each
-run. Do not rely on a shell `export` instead: it dies with the shell, and
-the next front-door run resolves the variable back to the default name and
-plans the GSA's destroy-and-recreate under `-auto-approve`. And do not
-hand-edit `terraform.tfvars`: install.sh, upgrade.sh and uninstall.sh
-regenerate it on every run, silently dropping the line (Terraform reads
-`TF_VAR_*` only where the file is silent, and on this key it stays silent).
-And a distinct name un-collides creation, not identity: the Workload
-Identity principal names a namespace and KSA project-wide, no cluster, so
-both installs bind the same principal and each agent can mint the other's
-GSA tokens. The `agent_service_account_id` description in `variables.tf`
-carries the limits to read before relying on this. Versioning is the
-recovery story:
+second-install story: every service account the composition creates has one
+fixed default name per project, so the second install must name its own —
+`agent_service_account_id`, and `github_minter_service_account_id` or
+`litellm_service_account_id` when it enables the minter or serves from Vertex —
+or its first apply stops on the account the first install owns. Through the
+installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
+`GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
+front door regenerates `terraform.tfvars` from; every front door that applies
+(`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
+names the key to set. Do not rely on a shell
+`export` or a hand-edited `terraform.tfvars` instead: the export dies with the
+shell and the file is regenerated on every run, and either way the next run
+resolves the name back to the default and plans the GSA's destroy-and-recreate
+under `-auto-approve` — which `lifecycle.sh`'s `guard_gsa_identity` refuses. The
+release namespace (`NAMESPACE` in `install.env`) has the same guard,
+`guard_release_namespace`, because `helm_release` treats it as ForceNew too, and
+so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
+`guard_kms_identity`): on a cluster this state created, a renamed key would be
+destroyed and recreated, which schedules the live key's versions for destruction.
+A key is rotated in Cloud KMS, not by renaming it here.
+And a distinct GSA name un-collides creation, not identity: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so two
+installs that share the namespace and the default KSA name bind the same
+principal and each agent can mint the other's GSA tokens however differently
+the GSAs are named. The second install names its own `agent_ksa_name` too. One
+variable feeds both the module's binding and the chart's `serviceAccountName`,
+so the pod and the binding move together, and it must end in `-agent`: the
+`kube-agents-agent-binding-scope` admission policy the chart ships selects the
+bindings it governs by that suffix on the bound ServiceAccount, so a name
+outside it would leave this install's agent bindings unselected by that policy
+and by any validation it gains. The validation in `variables.tf` refuses the
+plan instead, and the variable's description says what the policy does and does
+not deny today. `agent_ksa_name` has no `install.env` key of its own yet, so
+through the front doors it is a `TF_VAR_agent_ksa_name=...` line in that file:
+every front door sources it with `set -a`, and the generator never writes
+`agent_ksa_name` into `terraform.tfvars`, so the passthrough is what Terraform
+reads. The caution above applies to it with one gap — a lost line resolves the
+KSA back to the default and re-shares the identity silently, and there is no
+`guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
+GSA's destroy-and-recreate. The `agent_service_account_id` description in
+`variables.tf` carries the limits to read before relying on any of this.
+Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
@@ -172,9 +198,14 @@ gcloud storage cp gs://<bucket>/<prefix>/default.tfstate#<generation> \
   gs://<bucket>/<prefix>/default.tfstate
 ```
 
-If the state is gone entirely,
-re-run `lifecycle.sh apply` against the same tfvars — KMS adoption is
-automatic, and `terraform import` covers the rest.
+If the state is gone entirely, import the cluster back before anything else —
+`terraform import 'module.gke_cluster.google_container_cluster.<autopilot|standard>[0]' projects/<project>/locations/<location>/clusters/<cluster_name>`,
+with the provider override the BackupPlan recipe below uses — and then re-run
+`lifecycle.sh apply` against the same tfvars: KMS adoption is automatic, and
+`terraform import` covers the rest. Without that import the apply is refused up
+front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
+rather than 409ing on the cluster halfway through. Through `install.sh` the
+probe derives `create_cluster = false` instead and adopts the cluster.
 
 ### Asking what an apply would change
 
@@ -302,6 +333,36 @@ neither means what it looks like:
 
   Remove the override before the next apply — it is never meant to survive an
   import, which is why `lifecycle.sh` deletes it on an `EXIT` trap.
+
+- **A retry that would create a cluster that already exists.** State left by an
+  apply that died before the cluster finished creating can hold a managed
+  cluster entry that manages nothing, and a retry against it would plan a
+  create over the live cluster and 409 halfway through. `lifecycle.sh apply`
+  refuses that before Terraform runs (`guard_cluster_ownership`, in both
+  directions) and names a way out per caller: `create_cluster = false` if the
+  cluster is somebody else's to install onto; a `terraform import` of the
+  cluster address if this state created it (a hand-written tfvars keeps
+  `create_cluster = true`, so clearing the state alone reproduces the
+  refusal); or, through `install.sh`, `uninstall.sh` or clearing the state
+  under `gs://<bucket>/<prefix>/` and re-running `install.sh`, whose probe
+  derives `create_cluster = false` for a live cluster outside state and adopts
+  it. `install.sh` itself reaches this refusal only through a race. The other thing such a state holds is the cluster's CMEK key ring
+  and key, adopted on the retry; with `create_cluster = false` the module no
+  longer manages them, so `lifecycle.sh apply` forgets them from state
+  (`forget_unmanaged_cluster_kms`) rather than let the apply schedule the key's
+  versions for destruction under the live cluster.
+
+### Applying over a Pub/Sub topic that already exists
+
+`lifecycle.sh apply` adopts a pre-existing Google Chat Pub/Sub topic and
+subscription rather than failing with `Error 409: Resource already exists`, the
+way it already adopts KMS key rings (`adopt_pubsub`, beside `adopt_kms`).
+Configuring the Chat app in the Cloud console creates the topic before the
+installer runs, so this is reachable on a first install, not only on a
+re-apply. Every Pub/Sub IAM binding in the
+[`chat-pubsub`](../../modules/chat-pubsub/main.tf) module is keyed on its
+parent's `.id`, never its `.name`, so a replaced topic takes its bindings into
+the plan with it instead of leaving a green apply over an empty policy.
 
 ### The `image_tag` rule
 
@@ -501,7 +562,10 @@ uninstall its standalone release before setting these variables (`helm uninstall
   select Cloud Pub/Sub and enter the created topic (the `chat_topic_name`
   output, as `projects/<project>/topics/<topic>`), set visibility, and verify
   a **Service account email** appears under Connection settings after saving
-  (if it stays blank, Chat silently delivers no events). Then DM the bot; on
+  (if it stays blank, Chat silently delivers no events). That address is the
+  Workspace Add-ons service agent,
+  `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
+  the agent's own GSA. Then DM the bot; on
   first contact, optionally approve the pairing code via
   `hermes pairing approve google_chat <CODE>` in the gateway pod.
 - **Slack:** in the Slack app console enable Socket Mode and grant the bot

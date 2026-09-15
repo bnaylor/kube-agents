@@ -96,6 +96,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "workload-rebalancing",
     ],
     "Cost and capacity": [
+        "capacity-obtainability",
         "gce-compute-fleet-audit",
         "gke-cluster-autoscaler",
         "gke-compute-classes",
@@ -128,10 +129,12 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "kube-agents-observability",
     ],
     "Reliability": [
+        "fleet-upgrade-verification",
         "gke-reliability",
         "gke-upgrades",
     ],
     "Manifests and remediation": [
+        "gcp-config-connector",
         "gke-manifest-generation",
         "submit-suggestion",
     ],
@@ -140,6 +143,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "github-issue-resolver",
         "inspect-repository",
         "pr-conversation",
+        "version-control",
     ],
 }
 
@@ -159,6 +163,7 @@ CRON_CADENCE = {
     "0 10 * * *": "Daily 10:00",
     "0 11 * * *": "Daily 11:00",
     "0 12 * * *": "Daily 12:00",
+    "35 12 * * *": "Daily 12:35",
     "0 * * * *": "Hourly",
     "11 * * * *": "Hourly at :11",
     "*/10 * * * *": "Every 10 minutes",

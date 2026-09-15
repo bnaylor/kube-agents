@@ -25,7 +25,8 @@ default changes.
 Order of operations: resolve the image/source ref → check CLI prerequisites (including
 `terraform`, which it offers to install; `make` is not needed) → put the repository on disk and
 verify it against that ref → load `install.env` → interview for what is missing → generate
-`terraform.tfvars` → run
+`terraform.tfvars` → refuse a service account another install in the project owns
+(`check_service_account_ownership`, before the summary and the dry-run exit) → run
 `lifecycle.sh apply`. The source check happens **before** the interview, so a bad ref fails in
 seconds rather than after a dozen answers. Some steps stay `gcloud` calls outside the apply — before
 it, CMEK, the Workload Identity pool and NetworkPolicy enforcement on a pre-existing cluster; after
@@ -75,6 +76,28 @@ cd kube-agents
 
 Do not clone `main` to deploy an official release: manifests and CRD schemas on `main` evolve continuously and diverge from released container images. Running install scripts against a mismatched checkout will fail `verify_local_source_ref` to prevent deploying incompatible manifests.
 
+## Generate-Only Mode
+
+To generate configuration files (`install.env` and `terraform.tfvars`), run pre-apply validation checks, and hand off the apply to the operator without creating or mutating cloud resources, use `--generate-only`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --generate-only \
+  --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID" \
+  --cluster-name="platform-agent-host" \
+  --region="us-central1"
+```
+
+In `--generate-only` mode, the installer:
+
+1. Writes `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
+2. Runs the same pre-apply validation checks a real run does: the GitOps organization check, the service-account ownership check, and the existing-cluster node-pool and NetworkPolicy consent gates. A cluster needing `--migrate-node-pools` or `--enable-network-policy` is refused (`REFUSED_MISSING_NODE_POOL_MIGRATION`, `REFUSED_MISSING_NETWORK_POLICY`), as is one that cannot be described (`FAILED_PREFLIGHT_CLUSTER_UNREADABLE`). Step 1 has already written both files by then, so a refusal exits 1 leaving `install.env` and `terraform.tfvars` on disk — unvalidated, and with no handoff printed. Do not read the presence of `terraform.tfvars` as success; read the report status.
+3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
+4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
+
+The interactive wizard also offers the same choice by answering `g` at the final confirmation step.
+
 ## Dry-Run Inspection
 
 To validate prerequisites and preview the install without creating GCP resources, AI Agents must use `--dry-run` with the official release installer (substituting `<RELEASE_VERSION>` with the resolved release version):
@@ -120,12 +143,17 @@ Upon completion, `install.sh` generates a machine-readable JSON status report at
 {
   "status": "SUCCESS",
   "dry_run": false,
+  "generate_only": false,
   "non_interactive": true,
   "project_id": "YOUR_GCP_PROJECT_ID",
   "cluster_name": "platform-agent-host",
   "timestamp": "2026-08-05T03:35:00Z"
 }
 ```
+
+The full report also carries `gvisor_enabled` and `memory_mode`. A report written before the
+interview decided them (a run that failed early) says so: `gvisor_enabled` is `null` and
+`memory_mode` is empty, rather than restating a default the run never applied.
 
 ## Supported Command-Line Flags
 
@@ -137,6 +165,7 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | :----------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `-y, --non-interactive`              | Run without blocking on `/dev/tty` prompts                                                                                                                                                                                                             | `false`                                                                                                                                            |
 | `--dry-run`                          | Output plan and `terraform.tfvars` without creating resources                                                                                                                                                                                          | `false`                                                                                                                                            |
+| `--generate-only`                    | Write `install.env` and `terraform.tfvars`, run the pre-apply checks, print the operator handoff, and exit without creating or mutating resources. Mutually exclusive with `--dry-run`                                                                 | `false`                                                                                                                                            |
 | `--menu, --config`                   | Launch the Day-2 control panel instead of installing                                                                                                                                                                                                   | `false`                                                                                                                                            |
 | `--project-id=ID`                    | Target GCP Project ID                                                                                                                                                                                                                                  | Active `gcloud` project                                                                                                                            |
 | `--region=REGION`                    | Target GCP Region                                                                                                                                                                                                                                      | `installer_common.sh` `DEFAULT_REGION`                                                                                                             |
@@ -159,5 +188,7 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gvisor=true\|false`               | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                          | `true`                                                                                                                                             |
 | `--enable-web-ui=true\|false`        | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                  | `false`                                                                                                                                            |
 | `--allowed-users=EMAILS`             | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                           | _unset_                                                                                                                                            |
+| `--migrate-node-pools`               | Authorize migrating legacy GCE metadata server node pools to `GKE_METADATA` (recreates nodes, restarts workloads; required on clusters with legacy pools, else install aborts)                                                                         | `false`                                                                                                                                            |
+| `--enable-network-policy`            | Authorize enabling legacy Calico NetworkPolicy addon and node enforcement on GKE Standard clusters without Dataplane V2 (may recreate nodes, restart workloads; required on such clusters, else install aborts)                                        | `false`                                                                                                                                            |
 | `--memory=MODE`                      | Long-term agent memory engine: `file` \| `hindsight` \| `off`                                                                                                                                                                                          | `file`                                                                                                                                             |
 | `-h, --help, -?`                     | Output CLI usage banner and parameter details                                                                                                                                                                                                          | `N/A`                                                                                                                                              |

@@ -23,9 +23,9 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 `recoverable_safety`, `infrastructure`, `documentation` and `validated`. Strict mode
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
-**This repository's lints** read the same file for fields devops-bench discards: `domain`
-and `fixtures`. Those are ours. A typo in either cannot fail a run, which is exactly why
-`scripts/validate_bench_cases.py` exists.
+**This repository's lints** read the same file for fields devops-bench discards: `domain`,
+`fixtures` and `owner`. Those are ours. A typo in any of them cannot fail a run, which is
+exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
 
@@ -91,6 +91,12 @@ declaration for a case that plants its own state — `gpu-stress-test-diagnosis`
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it.
 
+`owner` is who answers for the case when it flakes: a GitHub login written without the at
+sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
+the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
+`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
+spelled out.
+
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
 
@@ -153,12 +159,14 @@ matched objects, with `op` one of eq/ne/gt/gte/lt/lte/exists/absent/contains/mat
 `pod_healthy` (pods matching a selector reach Ready), and `scaling_complete` (a
 deployment's ready replicas land in a range).
 
-Three read what the run produced, from this repository
+Four read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer), `tool_called` (calls in the
-trajectory), and `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published).
+trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
+published), and `worker_commands` (regular expressions over the terminal commands
+the delegated workers ran, read from each card's worker log before the harness
+purges it).
 
 Two limits are worth knowing before choosing one. `tool_called` sees the delegating
 turn's calls only — a delegated worker's calls never reach the trajectory — so it can
@@ -167,9 +175,12 @@ safeguard built on it is blind to the calls it fears; use `resource_property` fo
 And `report_contains` defaults to `scope: final`, the answer the user receives. `full`
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
-in quoted material.
+in quoted material. `worker_commands` is the complement of the `tool_called` limit: it is
+the one check that sees the route a worker took, but only its terminal commands, never
+its MCP tool calls, and only for cards the run delegated — a router that answered without
+delegating leaves it nothing to read, which is `status: "error"`, not a pass.
 
-All six fail closed. A check that cannot observe its subject returns `status: "error"`,
+All seven fail closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
 1.0, which the gate fails. Silence is not a pass.
 
@@ -289,10 +300,20 @@ and `docs/designs/testing-strategy.md` restate it and defer here.
 id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define, a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
-a check that carries no assertion and so can only pass, and a case that is registered
-nowhere. It also applies the entry vocabulary above — role, the severity pairing, the
-rejected `hold` mode, a positive weight — which devops-bench enforces too, at spec-load
-time, after the lease.
+a check that carries no assertion and so can only pass, a missing `owner:` or one written
+as a mention or as something other than a login, and a case that is registered nowhere. It
+also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
+mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
+lease.
+
+It also scans what the case brings with it: every text file under `bench/tasks/` and
+`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+string matching the token-shaped subset of `AuditRedactor`'s patterns, with
+`sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
+that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
+the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
+drift check, so `validate_all()` does not carry it; the lint asserts on
+`sanitization_findings()` in its own right.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.
@@ -305,7 +326,7 @@ green. A list of substrings is a second copy of the rule set; keep the assertion
 set.
 
 `make bench-case-check` itself is invoked by no workflow, and that is the intended shape.
-The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` (`Makefile:129`) and
+The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` in the `Makefile` and
 `.github/workflows/python-tests.yml`, so a separate job running the target would re-derive
 findings CI already has, on a second checkout, for nothing. The target is the pre-push
 copy of the gate rather than the gate; a rule that has to be enforced goes in the

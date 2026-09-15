@@ -79,7 +79,7 @@ To determine which users have interacted with the system via Google Chat in the 
 
 - Query Kubernetes metrics API to verify resource usage of the agent pods:
   ```bash
-  kubectl top pod -l app=<agent-name> -n kubeagents-system
+  kubectl top pod -l app=<agent-name>-gateway -n kubeagents-system
   ```
 
 ### 3. Check Token Usage (Last 24h)
@@ -118,7 +118,7 @@ To determine which users have interacted with the system via Google Chat in the 
   A source of `Default` on a cluster without GKE Managed OTel is the one to treat as a fault: it means nobody established what is there, so discovery is switched off (`OTEL_COLLECTOR_DISCOVERY=false`) or the probe cannot complete — most often the operator's cluster-wide RBAC on `services` has been narrowed. Spans are going nowhere and the endpoint on the pod does not resolve.
 
 - Ensure the `hermes_otel` plugin is enabled in the profile's own config — `/opt/data/config.yaml` for the Chat Agent, `/opt/data/profiles/<profile>/config.yaml` for the Platform and Cluster Agents.
-- Verify the plugin's exporter backend matches that endpoint. It is rewritten at container start from `OTEL_EXPORTER_OTLP_ENDPOINT`, so a mismatch means the pod predates the current setting and needs a restart:
+- Verify the plugin's exporter backend matches that endpoint (on a `None` cluster, `enabled: false` and `backends: []` is expected in the plugin config). It is rewritten at container start from `OTEL_EXPORTER_OTLP_ENDPOINT`, so a mismatch means the pod predates the current setting and needs a restart:
   ```bash
   kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- \
     sh -c 'echo "$OTEL_EXPORTER_OTLP_ENDPOINT"; grep -r endpoint /opt/data/plugins/hermes_otel/config.yaml /opt/data/profiles/*/plugins/hermes_otel/config.yaml'
@@ -170,16 +170,23 @@ To list recent traces or analyze span latency distributions to locate performanc
 
 - Verify pod running status and details:
   ```bash
-  kubectl get pods -n kubeagents-system -l app=<agent-name> -o wide
+  kubectl get pods -n kubeagents-system -l app=<agent-name>-gateway -o wide
   ```
-- Inspect Service configurations for the API port (`8642`) and Dashboard port (`9119`):
+- Inspect Service configurations for the API port (`8642`, which targets the credential proxy on `8643`) and Dashboard port (`9119`):
   ```bash
-  kubectl get service platform-agent -n kubeagents-system -o yaml
+  kubectl get service <agent-name> -n kubeagents-system -o yaml
   ```
-- Forward agent ports locally to test web UI or API access:
+- Probe the dashboard listener from inside the pod, not over `kubectl port-forward`. The dashboard
+  binds `127.0.0.1`, and on a GKE Sandbox (gVisor) node pool — the install default — a port-forward
+  lands in the host-side netns and never reaches the sandbox's listener, so it reports a refusal
+  whatever the dashboard is doing:
   ```bash
-  kubectl port-forward svc/<agent-service-name> -n kubeagents-system 9119:9119
+  kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- \
+    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9119
   ```
+- For a browser session against the dashboard, use `hermes-dashboard-tunnel.py` from the
+  repository's own `scripts/` at its root — not this skill's `scripts/`, which does not carry it.
+  It relays through `kubectl exec`, which does enter the sandbox.
 
 ### 2. Inspect Persistent Internal State & Memory
 

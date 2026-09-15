@@ -19,7 +19,7 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check iac-parity-check tf-apply tf-destroy coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -123,7 +123,7 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # `make test-python-deps`. CI installs the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Thirteen globs rather than one because the tests do
+# without editing this file. Several globs rather than one because the tests do
 # not all live under skills -- the admin console, the shared agent scripts,
 # Chat Agent plugins and hooks, image patches, image build and repository
 # tooling in scripts/ each hold their own. scripts/ is here
@@ -557,10 +557,10 @@ docs-check-map:
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules from k8s-operator/config.
+chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config; the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config and its hand-written webhook template matches config/webhook (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
@@ -569,6 +569,12 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 		exit 1; \
 	}
 	@python3 scripts/check_iac_parity.py
+
+# The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
+# in front of the real binary (#1309 shipped against a stub that answered `null`
+# where Terraform answers `tostring(null)`; #1350 has the story).
+tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
+	@./hack/check-tfvar-console.sh
 
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)

@@ -77,13 +77,68 @@ gcloud container clusters update <cluster-name> \\
     --region <region>
 ```"""
 
+# gke-manifest-generation's frontmatter description is what the router reads to pick a skill, and
+# the routing has to name gcp-config-connector, a skill this repository has and upstream does not.
+# The description is a folded YAML scalar, so the whole sentence has to be replaced rather than an
+# appended footer.
+GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET = (
+    "pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning "
+    "(use gke-cluster-creation)."
+)
+
+GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET = (
+    "pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning "
+    "(use gke-cluster-creation), or Google Cloud resources as Config Connector manifests "
+    "(use gcp-config-connector)."
+)
+
+# gke-manifest-generation's example ServiceAccount name upstream is `devteam-agent-sa`, a name from
+# this repository's retired multi-CR era (issue #340). The example is neutral here so the skill does
+# not suggest a DevTeamAgent exists.
+GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET = "(e.g., `devteam-agent-sa`)"
+
+GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET = "(e.g., `checkout-sa`)"
+
+# gke-manifest-generation's inference-manifest step upstream passes `--output-path` to gcloud. Here
+# gcloud runs in the credential proxy's container, which refuses that flag, so the skill has to
+# redirect stdout instead (#723). The replacement keeps the fence and adds the paragraph saying why.
+GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET = """          --output-path={output_file_path}
+        ```
+"""
+
+GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_path}
+        ```
+
+        Redirect stdout rather than passing `--output-path`: `gcloud` runs in
+        the credential proxy's container, so that flag writes the manifest
+        next to the credentials instead of in your workspace, and the proxy
+        refuses it.
+"""
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
-# where an appended footer is insufficient (e.g. multi-step remediation commands).
+# where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
+# skill only this repository has from a passage upstream cannot know about, or to drop a name this
+# repository has retired. Every pair here is also applied by hand to the in-tree copy, and
+# scripts/test_sync_upstream_skills.py checks that copy already reads as the next sync leaves it.
 SKILL_SUBSTITUTIONS = {
     "gke-workload-security": [
         (
             GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET,
             GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET,
+        ),
+    ],
+    "gke-manifest-generation": [
+        (
+            GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
         ),
     ],
 }
@@ -95,10 +150,11 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Two things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Three things need saying today — the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
-# and gke-networking must not present `--dns-endpoint` as unconditionally safe.
+# gke-networking must not present `--dns-endpoint` as unconditionally safe, and gke-upgrades must
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -135,6 +191,16 @@ Do not delete a Cluster Agent profile while its cluster still exists.
 Deleting the profile here is the immediate, preferred path. As a backstop, the hourly
 `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone, so a
 profile missed during teardown is cleaned up on the next reconcile cycle.
+
+## Before recommending GPU/TPU or large-shape capacity
+
+Before recommending capacity for a GPU/TPU or large-shape design, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics:
+verify the regional quota for the exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather
+capacity obtainability advice (`gcloud beta compute advice capacity`) for the requested machine
+shape and count across the region's zones, for the Spot and Flex-Start provisioning models the
+advice API accepts. That skill owns the rules for what to probe and how to report it; follow it
+rather than restating them here.
 """,
     "gke-networking": f"""{FOOTER_MARKER}
 
@@ -160,6 +226,38 @@ The Platform Agent's own tooling makes this decision per cluster in
 scaffolding already pass the flag exactly when it applies; the check above is for the times you
 run `get-credentials` by hand. That decision is re-read about once a minute per cluster, so after
 enabling the setting, wait a moment before retrying rather than concluding it did not work.
+""",
+    "gke-upgrades": f"""{FOOTER_MARKER}
+
+## Executed version checks: the fleet-upgrade-verification skill
+
+This skill plans one upgrade at a time; its references read one cluster at a time. When the
+question is which clusters in a fleet lag a target version, by how many minors, and whether the
+control plane or a node pool is the laggard, run the
+[fleet-upgrade-verification](../fleet-upgrade-verification/SKILL.md) skill's script and paste its
+table rather than reasoning from memory:
+
+```bash
+./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \\
+  --output /opt/data/scratch/fleet_versions.json
+```
+
+Without `--target-version` it measures each cluster against its own release channel's default and
+prints that baseline per member. Run again during a rollout, it says which members started,
+completed or stalled since the previous run. Without `--readiness` (below) it reads with
+`gcloud container` only and changes nothing in GCP; the only thing it then writes is its own
+record of each run under `/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and
+checklist for the members it flags are this skill's job.
+
+The same script's `--readiness` flag executes three items of this skill's pre-upgrade checklist
+per member, against the same target: PodDisruptionBudgets that would block a node drain
+(`maxUnavailable: 0`, or `minAvailable` demanding every expected pod), maintenance exclusions and
+the maintenance window at a given instant (`--at`, default now), and node-pool version skew
+against the target control plane. Run it before writing the plan and carry its `blocked` rows into
+the checklist rather than asking the operator to check those three by hand. The PDB read costs one
+`get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
+`${{HERMES_HOME:-/opt/data}}/.kubeconfigs/`; an exclusion is reported as holding back automatic
+upgrades only.
 """,
 }
 

@@ -863,8 +863,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.1.1" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.1, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.2" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.2, got %s", fbContainer.Image)
 	}
 	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
@@ -1128,6 +1128,18 @@ func TestSafeSandboxEnvOverridesPassesOtelSdkDisabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
+	// HERMES_OTEL_ENABLED is the specific knob controlling the hermes_otel
+	// plugin trace exporter. On the allowlist it lets operators disable or
+	// force-enable agent span telemetry via CR spec.deployment.env (#933).
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "HERMES_OTEL_ENABLED", Value: "false"},
+	})
+	if len(got) != 1 || got[0].Name != "HERMES_OTEL_ENABLED" || got[0].Value != "false" {
+		t.Fatalf("expected HERMES_OTEL_ENABLED to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -1357,20 +1369,37 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 //
 // Dashboard-disabled is deliberately absent: TestBuildDeployment_DashboardDisabled
 // already asserts it, and a second copy would only look like coverage.
+//
+// mode: next is the shape the field is actually load-bearing on, and it had no
+// case here until the bus surface landed: that render puts NATS_PASSWORD on the
+// agent container by SecretKeyRef, so sharing the namespace publishes the bus
+// credential through /proc/<pid>/environ to every other container in the Pod,
+// spec.deployment.sidecars entries included. The case carries a non-vacuity
+// check for exactly that reason -- an assertion that the process namespace is
+// unshared on a Pod that turns out to hold no credential proves nothing, so the
+// subtest fails if the credential it is guarding is not there.
 func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 	stock := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	}
 
 	for _, testCase := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
+		name string
+		// credentialed marks the shapes whose agent container carries the A2A
+		// bus password; on those the subtest first proves the credential is
+		// present, so the assertion below cannot pass by its absence.
+		credentialed bool
+		agent        *agentv1alpha1.PlatformAgent
 	}{
-		{"no harness configuration at all", stock},
-		{"broker in its own Pod", brokerPodAgent()},
+		{"no harness configuration at all", false, stock},
+		{"broker in its own Pod", false, brokerPodAgent()},
+		{"mode: next, where the agent container holds the bus credential", true, a2aTestAgent()},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			spec := buildPodTemplateSpec(testCase.agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true}).Spec
+			if testCase.credentialed {
+				assertAgentContainerHoldsBusCredential(t, spec)
+			}
 			if spec.ShareProcessNamespace != nil {
 				t.Errorf("a shared process namespace puts the credential holder's /proc/<pid>/environ "+
 					"inside a directory the sandbox can read; got shareProcessNamespace=%v",
@@ -1378,6 +1407,33 @@ func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertAgentContainerHoldsBusCredential fails unless the platform-agent
+// container carries NATS_PASSWORD as a SecretKeyRef. It is the non-vacuity
+// guard for the credentialed rows above: were the bus surface to stop
+// rendering, or move to another container, those rows would keep passing while
+// asserting nothing, and the comment in buildPodTemplateSpec that tells the
+// next author why ShareProcessNamespace stays unset would lose its test.
+func assertAgentContainerHoldsBusCredential(t *testing.T, spec corev1.PodSpec) {
+	t.Helper()
+	for _, container := range spec.Containers {
+		if container.Name != "platform-agent" {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name != "NATS_PASSWORD" {
+				continue
+			}
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Fatalf("NATS_PASSWORD is not a SecretKeyRef (%+v); the literal must never render into the pod spec", env)
+			}
+			return
+		}
+		t.Fatal("no NATS_PASSWORD on the platform-agent container: this shape holds no bus credential, " +
+			"so the shared-process-namespace assertion beside this one would pass vacuously")
+	}
+	t.Fatal("no platform-agent container in the pod template")
 }
 
 func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {
@@ -1430,10 +1486,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.1" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.2" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.1")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.2")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -1443,7 +1499,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.1.1" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.2" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -1462,7 +1518,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.1")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.2")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -5000,6 +5056,63 @@ func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
 	}
 	if found[0] == "not-the-operators-idea" {
 		t.Errorf("spec.deployment.env overrode the operator's cluster name, got %q", found[0])
+	}
+}
+
+// The watcher derives its Go soft memory limit from this variable, so it has to
+// be the container's own limits.memory read through the Downward API — not a
+// copy of the number, which would drift the first time the limit changed — and
+// as a plain byte count, which is what divisor 1 yields.
+func TestAgentAPIAuthSidecarReportsItsMemoryLimitToTheWatcher(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	ref := found[0].ValueFrom
+	if ref == nil || ref.ResourceFieldRef == nil {
+		t.Fatalf("EVENT_WATCHER_MEMORY_LIMIT_BYTES must come from a resourceFieldRef, got %#v", found[0])
+	}
+	if ref.ResourceFieldRef.ContainerName != sidecar.Name {
+		t.Errorf("resourceFieldRef names container %q, want the sidecar's own %q", ref.ResourceFieldRef.ContainerName, sidecar.Name)
+	}
+	if ref.ResourceFieldRef.Resource != "limits.memory" {
+		t.Errorf("resourceFieldRef reads %q, want limits.memory", ref.ResourceFieldRef.Resource)
+	}
+	if ref.ResourceFieldRef.Divisor.Cmp(resource.MustParse("1")) != 0 {
+		t.Errorf("resourceFieldRef divisor is %s, want 1 so the value is a byte count", ref.ResourceFieldRef.Divisor.String())
+	}
+	if _, ok := sidecar.Resources.Limits[corev1.ResourceMemory]; !ok {
+		t.Error("the sidecar has no memory limit for the resourceFieldRef to read")
+	}
+}
+
+// Same hole as the two variables beside it: appended after the merge, so a
+// same-named spec.deployment.env entry would sit alongside it and server-side
+// apply would reject the Deployment.
+func TestDeploymentEnvCannotDuplicateTheEventWatcherMemoryLimit(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_MEMORY_LIMIT_BYTES", Value: "1"}},
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].ValueFrom == nil || found[0].Value == "1" {
+		t.Errorf("spec.deployment.env overrode the operator's memory limit reference, got %#v", found[0])
 	}
 }
 

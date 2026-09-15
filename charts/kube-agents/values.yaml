@@ -180,9 +180,12 @@ telemetry:
   # appended by the exporters. A gRPC-only collector (port 4317) will not work.
   otlpEndpoint: ""
   # The namespace the NetworkPolicy opens OTLP egress to. Derived from otlpEndpoint when
-  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it explicitly for
-  # any endpoint that is not a cluster-local Service name, or the render fails rather
-  # than emit a policy that blocks the collector you just configured.
+  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it for an
+  # in-cluster collector whose host does not (an IP literal, a bare Service name).
+  # Must be a namespace name (a lowercase RFC 1123 label); with litellm.otel=true
+  # anything else fails the render. Leave it empty for an external endpoint, which
+  # then has to be a public host on port 443 — the chart README's "Telemetry"
+  # section says why.
   collectorNamespace: ""
 
 litellm:
@@ -284,11 +287,50 @@ litellm:
       cpu: 500m
       memory: 2Gi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
-  # disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
+  # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
+  # dynamically by the operator with cluster-discovered DNS VIPs. When either
+  # is false, setting networkPolicy: true renders the static template copy.
+  # Moving a live release from operator-managed back to the static copy needs
+  # a handoff first (chart README, "Handing litellm-policy back to Helm"):
+  # Helm refuses to adopt an object the operator has labelled as its own.
+  # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
   # helm template/lint cannot catch its absence: a non-GKE install fails at
   # apply time.
   networkPolicy: true
   podMonitoring: true
+  # Redaction of every request body the gateway forwards to a provider. Off by
+  # default: on, the ConfigMap also carries the shared redactor module and a
+  # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
+  # the built-in credential patterns plus the rules below over messages,
+  # embeddings input and completion prompts before the provider sees them.
+  # Request bodies only: responses, tool results on disk and chat egress are
+  # not covered. The concepts/inference-gateway page on the site owns the
+  # model, including why a pseudonymised identifier is one the agent can no
+  # longer act on.
+  redaction:
+    enabled: false
+    # IPv4 and IPv6 literals. action: pseudonym replaces each with a stable
+    # [ip:<12 hex>] token salted from SESSION_KV_SALT in the credentials
+    # Secret (a missing salt still redacts, with a per-pod salt); mask
+    # replaces each with [REDACTED_IP]; "off" leaves IP literals alone. Quote
+    # off: YAML reads the bare word as a boolean, and the chart refuses that
+    # rather than guessing. allowCidrs lists networks the model must still
+    # see, in CIDR form.
+    ip:
+      action: pseudonym
+      allowCidrs: []
+    # Operator rules, applied in order after the IP rules. Each has a name
+    # (starting with a letter or digit, then letters, digits, `_`, `.`, `-`),
+    # exactly one of `pattern` (a Python regular expression) or `literal` (an
+    # exact string), both non-empty text, and an action of mask (default,
+    # [REDACTED_<NAME>] with the name upper-cased and punctuation folded to
+    # `_`) or pseudonym ([<name>:<12 hex>]). The render fails on a name,
+    # action or source it cannot accept; a pattern that does not compile stops
+    # the gateway pod at startup rather than forwarding requests unredacted.
+    #   - name: cluster-name
+    #     literal: prod-eu-1
+    #     action: pseudonym
+    rules: []
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
@@ -417,7 +459,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.1"
+    tag: "5.1.2"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
@@ -434,6 +476,18 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
+  # Annotations to add to the PlatformAgent custom resource metadata. The
+  # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
+  # "PlatformAgent annotations"). Two of them the chart also derives from
+  # values: litellm.networkPolicy=false stamps
+  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false", and
+  # telemetry.collectorNamespace stamps
+  # kubeagents.x-k8s.io/otlp-collector-namespace. When the chart stamps a key,
+  # an entry here that disagrees with it fails the render; otherwise the entry
+  # passes through, except that with litellm.otel=true an otlp-collector-namespace
+  # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
+  # render too.
+  annotations: {}
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
@@ -580,7 +634,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.2"
+      tag: "1.36.4"
     # How long to wait for the finalizer to clear.
     timeout: 120s
     # Bounds the Job itself (image pull, scheduling) above that wait.
@@ -704,8 +758,8 @@ platformAgent:
   #
   #   networkPolicy:
   #     enabled: true              # false stops generation and deletes the
-  #                                # operator-owned <name>-gateway-netpol and
-  #                                # <name>-fqdn-netpol
+  #                                # operator-managed <name>-gateway-netpol,
+  #                                # <name>-fqdn-netpol and litellm-policy
   #     dnsClusterIPs: ["10.96.0.10"]
   #     metadataDaemon:
   #       endpoint: "169.254.169.252"  # "" suppresses the post-NAT rule

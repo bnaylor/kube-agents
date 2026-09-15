@@ -119,6 +119,46 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_get_previous_ga_tag(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            for tag in ("0.3.0", "0.4.0", "0.5.0", "0.10.0", "rc_0.3.0_validated", "v1.0.0"):
+                git("tag", "-a", tag, "-m", f"Tag {tag}")
+
+            cases = [
+                ("0.5.0", "0.4.0"),
+                ("0.4.0", "0.3.0"),
+                ("0.3.0", ""),
+                # Numeric, not lexical: 0.10.0 outranks 0.5.0.
+                ("1.0.0", "0.10.0"),
+                ("0.6.0", "0.5.0"),
+            ]
+            for version, expected in cases:
+                with self.subTest(version=version):
+                    proc = self._run_common_func(f'get_previous_ga_tag "{version}"', cwd=repo_dir)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.strip(), expected)
+
+            proc = self._run_common_func("get_previous_ga_tag", cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("version is required for get_previous_ga_tag", proc.stderr)
+
+            proc = self._run_common_func('get_previous_ga_tag "v0.5.0"', cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("not a valid pure numeric SemVer", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_get_previous_ga_tag_is_empty_in_a_repo_without_ga_tags(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "-a", "rc_0.3.0_validated", "-m", "RC tag")
+            proc = self._run_common_func('get_previous_ga_tag "0.3.0"', cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "")
+        finally:
+            temp_dir.cleanup()
+
     def test_get_latest_validated_rc_tag(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
@@ -740,8 +780,10 @@ source "{_COMMON_SH}"
     #
     # Shared by calculate_next_version.sh, which reads it to pick the bump, and
     # resolve_scheduled_release.sh, which reads it to decide whether an
-    # unattended release stops for a human. The two disagreeing is silent in the
-    # unsafe direction, so the last test here pins that neither keeps a copy.
+    # unattended release on stable GA (>= 1.0.0) stops for a human (while
+    # pre-1.0 breaking changes bump MINOR and release unattended). The two
+    # disagreeing is silent in the unsafe direction, so the last test here pins
+    # that neither keeps a copy.
 
     def test_commit_messages_have_breaking_change_detects_a_bang_subject(self):
         for subject in ("feat!: drop it", "fix(operator)!: drop the v1alpha1 field"):
@@ -857,6 +899,28 @@ source "{_COMMON_SH}"
                     f"{script} re-implements the breaking-change test instead of calling common.sh",
                 )
                 self.assertIn("commit_messages_have_breaking_change", body, f"{script} does not call the helper")
+
+    def test_both_callers_use_ga_tag_is_initial_development(self):
+        """Both calculate_next_version.sh and resolve_scheduled_release.sh must use the shared predicate."""
+        for script in ("calculate_next_version.sh", "resolve_scheduled_release.sh"):
+            with self.subTest(script=script):
+                text = (_REPO_ROOT / "scripts" / "release" / script).read_text()
+                body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+                self.assertIn("ga_tag_is_initial_development", body, f"{script} does not call ga_tag_is_initial_development")
+
+    # ── ga_tag_is_initial_development ────────────────────────────────────────
+
+    def test_ga_tag_is_initial_development_true_for_zero_major(self):
+        for tag in ("0.1.0", "0.9.0", "0.10.0", "0.0.1"):
+            with self.subTest(tag=tag):
+                proc = self._run_common_func(f'ga_tag_is_initial_development "{tag}"')
+                self.assertEqual(proc.returncode, 0, f"Expected {tag} to be initial development")
+
+    def test_ga_tag_is_initial_development_false_for_stable_and_invalid(self):
+        for tag in ("1.0.0", "1.2.3", "2.0.0", "invalid", "", "foo.bar"):
+            with self.subTest(tag=tag):
+                proc = self._run_common_func(f'ga_tag_is_initial_development "{tag}"')
+                self.assertNotEqual(proc.returncode, 0, f"Expected {tag} not to be initial development")
 
     def test_release_bundle_registries(self):
         """Verifies common.sh exports release bundle directories, root files, and charts."""
