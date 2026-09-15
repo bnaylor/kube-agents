@@ -578,9 +578,12 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         map -- so the rendered map should hold NO principal whose publish
         grant reaches the subject. `worker` does: `a2a.tasks.*.*.events` for
         every addressee, the shared credential the Hermes bridge sidecar
-        still authenticates with. Until A5 gives the bridge its own principal
-        and retires the user, `…events` identity is decision-grade for
-        session pods by the callout's derivation and not by this map.
+        still authenticates with. The wildcard is over the ADDRESSEE token, so
+        it reaches a chat session's `…events` exactly as it reaches a
+        profile's: the callout's per-session derivation bounds what a session
+        can forge -- it cannot write another session's subject -- but it takes
+        no writer away from `worker`, so no addressee's `…events` is
+        decision-grade for a consumer until A5 retires the user.
 
         Deleting this decorator is the signal A5 landed.
         """
