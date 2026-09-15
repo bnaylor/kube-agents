@@ -1314,6 +1314,16 @@ TASKS=(
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
+  # vcs-history-only-fact: the version-control skill's route-and-answer case
+  # (#1253). Seen red on main and green three times on the branch in the dev
+  # project, where the GitOps repository carries the git-access corpus branch
+  # `git-access-ab/r200` it reads. The eval pool repositories
+  # (`gke-agentic/<project>-infra`) do not carry that branch yet; pushing it
+  # is a fleet-activation step, and until it is done the case fails every
+  # run with the branch absent, which is broken rather than red. Uncomment
+  # once the branch is on every pool repository -- into NIGHTLY_TASKS if the
+  # clone-plus-history round trip prices above a presubmit seat.
+  # "./tasks/vcs-history-only-fact/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
   # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.
@@ -1509,13 +1519,17 @@ TASKS=(
 # knowledge-grounding-sources-probe, moved here 2026-09-09: its two
 # presubmit runs measured 615/715/166s and 1602/597/420s, ~25-45min serial
 # at three repetitions, so eighteen + eight, twenty-six in all, ~532-552min
-# serial. IF the periodic mirrors the presubmit's shape -- 360m deadline,
-# EVAL_REPETITIONS at its default 3; the periodic is in flight in
-# oss-test-infra, not merged, so this is the assumption and not yet a fact --
-# ~532-552min serial fits only through the fan-out: parallelism 4 has to
-# realise 1.5x or better, which the first scheduled run measures, and at more
-# repetitions the required factor scales with them. A deadline kill is
-# survivable by design --
+# serial. The periodic (ci-kube-agents-eval-nightly in oss-test-infra) runs
+# at 00:00 UTC -- 8 PM EDT, after the working day's presubmit herd -- with a
+# 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS at its default
+# 3 (#1491). The presubmit realised only ~1.15x on whole-job wall clock
+# (fixed provision/deploy term included) at parallelism 4 under the daytime
+# quota contention, per the periodic's timeout comment on its 2026-09-10
+# runs; at that rate ~532-552min serial projects to ~470-490min, which the
+# presubmit's 360m would truncate most nights, and 480m fits with margin.
+# The wider fan-out is safe because the nightly is alone on the model quota
+# at that hour. All three are priced, not measured: confirm them on the
+# first three nights' wall clock and record the result on #1491. A deadline kill is survivable by design --
 # the cost-hinted queue means it truncates in-flight units, the EXIT trap
 # still records what completed -- but it is a truncated night, so if the
 # first runs blow the deadline the lever is the periodic's timeout, not this
@@ -1810,15 +1824,15 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-
 # the baseline it is judged against" structural rather than conventional; see
 # docs/designs/eval-scorer.md#what-the-jobs-service-account-needs.
 #
-# It defaults to unset because the bucket does not exist yet. Pointing at a
-# bucket that is not there is not fatal -- an unreachable store degrades to
-# advisory with a banner -- but it is a banner on every run, so both exports
-# wait for the bucket. Until then the store fills only by hand from the
-# --lines-out artefact below. No job holds the writing export yet: the
-# nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly, in
-# flight in oss-test-infra) carries it commented out, and the change that
-# uncomments it there adds the read-only export to the presubmit in the same
-# diff. Arming stays a Prow-config change, never a default here.
+# It defaults to unset because arming is a Prow-config decision, never a
+# default here: a laptop run must not read, let alone write, the production
+# store. Both Prow jobs export it since oss-test-infra#2698 (2026-09-14) --
+# the nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly) as
+# eval-baseline-recorder with objectViewer and objectCreator on
+# gs://kube-agents-evals-bench, the presubmit as prowjob-default-sa with
+# objectViewer only. Pointing at a bucket that is unreachable is not fatal --
+# the store degrades to advisory with a banner -- but it is a banner on every
+# run, which is how a revoked grant would announce itself.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and

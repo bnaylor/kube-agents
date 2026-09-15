@@ -227,9 +227,15 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"worker":    {"$JS.ACK.TASKS.>"},
 		"agent":     nil,
 		"provision": nil,
-		"seed":      nil,
-		"web":       nil,
-		"sys":       nil,
+		// The session's grants are derived, so it holds no listed grant of
+		// any kind, ack included. What it actually gets at mint time is
+		// also ack-free: its three consumers are ack-none pulls, and an ack
+		// grant on the shared TASKS stream cannot distinguish consumers, so
+		// granting one would let a session +TERM the gateway's deliveries.
+		"session": nil,
+		"seed":    nil,
+		"web":     nil,
+		"sys":     nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -700,6 +706,12 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
+	// Recreate, not the RollingUpdate default: at one replica the default
+	// resolves maxUnavailable to 0 and the roll stalls under a full quota
+	// (#1506). The credential proxy makes the same choice.
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("gateway Deployment strategy = %q, want %q", dep.Spec.Strategy.Type, appsv1.RecreateDeploymentStrategyType)
+	}
 	pod := dep.Spec.Template.Spec
 	if pod.ServiceAccountName != "test-agent-a2a-gateway" {
 		t.Errorf("ServiceAccountName = %q", pod.ServiceAccountName)
@@ -972,10 +984,21 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 		}
 	}
 
-	// The spawner projects the bus password from this Secret; the gateway's
-	// baked default is right only for a CR named platform-agent.
-	if env["A2A_NATS_CREDS_SECRET"].Value != "test-agent-a2a-nats-creds" {
-		t.Errorf("A2A_NATS_CREDS_SECRET = %+v, want the Secret this CR's render actually creates", env["A2A_NATS_CREDS_SECRET"])
+	// The session identity the spawner runs pods as. The gateway has no
+	// default for it and refuses to boot without it, so an unrendered value
+	// here is a CrashLoopBackOff rather than a silent fallback — but the
+	// name still has to be this CR's, because the callout's map is keyed on
+	// exactly it.
+	if env["A2A_SESSION_SERVICE_ACCOUNT"].Value != "test-agent-a2a-session" {
+		t.Errorf("A2A_SESSION_SERVICE_ACCOUNT = %+v, want this CR's session ServiceAccount", env["A2A_SESSION_SERVICE_ACCOUNT"])
+	}
+	// And no bus password reaches the spawner any more. It projected the
+	// static `worker` credential into every session pod, where the model
+	// harness could read it back out of /proc/1/environ (gke-labs#1270);
+	// sessions now mint their own. A re-added reference here is that hole
+	// returning by way of the render.
+	if _, ok := env["A2A_NATS_CREDS_SECRET"]; ok {
+		t.Error("the gateway is still told the bus credentials Secret; the spawner has no use for it and naming it invites the env-injected password back")
 	}
 
 	pods := buildA2AGatewayRole(agent).Rules[0]
@@ -3285,9 +3308,9 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 // is what the server reads: a user the identities tests never see (callout,
 // in the AUTH template) still appears there, and a rendering bug that dropped
 // a list would too. The render is also held equal to the identity lists it
-// came from. The one callout-issued principal, provision, never reaches
-// nats.conf, so its lists are read from a2aIdentities and held to the same
-// rows. A callout-issued principal whose entry carries no grants at all,
+// came from. The callout-issued principals never reach nats.conf, so their
+// lists are read from a2aIdentities and held to the same rows. A
+// callout-issued principal whose entry carries no grants at all,
 // because the callout mints each connection's authorization from the pod the
 // API server attested, is recorded as perConnection and held to zero grants
 // in both lists; an empty row without that flag fails rule 1, so the empty
@@ -3344,6 +3367,13 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			callout:      true,
 			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
+		},
+		"session": {
+			// sessionIdentity lists nothing: the callout derives each
+			// connection's grants from the attested pod, and a grant
+			// recorded here would reach every session pod at once.
+			callout:       true,
+			perConnection: true,
 		},
 	}
 	var staticRows, calloutRows []string
