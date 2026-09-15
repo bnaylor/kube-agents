@@ -1113,8 +1113,14 @@ Mutation(
     Mutation(
         "A3-second-supervisor-writer",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",',
-         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
+        # Anchored on the comment that follows the events grant, not on the
+        # next subject in the list. That neighbour has now moved twice: #1316
+        # re-indented it, and this branch landed `a2a.cap.verify.*` between the
+        # two. Each time the mutation went STALE, which reports as silence --
+        # indistinguishable from a mutation that has nothing to say, against
+        # the one test that pins the supervisor subject to a single writer.
+        ('\t\t"a2a.tasks.*.*.events",\n\t\t// Ask the verifier',
+         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t// Ask the verifier'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "grant the static worker publish on the supervisor subject, the shape "
         "a bridge-side janitor written against the shared credential would "
