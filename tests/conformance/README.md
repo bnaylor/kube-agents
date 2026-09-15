@@ -252,15 +252,19 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-86 mutations: 66 KILLED, 18 NOISY, two `must_survive` controls (one on the
+95 mutations: 71 KILLED, 20 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-11 against
+handling), zero genuine survivors, and two stale — measured 2026-09-15 against
 this branch merged with `main`; re-run the harness rather than trusting these
 numbers, which is the sentence this paragraph exists to make cheap. Note that
-the summary line the harness prints accounts for 84 of the 86: a `must_survive`
+the summary line the harness prints accounts for 93 of the 95: a `must_survive`
 control's verdict is `SURVIVED (expected)`, which is neither killed, noisy, nor
-a survivor. Each names the control it removes, the test that must notice, and
-the plausible bad change it imitates. It is not run in CI — it edits tracked
+a survivor. The two stale entries, `C1-executable-allowlist` and
+`D15-executor-absolute-path`, are stale on `main` as well — the text they edit
+has moved out of `credential_proxy.py` — so they are not this branch's to
+rewrite and are not counted as coverage here. Each mutation names the control
+it removes, the test that must notice, and the plausible bad change it
+imitates. It is not run in CI — it edits tracked
 files in place — so it is a thing to run when adding a test, which step 4
 below says to do.
 
