@@ -2,14 +2,7 @@
 
 - **Author:** @bnaylor
 - **Date:** 2026-08-24
-- **Status:** draft for review. The 9/9 amendment below - the supervisor's own task
-  subject, and the identity half of the consumer rule - describes the render and the client
-  library that land in gke-labs#1617. This document merges behind that PR
-  (`do-not-merge/hold`) and is not true of a tree without it: before the split the gateway
-  publishes its supervisor terminals through `lib.TaskEventsSubject`, no principal in the
-  render holds publish on `a2a.tasks.*.*.supervisor`, and `ParseTaskSubject` knows two
-  classes. Every "today" in the Verified identity section means that tree, not the tree
-  this file first merges onto.
+- **Status:** draft for review
 - **Supersedes:** the demo protocol (`a2a-jetstream/0.1`). 0.2 was this doc's
   pre-amendment draft, never implemented; 0.3 added the ratified `authority` rules; 0.4
   moves the addressee into the task subjects, which is what makes connection-time
@@ -417,11 +410,10 @@ token, so it reaches a session's `…events` exactly as it reaches a profile's. 
 `worker` credential is retired - the Hermes bridge is the last holder - that subject has
 two writers on both classes. The suite records that rather than asserting it
 away: `test_A3_the_events_subject_has_no_rendered_writer` in
-`tests/conformance/test_A_authority.py`, decorated
-`@known_violation("A3", ... gke-labs/kube-agents#1316)`. It arrives with gke-labs#1617 along
-with the rest of the split, so on a tree before that, read the file and not this sentence -
-the record is the file's, never this document's. What the derived
-grant buys in the meantime is a bound on what a _session_ can forge - it cannot write
+`tests/conformance/test_A_authority.py`, decorated `@known_violation("A3", ...)` against
+gke-labs/kube-agents#1316. Read the file, not this sentence - the record is the suite's,
+never this document's, and which assertions exist changes faster than this paragraph.
+What the derived grant buys in the meantime is a bound on what a _session_ can forge - it cannot write
 another session's subject - which is not the same property as a consumer being able to
 read the writer off the subject. The directory: the profile binding closes the
 direct forge, and what remains is relocation of stored bytes through a browser
@@ -587,13 +579,14 @@ Verified identity (added 9/9):
 
 22. A supervisor emits only terminal `status-update`, and only on `…supervisor`. A
     non-final or non-status envelope on a supervisor subject is a protocol error; a
-    supervisor terminal on an executor's `…events` is a writer-class disagreement. Read
-    that last clause against the post-split render only. Before gke-labs#1617 the gateway
-    has no `…supervisor` grant and publishes every supervisor terminal through
-    `lib.TaskEventsSubject`, so a consumer applying this assertion to a pre-split tree
-    would call every legitimate reap, Sweep and Delegate terminal a disagreement. That is
-    the install the Migration note above describes, and the reason the check ships
-    advisory behind `A2A_STRICT_EVENTS_WRITER` rather than refusing.
+    supervisor terminal on an executor's `…events` is a writer-class disagreement. That
+    last clause is about the writer set, not about every envelope an install holds: on an
+    install that has not taken the split, and for one retention window after one that has,
+    the supervisor's own terminals are legitimately on `…events` and a consumer that
+    refuses them refuses every reap, Sweep and Delegate the gateway performed. That is the
+    Migration note above, and it is why the `…events` writer-class check ships advisory
+    behind `A2A_STRICT_EVENTS_WRITER` rather than refusing - the disagreement is counted,
+    and hardening is the operator's flip.
 23. Envelope-subject agreement, per class and closed-world on kind, as the Verified
     identity table states: a relocated envelope whose kind, `taskId`, `to` or writer
     class disagrees with its subject is a protocol error at delivery and at
