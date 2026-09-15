@@ -80,6 +80,7 @@ Only stdlib + PyYAML (already in requirements-test.txt) -- no build step.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import json
 import math
@@ -88,6 +89,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 import yaml
 
@@ -103,6 +105,11 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
 PAGES_JS = HERE / "template" / "pages.js"
+# The mark in the header and the browser tab: the same logo as the PR
+# dashboard, inlined as a data URI so the page keeps rendering whole from
+# its own bytes (SCHEMA.md, "The rendered pages": storage.cloud.google.com
+# answers a subresource fetch with a login redirect).
+LOGO = HERE / "template" / "logo.jpeg"
 DEFAULT_NOTES = HERE / "case-notes.yaml"
 DEFAULT_EVENTS = HERE / "events.yaml"
 
@@ -1030,6 +1037,7 @@ def render_page(page: str, brief: dict, data: dict, public_url: str | None = Non
         "__META__": meta_html(data),
         "__FRESHNESS__": freshness_html(data),
         "__PAGES_JS__": PAGES_JS.read_text(),
+        "__LOGO__": logo_data_uri(),
     }
     for token in values:
         if token not in template:
@@ -1082,6 +1090,11 @@ def inline_json_html(element_id: str, value) -> str:
     return f'<script type="application/json" id="{element_id}">{bootstrap_json(value)}</script>'
 
 
+def logo_data_uri() -> str:
+    """The header and favicon image as a data URI, read from template/logo.jpeg."""
+    return "data:image/jpeg;base64," + base64.b64encode(LOGO.read_bytes()).decode("ascii")
+
+
 def base_html(public_url: str | None) -> str:
     """``<base href>`` for the published site, so every relative link on the
     page (nav, footer, run.html#build=, the incident deep links) resolves
@@ -1089,7 +1102,12 @@ def base_html(public_url: str | None) -> str:
     is known, which keeps a file:// render browsable."""
     if not public_url:
         return ""
-    return f'<base href="{esc(public_url.rstrip("/") + "/")}">'
+    url = public_url.strip()
+    if url.startswith("gs://"):
+        target = url[len("gs://"):].strip("/")
+        parsed = urllib.parse.urlsplit(PUBLISHED_SITE)
+        url = f"{parsed.scheme}://{parsed.netloc}/{target}"
+    return f'<base href="{esc(url.rstrip("/") + "/")}">'
 
 
 # --------------------------------------------------------------------------
@@ -1130,7 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
         const=PUBLISHED_SITE,
         default=None,
         metavar="BASE",
-        help=f"emit <base href> so every link resolves to this site; the bare flag means the published dashboard ({PUBLISHED_SITE}); default (or an empty value): none, links stay relative",
+        help=f"emit <base href> so every link resolves to this site; accepts a gs:// bucket path or URL (bare flag means {PUBLISHED_SITE}); default (or an empty value): none, links stay relative",
     )
     args = parser.parse_args(argv)
 

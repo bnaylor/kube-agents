@@ -30,6 +30,7 @@ agents/cluster/*.md
 agents/cluster/skills/*/SKILL.md
   agents/cluster/skills/gke-observability/SKILL.md
   agents/cluster/skills/gke-reliability/SKILL.md
+  agents/cluster/skills/gke-stall-detection/SKILL.md
   agents/cluster/skills/gke-storage/SKILL.md
   agents/cluster/skills/gke-workload-scaling/SKILL.md
   agents/cluster/skills/gke-workload-security/SKILL.md
@@ -56,6 +57,7 @@ agents/platform/governance/*.md
   agents/platform/governance/stockout_prevention_sop.md
 
 agents/platform/skills/*/SKILL.md
+  agents/platform/skills/capacity-obtainability/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
   agents/platform/skills/fleet-upgrade-verification/SKILL.md
