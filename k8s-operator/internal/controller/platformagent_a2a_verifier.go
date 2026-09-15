@@ -148,6 +148,13 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 					Containers: []corev1.Container{{
 						Name:  "verifier",
 						Image: a2aVerifierImage(),
+						// #1259, on the same distroless base the gateway and
+						// the callout carry it for: the image's WORKDIR
+						// /home/nonroot is 0700 owned by 65532, and this pod
+						// runs as 1000. Latent today because the binary never
+						// stats ".", which is exactly why it is set here
+						// rather than left for the change that would.
+						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							// NATS_USER is deliberately ABSENT. The binary
