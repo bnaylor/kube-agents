@@ -106,13 +106,15 @@ func checkTaskAgreement(subject, addressee, taskID, class string, env *Envelope,
 	if env.TaskID != taskID {
 		return disagree(subject, "taskId %q does not match the subject's %q", env.TaskID, taskID)
 	}
-	// Class-independent, and deliberately broader than assertion 4. The docs
-	// scope that assertion to `…in`, because that is the only class where `to`
-	// is meaningful and the only one where its absence is worth asserting
-	// about. But the check this replaces refused a disagreeing `to` on ANY
-	// task subject, at publish and at delivery both, and an event carrying
-	// another session's `to` has no legitimate producer - so the rule stays
-	// where it was rather than narrowing to match the assertion's scope.
+	// Class-independent, and that IS assertion 4's second clause - it says
+	// "an envelope whose `to` disagrees with its subject's addressee token",
+	// with no class qualifier. An earlier version of this comment said the
+	// docs scoped the assertion to `…in` and that the library was
+	// deliberately wider; that was a misreading, and the spec's own `…in`
+	// row briefly grew a matching `to`-is-REQUIRED claim off the back of it.
+	// Nothing anywhere requires `to` to be PRESENT, on any class, and this
+	// function does not check presence either. What is scoped to `…in` is
+	// only the convention that a requester tends to set it.
 	// Events carry no `to` at all, so this is unreachable for them in
 	// practice; that is the point.
 	if env.To != nil && env.To.Session != addressee {
