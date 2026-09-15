@@ -363,19 +363,87 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         return len(p) == len(s)
 
     @classmethod
-    def _rendered_publish_grants(cls) -> dict[str, list[str]]:
-        """Every rendered principal's publish list, keyed by its Go builder.
+    def _go_publish_grants(cls) -> dict[str, tuple[list[str], bool]]:
+        """Each `...Identity` builder's publish list, keyed by NATS user.
 
-        Read out of each `...Identity` function body rather than from one
-        expected entry, so a grant added to any principal is examined. The
-        anchor test below keeps the set of builders honest.
+        The second element says whether the list was read in full. Most
+        builders return a struct literal, which is exact; `worker` and `seed`
+        assemble theirs in a local variable and append a shared helper whose
+        entries are Go constant concatenations (`"$JS.API.STREAM.INFO." +
+        a2aTasksStream`). Evaluating those here would be reimplementing the
+        compiler in a test, so those are reported as partial and the served
+        config below is what the assertions actually read for them.
+
+        What this must never do is report a list it could not read as empty.
+        It did, and an empty list satisfies every writer-set assertion in this
+        class vacuously -- which is how the `worker` grant on `…events` came
+        to report as absent while the served config still carried it.
         """
         source = h.text("a2a_identities")
         grants = {}
         for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
             body = h.go_function_body(source, builder)
-            block = re.search(r"publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
-            grants[builder] = re.findall(r'"([^"]+)"', block.group(1)) if block else []
+            user = re.search(r'user:\s*"([^"]+)"', body)
+            if user is None:
+                raise AssertionError(f"{builder} renders no user name")
+            field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
+            if field is None:
+                grants[user.group(1)] = ([], True)
+            elif field.group(1).startswith("[]string{"):
+                grants[user.group(1)] = (re.findall(r'"([^"]+)"', field.group(1)), True)
+            else:
+                name = field.group(1)
+                regions = re.findall(
+                    rf"\n\t{name} :?= (?:append\({name}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
+                    body,
+                    re.DOTALL,
+                )
+                if not regions:
+                    raise AssertionError(f"{builder} builds `{name}` in a shape this test cannot read")
+                # Comments inside these blocks quote the very subjects they
+                # explain the absence of, so they are stripped before reading.
+                bare = [re.sub(r"//[^\n]*", "", r) for r in regions]
+                grants[user.group(1)] = ([g for r in bare for g in re.findall(r'"([^"]+)"', r)], False)
+        return grants
+
+    @classmethod
+    def _conf_publish_grants(cls) -> dict[str, list[str]]:
+        """Every static user's publish allow-list, out of the rendered nats.conf.
+
+        The served artifact, in the spirit of `rendered_policy_rules`: the Go
+        map is what someone wrote, this is what the server enforces, and the
+        concatenated grants are already resolved here by the compiler that
+        emitted it. It covers the statically authenticated users only --
+        `provision` and `session` authenticate through the callout and appear
+        in no file.
+        """
+        conf = h.text("a2a_rendered_nats_conf")
+        grants = {}
+        for block in re.finditer(
+            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[(.*?)\]\s*\}", conf, re.DOTALL
+        ):
+            grants[block.group(1)] = re.findall(r'"([^"]+)"', block.group(2))
+        return grants
+
+    @classmethod
+    def _rendered_publish_grants(cls) -> dict[str, list[str]]:
+        """Every rendered principal's publish list, keyed by NATS user.
+
+        The served config for everything NATS authenticates from a file, the
+        Go map for the callout principals that are in no file. Read over every
+        principal rather than one expected entry, so a grant added to any of
+        them is examined.
+        """
+        served = cls._conf_publish_grants()
+        grants = {user: list(allow) for user, allow in served.items() if user != "callout"}
+        for user, (allow, complete) in cls._go_publish_grants().items():
+            if user in grants:
+                continue
+            if not complete:
+                raise AssertionError(
+                    f"{user} is in no served config and its Go publish list cannot be read in full"
+                )
+            grants[user] = allow
         return grants
 
     @classmethod
@@ -387,11 +455,44 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         return block.group(1)
 
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
-        """The builders the writer-set tests iterate, so a moved one is loud."""
+        """The principals the writer-set tests iterate, so a moved one is loud.
+
+        Asserts each one renders a NON-EMPTY list, not merely that its key is
+        present. The weaker check passed while two principals read as zero
+        grants, and a principal with zero grants satisfies every writer-set
+        assertion in this class vacuously.
+        """
         grants = self._rendered_publish_grants()
-        for builder in ("gatewayIdentity", "workerIdentity", "webIdentity"):
-            self.assertIn(builder, grants, f"{builder} is no longer a rendered principal")
-        self.assertTrue(grants["gatewayIdentity"], "the gateway renders no publish grants")
+        for user in ("gateway", "worker", "web", "seed", "provision"):
+            self.assertIn(user, grants, f"{user} is no longer a rendered principal")
+            self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
+        self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
+
+    def test_A3_precondition_every_served_user_is_built_by_an_identity(self) -> None:
+        """The two files name the same principals, and agree wherever both are exact.
+
+        One is hand-edited and one is generated from it, and the writer-set
+        tests are only as true as the reader that feeds them. For the builders
+        that return a struct literal the comparison is exact; for the two that
+        concatenate Go constants it is the literal head, which is where every
+        task subject in this class lives.
+        """
+        served = self._conf_publish_grants()
+        declared = self._go_publish_grants()
+        for user, allow in served.items():
+            if user == "callout":
+                continue  # its own account's login, not a principal in the identity map
+            self.assertIn(user, declared, f"{user} is served by NATS and built by no identity")
+            grants, complete = declared[user]
+            if complete:
+                self.assertEqual(sorted(allow), sorted(grants), f"{user}: served config and Go map disagree")
+            else:
+                self.assertEqual(
+                    sorted(grants),
+                    sorted(g for g in allow if g in set(grants)),
+                    f"{user}: the Go map's literal grants are not all served",
+                )
+                self.assertTrue(grants, f"{user}: no literal grants read at all")
 
     def test_A3_the_supervisor_subject_has_exactly_one_writer(self) -> None:
         """`…supervisor` is written by the supervisor and nobody else.
@@ -409,7 +510,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             for builder, grants in self._rendered_publish_grants().items()
             if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in grants)
         )
-        self.assertEqual(["gatewayIdentity"], writers)
+        self.assertEqual(["gateway"], writers)
         self.assertNotIn(
             "TaskSupervisorSubject",
             self._session_publish_derivation(),
@@ -426,7 +527,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         failing clause and stops: this half holds today and has to stay
         visible on its own.
         """
-        gateway = self._rendered_publish_grants()["gatewayIdentity"]
+        gateway = self._rendered_publish_grants()["gateway"]
         reaching = [g for g in gateway if self._subject_matches(g, self.EVENTS_PROBE)]
         self.assertEqual(
             [], reaching,
@@ -454,7 +555,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "is supposed to name subjects through the lib helpers so the token "
             "grammar and the class are the library's",
         )
-        gateway = self._rendered_publish_grants()["gatewayIdentity"]
+        gateway = self._rendered_publish_grants()["gateway"]
         self.assertTrue(
             any(self._subject_matches(g, self.IN_PROBE) for g in gateway),
             "the requester can no longer write the in subject; the probe below is then vacuous",
