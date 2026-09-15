@@ -370,13 +370,18 @@ Topics are deliberately outside this enumeration. Agent-scoped topics already ha
 exclusive writers and could join by the same rule; shared topics are multi-writer by
 design and their attribution stays `from`-advisory.
 
-**What is decision-grade today, and what is not.** Session-pod tasks: `…events` is
-written by the session's own derived grant and `…supervisor` by the gateway, and both
-are refused at the server for every other principal - decision-grade. Profile-addressed
-tasks: the static `worker` credential the Hermes bridge still holds publishes
-`…events` for every addressee until it is retired (A5), so `…events` identity for a
-profile is not yet single-writer in the render, and the conformance suite records that
-as a known violation rather than a pass. The directory: the profile binding closes the
+**What is decision-grade today, and what is not.** `…supervisor`, for every addressee:
+the gateway is the only principal in the render holding publish on it and every other
+principal is refused at the server - decision-grade. `…events`, for every addressee
+_including a session pod_: not yet. The session's own grant is derived per incarnation
+and reaches only its own pod's subjects, but the static `worker` credential the Hermes
+bridge still holds publishes `a2a.tasks.*.*.events` - a wildcard over the addressee
+token, so it reaches a session's `…events` exactly as it reaches a profile's. Until
+`worker` is retired (A5) that subject has two writers on both classes, and the
+conformance suite records it as a known violation rather than a pass. What the derived
+grant buys in the meantime is a bound on what a _session_ can forge - it cannot write
+another session's subject - which is not the same property as a consumer being able to
+read the writer off the subject. The directory: the profile binding closes the
 direct forge, and what remains is relocation of stored bytes through a browser
 credential's consumer-create grant, which only the account split closes; directory
 identity is not decision-grade until then. `$KV.session-state.>` likewise waits on the
