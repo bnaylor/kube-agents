@@ -72,6 +72,32 @@ replay completeness degrades oldest-first - a running task's early events can ag
 a flooded stream - and the byte-headroom alert below exists so that state is paged on
 before it is reached.
 
+`TASKS` carries one further limit, `max_msgs_per_subject` (4096; amended 9/16). The cap
+above is stream-wide, so one runaway task - a looping harness, a gigabyte of streamed
+artifact text - could consume the whole 20GiB budget and, under `discard: old`, evict
+every other session's history on the way out. The per-subject cap makes a runaway pay
+for its own runaway and nobody else's. Be precise about what it is not: a session's
+publish grant is `a2a.tasks.<pod>.*.events` - the task id is not part of the attested
+claim, so the grant cannot name one - and a session can therefore mint unbounded
+distinct subjects by inventing task ids. A per-subject cap is not a per-publisher
+budget, and JetStream has none to reach for. Closing that is a change to the callout's
+narrowing, not a stream flag.
+
+The replay consequence, stated rather than discovered later, because `discard: old`
+evicts the OLDEST message on a subject first: the oldest event on a task's `…events`
+subject is its `submitted` status-update, which assertion 9 requires and which
+`FoldTask` folds into `StatusHistory[0]`. A task past the cap replays without its head -
+the terminal state survives, the beginning does not. That is only acceptable because the
+fold now says so. `lib.Task` carries `SubmittedMissing`, the assertion-9 observation and
+the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
+degradation a reader can see rather than a short history it cannot distinguish from a
+real one. On the number: 4096 is a 1GiB ceiling on one subject - the largest single
+event the worker adapter emits is one result chunk at 256KiB - a twentieth of the
+stream, while a chat-driven task emits single digits to low hundreds of events. The
+alternative that would refuse the write instead of evicting the head, per-subject
+`discard: new`, is unavailable: JetStream only honours it under stream-wide `discard:
+new`, which contradicts the rule in the paragraph above.
+
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
 Three KV buckets ride the same JetStream deployment:
@@ -244,7 +270,14 @@ Layout:
   auth callout - `web` is browser-facing and therefore permanently statically
   authenticated, so the callout never reaches it:
   durability is a body field, so withholding the legacy `DURABLE.CREATE` subject does not
-  prevent a durable - `max_consumers` per stream bounds the cost instead; ack policy is
+  prevent a durable - `max_consumers` per stream bounds the cost instead (amended 9/16:
+  on `TASKS` that bound is no longer the flat 64 but a number derived from
+  `spec.harness.tuning.maxSessions`, since a session pod creates three consumers there
+  and a stream that cannot hold the configured concurrency refuses a legitimate session.
+  The trade is stated where it is made: an install that raises `maxSessions` raises
+  `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
+  install would silently tighten a working one, so the render takes the larger of 64 and
+  the derived budget); ack policy is
   the same class of body field, so a hostile holder can create an explicit-ack consumer
   it holds no grant to ack - endless redeliveries, churn against the server, and an
   amplifier for the deliver-subject write below; within the four
@@ -382,13 +415,27 @@ version it is serving and exposes it at runtime on `/status` and `/readyz`, so "
 says X" is checkable against the running system rather than against the rendered object.
 
 **What ships today is coarser than that sentence, and the gap is deliberate.** The
-condition is on the `PlatformAgent`, not on an `AgentProfile`, because neither the CRD
-nor the dispatcher exists yet. For the same reason the second half of the sentence -
-"nothing dispatches before that condition is true" - is not yet enforced by anything:
-the operator writes `BusCredentialsReady` and no code in this repository reads it. The
-dispatcher that would is the intended reader, so the condition is deliberately built
-ahead of its consumer rather than being dead code; but until that consumer exists the
-ordering is a published signal an operator can watch, not a gate. **Amended 9/8.** It asserts that the callout Deployment is Available with
+condition is on the `PlatformAgent`, not on an `AgentProfile`, because the profile CRD
+does not exist yet.
+
+**Amended 9/16: the second half of the sentence is enforced now.** "Nothing dispatches
+before that condition is true" used to describe an intention - the operator wrote
+`BusCredentialsReady` and no code in this repository read it. The dispatcher it was
+waiting for turns out to be one that already ships: the A2A gateway is what spawns
+session pods and relays their work onto the bus, and it is the only thing here that
+dispatches at all. So the operator withholds the gateway Deployment's _creation_ until
+the condition is true (`a2aGatewayWaitsForCallout`), and reconciles it normally once it
+exists. Creation only, and the distinction is the whole design: a callout outage after
+the gateway is up is an outage, not a reason to freeze a running gateway's image and
+environment at whatever the outage happened to interrupt - and the session pods already
+spawned carry an `ownerReference` to that Deployment, so withholding it is not a neutral
+act. The ordering holds where it is a real ordering, without making the callout a
+liveness dependency of everything downstream. One caveat, because it is visible in a
+`kubectl get` transcript: `syncBusCredentialsReady` is deferred to the way out of the
+reconcile, so a gate reading the condition sees it one pass old. A held reconcile
+requeues, so the cost is a delay of one requeue interval - never a wrong answer.
+
+**Amended 9/8.** The condition asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
 served AND the replica is attached to the bus, that means every replica is serving one
 and can be reached to answer with it. The bus half of that probe was added after the

@@ -53,6 +53,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -1271,7 +1272,7 @@ BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
 # every call would time out.
 NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
-# max_consumers caps each stream at 64. Consumer durability is a request-body
+# max_consumers caps each stream. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
 # in nats.conf); the cap is what stops an unreapable durable per page-load from
 # growing the file store without bound. The failure it converts to is loud — a
@@ -1279,6 +1280,11 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # burns the cap can also deny a legitimate consumer, which is the right way
 # round for a playground and the wrong one for production, where the callout
 # mints per-identity users and this becomes a per-user limit instead.
+#
+# Three streams keep the flat 64. TASKS does not: it is the one stream session
+# pods create consumers on, three apiece, so its cap is derived from this CR's
+# maxSessions (a2aTasksMaxConsumers) and a stream that cannot hold the
+# configured concurrency is a refusal below rather than a task failure at load.
 
 # Retention rule (deployment spec): acknowledgement must not delete — all
 # message streams are limits-based with an age window; replay is a read.
@@ -1291,9 +1297,75 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # config), so the bit the grant rests on is set here, not inherited.
 
 # TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
+#
+# max_msgs_per_subject bounds ONE SUBJECT, which on this stream is one class of
+# one task: a2a.tasks.{addressee}.{taskId}.{in,events,supervisor}. Read what it
+# does and does not buy, because the two are easy to swap.
+#
+# It buys: a runaway executor - a loop, a harness streaming forever - can no
+# longer push 20GiB through the stream on one task and, with discard=old, evict
+# every other session's history on the way. The runaway now pays for its own
+# runaway and nobody else's.
+#
+# It does NOT buy containment of a session that means it. A session's publish
+# grant is a2a.tasks.<pod>.*.events (authcallout/session.go, sessionGrants: the
+# task id is not in the attested claim, so the grant cannot name one), so a
+# session can mint unbounded distinct subjects by inventing task ids. A
+# per-subject cap is not a per-publisher budget, and JetStream has no per-
+# publisher budget to reach for. Closing that means putting the task id in the
+# claim, which is a change to the callout's narrowing and not to a stream flag.
+#
+# 4096: the largest single event the worker adapter emits is one result
+# artifact chunk at resultChunkSize (256 KiB), so this is a 1 GiB ceiling on one
+# subject, a twentieth of the stream. A chat-driven task emits single digits to
+# low hundreds of events; reaching 4096 is already a loop or a gigabyte of
+# streamed artifact text.
+#
+# What happens at the limit, because discard=old evicts the OLDEST message on
+# the subject first: the oldest event on a task's ...events subject is its
+# 'submitted' status-update, which assertion 9 requires and which FoldTask
+# folds into StatusHistory[0]. A truncated task therefore replays without its
+# head. That is only acceptable because the fold now SAYS so - lib.Task's
+# SubmittedMissing is the assertion-9 observation, the sibling of
+# PostFinalDropped for assertion 10 - so the eviction is a degradation a reader
+# can see rather than a short history it cannot distinguish from a real one.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
+  --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
+  --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
+
+# The consumer budget this CR's maxSessions needs, checked against the stream
+# that is actually there.
+#
+# The create above sizes a FRESH stream. Provisioning is create-only
+# convergence - the info-then-add guards never edit an existing stream, which
+# buildA2AProvisionJob says in terms - so raising maxSessions on a live install
+# leaves TASKS at whatever max_consumers it was created with, and the first
+# thing anyone learns about it is a legitimate session failing to create a
+# consumer, reported as a task failure. This turns that into a refusal here:
+# the provision Job's name is a digest of this script, so a changed maxSessions
+# is a new Job on the next reconcile, and a failed provision Job is already
+# surfaced on the CR.
+#
+# Parsed with grep rather than jq: nats-box is the image, and grep is in
+# busybox for certain. An unparseable answer FAILS - a check that silently
+# skips when its extractor stops matching is not a check.
+required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
+live_consumers="$($NATS stream info TASKS --json | tr -d ' \t\r\n' \
+  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_consumers}" ]; then
+  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
+  echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
+  echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
+  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
+  echo "Provisioning does not edit an existing stream. Either lower maxSessions or run:" >&2
+  echo "  nats stream edit TASKS --max-consumers=${required_consumers}" >&2
+  exit 1
+fi
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
@@ -1515,6 +1587,73 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxSessions
 	}
 	return defaultA2AMaxSessions
+}
+
+// The TASKS consumer budget, derived from maxSessions rather than fixed.
+//
+// Every session pod creates a2aSessionConsumersPerSession named consumers on
+// TASKS, so a stream whose max_consumers does not scale with the session cap
+// is a configuration the install cannot honour: above roughly twenty
+// concurrent sessions a legitimate session's consumer create is refused, and
+// it surfaces to the user as a task failure rather than as the capacity error
+// it is. The cap and the stream now come off the same number.
+//
+// The floor is why a default install sees no change. max_consumers was 64
+// before this derived it, and 64 is also what stops the `web` user - which
+// holds $JS.API.CONSUMER.CREATE.TASKS.> and no DELETE, because durability is
+// a request-body field no subject list can see - from growing the file store
+// with an unreapable durable per page load. Deriving downward would quietly
+// tighten that on every existing install for a reason that has nothing to do
+// with web, so the derivation only ever widens: max(64, budget).
+//
+// Widening has a cost and it is the same one, stated plainly: an install that
+// configures 10000 sessions also raises web's ceiling to ~30000. That is the
+// install's own choice of concurrency made explicit. The ceiling still
+// exists, and it still converts to a refused create rather than to silent
+// disk growth.
+const (
+	// a2aSessionConsumersPerSession mirrors lib.SessionConsumerRoles in the
+	// a2a module - origin, in, events - which worker-adapter creates on
+	// TASKS per session. The two modules cannot import each other;
+	// TestSessionConsumerCountMatchesTheA2AModule reads that slice and
+	// fails if this number stops matching it.
+	a2aSessionConsumersPerSession = 3
+
+	// a2aTasksReservedConsumers is the part of the budget that is nobody's
+	// session: the gateway's `gateway-relay` durable and the Hermes
+	// bridge's `bridge-<profile>` durable (2), the reserved `audit`
+	// durable gke-labs#1512 adds (1), one session's worth of overlap while
+	// the gateway retires an incarnation and mints its replacement and the
+	// old consumers have not yet reached their 5s inactive threshold (3),
+	// and ten for the web rail's concurrent readers.
+	a2aTasksReservedConsumers = 16
+
+	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
+	// default install still gets. Never render below it.
+	a2aTasksMaxConsumersFloor = 64
+
+	// a2aTasksMaxMsgsPerSubject bounds one task's own history so a runaway
+	// on one task cannot evict every other session's. The provision
+	// script's TASKS block argues the number, what it bounds, and what it
+	// deliberately does not.
+	a2aTasksMaxMsgsPerSubject = 4096
+)
+
+// a2aTasksConsumerBudget is what this CR's configuration needs TASKS to hold.
+// It is the number the provision script checks a live stream against, which is
+// deliberately the budget and not the rendered max_consumers: an existing
+// stream sized at the floor holds a default install fine, and failing it for
+// being below a floor it was never going to be below is a false alarm.
+func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
+	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReservedConsumers
+}
+
+// a2aTasksMaxConsumers is what a fresh TASKS stream is created with.
+func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
+	if budget := a2aTasksConsumerBudget(agent); budget > a2aTasksMaxConsumersFloor {
+		return budget
+	}
+	return a2aTasksMaxConsumersFloor
 }
 
 func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
@@ -1785,6 +1924,14 @@ type a2aProvisionState struct {
 	// BusCredentialsReady is the callout confirming it is serving this
 	// value, so it has to travel out of the render to the status write.
 	AuthMapVersion string
+
+	// gatewayHeld reports that the gateway Deployment was withheld this
+	// pass because BusCredentialsReady is not yet true. It exists to make
+	// the reconcile poll: the callout Deployment is owned, so its readiness
+	// change does trigger a pass, but the condition this gate reads is
+	// written on the way OUT of the previous one, and nothing else is
+	// guaranteed to wake the reconcile that finally sees it.
+	gatewayHeld bool
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -1986,15 +2133,68 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		}
 	}
 
+	// The gateway is what dispatches: it spawns the session pods, and a
+	// session pod's bus credential is minted by the auth callout. So this is
+	// where the deployment spec's ordering - "the operator sets
+	// BusCredentialsReady only after the callout reports serving, and nothing
+	// dispatches before that condition is true" - either holds or is a
+	// sentence. Until this gate, it was a sentence: the operator wrote the
+	// condition and nothing in the repository read it. This reads it.
+	//
+	// Creation only, and the distinction is the whole design. A callout that
+	// goes unready under a running install must not take the gateway with it:
+	// that would turn an ordering guarantee into a liveness coupling, and
+	// every in-flight session hangs off the gateway Deployment's UID. So an
+	// existing gateway is reconciled normally no matter what the condition
+	// says, and only the FIRST creation waits.
+	//
+	// It reads the published condition rather than recomputing readiness from
+	// the callout Deployment, so the gate and the signal an operator watches
+	// cannot disagree about what "ready" meant. The cost is that
+	// syncBusCredentialsReady is deferred to the way out of Reconcile, so the
+	// value read here is one pass old. That is a delay, never a wrong answer:
+	// stale-false holds the gateway one more pass and gatewayHeld requeues,
+	// and stale-true can only happen for a callout that was serving as
+	// recently as the previous pass, which is the same window the condition's
+	// own doc comment accepts ("a stale condition for a moment is cheaper
+	// than a refused connection").
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
+	}
+	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep); err != nil {
+		return state, err
+	} else if hold {
+		state.gatewayHeld = true
+		logf.FromContext(ctx).Info("holding the A2A gateway until the auth callout serves",
+			"deployment", dep.Name, "condition", busCredentialsReadyCondition)
+		return state, nil
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
 	return state, nil
+}
+
+// a2aGatewayWaitsForCallout reports whether the gateway Deployment must be
+// withheld this pass. See the call site for why the gate is creation-only and
+// why it reads the condition rather than the Deployment.
+func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) (bool, error) {
+	if meta.IsStatusConditionTrue(agent.Status.Conditions, busCredentialsReadyCondition) {
+		return false, nil
+	}
+	// Already there: reconcile it. A gateway that exists was let through by
+	// an earlier pass, and withholding its updates now would freeze its image
+	// and env at whatever a callout outage happened to interrupt.
+	err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+	if err == nil {
+		return false, nil
+	}
+	if !errors.IsNotFound(err) {
+		return false, err
+	}
+	return true, nil
 }
 
 // applyA2AGatewayDeployment applies the gateway Deployment and, when the API

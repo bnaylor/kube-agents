@@ -391,6 +391,9 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	if err := cl.List(ctx, jobs); err != nil || len(jobs.Items) == 0 {
 		t.Errorf("provision Job not rendered under next (err=%v, n=%d)", err, len(jobs.Items))
 	}
+	// The gateway waits on BusCredentialsReady (see the gate tests); under
+	// next with a serving callout it renders like the rest.
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
 		t.Errorf("A2A gateway Deployment not rendered under next: %v", err)
@@ -459,6 +462,7 @@ func TestUnrecognizedModePreservesRunningNextStack(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	sts := &appsv1.StatefulSet{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}, sts); err != nil {
 		t.Fatalf("next stack did not render: %v", err)

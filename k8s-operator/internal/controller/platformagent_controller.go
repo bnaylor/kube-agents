@@ -661,7 +661,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
 	// so completion, failure, and the TTL removing a finished Job are all
 	// invisible without a requeue.
-	if a2aNext && !a2aState.done {
+	//
+	// gatewayHeld shares the requeue rather than getting its own: the gateway
+	// is waiting on BusCredentialsReady, which this reconcile writes on its
+	// way out, so the pass that finally sees it true has to be a pass that
+	// happens. The callout Deployment is owned and its readiness does trigger
+	// one, but a gate that only converges because something else is watched
+	// is a gate with a hidden dependency.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
