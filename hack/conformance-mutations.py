@@ -510,8 +510,8 @@ Mutation(
     Mutation(
         "C1-executable-allowlist",
         "agents/platform/scripts/credential_proxy.py",
-        ('ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")',
-         'ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git", "sh")'),
+        ('return ("gcloud", "kubectl", "git", *providers.Registry().executables)',
+         'return ("gcloud", "kubectl", "git", "sh", *providers.Registry().executables)'),
         "test_C1_the_executor_refuses_an_executable_it_does_not_ship",
         "add sh to the allowlist, giving a compound command somewhere to land",
     ),
@@ -953,8 +953,8 @@ Mutation(
     Mutation(
         "D15-executor-absolute-path",
         "agents/platform/scripts/credential_proxy.py",
-        ('ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")',
-         'ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git", "/usr/bin/kubectl")'),
+        ('return ("gcloud", "kubectl", "git", *providers.Registry().executables)',
+         'return ("gcloud", "kubectl", "git", "/usr/bin/kubectl", *providers.Registry().executables)'),
         "test_D15_the_two_layers_agree_on_the_governed_tool",
         "pin kubectl to an absolute path so PATH cannot be shadowed -- a "
         "hardening on its face, and a spelling _GOVERNED_TOOLS matches exactly "
