@@ -386,8 +386,11 @@ class D5AvailabilityAndCostAreSecurityProperties(unittest.TestCase):
     bucket 1. They are recorded here so that "no budget of any kind" does not
     quietly stay written after it stopped being true.
 
-    TASKS carries max_msgs_per_subject, which bounds one task's own event
-    history so a runaway cannot evict every other session's. It is a budget,
+    TASKS is created with max_msgs_per_subject, which bounds one task's own
+    event history so a runaway cannot evict every other session's. Created
+    with, not converged to: provisioning never edits an existing stream, so an
+    install whose stream predates the limit is told about the gap and left to
+    apply it, because applying it evicts. It is a budget,
     and crossing it DEGRADES rather than refuses: discard=old evicts the head,
     so a truncated task replays without its `submitted` event. That is the
     behaviour this invariant says exhaustion must not have, so pinning it as a

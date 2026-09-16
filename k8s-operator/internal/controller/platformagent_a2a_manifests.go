@@ -1335,38 +1335,6 @@ $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct
   --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
-# The consumer budget this CR's maxSessions needs, checked against the stream
-# that is actually there.
-#
-# The create above sizes a FRESH stream. Provisioning is create-only
-# convergence - the info-then-add guards never edit an existing stream, which
-# buildA2AProvisionJob says in terms - so raising maxSessions on a live install
-# leaves TASKS at whatever max_consumers it was created with, and the first
-# thing anyone learns about it is a legitimate session failing to create a
-# consumer, reported as a task failure. This turns that into a refusal here:
-# the provision Job's name is a digest of this script, so a changed maxSessions
-# is a new Job on the next reconcile, and a failed provision Job is already
-# surfaced on the CR.
-#
-# Parsed with grep rather than jq: nats-box is the image, and grep is in
-# busybox for certain. An unparseable answer FAILS - a check that silently
-# skips when its extractor stops matching is not a check.
-required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
-live_consumers="$($NATS stream info TASKS --json | tr -d ' \t\r\n' \
-  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
-if [ -z "${live_consumers}" ]; then
-  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
-  exit 1
-fi
-if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
-  echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
-  echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
-  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
-  echo "Provisioning does not edit an existing stream. Either lower maxSessions or run:" >&2
-  echo "  nats stream edit TASKS --max-consumers=${required_consumers}" >&2
-  exit 1
-fi
-
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
@@ -1410,6 +1378,73 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+
+# TASKS older than this render: the limits the create above could not apply.
+#
+# Provisioning is create-only convergence - the info-then-add guards never
+# edit an existing stream, which buildA2AProvisionJob says in terms - so an
+# install whose TASKS predates a limit keeps the stream it was created with
+# and gains nothing from a re-run. Both limits this render puts on TASKS are
+# in exactly that position on every install that already has the stream, and
+# the two gaps are not the same kind:
+#
+#   max_consumers short is a capacity shortfall with a load-time failure
+#   attached. A legitimate session's consumer create is refused, surfaced as
+#   a task failure, with nothing in it pointing at the stream. Worth
+#   refusing over here, where the number that caused it is in hand.
+#
+#   max_msgs_per_subject absent is a missing bound, not a broken one: the
+#   install behaves exactly as it did before this render carried the flag.
+#   Applying it would be a TIGHTENING, and a tightening evicts: a
+#   stream edit that lowers max_msgs_per_subject drops every message over
+#   the new limit on every subject the moment it lands. Truncating a running
+#   install's task history as an automatic side effect of an operator
+#   upgrade is not a decision this script takes on an operator's behalf. It
+#   reports, names the edit and what the edit costs, and moves on.
+#
+# This runs LAST, after every other stream and bucket, so the refusal below
+# leaves a fully provisioned bus short one limit rather than a bus missing
+# DIRECTORY, the topic streams and the KV buckets. The refusal is reached on
+# an operator upgrade alone, with no CR edit involved - an install already
+# running maxSessions above what its stream holds has been under-provisioned
+# the whole time, and this is the first thing that says so.
+#
+# Parsed with grep rather than jq: nats-box is the image, and grep is in
+# busybox for certain. An unparseable answer FAILS - a check that silently
+# skips when its extractor stops matching is not a check.
+tasks_json="$($NATS stream info TASKS --json | tr -d ' \t\r\n')"
+
+live_subject_cap="$(printf '%s' "${tasks_json}" \
+  | grep -o '"max_msgs_per_subject":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_subject_cap}" ]; then
+  echo "could not read max_msgs_per_subject off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+if [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" ]; then
+  echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
+  echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
+  echo "  an operator applies it one task's events can still evict another session's history." >&2
+  echo "  Applying it evicts, on every subject already over the limit, oldest first - and a task's" >&2
+  echo "  oldest event is its 'submitted' one, so those tasks replay opening mid-history. Readers" >&2
+  echo "  report that rather than hiding it. With that understood:" >&2
+  echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+fi
+
+required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
+live_consumers="$(printf '%s' "${tasks_json}" \
+  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_consumers}" ]; then
+  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
+  echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
+  echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
+  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
+  echo "Provisioning does not edit an existing stream. Either lower maxSessions or run:" >&2
+  echo "  nats stream edit TASKS --max-consumers=${required_consumers}" >&2
+  exit 1
+fi
 
 echo "a2a provisioning complete"
 `
@@ -1621,8 +1656,8 @@ const (
 
 	// a2aTasksReservedConsumers is the part of the budget that is nobody's
 	// session: the gateway's `gateway-relay` durable and the Hermes
-	// bridge's `bridge-<profile>` durable (2), the reserved `audit`
-	// durable gke-labs#1512 adds (1), one session's worth of overlap while
+	// bridge's `bridge-<profile>` durable (2), headroom for the audit
+	// durable the accountability rail needs (1), one session's worth of overlap while
 	// the gateway retires an incarnation and mints its replacement and the
 	// old consumers have not yet reached their 5s inactive threshold (3),
 	// and ten for the web rail's concurrent readers.

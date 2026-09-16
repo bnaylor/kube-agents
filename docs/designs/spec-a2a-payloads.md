@@ -357,9 +357,11 @@ the class does.
 | **state**   | Current answer plus short history. Survives restarts indefinitely. | `max_msgs_per_subject: 8`, no age limit |
 | **journal** | Append-only record, ages out.                                      | limits retention, `max_age: 30d`        |
 
-Task subjects (`a2a.tasks.>`) get their own limits-retention stream with `max_age: 72h`,
-and the directory (`a2a.agents.>`) is last-value (`max_msgs_per_subject: 1`, so the
-tombstone replaces the card). The numbers in this section were ratified 8/24 as dev
+Task subjects (`a2a.tasks.>`) get their own limits-retention stream with `max_age: 72h`
+and `max_msgs_per_subject: 4096`, and the directory (`a2a.agents.>`) is last-value
+(`max_msgs_per_subject: 1`, so the tombstone replaces the card). Stream layout is owned
+by [the NATS deployment spec](spec-nats-deployment.md), including what the task stream's
+per-subject cap costs a replay that reaches it - see assertion 9 below. The numbers in this section were ratified 8/24 as dev
 defaults; the GA window is a product and tenancy decision, escalated to product.
 Long-term audit archival is the deployment spec's exporter.
 
@@ -396,7 +398,14 @@ Payloads:
 
 Lifecycle:
 
-9. The first event on every task is a `status-update` with state `submitted`.
+9. The first event on every task is a `status-update` with state `submitted`. A replay
+   can nevertheless open past it: `TASKS` carries a per-subject message limit with
+   `discard: old`, so a task that outruns the limit loses its oldest events first and
+   its oldest event is exactly this one. That is a retention consequence, not a
+   publisher breaking the rule, and the fold reports it (`lib.Task.SubmittedMissing`,
+   logged by the replay path) so the two are distinguishable - a truncated history must
+   not read like a complete one. Assertion 11 is bounded by the same thing: replay
+   matches a live subscriber only for the events retention still holds.
 10. Exactly one event has `final: true`, its state is terminal, and any event after it
     is surfaced as a protocol error - warn-and-drop, with the consumer loop surviving.
 11. A `tasks/get` materialized by replay yields the same terminal state and artifact set a

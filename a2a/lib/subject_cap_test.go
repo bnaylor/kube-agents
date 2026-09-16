@@ -11,8 +11,12 @@ package lib
 // back a short history indistinguishable from a real one.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,6 +87,53 @@ func TestAPerSubjectCapEvictsTheHeadAndTheFoldReportsIt(t *testing.T) {
 	if task.PostFinalDropped != 0 {
 		t.Errorf("PostFinalDropped = %d, want 0: eviction is not a post-final write", task.PostFinalDropped)
 	}
+
+	// The field on its own is not the deliverable. Nothing outside this
+	// package reads it, so a truncated replay is only observable if the
+	// replay path SAYS so — the same place PostFinalDropped is said.
+	logged, logs := replayLog(t, clientURL(s))
+	if _, err := logged.TasksGet(ctx, replayAddressee("task-cap"), "task-cap"); err != nil {
+		t.Fatalf("TasksGet through the logging client: %v", err)
+	}
+	line := logs.String()
+	if !strings.Contains(line, "a2a task replayed without its submitted event") {
+		t.Errorf("the replay of a truncated task logged nothing; the eviction is invisible to anyone not reading the struct\ngot:\n%s", line)
+	}
+	if !strings.Contains(line, "task-cap") || !strings.Contains(line, "opensAt=working") {
+		t.Errorf("the warning does not say which task or what it opens at, which is what makes it actionable\ngot:\n%s", line)
+	}
+}
+
+// replayLog is a client whose log lines a test can read.
+func replayLog(t *testing.T, url string) (*Client, *syncBuf) {
+	t.Helper()
+	buf := &syncBuf{}
+	c, err := Connect(testCtx(t), url,
+		WithName("replay-log-test"),
+		WithLogger(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(c.Close)
+	return c, buf
+}
+
+// syncBuf is a bytes.Buffer the client's own goroutines may also write to.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 // The control the test above needs to mean anything: the same three events on
@@ -104,6 +155,17 @@ func TestAnUncappedReplayKeepsItsHead(t *testing.T) {
 	}
 	if task.SubmittedMissing {
 		t.Error("SubmittedMissing is true on a complete replay")
+	}
+
+	// And the warning is conditional. A line that fires on every replay
+	// is noise an operator learns to filter, which costs the truncated
+	// case the only thing that makes it visible.
+	logged, logs := replayLog(t, clientURL(s))
+	if _, err := logged.TasksGet(ctx, replayAddressee("task-nocap"), "task-nocap"); err != nil {
+		t.Fatalf("TasksGet through the logging client: %v", err)
+	}
+	if strings.Contains(logs.String(), "replayed without its submitted event") {
+		t.Errorf("a complete replay warned anyway:\n%s", logs.String())
 	}
 }
 

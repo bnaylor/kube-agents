@@ -352,9 +352,14 @@ type TuningSpec struct {
 	// cannot hold the configured concurrency refuses a legitimate session's
 	// consumer create at load. That one is capacity, not a control - it is
 	// sized to fit this cap rather than to enforce it - and because
-	// provisioning never edits an existing stream, raising this field on a
-	// live install makes the provision Job fail with the `nats stream edit`
-	// it needs rather than letting the shortfall surface as a task failure.
+	// provisioning never edits an existing stream, an install whose TASKS
+	// stream is too small for the configured cap makes the provision Job
+	// fail, naming the `nats stream edit` it needs, rather than letting the
+	// shortfall surface later as a legitimate session's consumer create
+	// being refused and reported as a task failure. An operator upgrade
+	// reaches that as readily as an edit here does: a stream created before
+	// the derivation existed holds whatever it was created with, whatever
+	// this field says.
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.

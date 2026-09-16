@@ -30,7 +30,14 @@ type Task struct {
 	PostFinalDropped int
 	// SubmittedMissing reports that the first event folded was not a
 	// `submitted` status-update — assertion 9's observation, the sibling of
-	// PostFinalDropped for assertion 10, and surfaced the same way.
+	// PostFinalDropped for assertion 10.
+	//
+	// Surfaced like it but NOT counted like it: TasksGet logs it, and does
+	// not add it to protocolViolations. PostFinalDropped counts a publisher
+	// breaking the protocol; the common cause of this one is TASKS' own
+	// per-subject limit doing exactly what it was configured to do, and a
+	// counter that rises when our own retention policy works is a counter
+	// nobody can alert on.
 	//
 	// It exists because the head of a task's history can now go missing
 	// without anything else saying so. TASKS carries a per-subject message
@@ -275,6 +282,18 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		c.protocolViolations.Add(int64(task.PostFinalDropped))
 		c.log.Warn("a2a events after final dropped from fold",
 			"task", taskID, "dropped", task.PostFinalDropped)
+	}
+	if task.SubmittedMissing {
+		// Not a protocol violation and not counted as one — see the
+		// field. The line is the whole point of the field: without it a
+		// replay whose head was evicted is a short history that reads
+		// like a complete one.
+		opensAt := "<no status event>"
+		if len(task.StatusHistory) > 0 {
+			opensAt = string(task.StatusHistory[0])
+		}
+		c.log.Warn("a2a task replayed without its submitted event",
+			"task", taskID, "events", len(events), "opensAt", opensAt)
 	}
 	return task, nil
 }

@@ -45,12 +45,12 @@ window, not the delivery lifecycle. Concretely:
 
 Streams bind to the payload spec's subjects and topic classes:
 
-| Stream           | Subjects             | Retention                                   | Consumers                                                                                                                                                                                                                                                                                                                |
-| :--------------- | :------------------- | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), R3          | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events`, never a consume. |
-| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3               | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                              |
-| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject                                                                                                                                                                                                                                                                                                  |
-| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                          |                                                                                                                                                                                                                                                                                                                          |
+| Stream           | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                |
+| :--------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events`, never a consume. |
+| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                              |
+| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                  |
+| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                          |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -91,12 +91,35 @@ the terminal state survives, the beginning does not. That is only acceptable bec
 fold now says so. `lib.Task` carries `SubmittedMissing`, the assertion-9 observation and
 the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
 degradation a reader can see rather than a short history it cannot distinguish from a
-real one. On the number: 4096 is a 1GiB ceiling on one subject - the largest single
-event the worker adapter emits is one result chunk at 256KiB - a twentieth of the
-stream, while a chat-driven task emits single digits to low hundreds of events. The
+real one. On the number, sized against the publisher that means it rather than the
+well-behaved one: the render sets no `max_payload`, so NATS' 1MiB default is the
+per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - a fifth of
+the stream. The worker adapter's own result chunks are 256KiB, so a task built out of
+those reaches nearer 1GiB at the same count, but that is a property of one publisher and
+not a bound the bus enforces. A chat-driven task emits single digits to low hundreds of
+events; reaching 4096 is already a loop or a gigabyte of streamed artifact text. The
 alternative that would refuse the write instead of evicting the head, per-subject
 `discard: new`, is unavailable: JetStream only honours it under stream-wide `discard:
 new`, which contradicts the rule in the paragraph above.
+
+What an install that already has a `TASKS` stream gets from the cap is nothing, and the
+deployment says that rather than implying otherwise. Provisioning is create-only - the
+`stream info X || stream add X` guards never edit - so every limit this render has gained
+since an install's stream was created is absent from that stream, and a re-run does not
+add it. That is a property of the identity and not only of the script: the grant the
+callout mints for the provision principal is `$JS.API.STREAM.CREATE.<s>` and
+`$JS.API.STREAM.INFO.<s>` per stream and nothing else, so the Job could not edit a stream
+if it tried. Converging would mean adding `$JS.API.STREAM.UPDATE` to the one principal
+that runs unattended on every reconcile, next to the DELETE and PURGE that entry already
+refuses itself for the reason written beside them. The provision script's closing block
+reads the live stream back and reports the gap: it names the `nats stream edit` that
+closes it, and what the edit costs. Applying a per-subject cap is a tightening, and a
+tightening evicts on every subject already over the limit the moment it lands.
+Truncating a running install's task history as an automatic side effect of an operator
+upgrade is not a decision provisioning takes on an operator's behalf, so it reports and
+exits clean. The `max_consumers` gap in the same
+block is treated the other way - it refuses - because a short consumer budget is not a
+bound the install never had but a shortfall with a load-time failure already attached.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
@@ -277,7 +300,11 @@ Layout:
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
-  the derived budget); ack policy is
+  the derived budget. Because creates never edit, an install whose `maxSessions` already
+  exceeds what its stream holds is under-provisioned today, and the check is reached on
+  an operator upgrade alone with no CR edit involved - it runs last, after every other
+  stream and bucket, so the refusal leaves a fully provisioned bus short one limit rather
+  than a half-built one); ack policy is
   the same class of body field, so a hostile holder can create an explicit-ack consumer
   it holds no grant to ack - endless redeliveries, churn against the server, and an
   amplifier for the deliver-subject write below; within the four

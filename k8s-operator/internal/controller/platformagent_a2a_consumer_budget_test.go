@@ -18,9 +18,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/nats-io/nats.go/jetstream"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -68,7 +70,7 @@ func TestSessionConsumerCountMatchesTheA2AModule(t *testing.T) {
 	}
 
 	if len(roles.Elts) != a2aSessionConsumersPerSession {
-		t.Errorf("lib.SessionConsumerRoles has %d roles, a2aSessionConsumersPerSession says %d: TASKS would be sized for the wrong number of consumers per session. Update the constant (and the provision script's message, which quotes it).",
+		t.Errorf("lib.SessionConsumerRoles has %d roles, a2aSessionConsumersPerSession says %d: TASKS would be sized for the wrong number of consumers per session. Update the constant, the provision script's message, which quotes it, and docs/designs/spec-nats-deployment.md, which states it as 'a session pod creates three consumers there'.",
 			len(roles.Elts), a2aSessionConsumersPerSession)
 	}
 }
@@ -158,16 +160,19 @@ func streamAddInvocation(script, stream string) (string, bool) {
 	return "", false
 }
 
-// Proven by configuring it wrong: the script, executed, against a stream too
-// small for the CR that rendered it.
+// Proven by configuring it wrong: the script, executed, against a stream whose
+// limits are not the ones this render would have created.
 //
 // Provisioning is create-only convergence — the `stream info X || stream add X`
-// guards never edit a stream that already exists — so raising maxSessions on a
-// live install leaves TASKS at the cap it was created with. Without this check
-// the first symptom is a legitimate session's consumer create being refused at
-// load and surfacing as a task failure. With it, the provision Job fails, and a
-// failed provision Job is already on the CR.
-func TestProvisionRefusesATasksStreamTooSmallForMaxSessions(t *testing.T) {
+// guards never edit a stream that already exists — so every limit the render
+// has gained since an install's TASKS was created is absent from that install's
+// stream, and a re-run does not add it. The script's closing block is what an
+// operator hears about that, and the two limits get different treatment
+// because the two gaps are different: a short max_consumers is a capacity
+// shortfall whose only other symptom is a task failure, so it refuses; an
+// absent max_msgs_per_subject is a bound the install never had, and applying it
+// would evict, so it reports and exits clean.
+func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
 		// Not skipped: the script opens with `set -euo pipefail`, which
@@ -185,6 +190,7 @@ func TestProvisionRefusesATasksStreamTooSmallForMaxSessions(t *testing.T) {
 		liveJSON   string
 		wantExit   int
 		wantStderr []string
+		notStderr  []string
 	}{
 		{
 			name:       "a stream at the shipped cap cannot hold this CR",
@@ -193,28 +199,48 @@ func TestProvisionRefusesATasksStreamTooSmallForMaxSessions(t *testing.T) {
 			wantStderr: []string{"max_consumers=64", "needs 316", "nats stream edit TASKS --max-consumers=316"},
 		},
 		{
-			name:     "a stream sized for it passes",
-			liveJSON: `{"name":"TASKS","max_consumers":316,"max_msgs_per_subject":4096}`,
-			wantExit: 0,
+			name:      "a stream sized for it passes",
+			liveJSON:  `{"name":"TASKS","max_consumers":316,"max_msgs_per_subject":4096}`,
+			wantExit:  0,
+			notStderr: []string{"max_consumers", "max_msgs_per_subject"},
 		},
 		{
-			name:     "an operator who set it unlimited is not second-guessed",
-			liveJSON: `{"name":"TASKS","max_consumers":-1,"max_msgs_per_subject":4096}`,
-			wantExit: 0,
+			name:      "an operator who set it unlimited is not second-guessed",
+			liveJSON:  `{"name":"TASKS","max_consumers":-1,"max_msgs_per_subject":4096}`,
+			wantExit:  0,
+			notStderr: []string{"max_consumers", "max_msgs_per_subject"},
+		},
+		{
+			// The gap every install that predates this render is in. It
+			// is reported and named, and it is NOT applied: the edit
+			// evicts, and provisioning does not truncate a running
+			// install's history on an operator's behalf.
+			name:       "a stream that predates the per-subject cap is told, not edited",
+			liveJSON:   `{"name":"TASKS","max_consumers":-1,"max_msgs_per_subject":-1}`,
+			wantExit:   0,
+			wantStderr: []string{"max_msgs_per_subject=-1", "nats stream edit TASKS --max-msgs-per-subject=4096", "evicts"},
+			notStderr:  []string{"--max-consumers"},
 		},
 		{
 			// The property the comment beside the grep claims: a check
-			// whose extractor stops matching must fail, not skip.
-			name:       "an answer the extractor cannot read is a failure",
-			liveJSON:   `{"name":"TASKS","consumer_limit":64}`,
+			// whose extractor stops matching must fail, not skip. Once
+			// per limit — they are two greps.
+			name:       "an answer the consumer extractor cannot read is a failure",
+			liveJSON:   `{"name":"TASKS","consumer_limit":64,"max_msgs_per_subject":4096}`,
 			wantExit:   1,
 			wantStderr: []string{"could not read max_consumers"},
+		},
+		{
+			name:       "an answer the subject-cap extractor cannot read is a failure",
+			liveJSON:   `{"name":"TASKS","max_consumers":316,"per_subject_limit":4096}`,
+			wantExit:   1,
+			wantStderr: []string{"could not read max_msgs_per_subject"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			script := stageProvisionScript(t, dir, a2aProvisionScript(agent))
-			stubNats(t, dir, tc.liveJSON)
+			callLog := stubNats(t, dir, tc.liveJSON)
 
 			cmd := exec.Command(bash, script)
 			cmd.Env = append(os.Environ(),
@@ -242,11 +268,50 @@ func TestProvisionRefusesATasksStreamTooSmallForMaxSessions(t *testing.T) {
 					t.Errorf("stderr does not name %q; an operator cannot act on a refusal that does not say what to change\ngot:\n%s", want, stderr.String())
 				}
 			}
-			if tc.wantExit == 0 && strings.Contains(stderr.String(), "max_consumers") {
-				t.Errorf("a sufficient stream still produced a complaint:\n%s", stderr.String())
+			for _, unwanted := range tc.notStderr {
+				if strings.Contains(stderr.String(), unwanted) {
+					t.Errorf("stderr mentions %q, which this case is not about:\n%s", unwanted, stderr.String())
+				}
+			}
+
+			calls := readStubCalls(t, callLog)
+			// The guards guard: TASKS exists in every case here, so
+			// nothing may be created on top of it.
+			if strings.Contains(calls, "stream add TASKS") {
+				t.Errorf("the script created TASKS over a stream the stub reports as existing:\n%s", calls)
+			}
+			// And the refusal comes LAST. A check that exited in the
+			// middle of the script would leave a bus missing the
+			// streams and buckets below TASKS — a partially
+			// provisioned install is worse than an unprovisioned one,
+			// because it looks like neither.
+			for _, reached := range []string{
+				"stream info DIRECTORY",
+				"stream info TOPICS-STATE",
+				"stream info TOPICS-JOURNAL",
+				"kv info runtime-state",
+				"kv info session-state",
+				"kv info cap",
+			} {
+				if !strings.Contains(calls, reached) {
+					t.Errorf("the script exited before %q; the closing check must run after the rest of the bus is provisioned\ncalls:\n%s", reached, calls)
+				}
 			}
 		})
 	}
+}
+
+// readStubCalls returns everything the stubbed nats was asked to do, in order.
+func readStubCalls(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the stub call log: %v", err)
+	}
+	if len(b) == 0 {
+		t.Fatal("the stub was never invoked; this test would assert nothing")
+	}
+	return string(b)
 }
 
 // stageProvisionScript writes the script somewhere runnable, with the one
@@ -273,14 +338,18 @@ func stageProvisionScript(t *testing.T, dir, script string) string {
 
 // stubNats puts a `nats` on PATH that reports every stream and bucket as
 // already existing — the live-install shape, where the create-only guards all
-// short-circuit — and answers `stream info TASKS --json` with liveJSON.
-func stubNats(t *testing.T, dir, liveJSON string) {
+// short-circuit — and answers `stream info TASKS --json` with liveJSON. Every
+// invocation is appended to a log the caller reads, which is how the ordering
+// assertions below know how far the script got before it exited.
+func stubNats(t *testing.T, dir, liveJSON string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	log := filepath.Join(dir, "nats-calls.log")
 	stub := fmt.Sprintf(`#!/bin/sh
+echo "$*" >> %q
 for a in "$@"; do
   if [ "$a" = "--json" ]; then
     cat <<'JSON'
@@ -288,14 +357,51 @@ for a in "$@"; do
 JSON
     exit 0
   fi
-  if [ "$a" = "add" ]; then
-    echo "the stub reports every object as existing; a create here means a guard stopped guarding" >&2
-    exit 1
-  fi
 done
 exit 0
-`, liveJSON)
+`, log, liveJSON)
 	if err := os.WriteFile(filepath.Join(bin, "nats"), []byte(stub), 0o700); err != nil {
 		t.Fatal(err)
+	}
+	return log
+}
+
+// The envtest seed fixture says it is "the flags the script passes to natscli
+// translated to StreamConfig". This holds it to that for the two limits this
+// change put on TASKS.
+//
+// It is not decoration. Every A2A authz test in this package runs against the
+// bus a2aProvisionLikeTheScript seeds, so a fixture that has drifted from the
+// render is a suite proving things about a deployment nobody ships — and the
+// drift is invisible, because the fixture is valid NATS config either way.
+func TestTheSeedFixtureCarriesTheLimitsTheScriptRenders(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	add, ok := streamAddInvocation(script, "TASKS")
+	if !ok {
+		t.Fatal("the provision script no longer creates TASKS; this test reads its flags")
+	}
+
+	var tasks *jetstream.StreamConfig
+	for i, cfg := range a2aSeedStreamConfigs() {
+		if cfg.Name == "TASKS" {
+			tasks = &a2aSeedStreamConfigs()[i]
+		}
+	}
+	if tasks == nil {
+		t.Fatal("the seed fixture no longer carries TASKS")
+	}
+
+	for _, want := range []struct {
+		flag string
+		have int64
+	}{
+		{"--max-msgs-per-subject", tasks.MaxMsgsPerSubject},
+		{"--max-consumers", int64(tasks.MaxConsumers)},
+	} {
+		rendered := want.flag + "=" + strconv.FormatInt(want.have, 10)
+		if !strings.Contains(add, rendered) {
+			t.Errorf("the seed fixture sets %s but the script renders %q; the authz suite is seeded against a stream the deployment does not create",
+				rendered, add)
+		}
 	}
 }
