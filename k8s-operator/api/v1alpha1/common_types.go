@@ -334,7 +334,7 @@ type TuningSpec struct {
 	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
 	// preemption.
 	//
-	// The number lands in two places that deliberately differ. The gateway's
+	// The number lands in three places that deliberately differ. The gateway's
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
 	// delegation is refused with a chat reply naming the numbers, never queued,
 	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
@@ -346,7 +346,15 @@ type TuningSpec struct {
 	// bounds everything else in the namespace: an install whose namespace
 	// carries many non-session pods can see unrelated pod creation refused at
 	// admission before sessions reach this cap, and the headroom is an
-	// operator constant, not a CR field.
+	// operator constant, not a CR field. The third is the bus: the TASKS
+	// stream's max_consumers is provisioned from this number, because each
+	// session pod creates three named consumers there and a stream that
+	// cannot hold the configured concurrency refuses a legitimate session's
+	// consumer create at load. That one is capacity, not a control - it is
+	// sized to fit this cap rather than to enforce it - and because
+	// provisioning never edits an existing stream, raising this field on a
+	// live install makes the provision Job fail with the `nats stream edit`
+	// it needs rather than letting the shortfall surface as a task failure.
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
