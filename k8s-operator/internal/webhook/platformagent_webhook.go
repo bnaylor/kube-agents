@@ -170,11 +170,13 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		// 2b. Validate InitContainers security context
 		for i := range platformAgent.Spec.Deployment.InitContainers {
 			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.InitContainers[i].SecurityContext, depPath.Child("initContainers").Index(i))...)
+			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.InitContainers[i].VolumeMounts, depPath.Child("initContainers").Index(i))...)
 		}
 
 		// 2c. Validate Sidecars security context
 		for i := range platformAgent.Spec.Deployment.Sidecars {
 			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.Sidecars[i].SecurityContext, depPath.Child("sidecars").Index(i))...)
+			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.Sidecars[i].VolumeMounts, depPath.Child("sidecars").Index(i))...)
 		}
 
 		// 2d. Validate ExtraVolumes & SidecarVolumes (hostPath forbidden)
@@ -185,6 +187,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 					"hostPath volumes are forbidden for security reasons",
 				))
 			}
+			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
 			if vol.HostPath != nil {
@@ -193,6 +196,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 					"hostPath volumes are forbidden for security reasons",
 				))
 			}
+			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
 		}
 
 		// 2e. Validate ImagePullSecrets name a Secret, each of them exactly once.
@@ -277,6 +281,38 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return nil, nil
+}
+
+// validateReservedVolumeMounts refuses a user-authored container that mounts a
+// volume the operator renders for one specific container of its own. The only
+// member today is the projected bus token; agentv1alpha1.ReservedVolumeNames
+// says what that buys and why the render strips it as well as this rejecting
+// it.
+func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	for i, m := range mounts {
+		if _, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]; !reserved {
+			continue
+		}
+		errs = append(errs, field.Forbidden(
+			path.Child("volumeMounts").Index(i).Child("name"),
+			fmt.Sprintf("volume %q is rendered by the operator for a single container and may not be mounted here", m.Name),
+		))
+	}
+	return errs
+}
+
+// validateReservedVolumeName refuses a user-supplied volume that shadows one of
+// those names. Two volumes with one name is a Deployment server-side apply
+// rejects outright, so this is a wedged-reconcile guard as much as a credential
+// one.
+func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
+	if _, reserved := agentv1alpha1.ReservedVolumeNames[name]; !reserved {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(
+		path, fmt.Sprintf("volume name %q is reserved by the operator", name),
+	)}
 }
 
 func validateContainerSecurity(sc *corev1.SecurityContext, path *field.Path) field.ErrorList {

@@ -48,15 +48,59 @@ var SensitiveEnvVars = map[string]struct{}{
 	// spec.deployment.env[i].name.
 	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
 	"HERMES_HOME":                        {},
-	// The A2A bus wiring the operator renders under `mode: next`. NATS_PASSWORD
-	// arrives by SecretKeyRef, so the credential is in the container no matter
-	// what the address says: a CR-set NATS_URL would send the worker password
-	// to an address of the setter's choosing, in the CONNECT frame, in the
-	// clear. NATS_USER is here for the same reason at one remove — picking the
-	// identity picks which grants the connection gets.
-	"NATS_URL":      {},
-	"NATS_USER":     {},
-	"NATS_PASSWORD": {},
+	// The A2A bus wiring the operator renders under `mode: next`. The agent
+	// container's credential is a projected ServiceAccount token since A5, not
+	// a password, but the address is still the thing that decides who receives
+	// it: a CR-set NATS_URL would send the bearer token to a server of the
+	// setter's choosing, in the CONNECT frame, in the clear. The token is
+	// audience-bound so it does not authenticate anywhere else, but it still
+	// names this ServiceAccount to whoever catches it, and egress rule 7
+	// permits 443 to the internet whenever FQDN policy is off.
+	//
+	// A2A_BUS_USER picks the inbox prefix the client pins. It is not a
+	// credential — the grants come from the callout's answer about the
+	// ServiceAccount — so the failure it buys is denial rather than
+	// escalation: a wrong value connects and then times out on every reply.
+	// Reserved anyway, because a control whose subject can silently break it
+	// is the same argument as the one below.
+	//
+	// NATS_USER and NATS_PASSWORD are no longer rendered into the agent
+	// container and stay reserved regardless. The Hermes bridge sidecar still
+	// authenticates with both, and a spec.deployment.env entry is the wrong
+	// place to decide which identity anything in this pod connects as.
+	// A2A_BUS_TOKEN_FILE is the same argument one step stronger: it names the
+	// file the client reads and presents as its bearer token, and the client
+	// prefers an explicitly set value over the projected path with no
+	// fallback. Denial rather than escalation again — a forged file is not
+	// audience-bound to `a2a-bus`, and automountServiceAccountToken is false
+	// so there is no other real token in the container to redirect to — but
+	// the operator never sets it, so a spec.deployment.env entry naming it is
+	// never anything but an override of the projection.
+	"A2A_BUS_TOKEN_FILE": {},
+	"A2A_BUS_USER":       {},
+	"NATS_URL":           {},
+	"NATS_USER":          {},
+	"NATS_PASSWORD":      {},
+}
+
+// ReservedVolumeNames defines pod volume names the operator renders itself and
+// a user-authored container must not mount or shadow.
+//
+// The same two-layer shape as SensitiveEnvVars above, and for the same reason:
+// the validating webhook rejects a spec.deployment sidecar, init container or
+// volume that names one of these, and buildPodTemplateSpec strips it. The
+// webhook alone is not enough because the chart's default failurePolicy is
+// Ignore; the strip is what holds, and the rejection is what says why.
+//
+// One member so far. `a2a-bus-token` is the projected ServiceAccount token the
+// platform-agent container presents to the bus under `mode: next`, and it is
+// that container's alone — the auth callout resolves the POD's ServiceAccount,
+// so a sidecar mounting this token is a second workload wearing the agent's bus
+// identity. A sidecar that also holds bridge-password would hold the union of
+// the two grant sets, which is the retired `worker` credential rebuilt out of a
+// volumeMount. See a2aStripBusTokenMounts.
+var ReservedVolumeNames = map[string]struct{}{
+	"a2a-bus-token": {},
 }
 
 type HermesSpec struct {

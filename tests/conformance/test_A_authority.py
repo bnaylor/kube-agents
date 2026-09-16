@@ -367,12 +367,17 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """Each `...Identity` builder's publish list, keyed by NATS user.
 
         The second element says whether the list was read in full. Most
-        builders return a struct literal, which is exact; `worker` and `seed`
-        assemble theirs in a local variable and append a shared helper whose
-        entries are Go constant concatenations (`"$JS.API.STREAM.INFO." +
-        a2aTasksStream`). Evaluating those here would be reimplementing the
-        compiler in a test, so those are reported as partial and the served
-        config below is what the assertions actually read for them.
+        builders return a struct literal, which is exact. The rest assemble
+        theirs in a local variable and append a shared helper whose entries are
+        Go constant concatenations (`"$JS.API.STREAM.INFO." + a2aTasksStream`);
+        `_resolve_expr` evaluates those, so a builder is partial only when
+        something it appends is genuinely beyond a regex -- `seed` builds its
+        list in a `for` loop over another slice, and that one stays partial with
+        the served config below as what the assertions read for it.
+
+        Resolving rather than shrugging is not tidiness. A callout principal
+        appears in NO served config, so "partial" for one of those is a list
+        with nothing to fall back to; `agent` arrived in exactly that state.
 
         What this must never do is report a list it could not read as empty.
         It did, and an empty list satisfies every writer-set assertion in this
@@ -385,7 +390,18 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             body = h.go_function_body(source, builder)
             user = re.search(r'user:\s*"([^"]+)"', body)
             if user is None:
-                raise AssertionError(f"{builder} renders no user name")
+                # A5's two halves of the old `worker` name themselves through
+                # constants, because the operator renders one of them into an
+                # env var the `a2a` CLI reads back. Resolve the constant out of
+                # the same file rather than reporting the builder as nameless.
+                ref = re.search(r"user:\s*(a2a\w+),", body)
+                if ref is None:
+                    raise AssertionError(f"{builder} renders no user name")
+                user = re.search(rf'\n\t{ref.group(1)} = "([^"]+)"', source)
+                if user is None:
+                    raise AssertionError(
+                        f"{builder} names its user through {ref.group(1)}, which this file does not declare"
+                    )
             field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
             if field is None:
                 grants[user.group(1)] = ([], True)
@@ -403,8 +419,123 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 # Comments inside these blocks quote the very subjects they
                 # explain the absence of, so they are stripped before reading.
                 bare = [re.sub(r"//[^\n]*", "", r) for r in regions]
-                grants[user.group(1)] = ([g for r in bare for g in re.findall(r'"([^"]+)"', r)], False)
+                read = [g for r in bare for g in re.findall(r'"([^"]+)"', r)]
+                resolved, complete = cls._resolve_local_publish(body, name)
+                if complete:
+                    # Every literal the naive scan saw must survive into the
+                    # resolved reading -- as a whole grant, or as a piece of
+                    # one, since resolving is exactly what joins `"a2a.tasks."`
+                    # and `".*.events"` around a constant. A literal in neither
+                    # place means the resolver skipped a line, and calling that
+                    # result complete would be the vacuous reading this method
+                    # exists to prevent.
+                    missing = [g for g in read if not any(g in r for r in resolved)]
+                    if missing:
+                        raise AssertionError(
+                            f"{builder}: resolving `{name}` lost {missing}; the resolver is not reading every append"
+                        )
+                    grants[user.group(1)] = (resolved, True)
+                else:
+                    grants[user.group(1)] = (read, False)
         return grants
+
+    @staticmethod
+    def _go_string_consts(*sources: str) -> dict[str, str]:
+        """Every `name = "value"` string constant declared in these files."""
+        consts: dict[str, str] = {}
+        for text in sources:
+            for name, value in re.findall(
+                r"^(?:const )?\t?(\w+)\s*=\s*[\"`]([^\"`]*)[\"`]", text, re.MULTILINE
+            ):
+                consts[name] = value
+        return consts
+
+    @classmethod
+    def _resolve_expr(cls, expr: str, consts: dict[str, str]) -> str | None:
+        """A Go string expression: literals and declared constants, `+`-joined."""
+        out = []
+        for part in expr.split("+"):
+            part = part.strip()
+            if not part:
+                return None
+            if part[0] in "\"`" and part[-1] == part[0]:
+                out.append(part[1:-1])
+            elif part in consts:
+                out.append(consts[part])
+            else:
+                return None
+        return "".join(out)
+
+    @classmethod
+    def _resolve_local_publish(cls, body: str, name: str) -> tuple[list[str], bool]:
+        """`name := []string{...}` plus every `name = append(name, ...)`, resolved.
+
+        Returns the grants and whether every line was understood. Anything it
+        cannot read makes the whole reading partial -- never a shorter list
+        reported as the truth.
+        """
+        consts = cls._go_string_consts(h.text("a2a_identities"), h.text("a2a_jetstream_grants"))
+        text = re.sub(r"//[^\n]*", "", body)
+        grants: list[str] = []
+        complete = True
+
+        head = re.search(rf"\n\t{name} := \[\]string\{{(.*?)\n\t\}}", text, re.DOTALL)
+        if head is None:
+            return [], False
+        for element in head.group(1).split(","):
+            if element.strip():
+                value = cls._resolve_expr(element, consts)
+                if value is None:
+                    complete = False
+                else:
+                    grants.append(value)
+
+        appends = re.findall(rf"^\t{name} = append\({name},\s*(.*?),?\s*\)$", text, re.MULTILINE | re.DOTALL)
+        if len(appends) != text.count(f"{name} = append("):
+            # A line the scan did not see is a grant silently dropped from a
+            # list this method is about to call complete.
+            return grants, False
+        for arg in appends:
+            call = re.fullmatch(r"(\w+)\(\)\.\.\.", arg.strip())
+            if call is not None:
+                appended, whole = cls._resolve_grant_helper(call.group(1), consts)
+                grants.extend(appended)
+                complete = complete and whole
+                continue
+            for element in arg.split(","):
+                if not element.strip():
+                    continue
+                value = cls._resolve_expr(element, consts)
+                if value is None:
+                    complete = False
+                else:
+                    grants.append(value)
+        return grants, complete
+
+    @classmethod
+    def _resolve_grant_helper(cls, func: str, consts: dict[str, str]) -> tuple[list[str], bool]:
+        """A `func x() []string` whose body is one `return []string{...}`."""
+        body = re.sub(r"//[^\n]*", "", h.go_function_body(h.text("a2a_jetstream_grants"), func))
+        block = re.search(r"return \[\]string\{(.*?)\n\t\}", body, re.DOTALL)
+        if block is None:
+            return [], False  # seed's, which builds its list in a loop
+        # A helper may name a stream once in a local before using it three
+        # times; those are as much a part of the list as the constants are.
+        consts = dict(consts)
+        for local, expr in re.findall(r"\n\t(\w+) := ([^\n]+)", body):
+            value = cls._resolve_expr(expr, consts)
+            if value is not None:
+                consts[local] = value
+        out, complete = [], True
+        for element in block.group(1).split(","):
+            if not element.strip():
+                continue
+            value = cls._resolve_expr(element, consts)
+            if value is None:
+                complete = False
+            else:
+                out.append(value)
+        return out, complete
 
     @classmethod
     def _conf_publish_grants(cls) -> dict[str, list[str]]:
@@ -471,7 +602,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "worker", "web", "seed", "provision"):
+        for user in ("gateway", "agent", "bridge", "web", "seed", "provision"):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
@@ -569,23 +700,24 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "the requester can no longer write the in subject; the probe below is then vacuous",
         )
 
-    @h.known_violation("A3", "round_2/a2-followon-launch.md A5 (F-2); gke-labs/kube-agents#1316")
     def test_A3_the_events_subject_has_no_rendered_writer(self) -> None:
-        """KNOWN VIOLATION. The static `worker` still writes every executor's `…events`.
+        """A chat session's `…events` has no writer in the rendered map at all.
 
-        After the split the only legitimate writer of a task's `…events` is
-        its executor, whose grant is derived per session and appears in no
-        map -- so the rendered map should hold NO principal whose publish
-        grant reaches the subject. `worker` does: `a2a.tasks.*.*.events` for
-        every addressee, the shared credential the Hermes bridge sidecar
-        still authenticates with. The wildcard is over the ADDRESSEE token, so
-        it reaches a chat session's `…events` exactly as it reaches a
-        profile's: the callout's per-session derivation bounds what a session
-        can forge -- it cannot write another session's subject -- but it takes
-        no writer away from `worker`, so no addressee's `…events` is
-        decision-grade for a consumer until A5 retires the user.
+        The only legitimate writer of a task's `…events` is its executor,
+        whose grant is derived per session and appears in no map -- so the
+        rendered map should hold NO principal whose publish grant reaches the
+        subject. This was a known violation for as long as the shared `worker`
+        credential existed: its `a2a.tasks.*.*.events` wildcarded the ADDRESSEE
+        token, so it reached a chat session's `…events` exactly as it reached a
+        profile's, and the callout's per-session derivation bounded what a
+        session could forge without taking that writer away.
 
-        Deleting this decorator is the signal A5 landed.
+        Retiring `worker` closes it. The static half went to `bridge`, whose
+        grant names its one addressee literally (`a2a.tasks.platform.*.events`)
+        and so does not reach the probe; the callout half went to `agent`,
+        which holds no task-plane publish of any kind. What the probe asserts
+        is the general property rather than the absence of those two, so a
+        third principal granted the old wildcard is a red test.
         """
         writers = sorted(
             builder

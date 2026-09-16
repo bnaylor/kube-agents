@@ -1113,12 +1113,14 @@ Mutation(
     Mutation(
         "A3-second-supervisor-writer",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",',
-         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"$KV.runtime-state.>",'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
-        "grant the static worker publish on the supervisor subject, the shape "
-        "a bridge-side janitor written against the shared credential would "
-        "take. The subject then no longer says who wrote there",
+        "grant the static bridge publish on the supervisor subject, the shape "
+        "a bridge-side janitor would take -- finalising a task it executed "
+        "reads like the executor's own business. The subject then no longer "
+        "says who wrote there. Retargeted from `worker` when A5 retired that "
+        "user; the static credential it names is the half the bridge inherited",
     ),
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
@@ -1140,6 +1142,72 @@ Mutation(
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
         "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
+        "A3-bridge-events-grant-rewildcarded",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('"a2a.tasks." + a2aBridgeAddressee + ".*.events",',
+         '"a2a.tasks.*.*.events",'),
+        "test_A3_the_events_subject_has_no_rendered_writer",
+        "put the addressee wildcard back on the bridge's events grant, which "
+        "is what `worker` held and the one edit that reopens the violation A5 "
+        "closed. It reads as a generalisation -- one bridge build serving any "
+        "addressee -- and it costs every chat session's `…events` its writer "
+        "set, so a forged terminal from the shared credential is "
+        "indistinguishable from the executor's on replay",
+    ),
+    Mutation(
+        "C1-bus-user-env-renamed-on-one-side",
+        "a2a/lib/credentials.go",
+        ('EnvBusUser = "A2A_BUS_USER"', 'EnvBusUser = "A2A_BUS_PRINCIPAL"'),
+        "test_C1_the_agent_containers_bus_identity_env_is_spelled_the_same_in_both_modules",
+        "rename the bus identity env var in a2a/lib without touching the "
+        "operator that renders it -- the shape a rename takes when the two "
+        "literals live in modules that cannot import each other. Both modules "
+        "build, both test suites stay green, and the agent container starts "
+        "connecting with no inbox prefix: authenticated, and then timing out "
+        "on every JetStream reply with no permission error it can see",
+    ),
+    Mutation(
+        "C1-bus-token-path-moved-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ('a2aBusTokenPath      = "/var/run/secrets/a2a-bus"',
+         'a2aBusTokenPath      = "/var/run/secrets/kubeagents/a2a-bus"'),
+        "test_C1_the_bus_token_path_and_audience_agree_across_the_module_boundary",
+        "tidy the projected token under a vendor-prefixed directory, touching "
+        "only the module that renders the mount. The client half of the "
+        "contract lives in a2a/lib and is not rebuilt by this edit, so it keeps "
+        "os.Stat-ing the old path, finds nothing, and falls back to a password "
+        "this change stopped rendering -- an agent container that offers the "
+        "empty string to the callout and loses the bus entirely, with both Go "
+        "suites green because no test binary links both modules",
+    ),
+    Mutation(
+        "C1-agent-principal-gets-a-static-password",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\tuser:           a2aAgentBusUser,',
+         '\t\tuser:           a2aAgentBusUser,\n\t\tcredsKey:       a2aBridgePasswordKey,'),
+        "test_C1_the_agent_container_holds_no_static_bus_password",
+        "give the agent's callout principal a Secret key as well, so the same "
+        "name is answered for by both the callout and nats.conf's auth_users "
+        "exemption and a client is authenticated by whichever path it happened "
+        "to take. This is how the retired `worker` credential comes back: one "
+        "field, added by someone wiring up a local test that could not present "
+        "a token",
+    ),
+    Mutation(
+        "C1-bridge-principal-keyed-on-a-service-account",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\tuser:     a2aBridgeUser,',
+         '\t\tuser:     a2aBridgeUser,\n'
+         '\t\tserviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),'),
+        "test_C1_the_agent_container_holds_no_static_bus_password",
+        "move the bridge sidecar onto the callout, which reads as tightening "
+        "and is the exact opposite. A sidecar shares its pod's ServiceAccount, "
+        "so the bridge's entry and the agent's would key on one username and "
+        "each workload would hold the union of the two grant sets -- the task "
+        "plane and the blackboard in one credential, which is `worker` rebuilt "
+        "by the mechanism meant to retire it",
     ),
     Mutation(
         "harness-fixture-emptied",

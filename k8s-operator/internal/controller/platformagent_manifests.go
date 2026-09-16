@@ -1893,6 +1893,20 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		extraVolumes = agent.Spec.Deployment.ExtraVolumes
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
+	// Everything above is user-authored and copied verbatim, and under `next`
+	// the pod carries a projected bus token that belongs to the platform-agent
+	// container alone. Take the mount away from anything else that names it,
+	// before the operator's own containers join the slices -- see
+	// a2aStripBusTokenMounts for what a sidecar holding it would be. Gated on
+	// the surface for the same reason the plugin env drop is: on a today
+	// install there is no such volume, and dropping a name only the next stack
+	// cares about would be one more way to tell the feature exists.
+	if a2aAgentSurface(agent) {
+		initContainers = a2aStripBusTokenMounts(initContainers)
+		sidecars = a2aStripBusTokenMounts(sidecars)
+		sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
+		extraVolumes = a2aStripBusTokenVolume(extraVolumes)
+	}
 
 	homeDir := "/opt/data"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
@@ -2200,10 +2214,25 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// surface rather than unconditional so a today install's plugin env is
 		// untouched — dropping a name only the next stack cares about would be
 		// one more way to tell the feature exists.
+		//
+		// NATS_USER and NATS_PASSWORD are not appended any more — A5 moved this
+		// container onto a projected token — so the duplicate-key argument does
+		// not reach them and a different one does: the `a2a` CLI falls back to
+		// user/password when no bus token is readable, so a plugin that set
+		// them would be choosing the identity this container connects as. They
+		// are in SensitiveEnvVars for the CR's own env; this is the same refusal
+		// one layer out, where the webhook does not look.
+		//
+		// A2A_BUS_TOKEN_FILE is dropped for the stronger version of that: the
+		// operator never renders it, the client prefers it over the projected
+		// path with no fallback, and a plugin that set it would choose which
+		// file this container presents as its bearer token.
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
+				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
+					e.Name == a2aBusTokenFileEnv ||
+					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
 				}
 				kept = append(kept, e)
@@ -2287,34 +2316,40 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
-	// The A2A bus, under `next` only: address and credentials for the worker
-	// user, whose grants fit an agent-side reader — subscribe on a2a.topics.>,
-	// publish on the provisioned topics. From the same Secret the A2A gateway
-	// reads, and container env only: a copy in a profile .env on the PVC would
-	// be a second place to rotate and a first place to leak. A bridge sidecar
-	// declared in spec.deployment.sidecars shares the pod and declares the
-	// same three against the same Secret, so this is one Secret seam, not two.
+	// The A2A bus, under `next` only: the address, and the name this container
+	// authenticates as. There is no password here since A5. The credential is
+	// the projected ServiceAccount token mounted below, the callout resolves it
+	// against the cluster, and the grants it gets back are agentIdentity's —
+	// the blackboard and nothing else. What this replaced was NATS_USER=worker
+	// and a worker-password SecretKeyRef: a static credential, shared with the
+	// bridge sidecar, carrying publish on every addressee's task events.
 	//
-	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
-	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
-	// lands in the container whatever the address says; if a plugin could set
-	// NATS_URL, the client would hand the worker password to an address of the
-	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
-	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
-	// cluster. It cannot: the three names are dropped from plugin env above
-	// while the surface is up, and they are in SensitiveEnvVars so the CR's
-	// own spec.deployment.env cannot reach them either. Found by adversarial
-	// review before this shipped.
+	// A2A_BUS_USER is not decoration and not a second copy of a secret. A
+	// callout principal's grants carry its own inbox prefix (_INBOX.agent.>),
+	// and a client that does not pin a matching prefix authenticates fine and
+	// then hangs on every JetStream reply — the failure shape W6 found twice.
+	// The operator renders the name and the client reads it back, so the two
+	// cannot drift; the provision Job does the same thing with a literal in its
+	// script.
 	//
-	// The SecretKeyRef is Optional, and that is what keeps the skew branch of
-	// a2aAgentSurface inert rather than fatal: on a today-lineage install that
-	// hit skew the creds Secret has never existed, and a required ref there
-	// would roll the pod (strategy Recreate) into CreateContainerConfigError —
-	// a full agent outage bought by a helper that exists to prevent one. With
-	// Optional the kubelet omits the variable when the Secret is absent and
-	// injects it when a frozen next stack's Secret exists, which is the freeze
-	// the helper promises. Under plain next the Secret is reconciled into
-	// existence before anything dials, so Optional costs nothing there.
+	// APPENDED AFTER THE PLUGIN MERGE, and the reason survives the move off a
+	// password. A plugin that could set NATS_URL would point this container's
+	// bus client at an address of its choosing, and egress rule 7 permits 443
+	// to the internet whenever FQDN policy is off. A bearer token in a CONNECT
+	// frame to an attacker's server is the same exfiltration the password was;
+	// it is audience-bound, so it does not authenticate anywhere else, but it
+	// still names this ServiceAccount to whoever catches it. So the names stay
+	// dropped from plugin env above while the surface is up, and stay in
+	// SensitiveEnvVars so the CR's own spec.deployment.env cannot reach them.
+	//
+	// Nothing here is Optional any more and nothing needs to be, which is the
+	// one thing the token makes simpler: the skew branch of a2aAgentSurface
+	// used to need Optional on the SecretKeyRef so a today-lineage install that
+	// hit skew would not roll the pod into CreateContainerConfigError against a
+	// Secret that had never existed. A projected token volume has no such
+	// failure — the kubelet mints it from the pod's own ServiceAccount, which
+	// exists on every lineage — so the freeze the helper promises costs two
+	// inert env vars and a mount.
 	if a2aAgentSurface(agent) {
 		envVars = append(envVars,
 			corev1.EnvVar{
@@ -2322,16 +2357,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
 			},
 			corev1.EnvVar{
-				Name:  "NATS_USER",
-				Value: "worker",
-			},
-			corev1.EnvVar{
-				Name: "NATS_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-					Key:                  "worker-password",
-					Optional:             ptr.To(true),
-				}},
+				Name:  a2aBusUserEnv,
+				Value: a2aAgentBusUser,
 			},
 		)
 	}
@@ -2433,6 +2460,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
 		Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
 	})
+	// The bus credential, under `next` only. Into the agent container alone and
+	// never into a sidecar: the pod's ServiceAccount is what the callout
+	// resolves, so a sidecar holding this token would be a second workload
+	// wearing the agent's identity, and the split A5 made would be undone by a
+	// volumeMount. The bridge sidecar authenticates with its own password for
+	// exactly that reason — see bridgeIdentity.
+	if a2aAgentSurface(agent) {
+		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2478,6 +2514,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// watcher here, and so does the token the agent presents across the network.
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	if a2aAgentSurface(agent) {
+		volumes = append(volumes, a2aBusTokenVolumeSource())
+	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -153,6 +154,71 @@ func a2aBusTokenVolumeSource() corev1.Volume {
 
 func a2aBusTokenVolumeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aBusTokenVolume, MountPath: a2aBusTokenPath, ReadOnly: true}
+}
+
+// a2aStripBusTokenMounts removes a mount of the projected bus token from
+// user-authored containers.
+//
+// The token belongs to the platform-agent container and to nothing else in the
+// pod. That is the whole A5 split: the callout resolves the pod's
+// ServiceAccount, so a second container holding this token is a second workload
+// wearing the `agent` identity, and one that also holds bridge-password holds
+// the union of the two grant sets -- `worker` rebuilt out of a volumeMount.
+// Reachable in an ordinary CR: spec.deployment.sidecars and .initContainers are
+// copied verbatim, the volume is in the pod under `next`, and the bridge image
+// is built FROM the platform-agent image (a2a/docs/hermes-bridge.md) so it
+// already ships the client that would read it.
+//
+// Stripped rather than rejected, for the reason SensitiveEnvVars gives one
+// field over: the validating webhook's chart default failurePolicy is Ignore,
+// so an unreachable webhook admits the object with validation skipped. The
+// webhook's refusal is what tells the author why; this is what holds.
+//
+// The input slices belong to the CR, so the copy is not incidental.
+func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
+	mountsIt := func(c corev1.Container) bool {
+		return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			return m.Name == a2aBusTokenVolume
+		})
+	}
+	if !slices.ContainsFunc(containers, mountsIt) {
+		return containers
+	}
+	out := slices.Clone(containers)
+	for i := range out {
+		if !mountsIt(out[i]) {
+			continue
+		}
+		keep := make([]corev1.VolumeMount, 0, len(out[i].VolumeMounts))
+		for _, m := range out[i].VolumeMounts {
+			if m.Name == a2aBusTokenVolume {
+				continue
+			}
+			keep = append(keep, m)
+		}
+		out[i].VolumeMounts = keep
+	}
+	return out
+}
+
+// a2aStripBusTokenVolume removes a user-supplied volume that shadows the
+// projected bus token's name. Two reasons, and the second holds even if the
+// first is someone's honest mistake: a Secret or hostPath volume under this
+// name is a token of the author's choosing presented as the pod's, and two
+// volumes with one name is a Deployment server-side apply refuses outright,
+// which wedges every reconcile of the CR with nothing in status to say why.
+func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
+	if !slices.ContainsFunc(volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume }) {
+		return volumes
+	}
+	keep := make([]corev1.Volume, 0, len(volumes))
+	for _, v := range volumes {
+		if v.Name == a2aBusTokenVolume {
+			continue
+		}
+		keep = append(keep, v)
+	}
+	return keep
 }
 
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not

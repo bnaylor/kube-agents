@@ -486,6 +486,48 @@ func TestPlatformAgentValidation(t *testing.T) {
 		assertFieldError(t, err, "spec.deployment.sidecarVolumes[0].hostPath")
 	})
 
+	// The projected bus token is the platform-agent container's alone -- the
+	// auth callout resolves the POD's ServiceAccount, so a sidecar holding it
+	// is a second workload wearing the agent's bus identity, and one that also
+	// holds bridge-password holds the union of the two grant sets. The render
+	// strips the mount (TestUserAuthoredContainersCannotMountTheBusToken);
+	// this is the half that tells the author why, and the half that does not
+	// run when failurePolicy: Ignore meets an unreachable webhook.
+	t.Run("fails if a user-authored container mounts a reserved volume", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		mount := corev1.VolumeMount{Name: "a2a-bus-token", MountPath: "/var/run/secrets/a2a-bus"}
+
+		for _, tc := range []struct {
+			name string
+			dep  *agentv1alpha1.DeploymentSpec
+			path string
+		}{
+			{"sidecar", &agentv1alpha1.DeploymentSpec{
+				Sidecars: []corev1.Container{{Name: "bridge", VolumeMounts: []corev1.VolumeMount{mount}}},
+			}, "spec.deployment.sidecars[0].volumeMounts[0].name"},
+			{"init container", &agentv1alpha1.DeploymentSpec{
+				InitContainers: []corev1.Container{{Name: "peek", VolumeMounts: []corev1.VolumeMount{mount}}},
+			}, "spec.deployment.initContainers[0].volumeMounts[0].name"},
+			{"sidecar volume shadowing the name", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "a2a-bus-token"}},
+			}, "spec.deployment.sidecarVolumes[0].name"},
+			{"extra volume shadowing the name", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{Name: "a2a-bus-token"}},
+			}, "spec.deployment.extraVolumes[0].name"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{Deployment: tc.dep},
+					},
+				}
+				_, err := val.ValidateCreate(ctx, agent)
+				assertFieldError(t, err, tc.path)
+			})
+		}
+	})
+
 	t.Run("fails if privileged service account is specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 

@@ -174,8 +174,10 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // The residue, asserted so it cannot grow quietly. Each of these has a reason
 // recorded at its definition, and the reasons are not the same kind of thing:
 // web can never present a ServiceAccount token because a browser has none;
-// worker has no identity to present because session pods are spawned without
-// one; sys is a human; gateway could move today but its client program lands
+// bridge has a ServiceAccount and still cannot use it, because it is a sidecar
+// in the agent pod and a token names a pod rather than a container — a callout
+// entry would hand it the agent container's grants as well, which is the union
+// A5 broke up; sys is a human; gateway could move today but its client program lands
 // separately from this render, so moving the identity first would refuse it at
 // connect on every install; and seed is applied rather than rendered, so
 // dropping its user would break an object already running on installs today. A
@@ -186,7 +188,7 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	for _, id := range staticIdentities(identityTestAgent()) {
 		got = append(got, id.user)
 	}
-	want := []string{"gateway", "worker", "seed", "web", "sys"}
+	want := []string{"gateway", a2aBridgeUser, "seed", "web", "sys"}
 	if !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
 	}
@@ -200,9 +202,13 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 // moment the map is served. If nothing renders an a2a-bus token for that
 // account, the grant is not documentation of a future client — it is a standing
 // authorization waiting for one, in the file that is supposed to record who
-// actually authenticates. This branch had exactly that: an `agent` principal
-// keyed on the platform agent's ServiceAccount, whose only bus client is the
-// Hermes bridge sidecar authenticating as static `worker`.
+// actually authenticates. This file had exactly that before A5: an `agent`
+// principal keyed on the platform agent's ServiceAccount whose only bus client
+// was the Hermes bridge sidecar, authenticating as static `worker` — so the
+// entry authorized nobody and was withdrawn. It is back, and the answer is real
+// now: buildAgentDeployment mounts a2aBusTokenVolumeSource into the
+// platform-agent container, and the `a2a` CLI reads it (a2a/cmd/a2a/main.go,
+// connect).
 //
 // So the set is pinned by name rather than by shape. Adding a principal here
 // means saying, at review, which rendered workload presents its token.
@@ -222,7 +228,7 @@ func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 			got = append(got, id.user)
 		}
 	}
-	want := []string{"provision", "session"}
+	want := []string{"provision", "session", a2aAgentBusUser}
 	if !slices.Equal(got, want) {
 		t.Errorf("callout principals = %v, want %v.\nA new callout principal needs a rendered workload that mounts an a2a-bus token for its ServiceAccount (a2aBusTokenVolumeSource / a2aBusTokenVolumeMount). Without one the entry authorizes nobody and misreports who authenticates.", got, want)
 	}
@@ -253,8 +259,9 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // set, which is what this is. Seed came off the list the same way, in
 // gke-labs#1306: its $JS.API grant is now a2aSeedJetStreamGrants(), CREATE and
 // INFO on the streams provisioning names. Worker came off it in #1393, the same
-// way: a2aWorkerJetStreamGrants(), INFO/CONSUMER/DIRECT.GET on the four streams
-// it touches. Gateway is the last one, and it is the one that cannot narrow on
+// way, and A5 then split that list in two: a2aBridgeJetStreamGrants() on TASKS
+// and the runtime-state bucket, a2aAgentJetStreamGrants() on the two topic
+// streams and nothing else. Gateway is the last one, and it is the one that cannot narrow on
 // this branch's terms -- it has no client presenting a token yet.
 //
 // Failing here means one of two things and they want opposite responses. An
@@ -318,12 +325,19 @@ func TestTheSessionPrincipalIsNarrowedAndOtherwiseEmpty(t *testing.T) {
 	}
 }
 
-// No session pod may be handed the shared worker password again. This is the
+// No session pod may be handed a shared static password again. This is the
 // regression that gke-labs#1270 is about, asserted at the render.
-func TestNoSessionPrincipalSharesTheWorkerCredential(t *testing.T) {
+//
+// Written against any credsKey rather than against the one name it used to be:
+// A5 retired `worker-password`, and a test that named it would have gone
+// vacuous at that rename while still reporting a pass.
+func TestNoSessionPrincipalSharesAStaticCredential(t *testing.T) {
 	for _, id := range a2aIdentities(identityTestAgent()) {
-		if id.user == "session" && id.credsKey == "worker-password" {
-			t.Fatal("the session principal was given the worker password back")
+		if id.user != "session" {
+			continue
+		}
+		if id.credsKey != "" || id.auth != a2aAuthCallout {
+			t.Fatalf("the session principal reads static credential %q (auth %v); it must be callout-issued", id.credsKey, id.auth)
 		}
 	}
 }
@@ -342,10 +356,12 @@ func TestNoSessionPrincipalSharesTheWorkerCredential(t *testing.T) {
 //     executor would forge.
 //   - The gateway reads both, because its relay folds the pair.
 //
-// What is NOT asserted, and why: that `…events` has no writer beyond the
-// executor. The static `worker` still holds `a2a.tasks.*.*.events` for every
-// addressee until A5 retires it (gke-labs#1316), and that gap is recorded as a
-// known violation in tests/conformance rather than papered over here.
+// What is NOT asserted here, and why: that `…events` has no writer beyond the
+// executor. That is a statement about the whole rendered principal set rather
+// than about the supervisor split, and it is asserted in tests/conformance,
+// where it was a known violation until this change retired `worker`. The
+// bridge that inherits the static half publishes `…events` for its own
+// addressee only, so it does not reach another addressee's.
 func TestTheSupervisorSubjectHasExactlyOneWriterAndItIsNotAnEventsWriter(t *testing.T) {
 	const (
 		supervisorProbe = "a2a.tasks.chat-otter-1a2b.task-0001.supervisor"
@@ -409,5 +425,99 @@ func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
 	t.Setenv("A2A_STRICT_EVENTS_WRITER", "TRUE")
 	if got := strictEnv().Value; got != "false" {
 		t.Errorf("a near-miss value tightened the check: %q", got)
+	}
+}
+
+// The credential A5 retired, refused by name at the render.
+//
+// Three routes could bring it back and two of them would be quiet. A
+// `worker-password` key in a2aCredsKeys puts the password back in the Secret
+// with nothing reading it; an identity named `worker` puts the user back in
+// nats.conf or in the map; and either one alone becomes a working shared
+// credential the moment the other appears. So all three are checked, and
+// against the strings rather than against a deleted symbol — a deleted symbol
+// is exactly what a re-add restores.
+func TestTheWorkerCredentialIsGone(t *testing.T) {
+	agent := identityTestAgent()
+	for _, id := range a2aIdentities(agent) {
+		if id.user == "worker" {
+			t.Errorf("the `worker` principal is back in the identity list; A5 split it into %q and %q", a2aAgentBusUser, a2aBridgeUser)
+		}
+		if id.credsKey == "worker-password" {
+			t.Errorf("%s reads worker-password; that key is retired", id.user)
+		}
+	}
+	if slices.Contains(a2aCredsKeys, "worker-password") {
+		t.Error("worker-password is back in a2aCredsKeys; the operator would mint a password nothing authenticates with")
+	}
+
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	if strings.Contains(conf, "user: worker") {
+		t.Error("the rendered nats.conf still declares a `worker` user")
+	}
+	if strings.Contains(renderA2AAuthUsers(agent), "worker") {
+		t.Error("`worker` is still in the auth_users exemption; the callout would be bypassed for a name with no user block")
+	}
+}
+
+// Two identities on one ServiceAccount is one identity, and the map decides
+// which — the callout indexes its entries by ServiceAccount, so the loser is
+// silently unreachable and the winner's grants are what both workloads get.
+//
+// Reachable today through spec.security.serviceAccountName, which overrides the
+// agent pod's account (agentServiceAccountName): set it to the session pod's
+// and `agent` and `session` land under one key. The collision is not even
+// symmetric — the session entry is narrowed and the agent entry is not, so
+// whichever wins, one workload is running on grants derived for the other.
+func TestNoTwoIdentitiesShareAServiceAccount(t *testing.T) {
+	seen := map[string]string{}
+	for _, id := range a2aIdentities(identityTestAgent()) {
+		if id.serviceAccount == "" {
+			continue
+		}
+		if other, dup := seen[id.serviceAccount]; dup {
+			t.Errorf("%q and %q are both keyed on ServiceAccount %q; the callout serves one entry per account, so one is unreachable and the other's grants cover both workloads",
+				other, id.user, id.serviceAccount)
+		}
+		seen[id.serviceAccount] = id.user
+	}
+}
+
+// The case the test above structurally cannot see: it renders the DEFAULT
+// agent, where the accounts are distinct by construction, so it is a guard
+// against a future identity added with a copied serviceAccount field and not
+// against the collision a user can cause today.
+//
+// spec.security.serviceAccountName overrides the agent pod's account, and the
+// webhook only checks it against restrictedServiceAccounts, so pointing it at
+// the session pod's account is admitted. What refuses it is validateA2AAuthMap,
+// one layer in, which is fail-closed but diagnosed in a controller log rather
+// than at the apply. A5 is what makes this reachable: `agent` is the first
+// callout identity keyed on a user-settable field.
+func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
+	agent := identityTestAgent()
+	collide := a2aSessionServiceAccountName(agent)
+	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: collide}
+
+	// Precondition: the override actually landed on the agent identity, so a
+	// refusal below is the collision and not some unrelated validation.
+	var agentSA string
+	for _, id := range a2aIdentities(agent) {
+		if id.user == a2aAgentBusUser {
+			agentSA = id.serviceAccount
+		}
+	}
+	if want := a2aServiceAccountName(agent.Namespace, collide); agentSA != want {
+		t.Fatalf("the `agent` identity is keyed on %q, want %q; spec.security.serviceAccountName no longer "+
+			"reaches the map and this test measures nothing", agentSA, want)
+	}
+
+	if _, _, err := buildA2AAuthMapConfigMap(agent); err == nil {
+		t.Error("an override colliding with the session pod's ServiceAccount rendered a map: the callout " +
+			"serves one entry per account, so one workload would run on the other's grants")
+	} else if !strings.Contains(err.Error(), "duplicate serviceAccount") {
+		t.Errorf("the render failed for some other reason: %v", err)
+	} else {
+		t.Logf("refused: %v", err)
 	}
 }
