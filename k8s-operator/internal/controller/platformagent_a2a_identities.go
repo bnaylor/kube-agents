@@ -497,7 +497,7 @@ const (
 	// Mirrors lib.EnvBusTokenFile (a2a/lib/credentials.go), which is the
 	// reader. Separate modules, so the spelling is held by the conformance
 	// suite rather than by the compiler.
-	a2aBusTokenFileEnv = "A2A_BUS_TOKEN_FILE"
+	a2aBusTokenFileEnv = "A2A_BUS_TOKEN_FILE" // #nosec G101 -- Environment variable name, not hardcoded credentials
 )
 
 // a2aBridgeAddressee is the addressee the bridge executes for, and the only one
