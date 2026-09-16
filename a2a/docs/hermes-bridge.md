@@ -105,11 +105,16 @@ artifact (chunked if large), one terminal `status-update` with `final: true`. A 
 exit is terminal `failed` with the exit code and a stderr tail in the status message. A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
-alone (profiles spec). The bridge still reads `…events` only, and that is a real gap now
-rather than a spelling difference - the gateway's supervisor grant is an addressee
-wildcard, so a platform task CAN carry a terminal on `…supervisor` and nothing on
-`…events`, and the bridge would read that as a new task and run it again. Anything on
-`…in` for a task with a terminal event is acked with a warning and nothing else.
+alone (profiles spec). The bridge satisfies that without a change of its own, because it
+asks `lib.TasksGet` rather than reading a subject - and `tasks/get` folds `…events` and
+`…supervisor` together, so a platform task carrying a supervisor terminal and nothing on
+`…events` comes back `final` and is acked with a warning, not run again. That matters here
+because the gateway's supervisor grant is an addressee wildcard, so such a task is
+constructible. The component that does NOT get this for free is the worker adapter, whose
+`priorEvents` deliberately replaced `lib.TasksGet` with a consumer on its own `…events`
+(a session's grants reach neither `STREAM.INFO` nor a get-by-subject) and so cannot see a
+terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
+terminal event is acked with a warning and nothing else.
 
 **Steering:** `hermes chat -Q -q` is one-shot - there is no stdin to inject into. A
 follow-up message to a running task is acked and answered with a non-final status
