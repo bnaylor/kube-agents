@@ -11,12 +11,10 @@ package lib
 // back a short history indistinguishable from a real one.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -105,35 +103,17 @@ func TestAPerSubjectCapEvictsTheHeadAndTheFoldReportsIt(t *testing.T) {
 }
 
 // replayLog is a client whose log lines a test can read.
-func replayLog(t *testing.T, url string) (*Client, *syncBuf) {
+func replayLog(t *testing.T, url string) (*Client, *logCapture) {
 	t.Helper()
-	buf := &syncBuf{}
+	logs := &logCapture{}
 	c, err := Connect(testCtx(t), url,
 		WithName("replay-log-test"),
-		WithLogger(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))))
+		WithLogger(slog.New(logs)))
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	t.Cleanup(c.Close)
-	return c, buf
-}
-
-// syncBuf is a bytes.Buffer the client's own goroutines may also write to.
-type syncBuf struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuf) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuf) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
+	return c, logs
 }
 
 // The control the test above needs to mean anything: the same three events on
