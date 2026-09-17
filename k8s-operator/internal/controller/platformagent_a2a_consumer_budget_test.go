@@ -168,9 +168,11 @@ func streamAddInvocation(script, stream string) (string, bool) {
 // stream, and a re-run does not add it. The script's closing block is what an
 // operator hears about that, and the two limits get different treatment
 // because the two gaps are different: a short max_consumers is a capacity
-// shortfall whose only other symptom is a task failure, so it refuses; an
-// absent max_msgs_per_subject is a bound the install never had, and applying it
-// would evict, so it reports and exits clean.
+// shortfall whose only other symptom is a task failure, so it refuses — and
+// refuses with exit 2, the status the Job's podFailurePolicy reads as "a retry
+// reaches this same refusal"; an absent max_msgs_per_subject is a bound the
+// install never had, and applying it would evict, so it reports and exits
+// clean.
 func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
@@ -200,9 +202,15 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 		notStderr  []string
 	}{
 		{
+			// Exit 2, not 1, and the distinction is load-bearing: the
+			// Job's podFailurePolicy fails the Job on the first pod
+			// that returns 2 (buildA2AProvisionJob). Nothing about a
+			// re-run moves either number, so twenty retries would be
+			// ninety minutes of a CR reading Ready over a bus that
+			// cannot hold the concurrency it advertises.
 			name:       "a stream at the shipped cap cannot hold this CR",
 			liveJSON:   `{"name":"TASKS","max_consumers":64,"max_msgs_per_subject":4096}`,
-			wantExit:   1,
+			wantExit:   2,
 			wantStderr: []string{"max_consumers=64", "needs 316", "nats stream edit TASKS --max-consumers=316"},
 		},
 		{
@@ -244,13 +252,20 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// The property the comment beside the grep claims: a check
 			// whose extractor stops matching must fail, not skip. Once
 			// per limit — they are two greps.
-			name:       "an answer the consumer extractor cannot read is a failure",
+			//
+			// Exit 1 and not 2, on both: an empty extraction is what a
+			// momentarily unreachable bus looks like from here as much
+			// as a changed answer shape does, and only the second of
+			// those fails the same way next time. 1 keeps them on the
+			// backoffLimit, which is the retryable side of the
+			// convention the script's exit 2 establishes.
+			name:       "an answer the consumer extractor cannot read is retryable",
 			liveJSON:   `{"name":"TASKS","consumer_limit":64,"max_msgs_per_subject":4096}`,
 			wantExit:   1,
 			wantStderr: []string{"could not read max_consumers"},
 		},
 		{
-			name:       "an answer the subject-cap extractor cannot read is a failure",
+			name:       "an answer the subject-cap extractor cannot read is retryable",
 			liveJSON:   `{"name":"TASKS","max_consumers":316,"per_subject_limit":4096}`,
 			wantExit:   1,
 			wantStderr: []string{"could not read max_msgs_per_subject"},
@@ -279,6 +294,10 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				}
 				gotExit = ee.ExitCode()
 			}
+			// The status, not just the fact of failing: 2 is the
+			// script telling the Job's podFailurePolicy that a retry
+			// reaches the same refusal, and every other non-zero
+			// status leaves the run on the backoffLimit.
 			if gotExit != tc.wantExit {
 				t.Fatalf("exit %d, want %d\nstderr:\n%s", gotExit, tc.wantExit, stderr.String())
 			}

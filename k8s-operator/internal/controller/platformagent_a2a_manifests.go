@@ -1512,7 +1512,16 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "  That is what a fresh render creates TASKS with, and it is never below the" >&2
   echo "  ${required_consumers} needed here - the render floors at the cap TASKS shipped" >&2
   echo "  with and only ever widens from it, so the two numbers differ on a small install." >&2
-  exit 1
+  # Exit 2, and the convention it establishes: 2 means "this will fail the
+  # same way next time", anything else is worth retrying. The Job's
+  # podFailurePolicy matches on 2 and fails the Job from the first pod
+  # (buildA2AProvisionJob), so a refusal nothing about a re-run can change
+  # does not spend the backoffLimit before it is heard. This refusal is in
+  # that class: both numbers are fixed until an operator widens the stream
+  # or lowers maxSessions, and provisioning edits neither. Note that
+  # set -euo pipefail exits with the failing command's own status, which is
+  # not 2, so an unexpected failure stays on the retry budget.
+  exit 2
 fi
 
 echo "a2a provisioning complete"
@@ -1523,16 +1532,21 @@ echo "a2a provisioning complete"
 // The name carries a digest of the rendered spec (a2aProvisionJobName) so a
 // changed render is a new Job — Jobs are immutable — and completed runs clean
 // themselves up via TTL. The TTL has a known cost, chosen not overlooked: once
-// it removes the completed Job, the next reconcile's create-if-absent re-runs
-// the (idempotent) script under the same name, so a standing next install
-// re-proves its provisioning roughly daily. That churn is one short-lived pod
-// a day; the alternative — a completed Job kept forever as the done-marker —
-// trades it for permanent clutter and a stale-looking object in every kubectl
-// listing.
+// it removes the Job, the next reconcile's create-if-absent re-runs the
+// (idempotent) script under the same name, so a standing next install
+// re-proves its provisioning roughly daily. Re-proving is not all it does.
+// The TTL removes a FAILED Job on the same clock, and the closing block's
+// max_consumers refusal is deterministic and now fails the Job from its
+// first pod (the podFailurePolicy below), so the daily re-create is the only
+// thing that ever re-checks that refusal — against a stream an operator has
+// since widened. That churn is one short-lived pod a day; the alternative —
+// a Job kept forever as the done-marker — trades it for permanent clutter, a
+// stale-looking object in every kubectl listing, and a refusal that never
+// looks again.
 //
 // The digest covers everything this function renders into the spec: the
 // script, the image, the uid and security contexts, env, volumes, mounts,
-// backoffLimit and the TTL. What becomes of the generation the render has
+// backoffLimit, the restart and pod failure policies, and the TTL. What becomes of the generation the render has
 // moved past depends on how far that generation got, and one case is why the
 // rename on its own is not enough. A completed one leaves by TTL; one whose
 // pod ran and failed runs out its backoffLimit and then leaves by TTL; one
@@ -1565,10 +1579,47 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(20)),
 			TTLSecondsAfterFinished: ptr.To(int32(86400)),
+			// Exit 2 is the script saying "this will fail the same way next
+			// time" (its closing block), and this is what makes the Job
+			// believe it. The refusal it can reach there — a TASKS stream
+			// whose max_consumers is below this CR's budget — depends on two
+			// numbers neither the script nor a retry can move, so the
+			// backoffLimit below would spend twenty pods and roughly ninety
+			// minutes on it, during which the CR still reads Ready while the
+			// bus is known too short for the concurrency it advertises. This
+			// fails the Job on the first pod instead, so the phase says so
+			// immediately.
+			//
+			// The backoffLimit stays 20 and still means what it meant: any
+			// other status — NATS unreachable, a dial timeout, whatever
+			// `set -euo pipefail` hands back from an unexpected command
+			// failure — matches no rule here and is retried.
+			//
+			// The TTL is deliberately left on this path: once it removes the
+			// Failed Job, create-if-absent builds the identical Job again,
+			// which is how an install whose stream an operator has since
+			// widened provisions itself without anyone touching the CR.
+			//
+			// restartPolicy has to be Never for the API server to accept a
+			// podFailurePolicy at all ("This field cannot be used in
+			// combination with restartPolicy=OnFailure"), which changes what
+			// a retry looks like: each one is a fresh pod rather than a
+			// container restart inside the same one, so a transient failure
+			// leaves its pod behind, logs and all, until the Job is cleaned
+			// up.
+			PodFailurePolicy: &batchv1.PodFailurePolicy{
+				Rules: []batchv1.PodFailurePolicyRule{{
+					Action: batchv1.PodFailurePolicyActionFailJob,
+					OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
+						Operator: batchv1.PodFailurePolicyOnExitCodesOpIn,
+						Values:   []int32{2},
+					},
+				}},
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					// Its own ServiceAccount, holding no RBAC at all: the
 					// token exists to authenticate to the bus, not to talk to
 					// the API server. Automount stays off and the bus token is
