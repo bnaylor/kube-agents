@@ -495,6 +495,18 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             # A line the scan did not see is a grant silently dropped from a
             # list this method is about to call complete.
             return grants, False
+        # And an append is not the only way to change a slice. `x = f(x)`,
+        # `x = append(y, ...)`, `x[0] = ...`, an append nested one block
+        # deeper than the scan's single tab -- none of them are counted above,
+        # and each one edits the list this method is about to report. So count
+        # every assignment to the name instead of every append, and call the
+        # reading partial unless they are the same lines. Conservative by
+        # construction: an unrecognised mutation costs a fallback to the served
+        # config, where reporting a short list as complete costs an assertion
+        # that passes against a grant nobody read.
+        mutations = re.findall(rf"^\t+{name}\s*(?:\[[^\]]*\])?\s*=[^=]", text, re.MULTILINE)
+        if len(mutations) != len(appends):
+            return grants, False
         for arg in appends:
             call = re.fullmatch(r"(\w+)\(\)\.\.\.", arg.strip())
             if call is not None:
@@ -545,8 +557,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         map is what someone wrote, this is what the server enforces, and the
         concatenated grants are already resolved here by the compiler that
         emitted it. It covers the statically authenticated users only --
-        `provision` and `session` authenticate through the callout and appear
-        in no file.
+        `provision`, `session` and, since A5 split `worker`, `agent`
+        authenticate through the callout and appear in no file.
         """
         conf = h.text("a2a_rendered_nats_conf")
         grants = {}
@@ -561,15 +573,17 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """Every rendered principal's publish list, keyed by NATS user.
 
         The UNION of both readings, per principal. Neither alone is safe to
-        assert on. The served config is the only place `worker` and `seed`
-        can be read in full, because their Go lists concatenate constants; but
-        it is a generated file, so a mutation of the Go source does not move
-        it, and reading it alone let a mutation that puts the gateway's
-        terminals back on `…events` survive with every test green. The union
-        is also the honest reading of a containment invariant: a subject is
-        reachable if EITHER the map we edit or the config we serve grants it,
-        and the two disagreeing is itself a finding the precondition below
-        raises.
+        assert on. The served config is the only place `seed` can be read in
+        full -- it is the one builder left that assembles its list in a `for`
+        loop, where the Go reader stops; but the config is a generated file,
+        so a mutation of the Go source does not move it, and reading it alone
+        let a mutation that puts the gateway's terminals back on `…events`
+        survive with every test green. Conversely the config cannot see a
+        callout principal at all, `agent` among them since A5, so the Go
+        reading is the only reading for those. The union is also the honest
+        reading of a containment invariant: a subject is reachable if EITHER
+        the map we edit or the config we serve grants it, and the two
+        disagreeing is itself a finding the precondition below raises.
         """
         grants = {
             user: list(allow)
@@ -611,10 +625,13 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """The two files name the same principals, and agree wherever both are exact.
 
         One is hand-edited and one is generated from it, and the writer-set
-        tests are only as true as the reader that feeds them. For the builders
-        that return a struct literal the comparison is exact; for the two that
-        concatenate Go constants it is the literal head, which is where every
-        task subject in this class lives.
+        tests are only as true as the reader that feeds them. The comparison is
+        exact wherever the Go reader reports a complete list, which since A5 is
+        every served principal but `seed`; `seed` builds its list in a `for`
+        loop, so its reading is partial and the comparison falls back to
+        containment of the part that was read. Only served principals are
+        compared: a callout principal is in no config, so this precondition
+        says nothing about `agent`, `session` or `provision`.
         """
         served = self._conf_publish_grants()
         declared = self._go_publish_grants()

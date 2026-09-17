@@ -950,11 +950,23 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the bridge principal is gone from the operator's identities file; "
             "this test's premise about a two-way split no longer holds",
         )
+        # Two spellings, in the two files that can carry them. The identity
+        # list never held the literal -- it named the key through
+        # `a2aWorkerPasswordKey`, and the constant is declared one file over,
+        # so asserting the string's absence from this text guarded nothing a
+        # regression would touch.
+        self.assertNotIn(
+            "a2aWorkerPasswordKey",
+            operator,
+            "the retired worker credential's Secret key is named again in the "
+            "operator's identity list",
+        )
         self.assertNotIn(
             '"worker-password"',
-            operator,
-            "the retired worker credential's Secret key is back in the "
-            "operator's identity list",
+            h.text("a2a_jetstream_grants"),
+            "the retired worker credential's Secret key is declared again in "
+            "the operator's A2A manifests; a2aCredsKeys would mint a password "
+            "that nothing authenticates with",
         )
 
         # The split's shape, read off the two constructors. A callout principal
