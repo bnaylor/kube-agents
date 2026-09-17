@@ -25,9 +25,11 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -538,5 +540,131 @@ func TestASingleOversizedHostPathEntryIsTruncated(t *testing.T) {
 	}
 	if !strings.Contains(msg, hostPathDroppedEntryEllipsis) {
 		t.Errorf("a truncated entry is not marked as truncated: %s", msg)
+	}
+}
+
+// TestAPreRenderRefusalWritesNoVolumesDroppedCondition is the other side of
+// the Degraded-path write. Four refusals return before reconcileWorkload —
+// ForbiddenVolumeMount, ShellSandboxCannotBeDisabled, RuntimeClassNotFound and
+// EgressAllowlistRefused — and on those passes no Pod is rendered, so the
+// running workload is whatever the previous pass left. Writing the condition
+// there would report a security property of a Pod this operator never wrote:
+// on an install rolled forward over a CR whose Deployment a pre-fix render
+// gave real hostPath mounts, `kubectl describe` would say the mounts are gone
+// while they are still mounted, on every 30s requeue for as long as the
+// refusal stands.
+//
+// The refusal used here is the one that needs no cluster state to provoke.
+func TestAPreRenderRefusalWritesNoVolumesDroppedCondition(t *testing.T) {
+	agent := hostPathAgent()
+	agent.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{
+		ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+	}
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	for pass := 0; pass < 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("a refusal is a Degraded status, not a reconcile error (pass %d): %v", pass, err)
+		}
+	}
+
+	// Nothing rendered, which is what makes this the case under test rather
+	// than a variant of the Degraded case above.
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(dep), dep); !apierrors.IsNotFound(err) {
+		t.Fatalf("the refusal rendered the gateway Deployment (err %v), so this is no longer a pre-render pass", err)
+	}
+
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if got.Status.Phase != "Degraded" || ready == nil || ready.Reason != reasonShellSandboxCannotBeDisabled {
+		t.Fatalf("phase=%q Ready=%+v, want Degraded/%s; the pass under test is the one that parks there", got.Status.Phase, ready, reasonShellSandboxCannotBeDisabled)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
+		t.Errorf("%s written on a pass that rendered no Pod: the CR now asserts the hostPath entries are out of a workload this operator never wrote: %+v", hostPathConditionType, cond)
+	}
+}
+
+// TestAPreRenderRefusalLeavesAnAlreadyPresentVolumesDroppedInPlace pins the
+// other half of the gate, which is not symmetric with it. A condition already
+// on the CR was written by a pass that did render, and the Pod that pass wrote
+// is still the one running — so a pre-render refusal leaves it exactly as it
+// stands rather than clearing or refreshing it.
+//
+// The discriminator is a spec edit that takes the hostPath entries away at the
+// same time as it provokes the refusal. Recomputing the condition there would
+// remove it, and the CR would stop reporting volumes that are genuinely absent
+// from the running Pod. Left in place it is stale in its wording — it names
+// entries the spec no longer carries — and correct in what it asserts, which
+// is the direction this condition has to err in: over-reporting a drop that
+// happened, never claiming one that did not. The next pass to reach the render
+// refreshes or removes it.
+func TestAPreRenderRefusalLeavesAnAlreadyPresentVolumesDroppedInPlace(t *testing.T) {
+	agent := hostPathAgent()
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	for pass := 0; pass < 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile pass %d failed: %v", pass, err)
+		}
+	}
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	rendered := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	if rendered == nil {
+		t.Fatalf("the rendering passes wrote no %s condition, so there is nothing for the refusal to preserve", hostPathConditionType)
+	}
+	renderedMessage := rendered.Message
+
+	// Switch the sandbox off and take the hostPath entries out in one edit.
+	got.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{
+		ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+	}
+	got.Spec.Deployment.ExtraVolumes = got.Spec.Deployment.ExtraVolumes[1:]
+	got.Spec.Deployment.ExtraVolumeMounts = got.Spec.Deployment.ExtraVolumeMounts[1:]
+	got.Spec.Deployment.SidecarVolumes = got.Spec.Deployment.SidecarVolumes[1:]
+	got.Spec.Deployment.Sidecars[0].VolumeMounts = got.Spec.Deployment.Sidecars[0].VolumeMounts[1:]
+	got.Spec.Deployment.InitContainers[0].VolumeMounts = nil
+	if err := cl.Update(ctx, got); err != nil {
+		t.Fatalf("switching the sandbox off and removing the hostPath entries: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if got.Status.Phase != "Degraded" || ready == nil || ready.Reason != reasonShellSandboxCannotBeDisabled {
+		t.Fatalf("phase=%q Ready=%+v, want Degraded/%s", got.Status.Phase, ready, reasonShellSandboxCannotBeDisabled)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	if cond == nil {
+		t.Fatalf("the refusal cleared a %s condition a rendering pass had written; the Pod that pass rendered is still the one running without those volumes", hostPathConditionType)
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathConditionReason || cond.Message != renderedMessage {
+		t.Errorf("the refusal rewrote the condition instead of leaving it: got %s/%s %q, want it untouched at %s/%s %q", cond.Status, cond.Reason, cond.Message, metav1.ConditionTrue, hostPathConditionReason, renderedMessage)
+	}
+
+	// And a parked CR still writes once per change, not once per pass. The
+	// condition is out of the Degraded writer's comparison on a pre-render
+	// pass, because a term no write can satisfy would make every requeue tick
+	// a status write (#1392).
+	settledVersion := got.ResourceVersion
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile (settled) failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	if got.ResourceVersion != settledVersion {
+		t.Errorf("a parked pre-render pass with nothing to change wrote the CR (resourceVersion %s -> %s)", settledVersion, got.ResourceVersion)
 	}
 }

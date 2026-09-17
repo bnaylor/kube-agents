@@ -142,6 +142,17 @@ const (
 	// authorized-keys Secret only when a public key is supplied. That is the
 	// same chart-default install the webhook is off on, so the one park most
 	// likely to hold a dropped hostPath was the one saying nothing about it.
+	//
+	// The Degraded writer carries it on those three only. The other four
+	// refusals return before the render (ForbiddenVolumeMount,
+	// ShellSandboxCannotBeDisabled, RuntimeClassNotFound,
+	// EgressAllowlistRefused), so the Pod left running on such a pass is
+	// whatever the previous pass rendered -- and on an operator rolled out
+	// over a CR whose Deployment a pre-fix render gave real hostPath mounts,
+	// writing the condition there would report the mounts gone while they are
+	// still in the Pod, on every requeue tick for as long as the refusal
+	// stands. A condition asserting a security property must not be able to
+	// say True where the property does not hold. See workloadRenderState.
 	hostPathDroppedConditionType = "VolumesDropped"
 	hostPathDroppedReason        = "HostPathVolumeDropped"
 	// hostPathDroppedEntryFormat renders one dropped entry as the author would
@@ -151,8 +162,8 @@ const (
 	// left out, that the mounts go with it, why admission did not stop it,
 	// and how to clear the condition, because `kubectl describe` is where the
 	// author of a CR the webhook never saw finds out. Present tense, not past:
-	// the refusals that park the CR before the render reach this condition
-	// too, and there the Pod they describe has not been written yet.
+	// only a pass that rendered writes this, and the Pod that pass rendered
+	// stands without the entries until they leave the spec.
 	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and are left out of the agent Pod, with every volumeMount " +
 		"naming them: %s. The admission webhook refuses these when it runs, and this CR was admitted without it " +
 		"(the Helm chart ships operator.webhooks.enabled=false, and one enabled through the chart fails open at " +
@@ -488,7 +499,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if msg := validateExtraVolumeMounts(instance); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -507,7 +518,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if reason, msg := validateShellSandbox(instance); reason != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -526,7 +537,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
 			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg, workloadNotRendered); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			if guardrailErr != nil {
@@ -586,7 +597,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// before returning any guardrail error so neither the agent gateway policy
 		// nor the litellm policy is stranded when reconciliation pauses at Degraded.
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -663,13 +674,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// on this object's watches.
 	if modeErr != nil {
 		msg := modeErr.Error() + " (version skew); rendering today's stack until the operator is upgraded or spec.mode is corrected"
-		if statusErr := r.updateStatusDegraded(ctx, instance, "ModeNotRecognized", msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, "ModeNotRecognized", msg, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	if a2aState.failed {
-		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -688,7 +699,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Secret write in the namespace.
 	if reason, msg := r.checkShellSandboxKeys(ctx, instance); reason != "" {
 		log.Info(msg)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -2939,6 +2950,24 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 	return names
 }
 
+// workloadRenderState says whether the reconcile pass parking the agent on
+// Degraded reached the render, and is the argument updateStatusDegraded takes
+// to decide whether it may touch the VolumesDropped condition. Named rather
+// than a bare bool because the answer is not obvious from the call site: the
+// refusals read top to bottom and only their position in Reconcile says which
+// side of reconcileWorkload they are on.
+type workloadRenderState bool
+
+const (
+	// workloadRendered is the three refusals below the render:
+	// ModeNotRecognized, A2AProvisionFailed, ShellSandboxKeysMissing.
+	workloadRendered workloadRenderState = true
+	// workloadNotRendered is the four above it, which return with the workload
+	// untouched: ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
+	// RuntimeClassNotFound, EgressAllowlistRefused.
+	workloadNotRendered workloadRenderState = false
+)
+
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
 // Ready=False condition carrying the reason and message. It writes only when
 // something it is about to write differs from what the status already holds.
@@ -2963,20 +2992,40 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 // The generation witness is the condition's observedGeneration rather than the
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
-func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
-	// VolumesDropped rides along, because the strip it reports happens at
-	// render and three of the refusals that land here render first (see the
-	// condition's own comment). It is in the comparison as well as the write:
-	// without that, a CR parked on one of those refusals with an unchanged
-	// Ready would leave the condition unwritten forever.
-	hostPathDroppedMsg := hostPathDroppedMessage(agent)
+//
+// rendered says whether the caller got as far as reconcileWorkload, and gates
+// the VolumesDropped condition alone -- everything else here is written either
+// way. See workloadRenderState.
+func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState) error {
+	// VolumesDropped rides along on a pass that rendered, because the strip it
+	// reports happens at render and three of the refusals that land here
+	// render first (see the condition's own comment). It is in the comparison
+	// as well as the write: without that, a CR parked on one of those refusals
+	// with an unchanged Ready would leave the condition unwritten forever.
+	//
+	// A pre-render refusal neither writes it nor clears it. Not writes,
+	// because the Pod still running is the previous pass's and the strip may
+	// never have reached it; not clears, because a condition already on the CR
+	// was written by a pass that did render, and that render is still what the
+	// running Pod is -- so it is left exactly as it stands, stale wording and
+	// all, until a pass renders again and refreshes or removes it. That errs
+	// towards over-reporting a drop that has happened, never towards claiming
+	// one that has not. It leaves the comparison on those passes for the same
+	// reason: a term no write can satisfy would make every requeue tick a
+	// status write (#1392).
+	hostPathDroppedMsg := ""
+	hostPathDroppedUnchanged := true
+	if rendered {
+		hostPathDroppedMsg = hostPathDroppedMessage(agent)
+		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+	}
 	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
 		agent.Status.Phase == "Degraded" &&
 		existing.Status == metav1.ConditionFalse &&
 		existing.Reason == reason &&
 		existing.Message == message &&
 		existing.ObservedGeneration == agent.Generation &&
-		hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) {
+		hostPathDroppedUnchanged {
 		return nil
 	}
 
@@ -2994,7 +3043,9 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
-	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+	if rendered {
+		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+	}
 	return r.Status().Update(ctx, agent)
 }
 
