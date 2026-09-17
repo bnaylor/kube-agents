@@ -292,6 +292,16 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			if strings.Contains(calls, "stream add TASKS") {
 				t.Errorf("the script created TASKS over a stream the stub reports as existing:\n%s", calls)
 			}
+			// And it reports rather than converges. The name of the
+			// per-subject case is "told, not edited" and nothing here
+			// used to check the second half: the provision principal
+			// holds STREAM.CREATE and STREAM.INFO and no UPDATE, so an
+			// edit would fail at the server, but a script that reached
+			// for one would also be a script that had decided to
+			// truncate a running install's history.
+			if strings.Contains(calls, "stream edit") {
+				t.Errorf("the script edited a stream; provisioning reports a gap and never converges:\n%s", calls)
+			}
 			// And the refusal comes LAST. A check that exited in the
 			// middle of the script would leave a bus missing the
 			// streams and buckets below TASKS — a partially
