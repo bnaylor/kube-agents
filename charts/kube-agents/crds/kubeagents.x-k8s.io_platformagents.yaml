@@ -9440,7 +9440,14 @@ spec:
                             will not change on a stream that already exists: lower this number
                             until it fits the stream, or delete TASKS and let provisioning
                             recreate it at the width this number asks for, paying the task
-                            history the stream was holding. An operator upgrade reaches that
+                            history the stream was holding. The two do not finish the same way.
+                            Lowering this number re-renders the provision Job, so it re-runs by
+                            itself. Recreating the stream also needs the provision Job re-run,
+                            and then the A2A gateway restarted - deleting a stream deletes the
+                            durable consumers on it, the gateway's event relay and any Hermes
+                            bridge sidecar do not re-create theirs, and a gateway in that state
+                            still accepts delegations and spawns session pods while relaying no
+                            events. The refusal names the order. An operator upgrade reaches that
                             refusal as readily as an edit here does: a stream created before the
                             derivation existed holds whatever it was created with, whatever this
                             field says.

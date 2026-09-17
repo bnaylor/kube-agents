@@ -1653,8 +1653,12 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				// deletes a stream holding task history. `nats stream
 				// edit` is in the list because the remedy naming it
 				// was wrong for a second reason and could come back
-				// as a well-meaning revert.
-				for _, unwanted := range []string{"delete the TASKS stream", "lower maxSessions", "nats stream edit"} {
+				// as a well-meaning revert. The gateway restart is
+				// there for the same reason as the other two: it is
+				// the last step of the recreate, and prescribing it
+				// against a NATS outage tells an operator to bounce
+				// the one component whose durable is fine.
+				for _, unwanted := range []string{"delete the TASKS stream", "lower maxSessions", "nats stream edit", "kubectl rollout restart"} {
 					if strings.Contains(state.message, unwanted) {
 						t.Errorf("a %s failure names %q, which only the exit-2 refusal needs: %q", tc.cond.Reason, unwanted, state.message)
 					}
@@ -1668,10 +1672,34 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				// So the message has to say what re-runs the script -
 				// or an operator lowers maxSessions, watches the CR
 				// stay Degraded, and concludes the change was wrong.
-				for _, want := range []string{"maxSessions", "delete the TASKS stream", "Delete the Job to re-run it now"} {
+				//
+				// And the recreate's last step, which is the one
+				// an operator cannot infer: deleting a stream
+				// deletes every consumer on it, and the gateway's
+				// event relay and the Hermes bridge hold durables
+				// there that their client does not re-create --
+				// lib.Client.SubscribeDurable consumes with no
+				// jetstream.ConsumeErrHandler, so the deleted
+				// consumer ends the subscription silently. The
+				// remedy without the restart produces a gateway
+				// that spawns session pods and relays no events
+				// while this very condition has gone back to
+				// Ready, which is a worse place than the refusal.
+				for _, want := range []string{"maxSessions", "delete the TASKS stream", "Delete the Job to re-run it now", "kubectl rollout restart deployment/"} {
 					if !strings.Contains(state.message, want) {
 						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
 					}
+				}
+				// The half that needs none of the above. Lowering
+				// maxSessions moves required_consumers in the
+				// render, and the Job's name digests the render,
+				// so a new Job appears and runs on its own. The
+				// message used to tell the operator that neither
+				// way out cleared itself, which sent the one who
+				// took the cheap branch looking for something to
+				// delete.
+				if strings.Contains(state.message, "Neither way out clears this on its own") {
+					t.Errorf("message claims neither remedy clears itself, which is false of the maxSessions edit -- it re-renders the Job: %q", state.message)
 				}
 				// And it must not go back to naming the stream edit
 				// it used to name. nats-server refuses a

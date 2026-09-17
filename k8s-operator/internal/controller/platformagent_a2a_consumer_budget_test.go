@@ -218,6 +218,21 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				"delete the TASKS stream",
 				"recreates TASKS at 316",
 				"Delete the Job to re-run it now",
+				// The recreate's third step. Deleting a stream
+				// deletes every consumer on it, and the two
+				// long-lived durables there -- the gateway's
+				// event relay and the Hermes bridge's
+				// bridge-<profile> -- are held by clients that
+				// do not re-create them: both go through
+				// lib.Client.SubscribeDurable, whose Consume
+				// carries no jetstream.ConsumeErrHandler, so
+				// nats.go stops the subscription on the
+				// terminal ErrConsumerDeleted and logs nothing.
+				// An operator who follows this remedy and stops
+				// at the recreate is left with a gateway that
+				// still spawns session pods and relays no
+				// events, over a CR reading Ready.
+				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
 			},
 			// What this refusal must never go back to naming. It
 			// used to prescribe `nats stream edit TASKS
@@ -233,7 +248,16 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// sibling max_msgs_per_subject report names a `nats
 			// stream edit` that IS legal, so barring the command
 			// here would bar a remedy that works.
-			notStderr: []string{"--max-consumers="},
+			// And what the closing paragraph must never go
+			// back to claiming. "Neither way out clears this
+			// on its own" was true of the recreate and false
+			// here: lowering maxSessions edits the CR, which
+			// changes required_consumers in the render, which
+			// moves the digest in the Job's name -- a new Job,
+			// running by itself, with nothing to delete. An
+			// operator told otherwise deletes a Job that was
+			// about to be superseded anyway.
+			notStderr: []string{"--max-consumers=", "Neither way out clears this on its own"},
 		},
 		{
 			// Below the reserved block, where the first way out
@@ -252,8 +276,15 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				"minimum is 1, and one session still needs 19",
 				"That leaves deleting the TASKS stream",
 				"recreates TASKS at 316",
+				// The only way out here is the recreate, so the
+				// restart it needs is not optional detail.
+				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
 			},
-			notStderr: []string{"So either lower", "to at most", "--max-consumers="},
+			// The lowering branch's "finishes on its own" note
+			// is gated on the same `fits` test that picked this
+			// branch, and offering it here would point at a
+			// value the API server refuses (Minimum=1).
+			notStderr: []string{"So either lower", "to at most", "--max-consumers=", "finishes on its own"},
 		},
 		{
 			// The boundary between the two branches above, and the
@@ -272,8 +303,13 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				"max_consumers=19",
 				"lower spec.harness.tuning.maxSessions to at most 1 -",
 				"delete the TASKS stream",
+				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
 			},
-			notStderr: []string{"one session still needs 19", "--max-consumers="},
+			// Both branches are on offer here, so both halves of
+			// the split have to be: the recreate's restart above,
+			// and no claim that the lowering half needs a Job
+			// deleted to take effect.
+			notStderr: []string{"one session still needs 19", "--max-consumers=", "Neither way out clears this on its own"},
 		},
 		{
 			name:     "one consumer short of that, and lowering stops being a way out",
@@ -282,8 +318,9 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			wantStderr: []string{
 				"max_consumers=18",
 				"minimum is 1, and one session still needs 19",
+				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
 			},
-			notStderr: []string{"So either lower", "to at most", "--max-consumers="},
+			notStderr: []string{"So either lower", "to at most", "--max-consumers=", "finishes on its own"},
 		},
 		{
 			name:      "a stream sized for it passes",

@@ -1525,8 +1525,28 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "  checks, so the next run recreates TASKS at ` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + `. Deleting the stream discards the" >&2
   echo "  tasks it is holding - the 72h task history the design treats as the audit" >&2
   echo "  substrate - which is why provisioning will not do it on an operator's behalf." >&2
-  echo "Neither way out clears this on its own: nothing re-reads the stream until this Job" >&2
-  echo "  runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will." >&2
+  if [ "${fits}" -ge 1 ]; then
+    echo "The two ways out do not finish the same way. Lowering spec.harness.tuning.maxSessions" >&2
+    echo "  finishes on its own: this Job's name carries a digest of the rendered spec, the" >&2
+    echo "  consumer count is part of that render, so the edit produces a new Job that runs by" >&2
+    echo "  itself. Nothing below applies to it - there is nothing else to delete or restart." >&2
+  fi
+  echo "Deleting TASKS does not finish on its own. It takes three steps, in this order:" >&2
+  echo "  1. delete the stream." >&2
+  echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
+  echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
+  echo "     24h TTL will." >&2
+  echo "  3. once TASKS is back, restart the clients holding a durable consumer on it:" >&2
+  echo "       kubectl rollout restart deployment/` + a2aGatewayName(agent) + ` -n ` + agent.Namespace + `" >&2
+  echo "     and, where a Hermes bridge sidecar runs, the agent workload ` + agent.Name + `-gateway" >&2
+  echo "     (a Deployment or a StatefulSet, depending on the spec) with it." >&2
+  echo "     Deleting a stream deletes every consumer on it, and neither client re-creates" >&2
+  echo "     one: the consume underneath them carries no error handler, so a deleted consumer" >&2
+  echo "     ends the subscription with nothing logged. Skip this and the gateway goes on" >&2
+  echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
+  echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
+  echo "     recover by themselves, which hides it rather than helping." >&2
+  echo "     Restarting before TASKS is back only fails the subscribe, so the order holds." >&2
   # Exit 2, and the convention it establishes: 2 means "this will fail the
   # same way next time", anything else is worth retrying. The Job's
   # podFailurePolicy matches on 2 and fails the Job from the first pod
@@ -2254,6 +2274,30 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// stream they do not find, ahead of these checks — at
 				// the cost of the task history the stream is holding.
 				//
+				// The two do not finish the same way, and the message
+				// says so rather than making one claim about both.
+				// Lowering maxSessions edits the CR, which re-renders
+				// the provision script, which moves the digest the Job
+				// name carries (a2aProvisionJobName) — a new Job, and
+				// it runs by itself. Deleting TASKS changes nothing
+				// the operator reads, so that half needs the Job
+				// re-run, and then a restart of the two long-lived
+				// clients that held a durable consumer on the stream:
+				// deleting a stream deletes its consumers, and neither
+				// the gateway's relay nor the Hermes bridge sidecar
+				// re-creates one. Both subscribe through
+				// lib.Client.SubscribeDurable, whose Consume call
+				// passes no jetstream.ConsumeErrHandler, so nats.go
+				// treats the deleted consumer as terminal, stops the
+				// subscription and returns nothing to log — the same
+				// failure the worker adapter grew a supervisor for.
+				// An operator who recreates the stream and stops there
+				// has a gateway still accepting delegations and
+				// spawning session pods while relaying no events, a
+				// bridge dispatching nothing, and a CR reading Ready.
+				// The order is in the message because restarting
+				// before the stream is back just fails the subscribe.
+				//
 				// Of the three numbers that remedy wants, only two are
 				// in this process. The need is the budget, which is
 				// what the script's gate compares a live stream
@@ -2269,8 +2313,9 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 					existing.Name, cond.Reason, cond.Message)
 				if cond.Reason == batchv1.JobReasonPodFailurePolicy {
 					state.message += fmt.Sprintf(
-						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore the maxSessions that fits. Neither way out clears this on its own — nothing re-reads the stream until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will.",
-						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent))
+						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore the maxSessions that fits. The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted. Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
+						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent),
+						a2aGatewayName(agent), agent.Namespace, agent.Name)
 				}
 			}
 		}
