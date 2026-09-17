@@ -93,10 +93,13 @@ func TestTheAgentPrincipalWorksTheBlackboardOnARealServer(t *testing.T) {
 
 	provisionTopicStreams(t, h)
 
-	// The client's own log, captured: lib owns nats.ErrorHandler, so a refused
-	// publish does not come back from PublishTopic — it lands here as an
-	// async error. A publish arm that only checked the returned error would
-	// pass against a server refusing every write.
+	// The client's own log, captured. A refused JetStream publish does come
+	// back from PublishTopic, as a timeout on the API reply rather than as a
+	// permission error, so the arms below check the returned error too. What
+	// this adds is the second channel: lib owns nats.ErrorHandler, and a
+	// permission violation the server attributes to this connection lands
+	// there even when the operation it broke reported success — a refused
+	// subscription, or an inbox the grants do not cover.
 	clientLog := &safeBuffer{}
 	client, err := lib.Connect(ctx, h.url,
 		lib.WithName("a2a-cli-topics"),

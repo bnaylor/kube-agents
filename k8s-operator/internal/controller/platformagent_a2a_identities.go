@@ -408,14 +408,14 @@ func sessionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 // override. Two consequences worth naming. The map entry follows the override
 // (the operator renders both from the same call, so they cannot drift). And an
 // override that collides with another principal's ServiceAccount would put two
-// entries under one key, which validateA2AAuthMap refuses by returning
+// entries under one key, which validateA2AAuthMapIdentities refuses by returning
 // "duplicate serviceAccount" — buildA2AAuthMapConfigMap fails, and with it the
 // reconcile. Note where that refusal is NOT: the webhook validates
 // spec.security.serviceAccountName against restrictedServiceAccounts only, so
 // the CR is admitted and the operator then wedges on
 // "failed to render the A2A identity map" rather than the apply being
 // rejected. Fail-closed, but the diagnosis is a controller log rather than an
-// admission error. TestNoTwoIdentitiesShareAServiceAccount holds the default
+// admission error. TestPrincipalsAreDistinct holds the default
 // render; TestAnOverriddenServiceAccountThatCollidesIsRefused holds this path.
 func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	publish := []string{

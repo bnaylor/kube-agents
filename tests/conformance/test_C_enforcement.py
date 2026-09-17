@@ -791,13 +791,15 @@ class C1IsolationIsStructural(unittest.TestCase):
         Why this is a security assertion and not tidiness. A callout principal's
         grants carry its own inbox subject (`_INBOX.agent.>`), and a NATS client
         that does not pin a matching prefix subscribes to a random inbox its
-        grants refuse. That authenticates fine. It then times out on every
-        JetStream reply with no permission error anywhere the client can see --
-        the failure this system is worst at reading from the outside, and the
-        one a disagreement between these two literals produces. The CLI's
-        fallback is `NATS_USER`, which the operator no longer renders into this
-        container at all, so a drift does not degrade to the old behaviour
-        either: it degrades to a connection with no identity.
+        grants refuse. Pinning it is what the CLI needs the principal's name
+        for, and the env var is the only place the name arrives.
+
+        What a drift actually produces. `busUser()` reads this name and falls
+        back to `NATS_USER`, which the operator no longer renders into this
+        container, so a disagreement leaves the CLI with no identity at all:
+        `connect` refuses before dialling, with `no bus identity: set
+        A2A_BUS_USER or NATS_USER`. Loud rather than silent, and every `a2a`
+        invocation in the agent container fails the same way.
 
         Read as source rather than executed because the two literals are in
         different modules and no test binary links both.
@@ -828,8 +830,9 @@ class C1IsolationIsStructural(unittest.TestCase):
             operator_env[0],
             library_env[0],
             "the operator renders %r and the a2a client reads %r: the agent "
-            "container gets a bus identity under a name nothing looks up, so it "
-            "connects with no inbox prefix and hangs on every JetStream reply"
+            "container gets a bus identity under a name nothing looks up, so "
+            "every `a2a` invocation there refuses to connect with `no bus "
+            "identity`"
             % (operator_env[0], library_env[0]),
         )
         self.assertEqual(
@@ -1026,7 +1029,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "across the module boundary is not the name the operator refuses",
         )
 
-    def test_C1_the_agent_container_holds_no_static_bus_password(self) -> None:
+    def test_C1_the_agent_principal_carries_no_static_bus_password(self) -> None:
         """The other half of the same change, and what it was for.
 
         `worker` was one password shared by the agent container and the Hermes
@@ -1042,6 +1045,13 @@ class C1IsolationIsStructural(unittest.TestCase):
         and back into `/proc/<pid>/environ` reach of every other container in
         the pod, which is what the operator's shared-process-namespace test
         argues about.
+
+        What this reads is the identity list, not a rendered container: no
+        principal the agent's ServiceAccount resolves to carries a Secret key,
+        so there is no password for the operator to render. The container's own
+        env is asserted one module over, by
+        `TestPluginCannotOverrideBusEnv`, which pins `NATS_PASSWORD` absent
+        from the agent container under `mode: next`.
         """
         operator = h.text("a2a_identities")
 

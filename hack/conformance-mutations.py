@@ -1219,7 +1219,7 @@ Mutation(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\tuser:           a2aAgentBusUser,',
          '\t\tuser:           a2aAgentBusUser,\n\t\tcredsKey:       a2aBridgePasswordKey,'),
-        "test_C1_the_agent_container_holds_no_static_bus_password",
+        "test_C1_the_agent_principal_carries_no_static_bus_password",
         "give the agent's callout principal a Secret key as well, so the same "
         "name is answered for by both the callout and nats.conf's auth_users "
         "exemption and a client is authenticated by whichever path it happened "
@@ -1233,7 +1233,7 @@ Mutation(
         ('\t\tuser:     a2aBridgeUser,',
          '\t\tuser:     a2aBridgeUser,\n'
          '\t\tserviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),'),
-        "test_C1_the_agent_container_holds_no_static_bus_password",
+        "test_C1_the_agent_principal_carries_no_static_bus_password",
         "move the bridge sidecar onto the callout, which reads as tightening "
         "and is the exact opposite. A sidecar shares its pod's ServiceAccount, "
         "so the bridge's entry and the agent's would key on one username and "

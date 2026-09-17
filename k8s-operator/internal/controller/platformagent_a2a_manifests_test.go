@@ -2037,11 +2037,14 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		}
 	}
 	// The three the operator never renders into this container. Dropped rather
-	// than overwritten, so the assertion is absence: a surviving plugin
-	// NATS_USER would be the identity the `a2a` CLI falls back to if the token
-	// were ever unreadable, and a surviving A2A_BUS_TOKEN_FILE would be the
-	// file it presents as a token instead of the projected one, which the CLI
-	// prefers unconditionally and with no fallback.
+	// than overwritten, so the assertion is absence. A surviving plugin
+	// NATS_PASSWORD would be a static login as this principal on any pod where
+	// the projected token is missing, since the CLI only reaches for a token
+	// when one is on disk. NATS_USER is the identity the CLI reads when
+	// A2A_BUS_USER is absent, so a plugin that set both would choose the
+	// principal. And a surviving A2A_BUS_TOKEN_FILE would be the file the CLI
+	// presents as a token instead of the projected one, which it prefers
+	// unconditionally and with no fallback.
 	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
