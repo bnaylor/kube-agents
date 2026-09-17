@@ -127,6 +127,26 @@ const (
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
 
+	// The condition reporting that the render left a hostPath volume out of
+	// the agent Pod. Written only while the spec carries one, on the
+	// EventWatcher pattern above, and not a Degraded state: the Pod runs, the
+	// author's other volumes are in it, and the CR says what was left out and
+	// why. See hostPathVolumes for the drop itself.
+	hostPathDroppedConditionType = "VolumesDropped"
+	hostPathDroppedReason        = "HostPathVolumeDropped"
+	// hostPathDroppedEntryFormat renders one dropped entry as the author would
+	// find it in the spec: field, index, name, and the host path it asked for.
+	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
+	// hostPathDroppedMessageFormat takes the joined entries. It says what was
+	// left out, that the mounts went with it, why admission did not stop it,
+	// and how to clear the condition, because `kubectl describe` is where the
+	// author of a CR the webhook never saw finds out.
+	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and were left out of the agent Pod, with every volumeMount " +
+		"naming them: %s. The admission webhook refuses these when it runs, and this CR was admitted without it " +
+		"(the Helm chart ships operator.webhooks.enabled=false, and an enabled webhook fails open at " +
+		"failurePolicy: Ignore). Remove the entries from the spec to clear this condition."
+	hostPathDroppedEntrySeparator = ", "
+
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
 	gitopsStateConfigMapSuffix         = "-gitops-state"
@@ -2477,6 +2497,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		(!eventWatcherOn && existingWatcherCond != nil && existingWatcherCond.Status == metav1.ConditionFalse &&
 			existingWatcherCond.Reason == eventWatcherDisabledReason && existingWatcherCond.Message == eventWatcherDisabledMessage)
 
+	// A hostPath volume the render left out of the Pod, reported while the
+	// spec still carries one and absent otherwise. Message is compared for
+	// the same reason EventWatcher's is: it names the entries, and an edit
+	// that swaps one hostPath for another has to change what the CR says.
+	hostPathDroppedMsg := hostPathDroppedMessage(agent)
+	existingHostPathCond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
+	hostPathDroppedUnchanged := (hostPathDroppedMsg == "" && existingHostPathCond == nil) ||
+		(hostPathDroppedMsg != "" && existingHostPathCond != nil && existingHostPathCond.Status == metav1.ConditionTrue &&
+			existingHostPathCond.Reason == hostPathDroppedReason && existingHostPathCond.Message == hostPathDroppedMsg)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	// A Degraded/RBACIncomplete condition is reportRBACSkew's, and this function
@@ -2509,6 +2539,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
+		hostPathDroppedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
@@ -2574,7 +2605,35 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		})
 	}
 
+	if hostPathDroppedMsg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
+	} else {
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:               hostPathDroppedConditionType,
+			Status:             metav1.ConditionTrue,
+			Reason:             hostPathDroppedReason,
+			Message:            hostPathDroppedMsg,
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	}
+
 	return newPhase, r.Status().Update(ctx, agent)
+}
+
+// hostPathDroppedMessage is the VolumesDropped condition's message for the
+// hostPath entries the render left out of the Pod, or "" when the spec carries
+// none and the condition is to be absent.
+func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent) string {
+	dropped := hostPathVolumes(agent)
+	if len(dropped) == 0 {
+		return ""
+	}
+	entries := make([]string, 0, len(dropped))
+	for _, d := range dropped {
+		entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
+	}
+	return fmt.Sprintf(hostPathDroppedMessageFormat, strings.Join(entries, hostPathDroppedEntrySeparator))
 }
 
 func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, profile netpolProfile) bool {

@@ -121,6 +121,12 @@ const (
 	// error strings gVisor never raises, so the operator, which knows the runtime
 	// for certain, pins the mode instead.
 	sqliteJournalModeDelete = "delete"
+
+	// hostPathExtraVolumesField and hostPathSidecarVolumesField are the two CR
+	// lists a user-authored volume arrives on, spelled the way the
+	// VolumesDropped condition names them. See hostPathVolumes.
+	hostPathExtraVolumesField   = "spec.deployment.extraVolumes"
+	hostPathSidecarVolumesField = "spec.deployment.sidecarVolumes"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -1952,6 +1958,133 @@ func lastWinsEnv(env []corev1.EnvVar) []corev1.EnvVar {
 	return out
 }
 
+// droppedHostPathVolume is one user-authored volume the render left out of the
+// Pod because its source is a hostPath: the CR list it sits on, its index
+// there, its name, and the host path it asked for, which is what the
+// VolumesDropped condition has to say for the author to find the entry.
+type droppedHostPathVolume struct {
+	field string
+	index int
+	name  string
+	path  string
+}
+
+// hostPathVolumes lists the entries on spec.deployment.extraVolumes and
+// spec.deployment.sidecarVolumes whose source is a hostPath, in spec order.
+//
+// The admission webhook refuses these with a field error that tells the author
+// why, and on an install where it runs this returns nothing. It does not run on
+// a Helm install at the chart's defaults (operator.webhooks.enabled is false),
+// and when the chart does register it, failurePolicy: Ignore admits the CR
+// with validation skipped for as long as the webhook Pod is unreachable. The
+// controller used to copy both lists into the Pod verbatim, so on either
+// install a hostPath reached the agent Pod, which is the widest-reach workload
+// in the namespace and where model output executes (#1671).
+//
+// This is the layer that holds when admission did not run. The render leaves
+// the volume out of the Pod, and every volumeMount naming it out of the
+// containers the CR authored, because a mount naming a volume the Pod does not
+// declare is a Deployment the API server rejects, which wedges every reconcile
+// with nothing in status to say why. The drop is reported rather than parked
+// on: updateStatusReady writes the VolumesDropped condition while the spec
+// carries a hostPath and removes it once the entry is gone, so the agent keeps
+// running and the CR says what it is running without.
+func hostPathVolumes(agent *agentv1alpha1.PlatformAgent) []droppedHostPathVolume {
+	if agent.Spec.Deployment == nil {
+		return nil
+	}
+	var dropped []droppedHostPathVolume
+	collect := func(field string, volumes []corev1.Volume) {
+		for i, vol := range volumes {
+			if vol.HostPath == nil {
+				continue
+			}
+			dropped = append(dropped, droppedHostPathVolume{field: field, index: i, name: vol.Name, path: vol.HostPath.Path})
+		}
+	}
+	collect(hostPathExtraVolumesField, agent.Spec.Deployment.ExtraVolumes)
+	collect(hostPathSidecarVolumesField, agent.Spec.Deployment.SidecarVolumes)
+	return dropped
+}
+
+// hostPathVolumeNames is the set of volume names hostPathVolumes would drop,
+// which is what the mount filters key on. Empty when nothing is dropped, and
+// every filter below returns its input unchanged in that case, so a CR with no
+// hostPath renders the same bytes it always did.
+func hostPathVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
+	dropped := hostPathVolumes(agent)
+	if len(dropped) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(dropped))
+	for _, d := range dropped {
+		names[d.name] = true
+	}
+	return names
+}
+
+// stripHostPathVolumes returns volumes without the entries whose source is a
+// hostPath. The input is returned as-is when there is nothing to drop.
+func stripHostPathVolumes(volumes []corev1.Volume) []corev1.Volume {
+	if !slices.ContainsFunc(volumes, func(v corev1.Volume) bool { return v.HostPath != nil }) {
+		return volumes
+	}
+	keep := make([]corev1.Volume, 0, len(volumes))
+	for _, vol := range volumes {
+		if vol.HostPath != nil {
+			continue
+		}
+		keep = append(keep, vol)
+	}
+	return keep
+}
+
+// stripVolumeMountsNamed returns mounts without the entries naming a volume in
+// dropped. The input is returned as-is when nothing in it is named there.
+func stripVolumeMountsNamed(mounts []corev1.VolumeMount, dropped map[string]bool) []corev1.VolumeMount {
+	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return dropped[m.Name] }) {
+		return mounts
+	}
+	keep := make([]corev1.VolumeMount, 0, len(mounts))
+	for _, m := range mounts {
+		if dropped[m.Name] {
+			continue
+		}
+		keep = append(keep, m)
+	}
+	return keep
+}
+
+// stripContainerMountsNamed applies stripVolumeMountsNamed to every container
+// in the list. The containers come straight off the CR, which is the manager's
+// cached copy, so a container whose mounts change is copied rather than edited
+// in place; the input slice is returned as-is when no container is affected.
+func stripContainerMountsNamed(containers []corev1.Container, dropped map[string]bool) []corev1.Container {
+	if len(dropped) == 0 {
+		return containers
+	}
+	var out []corev1.Container
+	for i, c := range containers {
+		kept := stripVolumeMountsNamed(c.VolumeMounts, dropped)
+		if len(kept) == len(c.VolumeMounts) {
+			if out != nil {
+				out = append(out, c)
+			}
+			continue
+		}
+		if out == nil {
+			out = make([]corev1.Container, 0, len(containers))
+			out = append(out, containers[:i]...)
+		}
+		c.VolumeMounts = kept
+		out = append(out, c)
+	}
+	if out == nil {
+		return containers
+	}
+	return out
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -1971,10 +2104,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	var extraVolumes []corev1.Volume
 	var podAnnotations map[string]string
 	if agent.Spec.Deployment != nil {
-		initContainers = agent.Spec.Deployment.InitContainers
-		sidecars = agent.Spec.Deployment.Sidecars
-		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
-		extraVolumes = agent.Spec.Deployment.ExtraVolumes
+		// A hostPath entry on either volume list stays out of the Pod, and so
+		// does every mount naming it on the containers the CR authored; the
+		// agent container's own extraVolumeMounts get the same filter in
+		// buildBaseContainers. See hostPathVolumes for why the webhook's
+		// refusal is not enough on its own, and why the mounts have to go
+		// with the volume.
+		droppedVolumes := hostPathVolumeNames(agent)
+		initContainers = stripContainerMountsNamed(agent.Spec.Deployment.InitContainers, droppedVolumes)
+		sidecars = stripContainerMountsNamed(agent.Spec.Deployment.Sidecars, droppedVolumes)
+		sidecarVolumes = stripHostPathVolumes(agent.Spec.Deployment.SidecarVolumes)
+		extraVolumes = stripHostPathVolumes(agent.Spec.Deployment.ExtraVolumes)
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
 
@@ -3721,7 +3861,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		if agent.Spec.Deployment.ImagePullPolicy != nil {
 			pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 		}
-		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
+		// Filtered before dropTmpScratchIfClaimed reads the list, so a hostPath
+		// mount at /tmp that the render is about to drop does not also take
+		// the tmp-scratch emptyDir with it.
+		extraVolumeMounts = stripVolumeMountsNamed(agent.Spec.Deployment.ExtraVolumeMounts, hostPathVolumeNames(agent))
 		storages = agent.Spec.Deployment.Storages
 	}
 
