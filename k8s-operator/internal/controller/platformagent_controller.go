@@ -158,16 +158,38 @@ const (
 	// hostPathDroppedEntryFormat renders one dropped entry as the author would
 	// find it in the spec: field, index, name, and the host path it asked for.
 	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
-	// hostPathDroppedMessageFormat takes the joined entries. It says what is
-	// left out, that the mounts go with it, why admission did not stop it,
-	// and how to clear the condition, because `kubectl describe` is where the
-	// author of a CR the webhook never saw finds out. Present tense, not past:
-	// only a pass that rendered writes this, and the Pod that pass rendered
-	// stands without the entries until they leave the spec.
-	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and are left out of the agent Pod, with every volumeMount " +
-		"naming them: %s. The admission webhook refuses these when it runs, and this CR was admitted without it " +
-		"(the Helm chart ships operator.webhooks.enabled=false, and one enabled through the chart fails open at " +
-		"its default failurePolicy: Ignore). Remove the entries from the spec to clear this condition."
+	// hostPathDroppedMessageFormat takes the joined entries and then the
+	// rollout clause below, which is "" on most passes. It says what is left
+	// out, that the mounts go with it, what keeping them would have cost, why
+	// admission did not stop it, and how to clear the condition, because
+	// `kubectl describe` is where the author of a CR the webhook never saw
+	// finds out.
+	//
+	// It speaks about the Pod template the operator renders, not about the Pod
+	// that is running, because the template is the whole of what this
+	// controller observes. reconcileWorkload server-side-applies it and
+	// returns once the API server has accepted it; nothing waits on the
+	// rollout. With spec.deployment.availability.replicas > 1 the strategy is
+	// RollingUpdate at maxUnavailable 1, so Pods from the revision before it --
+	// on an operator rolled out over a CR a pre-fix render gave real hostPath
+	// mounts, Pods that really do mount them -- keep running until the roll
+	// finishes, and indefinitely if it stalls. "Left out of the agent Pod"
+	// asserted a property of those Pods too, and Ready does not offset it:
+	// updateStatusReady decides the phase from ReadyReplicas, which counts
+	// ready Pods across every ReplicaSet the Deployment owns.
+	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and are left out of the Pod template the operator " +
+		"renders, along with every volumeMount naming them: %s. Keeping them would give the agent container, which is " +
+		"where model output runs, access to the node's filesystem at those paths.%s The admission webhook refuses " +
+		"these when it runs, and this CR was admitted without it (the Helm chart ships operator.webhooks.enabled=false, " +
+		"and one enabled through the chart fails open at its default failurePolicy: Ignore). Remove the entries from " +
+		"the spec to clear this condition."
+	// hostPathDroppedRollingClause fills the second slot on a pass that can see
+	// the roll of that template is not finished. A separate sentence rather
+	// than a hedge on the first one, so the reader who does not get it reads an
+	// unqualified statement, and leading with a space because the slot sits
+	// directly after a full stop.
+	hostPathDroppedRollingClause = " That template is still rolling out, so Pods from an earlier revision may still be " +
+		"running with these volumes mounted."
 	hostPathDroppedEntrySeparator = ", "
 	// hostPathDroppedEntryBudget bounds the joined entries, and
 	// hostPathDroppedOverflowFormat counts whatever did not fit. Volume names
@@ -2394,6 +2416,26 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
 
+	// Whether the gateway workload may still be running Pods from a revision
+	// older than the template reconcileWorkload just applied. It qualifies the
+	// VolumesDropped message below, which otherwise asserts a security
+	// property of Pods the apply has not reached yet. Read off the object this
+	// function already fetches, so it costs no extra API call.
+	//
+	// Two terms, because neither is sound alone. UpdatedReplicas < Replicas is
+	// the direct reading -- Replicas counts every non-terminated Pod the
+	// selector matches, UpdatedReplicas only those from the current revision --
+	// but both are as of Status.ObservedGeneration, so immediately after an
+	// apply they describe the previous template and can read equal while every
+	// Pod is old. ObservedGeneration < Generation catches exactly that window.
+	//
+	// It over-reports on a workload that has only just been created: no Pods
+	// exist, the status is zeroes, and the generation term holds until the
+	// workload controller writes back. That is the safe direction, because the
+	// clause weakens the condition's claim -- a spurious one under-claims the
+	// drop rather than over-claiming it -- and it clears on the next pass.
+	workloadRollIncomplete := rolloutNotKnownIncomplete
+
 	if useStatefulSet(agent) {
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
@@ -2403,6 +2445,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
 			newDeploymentStatusReadyReplicas = sts.Status.ReadyReplicas
+			// The ordered roll has the same window: replicas > 1 over RWO
+			// storage takes this path, and the StatefulSet controller replaces
+			// Pods one at a time.
+			if sts.Status.ObservedGeneration < sts.Generation || sts.Status.UpdatedReplicas < sts.Status.Replicas {
+				workloadRollIncomplete = rolloutIncomplete
+			}
 		}
 	} else {
 		dep := &appsv1.Deployment{}
@@ -2413,6 +2461,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
 			newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
+			if dep.Status.ObservedGeneration < dep.Generation || dep.Status.UpdatedReplicas < dep.Status.Replicas {
+				workloadRollIncomplete = rolloutIncomplete
+			}
 		}
 	}
 
@@ -2536,11 +2587,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		(!eventWatcherOn && existingWatcherCond != nil && existingWatcherCond.Status == metav1.ConditionFalse &&
 			existingWatcherCond.Reason == eventWatcherDisabledReason && existingWatcherCond.Message == eventWatcherDisabledMessage)
 
-	// A hostPath volume the render left out of the Pod, reported while the
-	// spec still carries one and absent otherwise. Message is compared for
-	// the same reason EventWatcher's is: it names the entries, and an edit
-	// that swaps one hostPath for another has to change what the CR says.
-	hostPathDroppedMsg := hostPathDroppedMessage(agent)
+	// A hostPath volume the render left out of the Pod template, reported
+	// while the spec still carries one and absent otherwise. Message is
+	// compared for the same reason EventWatcher's is: it names the entries,
+	// and an edit that swaps one hostPath for another has to change what the
+	// CR says. workloadRollIncomplete rides in the same string, so the
+	// comparison covers it without a term of its own -- a roll finishing is
+	// one status write, not a write per pass (#1392).
+	hostPathDroppedMsg := hostPathDroppedMessage(agent, workloadRollIncomplete)
 	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
@@ -2679,10 +2733,28 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 	})
 }
 
+// oldPodsPossible says whether Pods from a revision older than the template
+// this pass rendered may still be running, and is the argument
+// hostPathDroppedMessage takes to decide whether the message carries
+// hostPathDroppedRollingClause. Named rather than a bare bool because the two
+// callers answer it from different evidence, and one of them cannot answer it
+// at all.
+type oldPodsPossible bool
+
+const (
+	// rolloutIncomplete is what updateStatusReady reports when the workload it
+	// already fetched has not finished rolling the applied template out.
+	rolloutIncomplete oldPodsPossible = true
+	// rolloutNotKnownIncomplete covers two different states on purpose: the
+	// roll has finished, and the caller holds no workload object to ask. Both
+	// take the unqualified wording -- see updateStatusDegraded for the second.
+	rolloutNotKnownIncomplete oldPodsPossible = false
+)
+
 // hostPathDroppedMessage is the VolumesDropped condition's message for the
-// hostPath entries the render left out of the Pod, or "" when the spec carries
-// none and the condition is to be absent.
-func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent) string {
+// hostPath entries the render left out of the Pod template, or "" when the
+// spec carries none and the condition is to be absent.
+func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsPossible) string {
 	dropped := hostPathVolumes(agent)
 	if len(dropped) == 0 {
 		return ""
@@ -2691,7 +2763,11 @@ func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent) string {
 	for _, d := range dropped {
 		entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
 	}
-	return fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries))
+	rolling := ""
+	if oldPods {
+		rolling = hostPathDroppedRollingClause
+	}
+	return fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling)
 }
 
 // hostPathDroppedEntryList joins as many entries as fit in
@@ -3017,7 +3093,16 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	hostPathDroppedMsg := ""
 	hostPathDroppedUnchanged := true
 	if rendered {
-		hostPathDroppedMsg = hostPathDroppedMessage(agent)
+		// Unqualified wording, without the rollout clause updateStatusReady can
+		// add. That function reads the roll off the gateway workload it fetches
+		// anyway; this one is handed the CR and the refusal and nothing else,
+		// and adding a workload Get here would put an API read on every parked
+		// pass to say something about three refusals out of seven. So a CR
+		// parked on one of those three states the drop slightly more strongly
+		// than the same CR reading Ready would. Both messages are about the
+		// rendered template either way -- only the Ready one says when that
+		// template has not reached every Pod yet.
+		hostPathDroppedMsg = hostPathDroppedMessage(agent, rolloutNotKnownIncomplete)
 		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 	}
 	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&

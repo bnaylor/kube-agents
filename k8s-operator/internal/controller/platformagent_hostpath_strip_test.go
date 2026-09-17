@@ -32,6 +32,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -555,6 +556,170 @@ func TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded(t *testing.T) {
 	}
 }
 
+// The message is a claim about the Pod template the controller rendered, not
+// about the Pod that is running. reconcileWorkload server-side-applies the
+// template and returns as soon as the API server accepts it, so on a CR a
+// pre-fix operator rendered with real hostPath mounts the old Pods keep them
+// until the roll replaces them -- and the roll can stall. The clause saying so
+// is present exactly when the caller could see the roll was unfinished.
+func TestTheDroppedVolumeMessageQualifiesItselfWhileTheRollIsUnfinished(t *testing.T) {
+	agent := hostPathAgent()
+	settled := hostPathDroppedMessage(agent, rolloutNotKnownIncomplete)
+	rolling := hostPathDroppedMessage(agent, rolloutIncomplete)
+
+	if strings.Contains(settled, hostPathDroppedRollingClause) {
+		t.Errorf("the unqualified message carries the rollout clause: %s", settled)
+	}
+	if !strings.Contains(rolling, hostPathDroppedRollingClause) {
+		t.Errorf("the message written while the roll is unfinished does not say so: %s", rolling)
+	}
+	for form, msg := range map[string]string{"settled": settled, "rolling": rolling} {
+		// What the controller observes is the template, so that is what the
+		// message may speak about.
+		if !strings.Contains(msg, "Pod template") {
+			t.Errorf("the %s message does not say the claim is about the rendered Pod template: %s", form, msg)
+		}
+		if !strings.Contains(msg, hostPathFixtureExtraVolume) || !strings.Contains(msg, hostPathFixtureSidecarVolume) {
+			t.Errorf("the %s message does not name both dropped entries: %s", form, msg)
+		}
+		if len(msg) > conditionMessageMaxLength {
+			t.Errorf("the %s message is %d characters, over the %d the CRD schema allows", form, len(msg), conditionMessageMaxLength)
+		}
+	}
+}
+
+// And the clause is wired to the gateway workload rather than to a constant.
+// updateStatusReady reads the roll off the workload it already fetches, on two
+// terms: the workload controller has not observed the applied template yet, or
+// it has and still counts Pods that are not on it. Either one means Pods from
+// an earlier revision -- which a pre-fix operator may have rendered with these
+// volumes really mounted -- can still be running.
+func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
+	cases := []struct {
+		name string
+		// replicas > 1 over RWO storage is what puts the gateway on a
+		// StatefulSet, whose ordered roll has the same window.
+		statefulSet bool
+		generation  int64
+		observed    int64
+		replicas    int32
+		updated     int32
+		rolling     bool
+	}{
+		{
+			// The apply has landed and the workload controller has written
+			// nothing back yet, so its counts describe the template before it
+			// and read fully rolled out while every Pod is still old.
+			name:       "applied template not observed yet",
+			generation: 4, observed: 3, replicas: 3, updated: 3,
+			rolling: true,
+		},
+		{
+			// Mid-roll: one Pod on the new template, two on the old one.
+			name:       "replicas from an earlier revision still counted",
+			generation: 4, observed: 4, replicas: 3, updated: 1,
+			rolling: true,
+		},
+		{
+			name:       "fully rolled out",
+			generation: 4, observed: 4, replicas: 3, updated: 3,
+			rolling: false,
+		},
+		{
+			name:        "statefulset mid-roll",
+			statefulSet: true,
+			generation:  4, observed: 4, replicas: 3, updated: 1,
+			rolling: true,
+		},
+		{
+			name:        "statefulset fully rolled out",
+			statefulSet: true,
+			generation:  4, observed: 4, replicas: 3, updated: 3,
+			rolling: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := hostPathAgent()
+			gatewayMeta := metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace, Generation: tc.generation}
+			var gateway client.Object = &appsv1.Deployment{
+				ObjectMeta: gatewayMeta,
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: tc.observed,
+					Replicas:           tc.replicas,
+					UpdatedReplicas:    tc.updated,
+					ReadyReplicas:      tc.replicas,
+				},
+			}
+			if tc.statefulSet {
+				agent.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(tc.replicas)}
+				agent.Spec.Deployment.Storages = []agentv1alpha1.StorageSpec{{
+					Name:        "gateway-data",
+					MountPath:   "/srv/gateway-data",
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				}}
+				if !useStatefulSet(agent) {
+					t.Fatalf("this case is meant to take the StatefulSet path and does not")
+				}
+				gateway = &appsv1.StatefulSet{
+					ObjectMeta: gatewayMeta,
+					Status: appsv1.StatefulSetStatus{
+						ObservedGeneration: tc.observed,
+						Replicas:           tc.replicas,
+						UpdatedReplicas:    tc.updated,
+						ReadyReplicas:      tc.replicas,
+					},
+				}
+			}
+
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, gateway).
+				WithStatusSubresource(agent).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+			ctx := context.Background()
+
+			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent)); err != nil {
+				t.Fatalf("updateStatusReady failed: %v", err)
+			}
+			cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathConditionType)
+			if cond == nil {
+				t.Fatalf("no %s condition; conditions: %+v", hostPathConditionType, agent.Status.Conditions)
+			}
+			if got := strings.Contains(cond.Message, hostPathDroppedRollingClause); got != tc.rolling {
+				t.Errorf("rollout clause present = %v, want %v, at generation %d with observedGeneration %d and %d of %d replicas updated: %s",
+					got, tc.rolling, tc.generation, tc.observed, tc.updated, tc.replicas, cond.Message)
+			}
+
+			// The clause has to be inside the unchanged comparison as well as
+			// inside the write. It rides in the message, which the comparison
+			// already covers -- but a comparison that recomputed the message
+			// without it would differ from the written one on every pass, and
+			// a CR sitting mid-roll would write status on every 30s requeue
+			// tick and wake itself through the unfiltered watch (#1392).
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("reading the PlatformAgent back: %v", err)
+			}
+			settledVersion := stored.ResourceVersion
+			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent)); err != nil {
+				t.Fatalf("updateStatusReady (settled) failed: %v", err)
+			}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("reading the PlatformAgent back: %v", err)
+			}
+			if stored.ResourceVersion != settledVersion {
+				t.Errorf("a second pass over unchanged state wrote the CR (resourceVersion %s -> %s); the %s message and the comparison disagree",
+					settledVersion, stored.ResourceVersion, hostPathConditionType)
+			}
+		})
+	}
+}
+
 // hostPathFloodDeploymentSpec is a spec.deployment carrying count hostPath
 // volumes whose names and paths are long enough that listing them all would
 // run past the 32768 characters the CRD schema allows a condition message.
@@ -578,7 +743,9 @@ func hostPathFloodDeploymentSpec(count, nameLen int) *agentv1alpha1.DeploymentSp
 func TestTheDroppedVolumeMessageStaysUnderTheConditionCap(t *testing.T) {
 	agent := brokerPodAgent()
 	agent.Spec.Deployment = hostPathFloodDeploymentSpec(floodedHostPathCount, floodedHostPathNameLen)
-	msg := hostPathDroppedMessage(agent)
+	// rolloutIncomplete because it is the longer of the two forms: the cap has
+	// to hold for the message as it is at its widest.
+	msg := hostPathDroppedMessage(agent, rolloutIncomplete)
 
 	if len(msg) > conditionMessageMaxLength {
 		t.Errorf("message is %d characters, over the %d the CRD schema allows: every status write on this CR fails, not just this condition", len(msg), conditionMessageMaxLength)
@@ -608,7 +775,7 @@ func TestTheDroppedVolumeMessageStaysUnderTheConditionCap(t *testing.T) {
 func TestASingleOversizedHostPathEntryIsTruncated(t *testing.T) {
 	agent := brokerPodAgent()
 	agent.Spec.Deployment = hostPathFloodDeploymentSpec(1, 64*1024)
-	msg := hostPathDroppedMessage(agent)
+	msg := hostPathDroppedMessage(agent, rolloutIncomplete)
 
 	if len(msg) > conditionMessageMaxLength {
 		t.Errorf("message is %d characters, over the %d the CRD schema allows", len(msg), conditionMessageMaxLength)
