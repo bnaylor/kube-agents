@@ -161,10 +161,14 @@ const (
 	// reaped session leaves three consumers on TASKS forever, and the
 	// successor incarnation — which mints a fresh name — leaves three more.
 	//
-	// nats.go's ordered consumers use five seconds and the same number is
-	// used here, but NOT because the threshold only fires after the pod is
-	// gone -- an earlier version of this comment claimed that and it is not
-	// true. A disconnect longer than five seconds reaps these consumers with
+	// Five seconds is this adapter's own number, not an inherited one:
+	// nats.go's ordered consumers default to five MINUTES
+	// (jetstream/ordered.go, v1.53.1), and an earlier version of this
+	// comment cited that default as five seconds, which is wrong by 60x.
+	// The short threshold is a deliberate departure from it, and NOT
+	// because the threshold only fires after the pod is gone -- an earlier
+	// version of this comment claimed that too and it is not true. A
+	// disconnect longer than five seconds reaps these consumers with
 	// the adapter still very much alive, and because they are MemoryStorage
 	// with Replicas 1 a nats-server restart destroys them outright. Both are
 	// routine. What makes the short threshold safe is not that the window
