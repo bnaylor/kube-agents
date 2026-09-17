@@ -158,6 +158,22 @@ const (
 		"(the Helm chart ships operator.webhooks.enabled=false, and one enabled through the chart fails open at " +
 		"its default failurePolicy: Ignore). Remove the entries from the spec to clear this condition."
 	hostPathDroppedEntrySeparator = ", "
+	// hostPathDroppedEntryBudget bounds the joined entries, and
+	// hostPathDroppedOverflowFormat counts whatever did not fit. Volume names
+	// and host paths are the author's, and neither the CRD nor this controller
+	// bounds their length or their number, while the CRD schema caps a
+	// condition message at 32768 characters -- so an unbounded list is one
+	// spec away from failing the whole status write, Ready and the phase and
+	// every other condition with it, on every pass, for as long as the entries
+	// stay in the spec. The budget is far under the cap because the message is
+	// read in `kubectl describe`, where the first few entries are what anyone
+	// acts on.
+	hostPathDroppedEntryBudget    = 4096
+	hostPathDroppedOverflowFormat = ", and %d more"
+	// hostPathDroppedEntryEllipsis marks a single entry cut to fit the budget,
+	// which takes one name or one path longer than the whole list is allowed
+	// to be.
+	hostPathDroppedEntryEllipsis = "..."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -2663,7 +2679,55 @@ func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent) string {
 	for _, d := range dropped {
 		entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
 	}
-	return fmt.Sprintf(hostPathDroppedMessageFormat, strings.Join(entries, hostPathDroppedEntrySeparator))
+	return fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries))
+}
+
+// hostPathDroppedEntryList joins as many entries as fit in
+// hostPathDroppedEntryBudget and counts the rest, so that the message stays
+// under the 32768 characters the CRD schema allows a condition message
+// whatever the spec asks for. See hostPathDroppedEntryBudget for why an
+// unbounded list is not an option: the status write that carries it is the
+// whole status write.
+func hostPathDroppedEntryList(entries []string) string {
+	var b strings.Builder
+	listed := 0
+	for _, entry := range entries {
+		want := len(entry)
+		if listed > 0 {
+			want += len(hostPathDroppedEntrySeparator)
+		}
+		if b.Len()+want > hostPathDroppedEntryBudget {
+			break
+		}
+		if listed > 0 {
+			b.WriteString(hostPathDroppedEntrySeparator)
+		}
+		b.WriteString(entry)
+		listed++
+	}
+	if listed == 0 {
+		// A single entry over the whole budget, which takes one author-chosen
+		// name or path longer than the message may be. Say as much of it as
+		// fits: a cut name is still something to search the spec for, and a
+		// message naming nothing at all is not.
+		b.WriteString(truncateToValidUTF8(entries[0], hostPathDroppedEntryBudget-len(hostPathDroppedEntryEllipsis)))
+		b.WriteString(hostPathDroppedEntryEllipsis)
+		listed = 1
+	}
+	if rest := len(entries) - listed; rest > 0 {
+		fmt.Fprintf(&b, hostPathDroppedOverflowFormat, rest)
+	}
+	return b.String()
+}
+
+// truncateToValidUTF8 cuts s to at most max bytes, dropping any rune the cut
+// lands in the middle of. The API server stores strings as UTF-8, so a message
+// ending in half a rune is a write that either fails or is silently rewritten.
+func truncateToValidUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
 }
 
 func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, profile netpolProfile) bool {

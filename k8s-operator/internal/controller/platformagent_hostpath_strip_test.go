@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -57,7 +59,23 @@ const (
 	// The condition the fix writes, as literals (see the file comment).
 	hostPathConditionType   = "VolumesDropped"
 	hostPathConditionReason = "HostPathVolumeDropped"
+	// conditionMessageMaxLength is the cap the CRD schema puts on a condition
+	// message (`maxLength: 32768` under status.conditions[].message in
+	// config/crd/bases/kubeagents.x-k8s.io_platformagents.yaml, from
+	// metav1.Condition's own marker). A message over it does not fail this
+	// condition alone: the API server refuses the whole status subresource
+	// write, so Ready, the phase and every other condition go with it.
+	conditionMessageMaxLength = 32768
+	// The flood fixture: enough author-chosen characters that listing every
+	// entry would run past that cap.
+	floodedHostPathCount   = 64
+	floodedHostPathNameLen = 1024
 )
+
+// hostPathOverflowCountPattern reads the count back out of the message's
+// overflow clause, so the test does not hard-code how many entries the budget
+// happens to fit.
+var hostPathOverflowCountPattern = regexp.MustCompile(`and (\d+) more`)
 
 // hostPathAgent is a CR carrying one hostPath on each list, mounted from the
 // agent container (extraVolumeMounts), a user sidecar and a user init container,
@@ -454,5 +472,71 @@ func TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded(t *testing.T) {
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
 		t.Errorf("%s condition survived the removal of every hostPath entry on the Degraded path: %+v", hostPathConditionType, cond)
+	}
+}
+
+// hostPathFloodDeploymentSpec is a spec.deployment carrying count hostPath
+// volumes whose names and paths are long enough that listing them all would
+// run past the 32768 characters the CRD schema allows a condition message.
+// Author-chosen strings, both of them, and nothing bounds either.
+func hostPathFloodDeploymentSpec(count, nameLen int) *agentv1alpha1.DeploymentSpec {
+	spec := &agentv1alpha1.DeploymentSpec{}
+	for i := 0; i < count; i++ {
+		// Distinct names: extraVolumes is a list-map keyed on name, so the API
+		// server refuses a CR that repeats one.
+		suffix := "-" + strconv.Itoa(i)
+		spec.ExtraVolumes = append(spec.ExtraVolumes, corev1.Volume{
+			Name: strings.Repeat("v", nameLen) + suffix,
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{Path: "/" + strings.Repeat("p", nameLen) + suffix},
+			},
+		})
+	}
+	return spec
+}
+
+func TestTheDroppedVolumeMessageStaysUnderTheConditionCap(t *testing.T) {
+	agent := brokerPodAgent()
+	agent.Spec.Deployment = hostPathFloodDeploymentSpec(floodedHostPathCount, floodedHostPathNameLen)
+	msg := hostPathDroppedMessage(agent)
+
+	if len(msg) > conditionMessageMaxLength {
+		t.Errorf("message is %d characters, over the %d the CRD schema allows: every status write on this CR fails, not just this condition", len(msg), conditionMessageMaxLength)
+	}
+	if !strings.Contains(msg, "spec.deployment.extraVolumes[0]") {
+		t.Errorf("message does not name the first entry, which is the one the author has to find: %s", msg)
+	}
+	// Every entry it did not list has to be accounted for, or the message is
+	// a shorter lie rather than a shorter report.
+	listed := strings.Count(msg, hostPathExtraVolumesField+"[")
+	match := hostPathOverflowCountPattern.FindStringSubmatch(msg)
+	if match == nil {
+		t.Fatalf("message lists %d of %d entries and does not say how many it left out: %s", listed, floodedHostPathCount, msg)
+	}
+	rest, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("unreadable overflow count %q: %v", match[1], err)
+	}
+	if listed+rest != floodedHostPathCount {
+		t.Errorf("message lists %d entries and counts %d more, which is %d of %d", listed, rest, listed+rest, floodedHostPathCount)
+	}
+	t.Logf("%d entries of %d characters each rendered a %d-character message listing %d of them", floodedHostPathCount, floodedHostPathNameLen, len(msg), listed)
+}
+
+// One entry can be longer on its own than the message may be, so the budget
+// has to cut inside an entry rather than only between entries.
+func TestASingleOversizedHostPathEntryIsTruncated(t *testing.T) {
+	agent := brokerPodAgent()
+	agent.Spec.Deployment = hostPathFloodDeploymentSpec(1, 64*1024)
+	msg := hostPathDroppedMessage(agent)
+
+	if len(msg) > conditionMessageMaxLength {
+		t.Errorf("message is %d characters, over the %d the CRD schema allows", len(msg), conditionMessageMaxLength)
+	}
+	if !strings.Contains(msg, "spec.deployment.extraVolumes[0]") {
+		t.Errorf("a truncated message still has to name the field the entry is on: %s", msg)
+	}
+	if !strings.Contains(msg, hostPathDroppedEntryEllipsis) {
+		t.Errorf("a truncated entry is not marked as truncated: %s", msg)
 	}
 }
