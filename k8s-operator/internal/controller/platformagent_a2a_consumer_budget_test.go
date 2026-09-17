@@ -174,9 +174,17 @@ func streamAddInvocation(script, stream string) (string, bool) {
 func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
-		// Not skipped: the script opens with `set -euo pipefail`, which
-		// dash does not have, so a runner without bash cannot execute
-		// what ships either.
+		// Not skipped: this is the only test that executes the
+		// script rather than reading it, and a skip would drop that
+		// coverage silently on a runner without bash.
+		//
+		// bash is this test's interpreter and not the shipped one.
+		// The provision Job runs `sh -c <script>` in
+		// natsio/nats-box, so what the pod uses is that image's sh,
+		// not bash. bash is chosen here because it has the
+		// `set -o pipefail` the script opens with and dash does not;
+		// the cost is that a bashism the script grew would pass here
+		// and only fail in the pod.
 		t.Fatalf("bash is required to execute the provision script (it uses `set -o pipefail`): %v", err)
 	}
 
