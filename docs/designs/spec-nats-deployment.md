@@ -171,6 +171,18 @@ operator who chose the number is not told their stream predates the limit. The
 block is treated the other way - it refuses - because a short consumer budget is not a
 bound the install never had but a shortfall with a load-time failure already attached.
 
+Where that report lands bounds what it is worth, so it is worth saying plainly: the
+provision Job's pod log, and nowhere else. The script exits 0, the reconcile reads the
+Job's `Complete` condition and nothing else, and no Event, no CR condition and no status
+field records that the stream is still unbounded - an install that predates this render
+reads `Ready` with the gap open, exactly as it did before. The 24h TTL removes the
+finished Job and the next reconcile recreates it under the same digested name, so the
+report reappears roughly daily rather than expiring; it is still a pod log, and someone
+has to go and read it. Surfacing it where an operator would see it without being told to
+look is deferred for the same reason the `max_consumers` refusal's own CR surfacing is -
+status plumbing with a blast radius of its own, which is a change about status and not
+about the bus render.
+
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
 Three KV buckets ride the same JetStream deployment:
