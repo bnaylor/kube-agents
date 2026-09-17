@@ -13,7 +13,6 @@ package controller
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -94,23 +93,48 @@ func busCredentialsAreReady(agent *agentv1alpha1.PlatformAgent) {
 // reason alone.
 func completeTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
 	t.Helper()
-	jobs := &batchv1.JobList{}
-	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
-		t.Fatalf("list Jobs: %v", err)
-	}
-	var job *batchv1.Job
-	for i := range jobs.Items {
-		if strings.Contains(jobs.Items[i].Name, "-a2a-provision-") {
-			job = &jobs.Items[i]
+	// By the exact name the controller renders, not by matching the infix.
+	// The name is a digest of the whole JobSpec, so a spec edit produces a
+	// second Job rather than replacing the first - which is the whole point
+	// of the digest - and a substring scan over the namespace would pick
+	// whichever of them the List happened to return last. Completing the
+	// wrong one leaves the reconcile under test reading an unprovisioned bus
+	// while this helper reports success.
+	name := buildA2AProvisionJob(agent).Name
+	job := &batchv1.Job{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, job); err != nil {
+		jobs := &batchv1.JobList{}
+		if lerr := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); lerr != nil {
+			t.Fatalf("get provision Job %s: %v (and listing Jobs failed: %v)", name, err, lerr)
 		}
-	}
-	if job == nil {
-		t.Fatalf("no A2A provision Job among %d Jobs; this helper would silently do nothing", len(jobs.Items))
+		var names []string
+		for i := range jobs.Items {
+			names = append(names, jobs.Items[i].Name)
+		}
+		t.Fatalf("no A2A provision Job named %s; the namespace holds %v. The render and this helper disagree about the digest, so completing anything here would be completing the wrong Job", name, names)
 	}
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	if err := cl.Status().Update(ctx, job); err != nil {
 		t.Fatalf("update provision Job status: %v", err)
 	}
+
+	// Read it back and assert it, because the caller's assertion cannot.
+	// Both arms of the requeue in Reconcile - provisioning unfinished, and
+	// the gateway held - return the same 30s, so a caller measuring that
+	// interval gets the number it wants whether or not this helper worked.
+	// The comment at the call site says the measurement was taken with
+	// provisioning complete; this is what makes that a checked precondition
+	// rather than an assumption the test cannot see failing.
+	check := &batchv1.Job{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, check); err != nil {
+		t.Fatalf("re-read provision Job %s: %v", name, err)
+	}
+	for _, c := range check.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return
+		}
+	}
+	t.Fatalf("provision Job %s does not read back complete (%+v); every requeue measured after this would be the unprovisioned arm, at the same 30s", name, check.Status.Conditions)
 }
 
 func a2aGateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
