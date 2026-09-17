@@ -282,12 +282,26 @@ const (
 	a2aSessionConsumersPerSession = 3
 
 	// a2aTasksReservedConsumers is the part of the budget that is nobody's
-	// session: the gateway's `gateway-relay` durable and the Hermes
-	// bridge's `bridge-<profile>` durable (2), headroom for the audit
-	// durable the accountability rail needs (1), one session's worth of overlap while
+	// session. What follows itemizes the STANDING consumers only: the
+	// gateway's `gateway-relay` durable and the Hermes bridge's
+	// `bridge-<profile>` durable (2), headroom for the audit durable the
+	// accountability rail needs (1), one session's worth of overlap while
 	// the gateway retires an incarnation and mints its replacement and the
 	// old consumers have not yet reached their 5s inactive threshold (3),
 	// and ten for the web rail's concurrent readers.
+	//
+	// It is not an accounting of everything that sits on TASKS, and reading
+	// it as one is the mistake to avoid: `tasks/get` replay ephemerals are
+	// outside this number and are not counted anywhere. lib.TasksGet opens an
+	// ordered consumer and its cleanup stops the local subscription only --
+	// the consumer itself waits out its InactiveThreshold, which TasksGet
+	// leaves unset, so nats.go's five-minute default applies. Every call
+	// therefore leaves one consumer on the stream for five minutes after it
+	// returns. That makes the missing term a call RATE over a rolling
+	// five-minute window rather than a concurrency, and the callers are not
+	// just the web rail: the gateway's sweep, reap and relay paths replay
+	// too. gke-labs#1739 owns the term and the number; this constant
+	// deliberately does not move for it here.
 	a2aTasksReservedConsumers = 16
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
