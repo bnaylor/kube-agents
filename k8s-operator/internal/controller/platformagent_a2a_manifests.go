@@ -658,11 +658,21 @@ func a2aWorkerJetStreamGrants() []string {
 //     TestGatewayConsumersSurviveABusRestart, which asserts that this is the
 //     only violation the restart produces.
 //   - The pre-reset ephemeral is not removed immediately; it waits out its
-//     own five-minute inactive threshold, holding a TASKS consumer slot
-//     against max_consumers. Stopping an ordered iterator never deleted its
-//     consumer under the wildcard either, so the per-replay ephemeral is
-//     pre-existing -- what this adds is that the RESET path's old consumer
-//     lingers too.
+//     own five-minute inactive threshold -- nats.go's ordered-consumer
+//     default (jetstream/ordered.go), which lib.TasksGet does not override --
+//     holding a TASKS consumer slot against max_consumers. Stopping an
+//     ordered iterator never deleted its consumer under the wildcard either,
+//     so the per-replay ephemeral is pre-existing -- what this adds is that
+//     the RESET path's old consumer lingers too. Measured on the rendered
+//     config: a reconnect that leaves the server running holds two slots per
+//     replay in flight, the old consumer and its replacement, until the
+//     threshold expires; a bus bounce leaves only the replacement, because
+//     these consumers are memory storage with one replica and the restarting
+//     server drops them. Those slots are the gateway's and never a session's,
+//     so whatever sizes TASKS' max_consumers has to count concurrent
+//     tasks/get replays beside the session cap. A budget that counts sessions
+//     alone runs out under replay load and refuses a legitimate session's
+//     consumer create, which reads as an undersized stream.
 //
 // Neither is worth the grant, but the cost is stated rather than described as
 // free, which is what this comment said first.

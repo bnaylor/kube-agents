@@ -204,6 +204,12 @@ Layout:
   `$JS.ACK.TASKS.>` for the gateway and the shared worker - and the principals whose reads
   are ordered or ack-none hold no ack grant at all. What scoping still cannot express is
   per-consumer scope inside a granted stream, since NATS wildcards match whole tokens.
+  Enumerating leaves one refusal that is expected rather than a fault: the gateway's
+  `tasks/get` replay reads through an ordered consumer whose reset path publishes
+  `$JS.API.CONSUMER.DELETE.TASKS.<server-generated name>` and ignores the answer, so a
+  reconnect writes one refusal per replay in flight into the bus log and into the
+  gateway's own log at Error. That subject is the only violation a rendered principal
+  produces by design; any other one is a missed grant.
 - **Topic publish grants are exact, never namespace wildcards.** Publish grants match
   the provisioned topic list subject-for-subject. A wildcard over a topic namespace
   turns provisioned-only into silent loss - a publish to an unprovisioned topic sails
