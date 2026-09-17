@@ -63,9 +63,14 @@ func TestAPerSubjectCapEvictsTheHeadAndTheFoldReportsIt(t *testing.T) {
 	s := startServer(t)
 	provisionCappedTasksStream(t, clientURL(s), 2)
 
-	c := replayFixture(t, clientURL(s), "task-cap", []TaskState{StateSubmitted, StateWorking, StateCompleted})
+	replayFixture(t, clientURL(s), "task-cap", []TaskState{StateSubmitted, StateWorking, StateCompleted})
 	ctx := testCtx(t)
 
+	// One replay, read two ways. The struct below and the log line further
+	// down are two reports of the same TasksGet, so a client whose logger the
+	// test can read serves both -- and the two halves cannot drift apart into
+	// describing different replays.
+	c, logs := replayLog(t, clientURL(s))
 	task, err := c.TasksGet(ctx, replayAddressee("task-cap"), "task-cap")
 	if err != nil {
 		t.Fatalf("TasksGet: %v", err)
@@ -89,10 +94,6 @@ func TestAPerSubjectCapEvictsTheHeadAndTheFoldReportsIt(t *testing.T) {
 	// The field on its own is not the deliverable. Nothing outside this
 	// package reads it, so a truncated replay is only observable if the
 	// replay path SAYS so — the same place PostFinalDropped is said.
-	logged, logs := replayLog(t, clientURL(s))
-	if _, err := logged.TasksGet(ctx, replayAddressee("task-cap"), "task-cap"); err != nil {
-		t.Fatalf("TasksGet through the logging client: %v", err)
-	}
 	line := logs.String()
 	if !strings.Contains(line, "a2a task replayed without its submitted event") {
 		t.Errorf("the replay of a truncated task logged nothing; the eviction is invisible to anyone not reading the struct\ngot:\n%s", line)
@@ -123,9 +124,10 @@ func TestAnUncappedReplayKeepsItsHead(t *testing.T) {
 	s := startServer(t)
 	provisionTasksStream(t, clientURL(s))
 
-	c := replayFixture(t, clientURL(s), "task-nocap", []TaskState{StateSubmitted, StateWorking, StateCompleted})
+	replayFixture(t, clientURL(s), "task-nocap", []TaskState{StateSubmitted, StateWorking, StateCompleted})
 	ctx := testCtx(t)
 
+	c, logs := replayLog(t, clientURL(s))
 	task, err := c.TasksGet(ctx, replayAddressee("task-nocap"), "task-nocap")
 	if err != nil {
 		t.Fatalf("TasksGet: %v", err)
@@ -140,10 +142,6 @@ func TestAnUncappedReplayKeepsItsHead(t *testing.T) {
 	// And the warning is conditional. A line that fires on every replay
 	// is noise an operator learns to filter, which costs the truncated
 	// case the only thing that makes it visible.
-	logged, logs := replayLog(t, clientURL(s))
-	if _, err := logged.TasksGet(ctx, replayAddressee("task-nocap"), "task-nocap"); err != nil {
-		t.Fatalf("TasksGet through the logging client: %v", err)
-	}
 	if strings.Contains(logs.String(), "replayed without its submitted event") {
 		t.Errorf("a complete replay warned anyway:\n%s", logs.String())
 	}
