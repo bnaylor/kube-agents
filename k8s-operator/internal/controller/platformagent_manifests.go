@@ -2042,10 +2042,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// Neither grants access to any cloud API, any repository, or anything
 	// outside the pod, which is the property the isolation boundary protects.
 	//
-	// The third is NATS_PASSWORD, appended further down under mode: next, and
-	// it is the one that does not have that property: it authenticates to the
-	// A2A bus over the cluster network. Do not reason about what this Pod
-	// holds from this block alone.
+	// There is no third any more. NATS_PASSWORD used to be appended further
+	// down under mode: next, and it was the one that did not have that
+	// property: it authenticated to the A2A bus over the cluster network. A5
+	// moved this container onto a projected token, so the bus credential is no
+	// longer an environment variable at all -- it is the file at
+	// a2aBusTokenPath, and the reasons it is not in reach of a plugin are the
+	// mount, not this list. Do not reason about what this Pod holds from this
+	// block alone.
 	// See docs/credential-isolation-design.md.
 	envVars = append(envVars,
 		corev1.EnvVar{
@@ -2596,15 +2600,22 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 		Spec: corev1.PodSpec{
 			// No ShareProcessNamespace, and under mode: next the field is
-			// load-bearing rather than a default. The agent container carries
-			// the A2A bus credential there (NATS_PASSWORD, by SecretKeyRef
-			// above), and a Pod that shares its process namespace hands every
-			// container's /proc/<pid>/environ — that value included — to every
-			// other container in it, spec.deployment.sidecars entries among
-			// them. Under mode: today the credential is absent and only the
-			// weaker reason applies: the next container added here should not
-			// inherit a shared namespace by default. Do not set this field on
-			// the strength of that weaker reason alone.
+			// load-bearing rather than a default. The agent container holds
+			// the A2A bus credential — since A5 not as NATS_PASSWORD in its
+			// env but as the projected token file at a2aBusTokenPath — and a
+			// Pod that shares its process namespace hands every container's
+			// /proc/<pid> to every other container in it,
+			// spec.deployment.sidecars entries among them. That reaches the
+			// file as well as the environment: /proc/<pid>/environ for an env
+			// var, /proc/<pid>/root for anything the process has mounted, and
+			// every container in this Pod runs as the same UID (see
+			// RunAsUser below), so the DAC check that would otherwise stop it
+			// passes. Moving the credential out of `env` narrowed which CR
+			// fields can reach it; it did not weaken this. Under mode: today
+			// the credential is absent and only the weaker reason applies:
+			// the next container added here should not inherit a shared
+			// namespace by default. Do not set this field on the strength of
+			// that weaker reason alone.
 			// See docs/security-requirements.md.
 			RuntimeClassName: runtimeClassName,
 			InitContainers:   initContainers,

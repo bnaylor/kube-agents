@@ -110,6 +110,68 @@ const (
 	a2aAccountSys = "SYS"
 )
 
+// The two principal names A5 split `worker` into. They are spelled once here
+// because each is used three times over — the identity's user field, the inbox
+// prefix its own grants carry, and (for the agent) the value the operator
+// renders into the container so the client can pin that same prefix.
+const (
+	// a2aAgentBusUser is the platform agent container's principal. The `a2a`
+	// CLI reads it back from a2aBusUserEnv; a2a/lib's EnvBusUser is the other
+	// half of that contract, duplicated rather than imported because the two
+	// modules cannot see each other.
+	a2aAgentBusUser = "agent"
+
+	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
+	// callout — see bridgeIdentity for why a token cannot separate it from
+	// the container above.
+	a2aBridgeUser = "bridge"
+
+	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a
+	// credential: it selects the inbox prefix the client pins, and the grants
+	// come from the callout's answer about the ServiceAccount, not from this.
+	// Setting it wrong gets a client that connects and then hangs on every
+	// reply, which is why it is reserved against spec.deployment.env and
+	// against plugin env both.
+	a2aBusUserEnv = "A2A_BUS_USER"
+
+	// a2aBusTokenFileEnv is NOT rendered by the operator: the client falls
+	// back to a2aBusTokenPath/a2aBusTokenFile, which is where the projection
+	// lands. It is named here only so the reservation can name it. Setting it
+	// points the client at a different file to present as its bearer token,
+	// and a2a/cmd/a2a/main.go prefers it unconditionally with no fallback --
+	// deliberately, because a caller who names a token file and is quietly
+	// logged in as something else is the failure that ordering prevents. The
+	// blast radius is denial rather than escalation, and the audience is the
+	// whole of why: automountServiceAccountToken is false, but this container
+	// is not tokenless -- it holds the broker-audience projection at
+	// credentialProxyTokenMountPath, and a CR can put more files in reach --
+	// and every one of them is minted for somebody else's audience, which the
+	// bus refuses at connect. It is still the variable that decides WHICH
+	// bearer token this container presents, so it is reserved on the same
+	// argument as a2aBusUserEnv above.
+	//
+	// Mirrors lib.EnvBusTokenFile (a2a/lib/credentials.go), which is the
+	// reader. Separate modules, so the spelling is held by the conformance
+	// suite rather than by the compiler.
+	a2aBusTokenFileEnv = "A2A_BUS_TOKEN_FILE" // #nosec G101 -- Environment variable name, not hardcoded credentials
+)
+
+// a2aBridgeAddressee is the addressee the bridge executes for, and the only one
+// its grants name. It is the bridge's BRIDGE_PROFILE default
+// (a2a/cmd/hermes-bridge/main.go, defaultProfile) — the two are one value, and a
+// deployment that overrides the env without widening this grant gets a bridge
+// that RUNS the other addressee's tasks and then cannot answer for them.
+//
+// Not the clean denial that reads like. The bridge consumes through a pull
+// consumer, so the filter subject travels in the CONSUMER.CREATE request body
+// and `$JS.API.CONSUMER.CREATE.TASKS.>` does not scope it — the inbound leg is
+// delivered and Hermes executes it. Only the events publish is refused, which
+// is the LAST step: every side effect the task asked for has happened by then
+// and the result is what gets dropped. Same mechanism as the "reading is not
+// narrowed" paragraph in bridgeIdentity, and
+// TestBridgeJetStreamGrantOnARealServer measures it.
+const a2aBridgeAddressee = "platform"
+
 // a2aServiceAccountName spells a KSA the way the Kubernetes TokenReview API
 // reports it, which is how the callout's map is keyed. Built here rather than
 // in the map renderer so the operator and the callout cannot disagree about the
@@ -461,68 +523,6 @@ func bridgeIdentity() a2aIdentity {
 		},
 	}
 }
-
-// The two principal names A5 split `worker` into. They are spelled once here
-// because each is used three times over — the identity's user field, the inbox
-// prefix its own grants carry, and (for the agent) the value the operator
-// renders into the container so the client can pin that same prefix.
-const (
-	// a2aAgentBusUser is the platform agent container's principal. The `a2a`
-	// CLI reads it back from a2aBusUserEnv; a2a/lib's EnvBusUser is the other
-	// half of that contract, duplicated rather than imported because the two
-	// modules cannot see each other.
-	a2aAgentBusUser = "agent"
-
-	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
-	// callout — see bridgeIdentity for why a token cannot separate it from
-	// the container above.
-	a2aBridgeUser = "bridge"
-
-	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a
-	// credential: it selects the inbox prefix the client pins, and the grants
-	// come from the callout's answer about the ServiceAccount, not from this.
-	// Setting it wrong gets a client that connects and then hangs on every
-	// reply, which is why it is reserved against spec.deployment.env and
-	// against plugin env both.
-	a2aBusUserEnv = "A2A_BUS_USER"
-
-	// a2aBusTokenFileEnv is NOT rendered by the operator: the client falls
-	// back to a2aBusTokenPath/a2aBusTokenFile, which is where the projection
-	// lands. It is named here only so the reservation can name it. Setting it
-	// points the client at a different file to present as its bearer token,
-	// and a2a/cmd/a2a/main.go prefers it unconditionally with no fallback --
-	// deliberately, because a caller who names a token file and is quietly
-	// logged in as something else is the failure that ordering prevents. The
-	// blast radius is denial rather than escalation, and the audience is the
-	// whole of why: automountServiceAccountToken is false, but this container
-	// is not tokenless -- it holds the broker-audience projection at
-	// credentialProxyTokenMountPath, and a CR can put more files in reach --
-	// and every one of them is minted for somebody else's audience, which the
-	// bus refuses at connect. It is still the variable that decides WHICH
-	// bearer token this container presents, so it is reserved on the same
-	// argument as a2aBusUserEnv above.
-	//
-	// Mirrors lib.EnvBusTokenFile (a2a/lib/credentials.go), which is the
-	// reader. Separate modules, so the spelling is held by the conformance
-	// suite rather than by the compiler.
-	a2aBusTokenFileEnv = "A2A_BUS_TOKEN_FILE" // #nosec G101 -- Environment variable name, not hardcoded credentials
-)
-
-// a2aBridgeAddressee is the addressee the bridge executes for, and the only one
-// its grants name. It is the bridge's BRIDGE_PROFILE default
-// (a2a/cmd/hermes-bridge/main.go, defaultProfile) — the two are one value, and a
-// deployment that overrides the env without widening this grant gets a bridge
-// that RUNS the other addressee's tasks and then cannot answer for them.
-//
-// Not the clean denial that reads like. The bridge consumes through a pull
-// consumer, so the filter subject travels in the CONSUMER.CREATE request body
-// and `$JS.API.CONSUMER.CREATE.TASKS.>` does not scope it — the inbound leg is
-// delivered and Hermes executes it. Only the events publish is refused, which
-// is the LAST step: every side effect the task asked for has happened by then
-// and the result is what gets dropped. Same mechanism as the "reading is not
-// narrowed" paragraph in bridgeIdentity, and
-// TestBridgeJetStreamGrantOnARealServer measures it.
-const a2aBridgeAddressee = "platform"
 
 // seed: the hand-applied seed tooling, which writes the starter topic entries.
 // There is deliberately no path to cite here — the manifest lives outside this

@@ -213,14 +213,17 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 // So the set is pinned by name rather than by shape. Adding a principal here
 // means saying, at review, which rendered workload presents its token.
 //
-// `session` is the second name, and answering the question for it needs a
-// pointer out of this module: the workload that mounts its token is the session
-// pod, and the gateway's spawner builds that pod (a2a/gateway/spawn.go), not the
-// operator. So a2aBusTokenVolumeSource and a2aBusTokenVolumeMount still have one
-// caller each and no assertion here can reach the other side of the pair. What
-// holds it is tests/conformance's C1, which reads the spawner and this package's
-// RBAC together for exactly that reason. If the spawner ever stops projecting the
-// token, this test keeps passing and C1 is what fails.
+// Two of the three answer inside this module: a2aBusTokenVolumeSource and
+// a2aBusTokenVolumeMount have two callers each -- buildPodTemplateSpec for
+// `agent` and buildA2AProvisionJob for `provision` -- so a renderer that
+// stopped projecting either token would fail a render assertion here.
+//
+// `session` is the one that does not. The workload that mounts its token is
+// the session pod, and the gateway's spawner builds that pod
+// (a2a/gateway/spawn.go), not the operator, so no assertion in this package can
+// reach it. What holds it is tests/conformance's C1, which reads the spawner
+// and this package's RBAC together for exactly that reason. If the spawner ever
+// stops projecting the token, this test keeps passing and C1 is what fails.
 func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {
@@ -461,32 +464,18 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 }
 
 // Two identities on one ServiceAccount is one identity, and the map decides
-// which — the callout indexes its entries by ServiceAccount, so the loser is
+// which -- the callout indexes its entries by ServiceAccount, so the loser is
 // silently unreachable and the winner's grants are what both workloads get.
+// The collision is not even symmetric: the session entry is narrowed and the
+// agent entry is not, so whichever wins, one workload runs on grants derived
+// for the other.
 //
-// Reachable today through spec.security.serviceAccountName, which overrides the
-// agent pod's account (agentServiceAccountName): set it to the session pod's
-// and `agent` and `session` land under one key. The collision is not even
-// symmetric — the session entry is narrowed and the agent entry is not, so
-// whichever wins, one workload is running on grants derived for the other.
-func TestNoTwoIdentitiesShareAServiceAccount(t *testing.T) {
-	seen := map[string]string{}
-	for _, id := range a2aIdentities(identityTestAgent()) {
-		if id.serviceAccount == "" {
-			continue
-		}
-		if other, dup := seen[id.serviceAccount]; dup {
-			t.Errorf("%q and %q are both keyed on ServiceAccount %q; the callout serves one entry per account, so one is unreachable and the other's grants cover both workloads",
-				other, id.user, id.serviceAccount)
-		}
-		seen[id.serviceAccount] = id.user
-	}
-}
-
-// The case the test above structurally cannot see: it renders the DEFAULT
-// agent, where the accounts are distinct by construction, so it is a guard
-// against a future identity added with a copied serviceAccount field and not
-// against the collision a user can cause today.
+// The default agent's accounts are distinct by construction, and a future
+// identity copied in with someone else's serviceAccount needs no test of its
+// own here: validateA2AAuthMapIdentities refuses a duplicate at render, and
+// TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne renders the
+// default agent and fails on the error. This test is for the case neither of
+// those reaches from a default CR -- the one a user can cause today.
 //
 // spec.security.serviceAccountName overrides the agent pod's account, and the
 // webhook only checks it against restrictedServiceAccounts, so pointing it at
