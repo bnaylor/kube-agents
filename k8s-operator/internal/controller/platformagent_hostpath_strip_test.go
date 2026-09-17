@@ -40,10 +40,17 @@ import (
 // or .sidecarVolumes was refused by the admission webhook and nowhere else, and
 // the chart ships the webhook off. They assert the render-side layer: the volume
 // and every mount naming it are out of the Pod, the CR's own slices are not
-// edited, the drop is reported on status, and a non-hostPath volume of the same
-// shape is untouched. The condition type and reason are spelled as literals so
-// the file also compiles against a controller without the fix, which is how the
-// failing run against main was produced.
+// edited, the drop is reported on status and only on the passes where it is
+// true of the Pod that is running, and a non-hostPath volume of the same shape
+// is untouched.
+//
+// The condition type and reason are spelled as literals below because the
+// render cases were first run against a controller without the fix, to watch
+// them fail. The file as a whole no longer compiles there: the message-budget
+// and condition-gate cases reach hostPathDroppedMessage,
+// hostPathExtraVolumesField and hostPathDroppedEntryEllipsis, none of which
+// exist without it. Reproducing that failing run now means taking the render
+// cases over on their own.
 
 const (
 	// Fixture names. The paths are chosen so a test that finds one in the
