@@ -171,6 +171,7 @@ currently fails.
 | C1  | the agent container's bus identity env is spelled the same in both modules | 1        | `test_C1_the_agent_containers_bus_identity_env_is_spelled_the_same_in_both_modules` | a rename of `A2A_BUS_USER` on the operator side alone: the writer and the reader are in different Go modules with no shared constant, so nothing but this catches it until a client exits `no bus identity` at runtime                                   |
 | C1  | the agent container holds no static bus password                           | 1        | `test_C1_the_agent_container_holds_no_static_bus_password`                          | the retired `worker` credential coming back by either route — a `credsKey` added to the callout-resolved `agent` principal, or the static `bridge` principal re-keyed on a ServiceAccount so the callout hands the sidecar and the agent the same grants |
 | C1  | the bus token path and audience agree across the module boundary           | 1        | `test_C1_the_bus_token_path_and_audience_agree_across_the_module_boundary`          | the projected token's mount path moved on the operator side alone: the client `os.Stat`s the old path, misses, falls back to a password this change stopped rendering, and offers the empty string — the bus lost, both Go suites green                  |
+| C1  | the reserved bus token-file env is spelled the same in both modules        | 2        | `test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules`       | a rename of `A2A_BUS_TOKEN_FILE` on either side alone, or the plugin-env drop spelling the reserved name by hand rather than through the constant. The odd one out of the three cross-module pairs, and the one a comment claimed this suite held.       |
 | C1  | the metadata server is unreachable from the sandbox                        | 2        | `Scenario5`                                                                         | the controller deleting the metadata-deny NetworkPolicy; the credential-free sandbox minting the GSA token                                                                                                                                               |
 | C1  | a violating request is rejected by the API server                          | 2        | `Scenario6`                                                                         | **slice 2b 1.2**: kustomize `namePrefix` leaving the policy applied and silently inert                                                                                                                                                                   |
 | C2  | an unparseable argv is refused                                             | 1        | `test_C2_an_unparseable_argv_is_refused`                                            | a new kubectl release adding a flag that hides the verb                                                                                                                                                                                                  |
@@ -255,12 +256,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-100 mutations: 77 KILLED, 21 NOISY, two `must_survive` controls (one on the
+102 mutations: 79 KILLED, 21 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-16 against
+handling), zero genuine survivors, zero stale — measured 2026-09-17 against
 this branch merged with `main`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 98 of the 100: a
+Note that the summary line the harness prints accounts for 100 of the 102: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
