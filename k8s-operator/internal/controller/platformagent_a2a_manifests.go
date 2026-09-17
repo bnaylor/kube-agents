@@ -2238,7 +2238,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 					existing.Name, cond.Reason, cond.Message)
 				if cond.Reason == batchv1.JobReasonPodFailurePolicy {
 					state.message += fmt.Sprintf(
-						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). Run `nats stream edit TASKS --max-consumers=%d` (what a fresh render creates TASKS with, which is never below the need), or lower maxSessions.",
+						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). Run `nats stream edit TASKS --max-consumers=%d` (what a fresh render creates TASKS with, which is never below the need), or lower maxSessions. Widening the stream does not clear this on its own — nothing re-reads it until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will.",
 						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent))
 				}
 			}

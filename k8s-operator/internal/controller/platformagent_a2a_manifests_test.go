@@ -1654,7 +1654,14 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				}
 			}
 			if tc.wantRemedy {
-				for _, want := range []string{"maxSessions", "nats stream edit TASKS --max-consumers="} {
+				// The stream edit alone changes nothing the operator
+				// can see: reconcileA2A reads the Job's condition,
+				// and a Failed Job stays Failed. So the remedy has to
+				// carry the second half - what makes the script run
+				// against the widened stream - or an operator does
+				// the edit, watches the CR stay Degraded, and
+				// concludes the edit was wrong.
+				for _, want := range []string{"maxSessions", "nats stream edit TASKS --max-consumers=", "Delete the Job to re-run it now"} {
 					if !strings.Contains(state.message, want) {
 						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
 					}
