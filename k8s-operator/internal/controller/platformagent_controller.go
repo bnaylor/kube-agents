@@ -132,16 +132,28 @@ const (
 	// EventWatcher pattern above, and not a Degraded state: the Pod runs, the
 	// author's other volumes are in it, and the CR says what was left out and
 	// why. See hostPathVolumes for the drop itself.
+	//
+	// Both status writers carry it, updateStatusReady and
+	// updateStatusDegraded, because the strip happens at render and the render
+	// is above both of them: three refusals park the CR on Degraded after the
+	// Pod has already been written (ModeNotRecognized, A2AProvisionFailed,
+	// ShellSandboxKeysMissing), and ShellSandboxKeysMissing is where a bare
+	// `helm install` sits indefinitely -- the chart renders the sandbox's
+	// authorized-keys Secret only when a public key is supplied. That is the
+	// same chart-default install the webhook is off on, so the one park most
+	// likely to hold a dropped hostPath was the one saying nothing about it.
 	hostPathDroppedConditionType = "VolumesDropped"
 	hostPathDroppedReason        = "HostPathVolumeDropped"
 	// hostPathDroppedEntryFormat renders one dropped entry as the author would
 	// find it in the spec: field, index, name, and the host path it asked for.
 	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
-	// hostPathDroppedMessageFormat takes the joined entries. It says what was
-	// left out, that the mounts went with it, why admission did not stop it,
+	// hostPathDroppedMessageFormat takes the joined entries. It says what is
+	// left out, that the mounts go with it, why admission did not stop it,
 	// and how to clear the condition, because `kubectl describe` is where the
-	// author of a CR the webhook never saw finds out.
-	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and were left out of the agent Pod, with every volumeMount " +
+	// author of a CR the webhook never saw finds out. Present tense, not past:
+	// the refusals that park the CR before the render reach this condition
+	// too, and there the Pod they describe has not been written yet.
+	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and are left out of the agent Pod, with every volumeMount " +
 		"naming them: %s. The admission webhook refuses these when it runs, and this CR was admitted without it " +
 		"(the Helm chart ships operator.webhooks.enabled=false, and one enabled through the chart fails open at " +
 		"its default failurePolicy: Ignore). Remove the entries from the spec to clear this condition."
@@ -2502,10 +2514,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// the same reason EventWatcher's is: it names the entries, and an edit
 	// that swaps one hostPath for another has to change what the CR says.
 	hostPathDroppedMsg := hostPathDroppedMessage(agent)
-	existingHostPathCond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
-	hostPathDroppedUnchanged := (hostPathDroppedMsg == "" && existingHostPathCond == nil) ||
-		(hostPathDroppedMsg != "" && existingHostPathCond != nil && existingHostPathCond.Status == metav1.ConditionTrue &&
-			existingHostPathCond.Reason == hostPathDroppedReason && existingHostPathCond.Message == hostPathDroppedMsg)
+	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
@@ -2605,20 +2614,41 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		})
 	}
 
-	if hostPathDroppedMsg == "" {
-		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
-	} else {
-		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
-			Type:               hostPathDroppedConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             hostPathDroppedReason,
-			Message:            hostPathDroppedMsg,
-			ObservedGeneration: agent.Generation,
-			LastTransitionTime: now,
-		})
-	}
+	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 
 	return newPhase, r.Status().Update(ctx, agent)
+}
+
+// hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
+// on the CR already says msg, where "" means the condition is to be absent.
+// Both status writers gate their write on this: a condition rewritten on every
+// pass re-enqueues the CR through the unfiltered watch (see
+// updateStatusDegraded for what that costs).
+func hostPathDroppedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == hostPathDroppedReason && existing.Message == msg
+}
+
+// setHostPathDroppedCondition writes the VolumesDropped condition, or removes
+// it when msg is "" because the spec carries no hostPath any more. The caller
+// does the API write.
+func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               hostPathDroppedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             hostPathDroppedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
 }
 
 // hostPathDroppedMessage is the VolumesDropped condition's message for the
@@ -2870,12 +2900,19 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
+	// VolumesDropped rides along, because the strip it reports happens at
+	// render and three of the refusals that land here render first (see the
+	// condition's own comment). It is in the comparison as well as the write:
+	// without that, a CR parked on one of those refusals with an unchanged
+	// Ready would leave the condition unwritten forever.
+	hostPathDroppedMsg := hostPathDroppedMessage(agent)
 	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
 		agent.Status.Phase == "Degraded" &&
 		existing.Status == metav1.ConditionFalse &&
 		existing.Reason == reason &&
 		existing.Message == message &&
-		existing.ObservedGeneration == agent.Generation {
+		existing.ObservedGeneration == agent.Generation &&
+		hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) {
 		return nil
 	}
 
@@ -2893,6 +2930,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
+	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	return r.Status().Update(ctx, agent)
 }
 

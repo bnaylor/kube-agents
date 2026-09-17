@@ -364,3 +364,95 @@ func TestReconcileWritesNoVolumesDroppedConditionWithoutAHostPath(t *testing.T) 
 		t.Errorf("%s condition written for a CR with no hostPath: %+v", hostPathConditionType, cond)
 	}
 }
+
+// TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded is the gap the
+// Ready-only condition write left. Three refusals render the workload in full
+// and then park the CR on Degraded (ModeNotRecognized, A2AProvisionFailed,
+// ShellSandboxKeysMissing), and on those passes updateStatusReady never runs.
+// The one used here is the one a chart-default install sits on indefinitely:
+// the chart renders the sandbox's authorized-keys Secret only when a public
+// key is supplied, and `credentials.create` is false by default — which is the
+// same install the webhook is off on, so it is also the install where a
+// hostPath reaches the reconcile at all. The Deployment is written without the
+// volume either way; what this asserts is that the CR says so.
+func TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded(t *testing.T) {
+	agent := hostPathAgent()
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	if err := cl.Delete(ctx, shellSandboxKeysSecret(agent)); err != nil {
+		t.Fatalf("removing the sandbox keys Secret the fixture creates: %v", err)
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	for pass := 0; pass < 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile pass %d failed: %v", pass, err)
+		}
+	}
+
+	// The render happened: without it there is no drop to report and the test
+	// would pass against a controller that never writes the condition at all.
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gateway", Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatalf("the Degraded path did not render the gateway Deployment, so this is no longer the case under test: %v", err)
+	}
+	assertNoHostPathVolumes(t, dep.Spec.Template.Spec.Volumes)
+	assertNoDanglingMounts(t, dep.Spec.Template.Spec)
+
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if got.Status.Phase != "Degraded" || ready == nil || ready.Reason != reasonShellSandboxKeysMissing {
+		t.Fatalf("phase=%q Ready=%+v, want Degraded/%s; the pass under test is the one that parks there", got.Status.Phase, ready, reasonShellSandboxKeysMissing)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	if cond == nil {
+		t.Fatalf("no %s condition on a CR parked Degraded after the render dropped a hostPath; conditions: %+v", hostPathConditionType, got.Status.Conditions)
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathConditionReason {
+		t.Errorf("%s condition = %s/%s, want True/%s", hostPathConditionType, cond.Status, cond.Reason, hostPathConditionReason)
+	}
+	for _, want := range []string{
+		"spec.deployment.extraVolumes[0]", hostPathFixtureExtraVolume, hostPathFixtureExtraPath,
+		"spec.deployment.sidecarVolumes[0]", hostPathFixtureSidecarVolume, hostPathFixtureSidecarPath,
+	} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("%s message does not name %q: %s", hostPathConditionType, want, cond.Message)
+		}
+	}
+
+	// Still one write per change, not one per pass: the Degraded writer's
+	// unchanged comparison has to cover the condition it now carries, or the
+	// parked CR writes status on every requeue tick (#1392).
+	settledVersion := got.ResourceVersion
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile (settled) failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	if got.ResourceVersion != settledVersion {
+		t.Errorf("a parked pass with nothing to change wrote the CR (resourceVersion %s -> %s)", settledVersion, got.ResourceVersion)
+	}
+
+	// And it clears on the Degraded path too, rather than standing until the
+	// CR happens to reach Ready.
+	got.Spec.Deployment.ExtraVolumes = got.Spec.Deployment.ExtraVolumes[1:]
+	got.Spec.Deployment.ExtraVolumeMounts = got.Spec.Deployment.ExtraVolumeMounts[1:]
+	got.Spec.Deployment.SidecarVolumes = got.Spec.Deployment.SidecarVolumes[1:]
+	got.Spec.Deployment.Sidecars[0].VolumeMounts = got.Spec.Deployment.Sidecars[0].VolumeMounts[1:]
+	got.Spec.Deployment.InitContainers[0].VolumeMounts = nil
+	if err := cl.Update(ctx, got); err != nil {
+		t.Fatalf("removing the hostPath entries: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile (after removal) failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
+		t.Errorf("%s condition survived the removal of every hostPath entry on the Degraded path: %+v", hostPathConditionType, cond)
+	}
+}
