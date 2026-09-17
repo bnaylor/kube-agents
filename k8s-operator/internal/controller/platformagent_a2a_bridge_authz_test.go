@@ -385,6 +385,14 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		{"$JS.API.STREAM.SNAPSHOT.TASKS", `{"deliver_subject":"_INBOX.bridge.snap"}`},
 		{"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay", ""},
 		{"$JS.API.CONSUMER.INFO.TASKS.gateway-relay", ""},
+		// The write narrowing, from the side that matters. Reading TASKS is not
+		// scoped to an addressee (the allowed table's wildcard DIRECT.GET row),
+		// so a bridge whose BRIDGE_PROFILE was overridden does get another
+		// addressee's submission delivered. This is the row that stops it there:
+		// accept publishes `submitted` on the addressee's events subject before
+		// it queues anything for a worker, so the refusal lands before the
+		// subprocess is spawned rather than after the task has run.
+		{"a2a.tasks.chat.t1.events", `{"kind":"status-update"}`},
 		{"$JS.API.DIRECT.GET.KV_runtime-state.$KV.runtime-state.bridge.platform.t1", ""},
 		{"$JS.API.STREAM.INFO.KV_session-state", ""},
 		{"$JS.API.CONSUMER.CREATE.KV_session-state.peek", `{"stream_name":"KV_session-state","config":{"name":"peek","deliver_subject":"_INBOX.bridge.peek"}}`},

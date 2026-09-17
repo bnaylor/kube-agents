@@ -219,9 +219,10 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 	agent := a2aTestAgent()
 
-	// Asserted against the principal list, which spans both renders: the
-	// gateway is now issued by the callout and the bridge still comes from
-	// nats.conf, and an unscoped ack grant is exactly as dangerous in either.
+	// Asserted against the principal list, which spans both renders: gateway
+	// and bridge are static entries in nats.conf, while the agent and session
+	// principals are derived by the callout at mint time. An unscoped ack
+	// grant is exactly as dangerous in either.
 	want := map[string][]string{
 		"gateway":       {"$JS.ACK.TASKS.>"},
 		a2aBridgeUser:   {"$JS.ACK.TASKS.>"},
@@ -2061,8 +2062,9 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	}
 	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
-			t.Errorf("%s is not in SensitiveEnvVars; the CR's own spec.deployment.env could name it, "+
-				"and the webhook's failurePolicy is Ignore so this drop is what actually holds", name)
+			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
+				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
+				"through mergeCredentialProxyEnv rather than through safeSandboxEnvOverrides' allowlist", name)
 		}
 	}
 

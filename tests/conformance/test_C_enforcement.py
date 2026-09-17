@@ -771,8 +771,12 @@ class C1IsolationIsStructural(unittest.TestCase):
                 self.assertEqual(redactor.redact_text(content), content)
 
     # The env var the operator renders into the agent container to name the bus
-    # principal it authenticated that container as. Spelled once in each module
-    # and nowhere else; this is the literal both sides must agree on.
+    # principal it authenticated that container as. This is the literal both
+    # sides must agree on, and each module holds its own copy because neither
+    # can import the other. The operator carries a third copy, as a
+    # SensitiveEnvVars key in api/v1alpha1 -- that one is the CR reservation
+    # rather than the render, and TestPluginCannotOverrideBusEnv pins it to the
+    # same controller constant this test reads.
     BUS_USER_ENV = "A2A_BUS_USER"
 
     def test_C1_the_agent_containers_bus_identity_env_is_spelled_the_same_in_both_modules(
@@ -929,8 +933,10 @@ class C1IsolationIsStructural(unittest.TestCase):
             )
 
     # The third cross-module literal, and the only one the operator names in
-    # order NOT to render it. Spelled once in each module; this is what both
-    # sides must agree on for the reservation to reserve anything.
+    # order NOT to render it. This is what both sides must agree on for the
+    # reservation to reserve anything. Same third copy as BUS_USER_ENV above --
+    # a SensitiveEnvVars key, pinned to the controller constant by
+    # TestPluginCannotOverrideBusEnv rather than by this suite.
     BUS_TOKEN_FILE_ENV = "A2A_BUS_TOKEN_FILE"
 
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(

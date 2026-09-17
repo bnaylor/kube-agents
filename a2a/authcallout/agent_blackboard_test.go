@@ -179,10 +179,12 @@ func TestTheAgentPrincipalWorksTheBlackboardOnARealServer(t *testing.T) {
 				"", "", "corr-"+entry.Topic, artifact))
 
 		// The read is the half the JetStream grant carries: a direct
-		// last-message-for-subject on the holding stream. It is also what
-		// makes the publish above an assertion rather than a hope — a refused
-		// core publish returns nil, so nothing is proven until the entry can
-		// be read back.
+		// last-message-for-subject on the holding stream. It also closes the
+		// publish above: PublishTopic goes through JetStream and does report a
+		// refusal, but as a timeout on the API reply rather than as a
+		// permission error, so the allowed() check alone says the reply
+		// arrived and not that the entry is on the stream. Reading it back
+		// says that.
 		env, err := client.ReadTopicLatest(ctx, entry.Stream, entry.Subject)
 		allowed("ReadTopicLatest "+entry.Subject+" ($JS.API.DIRECT.GET."+entry.Stream+")", err)
 		if env == nil || env.Kind != lib.KindTopicUpdate {

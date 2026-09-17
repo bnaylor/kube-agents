@@ -164,16 +164,22 @@ const (
 // its grants name. It is the bridge's BRIDGE_PROFILE default
 // (a2a/cmd/hermes-bridge/main.go, defaultProfile) — the two are one value, and a
 // deployment that overrides the env without widening this grant gets a bridge
-// that RUNS the other addressee's tasks and then cannot answer for them.
+// that reads the other addressee's prompts and then silently drops them.
 //
-// Not the clean denial that reads like. The bridge consumes through a pull
-// consumer, so the filter subject travels in the CONSUMER.CREATE request body
-// and `$JS.API.CONSUMER.CREATE.TASKS.>` does not scope it — the inbound leg is
-// delivered and Hermes executes it. Only the events publish is refused, which
-// is the LAST step: every side effect the task asked for has happened by then
-// and the result is what gets dropped. Same mechanism as the "reading is not
-// narrowed" paragraph in bridgeIdentity, and
-// TestBridgeJetStreamGrantOnARealServer measures it.
+// The read half happens. The bridge consumes through a pull consumer, so the
+// filter subject travels in the CONSUMER.CREATE request body and
+// `$JS.API.CONSUMER.CREATE.TASKS.>` does not scope it — the inbound leg is
+// delivered, on this user's own inbox prefix, whatever addressee it names.
+// Same mechanism as the "reading is not narrowed" paragraph in bridgeIdentity.
+//
+// Hermes never runs it, though. accept (a2a/hermes-bridge/bridge.go) publishes
+// `submitted` on the addressee's events subject before it queues the task for a
+// worker, and that publish is where the grant bites: the submission is dropped
+// there and no subprocess is ever spawned. The refusal arrives as a timeout on
+// the JetStream API reply rather than as a permission error, so what the
+// submitter sees is a task that never got a terminal event at all.
+// TestBridgeJetStreamGrantOnARealServer's refused table carries the events
+// publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
 
 // a2aServiceAccountName spells a KSA the way the Kubernetes TokenReview API
