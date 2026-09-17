@@ -537,6 +537,27 @@ informer that has not yet seen the Deployment gone - answers "already there" and
 be re-created while the condition is false, which is the single thing the gate exists to
 prevent. A stale NotFound costs one held pass and a requeue.
 
+**Amended 9/17: the hold is on the phase now.** The condition the gate reads is a claim
+about the callout as a whole - every replica ready and on the current spec - and that is
+strictly more than a new gateway needs, because the callout replicas form a queue group
+and one of them serving answers every authorization request. A callout stuck at one of
+two ready therefore withholds a _first_ gateway creation for as long as it stays there,
+which on a cluster with no headroom for the second pod is indefinite. The strict rule is
+kept on purpose: `ReadyReplicas` and `UpdatedReplicas` are independent counts, so "at
+least one ready" cannot tell one ready replica on the current template from two ready
+replicas on the previous one, and letting a gateway through against a callout that never
+accepted the current identity map is a worse failure than delaying one. What changes is
+that the delay stopped being invisible. Under `mode: next` the A2A gateway is one of the
+workloads `Ready` is computed from (`readSplitWorkloads`), so an install held at the gate
+reads `Provisioning` with a message naming the Deployment, beside the
+`BusCredentialsReady` that says why - rather than a `Ready: True` sitting above a `False`
+condition and contradicting it. A safe one-replica rule does exist, and is a follow-up
+rather than part of this design: `ReadyReplicas + UpdatedReplicas - Replicas` is a lower
+bound on the pods that are both ready and on the current template, so testing it against
+one can never read true when none is, and its only error direction is a false negative
+while terminated pods are still counted - which costs exactly the held pass and requeue
+that stale-false already costs.
+
 **Amended 9/8.** The condition asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
 served AND the replica is attached to the bus, that means every replica is serving one
