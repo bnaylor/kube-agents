@@ -2254,6 +2254,18 @@ func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context,
 	// Already there: reconcile it. A gateway that exists was let through by
 	// an earlier pass, and withholding its updates now would freeze its image
 	// and env at whatever a callout outage happened to interrupt.
+	//
+	// Live through a2aReader, not the Deployment informer, even though
+	// Deployment is an Owns() kind whose cache is already running and
+	// a2aTeardownEntry takes the cached read for exactly that reason. The
+	// teardown is reading to delete; this is reading to decide whether the
+	// gate holds, and the two directions of cache staleness are not
+	// symmetric. A stale NotFound costs one more held pass and a requeue. A
+	// stale hit — an informer that has not yet seen the gateway deleted —
+	// answers "already there" and lets the Deployment be re-created while
+	// BusCredentialsReady is false, which is the single thing this gate
+	// exists to prevent. The cost is one API call, and only while the
+	// condition is false: the check above returns first in the steady state.
 	err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
 	if err == nil {
 		return false, nil
