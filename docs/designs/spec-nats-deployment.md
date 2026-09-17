@@ -186,8 +186,10 @@ Layout:
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
-  known (the worker's list is the operator's `a2aWorkerJetStreamGrants`; a user still
-  holding `$JS.API.>` holds playground posture); `$JS.ACK.<its streams>.>` for explicit
+  known (the worker's list is the operator's `a2aWorkerJetStreamGrants` and the
+  gateway's is `a2aGatewayJetStreamGrants`; no rendered principal holds `$JS.API.>` any
+  more, and a user that gains one back holds playground posture);
+  `$JS.ACK.<its streams>.>` for explicit
   acks - an ack is a publish, and missing this grant means every consumer redelivers
   forever while TCP health stays green, the NR-5 incident class created at connect time;
   and `$JS.FC.>` for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant

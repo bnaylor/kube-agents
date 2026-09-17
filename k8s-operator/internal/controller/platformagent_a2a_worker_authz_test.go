@@ -250,10 +250,20 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 	workerPW := string(creds.Data["worker-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
+	webPW := string(creds.Data["web-password"])
 
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
 	_, gw := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
+	// The consumer-info oracle. It was `gateway` while that user held
+	// $JS.API.>; the narrowing #1666 asked for scoped it and took
+	// CONSUMER.INFO with it, so reading
+	// a consumer back moved to `web`, which holds CONSUMER.INFO.TASKS.* by
+	// enumeration and is now the only principal that can answer. `gateway`
+	// stays for what it still holds and what this test needs it for: owning
+	// the relay durable, publishing a submission, and the subscribe grants
+	// the deliver-subject cases turn on.
+	_, webJS := a2aConnectAs(t, s.ClientURL(), "web", webPW)
 	worker, js := a2aConnectAs(t, s.ClientURL(), "worker", workerPW)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -308,9 +318,9 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 		t.Fatalf("the pull delivered nothing: %v", batch.Error())
 	}
 	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
-	// The ack landed, read from the gateway's side because worker holds no
-	// CONSUMER.INFO.
-	relayView, err := gw.Consumer(ctx, "TASKS", "bridge-platform")
+	// The ack landed, read from web's side because worker holds no
+	// CONSUMER.INFO (and, since #1666, neither does gateway).
+	relayView, err := webJS.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +442,7 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 	if got := tasks.CachedInfo().State.Msgs; got != 3 {
 		t.Errorf("TASKS holds %d messages after the refused calls, want 3", got)
 	}
-	if _, err := gw.Consumer(ctx, "TASKS", "gateway-relay"); err != nil {
+	if _, err := webJS.Consumer(ctx, "TASKS", "gateway-relay"); err != nil {
 		t.Errorf("the gateway's relay durable after the worker's refused DELETE: %v", err)
 	}
 
@@ -505,16 +515,21 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 			t.Errorf("TOPICS-STATE gained %d messages but only %d sit under a2a.tasks.* subjects; the deliver-subject route rewrote a subject, which would be forgery",
 				info.State.Msgs-before, underTaskSubjects)
 		}
-		// Read back through the gateway rather than seed. Every other
-		// read here is a STREAM.INFO, which seed still holds, but this one
-		// asks for a stored message and #1306 scoped seed's grant to
+		// Read back through the worker rather than seed. Every other read
+		// here is a STREAM.INFO, which seed still holds, but this one asks
+		// for a stored message and #1306 scoped seed's grant to
 		// STREAM.CREATE and STREAM.INFO on the streams it provisions --
-		// reading content is not the provisioning identity's to do. Gateway
-		// still holds $JS.API.> (a2aWorkerJetStreamGrants records why), so
-		// it is the identity that can answer this. Asking as seed does not
-		// fail, it hangs: a refused request is not an error nats.go reports,
-		// so the call waits out ctx instead.
-		st, err := gw.Stream(ctx, "TOPICS-STATE")
+		// reading content is not the provisioning identity's to do. Asking
+		// as seed does not fail, it hangs: a refused request is not an
+		// error nats.go reports, so the call waits out ctx instead.
+		//
+		// The worker is the reader because DIRECT.GET on the topic streams
+		// is one of its own granted routes, in table 1 above. It used to be
+		// the gateway, on the strength of that user's $JS.API.>; the
+		// narrowing #1666 asked for scoped that grant to TASKS and the
+		// session registry, so the gateway can no longer read this stream
+		// at all.
+		st, err := js.Stream(ctx, "TOPICS-STATE")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -656,7 +671,7 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 		// task events, and no permissions violation is logged anywhere,
 		// because the call is inside the allow-list.
 		update("retune gateway-relay's filter_subject", relayConfig(`"filter_subject":"a2a.tasks.none"`))
-		relay, err := gw.Consumer(ctx, "TASKS", "gateway-relay")
+		relay, err := webJS.Consumer(ctx, "TASKS", "gateway-relay")
 		if err != nil {
 			t.Fatalf("gateway-relay after the worker's update: %v", err)
 		}
@@ -675,7 +690,7 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 		deadline := time.Now().Add(30 * time.Second)
 		var gone bool
 		for time.Now().Before(deadline) {
-			if _, err := gw.Consumer(ctx, "TASKS", "gateway-relay"); errors.Is(err, jetstream.ErrConsumerNotFound) {
+			if _, err := webJS.Consumer(ctx, "TASKS", "gateway-relay"); errors.Is(err, jetstream.ErrConsumerNotFound) {
 				gone = true
 				break
 			}

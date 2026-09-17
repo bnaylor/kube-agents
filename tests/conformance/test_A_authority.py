@@ -367,9 +367,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """Each `...Identity` builder's publish list, keyed by NATS user.
 
         The second element says whether the list was read in full. Most
-        builders return a struct literal, which is exact; `worker` and `seed`
-        assemble theirs in a local variable and append a shared helper whose
-        entries are Go constant concatenations (`"$JS.API.STREAM.INFO." +
+        builders return a struct literal, which is exact; `worker`, `seed` and
+        `gateway` assemble theirs in a local variable and append a shared
+        helper whose entries are Go constant concatenations (`"$JS.API.STREAM.INFO." +
         a2aTasksStream`). Evaluating those here would be reimplementing the
         compiler in a test, so those are reported as partial and the served
         config below is what the assertions actually read for them.
@@ -430,8 +430,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """Every rendered principal's publish list, keyed by NATS user.
 
         The UNION of both readings, per principal. Neither alone is safe to
-        assert on. The served config is the only place `worker` and `seed`
-        can be read in full, because their Go lists concatenate constants; but
+        assert on. The served config is the only place `worker`, `seed` and
+        `gateway` can be read in full, because their Go lists concatenate
+        constants; but
         it is a generated file, so a mutation of the Go source does not move
         it, and reading it alone let a mutation that puts the gateway's
         terminals back on `…events` survive with every test green. The union

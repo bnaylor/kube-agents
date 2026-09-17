@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -26,6 +27,28 @@ import (
 // One fixed name, reused across runs, so the install's max_consumers
 // budget pays for exactly one extra consumer rather than one per run.
 const liveTestRelayDurable = "gateway-relay-livetest"
+
+// liveLastPlatformSubmission answers "the newest submission on the platform
+// inbound leg" in one request, with the subject filter in the API subject's
+// trailing token.
+//
+// Direct get rather than STREAM.MSG.GET, because neither bus user this file
+// connects as holds the latter any more: #1393 scoped the worker's JetStream
+// grant and the narrowing #1666 asked for scoped the gateway's, and both
+// landed on
+// `$JS.API.DIRECT.GET.TASKS.>` — every stream the provision script creates is
+// created `--allow-direct`, so direct get is the route nats.go itself takes
+// and the one the grants are written for. Read as a raw request because this
+// is a raw request in the client too.
+const liveLastPlatformSubmission = "$JS.API.DIRECT.GET." + lib.TasksStream + ".a2a.tasks.platform.*.in"
+
+// liveDirectGetStatusHeader is how a direct get reports that it found
+// nothing: an empty body carrying a status header, 404 for no message. Any
+// other status is a real failure.
+const (
+	liveDirectGetStatusHeader = "Status"
+	liveDirectGetNoMessages   = "404"
+)
 
 // TestLiveAgainstInstallNATS runs the gateway (fake chat adapter, real bus
 // client) against a real deployment's NATS — the W6 install via
@@ -140,7 +163,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	})
 
 	// Beat 2 shape: "what is it doing" answered by replay under the gateway
-	// user's grants (ordered consumer + stream msg-get on TASKS).
+	// user's grants (ordered consumer + direct get on TASKS).
 	adapter.inbox <- InboundMessage{
 		Conversation: "discord:live/thread-livetest", Kind: "group",
 		AuthorID: "1001", MessageID: "live-2", Text: "what is it doing",
@@ -172,33 +195,27 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 }
 
 // findLatestLiveTask fetches the newest message on the platform in subjects
-// as the named bus user (stream msg-get by last_by_subj; wildcards are
-// legal there — both worker and gateway hold it).
+// as the named bus user, by direct get (liveLastPlatformSubmission says why
+// it is not a stream msg-get). A stream with no matching message answers 404,
+// which is a legitimate "not yet" for the poll above rather than a failure.
 func findLatestLiveTask(user, pass, url string) (*lib.Envelope, error) {
 	nc, err := nats.Connect(url, nats.UserInfo(user, pass), nats.CustomInboxPrefix("_INBOX."+user))
 	if err != nil {
 		return nil, err
 	}
 	defer nc.Close()
-	msg, err := nc.Request("$JS.API.STREAM.MSG.GET.TASKS", []byte(`{"last_by_subj":"a2a.tasks.platform.*.in"}`), 5*time.Second)
+	msg, err := nc.Request(liveLastPlatformSubmission, nil, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	var resp struct {
-		Message struct {
-			Data []byte `json:"data"`
-		} `json:"message"`
-		Error *struct {
-			Description string `json:"description"`
-		} `json:"error"`
+	if status := msg.Header.Get(liveDirectGetStatusHeader); status != "" {
+		if status == liveDirectGetNoMessages {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("direct get on %s: status %s (%s)",
+			lib.TasksStream, status, msg.Header.Get("Description"))
 	}
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Error != nil {
-		return nil, nil
-	}
-	return lib.ParseEnvelope(resp.Message.Data)
+	return lib.ParseEnvelope(msg.Data)
 }
 
 // TestLiveEndToEndThroughBridge is the W3 DoD's bus path with no stand-ins:
