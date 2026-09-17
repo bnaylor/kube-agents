@@ -1187,6 +1187,34 @@ Mutation(
         "suites green because no test binary links both modules",
     ),
     Mutation(
+        "C1-bus-token-file-env-renamed-on-the-client-side",
+        "a2a/lib/credentials.go",
+        ('EnvBusTokenFile = "A2A_BUS_TOKEN_FILE"',
+         'EnvBusTokenFile = "A2A_BUS_TOKEN_PATH"'),
+        "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
+        "tidy the client's override variable to match BusTokenPath beside it, "
+        "in the module that reads it. Nothing in a2a notices, because a2a is "
+        "the only module that consumes this name -- and the operator, which "
+        "does not consume it but RESERVES it, is not rebuilt by this edit. It "
+        "goes on refusing A2A_BUS_TOKEN_FILE in spec.deployment.env and in an "
+        "AgentPlugin's spec.env, and A2A_BUS_TOKEN_PATH is reserved nowhere: "
+        "a plugin sets it, connect() prefers it over the projection with no "
+        "fallback, and the agent container presents a file the plugin chose",
+    ),
+    Mutation(
+        "C1-bus-token-file-reservation-spelled-by-hand",
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ('\t\t\t\t\te.Name == a2aBusTokenFileEnv ||',
+         '\t\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
+        "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
+        "inline the constant at the plugin-env drop, which changes no "
+        "behaviour today and is the shape a reviewer waves through. It costs "
+        "the cross-module comparison its subject: a2aBusTokenFileEnv is what "
+        "the conformance suite pins against a2a/lib, and after this edit the "
+        "name the operator actually refuses is a literal no test reads. The "
+        "next rename moves the constant and leaves the drop behind",
+    ),
+    Mutation(
         "C1-agent-principal-gets-a-static-password",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\tuser:           a2aAgentBusUser,',

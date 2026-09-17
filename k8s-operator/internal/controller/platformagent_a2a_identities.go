@@ -152,7 +152,11 @@ const (
 	//
 	// Mirrors lib.EnvBusTokenFile (a2a/lib/credentials.go), which is the
 	// reader. Separate modules, so the spelling is held by the conformance
-	// suite rather than by the compiler.
+	// suite rather than by the compiler:
+	// test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules
+	// compares the two constants, and checks that buildPodTemplateSpec's
+	// plugin-env drop still refuses this name by way of this constant rather
+	// than a literal of its own.
 	a2aBusTokenFileEnv = "A2A_BUS_TOKEN_FILE" // #nosec G101 -- Environment variable name, not hardcoded credentials
 )
 

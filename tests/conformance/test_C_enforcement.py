@@ -925,6 +925,107 @@ class C1IsolationIsStructural(unittest.TestCase):
                 "test compared is not the one the pod gets" % name,
             )
 
+    # The third cross-module literal, and the only one the operator names in
+    # order NOT to render it. Spelled once in each module; this is what both
+    # sides must agree on for the reservation to reserve anything.
+    BUS_TOKEN_FILE_ENV = "A2A_BUS_TOKEN_FILE"
+
+    def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The contract the two tests above leave open, and the odd one out.
+
+        A2A_BUS_TOKEN_FILE is not rendered by the operator and never has been:
+        the client falls back to lib.BusTokenPath, which is where the kubelet
+        projects the token, and the test above is what holds that path to the
+        operator's. What the operator does with this name instead is REFUSE
+        it -- SensitiveEnvVars for a spec.deployment.env entry, and
+        buildPodTemplateSpec's own drop for an AgentPlugin's spec.env, which
+        is one layer further out than the webhook looks.
+
+        So the failure a drift produces here is not a client that cannot
+        connect. It is a reservation over a name nothing reads: the operator
+        goes on refusing A2A_BUS_TOKEN_FILE while the client consults
+        A2A_BUS_TOKEN_PATH, and an AgentPlugin -- model-authored content
+        reaches the container this variable belongs to -- sets the name that
+        is actually read. a2a/cmd/a2a/main.go's connect() prefers an
+        explicitly set value over the projection with NO fallback, so the
+        container then presents whatever file the plugin named. The blast
+        radius is denial rather than escalation, because every other token in
+        reach is minted for somebody else's audience and the bus refuses it at
+        connect -- but a control that can be silently pointed at the wrong
+        name is not a control, and the reason it is a security assertion is
+        that nothing fails: the operator's own tests stay green on both sides
+        of the drift, because no test binary links both modules.
+
+        Read as source for the same reason its two siblings are. The Go
+        constant in the operator is the one the comparison is about, so the
+        drop site is checked for the constant rather than for the literal:
+        a2aBusTokenFileEnv is what this test pinned, and a hand-spelled
+        "A2A_BUS_TOKEN_FILE" beside it would be a second spelling this test
+        does not police.
+        """
+        operator = h.text("a2a_identities")
+        library = h.text("a2a_bus_credentials")
+        cli = h.text("a2a_cli_main")
+
+        operator_env = re.findall(r'a2aBusTokenFileEnv\s*=\s*"([^"]+)"', operator)
+        library_env = re.findall(r'EnvBusTokenFile\s*=\s*"([^"]+)"', library)
+
+        # Anti-vacuity, both halves: a regex that stops matching returns [],
+        # and every comparison below would hold over nothing.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aBusTokenFileEnv is not a single string constant in the "
+            "operator's identities file; this test compared nothing",
+        )
+        self.assertEqual(
+            len(library_env),
+            1,
+            "EnvBusTokenFile is not a single string constant in "
+            "a2a/lib/credentials.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            library_env[0],
+            "the operator reserves %r and the a2a client reads %r: the "
+            "reservation covers a name nothing consults, and an AgentPlugin "
+            "or a spec.deployment.env entry can set the one that decides "
+            "which file this container presents as its bearer token"
+            % (operator_env[0], library_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.BUS_TOKEN_FILE_ENV,
+            "the bus token-file env var was renamed; every install keeps the "
+            "old name reserved until its operator is upgraded, and the new "
+            "one is unreserved on the installs that matter",
+        )
+
+        # The client half actually consults it, by the constant rather than by
+        # a literal of its own. Agreeing constants prove nothing if connect()
+        # reads the environment by some other name.
+        self.assertIn(
+            "lib.EnvBusTokenFile",
+            h.go_function_body(cli, "connect"),
+            "the a2a CLI's connect() no longer reads lib.EnvBusTokenFile, so "
+            "the name the operator reserves is not the name the client "
+            "resolves its bearer token from",
+        )
+
+        # And the operator half reserves it by that constant. The plugin-env
+        # drop is the layer the webhook does not reach, so it is the one worth
+        # pinning to the identifier this test compared.
+        self.assertIn(
+            "a2aBusTokenFileEnv",
+            h.go_function_body(h.text("manifests_go"), "buildPodTemplateSpec"),
+            "buildPodTemplateSpec no longer drops a plugin-supplied "
+            "a2aBusTokenFileEnv by that constant; the name this test compared "
+            "across the module boundary is not the name the operator refuses",
+        )
+
     def test_C1_the_agent_container_holds_no_static_bus_password(self) -> None:
         """The other half of the same change, and what it was for.
 
