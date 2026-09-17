@@ -2105,14 +2105,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	var sidecarVolumes []corev1.Volume
 	var extraVolumes []corev1.Volume
 	var podAnnotations map[string]string
+	// A hostPath entry on either volume list stays out of the Pod, and so does
+	// every mount naming it on the containers the CR authored. Computed once
+	// here and handed to buildBaseContainers below, which applies the same
+	// filter to the agent container's extraVolumeMounts. Empty on a CR with no
+	// spec.deployment, which is the same answer the scan would give. See
+	// hostPathVolumes for why the webhook's refusal is not enough on its own,
+	// and why the mounts have to go with the volume.
+	droppedVolumes := hostPathVolumeNames(agent)
 	if agent.Spec.Deployment != nil {
-		// A hostPath entry on either volume list stays out of the Pod, and so
-		// does every mount naming it on the containers the CR authored; the
-		// agent container's own extraVolumeMounts get the same filter in
-		// buildBaseContainers. See hostPathVolumes for why the webhook's
-		// refusal is not enough on its own, and why the mounts have to go
-		// with the volume.
-		droppedVolumes := hostPathVolumeNames(agent)
 		initContainers = stripContainerMountsNamed(agent.Spec.Deployment.InitContainers, droppedVolumes)
 		sidecars = stripContainerMountsNamed(agent.Spec.Deployment.Sidecars, droppedVolumes)
 		sidecarVolumes = stripHostPathVolumes(agent.Spec.Deployment.SidecarVolumes)
@@ -2630,7 +2631,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
+	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported, droppedVolumes)
 
 	// The API authenticator is a NATIVE SIDECAR -- an init container carrying
 	// restartPolicy: Always -- and not an ordinary container.
@@ -3850,7 +3851,10 @@ func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 }
 
 // buildBaseContainers generates the base containers for PlatformAgent.
-func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
+// droppedVolumes is the set of hostPath volume names the render is leaving out
+// of the Pod, from the caller, which needs it for the CR's own containers
+// anyway; see hostPathVolumeNames.
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool, droppedVolumes map[string]bool) []corev1.Container {
 	homeDir := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
@@ -3866,7 +3870,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		// Filtered before dropTmpScratchIfClaimed reads the list, so a hostPath
 		// mount at /tmp that the render is about to drop does not also take
 		// the tmp-scratch emptyDir with it.
-		extraVolumeMounts = stripVolumeMountsNamed(agent.Spec.Deployment.ExtraVolumeMounts, hostPathVolumeNames(agent))
+		extraVolumeMounts = stripVolumeMountsNamed(agent.Spec.Deployment.ExtraVolumeMounts, droppedVolumes)
 		storages = agent.Spec.Deployment.Storages
 	}
 
