@@ -279,10 +279,10 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 //
 // Best effort, off the caller's path. It runs in its own goroutine with its
 // own deadline because the principal may not hold
-// $JS.API.CONSUMER.DELETE.TASKS.* -- the rendered worker grant does not, and
-// the gateway's narrowing in #1672 withholds it -- and a request on a subject
-// the principal lacks is refused without a reply, so a synchronous delete
-// would hold every tasks/get for the whole timeout under that grant. The
+// $JS.API.CONSUMER.DELETE.TASKS.* -- a grant enumerated per stream and verb
+// can withhold it, and the rendered worker grant does -- and a request on a
+// subject the principal lacks is refused without a reply, so a synchronous
+// delete would hold every tasks/get for the whole timeout under that grant. The
 // refusal itself reaches the connection's async error handler, which logs it
 // at Error naming the subject; this logs the outcome at Debug because the
 // inactive threshold on the consumer reaps it within
@@ -295,6 +295,10 @@ func (c *Client) deleteReplayConsumer(js jetstream.JetStream, cons jetstream.Con
 	}
 	name := info.Name
 	go func() {
+		// Deliberately not derived from the caller's context: by the time
+		// this runs that context may be canceled or past its deadline (a
+		// tasks/get that timed out mid-replay is the common case), and the
+		// consumer it left behind is exactly the one that must still go.
 		ctx, cancel := context.WithTimeout(context.Background(), replayConsumerDeleteTimeout)
 		defer cancel()
 		err := js.DeleteConsumer(ctx, TasksStream, name)
