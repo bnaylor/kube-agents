@@ -1315,11 +1315,14 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # publisher budget to reach for. Closing that means putting the task id in the
 # claim, which is a change to the callout's narrowing and not to a stream flag.
 #
-# 4096: the largest single event the worker adapter emits is one result
-# artifact chunk at resultChunkSize (256 KiB), so this is a 1 GiB ceiling on one
-# subject, a twentieth of the stream. A chat-driven task emits single digits to
-# low hundreds of events; reaching 4096 is already a loop or a gigabyte of
-# streamed artifact text.
+# 4096, sized against the publisher that means it rather than the well-behaved
+# one: the render sets no max_payload, so NATS' 1MiB default is the per-message
+# ceiling and 4096 messages is a ~4GiB worst case on one subject, a fifth of the
+# stream. The worker adapter's own result chunks are resultChunkSize (256 KiB),
+# so a task built out of those reaches nearer 1GiB at the same count - but that
+# is a property of one publisher and not a bound the bus enforces. A chat-driven
+# task emits single digits to low hundreds of events; reaching 4096 is already a
+# loop or a gigabyte of streamed artifact text.
 #
 # What happens at the limit, because discard=old evicts the OLDEST message on
 # the subject first: the oldest event on a task's ...events subject is its
