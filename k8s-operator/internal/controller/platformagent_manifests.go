@@ -3653,6 +3653,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
 		storages = agent.Spec.Deployment.Storages
 	}
+	// The fifth user-authored mount surface, and the one the A5 reservation
+	// missed. buildPodTemplateSpec strips the bus token out of sidecars,
+	// initContainers, sidecarVolumes and extraVolumes; this list is read here
+	// instead of there, and it is appended verbatim BOTH to the platform-agent
+	// container below and to platform-agent-dashboard further down. A CR that
+	// names the projected bus token here therefore puts the agent's own bus
+	// identity into a second container -- see a2aStripBusTokenVolumeMounts.
+	// Gated on the surface for the same reason the strips up there are: on a
+	// today install there is no such volume, and dropping a name only the next
+	// stack cares about would be one more way to tell the feature exists.
+	if a2aAgentSurface(agent) {
+		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
+	}
 
 	resources := resolveResources(agent.Spec.Deployment)
 

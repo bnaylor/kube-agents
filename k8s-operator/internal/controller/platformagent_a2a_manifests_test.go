@@ -3966,3 +3966,106 @@ func TestUserAuthoredContainersCannotMountTheBusToken(t *testing.T) {
 			"which is one more way to tell the next stack exists", sidecarMounts)
 	}
 }
+
+// The fifth field, and the one the test above does not reach.
+//
+// spec.deployment.extraVolumeMounts names no container, which is why it did
+// not read like a surface the reservation had to cover -- but
+// buildBaseContainers appends it verbatim to the platform-agent container AND
+// to platform-agent-dashboard (its own comment there says "extraVolumeMounts
+// reaches both containers"). So the one CR field that mentions no container at
+// all is the one that puts the projected bus token into a SECOND container,
+// and the author never wrote a sidecar. The dashboard runs the same image as
+// the agent, so it already ships the `a2a` client that would read the file:
+// one entry, and the pod has two workloads on the bus wearing the `agent`
+// identity, which is the split A5 made undone by four lines of YAML.
+//
+// Measured on the rendered pod rather than on the presence of a guard. A test
+// that asserted "extraVolumeMounts is in ReservedVolumeNames' docstring" would
+// pass against the hole this closes.
+func TestTheDashboardNeverReceivesTheBusToken(t *testing.T) {
+	const ordinary = "my-scratch"
+	dep := func() *agentv1alpha1.DeploymentSpec {
+		return &agentv1alpha1.DeploymentSpec{
+			ExtraVolumeMounts: []corev1.VolumeMount{
+				{Name: ordinary, MountPath: "/scratch"},
+				{Name: a2aBusTokenVolume, MountPath: "/var/run/secrets/stolen"},
+			},
+		}
+	}
+
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = dep()
+	spec := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+
+	// Precondition. Without the projection in the pod an absent mount below
+	// says only that the feature is off, and every assertion here is vacuous.
+	if podVolume(corev1.PodTemplateSpec{Spec: spec}, a2aBusTokenVolume) == nil {
+		t.Fatalf("the pod carries no %s volume, so this test proves nothing about who mounts it",
+			a2aBusTokenVolume)
+	}
+	var dashboard bool
+	for _, c := range spec.Containers {
+		if c.Name == "platform-agent-dashboard" {
+			dashboard = true
+		}
+	}
+	if !dashboard {
+		t.Fatal("the render produced no platform-agent-dashboard container; the container this test " +
+			"is about is not in the pod, so its absence from the holder set below means nothing")
+	}
+
+	holders := map[string][]string{}
+	for _, c := range slices.Concat(spec.Containers, spec.InitContainers) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == a2aBusTokenVolume {
+				holders[c.Name] = append(holders[c.Name], m.MountPath)
+			}
+		}
+	}
+	// The agent keeps exactly the operator's mount at the operator's path. The
+	// CR's own entry is stripped there too: a second mount of the same volume
+	// at a path of the author's choosing is not an escalation inside the one
+	// container entitled to the token, but it is the CR deciding where a
+	// credential appears, and a2aBusTokenPath is the path a2a/lib reads.
+	if got := holders["platform-agent"]; len(got) != 1 || got[0] != a2aBusTokenPath {
+		t.Errorf("the platform-agent container mounts %s at %v, want exactly [%s]: the operator's mount "+
+			"and nothing the CR added", a2aBusTokenVolume, got, a2aBusTokenPath)
+	}
+	delete(holders, "platform-agent")
+	if len(holders) != 0 {
+		t.Errorf("containers other than platform-agent mount %s: %v. spec.deployment.extraVolumeMounts "+
+			"reaches platform-agent-dashboard as well as the agent, so this entry is a second workload "+
+			"wearing the agent's bus identity -- the retired `worker` credential rebuilt from a CR field "+
+			"that names no container", a2aBusTokenVolume, holders)
+	}
+
+	// Not too wide: an ordinary extraVolumeMount still reaches both.
+	for _, c := range spec.Containers {
+		if c.Name != "platform-agent" && c.Name != "platform-agent-dashboard" {
+			continue
+		}
+		if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool { return m.Name == ordinary }) {
+			t.Errorf("the %s container lost its %s mount; the strip is taking mounts it has no claim on",
+				c.Name, ordinary)
+		}
+	}
+
+	// Gated on the surface, like every other strip: a today install has no such
+	// volume and the CR's mount list is its author's business.
+	today := a2aTestAgent()
+	today.Spec.Mode = ptr.To("today")
+	today.Spec.Deployment = dep()
+	var kept int
+	for _, c := range buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}).Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name == a2aBusTokenVolume {
+				kept++
+			}
+		}
+	}
+	if kept == 0 {
+		t.Error("a today install lost the CR's extraVolumeMounts entry too; the strip is not gated on " +
+			"the surface, which is one more way to tell the next stack exists")
+	}
+}

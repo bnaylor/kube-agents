@@ -87,18 +87,37 @@ var SensitiveEnvVars = map[string]struct{}{
 // a user-authored container must not mount or shadow.
 //
 // The same two-layer shape as SensitiveEnvVars above, and for the same reason:
-// the validating webhook rejects a spec.deployment sidecar, init container or
-// volume that names one of these, and buildPodTemplateSpec strips it. The
-// webhook alone is not enough because the chart's default failurePolicy is
-// Ignore; the strip is what holds, and the rejection is what says why.
+// the validating webhook rejects a spec.deployment field that names one of
+// these, and the render strips it. The webhook alone is not enough because the
+// chart's default failurePolicy is Ignore; the strip is what holds, and the
+// rejection is what says why.
+//
+// FIVE fields, because spec.deployment has five user-authored volume and mount
+// surfaces and a reservation that covers four of them is not a reservation:
+// sidecars[].volumeMounts, initContainers[].volumeMounts, sidecarVolumes,
+// extraVolumes and extraVolumeMounts. The last one was the miss. It names no
+// container, so it does not read like a mount surface at all — but
+// buildBaseContainers appends it verbatim to the platform-agent container AND
+// to platform-agent-dashboard, which put the projected bus token into a second
+// container with the CR never mentioning one. spec.deployment.storages is NOT
+// in the list and does not need to be: it renders a PersistentVolumeClaim
+// volume under the name plus a "-vol" suffix, so it cannot collide with a
+// reserved name or carry a token projection.
+//
+// What this reservation does NOT cover is the volume SOURCE. It is a check on
+// names, so a differently-named projected volume whose
+// serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
+// same credential and is admitted. The only source-type check on
+// sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
 //
 // One member so far. `a2a-bus-token` is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
-// so a sidecar mounting this token is a second workload wearing the agent's bus
-// identity. A sidecar that also holds bridge-password would hold the union of
-// the two grant sets, which is the retired `worker` credential rebuilt out of a
-// volumeMount. See a2aStripBusTokenMounts.
+// so any other container mounting this token is a second workload wearing the
+// agent's bus identity. One that also holds bridge-password would hold the
+// union of the two grant sets, which is the retired `worker` credential rebuilt
+// out of a volumeMount. See a2aStripBusTokenMounts and, for the fifth field,
+// a2aStripBusTokenVolumeMounts.
 var ReservedVolumeNames = map[string]struct{}{
 	"a2a-bus-token": {},
 }

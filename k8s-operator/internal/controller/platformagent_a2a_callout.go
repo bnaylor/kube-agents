@@ -189,16 +189,38 @@ func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
 		if !mountsIt(out[i]) {
 			continue
 		}
-		keep := make([]corev1.VolumeMount, 0, len(out[i].VolumeMounts))
-		for _, m := range out[i].VolumeMounts {
-			if m.Name == a2aBusTokenVolume {
-				continue
-			}
-			keep = append(keep, m)
-		}
-		out[i].VolumeMounts = keep
+		out[i].VolumeMounts = a2aStripBusTokenVolumeMounts(out[i].VolumeMounts)
 	}
 	return out
+}
+
+// a2aStripBusTokenVolumeMounts is the same removal against a bare mount list,
+// for the one user-authored mount surface that reaches a container the operator
+// builds rather than one the CR declares.
+//
+// spec.deployment.extraVolumeMounts is that surface, and it is the widest of
+// the five: buildBaseContainers appends it verbatim to the platform-agent
+// container AND to platform-agent-dashboard, so a CR naming this volume there
+// mints the agent's bus identity into the dashboard -- a second container
+// wearing it, which is exactly what a2aStripBusTokenMounts above exists to
+// prevent for a sidecar. The dashboard runs the same image as the agent, so it
+// already ships the client that would read the file.
+//
+// Nothing in the operator's own lists names this volume, so this runs over
+// user-authored mounts only and the platform-agent container gets its real
+// mount from mountIntoContainer after the strip.
+func a2aStripBusTokenVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
+	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return m.Name == a2aBusTokenVolume }) {
+		return mounts
+	}
+	keep := make([]corev1.VolumeMount, 0, len(mounts))
+	for _, m := range mounts {
+		if m.Name == a2aBusTokenVolume {
+			continue
+		}
+		keep = append(keep, m)
+	}
+	return keep
 }
 
 // a2aStripBusTokenVolume removes a user-supplied volume that shadows the
