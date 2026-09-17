@@ -2325,6 +2325,10 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
+	// The A2A gateway is withheld until BusCredentialsReady is True, and it is
+	// one of the objects this test has to look at. Report the callout serving
+	// so the walk below has a gateway to walk.
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 
 	stored := &corev1.Secret{}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(creds), stored); err != nil {
@@ -2377,6 +2381,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 		&rbacv1.RoleBindingList{},
 	}
 	walked := 0
+	seen := map[string]bool{}
 	for _, list := range lists {
 		if err := cl.List(ctx, list); err != nil {
 			t.Fatalf("listing %T: %v", list, err)
@@ -2392,6 +2397,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 			}
 			walked++
 			kind := fmt.Sprintf("%T %s", obj, obj.GetName())
+			seen[kind] = true
 			check(t, kind, "name", obj.GetName())
 			for key, value := range obj.GetLabels() {
 				check(t, kind, "label "+key, value)
@@ -2423,6 +2429,22 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	}
 	if walked == 0 {
 		t.Fatal("walked no rendered objects; the check is inert")
+	}
+	// Named, not counted. A non-zero walk says the lists found something; it
+	// does not say they found the objects whose metadata the passwords could
+	// reach. Two must be there or this proves nothing about them: the NATS
+	// StatefulSet, which carries the nats.conf digest on its pod template and
+	// is the exact regression above, and the A2A gateway Deployment, which the
+	// creation gate withholds until BusCredentialsReady is True -- so a test
+	// that does not open the gate walks a namespace with no gateway in it and
+	// reports green on coverage it never had.
+	for _, want := range []string{
+		"*v1.StatefulSet test-agent-a2a-nats",
+		"*v1.Deployment test-agent-a2a-gateway",
+	} {
+		if !seen[want] {
+			t.Errorf("the walk never saw %s, so nothing here checked its metadata; walked %d objects", want, walked)
+		}
 	}
 }
 
