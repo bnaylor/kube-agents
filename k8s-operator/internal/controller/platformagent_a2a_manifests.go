@@ -2129,9 +2129,24 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				state.done = true
 			case batchv1.JobFailed:
 				state.failed = true
+				// This is the only place a provision refusal reaches
+				// `kubectl describe`, so it has to be true of every
+				// refusal rather than of the one that came first.
+				// "The bus has no streams" and "deleting the Job
+				// retries" were both true while the script could only
+				// fail on the way to creating something. They are not
+				// true of the closing block, which runs after every
+				// stream and bucket and refuses an install that is
+				// fully provisioned and one limit short: there the bus
+				// is complete, and a re-run reaches the same refusal.
+				// Naming that refusal's remedy here rather than leaving
+				// it in the pod log is the point — the log says which
+				// of the two happened, the status says what to do about
+				// the one a re-run cannot clear.
 				state.message = fmt.Sprintf(
-					"A2A provision Job %s failed (%s: %s); the bus has no streams until it succeeds. Inspect its pod logs; deleting the Job retries.",
-					existing.Name, cond.Reason, cond.Message)
+					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away. The refusal an operator upgrade reaches on its own is a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d): run `nats stream edit TASKS --max-consumers=%d`, or lower maxSessions.",
+					existing.Name, cond.Reason, cond.Message,
+					resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksConsumerBudget(agent))
 			}
 		}
 	}

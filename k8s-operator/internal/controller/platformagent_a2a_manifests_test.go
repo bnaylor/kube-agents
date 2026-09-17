@@ -1617,6 +1617,22 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				if !strings.Contains(state.message, "BackoffLimitExceeded") {
 					t.Errorf("message drops the condition reason: %q", state.message)
 				}
+				// The message is the only thing a refusal puts in
+				// `kubectl describe`, and the script's closing block
+				// refuses installs whose bus is complete. So it must
+				// not promise an empty bus, must not offer a Job
+				// delete as the remedy, and must name the one remedy
+				// a re-run cannot reach.
+				for _, untrue := range []string{"the bus has no streams", "deleting the Job retries"} {
+					if strings.Contains(state.message, untrue) {
+						t.Errorf("message claims %q, which is false of a closing-block refusal — that bus is fully provisioned and one limit short: %q", untrue, state.message)
+					}
+				}
+				for _, want := range []string{"maxSessions", "nats stream edit TASKS --max-consumers="} {
+					if !strings.Contains(state.message, want) {
+						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
+					}
+				}
 			}
 		})
 	}
