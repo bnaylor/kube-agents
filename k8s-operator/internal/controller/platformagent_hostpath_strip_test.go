@@ -40,18 +40,26 @@ import (
 // The tests in this file are for #1671: a hostPath on spec.deployment.extraVolumes
 // or .sidecarVolumes was refused by the admission webhook and nowhere else, and
 // the chart ships the webhook off. They assert the render-side layer: the volume
-// and every mount naming it are out of the Pod, the CR's own slices are not
-// edited, the drop is reported on status and only on the passes where it is
-// true of the Pod that is running, and a non-hostPath volume of the same shape
-// is untouched.
+// and every mount naming it are out of the Pod template, the CR's own slices are
+// not edited, the operator's own /tmp mount survives a user hostPath claiming
+// that path, a non-hostPath volume of the same shape is untouched, and the drop
+// is reported on status by the passes that rendered a template -- as a claim
+// about that template, qualified while the roll carrying it is unfinished.
 //
-// The condition type and reason are spelled as literals below because the
-// render cases were first run against a controller without the fix, to watch
-// them fail. The file as a whole no longer compiles there: the message-budget
-// and condition-gate cases reach hostPathDroppedMessage,
-// hostPathExtraVolumesField and hostPathDroppedEntryEllipsis, none of which
-// exist without it. Reproducing that failing run now means taking the render
-// cases over on their own.
+// The condition type and reason are spelled as literals below because the first
+// render cases were run against a controller without the fix, to watch them
+// fail. The file as a whole no longer compiles there: the message-budget,
+// condition-gate and rollout cases reach hostPathDroppedMessage,
+// hostPathExtraVolumesField, hostPathDroppedEntryEllipsis and the
+// oldPodsPossible constants, none of which exist without it. Reproducing that
+// failing run now means taking the render cases over on their own.
+//
+// The cases written after the fix were checked the other way round, by mutating
+// the fixed controller and watching which of them failed:
+// TestRenderDropsAHostPathMountedAtTmpKeepsTmpScratch by moving the mount filter
+// in buildPodTemplateSpec back below dropTmpScratchIfClaimed, and
+// TestTheDroppedVolumeConditionFollowsTheGatewayRollout by dropping the roll
+// test in updateStatusReady a term at a time.
 
 const (
 	// Fixture names. The paths are chosen so a test that finds one in the
