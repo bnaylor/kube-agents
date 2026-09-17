@@ -1673,8 +1673,28 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 
+	// The gateway is the first object cleanupA2A deletes, so it is the object
+	// this test's early-exit argument turns on -- and reconcileA2A withholds
+	// its creation until BusCredentialsReady is True. Driving reconcileA2A
+	// directly never publishes that condition, so without this the gateway is
+	// never created and the "it is gone after cleanup" row below asserts the
+	// absence of an object the render never made.
+	busCredentialsAreReady(agent)
+
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+
+	// The render has to have produced what the cleanup is asked to remove.
+	// Checked for the whole teardown list, not the gateway alone: every row of
+	// the IsNotFound table below is satisfied by an object that was never
+	// created, so this is what makes that table a proof rather than a
+	// restatement of what the render skipped.
+	for _, entry := range r.a2aNamespacedTeardown(agent) {
+		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(entry.obj), entry.obj); err != nil {
+			t.Fatalf("%T %s was not rendered, so cleanup deleting it proves nothing: %v",
+				entry.obj, entry.obj.GetName(), err)
+		}
 	}
 
 	// Pass one dies on the Role. The gateway Deployment (deleted first) is

@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -67,6 +68,24 @@ func letTheGatewayThrough(t *testing.T, ctx context.Context, cl client.Client, r
 			t.Fatalf("Reconcile %d after the callout came up: %v", i+1, err)
 		}
 	}
+}
+
+// busCredentialsAreReady sets BusCredentialsReady True on the in-memory CR,
+// which is the one thing the gateway gate reads. It is for tests that drive
+// reconcileA2A directly instead of going through Reconcile: syncBusCredentialsReady
+// runs on the way out of Reconcile, so on that path no pass ever publishes the
+// condition, the gate holds forever, and the gateway Deployment is never
+// created. An assertion about a gateway that was never created passes on
+// absence, which is the failure mode this helper exists to keep out of the
+// suite -- so call it, and then assert the Deployment is there before
+// asserting anything else about it.
+func busCredentialsAreReady(agent *agentv1alpha1.PlatformAgent) {
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:    busCredentialsReadyCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  busCredsReasonServing,
+		Message: "the auth callout is serving identity map <test>",
+	})
 }
 
 // completeTheProvisionJob reports the A2A provision Job complete, which is what
