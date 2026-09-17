@@ -1382,16 +1382,20 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # PostFinalDropped for assertion 10 - so the eviction is a degradation a reader
 # can see rather than a short history it cannot distinguish from a real one.
 #
-# The same eviction on the ...in class is quieter and worse. That subject's
-# oldest message is the task's originating kind:message, which the worker
-# re-reads on every start (worker-adapter fetchOrigin, an 'origin' consumer at
-# deliver:all taking the first kind:message it sees). Steers are kind:message
-# too and nothing on the envelope marks the submission, so past the cap the
-# scan returns the oldest surviving steer and the worker executes that as the
-# request - with no SubmittedMissing to show for it, because nothing folds
-# ...in. 4096 inbound messages on one task is a looping delegator rather than a
-# chat, so it is rarer than the events case; it is an open question in
-# docs/designs/spec-nats-deployment.md, not something a stream flag closes.
+# The same eviction on the ...in class is quieter and worse, and this flag
+# does not ship without the check that answers it. That subject's oldest
+# message is the task's originating kind:message, which the worker re-reads on
+# every start. Steers are kind:message too and nothing on the envelope marks
+# the submission, so a scan past the cap returns the oldest surviving steer and
+# the worker executes that as the request - with no SubmittedMissing to show
+# for it, because nothing folds ...in. No stream flag closes that: per-subject
+# discard:new would refuse the steer instead of the submission, which breaks
+# steering, and there is no 'keep the head' policy. It is closed on the client
+# side instead. The gateway publishes the submission before it spawns the pod,
+# so the ack names the sequence; it passes that to the pod as A2A_ORIGIN_SEQ
+# and the adapter opens its origin consumer there and refuses to run if the
+# message it gets back is a different sequence. See a2a/worker-adapter
+# fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
   --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
