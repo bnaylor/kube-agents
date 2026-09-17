@@ -2648,9 +2648,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 // hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
 // on the CR already says msg, where "" means the condition is to be absent.
-// Both status writers gate their write on this: a condition rewritten on every
-// pass re-enqueues the CR through the unfiltered watch (see
-// updateStatusDegraded for what that costs).
+// Both status writers gate their write on this -- the Degraded one only on the
+// passes that rendered, which are the only ones it may write the condition on
+// at all -- because a condition rewritten on every pass re-enqueues the CR
+// through the unfiltered watch (see updateStatusDegraded for what that costs).
 func hostPathDroppedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
 	if msg == "" {
@@ -3010,8 +3011,8 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// running Pod is -- so it is left exactly as it stands, stale wording and
 	// all, until a pass renders again and refreshes or removes it. That errs
 	// towards over-reporting a drop that has happened, never towards claiming
-	// one that has not. It leaves the comparison on those passes for the same
-	// reason: a term no write can satisfy would make every requeue tick a
+	// one that has not. It drops out of the comparison on those passes for the
+	// same reason: a term no write can satisfy would make every requeue tick a
 	// status write (#1392).
 	hostPathDroppedMsg := ""
 	hostPathDroppedUnchanged := true
