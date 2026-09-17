@@ -1986,11 +1986,16 @@ type droppedHostPathVolume struct {
 // containers the CR authored, because a mount naming a volume the Pod does not
 // declare is a Deployment the API server rejects, which wedges every reconcile
 // with nothing in status to say why. The drop is reported rather than parked
-// on: both status writers write the VolumesDropped condition while the spec
-// carries a hostPath and remove it once the entry is gone, so the agent keeps
-// running and the CR says what it is running without. Both of them, not only
-// updateStatusReady, because the render is above every refusal that parks the
-// CR on Degraded after it (see hostPathDroppedConditionType).
+// on: a pass that rendered writes the VolumesDropped condition while the spec
+// carries a hostPath and removes it once the entry is gone, so the agent keeps
+// running and the CR says what it is running without. Both status writers do
+// that, not only updateStatusReady, because three of the refusals that park the
+// CR on Degraded sit below the render and would otherwise drop the condition
+// off a CR whose template really is missing these volumes. The refusals above
+// the render neither write it nor clear it: that pass rendered nothing, so it
+// knows nothing about the template the workload is carrying, and the condition
+// the last rendering pass left is still the better answer (see
+// hostPathDroppedConditionType).
 func hostPathVolumes(agent *agentv1alpha1.PlatformAgent) []droppedHostPathVolume {
 	if agent.Spec.Deployment == nil {
 		return nil
