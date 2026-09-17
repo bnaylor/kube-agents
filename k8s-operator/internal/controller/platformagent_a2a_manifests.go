@@ -2256,11 +2256,11 @@ func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context,
 	// and env at whatever a callout outage happened to interrupt.
 	//
 	// Live through a2aReader, not the Deployment informer, even though
-	// Deployment is an Owns() kind whose cache is already running and
-	// a2aTeardownEntry takes the cached read for exactly that reason. The
-	// teardown is reading to delete; this is reading to decide whether the
-	// gate holds, and the two directions of cache staleness are not
-	// symmetric. A stale NotFound costs one more held pass and a requeue. A
+	// Deployment is an Owns() kind whose cache is already running and this
+	// same Deployment takes r.Client in a2aNamespacedTeardown for exactly
+	// that reason. The teardown is reading to delete; this is reading to
+	// decide whether the gate holds, and the two directions of cache
+	// staleness are not symmetric. A stale NotFound costs one more held pass and a requeue. A
 	// stale hit — an informer that has not yet seen the gateway deleted —
 	// answers "already there" and lets the Deployment be re-created while
 	// BusCredentialsReady is false, which is the single thing this gate
