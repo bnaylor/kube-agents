@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -176,7 +175,15 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 // findLatestLiveTask fetches the newest message on the platform in subjects
 // as the named bus user.
 //
-// It goes through GetLastMsgForSubject rather than a hand-rolled
+// Through lib.Connect and (*lib.Client).ReadTopicLatest, which is this exact
+// read -- stream, GetLastMsgForSubject, ParseEnvelope. A hand-rolled second
+// connection here would be a copy of library code that the live path does not
+// exercise, so a change to how the client reads a stream would leave this test
+// still passing against the old shape. The one thing it does not delegate is
+// the empty case: ReadTopicLatest reports it as ErrTopicEmpty and this
+// caller polls, so it becomes (nil, nil).
+//
+// It reads through GetLastMsgForSubject rather than a hand-rolled
 // $JS.API.STREAM.MSG.GET request, because MSG.GET is granted to nobody: every
 // stream the provision script creates sets --allow-direct, so nats.go picks
 // DIRECT.GET from the stream's own config and the grant lists carry only that
@@ -185,30 +192,24 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 // for the bridge against a real server in the operator's
 // TestBridgeJetStreamGrantOnARealServer.
 func findLatestLiveTask(user, pass, url string) (*lib.Envelope, error) {
-	nc, err := nats.Connect(url, nats.UserInfo(user, pass), nats.CustomInboxPrefix("_INBOX."+user))
-	if err != nil {
-		return nil, err
-	}
-	defer nc.Close()
-	js, err := jetstream.New(nc)
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stream, err := js.Stream(ctx, "TASKS")
+	client, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-gateway-livefind"),
+		lib.WithNATSOptions(nats.UserInfo(user, pass), nats.CustomInboxPrefix("_INBOX."+user)))
 	if err != nil {
 		return nil, err
 	}
-	msg, err := stream.GetLastMsgForSubject(ctx, "a2a.tasks.platform.*.in")
+	defer client.Close()
+	env, err := client.ReadTopicLatest(ctx, "TASKS", "a2a.tasks.platform.*.in")
 	if err != nil {
 		// No task on those subjects yet; the caller polls.
-		if errors.Is(err, jetstream.ErrMsgNotFound) {
+		if errors.Is(err, lib.ErrTopicEmpty) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return lib.ParseEnvelope(msg.Data)
+	return env, nil
 }
 
 // TestLiveEndToEndThroughBridge is the W3 DoD's bus path with no stand-ins:
