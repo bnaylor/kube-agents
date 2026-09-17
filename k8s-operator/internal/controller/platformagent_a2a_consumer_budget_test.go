@@ -24,6 +24,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -90,10 +91,10 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 		wantRender  int
 	}{
 		{"unset stays at the shipped cap", nil, 46, 64},
-		{"below the floor does not tighten it", ptrInt(2), 22, 64},
-		{"just under the floor still does not", ptrInt(15), 61, 64},
-		{"above the floor derives", ptrInt(20), 76, 76},
-		{"the CRD maximum", ptrInt(10000), 30016, 30016},
+		{"below the floor does not tighten it", ptr.To(2), 22, 64},
+		{"just under the floor still does not", ptr.To(15), 61, 64},
+		{"above the floor derives", ptr.To(20), 76, 76},
+		{"the CRD maximum", ptr.To(10000), 30016, 30016},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -112,8 +113,6 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 		})
 	}
 }
-
-func ptrInt(i int) *int { return &i }
 
 // The rendered flags, so a refactor that drops one is caught without running
 // anything.
