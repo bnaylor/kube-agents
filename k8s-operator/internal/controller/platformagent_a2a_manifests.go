@@ -2259,8 +2259,8 @@ func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context,
 	// same Deployment takes r.Client in a2aNamespacedTeardown for exactly
 	// that reason. The teardown is reading to delete; this is reading to
 	// decide whether the gate holds, and the two directions of cache
-	// staleness are not symmetric. A stale NotFound costs one more held pass and a requeue. A
-	// stale hit — an informer that has not yet seen the gateway deleted —
+	// staleness are not symmetric. A stale NotFound costs one more held pass
+	// and a requeue. A stale hit — an informer that has not yet seen it gone —
 	// answers "already there" and lets the Deployment be re-created while
 	// BusCredentialsReady is false, which is the single thing this gate
 	// exists to prevent. The cost is one API call, and only while the
