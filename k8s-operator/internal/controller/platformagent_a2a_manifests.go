@@ -250,6 +250,55 @@ const (
 # itself. The rest have a ServiceAccount and could move tomorrow, but no client
 # that sends a token yet - moving the identity before the program that uses it
 # would refuse the workload at connect.`
+
+	// The TASKS consumer budget, derived from maxSessions rather than fixed.
+	//
+	// Every session pod creates a2aSessionConsumersPerSession named consumers on
+	// TASKS, so a stream whose max_consumers does not scale with the session cap
+	// is a configuration the install cannot honour: above roughly twenty
+	// concurrent sessions a legitimate session's consumer create is refused, and
+	// it surfaces to the user as a task failure rather than as the capacity error
+	// it is. The cap and the stream now come off the same number.
+	//
+	// The floor is why a default install sees no change. max_consumers was 64
+	// before this derived it, and 64 is also what stops the `web` user - which
+	// holds $JS.API.CONSUMER.CREATE.TASKS.> and no DELETE, because durability is
+	// a request-body field no subject list can see - from growing the file store
+	// with an unreapable durable per page load. Deriving downward would quietly
+	// tighten that on every existing install for a reason that has nothing to do
+	// with web, so the derivation only ever widens: max(64, budget).
+	//
+	// Widening has a cost and it is the same one, stated plainly: an install that
+	// configures 10000 sessions also raises web's ceiling to ~30000. That is the
+	// install's own choice of concurrency made explicit. The ceiling still
+	// exists, and it still converts to a refused create rather than to silent
+	// disk growth.
+
+	// a2aSessionConsumersPerSession mirrors lib.SessionConsumerRoles in the
+	// a2a module - origin, in, events - which worker-adapter creates on
+	// TASKS per session. The two modules cannot import each other;
+	// TestSessionConsumerCountMatchesTheA2AModule reads that slice and
+	// fails if this number stops matching it.
+	a2aSessionConsumersPerSession = 3
+
+	// a2aTasksReservedConsumers is the part of the budget that is nobody's
+	// session: the gateway's `gateway-relay` durable and the Hermes
+	// bridge's `bridge-<profile>` durable (2), headroom for the audit
+	// durable the accountability rail needs (1), one session's worth of overlap while
+	// the gateway retires an incarnation and mints its replacement and the
+	// old consumers have not yet reached their 5s inactive threshold (3),
+	// and ten for the web rail's concurrent readers.
+	a2aTasksReservedConsumers = 16
+
+	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
+	// default install still gets. Never render below it.
+	a2aTasksMaxConsumersFloor = 64
+
+	// a2aTasksMaxMsgsPerSubject bounds one task's own history so a runaway
+	// on one task cannot evict every other session's. The provision
+	// script's TASKS block argues the number, what it bounds, and what it
+	// deliberately does not.
+	a2aTasksMaxMsgsPerSubject = 4096
 )
 
 func a2aNATSImage() string {
@@ -1640,56 +1689,6 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	}
 	return defaultA2AMaxSessions
 }
-
-// The TASKS consumer budget, derived from maxSessions rather than fixed.
-//
-// Every session pod creates a2aSessionConsumersPerSession named consumers on
-// TASKS, so a stream whose max_consumers does not scale with the session cap
-// is a configuration the install cannot honour: above roughly twenty
-// concurrent sessions a legitimate session's consumer create is refused, and
-// it surfaces to the user as a task failure rather than as the capacity error
-// it is. The cap and the stream now come off the same number.
-//
-// The floor is why a default install sees no change. max_consumers was 64
-// before this derived it, and 64 is also what stops the `web` user - which
-// holds $JS.API.CONSUMER.CREATE.TASKS.> and no DELETE, because durability is
-// a request-body field no subject list can see - from growing the file store
-// with an unreapable durable per page load. Deriving downward would quietly
-// tighten that on every existing install for a reason that has nothing to do
-// with web, so the derivation only ever widens: max(64, budget).
-//
-// Widening has a cost and it is the same one, stated plainly: an install that
-// configures 10000 sessions also raises web's ceiling to ~30000. That is the
-// install's own choice of concurrency made explicit. The ceiling still
-// exists, and it still converts to a refused create rather than to silent
-// disk growth.
-const (
-	// a2aSessionConsumersPerSession mirrors lib.SessionConsumerRoles in the
-	// a2a module - origin, in, events - which worker-adapter creates on
-	// TASKS per session. The two modules cannot import each other;
-	// TestSessionConsumerCountMatchesTheA2AModule reads that slice and
-	// fails if this number stops matching it.
-	a2aSessionConsumersPerSession = 3
-
-	// a2aTasksReservedConsumers is the part of the budget that is nobody's
-	// session: the gateway's `gateway-relay` durable and the Hermes
-	// bridge's `bridge-<profile>` durable (2), headroom for the audit
-	// durable the accountability rail needs (1), one session's worth of overlap while
-	// the gateway retires an incarnation and mints its replacement and the
-	// old consumers have not yet reached their 5s inactive threshold (3),
-	// and ten for the web rail's concurrent readers.
-	a2aTasksReservedConsumers = 16
-
-	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
-	// default install still gets. Never render below it.
-	a2aTasksMaxConsumersFloor = 64
-
-	// a2aTasksMaxMsgsPerSubject bounds one task's own history so a runaway
-	// on one task cannot evict every other session's. The provision
-	// script's TASKS block argues the number, what it bounds, and what it
-	// deliberately does not.
-	a2aTasksMaxMsgsPerSubject = 4096
-)
 
 // a2aTasksConsumerBudget is what this CR's configuration needs TASKS to hold.
 // It is the number the provision script checks a live stream against, which is
