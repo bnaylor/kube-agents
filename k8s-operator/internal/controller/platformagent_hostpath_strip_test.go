@@ -65,6 +65,11 @@ const (
 	hostPathFixtureEmptyDirSide  = "sidecar-scratch"
 	hostPathFixtureMountPath     = "/mnt/host"
 	hostPathFixtureScratchPath   = "/mnt/scratch"
+	// The /tmp fixture, for the ordering case below. Host path and mount path
+	// differ so a failure message says which of the two it found.
+	hostPathFixtureTmpVolume = "host-tmp"
+	hostPathFixtureTmpHost   = "/var/tmp"
+	hostPathFixtureTmpMount  = "/tmp"
 	// The condition the fix writes, as literals (see the file comment).
 	hostPathConditionType   = "VolumesDropped"
 	hostPathConditionReason = "HostPathVolumeDropped"
@@ -268,6 +273,72 @@ func TestRenderDropsAnUnmountedHostPathVolumeWithoutADanglingMount(t *testing.T)
 	for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
 		if hasMount(c.VolumeMounts, hostPathFixtureExtraVolume) {
 			t.Errorf("container %q mounts %q, which nothing in the spec asked for", c.Name, hostPathFixtureExtraVolume)
+		}
+	}
+	assertNoDanglingMounts(t, pod)
+}
+
+// TestRenderDropsAHostPathMountedAtTmpKeepsTmpScratch pins the order of two
+// filters inside buildBaseContainers that a rebase could swap without failing
+// anything else.
+//
+// The agent and dashboard containers get an operator-owned emptyDir at /tmp
+// (tmpScratchVolumeName), and dropTmpScratchIfClaimed takes it away when the
+// CR's own mounts already claim that path -- two mounts on one mountPath make
+// the Deployment unappliable. The hostPath mount filter therefore has to run
+// first: once the /tmp mount is out of the list, dropTmpScratchIfClaimed sees
+// nothing claiming /tmp and leaves the emptyDir in place.
+//
+// Run the other way round, the render drops the hostPath mount *and* the
+// emptyDir, and both containers come up with no /tmp at all -- on a
+// readOnlyRootFilesystem image whose entrypoint runs with HOME=/tmp, which is
+// a crash loop under a VolumesDropped condition reporting only the hostPath.
+// Nothing else in this file reaches the interaction: the other fixtures mount
+// at /mnt/*, and the tmp-scratch cases in platformagent_manifests_test.go
+// declare no hostPath, so the filter there is a no-op over an empty set.
+func TestRenderDropsAHostPathMountedAtTmpKeepsTmpScratch(t *testing.T) {
+	agent := brokerPodAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		ExtraVolumes: []corev1.Volume{{
+			Name:         hostPathFixtureTmpVolume,
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: hostPathFixtureTmpHost}},
+		}},
+		ExtraVolumeMounts: []corev1.VolumeMount{
+			{Name: hostPathFixtureTmpVolume, MountPath: hostPathFixtureTmpMount},
+		},
+	}
+	pod := renderHostPathPod(t, agent)
+
+	assertNoHostPathVolumes(t, pod.Volumes)
+	if hasVolume(pod.Volumes, hostPathFixtureTmpVolume) {
+		t.Errorf("extraVolumes entry %q is in the Pod", hostPathFixtureTmpVolume)
+	}
+	if !hasVolume(pod.Volumes, tmpScratchVolumeName) {
+		t.Errorf("the %s emptyDir went with the hostPath; the Pod declares %v", tmpScratchVolumeName, pod.Volumes)
+	}
+
+	// Both containers take extraVolumeMounts and both carry the emptyDir, so
+	// both have to be checked: the two dropTmpScratchIfClaimed calls are on
+	// separate lines and a rebase can reorder one without the other.
+	for _, name := range []string{"platform-agent", "platform-agent-dashboard"} {
+		c := mustFindContainer(t, pod, name)
+		if hasMount(c.VolumeMounts, hostPathFixtureTmpVolume) {
+			t.Errorf("container %q still mounts the hostPath %q", name, hostPathFixtureTmpVolume)
+		}
+		owners := []string{}
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == hostPathFixtureTmpMount {
+				owners = append(owners, m.Name)
+			}
+		}
+		switch {
+		case len(owners) == 0:
+			t.Errorf("container %q has no %s mount: the hostPath mount was filtered after dropTmpScratchIfClaimed read the list, so the %s emptyDir went with it. This container runs read-only-rootfs with HOME=%s.",
+				name, hostPathFixtureTmpMount, tmpScratchVolumeName, hostPathFixtureTmpMount)
+		case len(owners) > 1:
+			t.Errorf("container %q mounts %s twice, from %v; the API server rejects the Deployment", name, hostPathFixtureTmpMount, owners)
+		case owners[0] != tmpScratchVolumeName:
+			t.Errorf("container %q serves %s from volume %q, want the operator's %s emptyDir", name, hostPathFixtureTmpMount, owners[0], tmpScratchVolumeName)
 		}
 	}
 	assertNoDanglingMounts(t, pod)
