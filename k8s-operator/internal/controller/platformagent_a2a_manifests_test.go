@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1633,9 +1634,53 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
 					}
 				}
+				// And the number in that remedy is the one a fresh
+				// render creates, not the raw budget. This agent
+				// takes the default maxSessions, so its budget (46)
+				// sits below the floor its TASKS renders at (64) —
+				// and this message goes out on every JobFailed,
+				// whatever the cause. A remedy quoting the budget
+				// would tell an operator whose stream is already at
+				// the floor to edit it DOWN, which is the downward
+				// derivation the render refuses to make.
+				remedy := remedyMaxConsumers(t, state.message)
+				if remedy < a2aTasksMaxConsumersFloor {
+					t.Errorf("remedy says --max-consumers=%d, below the shipped floor %d: run against a default install's stream that TIGHTENS it: %q",
+						remedy, a2aTasksMaxConsumersFloor, state.message)
+				}
+				if remedy < a2aTasksConsumerBudget(agent) {
+					t.Errorf("remedy says --max-consumers=%d but the budget is %d, so the edit it names does not clear the script's own gate: %q",
+						remedy, a2aTasksConsumerBudget(agent), state.message)
+				}
 			}
 		})
 	}
+}
+
+// remedyMaxConsumers reads the number out of the status message's
+// `nats stream edit TASKS --max-consumers=N` remedy. It fails rather than
+// returning a zero value: a parse that quietly answered 0 would make every
+// floor assertion above pass on a message that had stopped naming a number.
+func remedyMaxConsumers(t *testing.T, message string) int {
+	t.Helper()
+	const flag = "--max-consumers="
+	i := strings.Index(message, flag)
+	if i < 0 {
+		t.Fatalf("no %q in the status message, so its remedy names no number: %q", flag, message)
+	}
+	rest := message[i+len(flag):]
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end == 0 {
+		t.Fatalf("%q in the status message is not followed by a number: %q", flag, message)
+	}
+	if end > 0 {
+		rest = rest[:end]
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		t.Fatalf("parsing the remedy's max_consumers from %q: %v", message, err)
+	}
+	return n
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's

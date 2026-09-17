@@ -1508,7 +1508,10 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
   echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
   echo "Provisioning does not edit an existing stream. Either lower maxSessions or run:" >&2
-  echo "  nats stream edit TASKS --max-consumers=${required_consumers}" >&2
+  echo "  nats stream edit TASKS --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + `" >&2
+  echo "  That is what a fresh render creates TASKS with, and it is never below the" >&2
+  echo "  ${required_consumers} needed here - the render floors at the cap TASKS shipped" >&2
+  echo "  with and only ever widens from it, so the two numbers differ on a small install." >&2
   exit 1
 fi
 
@@ -2159,10 +2162,21 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// it in the pod log is the point — the log says which
 				// of the two happened, the status says what to do about
 				// the one a re-run cannot clear.
+				//
+				// The two numbers in it are deliberately different.
+				// The need is the budget, which is what the script's
+				// gate compares a live stream against; the remedy is
+				// what a fresh render creates, which floors at the
+				// cap TASKS shipped with. A default install needs 46
+				// and renders 64, and this message goes out on every
+				// JobFailed whatever the cause — so a remedy naming
+				// the budget would tell an operator whose stream is
+				// already at 64 to edit it DOWN to 46, the downward
+				// derivation the constants above refuse to make.
 				state.message = fmt.Sprintf(
-					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away. The refusal an operator upgrade reaches on its own is a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d): run `nats stream edit TASKS --max-consumers=%d`, or lower maxSessions.",
+					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away. The refusal an operator upgrade reaches on its own is a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d): run `nats stream edit TASKS --max-consumers=%d` (what a fresh render creates TASKS with, which is never below the need), or lower maxSessions.",
 					existing.Name, cond.Reason, cond.Message,
-					resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksConsumerBudget(agent))
+					resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent))
 			}
 		}
 	}
