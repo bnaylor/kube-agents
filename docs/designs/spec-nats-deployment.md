@@ -144,9 +144,11 @@ event" - which is a visible failure but not a diagnosis. That is still the right
 against the alternative this replaces, where the worker ran the wrong input and reported
 success. But the refusal is deterministic and permanent, so an operator who does not read
 the pod log before the sweep deletes it gets a task that fails forever with no stated cause.
-Carrying the reason onto the bus means the worker publishing its own terminal, and it cannot:
-`contextId` and `correlationId` reach it only on the origin envelope it just refused to
-accept, so the fix is more pod env rather than a different publish. Left open below.
+Carrying the reason onto the bus means the worker publishing its own terminal, which it does
+not do here - not because the ids are out of reach, but because the adapter takes
+`contextId` and `correlationId` off the origin envelope and nowhere else, and that read sits
+downstream of the refusal. The values are already on the pod: the spawner annotates every
+session pod with both before it starts. Left open below.
 
 What an install that already has a `TASKS` stream gets from the cap is nothing, and the
 deployment says that rather than implying otherwise. Provisioning is create-only - the
@@ -770,8 +772,14 @@ Both run against `kind`.
 - **The origin refusal states its reason only in the pod log.** `fetchOriginAtSeq` names both
   sequences and exits; the sweep then closes the task with the supervisor's generic note, so a
   permanent, deterministic failure reaches its requester with no cause attached. The worker
-  cannot publish its own terminal because `contextId` and `correlationId` arrive on the origin
-  envelope it refused. Closing it means putting both on the pod env beside `A2A_ORIGIN_SEQ`.
-  Unowned.
+  does not publish its own terminal here because the adapter learns `contextId` and
+  `correlationId` from the origin envelope and nowhere else, and that assignment is downstream
+  of the refusal - a wiring gap in the adapter, not missing information. The ids are on the
+  pod object already: the spawner writes `a2a.kubeagents.dev/context-id` and
+  `…/correlation-id` as annotations on every session pod, and the supervisor's sweep reads
+  both back off the pod when it closes an orphan. Closing this is a downward-API `fieldRef`
+  on those two annotations, beside the `metadata.name` one that env block already carries -
+  not new plumbing from the gateway. Deferred because the branch needs the submission evicted
+  before the pod's first fetch, which is the 4096-message shape above. Unowned.
 - **Sizing.** TBD: message rates per stream class once the payload spec settles, and PV
   sizing from W times those rates.
