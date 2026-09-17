@@ -4076,3 +4076,115 @@ func TestTheDashboardNeverReceivesTheBusToken(t *testing.T) {
 			"the surface, which is one more way to tell the next stack exists")
 	}
 }
+
+// The fourth field, and the one neither test above reaches.
+//
+// spec.deployment.sidecarVolumes and spec.deployment.extraVolumes are two
+// separate slices that land in the same pod-level volume list, and the render
+// strips each with its own call —
+// TestUserAuthoredContainersCannotMountTheBusTokenByName puts its shadow in
+// sidecarVolumes only. Measured before this test was written: deleting
+// `extraVolumes = a2aStripBusTokenVolume(extraVolumes)` from
+// buildPodTemplateSpec left the whole operator suite green, so the reservation
+// row that claims a render strip for ExtraVolumes
+// (TestEveryUserAuthoredMountSurfaceIsReserved) was claiming coverage that did
+// not exist. That is the same defect class A5 shipped to close, one field over.
+//
+// Why extraVolumes is its own surface and not a rewording of sidecarVolumes:
+// it needs no container. A CR that declares no sidecar and no init container
+// at all can still add a volume named a2a-bus-token, so the author never
+// writes anything that looks like it is reaching for the agent's identity.
+// The entry is appended AFTER the operator's projection, and both halves of
+// a2aStripBusTokenVolume's argument apply to it — a Secret or hostPath under
+// that name is a credential of the author's choosing presented as the pod's,
+// and two volumes with one name is a Deployment server-side apply refuses,
+// which wedges every reconcile of the CR with nothing in status to say which
+// field did it.
+//
+// The webhook refuses the entry and says why, which is the half that gives the
+// author a field.Forbidden; this render is the half that holds when the
+// webhook is unreachable, which the chart's default failurePolicy: Ignore
+// makes the ordinary case rather than the exotic one.
+func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
+	const ordinary = "my-scratch"
+	dep := func() *agentv1alpha1.DeploymentSpec {
+		return &agentv1alpha1.DeploymentSpec{
+			// No sidecars, no initContainers, no sidecarVolumes: the only
+			// strip that can produce the pod asserted below is the
+			// extraVolumes one, so this test goes red for that call alone.
+			ExtraVolumes: []corev1.Volume{
+				{Name: ordinary, VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				}},
+				{Name: a2aBusTokenVolume, VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "attacker"},
+				}},
+			},
+		}
+	}
+
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = dep()
+	pod := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
+
+	// Precondition. If the surface were off there would be no projection to
+	// shadow, and every assertion below would hold over a pod this test is
+	// not about.
+	if !a2aAgentSurface(agent) {
+		t.Fatal("the a2a agent surface is off for this fixture, so the pod carries no bus token and " +
+			"nothing here measures a shadow of it")
+	}
+
+	var named []corev1.Volume
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == a2aBusTokenVolume {
+			named = append(named, v)
+		}
+	}
+	if len(named) != 1 {
+		t.Fatalf("the pod carries %d volumes named %s, want exactly 1: the CR's extraVolumes entry "+
+			"survived the strip. Two volumes with one name is refused by server-side apply, so the "+
+			"Deployment never applies and every reconcile of this CR wedges", len(named), a2aBusTokenVolume)
+	}
+	// And the one that survived is the operator's, not the author's. A strip
+	// that removed the projection and kept the Secret would leave the count at
+	// 1 and hand the agent container a credential the CR chose.
+	if !reflect.DeepEqual(named[0], a2aBusTokenVolumeSource()) {
+		t.Errorf("the pod's %s volume is %+v, not the operator's projection; the CR's entry is what the "+
+			"platform-agent container would mount at %s, which is the file a2a/lib reads",
+			a2aBusTokenVolume, named[0], a2aBusTokenPath)
+	}
+
+	// The agent keeps its mount: the strip is on the volume list, and taking
+	// the projection away would leave the container mounting a name no volume
+	// answers to.
+	var mounted bool
+	for _, c := range pod.Spec.Containers {
+		if c.Name != "platform-agent" {
+			continue
+		}
+		mounted = slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			return m.Name == a2aBusTokenVolume
+		})
+	}
+	if !mounted {
+		t.Error("the platform-agent container no longer mounts the bus token; the strip is too wide and " +
+			"the CLI falls through to a password that is no longer rendered")
+	}
+
+	// Not too wide: an ordinary extraVolumes entry is still the author's.
+	if podVolume(pod, ordinary) == nil {
+		t.Errorf("the pod lost its %s volume; the strip is taking entries it has no claim on", ordinary)
+	}
+
+	// Gated on the surface, like every other strip: a today install has no
+	// projected bus token, and a volume the next stack has never heard of is
+	// the CR author's business.
+	today := a2aTestAgent()
+	today.Spec.Mode = ptr.To("today")
+	today.Spec.Deployment = dep()
+	if podVolume(buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}), a2aBusTokenVolume) == nil {
+		t.Error("a today install lost the CR's extraVolumes entry too; the strip is not gated on the " +
+			"surface, which is one more way to tell the next stack exists")
+	}
+}
