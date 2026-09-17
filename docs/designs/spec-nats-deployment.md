@@ -467,10 +467,14 @@ does not exist yet.
 before that condition is true" used to describe an intention - the operator wrote
 `BusCredentialsReady` and no code in this repository read it. The dispatcher it was
 waiting for turns out to be one that already ships: the A2A gateway is what spawns
-session pods and relays their work onto the bus, and it is the only thing here that
-dispatches at all. So the operator withholds the gateway Deployment's _creation_ until
-the condition is true (`a2aGatewayWaitsForCallout`), and reconciles it normally once it
-exists. Creation only, and the distinction is the whole design: a callout outage after
+session pods and relays their work onto the bus. It is not the only thing that
+dispatches, since the Hermes bridge sidecar holds a durable on the task subjects too,
+but it is the only one whose work needs the callout: a session pod authenticates with a
+projected token and nothing else mints that. The gateway's own connection does not need
+it. The gateway is a static principal in `auth_users`, exactly as the bridge is. So the
+operator withholds the gateway Deployment's _creation_ until the condition is true
+(`a2aGatewayWaitsForCallout`), and reconciles it normally once it exists. Creation
+only, and the distinction is the whole design: a callout outage after
 the gateway is up is an outage, not a reason to freeze a running gateway's image and
 environment at whatever the outage happened to interrupt - and the session pods already
 spawned carry an `ownerReference` to that Deployment, so withholding it is not a neutral
