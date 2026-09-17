@@ -71,11 +71,15 @@ var SensitiveEnvVars = map[string]struct{}{
 	// A2A_BUS_TOKEN_FILE is the same argument one step stronger: it names the
 	// file the client reads and presents as its bearer token, and the client
 	// prefers an explicitly set value over the projected path with no
-	// fallback. Denial rather than escalation again — a forged file is not
-	// audience-bound to `a2a-bus`, and automountServiceAccountToken is false
-	// so there is no other real token in the container to redirect to — but
-	// the operator never sets it, so a spec.deployment.env entry naming it is
-	// never anything but an override of the projection.
+	// fallback. Denial rather than escalation, and the reason is the audience
+	// alone: automountServiceAccountToken is false, but the container is not
+	// tokenless — it holds the broker-audience projection at
+	// /var/run/secrets/kubeagents/credential-proxy, and a sidecar or an
+	// extraVolumes entry can put more files in reach. Redirecting to any of
+	// them presents a token minted for somebody else's audience, which the bus
+	// refuses at connect. What the reservation buys is that the operator never
+	// sets this variable, so a spec.deployment.env entry naming it is never
+	// anything but an override of the projection.
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	"NATS_URL":           {},

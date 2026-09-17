@@ -365,10 +365,12 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 		account:        a2aAccountApp,
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),
-		comment: "the platform agent container. Reads and writes the blackboard topics and\n" +
-			"nothing else: no task plane either way, and no JetStream consumer verb, so\n" +
-			"it cannot ask the server to deliver a stream anywhere. Replaced this pod's\n" +
-			"share of the retired shared `worker` credential.",
+		comment: "the platform agent container. Reads the whole blackboard and writes three\n" +
+			"topics on it. Beyond that, exactly two things: STREAM.INFO and DIRECT.GET on\n" +
+			"the two TOPICS streams, which carry the blackboard and nothing else, and its\n" +
+			"own reply inbox. No task plane either way, and no JetStream consumer verb\n" +
+			"anywhere, so it cannot ask the server to deliver a stream. Replaced this\n" +
+			"pod's share of the retired shared `worker` credential.",
 		publish: publish,
 		subscribe: []string{
 			"a2a.topics.>",
@@ -446,8 +448,11 @@ func bridgeIdentity() a2aIdentity {
 			"STATIC because it shares the agent pod, and a ServiceAccount token names a\n" +
 			"pod rather than a container — a callout identity here would be the agent\n" +
 			"container's grants and this one's added together, which is the credential\n" +
-			"the retired `worker` user was. It publishes events for one addressee and\n" +
-			"reads that addressee's inbound leg; the rest of the task plane is refused.",
+			"the retired `worker` user was. Its WRITE is narrowed to one addressee:\n" +
+			"publishing another's events is refused. Its READ is not. The JetStream\n" +
+			"grants below name the TASKS stream, and both DIRECT.GET and a consumer's\n" +
+			"filter_subject reach every addressee on it, so a holder of this password\n" +
+			"can read every session's prompts. `worker` held the identical two grants.",
 		publish: publish,
 		subscribe: []string{
 			"a2a.tasks." + a2aBridgeAddressee + ".*.in",
@@ -488,11 +493,14 @@ const (
 	// and a2a/cmd/a2a/main.go prefers it unconditionally with no fallback --
 	// deliberately, because a caller who names a token file and is quietly
 	// logged in as something else is the failure that ordering prevents. The
-	// blast radius is denial rather than escalation (the token is
-	// audience-bound, and automountServiceAccountToken is false so there is no
-	// second token in the container to redirect to), but it is the variable
-	// that decides WHICH bearer token this container presents, so it is
-	// reserved on the same argument as a2aBusUserEnv above.
+	// blast radius is denial rather than escalation, and the audience is the
+	// whole of why: automountServiceAccountToken is false, but this container
+	// is not tokenless -- it holds the broker-audience projection at
+	// credentialProxyTokenMountPath, and a CR can put more files in reach --
+	// and every one of them is minted for somebody else's audience, which the
+	// bus refuses at connect. It is still the variable that decides WHICH
+	// bearer token this container presents, so it is reserved on the same
+	// argument as a2aBusUserEnv above.
 	//
 	// Mirrors lib.EnvBusTokenFile (a2a/lib/credentials.go), which is the
 	// reader. Separate modules, so the spelling is held by the conformance
@@ -504,7 +512,16 @@ const (
 // its grants name. It is the bridge's BRIDGE_PROFILE default
 // (a2a/cmd/hermes-bridge/main.go, defaultProfile) — the two are one value, and a
 // deployment that overrides the env without widening this grant gets a bridge
-// that connects and then never sees a task.
+// that RUNS the other addressee's tasks and then cannot answer for them.
+//
+// Not the clean denial that reads like. The bridge consumes through a pull
+// consumer, so the filter subject travels in the CONSUMER.CREATE request body
+// and `$JS.API.CONSUMER.CREATE.TASKS.>` does not scope it — the inbound leg is
+// delivered and Hermes executes it. Only the events publish is refused, which
+// is the LAST step: every side effect the task asked for has happened by then
+// and the result is what gets dropped. Same mechanism as the "reading is not
+// narrowed" paragraph in bridgeIdentity, and
+// TestBridgeJetStreamGrantOnARealServer measures it.
 const a2aBridgeAddressee = "platform"
 
 // seed: the hand-applied seed tooling, which writes the starter topic entries.
