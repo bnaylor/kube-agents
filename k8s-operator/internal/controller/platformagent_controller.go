@@ -143,8 +143,8 @@ const (
 	// author of a CR the webhook never saw finds out.
 	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and were left out of the agent Pod, with every volumeMount " +
 		"naming them: %s. The admission webhook refuses these when it runs, and this CR was admitted without it " +
-		"(the Helm chart ships operator.webhooks.enabled=false, and an enabled webhook fails open at " +
-		"failurePolicy: Ignore). Remove the entries from the spec to clear this condition."
+		"(the Helm chart ships operator.webhooks.enabled=false, and one enabled through the chart fails open at " +
+		"its default failurePolicy: Ignore). Remove the entries from the spec to clear this condition."
 	hostPathDroppedEntrySeparator = ", "
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
