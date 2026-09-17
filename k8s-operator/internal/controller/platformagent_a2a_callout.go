@@ -174,6 +174,11 @@ func a2aBusTokenVolumeMount() corev1.VolumeMount {
 // so an unreachable webhook admits the object with validation skipped. The
 // webhook's refusal is what tells the author why; this is what holds.
 //
+// Name-matched, and only that: a user volume projecting the same audience
+// under another name reaches a sidecar untouched by this and by the webhook
+// both. ReservedVolumeNames carries what that does and does not buy;
+// gke-labs#1667 carries the source check that closes it.
+//
 // The input slices belong to the CR, so the copy is not incidental.
 func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
 	mountsIt := func(c corev1.Container) bool {

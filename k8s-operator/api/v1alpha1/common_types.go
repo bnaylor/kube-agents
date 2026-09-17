@@ -113,6 +113,24 @@ var SensitiveEnvVars = map[string]struct{}{
 // serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
 // same credential and is admitted. The only source-type check on
 // sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
+// Established by execution rather than by reading the render: a sidecarVolumes
+// entry named innocuous-cache projecting that audience renders intact and the
+// sidecar authenticates as `agent`.
+//
+// Which fixes the terms this should be read on. KSA tokens are pod-scoped and
+// the callout cannot see which container presented one, so neither a name nor
+// an audience reservation is a boundary against a hostile sidecar; it is a
+// guard against a misconfiguration. Worth having on those terms for the reason
+// agentForbiddenVolumeNames gives for the same class in
+// credential_proxy_manifests.go: the CR is authored by the platform operator
+// and not by the agent — buildPlatformLocalRole grants the agent
+// get/list/watch on its own CR and nothing more, and no tenant-facing or
+// aggregated role on platformagents ships — so this is a configuration hazard
+// rather than an escape, guarded because nothing else would notice. That rests
+// on who may write the CR, which makes it re-decidable rather than settled: a
+// delegable role, or the CR moving into a repo the agent can open pull
+// requests against, changes the answer. gke-labs#1667 closes the audience
+// route and the creds-Secret route that is cheaper than it.
 //
 // One member so far. `a2a-bus-token` is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is

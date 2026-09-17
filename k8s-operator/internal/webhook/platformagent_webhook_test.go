@@ -492,7 +492,7 @@ func TestPlatformAgentValidation(t *testing.T) {
 	// auth callout resolves the POD's ServiceAccount, so a sidecar holding it
 	// is a second workload wearing the agent's bus identity, and one that also
 	// holds bridge-password holds the union of the two grant sets. The render
-	// strips the mount (TestUserAuthoredContainersCannotMountTheBusToken);
+	// strips the mount (TestUserAuthoredContainersCannotMountTheBusTokenByName);
 	// this is the half that tells the author why, and the half that does not
 	// run when failurePolicy: Ignore meets an unreachable webhook.
 	t.Run("fails if a user-authored container mounts a reserved volume", func(t *testing.T) {

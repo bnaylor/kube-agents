@@ -3862,7 +3862,8 @@ func TestCheckA2AUserGrants(t *testing.T) {
 // The split A5 made is enforced by the pod spec, and spec.deployment is
 // user-authored: sidecars, init containers and their volumes are copied
 // verbatim into the render. So the one thing that keeps the projected bus token
-// in the platform-agent container is that nothing else mounts it, and until
+// in the platform-agent container is that nothing else mounts it by that name,
+// and until
 // this test nothing made that true — a2aBusTokenVolume is a public string in
 // the rendered Deployment, the volume is in the pod under `next`, and the
 // bridge image is built FROM the platform-agent image so it ships the client
@@ -3872,7 +3873,13 @@ func TestCheckA2AUserGrants(t *testing.T) {
 // Absence, per container, plus the volume-name shadow: two volumes with one
 // name is a Deployment server-side apply refuses, so that arm is a wedge guard
 // as well.
-func TestUserAuthoredContainersCannotMountTheBusToken(t *testing.T) {
+//
+// Scope, so the name is not read as more than it pins: this is the NAME-based
+// reservation. A user volume projecting the a2a-bus audience under some other
+// name defeats the reservation and leaves this test passing, which is what the
+// ByName is doing in the name. gke-labs#1667 adds the source check, with its
+// own test.
+func TestUserAuthoredContainersCannotMountTheBusTokenByName(t *testing.T) {
 	grab := func(agent *agentv1alpha1.PlatformAgent) corev1.PodSpec {
 		t.Helper()
 		return buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
