@@ -2283,8 +2283,9 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	return nil
 }
 
-// splitWorkloadStatus is one of the two workloads the credential-broker split made
-// mandatory alongside the gateway, read back so Ready can depend on it.
+// splitWorkloadStatus is one workload the gateway's readiness does not cover,
+// read back so Ready can depend on it: the two the credential-broker split made
+// mandatory, and on a next install the A2A gateway as well.
 type splitWorkloadStatus struct {
 	// name is the object's name, and what the Provisioning message reports.
 	name string
@@ -2295,9 +2296,10 @@ type splitWorkloadStatus struct {
 }
 
 // readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
+// Deployment, and on an install that renders the A2A stack, the A2A gateway
 // Deployment.
 //
-// Ready has to depend on both. Before the split the credential runtime was a native
+// Ready has to depend on all of them. Before the split the credential runtime was a native
 // sidecar of the gateway pod, so a broker that could not start held the gateway out of
 // readiness and the existing pod scan reported why. Splitting it into its own pod took
 // that away: the gateway now becomes Ready on its own while the model cannot run a single
@@ -2327,10 +2329,38 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 		broker.Status.ReadyReplicas = 0
 	}
 
-	return []splitWorkloadStatus{
+	workloads := []splitWorkloadStatus{
 		{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas},
 		{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas},
-	}, nil
+	}
+
+	// The A2A gateway stands in the same relation to Ready as those two: a next
+	// install without one cannot serve an A2A request at all, and nothing about the
+	// agent gateway's own readiness says so. It is also the one workload here that
+	// the operator withholds ON PURPOSE -- a2aGatewayWaitsForCallout holds the first
+	// creation while the auth callout is short of serving -- and until that hold is
+	// counted, the CR reports Ready: True beside a BusCredentialsReady of False and
+	// the two contradict each other. The hold stays; it stops being silent.
+	//
+	// a2aStackRendering, not a2aAgentSurface: this has to be the same predicate as
+	// whatever creates the Deployment. On version skew the A2A objects are frozen
+	// rather than reconciled, and that CR is already Degraded for the skew itself --
+	// a second reason to hold Ready there would report the freeze as a fault.
+	if a2aStackRendering(agent) {
+		gateway := &appsv1.Deployment{}
+		gatewayName := a2aGatewayName(agent)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: gatewayName}, gateway); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
+			}
+			gateway.Status.ReadyReplicas = 0
+		}
+		workloads = append(workloads, splitWorkloadStatus{
+			name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
+		})
+	}
+
+	return workloads, nil
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -2388,8 +2418,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 	}
 
-	// The two workloads the split made mandatory. Read before the phase is decided,
-	// because Ready is a claim about all three and not about the gateway alone.
+	// The workloads the gateway's own readiness does not cover. Read before the phase
+	// is decided, because Ready is a claim about every one of them and not about the
+	// gateway alone.
 	splitWorkloads, errSplit := r.readSplitWorkloads(ctx, agent)
 	if errSplit != nil {
 		return "", errSplit
@@ -2412,6 +2443,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
+		if a2aStackRendering(agent) {
+			condMsg = "Gateway, shell sandbox, credential broker and A2A gateway are all ready"
+		}
 	case errWorkload == nil:
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride

@@ -13,6 +13,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -390,10 +391,19 @@ func TestAPartlyReadyCalloutStillWithholdsANewGateway(t *testing.T) {
 		t.Errorf("the A2A gateway exists (err=%v) with one of two callout replicas ready; if the gate was deliberately loosened to one ready replica, the Risk & Rollout paragraph about what a partly-ready callout costs a new install has to change with it", err)
 	}
 
-	// The silent half. Nothing the hold does reaches the phase, and the three
-	// workloads the phase is computed from are all up, so an operator watching
-	// `kubectl get platformagent` sees a healthy install with no dispatcher.
-	if fresh.Status.Phase != "Ready" {
-		t.Errorf("phase = %q with the A2A gateway withheld, want %q; if the hold was deliberately made visible on the phase, update this assertion and drop the 'silent' half of the Risk & Rollout paragraph", fresh.Status.Phase, "Ready")
+	// The half that used to be silent. The three workloads the phase was computed
+	// from are all up, so before readSplitWorkloads counted the A2A gateway an
+	// operator watching `kubectl get platformagent` saw a healthy install with no
+	// dispatcher -- Ready: True sitting directly beside the False condition read
+	// above it. The hold is unchanged; what the phase says about it is not.
+	if fresh.Status.Phase != "Provisioning" {
+		t.Errorf("phase = %q with the A2A gateway withheld, want %q; if the gateway was deliberately taken back out of Ready, the Risk & Rollout paragraph about what a partly-ready callout costs a new install has to change with it", fresh.Status.Phase, "Provisioning")
+	}
+	ready := meta.FindStatusCondition(fresh.Status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatalf("no Ready condition, so there is nothing for an operator to read")
+	}
+	if !strings.Contains(ready.Message, a2aGatewayName(agent)) {
+		t.Errorf("the Ready message is %q; it has to name %s, because naming the object is the whole difference between a phase that says converging and a phase that says which describe to run", ready.Message, a2aGatewayName(agent))
 	}
 }
