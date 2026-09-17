@@ -2650,18 +2650,40 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
 
-	// All three pods, gateway first so an install with a fault in more than one of
-	// them reports the same sentence it always has. The other two are here because
-	// the faults this function names are exactly the ones the split introduced a
-	// new way to hit: a runtimeClassName the cluster has no node pool for, and a
-	// sandbox or broker image tag nothing published. Neither is visible from the
-	// gateway's own pod any more.
-	pods := make([]corev1.Pod, 0)
-	for _, selector := range []map[string]string{
+	// Every pod Ready is a claim about, gateway first so an install with a fault in
+	// more than one of them reports the same sentence it always has. The middle two
+	// are here because the faults this function names are exactly the ones the split
+	// introduced a new way to hit: a runtimeClassName the cluster has no node pool
+	// for, and a sandbox or broker image tag nothing published. Neither is visible
+	// from the gateway's own pod any more.
+	selectors := []map[string]string{
 		{"app": agent.Name + "-gateway"},
 		shellSandboxSelector(agent),
 		{"app": credentialProxyName(agent)},
-	} {
+	}
+
+	// Appended last, for that same reason, one release later: readSplitWorkloads
+	// made the A2A gateway gate Ready, and a workload that gates Ready and is never
+	// scanned leaves an operator with nothing to act on. Unscanned, a gateway pod in
+	// ImagePullBackOff or CrashLoopBackOff reads as "Waiting for Deployment
+	// <agent>-a2a-gateway to become ready" indefinitely -- which is also what the
+	// deliberate callout hold says, and what a slow scheduler says, so the phase
+	// distinguishes none of the three. Scanned, the container fault names itself.
+	//
+	// Last rather than first: the ordering above is load-bearing, and an install
+	// faulting in more than one workload has to keep reporting the sentence it
+	// always did.
+	//
+	// a2aStackRendering, the same predicate readSplitWorkloads gates on and the same
+	// one that renders the Deployment: a today install has no such pod, and a skewed
+	// one has its A2A objects frozen and is already Degraded/ModeNotRecognized for
+	// the skew itself -- a second reason there would report the freeze as a fault.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
+	}
+
+	pods := make([]corev1.Pod, 0)
+	for _, selector := range selectors {
 		podList := &corev1.PodList{}
 		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
 			continue
