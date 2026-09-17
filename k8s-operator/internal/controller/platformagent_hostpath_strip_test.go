@@ -313,6 +313,21 @@ func TestReconcileReportsADroppedHostPathVolumeAndClearsItWhenRemoved(t *testing
 	}
 	t.Logf("%s: %s/%s: %s", cond.Type, cond.Status, cond.Reason, cond.Message)
 
+	// A pass that changes nothing writes nothing. The condition is in
+	// updateStatusReady's unchanged comparison for the same reason the others
+	// are: a status write per pass re-enqueues the CR through the unfiltered
+	// watch and reconciles it continuously.
+	settledVersion := got.ResourceVersion
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile (settled) failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatalf("reading the PlatformAgent back: %v", err)
+	}
+	if got.ResourceVersion != settledVersion {
+		t.Errorf("a reconcile with nothing to change wrote the CR (resourceVersion %s -> %s); the %s condition is causing a write per pass", settledVersion, got.ResourceVersion, hostPathConditionType)
+	}
+
 	// Removing the entries clears the condition on the next pass.
 	got.Spec.Deployment.ExtraVolumes = got.Spec.Deployment.ExtraVolumes[1:]
 	got.Spec.Deployment.ExtraVolumeMounts = got.Spec.Deployment.ExtraVolumeMounts[1:]
