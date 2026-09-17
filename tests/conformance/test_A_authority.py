@@ -482,9 +482,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
         One is hand-edited and one is generated from it, and the writer-set
         tests are only as true as the reader that feeds them. For the builders
-        that return a struct literal the comparison is exact; for the two that
-        concatenate Go constants it is the literal head, which is where every
-        task subject in this class lives.
+        that return a struct literal the comparison is exact; for the three
+        that concatenate Go constants it is the literal head, which is where
+        every task subject in this class lives.
         """
         served = self._conf_publish_grants()
         declared = self._go_publish_grants()
