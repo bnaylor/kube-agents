@@ -2283,12 +2283,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// the callout Deployment, so the gate and the signal an operator watches
 	// cannot disagree about what "ready" meant. The cost is that
 	// syncBusCredentialsReady is deferred to the way out of Reconcile, so the
-	// value read here is one pass old. That is a delay, never a wrong answer:
-	// stale-false holds the gateway one more pass and gatewayHeld requeues,
-	// and stale-true can only happen for a callout that was serving as
-	// recently as the previous pass, which is the same window the condition's
-	// own doc comment accepts ("a stale condition for a moment is cheaper
-	// than a refused connection").
+	// value read here is one pass old, and the two directions differ.
+	// Stale-false costs only a delay: the gateway is held one more pass and
+	// gatewayHeld requeues. Stale-true is a wrong answer, and worth naming as
+	// one - a first creation goes through on a callout that was serving as
+	// recently as the previous pass and is not serving now. What bounds it is
+	// that one pass, the same window the condition's own doc comment already
+	// accepts ("a stale condition for a moment is cheaper than a refused
+	// connection").
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
