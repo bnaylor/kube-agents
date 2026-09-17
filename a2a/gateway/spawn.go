@@ -330,8 +330,12 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// submission. Always set, including when we do not know:
 					// the worker has to tell "spawned by something that never
 					// says" from "spawned by something that says it could not
-					// tell", and only the first of those may fall back to
-					// scanning the subject (lib.EnvOriginSeq).
+					// tell". Both of those fall back to scanning the subject,
+					// so the distinction does not change what the worker does
+					// - it changes what it can say about it. The sentinel is
+					// a spawner admitting a gap; absence is a spawner too old
+					// to have one, and only the second is unremarkable
+					// (lib.EnvOriginSeq).
 					{Name: lib.EnvOriginSeq, Value: originSeqValue(originSeq)},
 				},
 				Resources: corev1.ResourceRequirements{

@@ -136,6 +136,18 @@ subject-scoped and one grant for either reads the whole task plane. A consumer's
 subject rides its CREATE subject and is already granted per session, so the check costs no
 new reach - only a different `deliver` policy on a consumer the worker already creates.
 
+Worth being exact about how loud the refusal actually is, because it is quieter than it
+reads. The worker returns the error and exits non-zero, so the message naming both sequences
+lands in the pod's log and nowhere else. What the delegator sees is the supervisor's sweep
+closing the task `failed` with its generic note - "session pod exited without a terminal
+event" - which is a visible failure but not a diagnosis. That is still the right trade
+against the alternative this replaces, where the worker ran the wrong input and reported
+success. But the refusal is deterministic and permanent, so an operator who does not read
+the pod log before the sweep deletes it gets a task that fails forever with no stated cause.
+Carrying the reason onto the bus means the worker publishing its own terminal, and it cannot:
+`contextId` and `correlationId` reach it only on the origin envelope it just refused to
+accept, so the fix is more pod env rather than a different publish. Left open below.
+
 What an install that already has a `TASKS` stream gets from the cap is nothing, and the
 deployment says that rather than implying otherwise. Provisioning is create-only - the
 `stream info X || stream add X` guards never edit - so every limit this render has gained
@@ -722,5 +734,11 @@ Both run against `kind`.
 - **Which server error flips a client to terminal close** rather than transient reconnect is
   unconfirmed - the worked example never logged it. NR-3 closes this for the future and the
   uncertainty does not change NR-1 or NR-2.
+- **The origin refusal states its reason only in the pod log.** `fetchOriginAtSeq` names both
+  sequences and exits; the sweep then closes the task with the supervisor's generic note, so a
+  permanent, deterministic failure reaches its requester with no cause attached. The worker
+  cannot publish its own terminal because `contextId` and `correlationId` arrive on the origin
+  envelope it refused. Closing it means putting both on the pod env beside `A2A_ORIGIN_SEQ`.
+  Unowned.
 - **Sizing.** TBD: message rates per stream class once the payload spec settles, and PV
   sizing from W times those rates.
