@@ -218,8 +218,20 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			name:       "a stream that predates the per-subject cap is told, not edited",
 			liveJSON:   `{"name":"TASKS","max_consumers":-1,"max_msgs_per_subject":-1}`,
 			wantExit:   0,
-			wantStderr: []string{"max_msgs_per_subject=-1", "nats stream edit TASKS --max-msgs-per-subject=4096", "evicts"},
+			wantStderr: []string{"max_msgs_per_subject=-1", "no per-subject limit", "predates the limit", "nats stream edit TASKS --max-msgs-per-subject=4096", "evicts"},
 			notStderr:  []string{"--max-consumers"},
+		},
+		{
+			// A cap that is not the render's is not the same report. An
+			// operator who deliberately set 8192 has a bounded stream,
+			// and telling them it "predates the limit" and that one task
+			// can still evict another session's history is telling them
+			// something false about their own install.
+			name:       "a cap the operator chose is drift, not the unbounded gap",
+			liveJSON:   `{"name":"TASKS","max_consumers":316,"max_msgs_per_subject":8192}`,
+			wantExit:   0,
+			wantStderr: []string{"max_msgs_per_subject=8192", "drift between"},
+			notStderr:  []string{"predates the limit", "can still evict", "--max-consumers"},
 		},
 		{
 			// The property the comment beside the grep claims: a check

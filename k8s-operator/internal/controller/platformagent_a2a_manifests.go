@@ -1420,13 +1420,27 @@ if [ -z "${live_subject_cap}" ]; then
   echo "could not read max_msgs_per_subject off the TASKS stream; refusing to report this install as provisioned" >&2
   exit 1
 fi
-if [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" ]; then
-  echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
+#
+# Unbounded and merely different are not the same report. An unbounded stream
+# is the gap: nothing stops one task evicting another session's history, which
+# is the whole reason the render carries the flag. A stream carrying some other
+# finite cap is bounded already, and telling the operator who chose it that
+# their stream "predates the limit" is telling them something false about their
+# own install.
+if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
+  echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
   echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
   echo "  an operator applies it one task's events can still evict another session's history." >&2
   echo "  Applying it evicts, on every subject already over the limit, oldest first - and a task's" >&2
   echo "  oldest event is its 'submitted' one, so those tasks replay opening mid-history. Readers" >&2
   echo "  report that rather than hiding it. With that understood:" >&2
+  echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" ]; then
+  echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
+  echo "  Bounded either way, so no task can evict another session's history - this is drift between" >&2
+  echo "  the stream and the render, not the unbounded gap. Provisioning does not edit an existing" >&2
+  echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
+  echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
 fi
 

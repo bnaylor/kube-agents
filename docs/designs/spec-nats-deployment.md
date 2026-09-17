@@ -117,7 +117,11 @@ closes it, and what the edit costs. Applying a per-subject cap is a tightening, 
 tightening evicts on every subject already over the limit the moment it lands.
 Truncating a running install's task history as an automatic side effect of an operator
 upgrade is not a decision provisioning takes on an operator's behalf, so it reports and
-exits clean. The `max_consumers` gap in the same
+exits clean. What it reports that way is the absent bound - a stream carrying no
+per-subject limit at all. A stream carrying some other finite cap is bounded already, so
+it is reported as drift between the stream and the render rather than as that gap; an
+operator who chose the number is not told their stream predates the limit. The
+`max_consumers` gap in the same
 block is treated the other way - it refuses - because a short consumer budget is not a
 bound the install never had but a shortfall with a load-time failure already attached.
 
