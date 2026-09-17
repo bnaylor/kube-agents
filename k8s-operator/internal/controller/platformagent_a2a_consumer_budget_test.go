@@ -214,7 +214,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			wantStderr: []string{
 				"max_consumers=64", "needs 316",
 				"stream configuration update can not change MaxConsumers",
-				"lower spec.harness.tuning.maxSessions to 16 or below",
+				"lower spec.harness.tuning.maxSessions to at most 16",
 				"delete the TASKS stream",
 				"recreates TASKS at 316",
 				"Delete the Job to re-run it now",
@@ -253,7 +253,37 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				"That leaves deleting the TASKS stream",
 				"recreates TASKS at 316",
 			},
-			notStderr: []string{"So either lower", "or below", "--max-consumers="},
+			notStderr: []string{"So either lower", "to at most", "--max-consumers="},
+		},
+		{
+			// The boundary between the two branches above, and the
+			// only place they can be told apart: 19 is the
+			// narrowest stream that has room for a legal
+			// maxSessions at all - the 16 reserved plus one
+			// session's 3 - so it takes the "lower it" branch with
+			// nothing to spare, and 18 takes the other one. A gate
+			// off by one in either direction sends one of these
+			// two cases down the wrong branch, and only a pair
+			// sitting on the seam catches that.
+			name:     "the narrowest stream that a legal maxSessions still fits",
+			liveJSON: `{"name":"TASKS","max_consumers":19,"max_msgs_per_subject":4096}`,
+			wantExit: 2,
+			wantStderr: []string{
+				"max_consumers=19",
+				"lower spec.harness.tuning.maxSessions to at most 1 -",
+				"delete the TASKS stream",
+			},
+			notStderr: []string{"one session still needs 19", "--max-consumers="},
+		},
+		{
+			name:     "one consumer short of that, and lowering stops being a way out",
+			liveJSON: `{"name":"TASKS","max_consumers":18,"max_msgs_per_subject":4096}`,
+			wantExit: 2,
+			wantStderr: []string{
+				"max_consumers=18",
+				"minimum is 1, and one session still needs 19",
+			},
+			notStderr: []string{"So either lower", "to at most", "--max-consumers="},
 		},
 		{
 			name:      "a stream sized for it passes",

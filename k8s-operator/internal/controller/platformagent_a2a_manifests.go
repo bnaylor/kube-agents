@@ -1513,7 +1513,7 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
   fits=$(( (live_consumers - ` + strconv.Itoa(a2aTasksReservedConsumers) + `) / ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` ))
   if [ "${fits}" -ge 1 ]; then
-    echo "So either lower spec.harness.tuning.maxSessions to ${fits} or below - the most a" >&2
+    echo "So either lower spec.harness.tuning.maxSessions to at most ${fits} - the most a" >&2
     echo "  stream holding ${live_consumers} consumers has room for, with ` + strconv.Itoa(a2aTasksReservedConsumers) + ` of them reserved and" >&2
     echo "  the rest going ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` to a session - or delete the TASKS stream and provision again." >&2
   else
