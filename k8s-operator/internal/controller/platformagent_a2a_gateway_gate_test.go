@@ -137,12 +137,16 @@ func completeTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client
 	t.Fatalf("provision Job %s does not read back complete (%+v); every requeue measured after this would be the unprovisioned arm, at the same 30s", name, check.Status.Conditions)
 }
 
-func a2aGateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
+// extra is for the one test that needs the rest of the install standing: the
+// phase is decided from the agent gateway, the shell sandbox and the credential
+// broker, none of which this file's other tests care about because none of them
+// look at the phase.
+func a2aGateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent, extra ...client.Object) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
 	t.Helper()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithObjects(append([]client.Object{agent, sandboxKeysSecret(agent)}, extra...)...).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -292,5 +296,104 @@ func TestARunningGatewayKeepsReconcilingThroughACalloutOutage(t *testing.T) {
 	}
 	if got != "7" {
 		t.Errorf("A2A_MAX_SESSIONS = %q on the live gateway, want \"7\"; the gate froze a running gateway's spec instead of only withholding its creation", got)
+	}
+}
+
+// What the gate costs a new install whose callout is only partly up, pinned
+// because Risk & Rollout states it in prose and prose does not go red.
+//
+// The gate passes on BusCredentialsReady alone, and that condition is True only
+// when every replica of the callout Deployment is ready AND on the current pod
+// template. The Deployment is rendered at two. But the callout's replicas join
+// a NATS queue group (a2a/authcallout/service.go, AuthQueueGroup) precisely so
+// that exactly one of them answers each authorization request, so ONE ready
+// replica already mints credentials for every session. The condition's
+// all-replicas rule was written for a different question -- "is the callout as
+// a whole serving the map this render names", where a half-rolled Deployment
+// genuinely is not -- and the gate imports it wholesale.
+//
+// So a second replica that cannot schedule (node pressure, a namespace quota,
+// an image pull that fails on one node) or a roll that wedges holds a NEW
+// install's gateway for as long as that lasts, on a bus that would have
+// authenticated every one of its sessions. Before the gate the install got a
+// gateway and working sessions. The hold is not silent -- BusCredentialsReady
+// is False on the CR and its message carries the 1-of-2 -- but nothing ties it
+// to the gateway's absence: the hold writes no condition of its own, and the
+// phase is decided from the agent gateway, shell sandbox and credential broker,
+// so the CR reads Ready with no A2A gateway in the namespace.
+//
+// This is a characterisation test, and it is written to fail in both
+// directions. Loosening the gate to one ready replica breaks the "withheld"
+// assertion; making the hold observable on the CR breaks the phase assertion.
+// Either of those is a real decision, and when it is taken this test and the
+// Risk & Rollout paragraph move together, which is the point of pinning it.
+func TestAPartlyReadyCalloutStillWithholdsANewGateway(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent,
+		readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+
+	// More than one replica is the premise. At one the condition and the gate
+	// would agree with the queue group and there would be nothing to pin, so
+	// read it off the render rather than assuming the number.
+	calloutKey := types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, calloutKey, dep); err != nil {
+		t.Fatalf("get callout Deployment: %v", err)
+	}
+	rendered := int32(1)
+	if dep.Spec.Replicas != nil {
+		rendered = *dep.Spec.Replicas
+	}
+	if rendered < 2 {
+		t.Fatalf("the callout renders at %d replicas; this test is about the gap between one replica serving and every replica ready, and at one there is no gap", rendered)
+	}
+
+	// One of them up, on the current template, and the Deployment controller
+	// has seen the current spec. The only thing short of serving is the
+	// second pod.
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = rendered
+	dep.Status.ReadyReplicas = 1
+	dep.Status.UpdatedReplicas = 1
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("update callout status: %v", err)
+	}
+
+	// Two passes for the deferred condition write, the same reason
+	// letTheGatewayThrough takes two, and the Job kept complete across them so
+	// the requeue below is the gate's arm and not provisioning's.
+	for i := 0; i < 2; i++ {
+		completeTheProvisionJob(t, ctx, cl, agent)
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d at one ready replica: %v", i+1, err)
+		}
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("BusCredentialsReady = %+v at one of two replicas ready, want False; the rest of this test would prove nothing", cond)
+	}
+
+	gwKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Errorf("the A2A gateway exists (err=%v) with one of two callout replicas ready; if the gate was deliberately loosened to one ready replica, the Risk & Rollout paragraph about what a partly-ready callout costs a new install has to change with it", err)
+	}
+
+	// The silent half. Nothing the hold does reaches the phase, and the three
+	// workloads the phase is computed from are all up, so an operator watching
+	// `kubectl get platformagent` sees a healthy install with no dispatcher.
+	if fresh.Status.Phase != "Ready" {
+		t.Errorf("phase = %q with the A2A gateway withheld, want %q; if the hold was deliberately made visible on the phase, update this assertion and drop the 'silent' half of the Risk & Rollout paragraph", fresh.Status.Phase, "Ready")
 	}
 }
