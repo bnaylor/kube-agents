@@ -463,8 +463,17 @@ spawned carry an `ownerReference` to that Deployment, so withholding it is not a
 act. The ordering holds where it is a real ordering, without making the callout a
 liveness dependency of everything downstream. One caveat, because it is visible in a
 `kubectl get` transcript: `syncBusCredentialsReady` is deferred to the way out of the
-reconcile, so a gate reading the condition sees it one pass old. A held reconcile
-requeues, so the cost is a delay of one requeue interval - never a wrong answer.
+reconcile, so a gate reading the condition sees it one pass old. Stale-false costs only
+a delay: the gateway is held one more pass and the held reconcile requeues. Stale-true
+is a wrong answer, and worth naming as one - the gate can let a first creation through
+on a callout that was serving as recently as the previous pass and is not serving now.
+What bounds it is that one pass, the same window the condition's own doc comment already
+accepts. The gate's other read is deliberately not left to a cache, because there the
+asymmetry runs the other way: whether the gateway Deployment already exists is asked of
+the API server live rather than of the Deployment informer, since a stale _hit_ - an
+informer that has not yet seen the Deployment gone - answers "already there" and lets it
+be re-created while the condition is false, which is the single thing the gate exists to
+prevent. A stale NotFound costs one held pass and a requeue.
 
 **Amended 9/8.** The condition asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
