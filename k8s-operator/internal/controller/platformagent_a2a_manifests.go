@@ -2200,34 +2200,47 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			case batchv1.JobFailed:
 				state.failed = true
 				// This is the only place a provision refusal reaches
-				// `kubectl describe`, so it has to be true of every
-				// refusal rather than of the one that came first.
-				// "The bus has no streams" and "deleting the Job
-				// retries" were both true while the script could only
-				// fail on the way to creating something. They are not
-				// true of the closing block, which runs after every
-				// stream and bucket and refuses an install that is
-				// fully provisioned and one limit short: there the bus
-				// is complete, and a re-run reaches the same refusal.
-				// Naming that refusal's remedy here rather than leaving
-				// it in the pod log is the point — the log says which
-				// of the two happened, the status says what to do about
-				// the one a re-run cannot clear.
+				// `kubectl describe`, so the first half has to be true
+				// of every refusal rather than of the one that came
+				// first. "The bus has no streams" and "deleting the
+				// Job retries" were both true while the script could
+				// only fail on the way to creating something. They are
+				// not true of the closing block, which runs after
+				// every stream and bucket and refuses an install that
+				// is fully provisioned and one limit short: there the
+				// bus is complete, and a re-run reaches the same
+				// refusal.
 				//
-				// The two numbers in it are deliberately different.
-				// The need is the budget, which is what the script's
-				// gate compares a live stream against; the remedy is
-				// what a fresh render creates, which floors at the
-				// cap TASKS shipped with. A default install needs 46
-				// and renders 64, and this message goes out on every
-				// JobFailed whatever the cause — so a remedy naming
-				// the budget would tell an operator whose stream is
+				// The remedy is the second half, and it is conditional
+				// because the reason distinguishes the two causes. The
+				// podFailurePolicy matches the script's exit 2 and
+				// nothing else — the closing block's refusal, the one
+				// a re-run cannot clear — and the Job controller
+				// stamps a Job it fails that way with reason
+				// PodFailurePolicy; a transient failure that spends
+				// the backoffLimit instead arrives as
+				// BackoffLimitExceeded. Naming the stream edit on that
+				// one would prescribe a `nats stream edit` for a NATS
+				// outage, so it goes out only on the refusal it fixes;
+				// the pod log still says what happened either way.
+				//
+				// The two numbers in the remedy are deliberately
+				// different. The need is the budget, which is what the
+				// script's gate compares a live stream against; the
+				// remedy is what a fresh render creates, which floors
+				// at the cap TASKS shipped with. A default install
+				// needs 46 and renders 64 — so a remedy naming the
+				// budget would tell an operator whose stream is
 				// already at 64 to edit it DOWN to 46, the downward
 				// derivation the constants above refuse to make.
 				state.message = fmt.Sprintf(
-					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away. The refusal an operator upgrade reaches on its own is a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d): run `nats stream edit TASKS --max-consumers=%d` (what a fresh render creates TASKS with, which is never below the need), or lower maxSessions.",
-					existing.Name, cond.Reason, cond.Message,
-					resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent))
+					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away.",
+					existing.Name, cond.Reason, cond.Message)
+				if cond.Reason == batchv1.JobReasonPodFailurePolicy {
+					state.message += fmt.Sprintf(
+						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). Run `nats stream edit TASKS --max-consumers=%d` (what a fresh render creates TASKS with, which is never below the need), or lower maxSessions.",
+						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent))
+				}
 			}
 		}
 	}

@@ -1564,26 +1564,40 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 // unexercised -- nothing seeded a Job condition -- so dropping the JobFailed case
 // or inverting the ConditionTrue guard left a stream-less bus reporting Ready
 // with the suite green.
+//
+// The two failed cases split on the condition's reason, which is what decides
+// whether the message carries the consumer remedy. Only the deterministic
+// refusal exits 2, only exit 2 matches the podFailurePolicy, and only a Job the
+// policy failed carries PodFailurePolicy; a transient failure that spends the
+// backoffLimit arrives as BackoffLimitExceeded and must get no stream edit
+// prescribed for it.
 func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		cond       *batchv1.JobCondition
 		wantDone   bool
 		wantFailed bool
+		wantRemedy bool
 	}{
-		{"pending", nil, false, false},
-		{"complete", &batchv1.JobCondition{
+		{name: "pending"},
+		{name: "complete", cond: &batchv1.JobCondition{
 			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
-		}, true, false},
-		{"failed", &batchv1.JobCondition{
+		}, wantDone: true},
+		{name: "failed-backoff-limit", cond: &batchv1.JobCondition{
 			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
-			Reason: "BackoffLimitExceeded", Message: "Job has reached the specified backoff limit",
-		}, false, true},
+			Reason:  batchv1.JobReasonBackoffLimitExceeded,
+			Message: "Job has reached the specified backoff limit",
+		}, wantFailed: true},
+		{name: "failed-pod-failure-policy", cond: &batchv1.JobCondition{
+			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+			Reason:  batchv1.JobReasonPodFailurePolicy,
+			Message: "Container provision for pod test/x failed with exit code 2 matching FailJob rule at index 0",
+		}, wantFailed: true, wantRemedy: true},
 		// A condition present but False is not the event: the scan must skip it
 		// rather than read the type alone.
-		{"failed-but-false", &batchv1.JobCondition{
+		{name: "failed-but-false", cond: &batchv1.JobCondition{
 			Type: batchv1.JobFailed, Status: corev1.ConditionFalse,
-		}, false, false},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
@@ -1615,20 +1629,31 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				if !strings.Contains(state.message, job.Name) {
 					t.Errorf("message does not name the Job to inspect: %q", state.message)
 				}
-				if !strings.Contains(state.message, "BackoffLimitExceeded") {
-					t.Errorf("message drops the condition reason: %q", state.message)
+				if !strings.Contains(state.message, tc.cond.Reason) {
+					t.Errorf("message drops the condition reason %q: %q", tc.cond.Reason, state.message)
 				}
 				// The message is the only thing a refusal puts in
 				// `kubectl describe`, and the script's closing block
-				// refuses installs whose bus is complete. So it must
-				// not promise an empty bus, must not offer a Job
-				// delete as the remedy, and must name the one remedy
-				// a re-run cannot reach.
+				// refuses installs whose bus is complete. So whatever
+				// the cause, it must not promise an empty bus and must
+				// not offer a Job delete as the remedy.
 				for _, untrue := range []string{"the bus has no streams", "deleting the Job retries"} {
 					if strings.Contains(state.message, untrue) {
 						t.Errorf("message claims %q, which is false of a closing-block refusal — that bus is fully provisioned and one limit short: %q", untrue, state.message)
 					}
 				}
+			}
+			if tc.wantFailed && !tc.wantRemedy {
+				// A reason that is not PodFailurePolicy is not the
+				// exit-2 refusal, so prescribing a stream edit for it
+				// is a command-bearing wrong answer: the cause may be
+				// a NATS outage, and the stream may already be wide
+				// enough.
+				if strings.Contains(state.message, "nats stream edit") {
+					t.Errorf("a %s failure prescribes the consumer remedy, which only the exit-2 refusal needs: %q", tc.cond.Reason, state.message)
+				}
+			}
+			if tc.wantRemedy {
 				for _, want := range []string{"maxSessions", "nats stream edit TASKS --max-consumers="} {
 					if !strings.Contains(state.message, want) {
 						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
@@ -1637,11 +1662,11 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				// And the number in that remedy is the one a fresh
 				// render creates, not the raw budget. This agent
 				// takes the default maxSessions, so its budget (46)
-				// sits below the floor its TASKS renders at (64) —
-				// and this message goes out on every JobFailed,
-				// whatever the cause. A remedy quoting the budget
-				// would tell an operator whose stream is already at
-				// the floor to edit it DOWN, which is the downward
+				// sits below the floor its TASKS renders at (64),
+				// and the refusal is reached as readily by an
+				// operator upgrade whose stream is already at that
+				// floor. A remedy quoting the budget would tell that
+				// operator to edit it DOWN, which is the downward
 				// derivation the render refuses to make.
 				remedy := remedyMaxConsumers(t, state.message)
 				if remedy < a2aTasksMaxConsumersFloor {
