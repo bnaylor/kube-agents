@@ -1381,6 +1381,17 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # SubmittedMissing is the assertion-9 observation, the sibling of
 # PostFinalDropped for assertion 10 - so the eviction is a degradation a reader
 # can see rather than a short history it cannot distinguish from a real one.
+#
+# The same eviction on the ...in class is quieter and worse. That subject's
+# oldest message is the task's originating kind:message, which the worker
+# re-reads on every start (worker-adapter fetchOrigin, an 'origin' consumer at
+# deliver:all taking the first kind:message it sees). Steers are kind:message
+# too and nothing on the envelope marks the submission, so past the cap the
+# scan returns the oldest surviving steer and the worker executes that as the
+# request - with no SubmittedMissing to show for it, because nothing folds
+# ...in. 4096 inbound messages on one task is a looping delegator rather than a
+# chat, so it is rarer than the events case; it is an open question in
+# docs/designs/spec-nats-deployment.md, not something a stream flag closes.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
   --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \

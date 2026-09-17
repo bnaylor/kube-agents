@@ -102,6 +102,20 @@ alternative that would refuse the write instead of evicting the head, per-subjec
 `discard: new`, is unavailable: JetStream only honours it under stream-wide `discard:
 new`, which contradicts the rule in the paragraph above.
 
+The cap is not on `…events` alone, and the class it also lands on fails more quietly. A
+task's `…in` subject holds its originating `kind:message` submission and then every
+steer, follow-up and cancel sent afterwards, all under the same 4096. A worker reads
+that subject from the beginning on every start - `fetchOrigin` opens the `origin`
+consumer with `deliver: all` and takes the first `kind:message` it finds - to recover
+the request it is executing. Steers are `kind:message` too, and no envelope field marks
+one as the submission, so once the head is evicted that scan returns the oldest
+surviving steer and the worker executes it as if it were the request. There is no
+`SubmittedMissing` on this side, because nothing folds `…in`. The substitution is
+invisible to the worker and to a reader. Reaching 4096 inbound messages on one task
+takes a looping delegator rather than a chat, so it is rarer than the `…events` case -
+but where that one degrades a history, this one changes what the task is. It is in Open
+questions below rather than closed here.
+
 What an install that already has a `TASKS` stream gets from the cap is nothing, and the
 deployment says that rather than implying otherwise. Provisioning is create-only - the
 `stream info X || stream add X` guards never edit - so every limit this render has gained
@@ -684,5 +698,11 @@ Both run against `kind`.
 - **Which server error flips a client to terminal close** rather than transient reconnect is
   unconfirmed - the worked example never logged it. NR-3 closes this for the future and the
   uncertainty does not change NR-1 or NR-2.
+- **The per-subject cap evicting a task's origin.** `max_msgs_per_subject` lands on
+  `…in` as well as `…events`, and the head it evicts there is the originating
+  submission a worker re-reads on every start. No envelope field marks that message, so
+  the scan returns the oldest surviving steer and the worker runs against it. Two
+  candidate fixes: mark the submission on the envelope so the scan can refuse a
+  substitute, or keep the submission off the subject the steers share. Unowned.
 - **Sizing.** TBD: message rates per stream class once the payload spec settles, and PV
   sizing from W times those rates.
