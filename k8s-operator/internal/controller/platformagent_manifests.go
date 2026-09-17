@@ -1944,11 +1944,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// the surface for the same reason the plugin env drop is: on a today
 	// install there is no such volume, and dropping a name only the next stack
 	// cares about would be one more way to tell the feature exists.
+	//
+	// The name is the easy half. A volume the CR author called anything at all
+	// can still PROJECT the bus audience, or mount the creds Secret that holds
+	// bridge-password outright, and either one hands a sidecar the credential
+	// the reservation above is about -- so the source check runs here too, and
+	// takes the mounts naming those volumes with it.
 	if a2aAgentSurface(agent) {
 		initContainers = a2aStripBusTokenMounts(initContainers)
 		sidecars = a2aStripBusTokenMounts(sidecars)
 		sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
 		extraVolumes = a2aStripBusTokenVolume(extraVolumes)
+
+		if reserved := a2aReservedSourceVolumeNames(agent); len(reserved) > 0 {
+			initContainers = a2aStripNamedMountsFromContainers(initContainers, reserved)
+			sidecars = a2aStripNamedMountsFromContainers(sidecars, reserved)
+			sidecarVolumes = a2aStripNamedVolumes(sidecarVolumes, reserved)
+			extraVolumes = a2aStripNamedVolumes(extraVolumes, reserved)
+		}
 	}
 
 	homeDir := "/opt/data"
@@ -3676,6 +3689,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// stack cares about would be one more way to tell the feature exists.
 	if a2aAgentSurface(agent) {
 		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
+		// The volume itself is dropped in buildPodTemplateSpec, which does not
+		// see this list. Both derive the set from the CR; a2aReservedSourceVolumeNames
+		// says why that is the coupling rather than a parameter.
+		extraVolumeMounts = a2aStripNamedMounts(extraVolumeMounts, a2aReservedSourceVolumeNames(agent))
 	}
 
 	resources := resolveResources(agent.Spec.Deployment)

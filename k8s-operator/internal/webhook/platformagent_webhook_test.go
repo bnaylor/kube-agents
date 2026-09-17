@@ -540,6 +540,98 @@ func TestPlatformAgentValidation(t *testing.T) {
 		}
 	})
 
+	// The block above refuses the NAME. This refuses what the volume would
+	// HAND a container, which is the half that was missing: a volume the CR
+	// author called anything at all can project the a2a-bus audience, and the
+	// kubelet mints a token the callout accepts as the pod's own. Or it can
+	// mount the creds Secret and read bridge-password, which needs no token and
+	// is cheaper.
+	//
+	// The render strips the same volumes
+	// (TestUserAuthoredVolumesCannotSourceTheBusCredential). This is the half
+	// that tells the author why.
+	t.Run("fails if a user-authored volume sources the bus credential", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		const creds = "test-agent-a2a-nats-creds"
+		busProjection := corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience: agentv1alpha1.ReservedTokenAudience, Path: "token",
+			}}},
+		}}
+		credsSecret := corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: creds}}
+
+		for _, tc := range []struct {
+			name string
+			dep  *agentv1alpha1.DeploymentSpec
+			path string
+		}{
+			{"sidecar volume projecting the bus audience", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: busProjection}},
+			}, "spec.deployment.sidecarVolumes[0]"},
+			{"extra volume projecting the bus audience", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: busProjection}},
+			}, "spec.deployment.extraVolumes[0]"},
+			{"sidecar volume mounting the creds Secret", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: credsSecret}},
+			}, "spec.deployment.sidecarVolumes[0]"},
+			{"extra volume mounting the creds Secret", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: credsSecret}},
+			}, "spec.deployment.extraVolumes[0]"},
+			{"the creds Secret as a projected source", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
+						Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: creds}},
+					}}},
+				}}},
+			}, "spec.deployment.sidecarVolumes[0]"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{Deployment: tc.dep},
+					},
+				}
+				_, err := val.ValidateCreate(ctx, agent)
+				assertFieldError(t, err, tc.path)
+			})
+		}
+
+		// Refusing every serviceAccountToken projection was considered and
+		// rejected for taking a capability the bus has no claim on. These are
+		// that rejection: both must be admitted, and a check that refused
+		// everything would pass every case above.
+		for _, tc := range []struct {
+			name string
+			vol  corev1.Volume
+		}{
+			{"a projection for another audience", corev1.Volume{
+				Name: "vault-token", VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "vault", Path: "token"},
+					}}},
+				}}},
+			{"some other Secret", corev1.Volume{
+				Name: "app-config", VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "test-agent-app-config"},
+				}}},
+		} {
+			t.Run("admits "+tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+							SidecarVolumes: []corev1.Volume{tc.vol},
+						}},
+					},
+				}
+				if _, err := val.ValidateCreate(ctx, agent); err != nil {
+					t.Errorf("the source check refused %+v: %v", tc.vol, err)
+				}
+			})
+		}
+	})
+
 	t.Run("fails if privileged service account is specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 

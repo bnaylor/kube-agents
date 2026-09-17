@@ -144,6 +144,69 @@ var ReservedVolumeNames = map[string]struct{}{
 	"a2a-bus-token": {},
 }
 
+// ReservedTokenAudience is the ServiceAccount token audience the operator binds
+// every bus token to, and A2ANATSName/A2ACredsSecretName are the two rendered
+// names the source check needs.
+//
+// All three are second spellings of something the controller already says, and
+// deliberately so: the validating webhook cannot import the controller, and
+// collapsing either side into a reference to the other would satisfy the test
+// that compares them by construction. They are held together by
+// TestTheTwoSpellingsOfTheReservedSourceNamesAgree, and the audience
+// additionally by conformance C1, which reads the controller's literal and
+// compares it against the a2a module's.
+const ReservedTokenAudience = "a2a-bus"
+
+func A2ANATSName(agent *PlatformAgent) string { return agent.Name + "-a2a-nats" }
+
+func A2ACredsSecretName(agent *PlatformAgent) string { return A2ANATSName(agent) + "-creds" }
+
+// ReservedVolumeSource reports why a user-authored volume may not be rendered,
+// or "" when it is acceptable. It is the check ReservedVolumeNames above is
+// not: that one matches the name the operator renders, this one matches what
+// the volume would HAND a container regardless of what it is called.
+//
+// The two routes, and they are closed together on purpose. A projection of
+// ReservedTokenAudience mints a token the callout accepts as the pod's own, so
+// a sidecar mounting it authenticates as `agent` -- the retired `worker`
+// credential rebuilt out of a volumeMount, which is the thing the A5 split
+// exists to prevent. The creds Secret is the cheaper of the two and predates
+// A5: it holds bridge-password in plain text, so reading it needs no token at
+// all. Closing only the projection would narrow the expensive route and leave
+// the cheap one, which in practice advertises the cheap one.
+//
+// What it is NOT. KSA tokens are pod-scoped and the callout cannot see which
+// container presented one, so this is a guard against a misconfigured CR and
+// not a boundary against a hostile sidecar -- the same footing
+// agentForbiddenVolumeNames states for the same class, and for the same reason:
+// the CR is authored by the platform operator rather than by the agent. See
+// ReservedVolumeNames for the falsifier that would change that.
+//
+// Not covered, said rather than left to be discovered: a CSI driver that mints
+// audience-bound tokens of its own. The audience is a driver attribute there
+// rather than a field of the volume, so it cannot be read the way these two
+// can.
+func ReservedVolumeSource(vol *corev1.Volume, credsSecretName string) string {
+	if vol == nil {
+		return ""
+	}
+	if vol.Secret != nil && vol.Secret.SecretName == credsSecretName {
+		return fmt.Sprintf("mounts the bus credentials Secret %q", credsSecretName)
+	}
+	if vol.Projected == nil {
+		return ""
+	}
+	for _, src := range vol.Projected.Sources {
+		if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == ReservedTokenAudience {
+			return fmt.Sprintf("projects a ServiceAccount token for the %q audience", ReservedTokenAudience)
+		}
+		if src.Secret != nil && src.Secret.Name == credsSecretName {
+			return fmt.Sprintf("projects the bus credentials Secret %q", credsSecretName)
+		}
+	}
+	return ""
+}
+
 type HermesSpec struct {
 	// DashboardEnabled toggles the AGENT_DASHBOARD environment variable.
 	// +kubebuilder:default=true

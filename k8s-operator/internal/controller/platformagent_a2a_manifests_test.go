@@ -4076,3 +4076,210 @@ func TestTheDashboardNeverReceivesTheBusToken(t *testing.T) {
 			"the surface, which is one more way to tell the next stack exists")
 	}
 }
+
+// The reservation two tests up matches the volume NAME. This is the half that
+// matches what the volume would HAND a container, which is the half that was
+// missing: a sidecarVolumes entry called anything at all can project the
+// a2a-bus audience, and the kubelet mints a token the callout accepts as the
+// pod's own because the callout resolves the POD's ServiceAccount. Or it can
+// mount the creds Secret and read bridge-password in plain text, which needs
+// no token at all and is the cheaper of the two.
+//
+// Measured on the rendered pod, not on the presence of a guard: every case
+// here asserts the volume is absent AND that nothing is left mounting it,
+// because a volume removed while a mount still names it is a Deployment the
+// API server refuses -- a wedged reconcile with nothing in status to say why,
+// which is a worse outcome than the hole.
+//
+// What this does not claim: KSA tokens are pod-scoped, so this is a guard
+// against a misconfigured CR and not a boundary against a hostile sidecar.
+// agentv1alpha1.ReservedVolumeSource carries that and the falsifier.
+func TestUserAuthoredVolumesCannotSourceTheBusCredential(t *testing.T) {
+	creds := "test-agent-a2a-nats-creds"
+	busProjection := corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+			Audience: a2aBusTokenAudience, Path: "token",
+		}}},
+	}}
+
+	cases := []struct {
+		name string
+		dep  *agentv1alpha1.DeploymentSpec
+	}{
+		{
+			// The route proven by execution on a2a-next-dev: a name the
+			// reservation has no opinion about, carrying the audience.
+			name: "a projected bus audience under an innocuous name, mounted by a sidecar",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: busProjection}},
+				Sidecars: []corev1.Container{{
+					Name: "hermes-bridge", Image: "bridge:dev",
+					VolumeMounts: []corev1.VolumeMount{{Name: "innocuous-cache", MountPath: "/var/run/secrets/a2a-bus"}},
+				}},
+			},
+		},
+		{
+			// The cheaper route, and the one that predates A5.
+			name: "the creds Secret mounted directly",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: creds},
+				}}},
+				Sidecars: []corev1.Container{{
+					Name: "hermes-bridge", Image: "bridge:dev",
+					VolumeMounts: []corev1.VolumeMount{{Name: "innocuous-cache", MountPath: "/creds"}},
+				}},
+			},
+		},
+		{
+			name: "the creds Secret as a projected source",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
+						Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: creds}},
+					}}},
+				}}},
+				InitContainers: []corev1.Container{{
+					Name: "peek", Image: "busybox",
+					VolumeMounts: []corev1.VolumeMount{{Name: "innocuous-cache", MountPath: "/creds"}},
+				}},
+			},
+		},
+		{
+			// extraVolumes and extraVolumeMounts are read by two different
+			// functions, so this is the case where a volume could be dropped
+			// while its mount survives.
+			name: "extraVolumes plus extraVolumeMounts, the two-function case",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes:      []corev1.Volume{{Name: "innocuous-cache", VolumeSource: busProjection}},
+				ExtraVolumeMounts: []corev1.VolumeMount{{Name: "innocuous-cache", MountPath: "/var/run/secrets/a2a-bus"}},
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Spec.Deployment = c.dep
+			spec := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+
+			declared := map[string]bool{}
+			for _, v := range spec.Volumes {
+				declared[v.Name] = true
+				if v.Name == "innocuous-cache" {
+					t.Errorf("the pod still declares %+v; a sidecar mounting it wears the agent's bus identity", v)
+				}
+			}
+			for _, ctr := range slices.Concat(spec.Containers, spec.InitContainers) {
+				for _, m := range ctr.VolumeMounts {
+					if m.Name == "innocuous-cache" {
+						t.Errorf("container %q still mounts innocuous-cache at %s", ctr.Name, m.MountPath)
+					}
+					if !declared[m.Name] {
+						t.Errorf("container %q mounts %q, which the pod does not declare -- server-side "+
+							"apply refuses this Deployment and the reconcile wedges with nothing in "+
+							"status to say why", ctr.Name, m.Name)
+					}
+				}
+			}
+
+			// Precondition, so an absent volume above means the strip ran
+			// rather than the surface being off.
+			if !slices.ContainsFunc(spec.Volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume }) {
+				t.Fatalf("the operator's own bus token volume is missing, so this case proves nothing")
+			}
+
+			// The webhook says why. The render is what holds when it is
+			// unreachable, which the chart's failurePolicy: Ignore makes the
+			// ordinary case.
+			var refused int
+			for i := range slices.Concat(c.dep.SidecarVolumes, c.dep.ExtraVolumes) {
+				all := slices.Concat(c.dep.SidecarVolumes, c.dep.ExtraVolumes)
+				if agentv1alpha1.ReservedVolumeSource(&all[i], creds) != "" {
+					refused++
+				}
+			}
+			if refused == 0 {
+				t.Error("ReservedVolumeSource has no opinion on this volume, so the webhook admits it and " +
+					"the author gets a silent strip instead of a field.Forbidden")
+			}
+		})
+	}
+
+	t.Run("a today install is untouched", func(t *testing.T) {
+		today := a2aTestAgent()
+		today.Spec.Mode = ptr.To("today")
+		today.Spec.Deployment = cases[0].dep.DeepCopy()
+		spec := buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}).Spec
+		if !slices.ContainsFunc(spec.Volumes, func(v corev1.Volume) bool { return v.Name == "innocuous-cache" }) {
+			t.Error("a today install lost innocuous-cache; the strip is not gated on the surface, which is " +
+				"one more way to tell the next stack exists")
+		}
+	})
+
+	t.Run("a projection for another audience survives", func(t *testing.T) {
+		// A2 -- refusing every serviceAccountToken projection -- was rejected
+		// for removing a real capability. This is that rejection, pinned.
+		agent := a2aTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+			SidecarVolumes: []corev1.Volume{{Name: "vault-token", VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
+					ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "vault", Path: "token"},
+				}}},
+			}}},
+			Sidecars: []corev1.Container{{
+				Name: "vault-agent", Image: "vault:dev",
+				VolumeMounts: []corev1.VolumeMount{{Name: "vault-token", MountPath: "/vault"}},
+			}},
+		}
+		spec := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+		if !slices.ContainsFunc(spec.Volumes, func(v corev1.Volume) bool { return v.Name == "vault-token" }) {
+			t.Error("the strip took a projection bound to another audience; that is A2, which was rejected " +
+				"for removing a capability the bus has no claim on")
+		}
+	})
+}
+
+// The webhook cannot import this package, so agentv1alpha1 carries its own
+// spelling of the audience and of the two rendered names the source check
+// needs. Two spellings of one fact is a drift waiting to happen: the webhook
+// would go on refusing a string nothing mints, and report success doing it.
+//
+// Compared rather than collapsed. Making either side a reference to the other
+// would pass this test whatever it said -- which is not hypothetical, it is
+// what an earlier draft of this change did, and a mutation that moved the
+// audience survived it. Conformance C1 is the other half, pinning the
+// controller's literal against a2a/lib.BusTokenAudience across the module
+// boundary.
+func TestTheTwoSpellingsOfTheReservedSourceNamesAgree(t *testing.T) {
+	if a2aBusTokenAudience != agentv1alpha1.ReservedTokenAudience {
+		t.Errorf("the operator projects audience %q and the webhook refuses %q; a user volume "+
+			"projecting %q reaches a sidecar unrefused",
+			a2aBusTokenAudience, agentv1alpha1.ReservedTokenAudience, a2aBusTokenAudience)
+	}
+	agent := a2aTestAgent()
+	if got, want := agentv1alpha1.A2ANATSName(agent), a2aNATSName(agent); got != want {
+		t.Errorf("the webhook derives the NATS name %q; the operator renders %q", got, want)
+	}
+	if got, want := agentv1alpha1.A2ACredsSecretName(agent), a2aCredsSecretName(agent); got != want {
+		t.Errorf("the webhook refuses volumes naming %q; the operator renders the creds Secret as %q", got, want)
+	}
+	// And against the name the rest of the suite's fixture hardcodes, which is
+	// the closest thing here to the name a real install carries.
+	if got, want := a2aCredsSecretName(agent), a2aTestCreds().Name; got != want {
+		t.Errorf("the creds Secret is rendered as %q; the fixture every other test builds is %q", got, want)
+	}
+
+	// The audience the projection actually carries, read off the render rather
+	// than off the constant it is built from.
+	var seen []string
+	for _, src := range a2aBusTokenVolumeSource().Projected.Sources {
+		if src.ServiceAccountToken != nil {
+			seen = append(seen, src.ServiceAccountToken.Audience)
+		}
+	}
+	if !slices.Contains(seen, agentv1alpha1.ReservedTokenAudience) {
+		t.Errorf("the rendered projection carries audiences %v, none of them the %q that "+
+			"ReservedVolumeSource refuses", seen, agentv1alpha1.ReservedTokenAudience)
+	}
+}

@@ -447,6 +447,27 @@ any readable token in the cluster as proof of that pod's identity. A long-lived 
 MUST re-read the file when it reconnects rather than caching its first read, or it fails
 exactly when the bus restarts, which this spec calls a routine operation.
 
+The audience also has to be reserved, and reserving it is not the same as owning it. The
+projection is the platform-agent container's, but the callout resolves the POD's
+ServiceAccount, so any container in that pod presenting a token for this audience
+authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
+copied into the pod verbatim. The operator therefore refuses and strips user-authored
+volumes by SOURCE as well as by name: a projection of this audience under any name, and a
+volume mounting the `<agent>-a2a-nats` creds Secret, which holds `bridge-password` in
+plain text and is the cheaper of the two routes. Both are closed together, because
+closing only the first narrows the expensive route and leaves the cheap one.
+
+Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
+pod-scoped and the callout cannot see which container presented one, so this is a guard
+against a misconfigured CR rather than a boundary against a hostile sidecar. It is worth
+having because the CR is authored by the platform operator and not by the agent -
+`security-requirements.md` already puts administrator-supplied volumes and mounts outside
+the sandbox guarantee for the same reason. What would change that reading is a change in
+who may write the CR: a tenant-facing role on `platformagents`, or the CR moving into a
+repository the agent can open pull requests against. The only construction that would be
+a boundary is a separate pod for the bus identity, which is also what the `bridge`
+sidecar's static password is waiting on.
+
 The callout service runs in its own `AUTH` account - not `$SYS`, despite subscribing to
 a `$SYS.REQ.*` subject - with 2 replicas, joined in a queue group. The queue group is
 not optional above one replica: with a plain subscription every replica answers every

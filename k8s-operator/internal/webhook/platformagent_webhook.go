@@ -180,6 +180,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		}
 
 		// 2d. Validate ExtraVolumes & SidecarVolumes (hostPath forbidden)
+		// What a volume is CALLED and what it would hand a container are two
+		// checks; validateReservedVolumeName is the first and
+		// validateReservedVolumeSource is the second.
+		credsSecret := agentv1alpha1.A2ACredsSecretName(platformAgent)
 		for i, vol := range platformAgent.Spec.Deployment.ExtraVolumes {
 			if vol.HostPath != nil {
 				allErrs = append(allErrs, field.Forbidden(
@@ -188,6 +192,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 				))
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
+			allErrs = append(allErrs, validateReservedVolumeSource(&platformAgent.Spec.Deployment.ExtraVolumes[i], credsSecret, depPath.Child("extraVolumes").Index(i))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
 			if vol.HostPath != nil {
@@ -197,6 +202,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 				))
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
+			allErrs = append(allErrs, validateReservedVolumeSource(&platformAgent.Spec.Deployment.SidecarVolumes[i], credsSecret, depPath.Child("sidecarVolumes").Index(i))...)
 		}
 
 		// 2da. The fifth user-authored mount surface. Unlike the four above it
@@ -324,6 +330,27 @@ func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
 	}
 	return field.ErrorList{field.Forbidden(
 		path, fmt.Sprintf("volume name %q is reserved by the operator", name),
+	)}
+}
+
+// validateReservedVolumeSource refuses a user-supplied volume that would hand a
+// container the bus credential whatever the volume is called.
+// agentv1alpha1.ReservedVolumeSource holds the two routes and, more to the
+// point, what closing them does and does not buy. The render strips the same
+// volumes; this is the layer that says why, since the chart's default
+// failurePolicy is Ignore and an unreachable webhook admits the object.
+//
+// path is the VOLUME's path rather than a field of it: the reason is the
+// source, and which field carries it differs between the two routes.
+func validateReservedVolumeSource(vol *corev1.Volume, credsSecretName string, path *field.Path) field.ErrorList {
+	reason := agentv1alpha1.ReservedVolumeSource(vol, credsSecretName)
+	if reason == "" {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(
+		path,
+		fmt.Sprintf("volume %q %s, which is the platform-agent container's alone; "+
+			"a second container holding it wears the agent's bus identity", vol.Name, reason),
 	)}
 }
 

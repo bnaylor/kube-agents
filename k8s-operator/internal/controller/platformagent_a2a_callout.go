@@ -107,6 +107,13 @@ const (
 	// would accept any readable token in the cluster as proof of that pod's
 	// identity. Bound to a dedicated audience, the only tokens it accepts
 	// are ones minted for it by a projected volume that names it.
+	// Spelled out rather than taken from agentv1alpha1.ReservedTokenAudience,
+	// which has to be its own literal because the webhook cannot import this
+	// package. Two spellings, so two things pin them together:
+	// TestTheTwoSpellingsOfTheReservedSourceNamesAgree here, and conformance
+	// C1, which reads THIS literal and compares it against a2a/lib. Making
+	// this a reference to the other one satisfies the Go test by construction
+	// and blinds C1's extractor, which is a control lost to a tidy-up.
 	a2aBusTokenAudience = "a2a-bus"
 
 	// a2aBusTokenPath is where every bus client finds its projected token.
@@ -246,6 +253,104 @@ func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
 		keep = append(keep, v)
 	}
 	return keep
+}
+
+// a2aReservedSourceVolumeNames is the names of the user-authored volumes whose
+// SOURCE is reserved, computed from the CR rather than passed between the two
+// places that need it.
+//
+// Both callers derive it independently and get the same answer because the CR
+// is the input to both. That matters: buildPodTemplateSpec drops the volume,
+// and buildBaseContainers -- a different function, reading
+// spec.deployment.extraVolumeMounts, which buildPodTemplateSpec never sees --
+// has to drop any mount naming it. A volume removed while a mount still names
+// it is not a narrowed pod, it is a Deployment the API server refuses, which
+// wedges the reconcile with nothing in status to say why. The existing
+// name-based strips stay in step without this because they both match one
+// fixed string; a name the CR author chose has no such luck.
+//
+// nil rather than an empty map when nothing matches, so the ordinary CR pays a
+// nil check and no allocation.
+func a2aReservedSourceVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]struct{} {
+	if agent.Spec.Deployment == nil {
+		return nil
+	}
+	creds := a2aCredsSecretName(agent)
+	var names map[string]struct{}
+	for _, list := range [][]corev1.Volume{agent.Spec.Deployment.SidecarVolumes, agent.Spec.Deployment.ExtraVolumes} {
+		for i := range list {
+			if agentv1alpha1.ReservedVolumeSource(&list[i], creds) == "" {
+				continue
+			}
+			if names == nil {
+				names = make(map[string]struct{}, 1)
+			}
+			names[list[i].Name] = struct{}{}
+		}
+	}
+	return names
+}
+
+// a2aStripNamedVolumes removes the volumes a2aReservedSourceVolumeNames found.
+func a2aStripNamedVolumes(volumes []corev1.Volume, names map[string]struct{}) []corev1.Volume {
+	if len(names) == 0 {
+		return volumes
+	}
+	if !slices.ContainsFunc(volumes, func(v corev1.Volume) bool { _, hit := names[v.Name]; return hit }) {
+		return volumes
+	}
+	keep := make([]corev1.Volume, 0, len(volumes))
+	for _, v := range volumes {
+		if _, hit := names[v.Name]; hit {
+			continue
+		}
+		keep = append(keep, v)
+	}
+	return keep
+}
+
+// a2aStripNamedMounts is the mount-list half, for extraVolumeMounts.
+func a2aStripNamedMounts(mounts []corev1.VolumeMount, names map[string]struct{}) []corev1.VolumeMount {
+	if len(names) == 0 {
+		return mounts
+	}
+	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { _, hit := names[m.Name]; return hit }) {
+		return mounts
+	}
+	keep := make([]corev1.VolumeMount, 0, len(mounts))
+	for _, m := range mounts {
+		if _, hit := names[m.Name]; hit {
+			continue
+		}
+		keep = append(keep, m)
+	}
+	return keep
+}
+
+// a2aStripNamedMountsFromContainers is the same against user-authored
+// containers. The input slice belongs to the CR, so the clone is not
+// incidental.
+func a2aStripNamedMountsFromContainers(containers []corev1.Container, names map[string]struct{}) []corev1.Container {
+	if len(names) == 0 {
+		return containers
+	}
+	mountsIt := func(c corev1.Container) bool {
+		return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			_, hit := names[m.Name]
+			return hit
+		})
+	}
+	if !slices.ContainsFunc(containers, mountsIt) {
+		return containers
+	}
+	out := slices.Clone(containers)
+	for i := range out {
+		if !mountsIt(out[i]) {
+			continue
+		}
+		out[i].VolumeMounts = a2aStripNamedMounts(out[i].VolumeMounts, names)
+	}
+	return out
 }
 
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
