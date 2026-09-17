@@ -128,12 +128,14 @@ another addressee just worked. `bridge`'s grants name `platform` literally
 (`a2aBridgeAddressee`, which is also `defaultProfile` in the bridge's own `main.go`: one
 value living in two modules that cannot import each other). Override the env now and the
 intake half still works — the consumer is created and pulled over `$JS.API`, where the
-filter subject rides in the request body and no subject grant sees it — so the bridge
-accepts the other addressee's task, spawns Hermes, and runs it. The refusal comes on the
-way out: `a2a.tasks.<other>.*.events` is not in its publish list, so every event, every
-chunk, and the terminal status are all rejected, and the submitter waits on a task that
-is executing and can never answer. Leave the env unset, or widen the grant in the
-operator to match — the two have to move together.
+filter subject rides in the request body and no subject grant sees it — so the other
+addressee's task is delivered. It stops there. `accept` publishes `submitted` on
+`a2a.tasks.<other>.*.events` before it puts anything on the worker queue, and that subject
+is not in the publish list, so the publish is refused, the submission is dropped, and
+Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
+a reply that never arrives, so the bridge logs a timeout and the submitter waits on a task
+that got no terminal event and was never run. Leave the env unset, or widen the grant in
+the operator to match — the two have to move together.
 
 The agent container is the other half of the same change and needs no edit: the operator
 stops rendering `NATS_USER`/`NATS_PASSWORD` there and mounts a projected token instead.

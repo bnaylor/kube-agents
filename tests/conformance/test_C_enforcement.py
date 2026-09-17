@@ -26,6 +26,25 @@ from . import _harness as h
 from ._harness import command_policy
 
 
+def _go_code(source: str, name: str) -> str:
+    """`h.go_function_body` narrowed to the function's own code.
+
+    The harness helper runs from the `func` keyword to the NEXT one, so what
+    it returns carries the next function's doc comment as well as every
+    inline comment in the body. Either can satisfy an `assertIn` with an
+    explanation where the test meant to find code -- and in the operator's
+    identities file the function after `agentIdentity` is `bridgeIdentity`,
+    whose doc comment discusses exactly the fields the assertions below look
+    for. Trim at the column-zero closing brace, then drop `//` lines, the
+    same way test_A_authority.py does at its jetstream-grant call site.
+    """
+    body = h.go_function_body(source, name)
+    end = body.find("\n}\n")
+    if end != -1:
+        body = body[: end + 3]
+    return re.sub(r"//[^\n]*", "", body)
+
+
 class C1IsolationIsStructural(unittest.TestCase):
     """C1: no security property rests on the model choosing not to."""
 
@@ -877,10 +896,12 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         The audience is the same contract one field over and a sharper one: it
         is what stops the bus accepting any readable ServiceAccount token in the
-        cluster as proof of this pod's identity. A client demanding one audience
-        while the kubelet mints another does not silently downgrade -- but the
-        two literals are held apart by the same module boundary, so they are
-        checked together.
+        cluster as proof of this pod's identity. The client demands nothing --
+        it presents whatever file it read. What demands the audience is the
+        callout, whose TokenReview names it explicitly (`NewTokenValidator`), so
+        a kubelet minting anything else produces a refused connect rather than a
+        silent downgrade. The two literals are held apart by the same module
+        boundary as the path above, so they are checked together.
         """
         operator = h.text("operator_a2a_callout")
         library = h.text("a2a_bus_credentials")
@@ -931,6 +952,17 @@ class C1IsolationIsStructural(unittest.TestCase):
                 "a2aBusTokenVolumeSource does not use %s, so the constant this "
                 "test compared is not the one the pod gets" % name,
             )
+
+        # And the reading half consults the constant rather than a literal of
+        # its own: agreeing constants prove nothing if connect() stats some
+        # other path and falls through to the password branch.
+        self.assertIn(
+            "lib.BusTokenPath",
+            _go_code(h.text("a2a_cli_main"), "connect"),
+            "the a2a CLI's connect() no longer reaches for lib.BusTokenPath, so "
+            "the path this test held to the operator's projection is not the "
+            "path the client reads",
+        )
 
     # The third cross-module literal, and the only one the operator names in
     # order NOT to render it. This is what both sides must agree on for the
@@ -1000,10 +1032,11 @@ class C1IsolationIsStructural(unittest.TestCase):
             operator_env[0],
             library_env[0],
             "the operator reserves %r and the a2a client reads %r: the "
-            "reservation covers a name nothing consults, and an AgentPlugin "
-            "or a spec.deployment.env entry can set the one that decides "
-            "which file this container presents as its bearer token"
-            % (operator_env[0], library_env[0]),
+            "reservation covers a name nothing consults, and an AgentPlugin's "
+            "spec.env -- the only CR-authored env that reaches this container, "
+            "since safeSandboxEnvOverrides allowlists spec.deployment.env away "
+            "-- can set the one that decides which file this container presents "
+            "as its bearer token" % (operator_env[0], library_env[0]),
         )
         self.assertEqual(
             operator_env[0],
@@ -1029,7 +1062,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         # pinning to the identifier this test compared.
         self.assertIn(
             "a2aBusTokenFileEnv",
-            h.go_function_body(h.text("manifests_go"), "buildPodTemplateSpec"),
+            _go_code(h.text("manifests_go"), "buildPodTemplateSpec"),
             "buildPodTemplateSpec no longer drops a plugin-supplied "
             "a2aBusTokenFileEnv by that constant; the name this test compared "
             "across the module boundary is not the name the operator refuses",
@@ -1091,8 +1124,8 @@ class C1IsolationIsStructural(unittest.TestCase):
         # the reverse. An identity that grew the other field is a principal
         # authenticated two ways, which is the thing `auth_users` and the
         # callout must never both answer for.
-        agent = h.go_function_body(operator, "agentIdentity")
-        bridge = h.go_function_body(operator, "bridgeIdentity")
+        agent = _go_code(operator, "agentIdentity")
+        bridge = _go_code(operator, "bridgeIdentity")
         self.assertTrue(
             agent.strip() and bridge.strip(),
             "agentIdentity or bridgeIdentity is gone from the operator's "

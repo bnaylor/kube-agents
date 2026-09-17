@@ -488,7 +488,9 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 // and CONSUMER.CREATE + MSG.NEXT carries filter_subject in the REQUEST BODY, so
 // a consumer filtered on `a2a.tasks.>` is permitted by a grant that names only
 // the stream. Both are in TestBridgeJetStreamGrantOnARealServer's allowed
-// table, cross-addressee, so the test says so too. A holder of
+// table, measured on the bridge's own addressee: what makes them unscoped is
+// the shape of the two routes, not anything that test crosses -- its one
+// cross-addressee row is the refused events WRITE. A holder of
 // `bridge-password` can therefore drain every session's prompts off TASKS.
 // Not a regression -- `worker` held the identical two grants -- and not
 // closable by editing this list: what closes it is the bridge not holding

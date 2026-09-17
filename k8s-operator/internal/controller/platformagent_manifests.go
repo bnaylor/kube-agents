@@ -2266,9 +2266,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// container onto a projected token — so the duplicate-key argument does
 		// not reach them and a different one does: the `a2a` CLI falls back to
 		// user/password when no bus token is readable, so a plugin that set
-		// them would be choosing the identity this container connects as. They
-		// are in SensitiveEnvVars for the CR's own env; this is the same refusal
-		// one layer out, where the webhook does not look.
+		// them would be choosing the identity this container connects as. The
+		// CR's own spec.deployment.env never reaches this container to begin
+		// with — safeSandboxEnvOverrides copies a fixed allowlist and no bus
+		// name is on it — and their SensitiveEnvVars entries are what turn an
+		// attempt into a webhook rejection rather than a silent no-op. This
+		// drop is the same refusal one layer further out, at the env source
+		// with no allowlist in front of it and no webhook looking at it.
 		//
 		// A2A_BUS_TOKEN_FILE is dropped for the stronger version of that: the
 		// operator never renders it, the client prefers it over the projected
@@ -2386,8 +2390,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// frame to an attacker's server is the same exfiltration the password was;
 	// it is audience-bound, so it does not authenticate anywhere else, but it
 	// still names this ServiceAccount to whoever catches it. So the names stay
-	// dropped from plugin env above while the surface is up, and stay in
-	// SensitiveEnvVars so the CR's own spec.deployment.env cannot reach them.
+	// dropped from plugin env above while the surface is up. The CR's own
+	// spec.deployment.env is a different layer: safeSandboxEnvOverrides is an
+	// allowlist and no bus name is on it, so a CR entry cannot reach this
+	// container at all — the SensitiveEnvVars membership is what turns the
+	// attempt into a webhook rejection instead of a silent no-op.
 	//
 	// Nothing here is Optional any more and nothing needs to be, which is the
 	// one thing the token makes simpler: the skew branch of a2aAgentSurface

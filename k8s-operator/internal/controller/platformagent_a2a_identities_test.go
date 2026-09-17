@@ -206,7 +206,7 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 // principal keyed on the platform agent's ServiceAccount whose only bus client
 // was the Hermes bridge sidecar, authenticating as static `worker` — so the
 // entry authorized nobody and was withdrawn. It is back, and the answer is real
-// now: buildAgentDeployment mounts a2aBusTokenVolumeSource into the
+// now: buildPodTemplateSpec mounts a2aBusTokenVolumeSource into the
 // platform-agent container, and the `a2a` CLI reads it (a2a/cmd/a2a/main.go,
 // connect).
 //

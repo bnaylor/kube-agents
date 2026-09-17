@@ -221,8 +221,9 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 
 	// Asserted against the principal list, which spans both renders: gateway
 	// and bridge are static entries in nats.conf, while the agent and session
-	// principals are derived by the callout at mint time. An unscoped ack
-	// grant is exactly as dangerous in either.
+	// principals are served by the callout. The agent's grants are listed
+	// here; the session's are derived at mint time. An unscoped ack grant is
+	// exactly as dangerous in any of them.
 	want := map[string][]string{
 		"gateway":       {"$JS.ACK.TASKS.>"},
 		a2aBridgeUser:   {"$JS.ACK.TASKS.>"},
@@ -2039,13 +2040,15 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	}
 	// The three the operator never renders into this container. Dropped rather
 	// than overwritten, so the assertion is absence. A surviving plugin
-	// NATS_PASSWORD would be a static login as this principal on any pod where
-	// the projected token is missing, since the CLI only reaches for a token
-	// when one is on disk. NATS_USER is the identity the CLI reads when
-	// A2A_BUS_USER is absent, so a plugin that set both would choose the
-	// principal. And a surviving A2A_BUS_TOKEN_FILE would be the file the CLI
-	// presents as a token instead of the projected one, which it prefers
-	// unconditionally and with no fallback.
+	// NATS_PASSWORD is not a static login as this principal: nats.conf lists no
+	// `agent` in auth_users, so the connect reaches the callout, which reads
+	// ConnectOptions.Password as a bearer token and TokenReviews it. It is
+	// still what the CLI offers when no token is on disk, so what it buys is a
+	// refused connect rather than a second way in. NATS_USER is the identity
+	// the CLI reads when A2A_BUS_USER is absent, so a plugin that set both
+	// would choose the principal. And a surviving A2A_BUS_TOKEN_FILE would be
+	// the file the CLI presents as a token instead of the projected one, which
+	// it prefers unconditionally and with no fallback.
 	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
