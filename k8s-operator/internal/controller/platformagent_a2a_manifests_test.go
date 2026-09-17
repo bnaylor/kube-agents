@@ -1645,72 +1645,92 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 			}
 			if tc.wantFailed && !tc.wantRemedy {
 				// A reason that is not PodFailurePolicy is not the
-				// exit-2 refusal, so prescribing a stream edit for it
-				// is a command-bearing wrong answer: the cause may be
-				// a NATS outage, and the stream may already be wide
-				// enough.
-				if strings.Contains(state.message, "nats stream edit") {
-					t.Errorf("a %s failure prescribes the consumer remedy, which only the exit-2 refusal needs: %q", tc.cond.Reason, state.message)
+				// exit-2 refusal, so prescribing the consumer remedy
+				// for it is a wrong answer that costs something. The
+				// cause may be a NATS outage, and both ways out of
+				// the refusal give something up: one lowers the
+				// concurrency the install advertises, the other
+				// deletes a stream holding task history. `nats stream
+				// edit` is in the list because the remedy naming it
+				// was wrong for a second reason and could come back
+				// as a well-meaning revert.
+				for _, unwanted := range []string{"delete the TASKS stream", "lower maxSessions", "nats stream edit"} {
+					if strings.Contains(state.message, unwanted) {
+						t.Errorf("a %s failure names %q, which only the exit-2 refusal needs: %q", tc.cond.Reason, unwanted, state.message)
+					}
 				}
 			}
 			if tc.wantRemedy {
-				// The stream edit alone changes nothing the operator
-				// can see: reconcileA2A reads the Job's condition,
-				// and a Failed Job stays Failed. So the remedy has to
-				// carry the second half - what makes the script run
-				// against the widened stream - or an operator does
-				// the edit, watches the CR stay Degraded, and
-				// concludes the edit was wrong.
-				for _, want := range []string{"maxSessions", "nats stream edit TASKS --max-consumers=", "Delete the Job to re-run it now"} {
+				// Both ways out, and the second half that makes
+				// either of them land. Neither one changes anything
+				// the operator can see on its own: reconcileA2A reads
+				// the Job's condition, and a Failed Job stays Failed.
+				// So the message has to say what re-runs the script -
+				// or an operator lowers maxSessions, watches the CR
+				// stay Degraded, and concludes the change was wrong.
+				for _, want := range []string{"maxSessions", "delete the TASKS stream", "Delete the Job to re-run it now"} {
 					if !strings.Contains(state.message, want) {
 						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
 					}
 				}
-				// And the number in that remedy is the one a fresh
-				// render creates, not the raw budget. This agent
-				// takes the default maxSessions, so its budget (46)
-				// sits below the floor its TASKS renders at (64),
-				// and the refusal is reached as readily by an
-				// operator upgrade whose stream is already at that
-				// floor. A remedy quoting the budget would tell that
-				// operator to edit it DOWN, which is the downward
-				// derivation the render refuses to make.
-				remedy := remedyMaxConsumers(t, state.message)
-				if remedy < a2aTasksMaxConsumersFloor {
-					t.Errorf("remedy says --max-consumers=%d, below the shipped floor %d: run against a default install's stream that TIGHTENS it: %q",
-						remedy, a2aTasksMaxConsumersFloor, state.message)
+				// And it must not go back to naming the stream edit
+				// it used to name. nats-server refuses a
+				// max_consumers change on a stream that exists -
+				// "stream configuration update can not change
+				// MaxConsumers", in every release this operator's
+				// pinned nats:2.10 bus can be - so that remedy sent
+				// operators to a command that could only fail. The
+				// flag and not the command: the script's
+				// max_msgs_per_subject report names a `nats stream
+				// edit` that IS legal.
+				if strings.Contains(state.message, "--max-consumers=") {
+					t.Errorf("message prescribes a --max-consumers= edit, which nats-server refuses on a stream that exists: %q", state.message)
 				}
-				if remedy < a2aTasksConsumerBudget(agent) {
-					t.Errorf("remedy says --max-consumers=%d but the budget is %d, so the edit it names does not clear the script's own gate: %q",
-						remedy, a2aTasksConsumerBudget(agent), state.message)
+				// The number it does name is the width a fresh render
+				// creates, not the raw budget. This agent takes the
+				// default maxSessions, so its budget (46) sits below
+				// the floor its TASKS renders at (64), and the
+				// refusal is reached as readily by an operator
+				// upgrade whose stream is already at that floor. A
+				// recreate at the budget would hand that operator a
+				// NARROWER stream than the one they deleted, which is
+				// the downward derivation the render refuses to make.
+				width := remedyRecreateWidth(t, state.message)
+				if width < a2aTasksMaxConsumersFloor {
+					t.Errorf("remedy recreates TASKS at %d, below the shipped floor %d: run against a default install's stream, that TIGHTENS it: %q",
+						width, a2aTasksMaxConsumersFloor, state.message)
+				}
+				if width < a2aTasksConsumerBudget(agent) {
+					t.Errorf("remedy recreates TASKS at %d but the budget is %d, so the stream it describes does not clear the script's own gate: %q",
+						width, a2aTasksConsumerBudget(agent), state.message)
 				}
 			}
 		})
 	}
 }
 
-// remedyMaxConsumers reads the number out of the status message's
-// `nats stream edit TASKS --max-consumers=N` remedy. It fails rather than
-// returning a zero value: a parse that quietly answered 0 would make every
+// remedyRecreateWidth reads the number out of the status message's "delete the
+// TASKS stream and let provisioning recreate it at N" remedy. It fails rather
+// than returning a zero value: a parse that quietly answered 0 would make every
 // floor assertion above pass on a message that had stopped naming a number.
-func remedyMaxConsumers(t *testing.T, message string) int {
+func remedyRecreateWidth(t *testing.T, message string) int {
 	t.Helper()
-	const flag = "--max-consumers="
-	i := strings.Index(message, flag)
+	const marker = "recreate it at "
+	i := strings.Index(message, marker)
 	if i < 0 {
-		t.Fatalf("no %q in the status message, so its remedy names no number: %q", flag, message)
+		t.Fatalf("no %q in the status message, so its recreate remedy names no width: %q", marker, message)
 	}
-	rest := message[i+len(flag):]
+	rest := message[i+len(marker):]
 	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
 	if end == 0 {
-		t.Fatalf("%q in the status message is not followed by a number: %q", flag, message)
+		t.Fatalf("%q in the status message is not followed by a number: %q", marker, message)
 	}
 	if end > 0 {
 		rest = rest[:end]
 	}
 	n, err := strconv.Atoi(rest)
 	if err != nil {
-		t.Fatalf("parsing the remedy's max_consumers from %q: %v", message, err)
+		t.Fatalf("parsing the remedy's recreate width from %q: %v", message, err)
 	}
 	return n
 }

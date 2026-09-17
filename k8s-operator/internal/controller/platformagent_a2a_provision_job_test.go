@@ -244,13 +244,14 @@ func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) 
 // asks for it.
 //
 // The refusal the script's closing block can reach — a TASKS stream whose
-// max_consumers is below this CR's budget — is fixed until somebody widens the
-// stream, so the default backoffLimit handling would spend twenty pods and
-// about ninety minutes reaching it again while the CR still read Ready. A
-// FailJob rule on exit code 2 ends it on the first pod. Everything else stays
-// on the retry budget, which is why the backoffLimit is asserted here too: a
-// change that "fixed" the wait by dropping it to 1 would take NATS-unreachable
-// down with it.
+// max_consumers is below this CR's budget — is fixed until somebody lowers
+// maxSessions or recreates the stream (nats-server will not change a stream's
+// max_consumers in place), so the default backoffLimit handling would spend
+// twenty pods and about ninety minutes reaching it again while the CR still
+// read Ready. A FailJob rule on exit code 2 ends it on the first pod.
+// Everything else stays on the retry budget, which is why the backoffLimit is
+// asserted here too: a change that "fixed" the wait by dropping it to 1 would
+// take NATS-unreachable down with it.
 func TestA2AProvisionJobFailsFastOnADeterministicRefusal(t *testing.T) {
 	job := buildA2AProvisionJob(a2aTestAgent())
 
@@ -301,11 +302,11 @@ func TestA2AProvisionJobFailsFastOnADeterministicRefusal(t *testing.T) {
 	// it matches no rule, so it still gets the full budget, and the TTL
 	// still removes the Failed Job — which is what makes the next
 	// reconcile's create-if-absent re-check a stream an operator has since
-	// widened.
+	// recreated.
 	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 20 {
 		t.Errorf("backoffLimit = %v, want 20: the fail-fast rule is for the deterministic refusal only, and everything else still retries", job.Spec.BackoffLimit)
 	}
 	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 86400 {
-		t.Errorf("ttlSecondsAfterFinished = %v, want 86400: the daily re-create is how a failed-fast install picks up a widened stream", job.Spec.TTLSecondsAfterFinished)
+		t.Errorf("ttlSecondsAfterFinished = %v, want 86400: the daily re-create is how a failed-fast install picks up a recreated stream", job.Spec.TTLSecondsAfterFinished)
 	}
 }

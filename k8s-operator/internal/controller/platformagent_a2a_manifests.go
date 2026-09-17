@@ -1554,7 +1554,8 @@ echo "a2a provisioning complete"
 // max_consumers refusal is deterministic and now fails the Job from its
 // first pod (the podFailurePolicy below), so the daily re-create is the only
 // thing that ever re-checks that refusal — against a stream an operator has
-// since widened. That churn is one short-lived pod a day; the alternative —
+// since recreated, or a maxSessions that has come down to fit the stream that
+// is there. That churn is one short-lived pod a day; the alternative —
 // a Job kept forever as the done-marker — trades it for permanent clutter, a
 // stale-looking object in every kubectl listing, and a refusal that never
 // looks again.
@@ -1612,8 +1613,8 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			//
 			// The TTL is deliberately left on this path: once it removes the
 			// Failed Job, create-if-absent builds the identical Job again,
-			// which is how an install whose stream an operator has since
-			// widened provisions itself without anyone touching the CR.
+			// which is how an install whose TASKS an operator has since
+			// deleted provisions itself without anyone touching the CR.
 			//
 			// restartPolicy has to be Never for the API server to accept a
 			// podFailurePolicy at all ("This field cannot be used in
@@ -2234,26 +2235,41 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// stamps a Job it fails that way with reason
 				// PodFailurePolicy; a transient failure that spends
 				// the backoffLimit instead arrives as
-				// BackoffLimitExceeded. Naming the stream edit on that
-				// one would prescribe a `nats stream edit` for a NATS
-				// outage, so it goes out only on the refusal it fixes;
-				// the pod log still says what happened either way.
+				// BackoffLimitExceeded. Naming the consumer remedy on
+				// that one would tell an operator whose NATS is simply
+				// down to lower their concurrency or delete a stream,
+				// so it goes out only on the refusal it fixes; the pod
+				// log still says what happened either way.
 				//
-				// The two numbers in the remedy are deliberately
-				// different. The need is the budget, which is what the
-				// script's gate compares a live stream against; the
-				// remedy is what a fresh render creates, which floors
-				// at the cap TASKS shipped with. A default install
-				// needs 46 and renders 64 — so a remedy naming the
-				// budget would tell an operator whose stream is
-				// already at 64 to edit it DOWN to 46, the downward
-				// derivation the constants above refuse to make.
+				// Neither way out it names is a stream edit, because
+				// max_consumers is the one limit nats-server will not
+				// change on a stream that exists — an update carrying
+				// a different MaxConsumers comes back "stream
+				// configuration update can not change MaxConsumers",
+				// and the bus this operator renders is pinned to
+				// nats:2.10, where that holds. What is left is
+				// lowering maxSessions until the budget fits the
+				// stream, or deleting TASKS and letting the script
+				// recreate it — the create-only guards create every
+				// stream they do not find, ahead of these checks — at
+				// the cost of the task history the stream is holding.
+				//
+				// Of the three numbers that remedy wants, only two are
+				// in this process. The need is the budget, which is
+				// what the script's gate compares a live stream
+				// against; the recreate width is what a fresh render
+				// creates, which floors at the cap TASKS shipped with,
+				// so a default install needs 46 and recreates at 64.
+				// The third — what the live stream actually holds — is
+				// on the bus, and it is the one the maxSessions that
+				// fits is derived from, so that half of the remedy
+				// points at the pod log, which read it.
 				state.message = fmt.Sprintf(
 					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away.",
 					existing.Name, cond.Reason, cond.Message)
 				if cond.Reason == batchv1.JobReasonPodFailurePolicy {
 					state.message += fmt.Sprintf(
-						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). Run `nats stream edit TASKS --max-consumers=%d` (what a fresh render creates TASKS with, which is never below the need), or lower maxSessions. Widening the stream does not clear this on its own — nothing re-reads it until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will.",
+						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore the maxSessions that fits. Neither way out clears this on its own — nothing re-reads the stream until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will.",
 						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent))
 				}
 			}
