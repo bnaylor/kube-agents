@@ -1164,9 +1164,13 @@ Mutation(
         "rename the bus identity env var in a2a/lib without touching the "
         "operator that renders it -- the shape a rename takes when the two "
         "literals live in modules that cannot import each other. Both modules "
-        "build, both test suites stay green, and the agent container starts "
-        "connecting with no inbox prefix: authenticated, and then timing out "
-        "on every JetStream reply with no permission error it can see",
+        "build and both Go suites stay green, because no test binary links "
+        "them. What breaks is every `a2a` invocation in the agent container: "
+        "busUser() reads the new name, finds nothing, falls back to NATS_USER "
+        "which A5 stopped rendering, and connect() refuses with `no bus "
+        "identity` before it dials. Loud where it runs and invisible where it "
+        "is reviewed, and the half a reviewer has to think to check is the "
+        "operator's render rather than this file",
     ),
     Mutation(
         "C1-bus-token-path-moved-on-the-operator-side",
