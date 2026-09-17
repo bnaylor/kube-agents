@@ -354,12 +354,17 @@ type TuningSpec struct {
 	// sized to fit this cap rather than to enforce it - and because
 	// provisioning never edits an existing stream, an install whose TASKS
 	// stream is too small for the configured cap makes the provision Job
-	// fail, naming the `nats stream edit` it needs, rather than letting the
-	// shortfall surface later as a legitimate session's consumer create
-	// being refused and reported as a task failure. An operator upgrade
-	// reaches that as readily as an edit here does: a stream created before
-	// the derivation existed holds whatever it was created with, whatever
-	// this field says.
+	// fail rather than letting the shortfall surface later as a legitimate
+	// session's consumer create being refused and reported as a task
+	// failure. What that refusal names is the two ways out, and neither is
+	// a stream edit, because max_consumers is the one limit nats-server
+	// will not change on a stream that already exists: lower this number
+	// until it fits the stream, or delete TASKS and let provisioning
+	// recreate it at the width this number asks for, paying the task
+	// history the stream was holding. An operator upgrade reaches that
+	// refusal as readily as an edit here does: a stream created before the
+	// derivation existed holds whatever it was created with, whatever this
+	// field says.
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
