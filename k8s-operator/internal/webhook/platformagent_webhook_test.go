@@ -544,21 +544,34 @@ func TestPlatformAgentValidation(t *testing.T) {
 	// HAND a container, which is the half that was missing: a volume the CR
 	// author called anything at all can project the a2a-bus audience, and the
 	// kubelet mints a token the callout accepts as the pod's own. Or it can
-	// mount the creds Secret and read bridge-password, which needs no token and
-	// is cheaper.
+	// mount one of the bus's Secrets and read a password out of it, which needs
+	// no token and is cheaper.
 	//
 	// The render strips the same volumes
 	// (TestUserAuthoredVolumesCannotSourceTheBusCredential). This is the half
 	// that tells the author why.
 	t.Run("fails if a user-authored volume sources the bus credential", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
-		const creds = "test-agent-a2a-nats-creds"
+		// Literals, not agentv1alpha1.ReservedTokenAudience and not
+		// ReservedSecretNames: built from the constants under test, every case
+		// below passes whatever those constants say. The cross-package test
+		// TestTheTwoSpellingsOfTheReservedSourceNamesAgree is what ties these
+		// literals to what the operator renders.
+		const (
+			audience = "a2a-bus"
+			creds    = "test-agent-a2a-nats-creds"
+			conf     = "test-agent-a2a-nats-config"
+			keys     = "test-agent-a2a-callout-keys"
+		)
 		busProjection := corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-				Audience: agentv1alpha1.ReservedTokenAudience, Path: "token",
+				Audience: audience, Path: "token",
 			}}},
 		}}
-		credsSecret := corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: creds}}
+		secretVol := func(name string) corev1.VolumeSource {
+			return corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: name}}
+		}
+		credsSecret := secretVol(creds)
 
 		for _, tc := range []struct {
 			name string
@@ -577,6 +590,12 @@ func TestPlatformAgentValidation(t *testing.T) {
 			{"extra volume mounting the creds Secret", &agentv1alpha1.DeploymentSpec{
 				ExtraVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: credsSecret}},
 			}, "spec.deployment.extraVolumes[0]"},
+			{"sidecar volume mounting the rendered nats.conf Secret", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: secretVol(conf)}},
+			}, "spec.deployment.sidecarVolumes[0]"},
+			{"sidecar volume mounting the callout's signing keys", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: secretVol(keys)}},
+			}, "spec.deployment.sidecarVolumes[0]"},
 			{"the creds Secret as a projected source", &agentv1alpha1.DeploymentSpec{
 				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: corev1.VolumeSource{
 					Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
@@ -596,6 +615,33 @@ func TestPlatformAgentValidation(t *testing.T) {
 				assertFieldError(t, err, tc.path)
 			})
 		}
+
+		// generateName: the registry assigns the name AFTER admission, so
+		// agent.Name is empty here and the Secret half has no names to
+		// compare against. Admitted rather than refused on a name derived
+		// from the empty string, which would bounce an unrelated Secret
+		// called "-a2a-nats-creds". The render, which always runs with a real
+		// name, is the backstop for that window.
+		t.Run("a generateName create is admitted, and the audience half still fires", func(t *testing.T) {
+			base := func(vol corev1.Volume) *agentv1alpha1.PlatformAgent {
+				return &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{GenerateName: "agent-", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{
+						Deployment: &agentv1alpha1.DeploymentSpec{SidecarVolumes: []corev1.Volume{vol}},
+					}},
+				}
+			}
+			if _, err := val.ValidateCreate(ctx, base(corev1.Volume{
+				Name: "innocuous-cache", VolumeSource: secretVol("-a2a-nats-creds"),
+			})); err != nil {
+				t.Errorf("a generateName create was refused on a Secret name derived from the empty "+
+					"agent name: %v", err)
+			}
+			_, err := val.ValidateCreate(ctx, base(corev1.Volume{
+				Name: "innocuous-cache", VolumeSource: busProjection,
+			}))
+			assertFieldError(t, err, "spec.deployment.sidecarVolumes[0]")
+		})
 
 		// Refusing every serviceAccountToken projection was considered and
 		// rejected for taking a capability the bus has no claim on. These are
@@ -997,12 +1043,22 @@ func TestPlatformAgentValidateDelete(t *testing.T) {
 // validateReservedVolumeMounts / validateReservedVolumeName above AND to the
 // render strip, which is the half that holds under failurePolicy: Ignore.
 func TestEveryUserAuthoredMountSurfaceIsReserved(t *testing.T) {
+	// Two mechanisms per surface, because there are two reservations: the NAME
+	// the operator renders, and the SOURCE that would hand a container the
+	// credential whatever the volume is called. Free text -- nothing compares
+	// these strings against source -- so they are a map for the next author to
+	// read, and the assertion below is on the field names alone.
 	covered := map[string]string{
-		"Sidecars":          "webhook: validateReservedVolumeMounts; render: a2aStripBusTokenMounts",
-		"InitContainers":    "webhook: validateReservedVolumeMounts; render: a2aStripBusTokenMounts",
-		"SidecarVolumes":    "webhook: validateReservedVolumeName; render: a2aStripBusTokenVolume",
-		"ExtraVolumes":      "webhook: validateReservedVolumeName; render: a2aStripBusTokenVolume",
-		"ExtraVolumeMounts": "webhook: validateReservedVolumeMounts; render: a2aStripBusTokenVolumeMounts",
+		"Sidecars": "webhook: validateReservedVolumeMounts; " +
+			"render: a2aStripBusTokenMounts + a2aStripNamedMountsFromContainers",
+		"InitContainers": "webhook: validateReservedVolumeMounts; " +
+			"render: a2aStripBusTokenMounts + a2aStripNamedMountsFromContainers",
+		"SidecarVolumes": "webhook: validateReservedVolumeName + validateReservedVolumeSource; " +
+			"render: a2aStripBusTokenVolume + a2aStripNamedVolumes",
+		"ExtraVolumes": "webhook: validateReservedVolumeName + validateReservedVolumeSource; " +
+			"render: a2aStripBusTokenVolume + a2aStripNamedVolumes",
+		"ExtraVolumeMounts": "webhook: validateReservedVolumeMounts; " +
+			"render: a2aStripBusTokenVolumeMounts + a2aStripNamedMounts",
 	}
 
 	volumeType := reflect.TypeOf([]corev1.Volume{})

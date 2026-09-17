@@ -108,20 +108,21 @@ var SensitiveEnvVars = map[string]struct{}{
 // volume under the name plus a "-vol" suffix, so it cannot collide with a
 // reserved name or carry a token projection.
 //
-// What this reservation does NOT cover is the volume SOURCE. It is a check on
-// names, so a differently-named projected volume whose
-// serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
-// same credential and is admitted. The only source-type check on
-// sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
-// Established by execution rather than by reading the render: a sidecarVolumes
-// entry named innocuous-cache projecting that audience renders intact and the
-// sidecar authenticates as `agent`.
+// This half checks NAMES, and on its own that is not enough: a
+// differently-named projected volume whose serviceAccountToken.audience is
+// `a2a-bus` mints the same credential under a name nothing here matches.
+// Established by execution rather than by reading the render — a
+// sidecarVolumes entry named innocuous-cache projecting that audience rendered
+// intact and the sidecar authenticated as `agent`. ReservedVolumeSource below
+// is the other half and closes that, along with the cheaper route of mounting
+// the creds Secret directly; the two are companions and the webhook calls both
+// on every user-authored volume.
 //
-// Which fixes the terms this should be read on. KSA tokens are pod-scoped and
+// Which fixes the terms both should be read on. KSA tokens are pod-scoped and
 // the callout cannot see which container presented one, so neither a name nor
-// an audience reservation is a boundary against a hostile sidecar; it is a
-// guard against a misconfiguration. Worth having on those terms for the reason
-// agentForbiddenVolumeNames gives for the same class in
+// a source reservation is a boundary against a hostile sidecar; they are
+// guards against a misconfiguration. Worth having on those terms for the
+// reason agentForbiddenVolumeNames gives for the same class in
 // credential_proxy_manifests.go: the CR is authored by the platform operator
 // and not by the agent — buildPlatformLocalRole grants the agent
 // get/list/watch on its own CR and nothing more, and no tenant-facing or
@@ -129,8 +130,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // rather than an escape, guarded because nothing else would notice. That rests
 // on who may write the CR, which makes it re-decidable rather than settled: a
 // delegable role, or the CR moving into a repo the agent can open pull
-// requests against, changes the answer. gke-labs#1667 closes the audience
-// route and the creds-Secret route that is cheaper than it.
+// requests against, changes the answer.
 //
 // One member so far. `a2a-bus-token` is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
@@ -145,35 +145,66 @@ var ReservedVolumeNames = map[string]struct{}{
 }
 
 // ReservedTokenAudience is the ServiceAccount token audience the operator binds
-// every bus token to, and A2ANATSName/A2ACredsSecretName are the two rendered
-// names the source check needs.
+// every bus token to, and A2ANATSName/A2ACalloutName are the rendered names
+// ReservedSecretNames builds the source check's Secret set out of.
 //
-// All three are second spellings of something the controller already says, and
-// deliberately so: the validating webhook cannot import the controller, and
-// collapsing either side into a reference to the other would satisfy the test
-// that compares them by construction. They are held together by
-// TestTheTwoSpellingsOfTheReservedSourceNamesAgree, and the audience
-// additionally by conformance C1, which reads the controller's literal and
-// compares it against the a2a module's.
+// All of them are second spellings of something the controller already says,
+// and deliberately so. The webhook could import internal/controller -- there is
+// no cycle -- but the controller's spellings are unexported, and a webhook
+// reaching into a controller's internals to read them is the layering this
+// package exists to avoid. Two spellings then need something holding them
+// together, which is TestTheTwoSpellingsOfTheReservedSourceNamesAgree; the
+// audience additionally has conformance C1, which reads the controller's
+// literal and compares it against the a2a module's. Collapsing either side into
+// a reference to the other satisfies the Go test by construction and blinds
+// C1's extractor.
 const ReservedTokenAudience = "a2a-bus"
 
 func A2ANATSName(agent *PlatformAgent) string { return agent.Name + "-a2a-nats" }
 
+func A2ACalloutName(agent *PlatformAgent) string { return agent.Name + "-a2a-callout" }
+
 func A2ACredsSecretName(agent *PlatformAgent) string { return A2ANATSName(agent) + "-creds" }
+
+// ReservedSecretNames is every Secret the A2A bus renders, mapped to what a
+// container holding it would get. All three, not just the obvious one: the
+// first pass of this check reserved the creds Secret alone, and
+// <agent>-a2a-nats-config -- one suffix away, rendered into the same namespace
+// by buildA2ANATSConfigSecret -- carries the whole nats.conf with every static
+// user's password interpolated in clear text. Reserving one member of a set
+// and leaving its siblings is worse than reserving none, because the refusal
+// message names the class.
+//
+// Empty when the agent has no name yet. A CREATE that uses metadata.generateName
+// is admitted before the registry assigns one, and deriving "-a2a-nats-creds"
+// from an empty name would refuse an unrelated Secret that happened to be
+// called that. The render, which always runs with a real name, is the backstop
+// for that window.
+func ReservedSecretNames(agent *PlatformAgent) map[string]string {
+	if agent == nil || agent.Name == "" {
+		return nil
+	}
+	return map[string]string{
+		A2ACredsSecretName(agent): "the bus credentials Secret %q, which holds the static users' passwords",
+		A2ANATSName(agent) + "-config": "the bus config Secret %q, whose nats.conf carries every static " +
+			"user's password in clear text",
+		A2ACalloutName(agent) + "-keys": "the auth callout's key Secret %q, which signs the bus's own tokens",
+	}
+}
 
 // ReservedVolumeSource reports why a user-authored volume may not be rendered,
 // or "" when it is acceptable. It is the check ReservedVolumeNames above is
 // not: that one matches the name the operator renders, this one matches what
 // the volume would HAND a container regardless of what it is called.
 //
-// The two routes, and they are closed together on purpose. A projection of
+// The routes, and they are closed together on purpose. A projection of
 // ReservedTokenAudience mints a token the callout accepts as the pod's own, so
 // a sidecar mounting it authenticates as `agent` -- the retired `worker`
 // credential rebuilt out of a volumeMount, which is the thing the A5 split
-// exists to prevent. The creds Secret is the cheaper of the two and predates
-// A5: it holds bridge-password in plain text, so reading it needs no token at
+// exists to prevent. The bus's own Secrets are cheaper than that and predate
+// A5: they hold the passwords in plain text, so reading one needs no token at
 // all. Closing only the projection would narrow the expensive route and leave
-// the cheap one, which in practice advertises the cheap one.
+// the cheap ones, which in practice advertises the cheap ones.
 //
 // What it is NOT. KSA tokens are pod-scoped and the callout cannot see which
 // container presented one, so this is a guard against a misconfigured CR and
@@ -182,16 +213,25 @@ func A2ACredsSecretName(agent *PlatformAgent) string { return A2ANATSName(agent)
 // the CR is authored by the platform operator rather than by the agent. See
 // ReservedVolumeNames for the falsifier that would change that.
 //
-// Not covered, said rather than left to be discovered: a CSI driver that mints
-// audience-bound tokens of its own. The audience is a driver attribute there
-// rather than a field of the volume, so it cannot be read the way these two
-// can.
-func ReservedVolumeSource(vol *corev1.Volume, credsSecretName string) string {
+// Not covered, said rather than left to be discovered. Three of them.
+// sidecars[].env and .envFrom reach the same Secrets with no volume at all and
+// are deliberately left open: that is the supported route for the Hermes bridge
+// sidecar, which is meant to hold bridge-password (a2a/docs/hermes-bridge.md).
+// A CSI driver that mints audience-bound tokens of its own carries the audience
+// as a driver attribute rather than as a field of the volume, so it cannot be
+// read the way these can. And a manually created legacy
+// kubernetes.io/service-account-token Secret for the agent's ServiceAccount is
+// audience-unrestricted, so mounting it passes the audience check and still
+// authenticates as the pod -- which needs Secret-create in the namespace, and
+// is therefore inside the same threat model the paragraph above states.
+func ReservedVolumeSource(vol *corev1.Volume, reservedSecrets map[string]string) string {
 	if vol == nil {
 		return ""
 	}
-	if vol.Secret != nil && vol.Secret.SecretName == credsSecretName {
-		return fmt.Sprintf("mounts the bus credentials Secret %q", credsSecretName)
+	if vol.Secret != nil {
+		if what, ok := reservedSecrets[vol.Secret.SecretName]; ok {
+			return "mounts " + fmt.Sprintf(what, vol.Secret.SecretName)
+		}
 	}
 	if vol.Projected == nil {
 		return ""
@@ -200,8 +240,10 @@ func ReservedVolumeSource(vol *corev1.Volume, credsSecretName string) string {
 		if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == ReservedTokenAudience {
 			return fmt.Sprintf("projects a ServiceAccount token for the %q audience", ReservedTokenAudience)
 		}
-		if src.Secret != nil && src.Secret.Name == credsSecretName {
-			return fmt.Sprintf("projects the bus credentials Secret %q", credsSecretName)
+		if src.Secret != nil {
+			if what, ok := reservedSecrets[src.Secret.Name]; ok {
+				return "projects " + fmt.Sprintf(what, src.Secret.Name)
+			}
 		}
 	}
 	return ""
@@ -647,18 +689,26 @@ type DeploymentSpec struct {
 	Sidecars []corev1.Container `json:"sidecars,omitempty"`
 
 	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+	// An entry is refused at admission if it takes a reserved name, or if its
+	// source would hand a second container the agent's bus credential: a
+	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
+	// to the <agent>-a2a-nats-creds Secret.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
 
 	// ExtraVolumes specifies custom volumes to mount for the main container.
+	// The same reserved names and reserved sources as SidecarVolumes are refused
+	// at admission.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
 
 	// ExtraVolumeMounts specifies custom volume mounts for the main container.
+	// Appended to platform-agent and platform-agent-dashboard both, so an entry
+	// naming a reserved volume is refused at admission.
 	// +listType=map
 	// +listMapKey=name
 	// +optional

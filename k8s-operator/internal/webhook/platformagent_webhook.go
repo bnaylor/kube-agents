@@ -183,7 +183,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		// What a volume is CALLED and what it would hand a container are two
 		// checks; validateReservedVolumeName is the first and
 		// validateReservedVolumeSource is the second.
-		credsSecret := agentv1alpha1.A2ACredsSecretName(platformAgent)
+		reservedSecrets := agentv1alpha1.ReservedSecretNames(platformAgent)
 		for i, vol := range platformAgent.Spec.Deployment.ExtraVolumes {
 			if vol.HostPath != nil {
 				allErrs = append(allErrs, field.Forbidden(
@@ -192,7 +192,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 				))
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
-			allErrs = append(allErrs, validateReservedVolumeSource(&platformAgent.Spec.Deployment.ExtraVolumes[i], credsSecret, depPath.Child("extraVolumes").Index(i))...)
+			allErrs = append(allErrs, validateReservedVolumeSource(&platformAgent.Spec.Deployment.ExtraVolumes[i], reservedSecrets, depPath.Child("extraVolumes").Index(i))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
 			if vol.HostPath != nil {
@@ -202,7 +202,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 				))
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
-			allErrs = append(allErrs, validateReservedVolumeSource(&platformAgent.Spec.Deployment.SidecarVolumes[i], credsSecret, depPath.Child("sidecarVolumes").Index(i))...)
+			allErrs = append(allErrs, validateReservedVolumeSource(&platformAgent.Spec.Deployment.SidecarVolumes[i], reservedSecrets, depPath.Child("sidecarVolumes").Index(i))...)
 		}
 
 		// 2da. The fifth user-authored mount surface. Unlike the four above it
@@ -335,21 +335,30 @@ func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
 
 // validateReservedVolumeSource refuses a user-supplied volume that would hand a
 // container the bus credential whatever the volume is called.
-// agentv1alpha1.ReservedVolumeSource holds the two routes and, more to the
-// point, what closing them does and does not buy. The render strips the same
-// volumes; this is the layer that says why, since the chart's default
-// failurePolicy is Ignore and an unreachable webhook admits the object.
+// agentv1alpha1.ReservedVolumeSource holds the routes and, more to the point,
+// what closing them does and does not buy.
+//
+// Two layers, and which one an install gets differs. When the webhooks are on
+// and reachable this refusal is the ordinary outcome, and it is the only layer
+// that tells the author anything. The render strips the same volumes, which is
+// what holds where the chart left the webhooks off (its default) or where
+// failurePolicy: Ignore let an unreachable webhook admit the object -- silently,
+// the way a2aStripBusTokenVolume beside it is silent. validateExtraVolumeMounts
+// in the controller reaches the opposite conclusion for the same class and
+// reports a Degraded condition; the divergence is deliberate only in that
+// making this strip loud while its twin stays quiet is worse than either, and
+// it is worth revisiting for both at once rather than for one.
 //
 // path is the VOLUME's path rather than a field of it: the reason is the
-// source, and which field carries it differs between the two routes.
-func validateReservedVolumeSource(vol *corev1.Volume, credsSecretName string, path *field.Path) field.ErrorList {
-	reason := agentv1alpha1.ReservedVolumeSource(vol, credsSecretName)
+// source, and which field carries it differs between the routes.
+func validateReservedVolumeSource(vol *corev1.Volume, reservedSecrets map[string]string, path *field.Path) field.ErrorList {
+	reason := agentv1alpha1.ReservedVolumeSource(vol, reservedSecrets)
 	if reason == "" {
 		return nil
 	}
 	return field.ErrorList{field.Forbidden(
 		path,
-		fmt.Sprintf("volume %q %s, which is the platform-agent container's alone; "+
+		fmt.Sprintf("volume %q %s. That is the platform-agent container's alone; "+
 			"a second container holding it wears the agent's bus identity", vol.Name, reason),
 	)}
 }

@@ -113,7 +113,11 @@ shares the agent's pod, the pod does not reach Ready — the same failure shape 
 `mode: today` flip produces above. Two edits, both in the sidecar's own `env`:
 `NATS_USER` becomes `bridge`, and `NATS_PASSWORD`'s `secretKeyRef.key` becomes
 `bridge-password`. The Secret is the same `<agent>-a2a-nats-creds`; the operator fills the
-new key on the next reconcile. It does not remove the old one: `ensureA2ACredsSecret` only
+new key on the next reconcile. Both edits are in `env`, and that is the supported route on
+purpose: a `sidecarVolumes` entry that mounts that Secret — or the `<agent>-a2a-nats-config`
+Secret, or a projection of the `a2a-bus` audience under any name — is refused at admission
+and stripped from the render, because a volume is the shape that hands a second container
+the agent's own bus identity rather than the `bridge` principal's one password. It does not remove the old one: `ensureA2ACredsSecret` only
 fills keys that are missing or empty and never prunes, so `worker-password` stays in the
 Secret of an upgraded install indefinitely. It is dead data rather than a live credential —
 `worker` is no longer a user in the rendered `nats.conf`, so presenting that password

@@ -3877,8 +3877,8 @@ func TestCheckA2AUserGrants(t *testing.T) {
 // Scope, so the name is not read as more than it pins: this is the NAME-based
 // reservation. A user volume projecting the a2a-bus audience under some other
 // name defeats the reservation and leaves this test passing, which is what the
-// ByName is doing in the name. gke-labs#1667 adds the source check, with its
-// own test.
+// ByName is doing in the name. The source-based half has its own test,
+// TestUserAuthoredVolumesCannotSourceTheBusCredential.
 func TestUserAuthoredContainersCannotMountTheBusTokenByName(t *testing.T) {
 	grab := func(agent *agentv1alpha1.PlatformAgent) corev1.PodSpec {
 		t.Helper()
@@ -4082,8 +4082,8 @@ func TestTheDashboardNeverReceivesTheBusToken(t *testing.T) {
 // missing: a sidecarVolumes entry called anything at all can project the
 // a2a-bus audience, and the kubelet mints a token the callout accepts as the
 // pod's own because the callout resolves the POD's ServiceAccount. Or it can
-// mount the creds Secret and read bridge-password in plain text, which needs
-// no token at all and is the cheaper of the two.
+// mount any of the bus's three Secrets and read a password in plain text,
+// which needs no token at all and is the cheaper route.
 //
 // Measured on the rendered pod, not on the presence of a guard: every case
 // here asserts the volume is absent AND that nothing is left mounting it,
@@ -4095,7 +4095,16 @@ func TestTheDashboardNeverReceivesTheBusToken(t *testing.T) {
 // against a misconfigured CR and not a boundary against a hostile sidecar.
 // agentv1alpha1.ReservedVolumeSource carries that and the falsifier.
 func TestUserAuthoredVolumesCannotSourceTheBusCredential(t *testing.T) {
+	// Spelled out rather than taken from a2aReservedSecretNames, which is the
+	// thing under test. These are the three names a real install carries; the
+	// live enumeration on a2a-next-dev returned exactly this set.
 	creds := "test-agent-a2a-nats-creds"
+	conf := "test-agent-a2a-nats-config"
+	keys := "test-agent-a2a-callout-keys"
+	reserved := map[string]string{creds: "%q", conf: "%q", keys: "%q"}
+	secretVol := func(name string) corev1.VolumeSource {
+		return corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: name}}
+	}
 	busProjection := corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 			Audience: a2aBusTokenAudience, Path: "token",
@@ -4146,6 +4155,29 @@ func TestUserAuthoredVolumesCannotSourceTheBusCredential(t *testing.T) {
 			},
 		},
 		{
+			// The sibling one suffix away from the creds Secret. nats.conf
+			// interpolates every static user's password in clear text, so
+			// reserving the creds Secret alone leaves the cheaper copy of the
+			// same secret material and names the class while doing it.
+			name: "the rendered nats.conf Secret, which carries the passwords in clear text",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "innocuous-cache", VolumeSource: secretVol(conf)}},
+				Sidecars: []corev1.Container{{
+					Name: "hermes-bridge", Image: "bridge:dev",
+					VolumeMounts: []corev1.VolumeMount{{Name: "innocuous-cache", MountPath: "/conf"}},
+				}},
+			},
+		},
+		{
+			// Strictly more powerful than a password: this signs the bus's
+			// own tokens.
+			name: "the auth callout's signing keys",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes:      []corev1.Volume{{Name: "innocuous-cache", VolumeSource: secretVol(keys)}},
+				ExtraVolumeMounts: []corev1.VolumeMount{{Name: "innocuous-cache", MountPath: "/keys"}},
+			},
+		},
+		{
 			// extraVolumes and extraVolumeMounts are read by two different
 			// functions, so this is the case where a volume could be dropped
 			// while its mount survives.
@@ -4189,13 +4221,13 @@ func TestUserAuthoredVolumesCannotSourceTheBusCredential(t *testing.T) {
 				t.Fatalf("the operator's own bus token volume is missing, so this case proves nothing")
 			}
 
-			// The webhook says why. The render is what holds when it is
-			// unreachable, which the chart's failurePolicy: Ignore makes the
-			// ordinary case.
+			// The webhook is what says why. The render is what holds where
+			// the chart left the webhooks off, or where failurePolicy: Ignore
+			// let an unreachable one admit the object.
 			var refused int
 			for i := range slices.Concat(c.dep.SidecarVolumes, c.dep.ExtraVolumes) {
 				all := slices.Concat(c.dep.SidecarVolumes, c.dep.ExtraVolumes)
-				if agentv1alpha1.ReservedVolumeSource(&all[i], creds) != "" {
+				if agentv1alpha1.ReservedVolumeSource(&all[i], reserved) != "" {
 					refused++
 				}
 			}
@@ -4261,8 +4293,25 @@ func TestTheTwoSpellingsOfTheReservedSourceNamesAgree(t *testing.T) {
 	if got, want := agentv1alpha1.A2ANATSName(agent), a2aNATSName(agent); got != want {
 		t.Errorf("the webhook derives the NATS name %q; the operator renders %q", got, want)
 	}
-	if got, want := agentv1alpha1.A2ACredsSecretName(agent), a2aCredsSecretName(agent); got != want {
-		t.Errorf("the webhook refuses volumes naming %q; the operator renders the creds Secret as %q", got, want)
+	apiSet, ctlSet := agentv1alpha1.ReservedSecretNames(agent), a2aReservedSecretNames(agent)
+	for name := range ctlSet {
+		if _, ok := apiSet[name]; !ok {
+			t.Errorf("the operator renders Secret %q and the webhook does not reserve it; a user volume "+
+				"mounting it reaches a sidecar unrefused", name)
+		}
+	}
+	for name := range apiSet {
+		if _, ok := ctlSet[name]; !ok {
+			t.Errorf("the webhook reserves Secret %q, which the operator does not render; the refusal "+
+				"costs a capability and buys nothing", name)
+		}
+	}
+	// And the set is the one the bus actually renders, read off the builders
+	// rather than off either spelling of the list.
+	for _, want := range []string{a2aCredsSecretName(agent), a2aNATSName(agent) + "-config", a2aCalloutKeysName(agent)} {
+		if _, ok := apiSet[want]; !ok {
+			t.Errorf("the bus renders Secret %q and neither spelling reserves it", want)
+		}
 	}
 	// And against the name the rest of the suite's fixture hardcodes, which is
 	// the closest thing here to the name a real install carries.

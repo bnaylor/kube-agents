@@ -181,10 +181,10 @@ func a2aBusTokenVolumeMount() corev1.VolumeMount {
 // so an unreachable webhook admits the object with validation skipped. The
 // webhook's refusal is what tells the author why; this is what holds.
 //
-// Name-matched, and only that: a user volume projecting the same audience
-// under another name reaches a sidecar untouched by this and by the webhook
-// both. ReservedVolumeNames carries what that does and does not buy;
-// gke-labs#1667 carries the source check that closes it.
+// Name-matched, and only that. A user volume projecting the same audience
+// under another name goes untouched here; a2aReservedSourceVolumeNames is the
+// companion pass that finds those by SOURCE, and buildPodTemplateSpec runs
+// both. ReservedVolumeNames carries what the pair does and does not buy.
 //
 // The input slices belong to the CR, so the copy is not incidental.
 func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
@@ -275,11 +275,11 @@ func a2aReservedSourceVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string
 	if agent.Spec.Deployment == nil {
 		return nil
 	}
-	creds := a2aCredsSecretName(agent)
+	reserved := a2aReservedSecretNames(agent)
 	var names map[string]struct{}
 	for _, list := range [][]corev1.Volume{agent.Spec.Deployment.SidecarVolumes, agent.Spec.Deployment.ExtraVolumes} {
 		for i := range list {
-			if agentv1alpha1.ReservedVolumeSource(&list[i], creds) == "" {
+			if agentv1alpha1.ReservedVolumeSource(&list[i], reserved) == "" {
 				continue
 			}
 			if names == nil {
@@ -289,6 +289,27 @@ func a2aReservedSourceVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string
 		}
 	}
 	return names
+}
+
+// a2aReservedSecretNames is every Secret the bus renders, built from the
+// controller's own spellings rather than from agentv1alpha1's. That is the
+// point: the API package needs the same set for the webhook and cannot see
+// these functions, so there are two spellings and
+// TestTheTwoSpellingsOfTheReservedSourceNamesAgree is what keeps them equal.
+// Deriving one from the other would make that test pass by construction.
+//
+// The values are format strings taking the Secret's own name, so the refusal
+// says which Secret and why it matters.
+func a2aReservedSecretNames(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	if agent.Name == "" {
+		return nil
+	}
+	return map[string]string{
+		a2aCredsSecretName(agent): "the bus credentials Secret %q, which holds the static users' passwords",
+		a2aNATSName(agent) + "-config": "the bus config Secret %q, whose nats.conf carries every static " +
+			"user's password in clear text",
+		a2aCalloutKeysName(agent): "the auth callout's key Secret %q, which signs the bus's own tokens",
+	}
 }
 
 // a2aStripNamedVolumes removes the volumes a2aReservedSourceVolumeNames found.
