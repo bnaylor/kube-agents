@@ -208,10 +208,52 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// re-run moves either number, so twenty retries would be
 			// ninety minutes of a CR reading Ready over a bus that
 			// cannot hold the concurrency it advertises.
-			name:       "a stream at the shipped cap cannot hold this CR",
-			liveJSON:   `{"name":"TASKS","max_consumers":64,"max_msgs_per_subject":4096}`,
-			wantExit:   2,
-			wantStderr: []string{"max_consumers=64", "needs 316", "nats stream edit TASKS --max-consumers=316"},
+			name:     "a stream at the shipped cap cannot hold this CR",
+			liveJSON: `{"name":"TASKS","max_consumers":64,"max_msgs_per_subject":4096}`,
+			wantExit: 2,
+			wantStderr: []string{
+				"max_consumers=64", "needs 316",
+				"stream configuration update can not change MaxConsumers",
+				"lower spec.harness.tuning.maxSessions to 16 or below",
+				"delete the TASKS stream",
+				"recreates TASKS at 316",
+				"Delete the Job to re-run it now",
+			},
+			// What this refusal must never go back to naming. It
+			// used to prescribe `nats stream edit TASKS
+			// --max-consumers=N`, and nats-server refuses that:
+			// server/stream.go answers any update that moves
+			// MaxConsumers with "stream configuration update can
+			// not change MaxConsumers", in 2.10 and 2.11 alike,
+			// and the operator pins the bus to nats:2.10-alpine.
+			// An operator who followed it got an error and a
+			// stream no wider than before.
+			//
+			// The flag and not the command, deliberately: the
+			// sibling max_msgs_per_subject report names a `nats
+			// stream edit` that IS legal, so barring the command
+			// here would bar a remedy that works.
+			notStderr: []string{"--max-consumers="},
+		},
+		{
+			// Below the reserved block, where the first way out
+			// does not exist at all. maxSessions carries
+			// +kubebuilder:validation:Minimum=1 and one session
+			// still needs 19 consumers, so no value of the field
+			// fits a stream this narrow - offering "lower
+			// maxSessions" here would be a remedy the API server
+			// refuses. The script says why, and leaves the
+			// recreate standing on its own.
+			name:     "a stream too narrow for one session offers only the recreate",
+			liveJSON: `{"name":"TASKS","max_consumers":8,"max_msgs_per_subject":4096}`,
+			wantExit: 2,
+			wantStderr: []string{
+				"max_consumers=8", "needs 316",
+				"minimum is 1, and one session still needs 19",
+				"That leaves deleting the TASKS stream",
+				"recreates TASKS at 316",
+			},
+			notStderr: []string{"So either lower", "or below", "--max-consumers="},
 		},
 		{
 			name:      "a stream sized for it passes",

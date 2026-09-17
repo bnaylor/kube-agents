@@ -1507,18 +1507,33 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
   echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
-  echo "Provisioning does not edit an existing stream. Either lower maxSessions or run:" >&2
-  echo "  nats stream edit TASKS --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + `" >&2
-  echo "  That is what a fresh render creates TASKS with, and it is never below the" >&2
-  echo "  ${required_consumers} needed here - the render floors at the cap TASKS shipped" >&2
-  echo "  with and only ever widens from it, so the two numbers differ on a small install." >&2
+  echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
+  echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
+  echo "  \"stream configuration update can not change MaxConsumers\"" >&2
+  echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
+  fits=$(( (live_consumers - ` + strconv.Itoa(a2aTasksReservedConsumers) + `) / ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` ))
+  if [ "${fits}" -ge 1 ]; then
+    echo "So either lower spec.harness.tuning.maxSessions to ${fits} or below - the most a" >&2
+    echo "  stream holding ${live_consumers} consumers has room for, with ` + strconv.Itoa(a2aTasksReservedConsumers) + ` of them reserved and" >&2
+    echo "  the rest going ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` to a session - or delete the TASKS stream and provision again." >&2
+  else
+    echo "Lowering spec.harness.tuning.maxSessions will not fit it either: the field's" >&2
+    echo "  minimum is 1, and one session still needs ` + strconv.Itoa(a2aSessionConsumersPerSession+a2aTasksReservedConsumers) + `, more than this stream holds." >&2
+    echo "  That leaves deleting the TASKS stream and provisioning again." >&2
+  fi
+  echo "This script creates every stream it does not find, and it does that before these" >&2
+  echo "  checks, so the next run recreates TASKS at ` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + `. Deleting the stream discards the" >&2
+  echo "  tasks it is holding - the 72h task history the design treats as the audit" >&2
+  echo "  substrate - which is why provisioning will not do it on an operator's behalf." >&2
+  echo "Neither way out clears this on its own: nothing re-reads the stream until this Job" >&2
+  echo "  runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will." >&2
   # Exit 2, and the convention it establishes: 2 means "this will fail the
   # same way next time", anything else is worth retrying. The Job's
   # podFailurePolicy matches on 2 and fails the Job from the first pod
   # (buildA2AProvisionJob), so a refusal nothing about a re-run can change
   # does not spend the backoffLimit before it is heard. This refusal is in
-  # that class: both numbers are fixed until an operator widens the stream
-  # or lowers maxSessions, and provisioning edits neither. Note that
+  # that class: both numbers are fixed until an operator lowers maxSessions
+  # or recreates the stream, and provisioning does neither. Note that
   # set -euo pipefail exits with the failing command's own status, which is
   # not 2, so an unexpected failure stays on the retry budget.
   exit 2
