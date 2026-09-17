@@ -1685,7 +1685,22 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				// that spawns session pods and relays no events
 				// while this very condition has gone back to
 				// Ready, which is a worse place than the refusal.
-				for _, want := range []string{"maxSessions", "delete the TASKS stream", "Delete the Job to re-run it now", "kubectl rollout restart deployment/"} {
+				//
+				// The restart is asserted as the whole command,
+				// down to the workload it names. A restart of the
+				// wrong Deployment is worse than none: the callout
+				// and the agent workload both exist and both
+				// restart cleanly, so an operator who is sent to
+				// one of those watches the command succeed, sees
+				// the relay still dead, and has no reason to
+				// suspect the instruction. Only the A2A gateway
+				// holds the relay durable.
+				for _, want := range []string{
+					"maxSessions",
+					"delete the TASKS stream",
+					"Delete the Job to re-run it now",
+					fmt.Sprintf("kubectl rollout restart deployment/%s -n %s", a2aGatewayName(agent), agent.Namespace),
+				} {
 					if !strings.Contains(state.message, want) {
 						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
 					}
