@@ -48,7 +48,7 @@ class Mutation:
 
     id: str
     path: str
-    #: (old, new) applied with str.replace, or a callable taking/returning text.
+    #: (old, new), applied as a single str.replace of the first occurrence.
     edit: tuple[str, str]
     #: Substring matching the test name that must go red.
     kills: str
@@ -402,6 +402,42 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "point the classifier's checkout at the pull request so it classifies "
         "the new rules too -- arbitrary code execution with a writable token",
+    ),
+    Mutation(
+        # The same attack as the row above, spelled so a case-sensitive filter
+        # never sees it: GitHub resolves `uses:` case-insensitively, so this
+        # runs the identical action. The test walked straight past it and
+        # reported OK until the filter was lowercased. Pins the action SHA
+        # because the flip and the ref are not contiguous otherwise -- a pin
+        # bump reports STALE here, and the fix is to paste the new SHA in.
+        "B4-pull-request-target-checkout-case",
+        ".github/workflows/risk_classify.yml",
+        ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.repository.default_branch }}",
+         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.pull_request.head.sha }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "capitalise the action name while repointing the ref, which is what a "
+        "flip that slipped through review would look like",
+    ),
+    Mutation(
+        # The third route to the same code: no action at all. `git fetch
+        # origin pull/N/head` is the checkout action's own documented manual
+        # equivalent, and a rule that reads `uses:` steps cannot see it.
+        "B4-pull-request-target-run-fetch",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          git fetch --depth=1 origin "pull/${{ github.event.number }}/head"\n'
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the pull request by hand to get around a rule that only reads "
+        "the checkout action's ref",
     ),
     Mutation(
         "B6-codeowners-bot",

@@ -87,12 +87,13 @@ One set of inputs is not registered: the group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
-is added. Every consumer of that glob answers for the empty set itself: the
-group-B allowlists go red when an expected name goes missing, C4's SHA-pin
-sweep and B4's `workflow_run` gate carry their own non-empty preconditions,
-and `_workflows()` in `test_B_write_path.py` raises on behalf of the two
-absence assertions, which an empty set would otherwise satisfy. C4 is the
-invariant; its stricter form, which
+is added. Four of the five consumers of that glob answer for the empty set
+themselves: the group-B allowlists go red when an expected name goes missing,
+and B4's `workflow_run` gate and its `pull_request_target` checkout test each
+assert their own filtered subset non-empty. The fifth asserts an absence, and
+an absence is true of the empty set, so `_workflows()` in
+`test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
+copy of the glob and guards it the same way. C4 is the invariant; its stricter form, which
 also requires the version comment beside each SHA and a digest on a `docker://`
 ref, and the fork-guard check on every auto-triggered credentialed workflow,
 run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.

@@ -25,36 +25,53 @@ import yaml
 from . import _harness as h
 from ._harness import command_policy
 
-WORKFLOWS = sorted(
+_WORKFLOWS = sorted(
     # Both extensions: GitHub Actions accepts .yaml too, and a workflow added
     # as .yaml would otherwise escape every assertion over this set silently.
     (h.REPO_ROOT / ".github" / "workflows").glob("*.y*ml")
+)
+
+# A `run:` step reaches the pull request's head without the checkout action.
+# `git fetch origin pull/N/head` is the documented way to do it by hand, and a
+# `ref:` assertion on `uses:` steps never sees it.
+_PULL_REQUEST_FETCH = (
+    # `[^\n]*?` rather than a tighter class: the ref is interpolated, and
+    # `${{ github.event.number }}` has spaces in it.
+    re.compile(r"pull/[^\n]*?/(head|merge)\b"),
+    re.compile(r"(fetch|checkout)[^\n]*pull_request\.head"),
 )
 
 
 def _workflows():
     """The workflow set, which is never legitimately empty.
 
-    Three of the five assertions reading this glob answer for an empty set
-    already: two compare it against a named allowlist and go red when the
-    expected names go missing, and the `workflow_run` deploy gate carries its
-    own non-empty precondition. The other two assert an absence, and an
-    absence is true of the empty set.
+    Four of the five assertions reading this glob answer for an empty set on
+    their own: two compare it against a named allowlist and go red when the
+    expected names go missing, and the `workflow_run` deploy gate and the
+    `pull_request_target` checkout test each carry a non-empty precondition
+    over their own filtered subset. The fifth -- B2's "no workflow approves or
+    merges a pull request" -- asserts an absence, and an absence is true of
+    the empty set.
 
-    That is not a hole in the suite. Moving `.github/workflows` reds six
-    assertions today -- C4's SHA-pin sweep keeps its own copy of this glob and
-    guards it, and `autopush-deploy.yml` is a registered `_harness.SOURCES`
-    entry, so the harness self-check goes red too. What the two absence tests
-    inherit from that is an answer to somebody else's question. This is them
-    answering their own, in the place the set is built, for the same reason
-    `_harness.text()` raises rather than returning an empty string.
+    That one is not defenceless. Moving `.github/workflows` reds most of this
+    file anyway: C4's SHA-pin sweep keeps its own copy of this glob and guards
+    it, and `autopush-deploy.yml` is a registered `_harness.SOURCES` entry, so
+    the harness self-check goes red too. But what B2 inherits from that is an
+    answer to somebody else's question, and the count of neighbours that
+    happen to catch it is not a thing to depend on -- it changed twice while
+    this branch was in review. This is B2 answering its own question, in the
+    place the set is built, for the same reason `_harness.text()` raises
+    rather than returning an empty string.
+
+    The name is private so that the guard is the only route to the set: an
+    assertion that reaches for the module global skips it silently.
     """
-    if not WORKFLOWS:
+    if not _WORKFLOWS:
         raise AssertionError(
             f"no workflows matched {h.REPO_ROOT / '.github' / 'workflows'}/*.y*ml; "
             "the glob is wrong"
         )
-    return WORKFLOWS
+    return _WORKFLOWS
 
 
 def _workflow_documents():
@@ -377,7 +394,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
-        third holder is a red test and a conversation rather than a silent
+        seventh holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow.
         """
         holders = []
@@ -544,12 +561,19 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         with no `ref:` defaults to the PR merge commit on this trigger, which
         is the exact failure.
 
-        The filter is asserted non-empty for the same reason B4's
+        Both filters are asserted non-empty for the same reason B4's
         `workflow_run` gate asserts its own: this test says nothing at all
-        about a repository with no `pull_request_target` workflows, so it
-        cannot tell "the trigger is gone" from "the parse stopped seeing it".
-        Three workflows carry the trigger today. If that reaches zero the test
-        should be read again, not passed by default.
+        about a repository with no `pull_request_target` workflows, or one
+        where none of them checks anything out, so it cannot tell "the trigger
+        is gone" from "the parse stopped seeing it". Three workflows carry the
+        trigger today and two of them run a checkout. If either reaches zero
+        the test should be read again, not passed by default.
+
+        The `run:` half is a named-shape check rather than a proof. A shell
+        script can fetch a ref any number of ways and no assertion over YAML
+        will catch all of them. It covers the shape the checkout action's own
+        docs give for doing this by hand, which is the one somebody reaches
+        for when the `ref:` rule above sends them looking for a way around it.
         """
         consumers = [
             (path, document)
@@ -561,24 +585,36 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
             "no pull_request_target workflows found; the filter is wrong",
         )
 
+        saw_a_checkout = False
         for path, document in consumers:
             with self.subTest(workflow=path.name):
                 for job in (document.get("jobs") or {}).values():
                     for step in (job or {}).get("steps") or []:
-                        uses = str((step or {}).get("uses", ""))
-                        if not uses.startswith("actions/checkout"):
-                            continue
-                        ref = str(((step or {}).get("with") or {}).get("ref", ""))
-                        self.assertTrue(
-                            ref,
-                            "a checkout on pull_request_target with no ref: "
-                            "checks out the pull request's merge commit",
-                        )
-                        for fragment in ("pull_request", "head", "merge"):
-                            self.assertNotIn(
-                                fragment,
+                        # GitHub resolves `uses:` case-insensitively, so this
+                        # match has to be too. `Actions/checkout` runs the same
+                        # action and would otherwise walk past the filter.
+                        uses = str((step or {}).get("uses", "")).lower()
+                        if uses.startswith("actions/checkout"):
+                            saw_a_checkout = True
+                            ref = str(((step or {}).get("with") or {}).get("ref", ""))
+                            self.assertTrue(
                                 ref,
-                                "the checkout ref derives from the pull request",
+                                "a checkout on pull_request_target with no ref: "
+                                "checks out the pull request's merge commit",
+                            )
+                            for fragment in ("pull_request", "head", "merge"):
+                                self.assertNotIn(
+                                    fragment,
+                                    ref,
+                                    "the checkout ref derives from the pull request",
+                                )
+                        script = str((step or {}).get("run", ""))
+                        for pattern in _PULL_REQUEST_FETCH:
+                            self.assertIsNone(
+                                pattern.search(script),
+                                f"{path.name}: a run: step fetches the pull "
+                                "request's head, which is the checkout action's "
+                                "hazard without the checkout action",
                             )
                 for scope in [document.get("permissions") or {}] + [
                     (job or {}).get("permissions") or {}
@@ -587,6 +623,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                     if isinstance(scope, dict):
                         self.assertNotEqual("write", scope.get("contents"))
                         self.assertNotEqual("write", scope.get("id-token"))
+        self.assertTrue(
+            saw_a_checkout,
+            "no pull_request_target workflow runs a checkout step any more; "
+            "the ref half of this test examined nothing",
+        )
 
     def test_B4_contents_write_is_confined_to_the_release_path(self) -> None:
         """The credential that can push to this repository, and where it lives.
