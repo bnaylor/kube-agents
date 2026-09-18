@@ -42,12 +42,17 @@ const (
 	// taught to read as a missing grant.
 	//
 	// Widening the grant instead is the fix that suggests itself, and it is
-	// worse than the leak it closes. DELETE.TASKS.* is not scoped to the
-	// consumers its holder created, so it would hand everything carrying the
-	// bridge password delete on any consumer on TASKS, the gateway's own
-	// gateway-relay durable included; sessionConsumer in the worker adapter
-	// makes the same argument at length for MSG.NEXT. Reclaim the slot
-	// sooner by shortening this constant, not by adding a delete or a grant.
+	// worse than the leak it closes. A wildcard is the only form on offer:
+	// nats.go names an ordered consumer <prefix>_<serial> and bumps the
+	// serial on every reset (v1.53.1, jetstream/ordered.go:629), so no
+	// exact-name grant can cover one. And DELETE.TASKS.* is a wildcard over
+	// consumer names, not over the consumers its holder created, so it would
+	// hand everything carrying the bridge password delete on any consumer on
+	// TASKS -- the gateway's own gateway-relay durable included. That is the
+	// same argument sessionConsumer makes for MSG.NEXT in the worker adapter
+	// (adapter.go:801), and the stated reason the adapter uses named
+	// consumers rather than ordered ones. Reclaim the slot sooner by
+	// shortening this constant, not by adding a delete or a grant.
 	EphemeralConsumerInactiveThreshold = 5 * time.Second
 )
 
