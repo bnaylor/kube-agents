@@ -43,6 +43,11 @@ const (
 	replayStreamSubjects     = "a2a.tasks.>"
 	replayStreamMaxAge       = 72 * time.Hour
 	replayStreamMaxConsumers = 64
+	// permissionsViolation is how nats.go spells a refused publish on the
+	// connection's async error handler. Matching the prefix rather than a
+	// whole line keeps the count subject-agnostic, which is the point.
+	permissionsViolation = "Permissions Violation"
+
 	// replayAdminTimeout bounds each admin-side call (provision, list). It is
 	// per call, not per test: the poll loops below run longer than one of them.
 	replayAdminTimeout = 5 * time.Second
@@ -263,6 +268,15 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 // that one to show up. Refusals arrive in the order the publishes left, so
 // the control line landing is the barrier: anything the replay itself was
 // refused is already in the buffer by then.
+//
+// The assertion is over every violation in the buffer, not over
+// CONSUMER.DELETE alone. DELETE is the subject this change is about, but it
+// is not the only one the grant withholds, and TasksGet's request path is
+// wider than the ordered consumer: the horizon read ahead of it emits
+// STREAM.INFO and a direct get, and a nats.go bump could add a CONSUMER.INFO
+// or CONSUMER.NAMES to either half. Counting the violations catches all of
+// that, and costs nothing over checking one subject, because the control
+// refusal already tells us exactly how many there should be.
 func TestTasksGet_EmitsNothingTheBridgeGrantRefuses(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
@@ -292,12 +306,16 @@ func TestTasksGet_EmitsNothingTheBridgeGrantRefuses(t *testing.T) {
 	}
 	waitFor(t, logWithin, "the control refusal to reach the async error handler", func() bool {
 		out := logs.String()
-		return strings.Contains(out, "Permissions Violation") && strings.Contains(out, replayControlSubj)
+		return strings.Contains(out, permissionsViolation) && strings.Contains(out, replayControlSubj)
 	})
 
 	out := logs.String()
-	if strings.Contains(out, "CONSUMER.DELETE") {
-		t.Fatalf("TasksGet was refused a CONSUMER.DELETE under the bridge grant; the log line operators read as a missing grant is now one per tasks/get:\n%s", out)
+	if n := strings.Count(out, permissionsViolation); n != 1 {
+		t.Fatalf("%d %q lines on the reader's connection, want exactly 1 (the control publish on %s); every extra one is a subject TasksGet emitted that the bridge grant withholds, and an Error line per tasks/get on a real install:\n%s",
+			n, permissionsViolation, replayControlSubj, out)
+	}
+	if !strings.Contains(out, replayControlSubj) {
+		t.Fatalf("the one %q line does not name %s, so it is not the control refusal and TasksGet emitted it:\n%s", permissionsViolation, replayControlSubj, out)
 	}
 	t.Logf("client log after the replay, with a known refusal appended as the barrier:\n%s", out)
 }
