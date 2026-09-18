@@ -1,5 +1,6 @@
 import argparse
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -253,8 +254,17 @@ class AgentAPIProxyTest(unittest.TestCase):
                 ("127.0.0.1", self.proxy.server_port),
                 timeout=_STALLED_CLIENT_READ_TIMEOUT_SECONDS,
             ) as client:
-                client.sendall(request)
+                # The clock starts before the request leaves, not after. The
+                # server's drain window opens once it has read the partial body,
+                # and that can happen before sendall returns to this thread: the
+                # bytes reach the kernel inside sendall, and the server thread can
+                # wake, parse, and block in its timed read first. A clock started
+                # here precedes the bytes leaving this socket, so elapsed brackets
+                # whatever window the server enforced. Started after sendall it
+                # could sit inside that window, and a loaded runner read 0.2495
+                # against the 0.25 deadline (#1740).
                 started = time.monotonic()
+                client.sendall(request)
                 status = self._read_status_line(client)
                 elapsed = time.monotonic() - started
         self.assertIn(b"401", status)
@@ -1696,6 +1706,87 @@ class GitHardeningTest(unittest.TestCase):
         fake_git = fake_sub / ".git"
         fake_git.write_text("gitdir: ../.git\n" + "y" * 8192, encoding="utf-8")
         self.assertEqual(_find_repo_root(fake_sub), repo_alias)
+
+    def test_the_push_remote_cannot_name_a_head_file_outside_refs_remotes(self):
+        # CodeQL alert #38, py/path-injection. The `<repository>` argument of
+        # `git push` went into `refs/remotes/<repository>/HEAD` unchecked, so
+        # a path in that slot read a file of the agent's choosing and the gate
+        # took whatever branch it named as the remote's default. Verified on
+        # the pre-fix module with the files below planted: each of the five
+        # traversals lands on one of them, and each turned `HEAD:feature` into
+        # a refused push.
+        from credential_proxy import (
+            _detect_repo_default_branch,
+            _is_git_remote_name,
+            _remote_head_path,
+            git_push_violation,
+        )
+
+        executor = self.executor()
+        repo = self.repository(executor)
+        remotes = repo / ".git" / "refs" / "remotes"
+        for name, head in (("origin", "release-trunk"), ("upstream", "trunk")):
+            (remotes / name).mkdir(parents=True)
+            (remotes / name / "HEAD").write_text(
+                f"ref: refs/remotes/{name}/{head}\n", encoding="utf-8"
+            )
+        outside = Path(self.temp_dir.name) / "planted"
+        for planted in (
+            outside / "HEAD",  # `../../../../planted` and the absolute path
+            repo / ".git" / "refs" / "HEAD",  # `..`
+            repo / ".git" / "refs" / "planted" / "HEAD",  # `origin/../../planted`, `team/../../planted`
+        ):
+            planted.parent.mkdir(parents=True, exist_ok=True)
+            planted.write_text("ref: refs/heads/feature\n", encoding="utf-8")
+
+        traversal = os.path.relpath(outside, remotes)
+        for remote in (traversal, str(outside), "..", "origin/../../planted", "team/../../planted"):
+            with self.subTest(remote=remote):
+                self.assertIsNone(_remote_head_path(remotes, remote))
+                # Not looked up, so origin decides -- not the planted file.
+                self.assertEqual(_detect_repo_default_branch(repo, remote), "release-trunk")
+                self.assertIsNone(
+                    git_push_violation(["git", "push", remote, "HEAD:feature"], cwd=repo)
+                )
+
+        # A remote name still reads its own tracking HEAD, origin included.
+        self.assertEqual(_remote_head_path(remotes, "upstream"), remotes / "upstream" / "HEAD")
+        self.assertEqual(_detect_repo_default_branch(repo, "upstream"), "trunk")
+        self.assertIn(
+            "protected branch 'trunk'",
+            git_push_violation(["git", "push", "upstream", "HEAD:trunk"], cwd=repo) or "",
+        )
+        self.assertIn(
+            "protected branch 'release-trunk'",
+            git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=repo) or "",
+        )
+        # A URL in the repository slot has no tracking HEAD and is judged
+        # against origin, as it was before.
+        self.assertIn(
+            "protected branch 'release-trunk'",
+            git_push_violation(
+                ["git", "push", "https://example.invalid/acme/fleet.git", "HEAD:release-trunk"],
+                cwd=repo,
+            )
+            or "",
+        )
+
+        # The pre-check is thin on purpose -- containment is the sink's job --
+        # so every name git accepts is still looked up, slash-named remotes and
+        # the ones an ASCII allowlist would have dropped included.
+        for accepted in ("origin", "upstream", "my-fork_2", "fork.v2", "gh+fork", "my@fork", "fôrk", "team/upstream"):
+            self.assertTrue(_is_git_remote_name(accepted), accepted)
+        for refused in ("", ".", "..", "a\\b", "a\0b"):
+            self.assertFalse(_is_git_remote_name(refused), repr(refused))
+        # And those names keep their protection: each resolves its own HEAD.
+        for name, head in (("gh+fork", "plus-trunk"), ("team/upstream", "team-trunk")):
+            (remotes / name).mkdir(parents=True)
+            (remotes / name / "HEAD").write_text(f"ref: refs/remotes/{name}/{head}\n", encoding="utf-8")
+            self.assertEqual(_remote_head_path(remotes, name), remotes / name / "HEAD")
+            self.assertIn(
+                f"protected branch '{head}'",
+                git_push_violation(["git", "push", name, f"HEAD:{head}"], cwd=repo) or "",
+            )
 
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease
@@ -6870,6 +6961,301 @@ class ChatRelaySubscriptionsTest(unittest.TestCase):
                 credential_proxy.chat_relay_subscriptions("q"),
                 ("chat-sub", "projects/p/subscriptions/chat-sub"),
             )
+
+class RepositoryRoleTest(unittest.TestCase):
+    """Which list a repository is in decides what its clone presents, and nothing else."""
+
+    def setUp(self):
+        # Both lists are cached for thirty seconds; each test here reads its own.
+        for attribute in ("_managed_repository_cache", "_context_repository_cache"):
+            patcher = mock.patch.object(credential_proxy, attribute, None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _lists(self, managed=(), context=()):
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch("gitops_workspace.get_managed_github_repos", return_value=list(managed))
+        )
+        stack.enter_context(
+            mock.patch("gitops_workspace.get_context_github_repos", return_value=list(context))
+        )
+        return stack
+
+    def test_managed_wins_context_is_second_and_neither_is_unregistered(self):
+        with self._lists(managed=["acme/gitops"], context=["acme/gitops", "acme/tf-live"]):
+            self.assertEqual("managed", credential_proxy.repository_role("acme/gitops"))
+            # Case-insensitive on both sides, as `repository_is_managed` is.
+            self.assertEqual("context", credential_proxy.repository_role("Acme/TF-Live"))
+            self.assertEqual("unregistered", credential_proxy.repository_role("someone/else"))
+
+    def test_an_unreadable_context_list_raises_rather_than_answering(self):
+        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=[]):
+            with mock.patch(
+                "gitops_workspace.get_context_github_repos",
+                side_effect=RuntimeError("kubectl exited 1"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    credential_proxy.repository_role("acme/tf-live")
+
+    def test_the_write_gate_and_the_refresh_route_never_see_the_context_list(self):
+        """The property the issue asked to keep: a context repository stays unwritable.
+
+        `repository_is_managed` is the only question every write path asks,
+        and it reads `managed_repos` alone. A repository registered only under
+        `context_repos` is therefore refused by `commit`, `push`, the API
+        routes and `/v1/forge/refresh` exactly as an unregistered one is --
+        with a token for it now existing in the minter, which is why this is
+        worth a test rather than an assumption.
+        """
+        import content_workspace
+
+        with self._lists(managed=["acme/gitops"], context=["acme/tf-live"]):
+            self.assertFalse(credential_proxy.repository_is_managed("acme/tf-live"))
+            self.assertEqual("context", credential_proxy.repository_role("acme/tf-live"))
+
+            # commit / push: the workspace gate reads the repository off the handle.
+            store = mock.Mock()
+            store.get.return_value = mock.Mock(repo="acme/tf-live")
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                credential_proxy.require_managed_workspace(store, "h")
+
+            # The API routes and the refresh route share one gate.
+            handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+            handler.replies = []
+            handler._json = lambda status, payload: handler.replies.append((status, payload))
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertFalse(handler._repository_is_permitted("acme/tf-live"))
+            status, payload = handler.replies[0]
+            self.assertEqual(HTTPStatus.FORBIDDEN, status)
+            self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
+
+            # The write token's refresh is refused before the helper runs.
+            executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+            executor.execute_internal = lambda argv: self.fail("helper was run")
+            with self.assertRaises(PermissionError):
+                executor.refresh_forge_credential("github", "acme/tf-live")
+
+            # Paired: the managed repository passes every one of them.
+            self.assertTrue(credential_proxy.repository_is_managed("acme/gitops"))
+            store.get.return_value = mock.Mock(repo="acme/gitops")
+            credential_proxy.require_managed_workspace(store, "h")
+            self.assertTrue(handler._repository_is_permitted("acme/gitops"))
+
+
+class ReadCredentialMintTest(unittest.TestCase):
+    """The read-only mint: admitted by role, spelled with the helper's flag, token never logged."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        helpers = Path(self.temp_dir.name)
+        (helpers / "github_token_refresh.py").write_text("#!/usr/bin/env python3\n")
+        patcher = mock.patch.object(credential_proxy, "FORGE_REFRESH_HELPER_DIR", str(helpers))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _result(exit_code, stdout="", stderr=""):
+        return credential_proxy.ExecutionResult(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=5,
+            truncated=False,
+            timed_out=False,
+        )
+
+    def _executor(self, result=None):
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.calls = []
+
+        def run(argv):
+            executor.calls.append(list(argv))
+            return result
+
+        executor.execute_internal = run
+        return executor
+
+    def test_only_a_context_repository_is_minted_for(self):
+        # A managed repository has the write credential and must keep riding
+        # it; an unregistered one gets no credential of either kind. Neither
+        # reaches the helper.
+        for role in ("managed", "unregistered"):
+            with self.subTest(role=role):
+                executor = self._executor()
+                with mock.patch.object(credential_proxy, "repository_role", return_value=role):
+                    with self.assertRaises(PermissionError):
+                        executor.mint_read_credential("github", "acme/gitops")
+                self.assertEqual([], executor.calls)
+
+        # Paired: a context repository runs the helper in read-only mode and
+        # the token comes back from stdout, whitespace and all.
+        token = "ghs_" + "A" * 36
+        executor = self._executor(self._result(0, stdout=token + "\n"))
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            self.assertEqual(token, executor.mint_read_credential("github", "acme/tf-live"))
+        (argv,) = executor.calls
+        self.assertTrue(argv[0].endswith("/github_token_refresh.py"), argv)
+        self.assertEqual(["--read-only", "acme/tf-live"], argv[1:])
+
+    def test_the_flag_is_the_one_the_helper_parses(self):
+        # Two copies of one string, kept in step here because the broker
+        # cannot import the helper for it without importing its CLI side.
+        import github_token_refresh
+
+        self.assertEqual(github_token_refresh.READ_ONLY_FLAG, credential_proxy.FORGE_READ_ONLY_FLAG)
+
+    def test_a_failed_mint_logs_the_detail_redacted_and_raises_without_it(self):
+        token = "ghs_" + "B" * 36
+        executor = self._executor(
+            self._result(1, stderr=f"Minty returned error (HTTP 403): echoed {token}\n")
+        )
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                with self.assertRaises(RuntimeError) as raised:
+                    executor.mint_read_credential("github", "acme/tf-live")
+        self.assertEqual("read-only credential mint failed", str(raised.exception))
+        self.assertIn("HTTP 403", logs.output[0])
+        self.assertNotIn(token, logs.output[0])
+        self.assertIn("[REDACTED]", logs.output[0])
+
+    def test_an_empty_token_is_a_failure_not_a_credential(self):
+        executor = self._executor(self._result(0, stdout="  \n"))
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertRaises(RuntimeError):
+                executor.mint_read_credential("github", "acme/tf-live")
+
+    def test_a_provider_name_cannot_reach_out_of_the_helper_directory(self):
+        executor = self._executor()
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            for provider in ("../../bin/sh", "git hub", "", "GitHub"):
+                with self.subTest(provider=provider):
+                    with self.assertRaises(ValueError):
+                        executor.mint_read_credential(provider, "acme/tf-live")
+        self.assertEqual([], executor.calls)
+
+    def test_an_absent_helper_is_a_refusal(self):
+        executor = self._executor()
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertRaises(RuntimeError):
+                executor.mint_read_credential("gitlab", "acme/tf-live")
+        self.assertEqual([], executor.calls)
+
+
+class ReadCredentialSelectionTest(unittest.TestCase):
+    """What the store is handed per role, and how it reaches git."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def test_only_a_context_repository_gets_a_credential(self):
+        registry = providers.Registry({"mint": lambda provider, repo: "token"})
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
+        self.assertIsInstance(credential, providers.MintedReadCredential)
+        self.assertIn("repo=acme/tf-live role=context", logs.output[0])
+        for role in ("managed", "unregistered"):
+            with self.subTest(role=role):
+                with mock.patch.object(credential_proxy, "repository_role", return_value=role):
+                    with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                        credential = credential_proxy.read_credential_for(registry, "acme/x")
+                self.assertIsInstance(credential, providers.NoCredential)
+                self.assertIn(f"role={role}", logs.output[0])
+
+    def test_an_unreadable_list_means_no_credential_not_a_refusal(self):
+        # `open` has no gate by design; a ConfigMap read that failed must not
+        # take `inspect-repository` away from every public repository.
+        registry = providers.Registry({"mint": lambda provider, repo: "token"})
+        with mock.patch.object(
+            credential_proxy, "repository_role", side_effect=RuntimeError("kubectl exited 1")
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
+        self.assertIsInstance(credential, providers.NoCredential)
+        self.assertIn("role=unknown", logs.output[0])
+
+    def _executor(self):
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+            return CommandExecutor(
+                timeout_seconds=10,
+                max_output_bytes=1 << 16,
+                state_dir=str(Path(self.temp_dir.name) / "state"),
+            )
+
+    def test_the_store_the_broker_builds_mints_through_the_executor(self):
+        executor = self._executor()
+        store = credential_proxy.build_workspace_store(executor)
+        minted = []
+
+        def mint(provider, repository):
+            minted.append((provider, repository))
+            return "s3cret"
+
+        executor.mint_read_credential = mint
+        # Bound at construction: the registry was built with the executor's
+        # method, so swapping the attribute afterwards must not matter for the
+        # property under test -- rebuild to pick the stub up.
+        store = credential_proxy.build_workspace_store(executor)
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            credential = store._credential_for("acme/tf-live")
+        credential.ensure("acme/tf-live")
+        self.assertEqual([("github", "acme/tf-live")], minted)
+        config = dict(credential.git_config("acme/tf-live"))
+        header = config["http.https://github.com/.extraheader"]
+        self.assertEqual(
+            "x-access-token:s3cret",
+            base64.b64decode(header.split()[-1]).decode("utf-8"),
+        )
+        self.assertEqual("", config["credential.helper"])
+
+    def test_the_workspace_git_path_carries_the_credential_layer_ahead_of_the_pins(self):
+        executor = self._executor()
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/bash\nenv\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        tree = executor.content_workspace_root / "repo"
+        tree.mkdir(parents=True, exist_ok=True)
+
+        def environment(config=()):
+            result = executor.execute_workspace_git(
+                ["git", "rev-parse", "HEAD"], tree, config=config
+            )
+            self.assertEqual(0, result.exit_code, result.stderr)
+            self.assertFalse(result.truncated)
+            return dict(
+                line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+            )
+
+        def layer(env):
+            count = int(env["GIT_CONFIG_COUNT"])
+            return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
+
+        credential = (
+            ("http.https://github.com/.extraheader", "AUTHORIZATION: basic eDp5"),
+            ("credential.helper", ""),
+        )
+        with_credential = layer(environment(credential))
+        self.assertEqual(list(credential), with_credential[:2])
+        self.assertEqual("core.hooksPath", with_credential[2][0])
+        self.assertEqual(
+            list(credential_proxy.GIT_FORCED_CONFIG), with_credential[3:],
+            "the forced pins must follow the credential so they still win",
+        )
+        # The token is in the environment of that one process and nowhere in
+        # its argv.
+        self.assertNotIn("eDp5", " ".join(environment(credential).get("_", "")))
+
+        # Paired: with nothing to add, the layer is exactly what it always was.
+        without = layer(environment())
+        self.assertEqual("core.hooksPath", without[0][0])
+        self.assertEqual(list(credential_proxy.GIT_FORCED_CONFIG), without[1:])
+        self.assertNotIn("http.https://github.com/.extraheader", dict(without))
 
 if __name__ == "__main__":
     unittest.main()
