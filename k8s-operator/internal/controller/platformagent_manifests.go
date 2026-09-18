@@ -2105,13 +2105,12 @@ func stripVolumeMountsNamed(mounts []corev1.VolumeMount, dropped map[string]bool
 }
 
 // stripContainerMountsNamed is stripVolumeMountsNamed over a list of
-// containers. The len check is not for speed alone: with nothing dropped this
-// hands back the CR's own container slice, which is what a clean CR rendering
-// unchanged depends on.
+// containers. An empty dropped set needs no guard here: no mount matches, so
+// stripContainerMountsMatching hands back the CR's own container slice, which
+// is what a clean CR rendering unchanged depends on. An earlier version of
+// this carried a len check and a comment crediting it with that, which the
+// callee does anyway.
 func stripContainerMountsNamed(containers []corev1.Container, dropped map[string]bool) []corev1.Container {
-	if len(dropped) == 0 {
-		return containers
-	}
 	return stripContainerMountsMatching(containers, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
 }
 
@@ -2158,11 +2157,27 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// the surface for the same reason the plugin env drop is: on a today
 	// install there is no such volume, and dropping a name only the next stack
 	// cares about would be one more way to tell the feature exists.
+	//
+	// Two halves. The name half takes the reserved volume name. The source
+	// half takes any user volume that would deliver the same credential under
+	// another name -- a serviceAccountToken projection for the bus audience,
+	// or the credentials Secret -- and every mount naming it, because a mount
+	// with no volume is a Deployment the API server refuses. Neither half is a
+	// boundary against a hostile sidecar: KSA tokens are pod-scoped and the
+	// callout cannot tell which container presented one. Both are a guard
+	// against a misconfiguration by the CR's author, and are worth having on
+	// those terms -- see a2aBusCredentialVolumeNames.
 	if a2aAgentSurface(agent) {
 		initContainers = a2aStripBusTokenMounts(initContainers)
 		sidecars = a2aStripBusTokenMounts(sidecars)
 		sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
 		extraVolumes = a2aStripBusTokenVolume(extraVolumes)
+
+		droppedSources := a2aBusCredentialVolumeNames(agent)
+		initContainers = stripContainerMountsNamed(initContainers, droppedSources)
+		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
+		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
+		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
 	}
 
 	homeDir := "/opt/data"
@@ -3981,8 +3996,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// Gated on the surface for the same reason the strips up there are: on a
 	// today install there is no such volume, and dropping a name only the next
 	// stack cares about would be one more way to tell the feature exists.
+	// The source half of the same reservation takes the mounts of any user
+	// volume buildPodTemplateSpec dropped for what it projects or which
+	// Secret it names; see a2aBusCredentialVolumeNames.
 	if a2aAgentSurface(agent) {
 		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
+		extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, a2aBusCredentialVolumeNames(agent))
 	}
 
 	resources := resolveResources(agent.Spec.Deployment)

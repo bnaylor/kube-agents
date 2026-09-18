@@ -105,8 +105,10 @@ const (
 	// default ServiceAccount token already carries — so without this the bus
 	// would accept any readable token in the cluster as proof of that pod's
 	// identity. Bound to a dedicated audience, the only tokens it accepts
-	// are ones minted for it by a projected volume that names it.
-	a2aBusTokenAudience = "a2a-bus"
+	// are ones minted for it by a projected volume that names it. Spelled in
+	// the API package so the validating webhook refuses a user volume that
+	// projects the same audience; see agentv1alpha1.BusCredentialRoutes.
+	a2aBusTokenAudience = agentv1alpha1.A2ABusTokenAudience
 
 	// a2aBusTokenPath is where every bus client finds its projected token.
 	a2aBusTokenPath      = "/var/run/secrets/a2a-bus" // #nosec G101 -- Mount path, not a credential
@@ -173,10 +175,11 @@ func a2aBusTokenVolumeMount() corev1.VolumeMount {
 // so an unreachable webhook admits the object with validation skipped. The
 // webhook's refusal is what tells the author why; this is what holds.
 //
-// Name-matched, and only that: a user volume projecting the same audience
-// under another name reaches a sidecar untouched by this and by the webhook
-// both. ReservedVolumeNames carries what that does and does not buy;
-// gke-labs#1667 carries the source check that closes it.
+// Name-matched, and only that. The source-matched half -- a user volume
+// projecting the same audience under another name, or mounting the
+// credentials Secret -- is a2aStripBusCredentialSources and the mount strips
+// beside it, below. ReservedVolumeNames carries what the pair does and does
+// not buy.
 //
 // The input slices belong to the CR, so the copy stripContainerMountsMatching
 // makes is not incidental.
@@ -218,6 +221,63 @@ func a2aStripBusTokenVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMo
 func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
 	return stripMatching(volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume })
 }
+
+// a2aBusCredentialVolumeNames is the set of user-authored volumes, on both of
+// the CR's volume lists, whose SOURCE would deliver the bus credential to
+// whichever container mounts them: a projected serviceAccountToken for the
+// bus audience under any name, or one of the Secrets the operator renders
+// with bus credentials in them (agentv1alpha1.BusCredentialRoutes has the two
+// routes, the three Secrets, and why env is not among them). It is
+// what the mount strips below key on, and it is empty for a CR that carries
+// neither, in which case every strip below returns its input unchanged. A
+// pure function of the CR, so buildBaseContainers recomputes it rather than
+// taking a parameter.
+//
+// This is a guard against a misconfiguration by the CR's author, who is the
+// platform operator, and not a boundary against a hostile sidecar: KSA tokens
+// are pod-scoped and the callout cannot tell which container presented one.
+// Reading the reservation as stronger than that was the defect in the
+// name-only version above (gke-labs#1667).
+//
+// Silent, like a2aStripBusTokenVolume: the webhook's field.Forbidden is what
+// tells the author why, and this is what holds when admission did not run.
+func a2aBusCredentialVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
+	if agent.Spec.Deployment == nil {
+		return nil
+	}
+	var names map[string]bool
+	for _, list := range [][]corev1.Volume{agent.Spec.Deployment.SidecarVolumes, agent.Spec.Deployment.ExtraVolumes} {
+		for _, v := range list {
+			if len(agentv1alpha1.BusCredentialRoutes(v, agent.Name)) == 0 {
+				continue
+			}
+			if names == nil {
+				names = map[string]bool{}
+			}
+			names[v.Name] = true
+		}
+	}
+	return names
+}
+
+// a2aStripBusCredentialSources removes the volumes a2aBusCredentialVolumeNames
+// describes from one of the CR's volume lists. The operator's own projection
+// never passes through here -- buildPodTemplateSpec appends
+// a2aBusTokenVolumeSource to the pod separately -- so the only volumes this
+// can drop are the author's.
+func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []corev1.Volume {
+	return stripMatching(volumes, func(v corev1.Volume) bool {
+		return len(agentv1alpha1.BusCredentialRoutes(v, agentName)) > 0
+	})
+}
+
+// The two mount strips that used to live here -- one over a bare mount list,
+// one over a list of containers -- were character-for-character
+// stripVolumeMountsNamed and stripContainerMountsNamed in
+// platformagent_manifests.go. They were written separately because
+// gke-labs#1675 had not landed yet. The callers use those two directly now;
+// what is bus-specific is the name set a2aBusCredentialVolumeNames builds, not
+// the removal.
 
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
 // a bus identity: the callout authenticates to NATS with a password, because it
