@@ -37,9 +37,9 @@ def _workflows():
 
     Three of the five assertions reading this glob answer for an empty set
     already: two compare it against a named allowlist and go red when the
-    expected names go missing, and `every_workflow_run_deploy_gates_on_
-    repository_and_branch` carries its own non-empty precondition. The other
-    two assert an absence, and an absence is true of the empty set.
+    expected names go missing, and the `workflow_run` deploy gate carries its
+    own non-empty precondition. The other two assert an absence, and an
+    absence is true of the empty set.
 
     That is not a hole in the suite. Moving `.github/workflows` reds six
     assertions today -- C4's SHA-pin sweep keeps its own copy of this glob and
@@ -548,7 +548,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `workflow_run` gate asserts its own: this test says nothing at all
         about a repository with no `pull_request_target` workflows, so it
         cannot tell "the trigger is gone" from "the parse stopped seeing it".
-        Four workflows carry the trigger today. If that reaches zero the test
+        Three workflows carry the trigger today. If that reaches zero the test
         should be read again, not passed by default.
         """
         consumers = [
