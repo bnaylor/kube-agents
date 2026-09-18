@@ -10,6 +10,11 @@ decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 the dashboard's Brief bakes that verdict and its history (`render.py --health`,
 `--health-history`; the checkout is fetched with full history for the Brief's
 "what changed right before" block).
+The Brief's "What the agent saw" also quotes the agent's own words:
+`bench-gate case` prints the first 300 characters of each failing
+repetition's final report under its grading line (`rep N report:`), the
+collector keeps it as `reps[].excerpt`, and the Brief and the run page show
+it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
@@ -320,8 +325,8 @@ per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
 grant #1238 gave the presubmit's identity — and nothing on the project itself.
 The grant lives on the service account resource, so it is per project by
 nature (the pool projects sit directly under the organisation, with no folder
-to grant on). `bench/tf/fleet`'s `fleet_reader_token_creators` defaults to both
-identities, so an apply of the fleet stack in a project grants it; for projects
+to grant on). `bench/tf/fleet`'s `fleet_reader_token_creators` defaults to the bot
+beside both runners, so an apply of the fleet stack in a project grants it; for projects
 applied before that default, the repair is one command per project:
 
 ```bash
