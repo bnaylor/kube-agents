@@ -2030,49 +2030,45 @@ func hostPathVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
 	return names
 }
 
-// stripHostPathVolumes returns volumes without the entries whose source is a
-// hostPath. The input is returned as-is when there is nothing to drop.
-func stripHostPathVolumes(volumes []corev1.Volume) []corev1.Volume {
-	if !slices.ContainsFunc(volumes, func(v corev1.Volume) bool { return v.HostPath != nil }) {
-		return volumes
+// stripMatching returns s without the elements drop reports true for, and
+// returns s itself when drop matches none of them.
+//
+// One helper rather than a filter loop per reservation. buildPodTemplateSpec
+// now applies two of them to the same four user-authored lists -- the hostPath
+// source strip below and the bus-token name strip from gke-labs#1653 -- and
+// gke-labs#1667 adds a third; written out longhand they were the same fourteen
+// lines with the predicate swapped, and the interesting part of each is the
+// predicate and the comment above it.
+//
+// Not slices.DeleteFunc, which compacts in place. Every caller here is
+// filtering a list that came off the manager's cached copy of the CR, so
+// rewriting the backing array would edit the informer's object underneath
+// every other reader of it. Returning the input unchanged when there is
+// nothing to drop is what keeps a clean CR rendering the same bytes it always
+// did, and keeps the cost of a reservation nobody tripped at one scan.
+func stripMatching[E any](s []E, drop func(E) bool) []E {
+	if !slices.ContainsFunc(s, drop) {
+		return s
 	}
-	keep := make([]corev1.Volume, 0, len(volumes))
-	for _, vol := range volumes {
-		if vol.HostPath != nil {
+	keep := make([]E, 0, len(s))
+	for _, e := range s {
+		if drop(e) {
 			continue
 		}
-		keep = append(keep, vol)
+		keep = append(keep, e)
 	}
 	return keep
 }
 
-// stripVolumeMountsNamed returns mounts without the entries naming a volume in
-// dropped. The input is returned as-is when nothing in it is named there.
-func stripVolumeMountsNamed(mounts []corev1.VolumeMount, dropped map[string]bool) []corev1.VolumeMount {
-	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return dropped[m.Name] }) {
-		return mounts
-	}
-	keep := make([]corev1.VolumeMount, 0, len(mounts))
-	for _, m := range mounts {
-		if dropped[m.Name] {
-			continue
-		}
-		keep = append(keep, m)
-	}
-	return keep
-}
-
-// stripContainerMountsNamed applies stripVolumeMountsNamed to every container
-// in the list. The containers come straight off the CR, which is the manager's
-// cached copy, so a container whose mounts change is copied rather than edited
-// in place; the input slice is returned as-is when no container is affected.
-func stripContainerMountsNamed(containers []corev1.Container, dropped map[string]bool) []corev1.Container {
-	if len(dropped) == 0 {
-		return containers
-	}
+// stripContainerMountsMatching applies stripMatching to the volumeMounts of
+// every container in the list. A container whose mounts change is copied
+// rather than edited in place, for stripMatching's reason -- these containers
+// are the CR's own, off the cache -- and the input slice is returned as-is
+// when no container is affected.
+func stripContainerMountsMatching(containers []corev1.Container, drop func(corev1.VolumeMount) bool) []corev1.Container {
 	var out []corev1.Container
 	for i, c := range containers {
-		kept := stripVolumeMountsNamed(c.VolumeMounts, dropped)
+		kept := stripMatching(c.VolumeMounts, drop)
 		if len(kept) == len(c.VolumeMounts) {
 			if out != nil {
 				out = append(out, c)
@@ -2090,6 +2086,33 @@ func stripContainerMountsNamed(containers []corev1.Container, dropped map[string
 		return containers
 	}
 	return out
+}
+
+// stripHostPathVolumes returns volumes without the entries whose source is a
+// hostPath. This is the source-type predicate: unlike the bus-token strip next
+// to it, it matches on what the volume is and not on what it is called, so a
+// CR cannot dodge it by renaming the entry.
+func stripHostPathVolumes(volumes []corev1.Volume) []corev1.Volume {
+	return stripMatching(volumes, func(v corev1.Volume) bool { return v.HostPath != nil })
+}
+
+// stripVolumeMountsNamed returns mounts without the entries naming a volume in
+// dropped. Name-matched rather than source-matched because a mount names a
+// volume and carries no source of its own; dropped comes from
+// hostPathVolumeNames, which resolved the sources.
+func stripVolumeMountsNamed(mounts []corev1.VolumeMount, dropped map[string]bool) []corev1.VolumeMount {
+	return stripMatching(mounts, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
+}
+
+// stripContainerMountsNamed is stripVolumeMountsNamed over a list of
+// containers. The len check is not for speed alone: with nothing dropped this
+// hands back the CR's own container slice, which is what a clean CR rendering
+// unchanged depends on.
+func stripContainerMountsNamed(containers []corev1.Container, dropped map[string]bool) []corev1.Container {
+	if len(dropped) == 0 {
+		return containers
+	}
+	return stripContainerMountsMatching(containers, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
 }
 
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
@@ -2125,10 +2148,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		extraVolumes = stripHostPathVolumes(agent.Spec.Deployment.ExtraVolumes)
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
-	// Everything above is user-authored and copied verbatim, and under `next`
-	// the pod carries a projected bus token that belongs to the platform-agent
-	// container alone. Take the mount away from anything else that names it,
-	// before the operator's own containers join the slices -- see
+	// The four slices above are still the CR's own, filtered for hostPath and
+	// nothing else: no operator-owned container or volume has joined them yet,
+	// which is what the strip below depends on. Under `next` the pod carries a
+	// projected bus token that belongs to the platform-agent container alone.
+	// Take the mount away from anything else that names it, before the
+	// operator's own containers join the slices -- see
 	// a2aStripBusTokenMounts for what a sidecar holding it would be. Gated on
 	// the surface for the same reason the plugin env drop is: on a today
 	// install there is no such volume, and dropping a name only the next stack

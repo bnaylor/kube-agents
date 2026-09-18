@@ -2623,9 +2623,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			// The ordered roll has the same window: replicas > 1 over RWO
 			// storage takes this path, and the StatefulSet controller replaces
 			// Pods one at a time.
-			if sts.Status.ObservedGeneration < sts.Generation || sts.Status.UpdatedReplicas < sts.Status.Replicas {
-				workloadRollIncomplete = rolloutIncomplete
-			}
+			workloadRollIncomplete = statefulSetRollIncomplete(sts)
 		}
 	} else {
 		dep := &appsv1.Deployment{}
@@ -2636,9 +2634,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
 			newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
-			if dep.Status.ObservedGeneration < dep.Generation || dep.Status.UpdatedReplicas < dep.Status.Replicas {
-				workloadRollIncomplete = rolloutIncomplete
-			}
+			workloadRollIncomplete = deploymentRollIncomplete(dep)
 		}
 	}
 
@@ -2915,20 +2911,66 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 // oldPodsPossible says whether Pods from a revision older than the template
 // this pass rendered may still be running, and is the argument
 // hostPathDroppedMessage takes to decide whether the message carries
-// hostPathDroppedRollingClause. Named rather than a bare bool because the two
-// callers answer it from different evidence, and one of them cannot answer it
-// at all.
+// hostPathDroppedRollingClause. Named rather than a bare bool because it is
+// not a property of the CR the callers are holding: it is read off the
+// workload, and a caller that cannot see the workload has to say so rather
+// than say no.
 type oldPodsPossible bool
 
 const (
-	// rolloutIncomplete is what updateStatusReady reports when the workload it
-	// already fetched has not finished rolling the applied template out.
+	// rolloutIncomplete is the workload not having finished rolling the
+	// applied template out, and also the workload not being readable at all
+	// -- see gatewayRollIncomplete for why those share an answer.
 	rolloutIncomplete oldPodsPossible = true
-	// rolloutNotKnownIncomplete covers two different states on purpose: the
-	// roll has finished, and the caller holds no workload object to ask. Both
-	// take the unqualified wording -- see updateStatusDegraded for the second.
+	// rolloutNotKnownIncomplete is the workload's own status saying the roll
+	// is done, which is as far as the operator can see.
 	rolloutNotKnownIncomplete oldPodsPossible = false
 )
+
+// deploymentRollIncomplete and statefulSetRollIncomplete are the two-term roll
+// test, in one place because both status writers ask it. updateStatusReady
+// carries the argument for the two terms; neither is sound alone.
+func deploymentRollIncomplete(dep *appsv1.Deployment) oldPodsPossible {
+	return oldPodsPossible(dep.Status.ObservedGeneration < dep.Generation ||
+		dep.Status.UpdatedReplicas < dep.Status.Replicas)
+}
+
+func statefulSetRollIncomplete(sts *appsv1.StatefulSet) oldPodsPossible {
+	return oldPodsPossible(sts.Status.ObservedGeneration < sts.Generation ||
+		sts.Status.UpdatedReplicas < sts.Status.Replicas)
+}
+
+// gatewayRollIncomplete answers the same question for a caller that is not
+// already holding the gateway workload, by reading it back.
+//
+// The read does not reach the API server. SetupWithManager Owns both the
+// Deployment and the StatefulSet, so the manager's cache already watches them
+// and r.Get is served from that informer's store; r.APIReader is the uncached
+// reader and this is deliberately not it. That is why the Degraded path can
+// afford to qualify its wording on a parked CR, which an earlier round of this
+// change assumed it could not.
+//
+// A workload it cannot read counts as still rolling. NotFound is not sorted
+// out from a real read error, because the safe answer is the same for both and
+// it is the same direction the two terms already err in on a workload that has
+// only just been created: the clause weakens the condition's claim, so a
+// spurious one under-reports a drop that did happen rather than asserting one
+// that did not.
+func (r *PlatformAgentReconciler) gatewayRollIncomplete(ctx context.Context, agent *agentv1alpha1.PlatformAgent) oldPodsPossible {
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
+	if useStatefulSet(agent) {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, key, sts); err != nil {
+			return rolloutIncomplete
+		}
+		return statefulSetRollIncomplete(sts)
+	}
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, key, dep); err != nil {
+		return rolloutIncomplete
+	}
+	return deploymentRollIncomplete(dep)
+}
 
 // hostPathDroppedMessage is the VolumesDropped condition's message for the
 // hostPath entries the render left out of the Pod template, or "" when the
@@ -3294,16 +3336,25 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	hostPathDroppedMsg := ""
 	hostPathDroppedUnchanged := true
 	if rendered {
-		// Unqualified wording, without the rollout clause updateStatusReady can
-		// add. That function reads the roll off the gateway workload it fetches
-		// anyway; this one is handed the CR and the refusal and nothing else,
-		// and adding a workload Get here would put an API read on every parked
-		// pass to say something about three refusals out of seven. So a CR
-		// parked on one of those three states the drop slightly more strongly
-		// than the same CR reading Ready would. Both messages are about the
-		// rendered template either way -- only the Ready one says when that
-		// template has not reached every Pod yet.
-		hostPathDroppedMsg = hostPathDroppedMessage(agent, rolloutNotKnownIncomplete)
+		// Qualified the same way updateStatusReady qualifies it. That function
+		// reads the roll off the gateway workload it fetches anyway; this one
+		// is handed the CR and the refusal and nothing else, so it reads the
+		// workload back through gatewayRollIncomplete, which is a cache hit
+		// and not an API request. A CR parked on one of these three refusals
+		// has exactly the same window as one reading Ready -- the render
+		// applied a template and the apply returns before the Pods carrying
+		// the hostPath are gone -- so saying it more strongly here would be
+		// the one wording that can claim a security property the cluster does
+		// not have.
+		//
+		// Only asked when there is something to report. On the CRs that never
+		// carried a hostPath, which is nearly all of them, a parked pass does
+		// no workload read at all.
+		oldPods := rolloutNotKnownIncomplete
+		if len(hostPathVolumes(agent)) > 0 {
+			oldPods = r.gatewayRollIncomplete(ctx, agent)
+		}
+		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
 		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 	}
 	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&

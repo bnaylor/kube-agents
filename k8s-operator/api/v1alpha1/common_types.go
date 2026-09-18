@@ -112,10 +112,12 @@ var SensitiveEnvVars = map[string]struct{}{
 // names, so a differently-named projected volume whose
 // serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
 // same credential and is admitted. The only source-type check on
-// sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
-// Established by execution rather than by reading the render: a sidecarVolumes
-// entry named innocuous-cache projecting that audience renders intact and the
-// sidecar authenticates as `agent`.
+// sidecarVolumes/extraVolumes today is the hostPath one, and it covers that
+// source alone: the webhook refuses a hostPath entry, and the render drops it
+// and every mount naming it whether or not the webhook ran (gke-labs#1675).
+// Nothing reads serviceAccountToken. Established by execution rather than by
+// reading the render: a sidecarVolumes entry named innocuous-cache projecting
+// that audience renders intact and the sidecar authenticates as `agent`.
 //
 // Which fixes the terms this should be read on. KSA tokens are pod-scoped and
 // the callout cannot see which container presented one, so neither a name nor

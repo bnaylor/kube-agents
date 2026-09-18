@@ -46,18 +46,21 @@ import (
 // is reported on status by the passes that rendered a template -- as a claim
 // about that template, qualified while the roll carrying it is unfinished.
 //
-// The condition type and reason are spelled as literals below because the first
-// render cases were run against a controller without the fix, to watch them
-// fail. The file as a whole no longer compiles there: the message-budget,
-// condition-gate and rollout cases reach hostPathDroppedMessage,
-// hostPathExtraVolumesField, hostPathDroppedEntryEllipsis and the
-// oldPodsPossible constants, none of which exist without it. Reproducing that
-// failing run now means taking the render cases over on their own.
+// The condition type and reason are read off the controller's own constants,
+// as the EventWatcher cases in platformagent_controller_test.go read theirs.
+// They were spelled as literals here while the first render cases were being
+// run against a controller without the fix, to watch them fail; that is not
+// reproducible in place any more, because the message-budget, condition-gate
+// and rollout cases reach hostPathDroppedMessage, hostPathExtraVolumesField,
+// hostPathDroppedEntryEllipsis and the oldPodsPossible constants, none of
+// which exist without the fix, so the file as a whole does not compile there.
+// Reproducing that failing run now means taking the render cases over on
+// their own, and the literals bought nothing once it did.
 //
 // The cases written after the fix were checked the other way round, by mutating
 // the fixed controller and watching which of them failed:
 // TestRenderDropsAHostPathMountedAtTmpKeepsTmpScratch by moving the mount filter
-// in buildPodTemplateSpec back below dropTmpScratchIfClaimed, and
+// in buildBaseContainers back below dropTmpScratchIfClaimed, and
 // TestTheDroppedVolumeConditionFollowsTheGatewayRollout by dropping the roll
 // test in updateStatusReady a term at a time.
 
@@ -79,9 +82,6 @@ const (
 	hostPathFixtureTmpVolume = "host-tmp"
 	hostPathFixtureTmpHost   = "/var/tmp"
 	hostPathFixtureTmpMount  = "/tmp"
-	// The condition the fix writes, as literals (see the file comment).
-	hostPathConditionType   = "VolumesDropped"
-	hostPathConditionReason = "HostPathVolumeDropped"
 	// conditionMessageMaxLength is the cap the CRD schema puts on a condition
 	// message (`maxLength: 32768` under status.conditions[].message in
 	// config/crd/bases/kubeagents.x-k8s.io_platformagents.yaml, from
@@ -400,19 +400,19 @@ func TestReconcileReportsADroppedHostPathVolumeAndClearsItWhenRemoved(t *testing
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
-	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType)
 	if cond == nil {
-		t.Fatalf("no %s condition after rendering around a hostPath; conditions: %+v", hostPathConditionType, got.Status.Conditions)
+		t.Fatalf("no %s condition after rendering around a hostPath; conditions: %+v", hostPathDroppedConditionType, got.Status.Conditions)
 	}
-	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathConditionReason {
-		t.Errorf("%s condition = %s/%s, want True/%s", hostPathConditionType, cond.Status, cond.Reason, hostPathConditionReason)
+	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathDroppedReason {
+		t.Errorf("%s condition = %s/%s, want True/%s", hostPathDroppedConditionType, cond.Status, cond.Reason, hostPathDroppedReason)
 	}
 	for _, want := range []string{
 		"spec.deployment.extraVolumes[0]", hostPathFixtureExtraVolume, hostPathFixtureExtraPath,
 		"spec.deployment.sidecarVolumes[0]", hostPathFixtureSidecarVolume, hostPathFixtureSidecarPath,
 	} {
 		if !strings.Contains(cond.Message, want) {
-			t.Errorf("%s message does not name %q: %s", hostPathConditionType, want, cond.Message)
+			t.Errorf("%s message does not name %q: %s", hostPathDroppedConditionType, want, cond.Message)
 		}
 	}
 	if got.Status.Phase == "Degraded" {
@@ -432,7 +432,7 @@ func TestReconcileReportsADroppedHostPathVolumeAndClearsItWhenRemoved(t *testing
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
 	if got.ResourceVersion != settledVersion {
-		t.Errorf("a reconcile with nothing to change wrote the CR (resourceVersion %s -> %s); the %s condition is causing a write per pass", settledVersion, got.ResourceVersion, hostPathConditionType)
+		t.Errorf("a reconcile with nothing to change wrote the CR (resourceVersion %s -> %s); the %s condition is causing a write per pass", settledVersion, got.ResourceVersion, hostPathDroppedConditionType)
 	}
 
 	// Removing the entries clears the condition on the next pass.
@@ -448,8 +448,8 @@ func TestReconcileReportsADroppedHostPathVolumeAndClearsItWhenRemoved(t *testing
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
-	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
-		t.Errorf("%s condition survived the removal of every hostPath entry: %+v", hostPathConditionType, cond)
+	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType); cond != nil {
+		t.Errorf("%s condition survived the removal of every hostPath entry: %+v", hostPathDroppedConditionType, cond)
 	}
 }
 
@@ -467,8 +467,8 @@ func TestReconcileWritesNoVolumesDroppedConditionWithoutAHostPath(t *testing.T) 
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
-	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
-		t.Errorf("%s condition written for a CR with no hostPath: %+v", hostPathConditionType, cond)
+	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType); cond != nil {
+		t.Errorf("%s condition written for a CR with no hostPath: %+v", hostPathDroppedConditionType, cond)
 	}
 }
 
@@ -513,19 +513,19 @@ func TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded(t *testing.T) {
 	if got.Status.Phase != "Degraded" || ready == nil || ready.Reason != reasonShellSandboxKeysMissing {
 		t.Fatalf("phase=%q Ready=%+v, want Degraded/%s; the pass under test is the one that parks there", got.Status.Phase, ready, reasonShellSandboxKeysMissing)
 	}
-	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType)
 	if cond == nil {
-		t.Fatalf("no %s condition on a CR parked Degraded after the render dropped a hostPath; conditions: %+v", hostPathConditionType, got.Status.Conditions)
+		t.Fatalf("no %s condition on a CR parked Degraded after the render dropped a hostPath; conditions: %+v", hostPathDroppedConditionType, got.Status.Conditions)
 	}
-	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathConditionReason {
-		t.Errorf("%s condition = %s/%s, want True/%s", hostPathConditionType, cond.Status, cond.Reason, hostPathConditionReason)
+	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathDroppedReason {
+		t.Errorf("%s condition = %s/%s, want True/%s", hostPathDroppedConditionType, cond.Status, cond.Reason, hostPathDroppedReason)
 	}
 	for _, want := range []string{
 		"spec.deployment.extraVolumes[0]", hostPathFixtureExtraVolume, hostPathFixtureExtraPath,
 		"spec.deployment.sidecarVolumes[0]", hostPathFixtureSidecarVolume, hostPathFixtureSidecarPath,
 	} {
 		if !strings.Contains(cond.Message, want) {
-			t.Errorf("%s message does not name %q: %s", hostPathConditionType, want, cond.Message)
+			t.Errorf("%s message does not name %q: %s", hostPathDroppedConditionType, want, cond.Message)
 		}
 	}
 
@@ -559,8 +559,8 @@ func TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded(t *testing.T) {
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
-	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
-		t.Errorf("%s condition survived the removal of every hostPath entry on the Degraded path: %+v", hostPathConditionType, cond)
+	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType); cond != nil {
+		t.Errorf("%s condition survived the removal of every hostPath entry on the Degraded path: %+v", hostPathDroppedConditionType, cond)
 	}
 }
 
@@ -694,9 +694,9 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent)); err != nil {
 				t.Fatalf("updateStatusReady failed: %v", err)
 			}
-			cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathConditionType)
+			cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
 			if cond == nil {
-				t.Fatalf("no %s condition; conditions: %+v", hostPathConditionType, agent.Status.Conditions)
+				t.Fatalf("no %s condition; conditions: %+v", hostPathDroppedConditionType, agent.Status.Conditions)
 			}
 			if got := strings.Contains(cond.Message, hostPathDroppedRollingClause); got != tc.rolling {
 				t.Errorf("rollout clause present = %v, want %v, at generation %d with observedGeneration %d and %d of %d replicas updated: %s",
@@ -722,7 +722,142 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 			}
 			if stored.ResourceVersion != settledVersion {
 				t.Errorf("a second pass over unchanged state wrote the CR (resourceVersion %s -> %s); the %s message and the comparison disagree",
-					settledVersion, stored.ResourceVersion, hostPathConditionType)
+					settledVersion, stored.ResourceVersion, hostPathDroppedConditionType)
+			}
+		})
+	}
+}
+
+// The same qualification on the Degraded path. The three refusals that land
+// there below the render have the identical window -- the pass applied a
+// template and the apply returns before the Pods carrying the hostPath are
+// gone -- and unlike updateStatusReady this writer holds no workload object,
+// so it reads the gateway back to answer. It is a cache read: SetupWithManager
+// Owns both workload kinds. An earlier round of this change left the Degraded
+// wording unqualified on the theory that the read would be an API request per
+// parked pass, which is the one wording that can claim a security property the
+// cluster does not have.
+func TestTheDegradedPathQualifiesTheDroppedVolumeMessageWhileTheRollIsUnfinished(t *testing.T) {
+	cases := []struct {
+		name string
+		// replicas > 1 over RWO storage is what puts the gateway on a
+		// StatefulSet, whose ordered roll has the same window.
+		statefulSet bool
+		// noGateway drops the workload entirely: a writer that cannot read the
+		// roll has to qualify, not to assume the roll is done.
+		noGateway  bool
+		generation int64
+		observed   int64
+		replicas   int32
+		updated    int32
+		rolling    bool
+	}{
+		{
+			name:       "applied template not observed yet",
+			generation: 4, observed: 3, replicas: 3, updated: 3,
+			rolling: true,
+		},
+		{
+			name:       "replicas from an earlier revision still counted",
+			generation: 4, observed: 4, replicas: 3, updated: 1,
+			rolling: true,
+		},
+		{
+			name:       "fully rolled out",
+			generation: 4, observed: 4, replicas: 3, updated: 3,
+			rolling: false,
+		},
+		{
+			name:        "statefulset mid-roll",
+			statefulSet: true,
+			generation:  4, observed: 4, replicas: 3, updated: 1,
+			rolling: true,
+		},
+		{
+			name:      "no gateway to read the roll from",
+			noGateway: true,
+			rolling:   true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := hostPathAgent()
+			gatewayMeta := metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace, Generation: tc.generation}
+			var gateway client.Object = &appsv1.Deployment{
+				ObjectMeta: gatewayMeta,
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: tc.observed,
+					Replicas:           tc.replicas,
+					UpdatedReplicas:    tc.updated,
+					ReadyReplicas:      tc.replicas,
+				},
+			}
+			if tc.statefulSet {
+				agent.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(tc.replicas)}
+				agent.Spec.Deployment.Storages = []agentv1alpha1.StorageSpec{{
+					Name:        "gateway-data",
+					MountPath:   "/srv/gateway-data",
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				}}
+				if !useStatefulSet(agent) {
+					t.Fatalf("this case is meant to take the StatefulSet path and does not")
+				}
+				gateway = &appsv1.StatefulSet{
+					ObjectMeta: gatewayMeta,
+					Status: appsv1.StatefulSetStatus{
+						ObservedGeneration: tc.observed,
+						Replicas:           tc.replicas,
+						UpdatedReplicas:    tc.updated,
+						ReadyReplicas:      tc.replicas,
+					},
+				}
+			}
+
+			scheme := setupScheme()
+			builder := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(agent).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors())
+			if tc.noGateway {
+				builder = builder.WithObjects(agent)
+			} else {
+				builder = builder.WithObjects(agent, gateway)
+			}
+			cl := builder.Build()
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+			ctx := context.Background()
+
+			if err := r.updateStatusDegraded(ctx, agent, reasonShellSandboxKeysMissing, "the sandbox keypair Secret is missing", workloadRendered); err != nil {
+				t.Fatalf("updateStatusDegraded failed: %v", err)
+			}
+			cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
+			if cond == nil {
+				t.Fatalf("no %s condition on a CR parked Degraded after a pass that rendered; conditions: %+v", hostPathDroppedConditionType, agent.Status.Conditions)
+			}
+			if got := strings.Contains(cond.Message, hostPathDroppedRollingClause); got != tc.rolling {
+				t.Errorf("rollout clause present = %v, want %v, at generation %d with observedGeneration %d and %d of %d replicas updated: %s",
+					got, tc.rolling, tc.generation, tc.observed, tc.updated, tc.replicas, cond.Message)
+			}
+
+			// Whatever the clause says, it has to say the same thing twice:
+			// the roll state rides in the message the unchanged comparison
+			// covers, and a comparison that recomputed it differently would
+			// write status on every 30s requeue of a parked CR (#1392).
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("reading the PlatformAgent back: %v", err)
+			}
+			settledVersion := stored.ResourceVersion
+			if err := r.updateStatusDegraded(ctx, agent, reasonShellSandboxKeysMissing, "the sandbox keypair Secret is missing", workloadRendered); err != nil {
+				t.Fatalf("updateStatusDegraded (settled) failed: %v", err)
+			}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("reading the PlatformAgent back: %v", err)
+			}
+			if stored.ResourceVersion != settledVersion {
+				t.Errorf("a second parked pass over unchanged state wrote the CR (resourceVersion %s -> %s); the %s message and the comparison disagree",
+					settledVersion, stored.ResourceVersion, hostPathDroppedConditionType)
 			}
 		})
 	}
@@ -837,8 +972,8 @@ func TestAPreRenderRefusalWritesNoVolumesDroppedCondition(t *testing.T) {
 	if got.Status.Phase != "Degraded" || ready == nil || ready.Reason != reasonShellSandboxCannotBeDisabled {
 		t.Fatalf("phase=%q Ready=%+v, want Degraded/%s; the pass under test is the one that parks there", got.Status.Phase, ready, reasonShellSandboxCannotBeDisabled)
 	}
-	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType); cond != nil {
-		t.Errorf("%s written on a pass that rendered no Pod: the CR now asserts the hostPath entries are out of a workload this operator never wrote: %+v", hostPathConditionType, cond)
+	if cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType); cond != nil {
+		t.Errorf("%s written on a pass that rendered no Pod: the CR now asserts the hostPath entries are out of a workload this operator never wrote: %+v", hostPathDroppedConditionType, cond)
 	}
 }
 
@@ -870,9 +1005,9 @@ func TestAPreRenderRefusalLeavesAnAlreadyPresentVolumesDroppedInPlace(t *testing
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
-	rendered := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	rendered := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType)
 	if rendered == nil {
-		t.Fatalf("the rendering passes wrote no %s condition, so there is nothing for the refusal to preserve", hostPathConditionType)
+		t.Fatalf("the rendering passes wrote no %s condition, so there is nothing for the refusal to preserve", hostPathDroppedConditionType)
 	}
 	renderedMessage := rendered.Message
 
@@ -898,12 +1033,12 @@ func TestAPreRenderRefusalLeavesAnAlreadyPresentVolumesDroppedInPlace(t *testing
 	if got.Status.Phase != "Degraded" || ready == nil || ready.Reason != reasonShellSandboxCannotBeDisabled {
 		t.Fatalf("phase=%q Ready=%+v, want Degraded/%s", got.Status.Phase, ready, reasonShellSandboxCannotBeDisabled)
 	}
-	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType)
 	if cond == nil {
-		t.Fatalf("the refusal cleared a %s condition a rendering pass had written; the Pod that pass rendered is still the one running without those volumes", hostPathConditionType)
+		t.Fatalf("the refusal cleared a %s condition a rendering pass had written; the Pod that pass rendered is still the one running without those volumes", hostPathDroppedConditionType)
 	}
-	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathConditionReason || cond.Message != renderedMessage {
-		t.Errorf("the refusal rewrote the condition instead of leaving it: got %s/%s %q, want it untouched at %s/%s %q", cond.Status, cond.Reason, cond.Message, metav1.ConditionTrue, hostPathConditionReason, renderedMessage)
+	if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathDroppedReason || cond.Message != renderedMessage {
+		t.Errorf("the refusal rewrote the condition instead of leaving it: got %s/%s %q, want it untouched at %s/%s %q", cond.Status, cond.Reason, cond.Message, metav1.ConditionTrue, hostPathDroppedReason, renderedMessage)
 	}
 
 	// And a parked CR still writes once per change, not once per pass. The

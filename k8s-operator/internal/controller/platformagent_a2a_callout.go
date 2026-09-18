@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -179,25 +178,17 @@ func a2aBusTokenVolumeMount() corev1.VolumeMount {
 // both. ReservedVolumeNames carries what that does and does not buy;
 // gke-labs#1667 carries the source check that closes it.
 //
-// The input slices belong to the CR, so the copy is not incidental.
+// The input slices belong to the CR, so the copy stripContainerMountsMatching
+// makes is not incidental.
 func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
-	mountsIt := func(c corev1.Container) bool {
-		return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-			return m.Name == a2aBusTokenVolume
-		})
-	}
-	if !slices.ContainsFunc(containers, mountsIt) {
-		return containers
-	}
-	out := slices.Clone(containers)
-	for i := range out {
-		if !mountsIt(out[i]) {
-			continue
-		}
-		out[i].VolumeMounts = a2aStripBusTokenVolumeMounts(out[i].VolumeMounts)
-	}
-	return out
+	return stripContainerMountsMatching(containers, a2aIsBusTokenMount)
 }
+
+// a2aIsBusTokenMount is the predicate the two mount strips on either side of
+// it share, named rather than written twice so they cannot drift apart. Name
+// matching is the whole of what it claims; a2aStripBusTokenMounts says what a
+// name match does not buy.
+func a2aIsBusTokenMount(m corev1.VolumeMount) bool { return m.Name == a2aBusTokenVolume }
 
 // a2aStripBusTokenVolumeMounts is the same removal against a bare mount list,
 // for the one user-authored mount surface that reaches a container the operator
@@ -215,17 +206,7 @@ func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
 // user-authored mounts only and the platform-agent container gets its real
 // mount from mountIntoContainer after the strip.
 func a2aStripBusTokenVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
-	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return m.Name == a2aBusTokenVolume }) {
-		return mounts
-	}
-	keep := make([]corev1.VolumeMount, 0, len(mounts))
-	for _, m := range mounts {
-		if m.Name == a2aBusTokenVolume {
-			continue
-		}
-		keep = append(keep, m)
-	}
-	return keep
+	return stripMatching(mounts, a2aIsBusTokenMount)
 }
 
 // a2aStripBusTokenVolume removes a user-supplied volume that shadows the
@@ -235,17 +216,7 @@ func a2aStripBusTokenVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMo
 // volumes with one name is a Deployment server-side apply refuses outright,
 // which wedges every reconcile of the CR with nothing in status to say why.
 func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
-	if !slices.ContainsFunc(volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume }) {
-		return volumes
-	}
-	keep := make([]corev1.Volume, 0, len(volumes))
-	for _, v := range volumes {
-		if v.Name == a2aBusTokenVolume {
-			continue
-		}
-		keep = append(keep, v)
-	}
-	return keep
+	return stripMatching(volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume })
 }
 
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not

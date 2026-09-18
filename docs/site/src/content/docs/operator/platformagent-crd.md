@@ -590,8 +590,8 @@ it opens at `availability.replicas` above 1, and the StatefulSet path rolls one 
 the same effect. While the operator can see the roll is unfinished — the workload has not observed
 the applied template, or it counts Pods that are not on it — the message says so in a sentence of
 its own. A CR parked `Degraded` by `ModeNotRecognized`, `A2AProvisionFailed` or
-`ShellSandboxKeysMissing` never carries that sentence: that status write holds no workload object
-to read the roll from.
+`ShellSandboxKeysMissing` carries it on the same terms: those three refusals render before they
+park, so that status write reads the gateway workload back to see whether the roll has finished.
 
 ```console
 $ kubectl describe platformagent platform-agent -n kubeagents-system

@@ -114,12 +114,12 @@ func TestAHostPathVolumeStaysOutOfTheDeploymentWithoutTheWebhookEnvtest(t *testi
 	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
 		t.Fatalf("reading the PlatformAgent back: %v", err)
 	}
-	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType)
 	if cond == nil {
-		t.Errorf("no %s condition on the CR; conditions: %+v", hostPathConditionType, got.Status.Conditions)
+		t.Errorf("no %s condition on the CR; conditions: %+v", hostPathDroppedConditionType, got.Status.Conditions)
 	} else {
-		if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathConditionReason {
-			t.Errorf("%s condition = %s/%s, want True/%s", hostPathConditionType, cond.Status, cond.Reason, hostPathConditionReason)
+		if cond.Status != metav1.ConditionTrue || cond.Reason != hostPathDroppedReason {
+			t.Errorf("%s condition = %s/%s, want True/%s", hostPathDroppedConditionType, cond.Status, cond.Reason, hostPathDroppedReason)
 		}
 		t.Logf("%s: %s/%s: %s", cond.Type, cond.Status, cond.Reason, cond.Message)
 	}
@@ -188,9 +188,9 @@ func TestAFloodOfHostPathVolumesStillWritesStatusEnvtest(t *testing.T) {
 	if meta.FindStatusCondition(got.Status.Conditions, "Ready") == nil {
 		t.Errorf("no Ready condition: the status write carrying it was refused, which is what an unbounded message costs")
 	}
-	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathConditionType)
+	cond := meta.FindStatusCondition(got.Status.Conditions, hostPathDroppedConditionType)
 	if cond == nil {
-		t.Fatalf("no %s condition on the CR; conditions: %+v", hostPathConditionType, got.Status.Conditions)
+		t.Fatalf("no %s condition on the CR; conditions: %+v", hostPathDroppedConditionType, got.Status.Conditions)
 	}
 	if len(cond.Message) > conditionMessageMaxLength {
 		t.Errorf("the API server stored a %d-character message; the schema caps it at %d", len(cond.Message), conditionMessageMaxLength)
