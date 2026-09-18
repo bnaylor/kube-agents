@@ -3127,8 +3127,8 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 
 // TestGatewayHoldsNoWholesaleJetStreamAPI is the shape check for the gateway's
 // JetStream API grant; the refusal proof is
-// TestGatewayJetStreamGrantOnARealServer, which asks a server. It is the third
-// of these, and it asks what the seed and worker ones ask, in the same four
+// TestGatewayJetStreamGrantOnARealServer, which asks a server. It is the last
+// of these, and it asks what the seed and bridge ones ask, in the same four
 // parts: the publish allow-list pinned exactly, every destructive and
 // out-of-scope route run through subjectMatches against every rendered entry,
 // a structural bound on the grant function's own output, and the subscribe
@@ -3189,7 +3189,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// consumer, not a direct get. The directory is the identity plane and
 	// the gateway reads it by subscribing to the cards; the topic streams
 	// are the blackboard, which nothing in a2a/gateway touches; the other
-	// two buckets are the worker's and the capability envelope's.
+	// two buckets are the bridge's and the capability envelope's.
 	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
@@ -3324,7 +3324,7 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 // and the gateway can write the registry and not read it, which is an
 // authorization failure at runtime with nothing failing here to say so.
 //
-// Also held to the provision script, for the same reason the worker's streams
+// Also held to the provision script, for the same reason the bridge's streams
 // are: a grant naming a bucket nothing creates is a call that times out on a
 // real install and nowhere else.
 func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {

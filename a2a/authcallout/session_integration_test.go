@@ -193,8 +193,9 @@ func TestASessionIsRefusedEverythingBeyondItsOwnTask(t *testing.T) {
 		"$JS.API.STREAM.DELETE.TASKS":  true,
 		"$JS.API.STREAM.PURGE.TASKS":   true,
 
-		// The blanket the shared worker user used to hold (#1393 enumerated
-		// it; worker holds neither of these now).
+		// The blanket the shared worker user used to hold: #1393 enumerated
+		// it, and A5 then retired that user entirely. Neither subject is in
+		// any rendered principal's list now.
 		"$JS.API.CONSUMER.LIST.TASKS": true,
 		"$JS.API.STREAM.LIST":         true,
 
