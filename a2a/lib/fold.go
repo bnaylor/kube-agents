@@ -32,7 +32,7 @@ const (
 	//
 	// The threshold is the only cleanup: TasksGet does not delete the
 	// consumer it creates, and must not be made to. The delete is a publish
-	// on $JS.API.CONSUMER.DELETE.TASKS.*, a subject the rendered worker
+	// on $JS.API.CONSUMER.DELETE.TASKS.*, a subject the rendered bridge
 	// grant withholds, and a refused publish gets no reply -- nats.go routes
 	// a permissions violation to subscriptions only. Under that principal an
 	// explicit delete would buy back the last few seconds of one consumer

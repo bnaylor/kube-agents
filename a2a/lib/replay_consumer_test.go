@@ -17,7 +17,7 @@ import (
 // The consumer TasksGet creates on TASKS must be gone within
 // EphemeralConsumerInactiveThreshold of the call returning, and TasksGet must
 // not try to delete it by hand (#1739). Both are measured on a real server
-// against the rendered worker grant, because the second one only matters
+// against the rendered bridge grant, because the second one only matters
 // under that grant: the delete would be a $JS.API.CONSUMER.DELETE.TASKS.<name>
 // publish, and this principal does not hold the subject.
 const (
@@ -47,13 +47,13 @@ const (
 	replayAdminTimeout = 5 * time.Second
 
 	replayAdminUser   = "admin"
-	replayReaderUser  = "worker-shaped"
+	replayReaderUser  = "bridge-shaped"
 	replayPassword    = "pw"
 	replayControlSubj = "$JS.API.STREAM.DELETE.TASKS"
 )
 
 // replayGrant is the reader grant in the shape the operator renders for the
-// `worker` principal: the JetStream API subjects TasksGet emits on TASKS,
+// `bridge` principal: the JetStream API subjects TasksGet emits on TASKS,
 // enumerated per stream and verb, plus the ack, flow-control and inbox
 // subjects beside them in the identity. CONSUMER.DELETE is deliberately not
 // in the list -- that is the grant TasksGet has to work within, and the whole
@@ -179,7 +179,7 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
-// replayReader connects a reader under the worker-shaped grant.
+// replayReader connects a reader under the bridge-shaped grant.
 func replayReader(t *testing.T, url, name string, log *slog.Logger) *Client {
 	t.Helper()
 	opts := []ClientOption{WithName(name), WithUserPassword(replayReaderUser, replayPassword)}
@@ -248,7 +248,7 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 		time.Since(start).Round(100*time.Millisecond), EphemeralConsumerInactiveThreshold)
 }
 
-// TasksGet emits nothing the worker grant refuses. The grant withholds
+// TasksGet emits nothing the bridge grant refuses. The grant withholds
 // $JS.API.CONSUMER.DELETE.TASKS.*, and a refused publish gets no reply: it
 // costs one Error-level "Permissions Violation" line per call from the
 // connection's async error handler, which is the line an operator is taught
@@ -258,7 +258,7 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 // that one to show up. Refusals arrive in the order the publishes left, so
 // the control line landing is the barrier: anything the replay itself was
 // refused is already in the buffer by then.
-func TestTasksGet_EmitsNothingTheWorkerGrantRefuses(t *testing.T) {
+func TestTasksGet_EmitsNothingTheBridgeGrantRefuses(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
 	provisionTasksStreamAsProvisioned(t, url)
@@ -291,7 +291,7 @@ func TestTasksGet_EmitsNothingTheWorkerGrantRefuses(t *testing.T) {
 
 	out := logs.String()
 	if strings.Contains(out, "CONSUMER.DELETE") {
-		t.Fatalf("TasksGet was refused a CONSUMER.DELETE under the worker grant; the log line operators read as a missing grant is now one per tasks/get:\n%s", out)
+		t.Fatalf("TasksGet was refused a CONSUMER.DELETE under the bridge grant; the log line operators read as a missing grant is now one per tasks/get:\n%s", out)
 	}
 	t.Logf("client log after the replay, with a known refusal appended as the barrier:\n%s", out)
 }
