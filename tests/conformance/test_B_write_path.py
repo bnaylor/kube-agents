@@ -26,9 +26,8 @@ from . import _harness as h
 from ._harness import command_policy
 
 WORKFLOWS = sorted(
-    # Both extensions: GitHub Actions accepts .yaml too, and every assertion
-    # over this set is an allowlist -- a workflow added as .yaml would
-    # otherwise escape all of them silently.
+    # Both extensions: GitHub Actions accepts .yaml too, and a workflow added
+    # as .yaml would otherwise escape every assertion over this set silently.
     (h.REPO_ROOT / ".github" / "workflows").glob("*.y*ml")
 )
 
@@ -36,25 +35,24 @@ WORKFLOWS = sorted(
 def _workflows():
     """The workflow set, which is never legitimately empty.
 
-    Most assertions over this glob compare it against a named allowlist, and
-    those defend themselves: an empty set makes the expected names missing and
-    the test red. Two do not. B2's `no_workflow_approves_or_merges_a_pull_
-    request` and B4's `no_pull_request_target_workflow_checks_out_the_pull_
-    request` assert an absence, and an absence is true of the empty set. Both
-    go green over nothing, which is the shape the rest of the suite reds.
+    Three of the five assertions reading this glob answer for an empty set
+    already: two compare it against a named allowlist and go red when the
+    expected names go missing, and `every_workflow_run_deploy_gates_on_
+    repository_and_branch` carries its own non-empty precondition. The other
+    two assert an absence, and an absence is true of the empty set.
 
-    So whether the glob needs a guard is decided by the shape of the assertion
-    reading it, and the two that need one are the two that cannot announce it
-    themselves. Reading nothing is checked here instead, once, for the same
-    reason `_harness.text()` raises rather than returning an empty string.
-
-    Latent rather than live: the glob resolves today. One rename of
-    `.github/workflows` is what turns it.
+    That is not a hole in the suite. Moving `.github/workflows` reds six
+    assertions today -- C4's SHA-pin sweep keeps its own copy of this glob and
+    guards it, and `autopush-deploy.yml` is a registered `_harness.SOURCES`
+    entry, so the harness self-check goes red too. What the two absence tests
+    inherit from that is an answer to somebody else's question. This is them
+    answering their own, in the place the set is built, for the same reason
+    `_harness.text()` raises rather than returning an empty string.
     """
     if not WORKFLOWS:
         raise AssertionError(
             f"no workflows matched {h.REPO_ROOT / '.github' / 'workflows'}/*.y*ml; "
-            "the directory moved and the gates over it assert nothing"
+            "the glob is wrong"
         )
     return WORKFLOWS
 
@@ -545,12 +543,25 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         explicit `ref:` that does not reference the pull request; a checkout
         with no `ref:` defaults to the PR merge commit on this trigger, which
         is the exact failure.
+
+        The filter is asserted non-empty for the same reason B4's
+        `workflow_run` gate asserts its own: this test says nothing at all
+        about a repository with no `pull_request_target` workflows, so it
+        cannot tell "the trigger is gone" from "the parse stopped seeing it".
+        Four workflows carry the trigger today. If that reaches zero the test
+        should be read again, not passed by default.
         """
-        for path, document in _workflow_documents():
-            triggers = document.get("on") or {}
-            if "pull_request_target" not in triggers:
-                continue
-            text = path.read_text()
+        consumers = [
+            (path, document)
+            for path, document in _workflow_documents()
+            if "pull_request_target" in (document.get("on") or {})
+        ]
+        self.assertTrue(
+            consumers,
+            "no pull_request_target workflows found; the filter is wrong",
+        )
+
+        for path, document in consumers:
             with self.subTest(workflow=path.name):
                 for job in (document.get("jobs") or {}).values():
                     for step in (job or {}).get("steps") or []:

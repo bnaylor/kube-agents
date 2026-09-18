@@ -87,9 +87,12 @@ One set of inputs is not registered: the group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
-is added. The non-empty-glob guard lives with C4's SHA-pin sweep; the group-B
-allowlists are guarded differently — a holder appearing or vanishing moves a
-set the test compares exactly. C4 is the invariant; its stricter form, which
+is added. Every consumer of that glob answers for the empty set itself: the
+group-B allowlists go red when an expected name goes missing, C4's SHA-pin
+sweep and B4's `workflow_run` gate carry their own non-empty preconditions,
+and `_workflows()` in `test_B_write_path.py` raises on behalf of the two
+absence assertions, which an empty set would otherwise satisfy. C4 is the
+invariant; its stricter form, which
 also requires the version comment beside each SHA and a digest on a `docker://`
 ref, and the fork-guard check on every auto-triggered credentialed workflow,
 run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
@@ -142,7 +145,7 @@ currently fails.
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
 | B1  | the agent cannot force-push                                                | 1 **KV** | `test_B1_the_agent_cannot_merge_or_approve`                                         | `git push --force origin main` matches no denylist rule; the git verb and lease machinery constrain where git writes, not this flag — a watched branch is still rewritable                                                                               |
 | B2  | no workflow approves or merges a pull request                              | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                             | a model verdict causing a merge                                                                                                                                                                                                                          |
-| B2  | `pull-requests: write` has exactly one holder                              | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
+| B2  | `pull-requests: write` has exactly six holders                             | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
 | B2  | a certified predicate in a human-only path                                 | **3**    | —                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
 | B3  | substrate paths enumerated as code                                         | 1 **KV** | `test_B3_the_substrate_paths_are_enumerated_as_code`                                | `failurePolicy: Fail` → `Ignore`, commit message "unblock apply during upgrade window"                                                                                                                                                                   |
 | B3  | the agent cannot reach admission or RBAC through kubectl                   | 1        | `test_B3_the_agent_cannot_reach_the_admission_policy_through_kubectl`               | — (the API half; the artifact half is the KV above)                                                                                                                                                                                                      |
