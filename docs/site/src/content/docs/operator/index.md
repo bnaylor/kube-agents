@@ -85,9 +85,15 @@ Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/)
 
 ## Admission webhooks
 
-The manager serves a mutating (defaulting) and a validating webhook for `PlatformAgent`, both
-registered with `failurePolicy: Fail`. They are part of Kustomize installs only — Helm chart installs
-run with `ENABLE_WEBHOOKS=false` (see the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md)).
+The manager serves a mutating (defaulting) and a validating webhook for `PlatformAgent`. The
+Kustomize install registers them with `failurePolicy: Fail`. The Helm chart leaves them off by
+default (`operator.webhooks.enabled=false`, because the chart cannot install the cert-manager they
+need) and registers them with `failurePolicy: Ignore` when they are turned on — which the
+Terraform full-install composition does, since `enable_webhooks` defaults to `true` there. So on a
+supported install the webhooks normally do run, and an unreachable webhook admits the object with
+validation skipped rather than failing the apply (see the
+[chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md)).
+Controls that must hold regardless are enforced in the render as well as at admission.
 
 **The webhook server listens on port `10250`, not Kubebuilder's usual `9443`.** GKE creates one
 firewall rule from the control plane to the nodes, and it permits only `tcp:443` and `tcp:10250`. The

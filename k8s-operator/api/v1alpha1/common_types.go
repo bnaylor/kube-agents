@@ -770,18 +770,29 @@ type DeploymentSpec struct {
 	Sidecars []corev1.Container `json:"sidecars,omitempty"`
 
 	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+	// An entry is refused at admission if it takes a reserved volume name, or if
+	// its source would hand a sidecar the agent's A2A bus credential: a
+	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
+	// to one of the Secrets the operator renders bus credentials into
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// as either a secret volume or a projected secret source. Reading those
+	// Secrets through env is not refused here.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
 
 	// ExtraVolumes specifies custom volumes to mount for the main container.
+	// The same reserved names and reserved sources as SidecarVolumes are refused
+	// at admission.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
 
 	// ExtraVolumeMounts specifies custom volume mounts for the main container.
+	// Appended to platform-agent and platform-agent-dashboard both, so an entry
+	// naming a reserved volume is refused at admission.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
