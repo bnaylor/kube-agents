@@ -782,8 +782,9 @@ type DeploymentSpec struct {
 	// as either a secret volume or a projected secret source. Reading those
 	// Secrets through env is not refused here. On an install running the A2A
 	// surface the same entries are dropped from the render as well, which is the
-	// half that holds when admission does not run: the chart's default webhook
-	// failurePolicy is Ignore.
+	// half that holds when admission does not run: a default chart install does
+	// not register the webhooks at all (operator.webhooks.enabled=false), and one
+	// that does registers them at failurePolicy Ignore by default.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
@@ -802,9 +803,10 @@ type DeploymentSpec struct {
 
 	// ExtraVolumeMounts specifies custom volume mounts for the main container.
 	// Appended to platform-agent and platform-agent-dashboard both, so an entry
-	// naming a reserved volume is refused at admission. On an install running the
-	// A2A surface an entry naming a volume whose source carries a bus credential
-	// is dropped from the render too.
+	// naming a reserved volume is refused at admission, and dropped from the
+	// render on an install running the A2A surface. The render drops one more
+	// shape admission does not: an entry naming a user volume that was itself
+	// dropped for the credential its source carries.
 	// +listType=map
 	// +listMapKey=name
 	// +optional

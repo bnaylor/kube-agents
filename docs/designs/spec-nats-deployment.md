@@ -649,7 +649,10 @@ ServiceAccount, so any container in that pod presenting a token for this audienc
 authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
 copied into the pod verbatim. The operator therefore refuses and strips user-authored
 volumes by SOURCE as well as by name: a projection of this audience under any name, and a
-volume referencing any of the three Secrets the bus renders - `<agent>-a2a-nats-creds`,
+`secret` volume or projected `secret` source naming one of the three Secrets the bus
+renders. (Those two source fields only - the ones that mount the Secret into the
+container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
+node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
 which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
 interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
 which signs the bus's own tokens. The Secrets are cheaper than the projection, because

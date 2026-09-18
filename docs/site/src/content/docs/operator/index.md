@@ -88,10 +88,13 @@ Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/)
 The manager serves a mutating (defaulting) and a validating webhook for `PlatformAgent`. The
 Kustomize install registers them with `failurePolicy: Fail`. The Helm chart leaves them off by
 default (`operator.webhooks.enabled=false`, because the chart cannot install the cert-manager they
-need) and registers them with `failurePolicy: Ignore` when they are turned on — which the
-Terraform full-install composition does, since `enable_webhooks` defaults to `true` there. So on a
-supported install the webhooks normally do run, and an unreachable webhook admits the object with
-validation skipped rather than failing the apply (see the
+need) and registers them at `operator.webhooks.failurePolicy`, which defaults to `Ignore`. The
+Terraform full-install composition turns them on, since `enable_webhooks` defaults to `true`
+there. So on a supported install the webhooks are registered — but under `Ignore` an unreachable
+one admits the object with validation skipped rather than failing the apply, and on a fresh
+full-install that is the first `PlatformAgent` rather than an edge case: Helm applies the webhook
+configurations ahead of the cert-manager `Certificate` and the CR in the same release, which is
+why the default is `Ignore` at all. Setting it to `Fail` is supported and documented (see the
 [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md)).
 Controls that must hold regardless are enforced in the render as well as at admission.
 

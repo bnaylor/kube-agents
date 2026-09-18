@@ -1262,9 +1262,10 @@ spec:
                       description: |-
                         ExtraVolumeMounts specifies custom volume mounts for the main container.
                         Appended to platform-agent and platform-agent-dashboard both, so an entry
-                        naming a reserved volume is refused at admission. On an install running the
-                        A2A surface an entry naming a volume whose source carries a bus credential
-                        is dropped from the render too.
+                        naming a reserved volume is refused at admission, and dropped from the
+                        render on an install running the A2A surface. The render drops one more
+                        shape admission does not: an entry naming a user volume that was itself
+                        dropped for the credential its source carries.
                       items:
                         description:
                           VolumeMount describes a mounting of a Volume within
