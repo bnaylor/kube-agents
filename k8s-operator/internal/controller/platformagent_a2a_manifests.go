@@ -216,9 +216,6 @@ const (
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
 
-	// a2aCredsSecretSuffix is appended to the NATS object name.
-	a2aCredsSecretSuffix = "-creds"
-
 	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
 	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
 	// the hex digest follows it. Eight characters is a change detector, the
@@ -289,13 +286,18 @@ func a2aStrictEventsWriter() string {
 	return "false"
 }
 
-func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Name + "-a2a-nats" }
+// a2aNATSName and a2aCredsSecretName are spelled in the API package, because
+// the validating webhook recognises the credentials Secret by name and must
+// agree with the render on what that name is.
+func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string {
+	return agentv1alpha1.A2ANATSName(agent.Name)
+}
 func a2aGatewayName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-gateway" }
 func a2aCalloutName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-callout" }
 
 // a2aCredsSecretName is the Secret holding the static users' passwords.
 func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
-	return a2aNATSName(agent) + a2aCredsSecretSuffix
+	return agentv1alpha1.A2ACredsSecretName(agent.Name)
 }
 
 // a2aNATSAddress is the bus's in-cluster host:port. a2aNATSClientURL is the

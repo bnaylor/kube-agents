@@ -28,6 +28,36 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	// A2ABusTokenAudience is the audience every A2A bus token is bound to. The
+	// operator projects a ServiceAccount token for it into the platform-agent
+	// container under `mode: next`, and the auth callout accepts no other
+	// audience. It lives here rather than in the controller because the
+	// validating webhook needs the same value: a user-authored volume that
+	// projects a token for this audience under any name is the bus credential
+	// by another route, and BusCredentialRoutes below is what both halves of
+	// that reservation key on.
+	A2ABusTokenAudience = "a2a-bus"
+
+	// a2aNATSNameSuffix and a2aCredsSecretSuffix build the names of the bus
+	// objects the operator renders off the PlatformAgent's own name. Here for
+	// the same reason as the audience: the webhook has to recognise the
+	// credentials Secret by name, and a second spelling of the suffix in the
+	// webhook package would drift from the one the render uses.
+	a2aNATSNameSuffix    = "-a2a-nats"
+	a2aCredsSecretSuffix = "-creds"
+)
+
+// A2ANATSName is the name of the NATS objects the operator renders for a
+// PlatformAgent under `mode: next`, and the stem of A2ACredsSecretName.
+func A2ANATSName(agentName string) string { return agentName + a2aNATSNameSuffix }
+
+// A2ACredsSecretName is the Secret holding the bus's static passwords
+// (`bridge-password` among them) for a PlatformAgent of that name.
+func A2ACredsSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aCredsSecretSuffix
+}
+
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
 // overridden by user Deployment specs or injected into the credential proxy.
 //
@@ -129,8 +159,9 @@ var SensitiveEnvVars = map[string]struct{}{
 // rather than an escape, guarded because nothing else would notice. That rests
 // on who may write the CR, which makes it re-decidable rather than settled: a
 // delegable role, or the CR moving into a repo the agent can open pull
-// requests against, changes the answer. gke-labs#1667 closes the audience
-// route and the creds-Secret route that is cheaper than it.
+// requests against, changes the answer. BusCredentialRoutes below is the
+// source half of this reservation: the audience route, and the creds-Secret
+// route that is cheaper than it.
 //
 // One member so far. `a2a-bus-token` is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
@@ -142,6 +173,80 @@ var SensitiveEnvVars = map[string]struct{}{
 // a2aStripBusTokenVolumeMounts.
 var ReservedVolumeNames = map[string]struct{}{
 	"a2a-bus-token": {},
+}
+
+// BusCredentialRouteKind says which of the two sources a user-authored volume
+// used to reach the bus credential without naming the reserved volume.
+type BusCredentialRouteKind string
+
+const (
+	// BusCredentialRouteAudience is a projected serviceAccountToken source whose
+	// audience is A2ABusTokenAudience: a valid bus token for the pod's
+	// ServiceAccount, under whatever volume name the CR chose.
+	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
+	// BusCredentialRouteSecret is a volume that mounts the credentials Secret
+	// the operator renders (A2ACredsSecretName), whose `bridge-password` is a
+	// static bus credential, either as a `secret` volume or as a projected
+	// `secret` source.
+	BusCredentialRouteSecret BusCredentialRouteKind = "secret"
+)
+
+// BusCredentialRoute is one way a user-authored volume would hand the A2A bus
+// credential to whichever container mounts it. Source is the index into
+// projected.sources the route was found at, or BusCredentialRouteVolumeSource
+// when it is the volume's own `secret` field. Not an API type, so no deepcopy.
+// +kubebuilder:object:generate=false
+type BusCredentialRoute struct {
+	Kind   BusCredentialRouteKind
+	Source int
+}
+
+// BusCredentialRouteVolumeSource is the Source of a route found on the volume
+// itself rather than on one of a projected volume's sources.
+const BusCredentialRouteVolumeSource = -1
+
+// BusCredentialRoutes lists the ways a user-authored volume would deliver the
+// A2A bus credential, regardless of the volume's name. Empty for a volume that
+// would not. ReservedVolumeNames above is the name half of the same
+// reservation; this is the source half, and the webhook refuses what it finds
+// while the render strips it (see a2aStripBusCredentialSources in the
+// controller).
+//
+// Two routes. A projected serviceAccountToken for A2ABusTokenAudience is the
+// token the platform-agent container presents, minted for the pod's
+// ServiceAccount, so the name on the volume changes nothing about what the
+// callout sees. The credentials Secret (A2ACredsSecretName) holds
+// `bridge-password`, which needs no token minting at all and is the cheaper of
+// the two; a check on the audience alone would narrow the expensive route and
+// advertise the cheap one. A `secret` volume and a projected `secret` source
+// are the two shapes that put a Secret's data in the container. The other
+// volume sources that name a Secret (csi.nodePublishSecretRef, the storage
+// drivers' secretRef fields) hand it to a node plugin rather than to the
+// container, and are not routes to the credential's bytes.
+//
+// What this is, so the guard is not read as more than it is: KSA tokens are
+// pod-scoped and the callout cannot tell which container presented one, so
+// neither this nor the name reservation is a boundary against a hostile
+// sidecar. It is a guard against a misconfiguration by the CR's author, who is
+// the platform operator (ReservedVolumeNames says why that is the actor), and
+// it is worth having on those terms because nothing else would notice.
+func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute {
+	creds := A2ACredsSecretName(agentName)
+	var routes []BusCredentialRoute
+	if v.Secret != nil && v.Secret.SecretName == creds {
+		routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource})
+	}
+	if v.Projected != nil {
+		for i, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
+				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+			}
+			if src.Secret != nil && src.Secret.Name == creds {
+				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i})
+			}
+		}
+	}
+	return routes
 }
 
 type HermesSpec struct {
