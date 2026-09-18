@@ -758,12 +758,16 @@ type DeploymentSpec struct {
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// InitContainers specifies standard Kubernetes initContainers to run before the agent starts.
+	// A volumeMounts entry naming a reserved volume is refused at admission, and
+	// dropped from the render on an install running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
 
 	// Sidecars specifies standard Kubernetes sidecar/application containers to run alongside the agent.
+	// A volumeMounts entry naming a reserved volume is refused at admission, and
+	// dropped from the render on an install running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
@@ -776,7 +780,10 @@ type DeploymentSpec struct {
 	// to one of the Secrets the operator renders bus credentials into
 	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
 	// as either a secret volume or a projected secret source. Reading those
-	// Secrets through env is not refused here.
+	// Secrets through env is not refused here. On an install running the A2A
+	// surface the same entries are dropped from the render as well, which is the
+	// half that holds when admission does not run: the chart's default webhook
+	// failurePolicy is Ignore.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
@@ -784,7 +791,10 @@ type DeploymentSpec struct {
 
 	// ExtraVolumes specifies custom volumes to mount for the main container.
 	// The same reserved names and reserved sources as SidecarVolumes are refused
-	// at admission.
+	// at admission -- a ServiceAccount token projection for the "a2a-bus"
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
+	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
@@ -792,7 +802,9 @@ type DeploymentSpec struct {
 
 	// ExtraVolumeMounts specifies custom volume mounts for the main container.
 	// Appended to platform-agent and platform-agent-dashboard both, so an entry
-	// naming a reserved volume is refused at admission.
+	// naming a reserved volume is refused at admission. On an install running the
+	// A2A surface an entry naming a volume whose source carries a bus credential
+	// is dropped from the render too.
 	// +listType=map
 	// +listMapKey=name
 	// +optional

@@ -52,7 +52,8 @@ flip runbook that step is a blocker, not tidiness.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
-webhook validates sidecar `securityContext` and nothing else about it). The bridge
+webhook validates a sidecar's `securityContext` and its `volumeMounts` against the
+reserved volume names, and nothing else about it). The bridge
 depends on exactly that gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
@@ -116,9 +117,13 @@ shares the agent's pod, the pod does not reach Ready — the same failure shape 
 new key on the next reconcile. Both edits are in `env`, and that is the supported route on
 purpose: a `sidecarVolumes` entry that mounts that Secret — or the `<agent>-a2a-nats-config`
 or `<agent>-a2a-callout-keys` Secret, or a projection of the `a2a-bus` audience under any
-name — is refused at admission and stripped from the render, because a volume is the shape
-that hands a second container the agent's own bus identity rather than the `bridge`
-principal's one password. It does not remove the old one: `ensureA2ACredsSecret` only
+name — is refused at admission, and stripped from the render on an install running the A2A
+surface, because a volume hands a second container far more than the `bridge` principal's
+one password. `<agent>-a2a-nats-creds` and the `nats.conf` in `<agent>-a2a-nats-config`
+both carry `sys-password`, which is the `$SYS` account, and `<agent>-a2a-callout-keys`
+holds the issuer seed that signs every identity the bus accepts. The agent's own
+credential is in none of them — under the auth callout the `agent` principal has no shared
+secret at all, and the `a2a-bus` audience projection is the only route to it. It does not remove the old one: `ensureA2ACredsSecret` only
 fills keys that are missing or empty and never prunes, so `worker-password` stays in the
 Secret of an upgraded install indefinitely. It is dead data rather than a live credential —
 `worker` is no longer a user in the rendered `nats.conf`, so presenting that password

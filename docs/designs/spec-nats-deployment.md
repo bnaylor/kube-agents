@@ -656,11 +656,15 @@ which signs the bus's own tokens. The Secrets are cheaper than the projection, b
 reading one needs no token at all. All of them are closed together, because closing one
 narrows the expensive route, leaves the cheap ones, and names the class while doing it.
 
-Two layers, and they are not the same layer. The admission refusal is unconditional and
-is the only one that tells the CR's author why. The render strip is gated on the A2A
-surface, so it runs under `next` and not under `today`, and it takes the matching entries
-out of `extraVolumeMounts` and the sidecar and init containers' mounts as well - a volume
-dropped while a mount still names it is a Deployment the API server refuses. Neither
+Two layers, and they are not the same layer. The admission refusal is unconditional, is
+the only one that tells the CR's author why, and covers mounts as well as volumes:
+`extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
+against the reserved names. The render strip is gated on the A2A surface, so it runs
+under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
+recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
+on that function). On the mounts it goes further than admission does: besides the
+reserved names it drops any mount naming a volume it has just dropped by source, because
+a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
 at all; that is deliberate, because it is the supported route for the Hermes bridge
 sidecar, which is meant to hold `bridge-password`.

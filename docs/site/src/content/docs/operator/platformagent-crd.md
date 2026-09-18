@@ -414,7 +414,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it ([#610](https://github.com/gke-labs/kube-agents/issues/610)). The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
-- `initContainers` / `sidecars` — standard init and sidecar containers.
+- `initContainers` / `sidecars` — standard init and sidecar containers. A `volumeMounts` entry naming a reserved volume is refused at admission, the same as `extraVolumeMounts`; see [Reconcile behavior](#reconcile-behavior).
 - `extraVolumes` / `extraVolumeMounts` — custom volumes and mounts for the main container. Reserved names and reserved volume sources are refused at admission; see [Reconcile behavior](#reconcile-behavior).
 - `sidecarVolumes` — custom volumes for the sidecar containers. Same reservations as `extraVolumes`.
 - `podAnnotations` — annotations applied to the generated pod template.

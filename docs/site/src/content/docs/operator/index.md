@@ -166,7 +166,9 @@ kubectl delete mutatingwebhookconfiguration kubeagents-mutating-webhook-configur
 kubectl -n kubeagents-system set env deploy/kubeagents-controller-manager ENABLE_WEBHOOKS=false
 ```
 
-That leaves the cluster with the same validation coverage a chart install has. Re-apply with
+That leaves the cluster with the validation coverage a chart install with
+`operator.webhooks.enabled=false` has — none from admission, and whatever the render
+enforces on its own. Re-apply with
 `make deploy IMG=$IMG` once the cause is fixed.
 
 ## An image ahead of its ClusterRole
