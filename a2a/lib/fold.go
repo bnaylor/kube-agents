@@ -33,13 +33,21 @@ const (
 	// The threshold is the only cleanup: TasksGet does not delete the
 	// consumer it creates, and must not be made to. The delete is a publish
 	// on $JS.API.CONSUMER.DELETE.TASKS.*, a subject the rendered bridge
-	// grant withholds, and a refused publish gets no reply -- nats.go routes
-	// a permissions violation to subscriptions only. Under that principal an
-	// explicit delete would buy back the last few seconds of one consumer
-	// slot in exchange for an Error-level permissions violation on every
-	// call, which is the line an operator is taught to read as a missing
-	// grant. Reclaim the slot sooner by shortening this constant, not by
-	// adding a delete.
+	// grant withholds, and a refused publish on a request subject gets no
+	// reply at all -- the caller blocks to its own deadline while the
+	// violation arrives out of band, on the connection's async error
+	// handler. Both halves were measured: re-adding a synchronous delete
+	// here takes a replay from 0.11s to 30.07s and logs one Error-level
+	// permissions violation per call, which is the line an operator is
+	// taught to read as a missing grant.
+	//
+	// Widening the grant instead is the fix that suggests itself, and it is
+	// worse than the leak it closes. DELETE.TASKS.* is not scoped to the
+	// consumers its holder created, so it would hand everything carrying the
+	// bridge password delete on any consumer on TASKS, the gateway's own
+	// gateway-relay durable included; sessionConsumer in the worker adapter
+	// makes the same argument at length for MSG.NEXT. Reclaim the slot
+	// sooner by shortening this constant, not by adding a delete or a grant.
 	EphemeralConsumerInactiveThreshold = 5 * time.Second
 )
 
