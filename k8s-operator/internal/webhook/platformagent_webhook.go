@@ -58,7 +58,7 @@ const DefaultPort = 10250
 // agentv1alpha1.BusCredentialRoutes. Each names the thing matched, so the
 // author reading the field error knows which line to change and why.
 const (
-	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone"
+	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone" // #nosec G101 -- Error message format, not a credential
 	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"
 )
 
