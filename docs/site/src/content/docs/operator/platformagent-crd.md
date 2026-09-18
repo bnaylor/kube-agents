@@ -304,8 +304,8 @@ Three things change while it is on:
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
   dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
-  it instead, on the same terms as the `default` profile's own file, so `/sethome` and
-  `monitoring.install_id` survive a restart — see
+  it instead, on the same terms as the `default` profile's own file (with one exception, the
+  remote MCP `User-Agent`), so `/sethome` and `monitoring.install_id` survive a restart — see
   [How config reaches each profile](#how-config-reaches-each-profile).
 
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
@@ -382,8 +382,9 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Handing the file to the agent is the point — that is what lets `/sethome` and
   `monitoring.install_id` survive — but the same change means a key the running agent writes there
   is not reverted at boot. Keys the image adds still arrive through the back-fill; keys already in
-  the file stay as they were last written. Operator-owned settings are unaffected: they come from
-  the overlay and the `/etc/hermes` pins, both re-applied every boot.
+  the file stay as they were last written, except the remote MCP `User-Agent`, which follows the
+  image ([below](#how-config-reaches-each-profile)). Operator-owned settings are unaffected: they
+  come from the overlay and the `/etc/hermes` pins, both re-applied every boot.
 - Cluster profiles that already exist are otherwise unaffected — their config, skills and
   scaffolding on disk are unchanged and they keep working. What stops is the scheduled work above,
   which includes `cluster-agent-reconcile`, so a cluster onboarded while the flag is on gets no
@@ -393,7 +394,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 
 - `enabled` — the agent's shell runs in a StatefulSet of its own, reached over SSH with the keypair in the agent's credential Secret (`SANDBOX_SSH_PRIVATE_KEY` and its public half in `<name>-shell-authorized-keys`). **This is not a toggle: `false` is refused** with `Degraded`/`ShellSandboxCannotBeDisabled`, which changes nothing about the running workload. Absent or `true` are the same thing. With no keypair the sandbox Pod cannot start at all — the Secret it mounts is not optional — so the operator reports `Degraded`/`ShellSandboxKeysMissing` rather than leaving the Pod in `ContainerCreating` with the reason only in a Pod event. Every install surface generates the pair; a bare `helm install` that passes none is the way to reach that state.
 - `image` — overrides the sandbox image. Empty takes the operator's default.
-- `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds WAL-mode SQLite, which gVisor corrupts on the gofer-backed mount, and the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing the trusted one. On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
+- `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds SQLite databases whose WAL mode gVisor corrupts on the gofer-backed mount, and setting the agent Pod's field pins Hermes' own databases to the DELETE journal mode (the Session KV store is not covered; see `availability.runtimeClassName` under [`spec.deployment`](#specdeployment)), while the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing, or slowing, the trusted one. On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
 
 The GitHub-writing skills hand the credential broker file content and a commit message rather than a directory both sides mount, so the agent never holds a `.git`. There is no field for it: the broker keeps the checkout on its own state volume, which closes git's config-driven exec surface — a hook, a pager, a `filter.*.clean`, an `ext::` transport — and an install that could turn that off would be choosing to keep it open.
 
@@ -411,7 +412,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   scheduled. Pod-scoped, so it covers the agent, both injected sidecars, anything in
   `initContainers`/`sidecars`, and the OCI image volumes `AgentPlugin`s mount.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
-- `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`.
+- `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it ([#610](https://github.com/gke-labs/kube-agents/issues/610)). The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
 - `initContainers` / `sidecars` — standard init and sidecar containers.
 - `extraVolumes` / `extraVolumeMounts` — custom volumes and mounts for the main container.
@@ -514,7 +515,7 @@ Enables external integrations. Only the enabled ones need to be present.
 
 - **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by the installer when Google Chat is enabled.
 - **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by the installer when Slack is enabled.
-- **`github`** — `org` (optional target GitHub organization/user, up to 39 characters) and `gitRepo` (optional target GitOps repository URL or `owner/repo` shorthand, up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@github.com:owner/repo`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand. Rejects non-GitHub hosts and URLs containing whitespace or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL or organization is encountered during reconciliation, GitOps is disabled in config and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. On reconcile, `gitRepo` is appended to the `gitops-state` ConfigMap (`managed_repos`) if absent; removing a repository configured via `gitRepo` requires clearing or updating `spec.integration.github.gitRepo` on the CR in addition to editing the ConfigMap. Populated by the installer when a GitOps repository is connected. The same ConfigMap accepts a hand-added `context_repos` key in the same JSON shape (`[{"type": "github", "url": "https://github.com/<owner>/<name>"}]`), naming repositories the agent reads for declared intent — a Terraform repository an audit consults before it reports a posture as a finding — and never writes to. The operator does not manage that key: it is not seeded from the CR, there is no CR field for it, and reconciles leave it in place. A private context repository also needs a token the minter will issue for it, which today it does only for `managed_repos`; the pilot reads public repositories and the GitOps repository itself.
+- **`github`** — `org` (optional target GitHub organization/user, up to 39 characters) and `gitRepo` (optional target GitOps repository URL or `owner/repo` shorthand, up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@github.com:owner/repo`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand. Rejects non-GitHub hosts and URLs containing whitespace or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL or organization is encountered during reconciliation, GitOps is disabled in config and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. On reconcile, `gitRepo` is appended to the `gitops-state` ConfigMap (`managed_repos`) if absent; removing a repository configured via `gitRepo` requires clearing or updating `spec.integration.github.gitRepo` on the CR in addition to editing the ConfigMap. Populated by the installer when a GitOps repository is connected. The same ConfigMap accepts a hand-added `context_repos` key in the same JSON shape (`[{"type": "github", "url": "https://github.com/<owner>/<name>"}]`), naming repositories the agent reads for declared intent — a Terraform repository an audit consults before it reports a posture as a finding — and never writes to. The operator does not seed that key: it is not populated from the CR, there is no CR field for it, and reconciles leave it in place. The operator does read it: each same-organization entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's content-mode clone, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). Nothing that writes consults the key: a context repository stays refused by the broker's `commit` and `push`.
 
 :::caution[Upgrade note: non-GitHub repository rejection]
 Earlier operator versions passed arbitrary `https://` and `http://` URLs through to `CleanRepoURLWithOrg` without host validation. The operator now strictly restricts repository URLs to GitHub (`github.com` or `www.github.com`). Existing `PlatformAgent` resources configured with non-GitHub repositories reconcile into `phase: Degraded` with condition `Reason: InvalidGitRepoURL`, and subsequent updates to those resources are rejected at admission by the validating webhook (`failurePolicy: Fail`) until `spec.integration.github.gitRepo` is corrected or removed.
@@ -622,9 +623,12 @@ is _not_ a security sandbox — see the
 
 **What is pinned is narrow, on purpose.** `/etc/hermes` is machine-global — one file for every
 profile in the pod, not just `default` — so it carries only what is identical for every profile
-_and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode` and
-`display.platforms`. The reasoning is that as long as a human can reach the agent (`platforms`) and
-the agent can reason (`model`), anything else it breaks it can be talked into fixing.
+_and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode`,
+`display.platforms`, `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
+profile) and, when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
+corrupted database is found only after the sessions in it are unreadable). The reasoning is that as long as a
+human can reach the agent (`platforms`) and the agent can reason (`model`), anything else it breaks it can be
+talked into fixing.
 
 Everything else the operator owns for the front door goes in `profile-default.overlay.yaml`
 instead: `plugins.enabled` for AgentPlugins with no `targetProfile`, those plugins' non-gateway
@@ -661,7 +665,7 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
-That file also pins two values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
+That file also pins three values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
 the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
 because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
 file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
@@ -670,7 +674,12 @@ credential proxy, the startup probe and every in-pod loopback call get `401 Inva
 The container entrypoint warns at boot when this pin and the container env disagree.
 The credential that guards the API from _outside_ is `API_SERVER_EXTERNAL_KEY`, set from
 `hermes.apiServerSecretRef`; the sidecar authenticates the caller against it and swaps in the sentinel.
-The second is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
+The second is `HERMES_HOME_MODE=2770`, the mode Hermes re-applies to `$HERMES_HOME` at every process
+start. The container env carries it too, but that is the lowest-precedence of the three layers, so a
+`HERMES_HOME_MODE=0777` line the agent writes into the PVC `.env` outranks it and widens every
+directory Hermes secures on the shared volume.
+
+The third is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
 contract (`docs/designs/spec-mode-switch.md`). It is pinned always, with the real value, because an
 absent key is a key the agent may write, and it is read back by exactly one module,
 `agents/platform/scripts/runtime_mode.py`.
@@ -715,6 +724,13 @@ alone. Its overlay merges after that back-fill as it always did. Everything else
 that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
 force-syncs either way.
 
+One value inside both of these files does follow the image: the `User-Agent` header that the
+remote MCP servers' `args` carry (see [the config reference](/kube-agents/reference/config/)). The
+back-fill recurses only through mappings and that value lives in a list, so it would otherwise stay
+as the image that scaffolded the profile spelled it for the life of the volume. At every start the
+entrypoint sets it to the image template's in each cluster profile's `config.yaml`, and in the
+platform profile's when it is the front door, and changes nothing else in the file.
+
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
 lists union, and scalars are replaced by the overlay; precedence, lowest to highest, is Hermes
@@ -731,6 +747,55 @@ config and writable only by the operator. That is a coordination boundary rather
 in-process and could change these at runtime — but it keeps limits with board-wide consequences in
 one reviewable place.
 
+### Rotating a Secret rolls the pod
+
+Credentials reach the agent pod as environment, through `SecretKeyRef`, and a container's
+environment is fixed for the life of the pod: editing the Secret changes nothing a running container
+can see. So the operator does for Secrets what the config hash does for ConfigMaps. It reads the
+Secret keys the rendered pod spec consumes as environment, digests them with an HMAC-SHA256 keyed by
+the UID of each Secret they come from, and stamps the result on the pod template as
+`kubeagents.x-k8s.io/secret-env-hash`. Rotating one of those keys moves the digest, which changes the
+template, which rolls the pod onto the new value. Both pods that read credentials this way are
+stamped: the gateway and the credential proxy. The digest is keyed because the annotation is
+readable by anyone who can read pods: an unkeyed hash would let that reader verify guesses at a
+low-entropy value offline, whereas the UID is on the Secret object, and reading it takes the same
+`get` on the Secret that reads the values. (A UID also travels on Events and owner references that
+point at the Secret; the operator creates neither.)
+
+Five details decide whether you will see it happen.
+
+- **Within fifteen minutes, not immediately.** The operator does not watch Secrets — it holds no
+  `list` or `watch` on them, deliberately — so nothing wakes a reconcile when one changes. A healthy
+  pass instead asks to be requeued after `secretEnvReprobeInterval`, and the re-read happens then.
+  `kubectl rollout restart deployment/<agent>-gateway` still works and is immediate.
+- **Only what the pod reads as environment.** A key no container references is not in the digest, and
+  editing it rolls nothing. Neither does a key the pod _mounts_: the kubelet refreshes a mounted
+  Secret file in place, so hashing one would roll a pod over a change it was going to see anyway. The
+  gateway mounts exactly one item of `platform-agent-secrets` that way, `SANDBOX_SSH_PRIVATE_KEY`,
+  and because an init container copies it into an `emptyDir` at pod start, rotating that one key
+  still needs a restart — as it did before this change. The shell sandbox mounts its own
+  `<agent>-shell-authorized-keys`, and deliberately never names `platform-agent-secrets` at all.
+- **Whichever Secret the pod actually names.** The refs are read off the rendered pod spec, so a CR
+  that supplies its own `SecretKeyRef` pointing at a different Secret is covered without naming it
+  anywhere.
+- **A missing Secret is not an error.** It digests to a marker, so creating the Secret later moves the
+  digest and rolls the pod, and an install whose credentials arrive after the agent behaves the way
+  you would expect. A Secret the operator cannot read for any other reason — an API error rather than
+  a `NotFound` — keeps the digest the last good pass computed, so a blip neither rolls the pod nor
+  stops the rest of the reconcile.
+- **Recreating a Secret rolls the pod once, even with the same values.** The digest's key is built
+  from the UID of every Secret it reads, which an in-place edit, `kubectl apply`, or a patch keeps
+  and a delete-and-create (including `kubectl replace --force`) replaces. A metadata-only write — a new label or annotation —
+  changes neither the UID nor the values and rolls nothing.
+
+**The roll is a stop-start.** At the default single replica the gateway's update strategy is
+`Recreate`, so the old pod is terminated before the new one starts and the agent is unreachable
+across the gap — up to the startup budget of roughly ten minutes on a cold image pull. Expect one
+such restart per agent the first time an operator carrying this change reconciles: the annotation is
+new, so the first pass adds it and the template changes once, whether or not anything was rotated.
+An operator upgrade that changes how the digest is computed restarts each stamped pod once in the
+same way.
+
 ## Reconcile behavior
 
 - On create/update, the controller ensures the Deployment, Service, ServiceAccount, and ConfigMaps match the spec.
@@ -739,6 +804,7 @@ one reviewable place.
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
 - The `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` annotation on a `PlatformAgent` opts the shared `litellm-policy` out of operator reconciliation and deletes any managed copy without affecting the agent pod's own NetworkPolicy. Note that deleting the managed policy leaves LiteLLM unselected (fail-open) unless a replacement NetworkPolicy is managed out-of-band.
 - The `kubeagents.x-k8s.io/otlp-collector-namespace` annotation sets the collector namespace for `litellm-policy` when LiteLLM exports to an in-cluster collector whose namespace cannot be derived from `spec.telemetry.otlpEndpoint`.
+- The `kubeagents.x-k8s.io/network-policy-enforcement: absent-accepted` annotation is a record, not a control: the Terraform composition stamps it when an install onto an existing cluster chose to proceed without NetworkPolicy enforcement, and the operator does not read it. [Installing without NetworkPolicy enforcement](/kube-agents/install/prerequisites/#installing-without-networkpolicy-enforcement) says what it means.
 - Under the Helm chart, `platformAgent.annotations` is the route to these annotations. The chart stamps the last two itself from `litellm.networkPolicy=false` and a non-empty `telemetry.collectorNamespace`, and when it does, an entry that disagrees with the value fails the render — see [PlatformAgent annotations](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#platformagent-annotations) in the chart README.
 - The Helm chart renders and applies the CR (the install engine drives it through `terraform apply`); you can also edit it directly with `kubectl edit`.
 

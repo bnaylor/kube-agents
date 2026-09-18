@@ -44,7 +44,17 @@ locals {
   # service agent behind: in the same sample container-engine-robot accounted
   # for 287 lease writes, which would have inflated the surviving stream by 65%.
   # Matching any *.iam.gserviceaccount.com covers it and every future service
-  # agent without another edit here.
+  # agent that carries the "iam" label. It does not cover the Google-managed
+  # accounts, which do not: the Compute Engine default is
+  # "<number>-compute@developer.gserviceaccount.com", and Cloud Build, App
+  # Engine and the cloudservices agent use "@cloudbuild.", "@appspot." and
+  # "@cloudservices." respectively. Their lease writes therefore survive this
+  # exclusion and reach the topic. That costs volume and nothing else -- the
+  # detector's own classifier matches the whole ".gserviceaccount.com" domain
+  # (gcpServiceAccountSuffix in k8s-operator/cmd/drift-detector/classify.go)
+  # and drops them as automation. Widening the suffix here would cut delivered
+  # volume; it is left alone deliberately, because changing a sink filter
+  # changes what a deployed install receives and belongs in its own change.
   #
   # Kept to a single line on purpose: Cloud Logging treats a newline as an
   # implicit AND, which would break the OR grouping if this were wrapped.
@@ -157,11 +167,14 @@ resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
 # _check_subscription_exists) needs viewer as well, and without it fails with a
 # PermissionDenied that reads nothing like a missing grant.
 #
-# The drift detector as built does not make that call: it pulls straight away,
-# so subscriber alone would carry it. Viewer stays because `gcloud pubsub
-# subscriptions describe` needs it and that is the first command anyone runs
-# against an empty topic -- and because a detector that later adopts the
-# adapter's preflight would otherwise fail in that unreadable way.
+# The drift detector now makes one: a startup subscriptions.get reading the
+# configured ackDeadlineSeconds, so it can warn when --batch-join-budget would
+# hold a batch past it. This grant is what keeps that call from failing. It is
+# advisory on the detector's side -- a probe that is denied logs that the budget
+# went unchecked and the loop pulls anyway -- so removing viewer degrades the
+# warning rather than breaking ingestion. Viewer would stay regardless: `gcloud
+# pubsub subscriptions describe` needs it, and that is the first command anyone
+# runs against an empty topic.
 resource "google_pubsub_subscription_iam_member" "detector_viewer" {
   project      = var.project_id
   subscription = google_pubsub_subscription.drift_audit.id

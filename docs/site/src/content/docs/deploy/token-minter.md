@@ -5,11 +5,11 @@ sidebar:
   order: 3
 ---
 
-Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
+Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills, and read-only tokens for the credential broker's own clones of the repositories registered as context. The GitHub App's private key never leaves GCP KMS.
 
 GCP half (minter GSA, Workload Identity binding, import-only KMS signing key): [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter).
 Kubernetes half (Deployment, Service, NetworkPolicy, KSA, rule ConfigMap, `github-app-credentials` Secret): the chart's `githubMinter.*` values; the dev copy is `make -C k8s-operator deploy-github`.
-Full README: [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
+Overlay reference (the kustomize manifests behind that dev copy, and Minty's GSA-token limitations): [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
 
 ## How it works
 
@@ -27,32 +27,85 @@ Create the repo under an organization, or transfer an existing one into it. A fr
 
 ## Single-organization scoping boundary
 
-Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization. The ConfigMap's `context_repos` key is not minted for: the policy is synced from `managed_repos` only, so a context repository is readable only if it needs no token.
+Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization, and so must the repositories registered under its `context_repos` key.
 
-## Setup checklist
+## Read-only tokens for context repositories
 
-### GitHub App
+A repository registered under `context_repos` — a Terraform repository an audit reads for declared intent — gets a read-only grant, not the write one. The operator renders a policy per same-organization context repository carrying the `platform-agent-read-scope` scope alone, which grants `contents: read` and nothing else. The credential broker requests a token from that scope for its own content-mode clone of the repository, presents it to that one `git` process, and installs it nowhere: the agent sandbox never holds it, and the broker's write gate still refuses a `commit` or `push` to a context repository. A repository registered under both keys is managed and keeps its write policy.
 
-1. Create a new GitHub App, owned either by the organization or by your personal account.
-2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
-3. Note the **App ID**.
-4. Generate and download a **private key** (`.pem` file).
-5. Install the App on the target GitOps repo.
+The GitHub App must be installed on each context repository, as it must on each managed one; a private repository the App is not installed on fails to clone as before. A cross-organization entry is skipped with an operator log line. A rule ConfigMap whose `default.yaml` predates the read scope renders no context policies — upgrade the chart or the kustomize template to get it.
 
-A personal-account App is created as "Only on this account", which cannot install onto an organization. Either own the App from the organization (it stays private to it), or flip the personal one to "Any account" under **Advanced → Make public** first. Public here means installable by others, not that anyone gains access — an install is still explicit.
+## Setup and Key Provisioning
+
+Minty requires a GitHub App private key imported into Google Cloud KMS as an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`). You can either let the `kube-agents` installer import the key automatically during initial setup, or pre-provision it Ahead-Of-Time (AOT).
+
+### Prerequisites Checklist
+
+Before enabling the token minter, ensure you have:
+
+1. **GitHub Organization:** A GitHub repo **owned by an organization** (or transferred into one). Minty queries `/orgs/{org}/installation`, so personal accounts fail token minting with HTTP 404. A free organization is sufficient.
+2. **GitOps Repository:** The repository the agent opens pull requests against (e.g. `gke-fleet-iac`).
+3. **GitHub App:**
+   - Created in GitHub (`Settings -> Developer settings -> GitHub Apps`).
+   - Repository permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
+   - Installed onto the target organization, the GitOps repository, and every repository registered under `context_repos`.
+   - If created under a personal user account, "Where can this GitHub App be installed?" must be set to "Any account (Public)".
+4. **App ID:** The numeric App ID from the GitHub App settings page.
+5. **Private Key (`.pem`):** Generated and downloaded from the GitHub App settings page (needed for initial Cloud KMS import).
+6. **Host Requirements:** `go` 1.21+ on the host machine running the import — `minty tools import-pk` builds the Minty CLI, which asks for Go 1.24 and relies on 1.21 onwards fetching that toolchain on demand — and `gcloud` authenticated with Cloud KMS admin permissions on your GCP project.
+
+### Path 1: Automated Import via `install.sh`
+
+During initial installation, `install.sh` can create the Cloud KMS keyring/key and import the GitHub App private key automatically using the Minty CLI:
+
+```bash
+./install.sh --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID" \
+  --cluster-name="platform-agent-host" \
+  --region="us-central1" \
+  --gitops-org="YOUR_GITHUB_ORG" \
+  --gitops-repo="YOUR_GITOPS_REPO" \
+  --github-app-id="YOUR_GITHUB_APP_ID" \
+  --github-pem-path="/path/to/app-private-key.pem"
+```
+
+In interactive mode, `install.sh` prompts for the path to the `.pem` file if the Cloud KMS key does not yet hold an `ENABLED` version.
+
+> [!TIP]
+> **Delete the `.pem` after import:** Once `install.sh` successfully imports the key into Cloud KMS, delete the local `.pem` file. Cloud KMS keys cannot be destroyed or deleted in GCP. Subsequent runs, re-installations, and upgrades automatically detect the existing `ENABLED` key version and skip the `.pem` import step.
+
+### Path 2: Ahead-Of-Time (AOT) Pre-Provisioned Key (CI/CD & Production)
+
+For automated CI/CD pipelines, release automation, or production environments where runners do not handle raw private keys, pre-provision the Cloud KMS key upfront following the official [GitHub Token Minter documentation](https://github.com/abcxyz/github-token-minter) and the [Google Cloud KMS key import guide](https://cloud.google.com/kms/docs/importing-a-key):
+
+1. **Pre-provision Cloud KMS Key & Import Private Key:**
+   Follow the upstream [GitHub Token Minter guide](https://github.com/abcxyz/github-token-minter) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) to configure your Cloud KMS keyring and key, and import your GitHub App's private key. By default, `kube-agents` expects the key ring `github-token-minter-keyring` and key `github-token-minter-key` in your cluster's region (or custom names passed via `--kms-keyring` and `--kms-key`).
+
+2. **Deploy `kube-agents` without `.pem`:**
+   Once the key holds an `ENABLED` version in Cloud KMS, invoke `install.sh` without `--github-pem-path`:
+   ```bash
+   ./install.sh --non-interactive \
+     --project-id="YOUR_GCP_PROJECT_ID" \
+     --cluster-name="platform-agent-host" \
+     --region="us-central1" \
+     --gitops-org="YOUR_GITHUB_ORG" \
+     --gitops-repo="YOUR_GITOPS_REPO" \
+     --github-app-id="YOUR_GITHUB_APP_ID"
+   ```
 
 ### Install variables
 
-The installer (`install.sh`) collects these in its GitOps interview and saves them to `install.env`:
+The deployment requires the following variables in `install.env` or via CLI flags:
 
-- `GITHUB_APP_ID` — numeric App ID.
-- `GITOPS_ORG` — the organization hosting the repo. A username will not work; see above.
-- `GITOPS_REPO` — repo name.
+- `GITHUB_APP_ID` (`--github-app-id`) — numeric App ID.
+- `GITOPS_ORG` (`--gitops-org`) — the organization hosting the GitOps repository.
+- `GITOPS_REPO` (`--gitops-repo`) — GitOps repository name (default `gke-fleet-iac`).
+- `GITHUB_PEM_PATH` (`--github-pem-path`) — path to `.pem` (Path 1 only; omitted when key is pre-provisioned).
+- `KMS_KEYRING` (`--kms-keyring`) — Cloud KMS keyring name (default `github-token-minter-keyring`).
+- `KMS_KEY` (`--kms-key`) — Cloud KMS key name (default `github-token-minter-key`).
 
-  These were `GITHUB_ORG` / `GITHUB_REPO`, which still work for one release with a
+  `GITOPS_ORG` and `GITOPS_REPO` were previously named `GITHUB_ORG` / `GITHUB_REPO`, which still work for one release with a
   deprecation warning.
-
-- `GITHUB_PEM_PATH` — absolute path to the `.pem` file. If provided, the installer auto-imports it to KMS via the Minty CLI. If omitted, deployment proceeds but Minty fails readiness until the key is imported manually.
 
 ## Why KMS instead of a Kubernetes Secret
 
@@ -60,9 +113,7 @@ The installer (`install.sh`) collects these in its GitOps interview and saves th
 - **Auditable.** Every sign operation logs to Cloud Audit Logs.
 - **Rotatable without touching the cluster's key material.** Import a new key version to KMS; nothing on the node ever held the old one. Rotation is not free of a redeploy, though — the Deployment names one `cryptoKeyVersions/<n>`, not the key, so a new version also needs `githubMinter.kms.keyVersion` bumped and the chart re-applied.
 
-The Minty CLI handles the KMS import — it deals with PKCS#1 to PKCS#8 conversion, provisions the KMS Import Job, and does RSA-OAEP wrapping automatically. The installer shallow-clones the Minty repo at `v2.7.1` and runs `go run ./cmd/minty tools import-pk` from the tree (requires `git` and `go` on the install host; the `go run <module>@v2.7.1` form does not resolve because upstream's go.mod lacks the `/v2` suffix its v2 tags require). The import is deliberately not a Terraform resource, so the PEM never enters Terraform state.
-
-When that path is unavailable — no Go toolchain, or a host security agent that kills the compiler — `gcloud` can do the same import in four commands. The [integration README](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) has the recipe; re-running the installer afterwards skips the Go step entirely, because it only imports when the key has no enabled version.
+In the Ahead-Of-Time (AOT) model, the private key is imported into Cloud KMS upfront following the upstream documentation ([`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)). Because the key material lives permanently in Cloud KMS, `kube-agents` manifests and CI pipelines never handle or stage private keys.
 
 ## GSA-only auth
 
@@ -77,7 +128,7 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 - **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
 - **Image:** substituted from `GITHUB_MINTER_IMAGE`, run as `/minty server run`. The upstream reference and pin live in `images.json`; see the [Docker images](docker-images.md) inventory.
 - **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
-- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write`, `pull_requests: write`, and `issues: write`; requests must pass this in the `scope` field.
+- **Scopes:** the ConfigMap rule exposes two. `platform-agent-scope` grants `contents: write`, `pull_requests: write`, and `issues: write`, and is what the agent's managed repositories ride. `platform-agent-read-scope` grants `contents: read` alone, and is what the credential broker requests for its clone of a context repository. A request names one in its `scope` field.
 - The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) points at the configured key version (the chart's `githubMinter.kms.keyVersion`), which must be ENABLED — i.e. imported — before the Deployment passes readiness.
 
 ## Manual testing
@@ -106,9 +157,9 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
   -d '{"org_name":"<org>","repositories":["<repo>"],"scope":"platform-agent-scope"}'
 ```
 
-A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end.
+A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end. Put `platform-agent-read-scope` in `scope` to check the read-only grant: the token returned can clone the repository and nothing more.
 
 ## Where to go next
 
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the `submit-suggestion` skill that uses Minty.
-- [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) — full Minty install detail.
+- [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) — the kustomize overlay's reference notes, including Minty's GSA-token limitations.

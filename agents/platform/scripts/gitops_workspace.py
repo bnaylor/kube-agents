@@ -10,7 +10,7 @@ Why the clone is *leased*
 -------------------------
 The first version of this file put every repository at one flat path, a pure
 function of `owner/name`. That is exactly one working tree for the whole pod,
-and the pod runs many agents at once: six audit crons, plus every kanban worker
+and the pod runs many agents at once: the audit crons, plus every kanban worker
 the dispatcher spawns, plus whatever the operator is doing interactively. In the
 incident that prompted this design, the `submit-suggestion` skill ran
 `git checkout -b …` and `git push -f` inside the tree a fleet audit was midway
@@ -75,10 +75,15 @@ DEFAULT_AGENT_HOME = "/opt/data"
 # repositories consulted for declared intent before an audit reports a
 # finding. It is a separate key, and nothing in this module merges it into the
 # managed list, which is what makes a context repository read-only by
-# construction: the broker, the resolver and the operator never see it. A
-# `role: context` marker inside `managed_repos` would instead be flattened by
-# `_parse_repos_json` into a writable entry. The operator's reconcile leaves
-# keys it does not own alone, so a hand-added `context_repos` survives it.
+# construction: the push gate and the resolver never see it. It has three
+# readers. Two read it for a read-only grant — the operator renders a
+# `contents: read` minter policy per entry, and the broker's content-mode clone
+# presents the token minted from it (`repository_role` in credential_proxy.py,
+# consulted by no write path) — and the fleet-audit helper (`audit_report.py
+# start`) reads it to tell the SOP which repositories to search. A `role: context` marker
+# inside `managed_repos` would instead be flattened by `_parse_repos_json` into
+# a writable entry. The operator's reconcile leaves keys it does not own alone,
+# so a hand-added `context_repos` survives it.
 MANAGED_REPOS_KEY = "managed_repos"
 CONTEXT_REPOS_KEY = "context_repos"
 
@@ -177,15 +182,19 @@ def resolve_base_branch(
 
     Resolution order:
 
-    1. `GITOPS_BASE_BRANCH`. For a repository whose default branch is not the
-       branch the fleet deploys from — a `release` line, say. Nothing this
-       function can observe would tell it that, so an operator has to.
+    1. `CREDENTIAL_PROXY_BASE_BRANCH` or `GITOPS_BASE_BRANCH`. For a repository
+       whose default branch is not the branch the fleet deploys from — a `release`
+       line, say. Nothing this function can observe would tell it that, so an operator
+       has to.
     2. `origin/HEAD` in the clone. `git clone` sets it from the default the
        remote advertises, which is the right answer for every ordinary
        repository, and it costs one `symbolic-ref`.
     3. `main`, when there is no clone to ask yet.
     """
-    override = os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
     if override:
         return override
     if workspace is None:
@@ -726,6 +735,13 @@ def extract_github_slug(entry: str) -> str | None:
 
 
 DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+# How long `_read_state_key`'s ConfigMap fallback read waits on the API server
+# before giving up.
+# One namespaced GET against an in-cluster endpoint, so this is not a budget so
+# much as a ceiling on a call that has no other one: unbounded, an API server
+# that accepts the connection and then stops talking hangs the caller forever
+# rather than failing it, and nothing between this call and whatever deadline
+# encloses the run would report that as a read failure.
 GITOPS_STATE_READ_TIMEOUT_SECONDS = 30
 
 
@@ -813,6 +829,9 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
     except FileNotFoundError as e:
         raise RuntimeError("kubectl binary not found in PATH") from e
     except subprocess.TimeoutExpired as e:
+        # Same RuntimeError as every other failure here, because every caller
+        # already handles one and none of them can do anything with a distinct
+        # type: a list that cannot be read is a list that cannot be read.
         raise RuntimeError(
             f"Timed out after {GITOPS_STATE_READ_TIMEOUT_SECONDS}s reading ConfigMap "
             f"{cfg_name} in namespace {ns}"

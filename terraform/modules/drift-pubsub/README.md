@@ -27,7 +27,7 @@ The 10,000 is the query's row cap rather than the window's true total, so it fix
 
 The exclusion is scoped by principal rather than dropping Leases outright, so a person running `kubectl patch lease` still reaches the detector. That is not GitOps drift, but it can knock an active controller off its lock, and discarding it silently is hard to defend.
 
-Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same sample `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches any `*.iam.gserviceaccount.com`, covering it and any future service agent without a change here.
+Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same sample `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches any `*.iam.gserviceaccount.com`, covering it and any future service agent that carries the `iam` label. It does not cover the Google-managed accounts, which do not carry it — `<number>-compute@developer.`, `@cloudbuild.`, `@appspot.` and `@cloudservices.` — so their Lease writes survive this exclusion and reach the topic. That costs delivered volume and nothing else: the detector matches the whole `.gserviceaccount.com` domain and drops them as automation. Widening the suffix here would cut volume, and is left for its own change because it alters what a deployed install receives.
 
 Set the variable to `false` to export the unfiltered stream while debugging.
 
@@ -51,6 +51,12 @@ module "drift_pubsub" {
   cluster_names = ["platform-agent-host", "prod-us-east4"]
 ```
 
+The filter matches on the bare cluster name, which is unique within a project and location but not
+across locations, so listing `prod` here exports every `prod` in the project. That is the safe
+direction — the detector matches on the full `project/location/cluster` triple and reports anything
+it cannot reach as `unreachable` rather than reading the wrong cluster — but it does mean a narrowed
+`cluster_names` can still carry more traffic than the list suggests.
+
 `subscription_id` is the output to feed the detector's `--subscription` flag, alongside `--project`:
 
 ```bash
@@ -60,5 +66,12 @@ drift-detector --project my-gcp-project --subscription "$(terraform output -raw 
 The flag takes either form — this fully-qualified path, or the bare `subscription_name`, which it
 qualifies with `--project`. `--project` is required either way, because the detector's credentials
 are resolved against it.
+
+Lowering `ack_deadline_seconds` below its 60s default means passing the detector a matching
+`--batch-join-budget`. The detector holds a whole batch while it reads live objects, and the two
+values are not wired together — it reads this one at startup and warns when its budget takes more
+than half of it, but it does not adopt it.
+[The detector's README](../../../k8s-operator/cmd/drift-detector/README.md) is canonical for what
+happens when the budget outlasts the deadline.
 
 See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

@@ -26,6 +26,14 @@ export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
 
+# The WAL-to-DELETE conversion (deploy/shared/sqlite_journal_migrate.py). Named here
+# because two places use it: the owner runs it at step 1.7 and a non-owner waits on
+# its --check below the shared-state gate. The PVC copy is the fallback for an image
+# whose /opt/defaults predates the script, and for the tests, which run these steps
+# against a temporary home.
+SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"
+[ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] || SQLITE_JOURNAL_MIGRATE_SCRIPT="$TARGET_DIR/scripts/sqlite_journal_migrate.py"
+
 # Pre-export AGENT_BROWSER_EXECUTABLE_PATH before running stage2-hook.sh.
 # Why: Upstream stage2-hook.sh scans for Playwright's Chromium binary and
 # attempts to export it to s6-overlay by creating /run/s6/container_environment/.
@@ -34,7 +42,8 @@ export INSTALL_DIR="/opt/hermes"
 # By pre-exporting AGENT_BROWSER_EXECUTABLE_PATH here, stage2-hook.sh detects
 # [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] is false and cleanly skips writing to /run/s6/.
 if [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] && [ -d "/opt/hermes/.playwright" ]; then
-    export AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    export AGENT_BROWSER_EXECUTABLE_PATH
 fi
 
 # 1. Execute upstream container initialization natively (inherits 100% of upstream updates)
@@ -173,7 +182,7 @@ if ! agent_owns_shared_state "$@"; then
     # plain manifest, `docker run`, the kustomize bases, a test harness — a missing
     # config.yaml means nobody is coming to write it, and pausing would turn a fast
     # failure into a two-minute one for no possible gain.
-    if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ ! -f "$TARGET_DIR/config.yaml" ]; then
+    if [ -n "${HERMES_MANAGED_DIR:-}" ]; then
         _wait_secs="${AGENT_SHARED_STATE_WAIT_SECS:-120}"
         # A non-numeric value would make the `-lt` below a shell ERROR, and `set -e` is on
         # — so a typo in a knob for waiting would kill the container outright, which is
@@ -185,16 +194,42 @@ if ! agent_owns_shared_state "$@"; then
                 _wait_secs=120
                 ;;
         esac
-        echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
-        _waited=0
-        while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
-            sleep 1
-            _waited=$((_waited + 1))
-        done
-        if [ -f "$TARGET_DIR/config.yaml" ]; then
-            echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
-        else
-            echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+        if [ ! -f "$TARGET_DIR/config.yaml" ]; then
+            echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
+            _waited=0
+            while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ -f "$TARGET_DIR/config.yaml" ]; then
+                echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
+            else
+                echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+            fi
+        fi
+        # The same bounded wait for the owner's step 1.7, the WAL-to-DELETE conversion.
+        # Unlike the config file, this one is real in the shipped image: the owner
+        # converts the databases in place, and a non-owner that opens one mid-switch
+        # holds exactly the concurrent connection the conversion refuses to run under,
+        # so the two would settle into "left in WAL" on every start. --check exits
+        # non-zero only while the managed scope pins `delete` and a governed header
+        # still reads WAL; every other answer, including a script that cannot read the
+        # config, is "nothing to wait for". Same budget, same proceed-anyway ending.
+        if [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            _waited=0
+            while ! "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" --check \
+                    --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" 2>/dev/null; do
+                if [ "$_waited" -ge "$_wait_secs" ]; then
+                    echo "[ENTRYPOINT] WARN: a database under $TARGET_DIR still reads WAL after ${_wait_secs}s with journal_mode=delete pinned; starting '$*' anyway (the owner converts it at its next start)." >&2
+                    break
+                fi
+                [ "$_waited" -gt 0 ] || echo "[ENTRYPOINT] a database under $TARGET_DIR still reads WAL with journal_mode=delete pinned; waiting up to ${_wait_secs}s for the owner's conversion (step 1.7)." >&2
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ "$_waited" -gt 0 ] && [ "$_waited" -lt "$_wait_secs" ]; then
+                echo "[ENTRYPOINT] the WAL-to-DELETE conversion finished after ${_waited}s; continuing." >&2
+            fi
         fi
         unset _wait_secs _waited
     fi
@@ -378,6 +413,34 @@ if command -v flock >/dev/null 2>&1; then
         # behaviour, so the worst case is no worse than before the lock.
         flock -w 300 9 || echo "WARN: timed out waiting for the $TARGET_DIR bootstrap lock; proceeding concurrently with the peer container" >&2
     fi
+fi
+
+# 1.7 Convert the SQLite databases on this volume out of WAL, once, when the operator
+# has pinned `database.journal_mode: delete` in the managed scope.
+#
+# The operator pins it whenever the agent pod has a runtime class (renderConfigYAML in
+# platformagent_manifests.go): under gVisor the volume is a 9p gofer mount that accepts
+# WAL and then corrupts it, and two databases went that way in three days (#610).
+# Hermes honours the pin for a database it creates, but never downgrades one whose
+# header already reads WAL — apply_wal_with_fallback returns an on-disk WAL database
+# before it consults the setting, because a live downgrade under a concurrent opener
+# destroys committed-but-uncheckpointed frames. So a volume that ran in WAL before the
+# pin, which is every install this was written for, needs one conversion, and it has
+# to happen HERE: after the lock above, so one container does it, and before step 2,
+# because everything below opens a database somewhere (the cron reconcile, the kanban
+# board, the session store). The non-owner's wait below the shared-state gate is the
+# other half: a sidecar holds off opening a database until this has run.
+#
+# The script checkpoints each database with TRUNCATE first and switches only when
+# SQLite reports the switch took. A database another process holds open is left as it
+# is and logged, and the next start retries; nothing here can make a file worse than
+# WAL already left it. Best-effort: the gate is in the script (no pin, no conversion),
+# so an image started without the operator — compose, a plain manifest, the kustomize
+# bases — runs a no-op, and a host without the venv skips the step outright.
+if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" \
+        --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" \
+        || echo "WARN: the WAL-to-DELETE conversion did not finish (exit $?); a database still in WAL is converted at the next start" >&2
 fi
 
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
@@ -595,6 +658,99 @@ if added:
     os.replace(tmp_path, live_path)
     print(f"[ENTRYPOINT] config backfill: restored {len(added)} key(s) the live file did not hold: {', '.join(added)}")
 PYEOF
+}
+
+# Make a live config.yaml send the User-Agent its image template sends on every remote
+# MCP server the two have in common, and change nothing else. $1 = the template, $2 =
+# the live file.
+#
+# The header is image-owned state inside files the fill above cannot reach: `args` is
+# a list, and the fill recurses only where both sides are mappings, so a live list
+# keeps the string it was scaffolded with. That is right for everything else a list
+# holds and wrong for this one value, which the API teams serving the endpoints key
+# dashboards on (deploy/shared/defaults/config.yaml carries the rationale). Left
+# alone, a PVC upgraded onto a new image sends the new build's version in the old
+# header shape from every cluster profile, and from the platform profile at the front
+# door, for as long as the volume lives — while a fresh install sends the new one.
+#
+# Two things in the live file are matched, and nothing else is read: the server, by
+# name, so a server the template does not ship is left as it is; and inside its args
+# the value after a `--header` token that names User-Agent, which becomes the
+# template's. A profile scaffolded before the header existed has no such pair, and
+# gets the template's inserted where the template carries it, so the proxy invocation
+# keeps the same shape. Identity, overlays, timeouts, every other arg: untouched.
+#
+# A caller reports its own failure, as with the fill: only it knows which profile.
+repair_remote_mcp_user_agent() {
+    "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" <<'UAEOF'
+import os
+import sys
+
+import yaml
+
+HEADER_FLAG = "--header"
+HEADER_NAME = "user-agent"
+TMP_SUFFIX = ".user-agent.tmp"
+
+template_path, live_path = sys.argv[1], sys.argv[2]
+
+
+def load(path):
+    with open(path) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def header_slot(args):
+    # Index of the User-Agent value: the arg after a `--header` token whose name is
+    # User-Agent. Header names are case-insensitive (RFC 9110 §5.1), so compare folded.
+    for i in range(len(args) - 1):
+        if args[i] == HEADER_FLAG and isinstance(args[i + 1], str):
+            name, sep, _ = args[i + 1].partition(":")
+            if sep and name.strip().lower() == HEADER_NAME:
+                return i + 1
+    return None
+
+
+template, live = load(template_path), load(live_path)
+if not isinstance(template, dict) or not isinstance(live, dict):
+    print("[ENTRYPOINT] User-Agent repair skipped: not a mapping", file=sys.stderr)
+    raise SystemExit(0)
+
+template_servers, live_servers = template.get("mcp_servers"), live.get("mcp_servers")
+if not isinstance(template_servers, dict) or not isinstance(live_servers, dict):
+    raise SystemExit(0)
+
+repaired = []
+for name, template_server in template_servers.items():
+    live_server = live_servers.get(name)
+    if not isinstance(template_server, dict) or not isinstance(live_server, dict):
+        continue
+    template_args, live_args = template_server.get("args"), live_server.get("args")
+    if not isinstance(template_args, list) or not isinstance(live_args, list):
+        continue
+    template_slot = header_slot(template_args)
+    if template_slot is None:
+        continue
+    wanted = template_args[template_slot]
+    live_slot = header_slot(live_args)
+    if live_slot is None:
+        at = min(template_slot - 1, len(live_args))
+        live_args[at:at] = [HEADER_FLAG, wanted]
+        repaired.append(name)
+    elif live_args[live_slot] != wanted:
+        live_args[live_slot] = wanted
+        repaired.append(name)
+
+if repaired:
+    # Atomic, for the fill's reason and one more: a torn write of a cluster profile's
+    # config.yaml loses `cluster_identity`, and the reconciler then scaffolds a
+    # duplicate it can never prune.
+    tmp_path = live_path + TMP_SUFFIX
+    with open(tmp_path, "w") as fh:
+        yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
+    os.replace(tmp_path, live_path)
+    print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+UAEOF
 }
 
 # Fresh volume: lay the image's copy down before anything can read it, so neither the
@@ -918,15 +1074,21 @@ fi
 #     restart. So config.yaml leaves the --items list, and step 2.6b below
 #     back-fills it the way step 2d back-fills the default profile's, with the
 #     same fill-only rule and the same trade: keys the image ADDS still arrive,
-#     keys the file already holds stay as the agent last wrote them. Everything
-#     else here force-syncs either way.
+#     keys the file already holds stay as the agent last wrote them — plus the
+#     same remote MCP User-Agent repair the cluster loop runs, for the one
+#     image-owned value the fill cannot reach. Everything else here force-syncs
+#     either way.
 #   - A cluster config.yaml is identity-stamped at scaffold time with that
 #     cluster's `cluster_identity` block (project/cluster/location), so it is
 #     runtime state. Overwriting it from the template would strip the record
 #     cluster_agent_reconcile.py matches a profile to its cluster by, and the
 #     reconciler would then scaffold a duplicate profile it can never prune.
 #     (KUBECONFIG is not in this file — it is pinned in the profile's .env by
-#     cluster_agent_profile.py:_pin_kubeconfig_env.)
+#     cluster_agent_profile.py:_pin_kubeconfig_env.) The two image-owned values
+#     inside it are repaired in place instead, in the cluster loop below: the
+#     retired `memory.provider` key is dropped, and the remote MCP User-Agent is
+#     set to the template's, so an upgraded volume sends the same header a fresh
+#     one does.
 #
 # Profile identity is NOT at risk either way: `hermes profile create` records the
 # name and description in profiles/<name>/profile.yaml, a separate file that no
@@ -1115,6 +1277,7 @@ sync_profile_skills() {
     #
     # $_src is NOT shared: it is the read-only image template inside this container,
     # so only the destination side needs this.
+    # shellcheck disable=SC3028 # the next two lines fall back to hostname and $$ where HOSTNAME is unset
     _tag="${HOSTNAME:-}"
     [ -n "$_tag" ] || _tag="$(hostname 2>/dev/null || true)"
     [ -n "$_tag" ] || _tag="$$"
@@ -1316,6 +1479,18 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
                 || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
         fi
+        # Second targeted self-heal, same file, same reason it is not force-synced: the
+        # User-Agent the profile's remote MCP calls carry is image-owned, and lives in
+        # an arg list that neither the force-sync nor a fill-only merge reaches. Without
+        # this, every cluster onboarded before an image changed the header keeps
+        # sending the old one for the life of the volume, while the platform profile
+        # and every newly onboarded cluster send the new one — two header shapes from
+        # one build, on a value the API teams key dashboards on. The helper writes
+        # only when the value differs, so a profile already current is not rewritten.
+        if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
+            repair_remote_mcp_user_agent "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
+                || echo "WARN: failed to repair the remote MCP User-Agent in $d/config.yaml; this cluster agent keeps sending the header it was scaffolded with" >&2
+        fi
         # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
         # cron store if one exists on the PVC.
         if [ -f "$d/cron/jobs.json" ] && [ -w "$d/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
@@ -1368,6 +1543,13 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
         backfill_config_from_template \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
             || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
+        # The fill leaves lists alone, so the one image-owned value inside one — the
+        # remote MCP User-Agent — is repaired in place, exactly as the cluster loop
+        # above does for its profiles. Force-synced, flag off, the file already
+        # carries it; this is the front door taking the same repair.
+        repair_remote_mcp_user_agent \
+            "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
+            || echo "WARN: could not repair the remote MCP User-Agent in profiles/platform/config.yaml; the front door keeps sending the header it was scaffolded with" >&2
     else
         echo "[ENTRYPOINT] profiles/platform/config.yaml is missing; seeding it from the image template." >&2
         cp "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
@@ -1556,6 +1738,7 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
     OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
     mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    # shellcheck disable=SC3013 # -ef is implemented by dash and busybox ash, the shells this image runs
     if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
         ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
     fi

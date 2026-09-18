@@ -460,11 +460,13 @@ fi
 # which is `gvisor`. Step 7 reaches the agent over `kubectl port-forward`, and
 # that does not work against a sandboxed pod -- the forward is set up in the
 # host-side CNI netns while the listener lives in the sandbox's own network
-# stack, so the connection is refused (scripts/exec_tunnel.py is canonical on
-# this). On a pool cluster with no `gvisor` RuntimeClass the pod would not
-# schedule at all. Either way this job wants the standard runtime; what the
-# sandbox does to the agent is the release pipeline's to exercise, not a smoke
-# test's.
+# stack, so the connection is refused
+# (docs/site/src/content/docs/operator/platformagent-crd.md is canonical on
+# this; scripts/exec_tunnel.py is the relay that reaches one instead, as
+# tests/e2e does). On a pool cluster with no `gvisor` RuntimeClass the pod
+# would not schedule at all. Either way this job wants the standard runtime;
+# what the sandbox does to the agent is the release pipeline's to exercise,
+# not a smoke test's.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ==="
 
@@ -558,7 +560,7 @@ echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 # its own gate with diagnostics.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
-for i in {1..60}; do
+for _ in {1..60}; do
   kubectl get deployment platform-agent-gateway -n "${NAMESPACE}" >/dev/null 2>&1 && break
   sleep 5
 done
@@ -575,7 +577,7 @@ fi
 # stuck on ImagePullBackOff is an install this job must fail rather than pass.
 # Gated separately for the same reason the Deployment is -- the operator
 # creates it from the CR, so `helm --wait` never saw it.
-for i in {1..60}; do
+for _ in {1..60}; do
   kubectl get statefulset platform-agent-shell -n "${NAMESPACE}" >/dev/null 2>&1 && break
   sleep 5
 done
@@ -619,7 +621,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
   PF_PID=$!
 
   echo "Waiting for platform-agent port-forward on port 8642 (attempt ${attempt}/${CONNECTIVITY_ATTEMPTS})..."
-  for i in {1..30}; do
+  for _ in {1..30}; do
     if nc -z localhost 8642 2>/dev/null; then
       break
     fi

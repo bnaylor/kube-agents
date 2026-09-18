@@ -54,6 +54,20 @@ readonly NODE_POOL_UPDATE_POLL_INTERVAL_SECS="${NODE_POOL_UPDATE_POLL_INTERVAL_S
 readonly NODE_POOL_UPDATE_POLL_MAX_RETRIES="${NODE_POOL_UPDATE_POLL_MAX_RETRIES:-3}"
 readonly GKE_OP_STATUS_DONE="DONE"
 readonly GKE_OP_STATUS_RUNNING="RUNNING"
+# What a run records about NetworkPolicy enforcement on the cluster it installs
+# onto: the install report's network_policy_enforcement field carries one of the
+# three values, and the composition stamps the third onto the PlatformAgent as
+# the annotation, so the choice to install without enforcement outlives the
+# terminal (issue #1682).
+readonly NETWORK_POLICY_ENFORCEMENT_ANNOTATION="kubeagents.x-k8s.io/network-policy-enforcement"
+readonly NP_ENFORCEMENT_ENFORCED="enforced"
+readonly NP_ENFORCEMENT_ENABLED_BY_INSTALL="enabled-by-install"
+readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
+# The report field's key, and the value in the report until a run has decided.
+readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
+NETWORK_POLICY_ENFORCEMENT=""
+# Whether note_stale_network_policy_acceptance has spoken this run.
+NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -367,6 +381,10 @@ PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
+PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
+PARAM_KMS_KEY="${KMS_KEY:-}"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -417,6 +435,8 @@ PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
 PARAM_MIGRATE_NODE_POOLS_PASSED="false"
 PARAM_ENABLE_NETWORK_POLICY="${ENABLE_NETWORK_POLICY:-}"
 PARAM_ENABLE_NETWORK_POLICY_PASSED="false"
+PARAM_ACCEPT_NO_NETWORK_POLICY="${ACCEPT_NO_NETWORK_POLICY:-}"
+PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="false"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
 # check and the one at the workspace step do not report the same verdict twice.
@@ -482,9 +502,15 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org/Username for GitOps repo
+  --gitops-org=ORG              GitHub Org for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
                                 currently gke-fleet-iac)
+  --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
+  --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
+  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
+                                currently github-token-minter-keyring)
+  --kms-key=KEY                 Cloud KMS Key Name for token minter (default: DEFAULT_KMS_KEY,
+                                currently github-token-minter-key)
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
@@ -542,12 +568,21 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
-  --migrate-node-pools          Opt in to migrating legacy node pools to GKE_METADATA on an existing
-                                cluster (recreates nodes and restarts workloads; required on clusters
-                                with legacy pools, else install aborts)
-  --enable-network-policy       Opt in to enabling legacy Calico NetworkPolicy addon and enforcement
-                                on an existing GKE Standard cluster without Dataplane V2 (may recreate
-                                nodes and restart workloads; required on such clusters, else install aborts)
+  --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
+                                GKE_METADATA. Recreates those nodes and restarts every workload on
+                                them, kube-agents' or not. Without it a cluster with legacy pools is
+                                refused unchanged (REFUSED_MISSING_NODE_POOL_MIGRATION); there is no
+                                install without Workload Identity. The cluster's owner decides this.
+  --enable-network-policy       Authorize enabling the legacy Calico NetworkPolicy addon and
+                                enforcement on an existing GKE Standard cluster that has neither it
+                                nor Dataplane V2. May recreate nodes and restart workloads. One of
+                                two answers for such a cluster; the other is below, and without
+                                either the cluster is refused unchanged (REFUSED_MISSING_NETWORK_POLICY).
+                                The cluster's owner decides this.
+  --accept-no-network-policy    Install onto such a cluster without modifying it. Every NetworkPolicy
+                                kube-agents ships is then inert, including the ones that confine the
+                                agent's shell sandbox; the choice is recorded in the install report
+                                and on the PlatformAgent. Mutually exclusive with the flag above.
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
   -h, --help, -?                Show this help message
 
@@ -582,6 +617,10 @@ parse_args() {
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; shift ;;
+      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
+      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
@@ -621,6 +660,16 @@ parse_args() {
       --enable-network-policy)
         PARAM_ENABLE_NETWORK_POLICY="true"
         PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --accept-no-network-policy=*)
+        PARAM_ACCEPT_NO_NETWORK_POLICY="${1#*=}"
+        PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --accept-no-network-policy)
+        PARAM_ACCEPT_NO_NETWORK_POLICY="true"
+        PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="true"
         shift
         ;;
       -h|--help|-\?|help) show_help; exit 0 ;;
@@ -675,8 +724,8 @@ EOF
 # Minimum tool versions, kept in scripts/installer/min_versions.sh so the
 # numbers live in exactly one place. This installer is also downloaded and run
 # on its own, before any checkout exists, so the source is guarded: in that
-# case the workspace step clones the repository and the check runs against the
-# clone's copy.
+# case source_provisioning_helpers re-sources this file out of the clone at
+# step 2, which is what the Go floor at step 12 relies on.
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 _min_versions="${_script_dir}/scripts/installer/min_versions.sh"
 if [ -r "$_min_versions" ]; then
@@ -685,8 +734,20 @@ if [ -r "$_min_versions" ]; then
   # shellcheck source=scripts/installer/min_versions.sh disable=SC1091
   source "$_min_versions"
 else
+  # Reached when install.sh runs without the repository beside it, which is
+  # the documented `curl … | bash` path. Every require_min_* the script calls
+  # needs an arm here: the calls are unguarded, so a missing one is not a
+  # skipped check but an undefined command, and `set -u`/`|| return 1` turns
+  # that 127 into a failure of whatever was being attempted.
+  #
+  # These stubs hold only until the clone arrives. The gcloud and terraform
+  # floors run at step 1 and so are genuinely unenforceable on this path --
+  # there is no checkout yet to state a number. The Go floor is not: it runs
+  # at step 12, and source_provisioning_helpers has replaced this stub with
+  # the clone's copy by then.
   require_min_gcloud_version() { return 0; }
   require_min_terraform_version() { return 0; }
+  require_min_go_version() { return 0; }
 fi
 unset _min_versions
 
@@ -1035,7 +1096,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH; do
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
@@ -1070,12 +1131,58 @@ warn_unrecorded_interview_answers() {
   print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you."
 }
 
+# The one answer checked on every run, TTY or not, and unlike the interview
+# answers above a missing line counts: an agent-driven install passes
+# --accept-no-network-policy on the command line and never sees a prompt, and
+# if the file does not record it, the next generator run -- upgrade.sh, the
+# Day-2 menu -- emits accept_no_network_policy = false and the module refuses
+# the plan for the very enforcement this install already accepted. Still a
+# warning rather than a write, for the reasons warn_unrecorded_interview_answers
+# gives.
+note_unrecorded_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  # The decision, not the flag: a flag passed against a cluster that already
+  # enforces accepted nothing, and recording it would waive the module's check
+  # for the life of the install.
+  [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ] || return 0
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  ! is_truthy "${recorded:-false}" || return 0
+  print_warning "This run installs without NetworkPolicy enforcement, and ${file} does not record it."
+  print_info "Add ACCEPT_NO_NETWORK_POLICY=true to ${file}. upgrade.sh and the Day-2 menu regenerate from the file, and without the key the next apply is refused for the enforcement this install accepted."
+}
+
+# The converse, so the key retires: a file that still records
+# ACCEPT_NO_NETWORK_POLICY=true once the cluster enforces -- confined later
+# with --enable-network-policy, moved to Dataplane V2, or a created cluster
+# under a copied install.env -- keeps every later upgrade.sh and Day-2 apply
+# emitting accept_no_network_policy = true, and the module's postcondition,
+# the one guard against policies going silently inert again, never fires for
+# that install. Nothing rewrites install.env, so the operator is told once.
+note_stale_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ "$NETWORK_POLICY_STALE_ACCEPTANCE_NOTED" != "true" ] || return 0
+  case "${NETWORK_POLICY_ENFORCEMENT:-}" in
+    "$NP_ENFORCEMENT_ENFORCED" | "$NP_ENFORCEMENT_ENABLED_BY_INSTALL") ;;
+    *) return 0 ;;
+  esac
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  is_truthy "${recorded:-false}" || return 0
+  NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="true"
+  print_warning "${file} records ACCEPT_NO_NETWORK_POLICY=true, but cluster '${CLUSTER_NAME:-}' enforces NetworkPolicy now."
+  print_info "Remove that line. While it stays, every later upgrade.sh and Day-2 apply waives the check that would refuse this install if enforcement were ever lost again."
+}
+
 bootstrap_install_env_file() {
   local destination="${1:-}" image_tag="${2:-}"
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
     print_info "Left your install configuration as you wrote it: ${destination}"
     warn_unrecorded_interview_answers "$destination"
+    note_unrecorded_network_policy_acceptance "$destination"
     return 0
   fi
   if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -1131,7 +1238,6 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
-  write_env_var "$tmp" GITHUB_PEM_PATH "${GITHUB_PEM_PATH:-}"
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
   write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
@@ -1139,7 +1245,16 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
-  
+  # Recorded only when this run accepted it -- the decision, not the flag: a
+  # flag passed against a cluster that already enforces accepted nothing. The
+  # key is a standing decision about this cluster, and every later generator
+  # run -- upgrade.sh, the Day-2 menu -- must carry it, or it emits
+  # accept_no_network_policy = false and the module refuses the plan this
+  # install already passed.
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    write_env_var "$tmp" ACCEPT_NO_NETWORK_POLICY "true"
+  fi
+
   write_env_var "$tmp" REGISTRY_PREFIX "${REGISTRY_PREFIX:-}"
   if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
     write_env_var "$tmp" THIRD_PARTY_REGISTRY_PREFIX "${THIRD_PARTY_REGISTRY_PREFIX}"
@@ -1413,6 +1528,15 @@ source_provisioning_helpers() {
   # gke_dns_endpoint_flag, for the credentials fetch before the health checks.
   # shellcheck source=/dev/null
   source "${SCRIPT_DIR}/gke_dns_endpoint.sh"
+  # The version floors. On the `curl … | bash` path the guard near the top of
+  # this file had no file to read them from and armed no-op stubs instead; the
+  # clone has the file, so the real checks replace those stubs here. This is
+  # what makes the Go floor at import_github_pem an actual check on that path
+  # rather than an unconditional `return 0` — it runs at step 12, long after
+  # this step 2. (The gcloud and terraform floors are already past by now:
+  # they run at step 1, before any checkout exists to read a number from.)
+  # shellcheck source=/dev/null
+  source "${SCRIPT_DIR}/min_versions.sh"
   print_success "Loaded installer defaults from scripts/installer/installer_common.sh"
 }
 
@@ -1441,6 +1565,8 @@ resolve_shared_defaults() {
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
   PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
   PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
 }
@@ -1864,6 +1990,11 @@ auto_install_tool() {
         sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin 2>/dev/null || \
           sudo apt-get install -y gke-gcloud-auth-plugin 2>/dev/null || \
           (command -v gcloud >/dev/null 2>&1 && gcloud components install gke-gcloud-auth-plugin -q) || true
+      elif [ "$tool" = "go" ]; then
+        sudo apt-get update >/dev/null 2>&1 || true
+        if ! sudo apt-get install -y golang-go 2>/dev/null; then
+          sudo apt-get install -y golang 2>/dev/null || true
+        fi
       else
         sudo apt-get update >/dev/null 2>&1 || true
         sudo apt-get install -y "$tool" || true
@@ -1912,6 +2043,7 @@ write_json_report() {
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-null},
   "memory_mode": "$(json_escape "${memory_mode:-}")",
+  "${NETWORK_POLICY_REPORT_FIELD}": "$(json_escape "${NETWORK_POLICY_ENFORCEMENT:-}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "install_env_file": "$(json_escape "${INSTALL_ENV_FILE:-}")",
   "timestamp": "$(json_escape "$timestamp")"
@@ -1986,9 +2118,20 @@ print_generate_only_handoff() {
   echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
   echo ""
   echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
-  echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Nothing to run: this run accepted installing without enforcement, and the generated"
+    echo -e "    # terraform.tfvars carries accept_no_network_policy = true. Every NetworkPolicy kube-agents"
+    echo -e "    # ships will be inert, the agent sandbox's included. To enforce instead, run the two commands"
+    echo -e "    # below and set accept_no_network_policy = false (ACCEPT_NO_NETWORK_POLICY in install.env)."
+  else
+    echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  fi
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" != "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Or leave the cluster as it is: accept_no_network_policy = true in terraform.tfvars (what --accept-no-network-policy"
+    echo -e "    # writes) installs without enforcement; every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included."
+  fi
   echo ""
   echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
   echo -e "    # Note: the two create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
@@ -2333,6 +2476,56 @@ ensure_existing_cluster_workload_identity() {
   fi
 }
 
+# What installing without NetworkPolicy enforcement costs, printed wherever the
+# choice is offered or applied. Precise on purpose: the usual argument for
+# accepting -- "we trust the workloads in this cluster" -- is about the
+# operator's workloads, and the confinement at stake is ours. The shell
+# sandbox is where model-authored commands run, and a NetworkPolicy is the
+# only thing between it and the VPC. An operator who reads this and still
+# says yes has made an informed decision, which is more than an abort-or-
+# enable-Calico fork gives them.
+print_no_network_policy_consequences() {
+  local cluster_name="$1"
+  print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement. The cluster is not modified."
+  print_info "Every NetworkPolicy this install ships is accepted by the API server and enforced by nothing:"
+  print_info "  • the agent pod's ingress restriction and egress confinement (otherwise port 443 outside private ranges, and named in-cluster peers)"
+  print_info "  • the shell sandbox's deny-all policy, which otherwise allows only cluster DNS and the credential proxy"
+  print_info "  • the LiteLLM gateway, GitHub token minter and Hindsight policies"
+  print_info "What is lost is the confinement of kube-agents' own workloads, not of yours: the sandbox that runs model-authored commands can reach anything routable in this VPC. Trusting the workloads already in this cluster is a different decision."
+  print_info "Recorded as ${NETWORK_POLICY_REPORT_FIELD}=${NP_ENFORCEMENT_ABSENT_ACCEPTED} in the install report and as the ${NETWORK_POLICY_ENFORCEMENT_ANNOTATION} annotation on the PlatformAgent. To confine it later, enable Dataplane V2 or the Calico addon on the cluster and re-run the installer."
+}
+
+# The interactive fork for an adopted cluster that enforces no NetworkPolicy.
+# Three answers, and the default is the one that changes nothing: enable
+# Calico (a control-plane update that may recreate nodes), install without
+# enforcement (the cluster is untouched; print_no_network_policy_consequences
+# says what that costs), or stop. Sets the two PARAM_ variables; the caller
+# acts on them. Never reached without a controlling TTY: an agent-driven run
+# has to pass one of the two flags, and the skill tells it to ask first.
+prompt_network_policy_choice() {
+  local cluster_name="$1"
+  local np_choice=""
+  print_warning "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy Calico addon)."
+  print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
+  print_info "  a) install without NetworkPolicy enforcement: the cluster is not modified, and every policy kube-agents ships stays inert, including the ones confining the agent's shell sandbox"
+  print_info "  n) stop here, changing nothing"
+  prompt_read "Choose (e/a/N)" np_choice "n"
+  case "$np_choice" in
+    [Ee])
+      PARAM_ENABLE_NETWORK_POLICY="true"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      ;;
+    [Aa])
+      PARAM_ENABLE_NETWORK_POLICY="false"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="true"
+      ;;
+    *)
+      PARAM_ENABLE_NETWORK_POLICY="false"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      ;;
+  esac
+}
+
 # NetworkPolicy enforcement on a pre-existing cluster is the third such
 # behaviour: every NetworkPolicy this install ships — LiteLLM's, the
 # minter's, Hindsight's, and the ones the operator generates around the
@@ -2340,9 +2533,12 @@ ensure_existing_cluster_workload_identity() {
 # V2 nor the legacy Calico addon, which is GKE Standard's default shape.
 # Clusters created by this repository's gke-cluster module have Dataplane V2;
 # clusters created by other Terraform configurations or pre-existing Standard
-# clusters may have neither Dataplane V2 nor Calico, requiring explicit opt-in
-# to enable the legacy Calico addon. The gke-cluster module's postcondition
-# backstops bare-Terraform installs.
+# clusters may have neither Dataplane V2 nor Calico. Such a cluster has three
+# outcomes, and the operator picks: enable the legacy Calico addon
+# (--enable-network-policy, a control-plane update), install without
+# enforcement (--accept-no-network-policy, the cluster untouched and the
+# choice on record), or refuse. The gke-cluster module's postcondition
+# backstops bare-Terraform installs, relaxed by the same variable.
 ensure_existing_cluster_network_policy() {
   local project_id="$1" cluster_name="$2" region="$3"
   local cluster_info
@@ -2363,31 +2559,29 @@ ensure_existing_cluster_network_policy() {
   fi
   if [ "$dp_provider" = "ADVANCED_DATAPATH" ]; then
     print_success "Existing cluster '$cluster_name' runs Dataplane V2; NetworkPolicy enforcement is built in."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
   if [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ]; then
     print_success "Existing cluster '$cluster_name' already enforces NetworkPolicy (legacy Calico addon)."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
 
-  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ]; then
-    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
-      PARAM_ENABLE_NETWORK_POLICY="false"
-    else
-      local np_choice=""
-      prompt_read "Existing cluster '$cluster_name' does not enforce NetworkPolicy (kube-agents requires Dataplane V2 or Calico). Enabling Calico may recreate nodes and restart workloads. Declining ends the install (kube-agents requires NetworkPolicy enforcement). Enable Calico NetworkPolicy now? (y/N)" np_choice "n"
-      if is_truthy "$np_choice"; then
-        PARAM_ENABLE_NETWORK_POLICY="true"
-      else
-        PARAM_ENABLE_NETWORK_POLICY="false"
-      fi
-    fi
+  # No prompt here: by the time a run reaches this step the answer was given,
+  # at prompt_existing_cluster_opt_ins or by a flag, and the preflight has
+  # refused a run that has neither. The consequences were stated there too;
+  # this step only says it is proceeding as accepted.
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement, as accepted above. The cluster is not modified."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    return 0
   fi
 
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' has neither Dataplane V2 nor legacy Calico NetworkPolicy."
-    print_info "kube-agents requires NetworkPolicy enforcement. Enabling Calico may recreate nodes and restart workloads."
-    print_info "Explicit opt-in was not provided (--enable-network-policy). Refusing to proceed without NetworkPolicy enforcement."
+    print_info "Enabling Calico may recreate nodes and restart workloads; installing without enforcement leaves the agent sandbox unconfined on the network. The cluster's owner decides which."
+    print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
     return 1
   fi
 
@@ -2421,6 +2615,7 @@ ensure_existing_cluster_network_policy() {
       print_warning "Operation wait returned non-zero (it may have finished between list and wait); proceeding..."
   fi
   print_warning "Legacy Network Policy enabled. FQDN-based NetworkPolicies stay unsupported without Dataplane V2."
+  NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENABLED_BY_INSTALL"
 }
 
 # Interactively prompts for existing-cluster opt-in mutations before the Step 11 summary
@@ -2456,8 +2651,9 @@ prompt_existing_cluster_opt_ins() {
     fi
   fi
 
-  # Calico NetworkPolicy opt-in prompt
-  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ]; then
+  # The NetworkPolicy fork: enable Calico, accept the absence, or stop
+  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ] && \
+     [ -z "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-}}" ]; then
     local cluster_info
     cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
       --location="$region" --project="$project_id" \
@@ -2467,13 +2663,35 @@ prompt_existing_cluster_opt_ins() {
       IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
     fi
     if [ -n "$status" ] && [ "$dp_provider" != "ADVANCED_DATAPATH" ] && [ "$legacy_np" != "True" ] && [ "$legacy_np" != "true" ]; then
-      local np_choice=""
-      prompt_read "Existing cluster '$cluster_name' does not enforce NetworkPolicy (kube-agents requires Dataplane V2 or Calico). Enabling Calico may recreate nodes and restart workloads. Declining ends the install (kube-agents requires NetworkPolicy enforcement). Authorize enabling Calico NetworkPolicy now? (y/N)" np_choice "n"
-      if is_truthy "$np_choice"; then
-        PARAM_ENABLE_NETWORK_POLICY="true"
-      else
-        PARAM_ENABLE_NETWORK_POLICY="false"
-      fi
+      prompt_network_policy_choice "$cluster_name"
+    fi
+  fi
+}
+
+# After the existing-cluster prompt and before install.env is written: carry
+# an "install without NetworkPolicy enforcement" answer into the files.
+#
+# The answer arrives after the generator ran, and the generated tfvars must
+# hold it -- the module's postcondition reads accept_no_network_policy, not
+# the flag -- so regenerate from the same inputs plus the answer. The
+# generator reuses the API_SERVER_KEY it exported on the first pass, so
+# nothing new is minted. Then settle what install.env will record, which is
+# the decision rather than the flag: the flag against a cluster that already
+# enforces accepted nothing, and an unreadable cluster decides nothing (the
+# preflight refuses it a few steps on). The preflight reaches the same answer
+# and prints it; this only settles it before the bootstrap writes the file.
+settle_network_policy_acceptance() {
+  local project_id="$1" cluster_name="$2" region="$3" tfvars_file="$4" image_tag="$5"
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
+    export ACCEPT_NO_NETWORK_POLICY="true"
+    KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+      write_tfvars_from_state "$tfvars_file" "$image_tag"
+  fi
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    local np_probe=0
+    is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?
+    if [ "$np_probe" -eq 1 ]; then
+      NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
     fi
   fi
 }
@@ -2555,11 +2773,16 @@ is_existing_cluster_network_policy_satisfied() {
 
 check_existing_cluster_network_policy_preflight() {
   local project_id="$1" cluster_name="$2" region="$3"
-  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+  # A cluster this run creates comes up on Dataplane V2.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" != "false" ]; then
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
+    return 0
+  fi
 
   local np_status=0
   is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
   if [ "$np_status" -eq 0 ]; then
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
 
@@ -2570,12 +2793,27 @@ check_existing_cluster_network_policy_preflight() {
     exit 1
   fi
 
+  # The third answer: install anyway, on record, without touching the cluster.
+  # The generated tfvars carry accept_no_network_policy = true, which is what
+  # gets the plan past the module's postcondition.
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    print_no_network_policy_consequences "$cluster_name"
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    # The settle step and this preflight each describe the cluster once. If
+    # the first describe failed and this one succeeded, install.env was just
+    # written without the key and nobody said so; the note reads the decision
+    # and the file, so asking it again here closes that gap.
+    note_unrecorded_network_policy_acceptance "$INSTALL_ENV_FILE"
+    return 0
+  fi
+
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor legacy Calico)."
-    print_info "kube-agents requires NetworkPolicy enforcement to isolate agent execution sandboxes."
-    print_info "The Terraform apply will refuse an existing cluster without Dataplane V2 or NetworkPolicy enforcement."
-    print_info "Enabling Calico may recreate nodes and restart workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
-    print_info "Aborting before making any cluster changes. Pass --enable-network-policy or set ENABLE_NETWORK_POLICY=true to authorize."
+    print_info "kube-agents ships NetworkPolicies that isolate the agent's execution sandbox; on this cluster they would be accepted and inert, and the Terraform apply refuses the plan."
+    print_info "Two ways forward, and the cluster's owner chooses:"
+    print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+    print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    print_info "Neither was given. Aborting before making any cluster changes."
     write_json_report "REFUSED_MISSING_NETWORK_POLICY"
     exit 1
   fi
@@ -2593,6 +2831,121 @@ validate_existing_cluster_opt_in_flags() {
     print_error "--enable-network-policy must be either true or false."
     exit 1
   fi
+  if { [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] || [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; } && \
+     [[ ! "$PARAM_ACCEPT_NO_NETWORK_POLICY" =~ ^(true|false)$ ]]; then
+    print_error "--accept-no-network-policy must be either true or false."
+    exit 1
+  fi
+  # Two answers to one question. A run carrying both would enable Calico and
+  # then record that it did not, so it is refused before it reads the cluster
+  # -- unless exactly one came from the command line, in which case the flag
+  # beats the recorded value for this run, as install.env's contract says.
+  # That is the documented "confine it later" path: an install that recorded
+  # ACCEPT_NO_NETWORK_POLICY=true re-run with --enable-network-policy.
+  if [ "${PARAM_ENABLE_NETWORK_POLICY:-}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" = "true" ]; then
+    if [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
+      print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run. Remove that line once Calico is on, or every later upgrade waives the enforcement check."
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+    elif [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
+      print_info "--accept-no-network-policy overrides the ENABLE_NETWORK_POLICY=true your install configuration records, for this run."
+      PARAM_ENABLE_NETWORK_POLICY="false"
+    else
+      print_error "--enable-network-policy and --accept-no-network-policy are two answers to one question; pass one (as flags, or as ENABLE_NETWORK_POLICY / ACCEPT_NO_NETWORK_POLICY in install.env)."
+      print_info "The first enables the legacy Calico addon on the cluster (may recreate nodes); the second installs without NetworkPolicy enforcement and changes nothing."
+      exit 1
+    fi
+  fi
+}
+
+# Validates that non-interactive minter configuration has either an ENABLED KMS key
+# (Path 2: AOT) or a valid PEM file path (Path 1: automated import) whenever there
+# is an explicit intention to configure the token minter.
+validate_non_interactive_minter_config() {
+  local app_id="$1" pem_path="$2" keyring="$3" key="$4" region="$5" project_id="$6" org="${7:-}"
+  # If neither App ID nor PEM path is provided, the token minter is omitted (optional feature).
+  if [ -z "$app_id" ] && [ -z "$pem_path" ]; then
+    return 0
+  fi
+
+  # Explicit intention to configure minter exists:
+  if [ -n "$pem_path" ] && [ -z "$app_id" ]; then
+    print_error "--github-pem-path was provided, but --github-app-id is missing."
+    print_info "The GitHub token minter requires both a GitHub App ID and an asymmetric signing key."
+    return 1
+  fi
+
+  if [ -n "$app_id" ] && [ -z "$org" ]; then
+    print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but --gitops-org is missing."
+    print_info "The GitHub token minter requires an organization to mint installation access tokens for."
+    return 1
+  fi
+
+  local kms_loc existing_kms_ver=""
+  kms_loc="$(derive_kms_location "$region")"
+  existing_kms_ver="$(kms_key_enabled_version "$key" "$keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+
+  if [ -n "$existing_kms_ver" ]; then
+    return 0
+  fi
+
+  if [ -n "$pem_path" ] && [ ! -f "$pem_path" ]; then
+    print_error "GitHub App private key PEM file does not exist or is not a regular file: '${pem_path}'."
+    return 1
+  fi
+
+  if [ -z "$pem_path" ]; then
+    print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
+    print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    print_info "To install without the token minter, omit --github-app-id."
+    return 1
+  fi
+  return 0
+}
+
+# The half of the PEM decision the early preflight could not make.
+#
+# A .pem deleted after a successful import is the documented end state, not an
+# error: docs/site/src/content/docs/deploy/token-minter.md and
+# .agents/skills/install-kube-agents/SKILL.md both tell the operator to remove
+# it. So a missing file is fatal only when the signing key has no ENABLED
+# version to fall back on.
+#
+# A function rather than a block inside main(), because reaching step 8 costs a
+# live project and a cluster: inverting the ENABLED test below left all 398
+# tests green while it was inline, and no test could reach it to say otherwise.
+#
+# Reads and clears the global PARAM_GITHUB_PEM_PATH instead of echoing a value.
+# The point of resolving it here is that every later consumer in step 8 -- the
+# locals the step copies it into, the interview, the non-interactive validator
+# -- sees one answer, and a captured stdout would leave the global behind.
+#
+# Callers must run this below source_provisioning_helpers: derive_kms_location
+# and kms_key_enabled_version live in installer_common.sh and
+# DEFAULT_KMS_KEYRING in install.defaults.env, and a `curl | bash` run has no
+# copy of either before the clone.
+resolve_missing_pem_against_kms() {
+  local region="$1" project_id="$2"
+
+  if [ -z "$PARAM_GITHUB_PEM_PATH" ] || [ -e "$PARAM_GITHUB_PEM_PATH" ]; then
+    return 0
+  fi
+
+  local pem_keyring pem_key pem_kms_loc pem_enabled_ver=""
+  pem_keyring="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  pem_key="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
+  pem_kms_loc="$(derive_kms_location "$region")"
+  pem_enabled_ver="$(kms_key_enabled_version "$pem_key" "$pem_keyring" "$pem_kms_loc" "$project_id" 2>/dev/null || true)"
+
+  if [ -n "$pem_enabled_ver" ]; then
+    print_info "Cloud KMS key ${pem_keyring}/${pem_key} already has an ENABLED version (${pem_enabled_ver}); ignoring missing local PEM path '${PARAM_GITHUB_PEM_PATH}'."
+    PARAM_GITHUB_PEM_PATH=""
+    return 0
+  fi
+
+  print_error "GitHub App private key PEM file does not exist: '${PARAM_GITHUB_PEM_PATH}'."
+  print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
+  print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  return 1
 }
 
 # Enumerates pending existing-cluster mutations for the pre-flight summary
@@ -2671,8 +3024,10 @@ summarize_existing_cluster_mutations() {
   else
     if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
       echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Will enable${C_RESET} legacy Calico addon & enforcement (${C_YELLOW}may recreate nodes, restart workloads${C_RESET})"
+    elif is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Absent, accepted${C_RESET} (--accept-no-network-policy: cluster unchanged; ${C_YELLOW}every NetworkPolicy kube-agents ships is inert, the agent sandbox included${C_RESET}; recorded on the PlatformAgent)"
     else
-      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (opt-in not provided; pass --enable-network-policy; install will abort)"
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (opt-in not provided; pass --enable-network-policy or --accept-no-network-policy; install will abort)"
     fi
   fi
 
@@ -2702,12 +3057,13 @@ apply_managed_otel_scope() {
 # One-shot import of the GitHub App private key into the minter's KMS signing
 # key, via the Minty CLI. The PEM never enters Terraform state — that is why
 # this is not a Terraform resource. Skipped when a key version is already
-# ENABLED (the import happened on an earlier run) and downgraded to printed
-# instructions when Go is unavailable.
+# ENABLED (the import happened on an earlier run), downgraded to printed
+# instructions when no PEM is provided, and auto-installs Go if missing.
 import_github_pem() {
   local project_id="$1" region="$2"
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
   local pem_path="${GITHUB_PEM_PATH:-}"
+  pem_path="$(expand_tilde_path "$pem_path")"
   local kms_location keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
   kms_location="$(derive_kms_location "$region")"
 
@@ -2722,8 +3078,7 @@ import_github_pem() {
   # `go run github.com/abcxyz/github-token-minter/cmd/minty@<tag>`
   # cannot work: the upstream go.mod declares the module without the /v2 suffix
   # its v2 tags require, so Go rejects the version with or without /v2 in the
-  # path. The gcloud-only recovery recipe lives in
-  # k8s-operator/config/integrations/github/README.md.
+  # path. Upstream guide: https://github.com/abcxyz/github-token-minter
   local import_cmd="git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR} && cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_location} -key-ring=${keyring} -key=${key} -private-key=@<path-to-pem>"
   if [ -z "$pem_path" ] || [ ! -f "$pem_path" ]; then
     print_warning "No GitHub App private key PEM available (GITHUB_PEM_PATH='${pem_path}')."
@@ -2731,11 +3086,25 @@ import_github_pem() {
     return 0
   fi
   if ! command -v go >/dev/null 2>&1; then
-    print_warning "Go is not installed, so the App key cannot be imported automatically."
-    print_info "Import it manually: ${import_cmd/<path-to-pem>/$pem_path}"
-    print_info "Without Go, the gcloud-only import recipe is in k8s-operator/config/integrations/github/README.md."
-    return 0
+    print_info "Go is required to build the Minty CLI for initial private key import into Cloud KMS."
+    # Said before the attempt rather than after it. auto_install_tool ends in
+    # `exit 1` when the tool is still missing afterwards, which is what every
+    # host it has no package manager for gets -- and from inside that exit
+    # there is nowhere left to say what to do instead. The run stops either
+    # way: the minter is enabled in the generated configuration, so the
+    # readiness gate after this import refuses the apply without a key. What
+    # the operator loses is the recipe, and only on the path where they need
+    # it most, so print it while there is still a stdout to print it to.
+    print_info "If Go cannot be installed on this host, import the key by hand instead: ${import_cmd/<path-to-pem>/$pem_path}"
+    auto_install_tool "go"
   fi
+  # auto_install_tool judges success by `command -v`, which a Go far too old to
+  # build the CLI answers just as well — and on Debian 12 and Ubuntu 22.04 that
+  # is exactly what its `apt-get install golang-go` leaves behind. Checked here
+  # rather than left to `go run`: that call is wrapped in `retry 6 5` below, so
+  # a toolchain that cannot satisfy the CLI's go.mod costs six attempts and
+  # then advises retrying the same command by hand.
+  require_min_go_version || return 1
   # The ring and key normally come from Terraform, but this import runs
   # BEFORE the apply — the minter Deployment cannot pass readiness without an
   # imported key, and the composition's helm release waits on every
@@ -2792,7 +3161,7 @@ import_github_pem() {
     print_info "Create them by hand with:"
     print_info "  gcloud kms keyrings create ${keyring} --location=${kms_location} --project=${project_id}"
     print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
-    print_info "Then import the PEM with the recipe in k8s-operator/config/integrations/github/README.md."
+    print_info "Then import the PEM following: https://github.com/abcxyz/github-token-minter"
     return 0
   fi
 
@@ -2807,9 +3176,11 @@ import_github_pem() {
       -private-key=@"$pem_abs"); then
     print_success "GitHub App private key imported into ${keyring}/${key}."
   else
-    print_warning "PEM import failed; the minter deployment stays unready until it succeeds."
+    print_error "PEM import failed: Minty CLI could not import the private key into Cloud KMS (${keyring}/${key})."
     print_info "Retry manually: ${import_cmd/<path-to-pem>/$pem_path}"
-    print_info "If Go itself is the problem (killed compiler, no toolchain), the gcloud-only recipe is in k8s-operator/config/integrations/github/README.md."
+    print_info "See https://github.com/abcxyz/github-token-minter for the upstream troubleshooting guide."
+    rm -rf "$minty_dir"
+    return 1
   fi
   rm -rf "$minty_dir"
 }
@@ -2904,7 +3275,6 @@ run_menu_system() {
   local github_app_id="${GITHUB_APP_ID:-}"
   local kms_keyring="${KMS_KEYRING:-}"
   local kms_key="${KMS_KEY:-}"
-  local github_pem_path="${GITHUB_PEM_PATH:-}"
   local image_tag="${PARAM_IMAGE_TAG:-}"
 
   while true; do
@@ -3024,7 +3394,12 @@ run_menu_system() {
         esac
         ;;
       5)
-        prompt_read "GitHub Org / Username" github_org "$github_org"
+        # An organization, never a login: the minter resolves App installations
+        # at /orgs/{org}/installation, so a personal account deploys cleanly and
+        # then 404s every token request. The fresh-install interview settles
+        # this with github_account_type; this panel does not verify it, so the
+        # least it can do is stop suggesting the value that cannot work.
+        prompt_read "GitHub Organization" github_org "$github_org"
         prompt_read "GitOps Repository Name" github_repo "$github_repo"
         ;;
       6)
@@ -3073,7 +3448,6 @@ run_menu_system() {
         save_env_var GITHUB_APP_ID "$github_app_id"
         save_env_var KMS_KEYRING "$kms_keyring"
         save_env_var KMS_KEY "$kms_key"
-        save_env_var GITHUB_PEM_PATH "$github_pem_path"
         print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
@@ -3133,6 +3507,41 @@ main() {
   local image_tag=""
   resolve_effective_image_tag image_tag "." "${PARAM_IMAGE_TAG:-}" || exit 1
   validate_immutable_ref "$image_tag" || exit 1
+
+  # Local-only checks on the GitHub App private key path. The other half of this
+  # decision — that a missing .pem is harmless once the signing key holds an
+  # ENABLED version, which is the state this installer's own documentation tells
+  # the operator to leave behind — cannot be made here. kms_key_enabled_version
+  # and derive_kms_location arrive with installer_common.sh at step 2, the
+  # keyring and key defaults with resolve_shared_defaults beside it, and the
+  # lookup itself needs an authenticated gcloud and a resolved project and
+  # region, none of which exist this early. It runs at step 8 instead, beside
+  # the only consumer.
+  #
+  # Nor is the path expanded here: expand_tilde_path is in installer_common.sh,
+  # which is not sourced yet either. So a `~/...` value does not match -e below,
+  # falls through this block untouched, and is expanded and judged at step 8.
+  # That costs nothing in practice — a ~ typed on the command line is expanded
+  # by the operator's own shell before install.sh sees it, so what reaches here
+  # is a quoted flag value or a path out of install.env.
+  #
+  # What is left is what the filesystem alone can answer about an already-usable
+  # path. A path that exists but is not a readable regular file is a typo or a
+  # permission problem rather than a deleted key, and no KMS state makes it
+  # right, so it is worth catching before the installer does any work. A path
+  # that is simply absent is not decided here.
+  if [ -n "$PARAM_GITHUB_PEM_PATH" ]; then
+    if [ -e "$PARAM_GITHUB_PEM_PATH" ]; then
+      if [ ! -f "$PARAM_GITHUB_PEM_PATH" ]; then
+        print_error "GitHub App private key PEM path is not a regular file: '${PARAM_GITHUB_PEM_PATH}'."
+        exit 1
+      fi
+      if [ ! -r "$PARAM_GITHUB_PEM_PATH" ]; then
+        print_error "GitHub App private key PEM file is not readable: '${PARAM_GITHUB_PEM_PATH}'."
+        exit 1
+      fi
+    fi
+  fi
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"
@@ -3665,15 +4074,29 @@ main() {
 
   # 8. GitOps Infrastructure Repository Connection
   print_step "8. GitOps Infrastructure Repository Setup"
-  local github_org="${PARAM_GITOPS_ORG:-}"
+
+  # A leading ~ survived the early preflight untouched, because the function
+  # that resolves it lives in installer_common.sh and that file was not sourced
+  # yet. Resolved here, ahead of every test and every copy below, so the whole
+  # step judges one real path.
+  if [ -n "$PARAM_GITHUB_PEM_PATH" ]; then
+    PARAM_GITHUB_PEM_PATH="$(expand_tilde_path "$PARAM_GITHUB_PEM_PATH")"
+  fi
+
+  # The half of the PEM decision the early preflight could not make. Called
+  # here because by this point installer_common.sh is sourced,
+  # resolve_shared_defaults has filled the keyring and key, gcloud is
+  # authenticated, and project and region are settled -- step 5 can still
+  # change the region, and it has run. Called before the locals below copy
+  # PARAM_GITHUB_PEM_PATH, so every consumer in this step sees one answer.
+  resolve_missing_pem_against_kms "$region" "$project_id" || exit 1
+
+  local github_org="$PARAM_GITOPS_ORG"
   local github_repo="$PARAM_GITOPS_REPO"
-  # Env fallbacks, not bare empties: the non-interactive path never reaches
-  # the interview prompts below, so GITHUB_APP_ID / GITHUB_PEM_PATH exported
-  # into the run are the only way an automated install can enable the minter.
-  local github_app_id="${GITHUB_APP_ID:-}"
-  local kms_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
-  local kms_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
-  local github_pem_path="${GITHUB_PEM_PATH:-}"
+  local github_app_id="$PARAM_GITHUB_APP_ID"
+  local kms_keyring="$PARAM_KMS_KEYRING"
+  local kms_key="$PARAM_KMS_KEY"
+  local github_pem_path="$PARAM_GITHUB_PEM_PATH"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # An install that already names an org has a repository to connect, so
@@ -3733,13 +4156,88 @@ main() {
           exit 1
         fi
       done
-      prompt_read "GitOps Repository Name" github_repo "${github_repo:-$DEFAULT_GITOPS_REPO}"
+      prompt_read "GitOps Repository Name" github_repo "${github_repo}"
 
       print_info "GitHub access uses the short-lived GitHub App token minter."
-      prompt_read "GitHub App ID" github_app_id "${github_app_id}"
-      prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring:-$DEFAULT_KMS_KEYRING}"
-      prompt_read "Cloud KMS Key Name" kms_key "${kms_key:-$DEFAULT_KMS_KEY}"
-      prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path "${github_pem_path}"
+      prompt_read "GitHub App ID (optional, press Enter to skip token minter)" github_app_id "${github_app_id}"
+      if [ -n "$github_app_id" ]; then
+        prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring}"
+        prompt_read "Cloud KMS Key Name" kms_key "${kms_key}"
+
+        local kms_loc existing_kms_ver=""
+        kms_loc="$(derive_kms_location "$region")"
+        existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+        if [ -n "$existing_kms_ver" ]; then
+          print_success "Cloud KMS key ${kms_keyring}/${kms_key} already has an ENABLED version (${existing_kms_ver}); skipping PEM prompt."
+        else
+          while true; do
+            prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path "${github_pem_path}"
+            if [ -z "$github_pem_path" ]; then
+              print_warning "No PEM path entered. The token minter will be deferred unless key version 1 is imported into KMS."
+              break
+            fi
+            github_pem_path="$(expand_tilde_path "$github_pem_path")"
+            if [ -f "$github_pem_path" ]; then
+              break
+            fi
+            print_error "File not found: '${github_pem_path}'. Please enter a valid path to your .pem file, or leave blank to defer."
+          done
+          if [ -n "$github_pem_path" ] && [ -f "$github_pem_path" ]; then
+            if ! command -v go >/dev/null 2>&1; then
+              # Say it now, install it later. This runs inside step 8, which
+              # --dry-run and --generate-only both cross before they exit, and
+              # auto_install_tool exits 1 in the first and `sudo apt-get
+              # install`s in the second. Neither mode imports anything, so
+              # neither has any business refusing over Go or putting a package
+              # on the operator's machine. import_github_pem makes the same
+              # check where the toolchain is actually about to be used.
+              print_warning "Go toolchain ('go') is required to import the GitHub App private key into Cloud KMS via the Minty CLI; the installer will offer to install it when the import runs."
+            fi
+          fi
+        fi
+      else
+        print_info "No GitHub App ID entered; skipping token minter setup."
+        github_pem_path=""
+      fi
+    else
+      # Deliberately not clearing github_org / github_repo / github_app_id /
+      # github_pem_path here. "Skip for now" is the operator declining the
+      # interview, not asking for a teardown, and the four names are exactly
+      # the ones write_tfvars_from_state's three-way guard reads
+      # (scripts/installer/installer_common.sh): emptying them renders
+      # enable_github_minter = false, and the apply then removes a deployed
+      # minter's GSA, its Workload Identity binding, and the chart's
+      # Deployment, Service, NetworkPolicy and KSA — while install.env, which
+      # this run does not rewrite, goes on recording a minter that is gone.
+      #
+      # On a fresh install they are already empty, so the minter is skipped
+      # either way and this arm changes nothing. On a re-run the loaded values
+      # are the whole reason the minter survives. The comment above the
+      # interview prompts makes the same point about empty defaults.
+      if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
+        print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
+      else
+        print_info "GitOps repository connection skipped."
+      fi
+    fi
+  else
+    if [ -n "$github_pem_path" ]; then
+      github_pem_path="$(expand_tilde_path "$github_pem_path")"
+    fi
+
+    validate_non_interactive_minter_config "$github_app_id" "$github_pem_path" "$kms_keyring" "$kms_key" "$region" "$project_id" "$github_org" || exit 1
+
+    if [ -n "$github_app_id" ] && [ -n "$github_pem_path" ]; then
+      local kms_loc existing_kms_ver=""
+      kms_loc="$(derive_kms_location "$region")"
+      existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+      if [ -z "$existing_kms_ver" ]; then
+        if ! command -v go >/dev/null 2>&1; then
+          # Warning only, for the reason given on the interactive arm above:
+          # step 8 runs before --dry-run and --generate-only exit.
+          print_warning "Go toolchain ('go') is required to import the GitHub App private key into Cloud KMS via the Minty CLI; the installer will install it when the import runs."
+        fi
+      fi
     fi
   fi
 
@@ -4005,6 +4503,15 @@ main() {
   export CLUSTER_MODE="$cluster_mode"
   export REGION="$region"
   export ENABLE_GVISOR="$enable_gvisor"
+  # The generator emits it into terraform.tfvars, where the gke-cluster
+  # module's postcondition reads it, defaulting the line to false itself.
+  # Exported only when a flag or install.env set it: the prompt gates read
+  # ${PARAM_...:-${ACCEPT_NO_NETWORK_POLICY:-}}, so an unconditional "false"
+  # here would count as an answer and silence the three-way prompt on every
+  # interactive run.
+  if [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; then
+    export ACCEPT_NO_NETWORK_POLICY="$PARAM_ACCEPT_NO_NETWORK_POLICY"
+  fi
   # No GVISOR_POOL_NAME. It has no flag and no interview question, so anything
   # exported here would be a constant written over whatever install.env says --
   # the generator already applies DEFAULT_GVISOR_POOL_NAME when nothing sets it,
@@ -4048,8 +4555,8 @@ main() {
   export USER_PROFILE_ENABLED="$PARAM_USER_PROFILE_ENABLED"
   export HERMES_DASHBOARD_ENABLED="$PARAM_ENABLE_WEBUI"
   export REGISTRY_PREFIX="$registry_prefix"
-  export ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
-  export ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
+  export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an
@@ -4076,6 +4583,14 @@ main() {
   # answering "proceed", and it costs a describe per account. Read-only.
   check_service_account_ownership || exit 1
 
+  # Prompt for opt-ins on existing cluster mutations before the summary
+  # checkpoint -- and before install.env is written, so an answer given here
+  # is recorded there.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
+    settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"
+  fi
+
   # Written once, and only when there is nothing there. The probed cluster
   # shape is deliberately NOT recorded: a file that is read as configuration
   # and also written as findings has two answers for one question. The probe is
@@ -4083,11 +4598,6 @@ main() {
   # stops a hand-written CLUSTER_MODE=standard from planning a live Autopilot
   # cluster's replacement.
   bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"
-
-  # Prompt for opt-ins on existing cluster mutations before the summary checkpoint
-  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
-    prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
-  fi
 
   # Pre-Flight Summary & Final Confirmation Checkpoint
   print_step "11. Pre-Flight Configuration Summary"
@@ -4160,13 +4670,13 @@ main() {
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
-      elif [ "$np_status" -ne 0 ]; then
+      elif [ "$np_status" -ne 0 ] && ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
         if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
           print_info "Dry-run: skipping terraform plan because Calico has not yet been applied to the live cluster (a real run enables Calico prior to apply)."
         else
           print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' enforces no NetworkPolicy (postcondition would fail)."
-          print_info "A real run will abort unless authorized with --enable-network-policy or ENABLE_NETWORK_POLICY=true."
-          print_info "To remediate manually beforehand, run these two commands in this order:"
+          print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          print_info "To enable enforcement by hand beforehand, run these two commands in this order:"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --update-addons=NetworkPolicy=ENABLED"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --enable-network-policy"
         fi
@@ -4180,6 +4690,11 @@ main() {
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
       else
+        # Reached with an unenforcing cluster only under --accept-no-network-policy,
+        # whose tfvars carry the variable that passes the module's postcondition.
+        if [ "$np_status" -ne 0 ]; then
+          print_no_network_policy_consequences "$cluster_name"
+        fi
         print_info "Previewing the resources a real run would create (terraform plan)..."
         (
           cd "$(tf_compose_dir "$repo_dir")"
@@ -4211,6 +4726,7 @@ main() {
   # they are: this sits above the (Y/n/g) prompt, so both routes cross it.
   check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
   check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+  note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
 
   if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
@@ -4256,6 +4772,9 @@ main() {
   # halts before permanent control-plane modifications (Workload Identity, CMEK).
   if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
     ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+    # Calico just went on under --enable-network-policy: a recorded acceptance
+    # is stale from here.
+    note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
     ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
     ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
   fi
@@ -4267,7 +4786,7 @@ main() {
   # pass readiness once the key is imported. The generator enabled the
   # minter on the promise of this import, so a failed one stops the run
   # here rather than wedging the apply.
-  import_github_pem "$project_id" "$region"
+  import_github_pem "$project_id" "$region" || exit 1
   local minter_enabled_version=""
   minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"

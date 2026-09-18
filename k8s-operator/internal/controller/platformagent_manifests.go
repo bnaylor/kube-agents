@@ -54,6 +54,15 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// credentialProxyMaxOutputBytes caps each stream a brokered command returns;
+	// the paragraph above its use ties the figure to the proxy container's
+	// memory limit, and the cap test asserts the pair.
+	credentialProxyMaxOutputBytes = "8388608"
+	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
+	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
+	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
+	// is not an alternative.
+	hermesHomeMode = "2770"
 	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
 	// shell_sandbox_manifests.go the sandbox's claim at the same path.
 	//
@@ -102,6 +111,16 @@ const (
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
+
+	// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
+	// `database.journal_mode`, rendered into the managed scope by renderConfigYAML
+	// when the agent pod has a runtime class. Under gVisor the data volume is a 9p
+	// gofer mount, which accepts `PRAGMA journal_mode=WAL` but cannot honour WAL's
+	// shared-memory and byte-range lock contract, and two databases corrupted in
+	// three days on such a mount (#610). Hermes' own DELETE fallback fires only on
+	// error strings gVisor never raises, so the operator, which knows the runtime
+	// for certain, pins the mode instead.
+	sqliteJournalModeDelete = "delete"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -358,9 +377,10 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and the only pin here that is not about chat. Every other key below
-	// exists because the agent could otherwise write a competing value into the PVC .env;
-	// this one exists because something already does, on every boot, without being asked.
+	// UNCONDITIONAL, and one of the three pins here that are not about chat. Every chat key
+	// below exists because the agent could otherwise write a competing value into the PVC
+	// .env; this one exists because something already does, on every boot, without being
+	// asked.
 	//
 	// Hermes' Docker stage2 hook generates a strong random API_SERVER_KEY into
 	// $HERMES_HOME/.env whenever that file does not already carry one, and
@@ -384,6 +404,20 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// sidecar's AGENT_API_UPSTREAM_KEY and to the probe's bearer, reintroducing exactly
 	// the several-parties-must-agree problem this closes.
 	add("API_SERVER_KEY", loopbackAgentAPIKey)
+
+	// Another non-chat pin, and it closes a claim the container env cannot make on its
+	// own. Setting HERMES_HOME_MODE in Container.Env puts it in the LOWEST-precedence
+	// layer of the three: the managed .env beats the PVC .env beats the process
+	// environment. So a single `HERMES_HOME_MODE=0777` line in $HERMES_HOME/.env — which
+	// the agent can write, and which sandbox-credential-cleanup does not remove, so it
+	// survives every upgrade — silently widens every directory hermes secures on the
+	// shared PVC. Sessions, memories and logs open to anything else that mounts it, and
+	// the pod stays green throughout.
+	//
+	// Not a regression this branch introduced; the route predates it. But the container
+	// env alone was never the guarantee it reads as, and pinning here is what makes it
+	// one: save_env_value refuses to write a key this file holds.
+	add("HERMES_HOME_MODE", hermesHomeMode)
 
 	// The mode pin, also unconditional and also not about chat. The managed key
 	// is the only way the mode reaches the agent runtime, and pinning it is what
@@ -1399,6 +1433,15 @@ type managedTerminalConfig struct {
 // outlived a month of rollouts, which nothing here does.
 const shellSandboxEnvLifetimeSeconds = 2592000
 
+// managedDatabaseConfig is the `database` block rendered into the managed scope
+// when the agent pod runs under a runtime class. The key is Hermes' own:
+// hermes_state.resolve_journal_mode reads `database.journal_mode` and
+// apply_wal_with_fallback — shared by every profile's state.db and by kanban.db —
+// creates a fresh database in that mode.
+type managedDatabaseConfig struct {
+	JournalMode string `json:"journal_mode"`
+}
+
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 
@@ -1459,6 +1502,16 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// human telling it to put the value back would be reason to trust the value.
 		// The managed scope is what makes that write have no effect.
 		Terminal *managedTerminalConfig `json:"terminal,omitempty"`
+		// The SQLite journal mode, rendered only when the agent pod has a runtime
+		// class (see sqliteJournalModeDelete). It meets both of this function's
+		// tests. Uniform: the runtime class is a property of the pod, so every
+		// profile's state.db and the shared kanban.db sit on the same 9p mount and
+		// need the same answer. Beyond the agent's repair: the failure is a
+		// corrupted database, which the agent discovers only after its sessions
+		// are already unreadable, and a profile-level key would let one profile
+		// opt back into the mode that corrupts the file every other profile shares
+		// the volume with.
+		Database *managedDatabaseConfig `json:"database,omitempty"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1493,6 +1546,20 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		SSHKey:          shellSandboxClientKeyFilePath(),
 		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
 		WorkspaceRoot:   shellSandboxDataPath,
+	}
+
+	// Database. The journal mode follows the pod's runtime class, not an env knob
+	// or a filesystem probe: the operator sets the runtime class and so knows
+	// whether the volume is a gofer mount, where a statfs check would be a guess
+	// that also changed behaviour for every FUSE and NFS install. Hermes never
+	// downgrades a database whose header already reads WAL, so the entrypoint's
+	// step 1.7 (deploy/shared/sqlite_journal_migrate.py) converts existing files
+	// once before anything opens them; this leaf is what keeps them that way and
+	// creates new ones in DELETE.
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil &&
+		agent.Spec.Deployment.Availability.RuntimeClassName != nil &&
+		*agent.Spec.Deployment.Availability.RuntimeClassName != "" {
+		cfg.Database = &managedDatabaseConfig{JournalMode: sqliteJournalModeDelete}
 	}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
@@ -1868,6 +1935,23 @@ type renderOptions struct {
 	otlpDisabled bool
 }
 
+// lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
+// surviving one where it already sits. Order is otherwise untouched, so on the ordinary
+// render -- no plugin naming an operator-owned variable -- the result is the input.
+func lastWinsEnv(env []corev1.EnvVar) []corev1.EnvVar {
+	lastIndex := make(map[string]int, len(env))
+	for i, e := range env {
+		lastIndex[e.Name] = i
+	}
+	out := make([]corev1.EnvVar, 0, len(lastIndex))
+	for i, e := range env {
+		if lastIndex[e.Name] == i {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -1892,6 +1976,20 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
 		extraVolumes = agent.Spec.Deployment.ExtraVolumes
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
+	}
+	// Everything above is user-authored and copied verbatim, and under `next`
+	// the pod carries a projected bus token that belongs to the platform-agent
+	// container alone. Take the mount away from anything else that names it,
+	// before the operator's own containers join the slices -- see
+	// a2aStripBusTokenMounts for what a sidecar holding it would be. Gated on
+	// the surface for the same reason the plugin env drop is: on a today
+	// install there is no such volume, and dropping a name only the next stack
+	// cares about would be one more way to tell the feature exists.
+	if a2aAgentSurface(agent) {
+		initContainers = a2aStripBusTokenMounts(initContainers)
+		sidecars = a2aStripBusTokenMounts(sidecars)
+		sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
+		extraVolumes = a2aStripBusTokenVolume(extraVolumes)
 	}
 
 	homeDir := "/opt/data"
@@ -1985,10 +2083,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// Neither grants access to any cloud API, any repository, or anything
 	// outside the pod, which is the property the isolation boundary protects.
 	//
-	// The third is NATS_PASSWORD, appended further down under mode: next, and
-	// it is the one that does not have that property: it authenticates to the
-	// A2A bus over the cluster network. Do not reason about what this Pod
-	// holds from this block alone.
+	// There is no third any more. NATS_PASSWORD used to be appended further
+	// down under mode: next, and it was the one that did not have that
+	// property: it authenticated to the A2A bus over the cluster network. A5
+	// moved this container onto a projected token, so the bus credential is no
+	// longer an environment variable at all -- it is the file at
+	// a2aBusTokenPath, and the reasons it is not in reach of a plugin are the
+	// mount, not this list. Do not reason about what this Pod holds from this
+	// block alone.
 	// See docs/credential-isolation-design.md.
 	envVars = append(envVars,
 		corev1.EnvVar{
@@ -2200,10 +2302,29 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// surface rather than unconditional so a today install's plugin env is
 		// untouched — dropping a name only the next stack cares about would be
 		// one more way to tell the feature exists.
+		//
+		// NATS_USER and NATS_PASSWORD are not appended any more — A5 moved this
+		// container onto a projected token — so the duplicate-key argument does
+		// not reach them and a different one does: the `a2a` CLI falls back to
+		// user/password when no bus token is readable, so a plugin that set
+		// them would be choosing the identity this container connects as. The
+		// CR's own spec.deployment.env never reaches this container to begin
+		// with — safeSandboxEnvOverrides copies a fixed allowlist and no bus
+		// name is on it — and their SensitiveEnvVars entries are what turn an
+		// attempt into a webhook rejection rather than a silent no-op. This
+		// drop is the same refusal one layer further out, at the env source
+		// with no allowlist in front of it and no webhook looking at it.
+		//
+		// A2A_BUS_TOKEN_FILE is dropped for the stronger version of that: the
+		// operator never renders it, the client prefers it over the projected
+		// path with no fallback, and a plugin that set it would choose which
+		// file this container presents as its bearer token.
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
+				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
+					e.Name == a2aBusTokenFileEnv ||
+					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
 				}
 				kept = append(kept, e)
@@ -2231,6 +2352,33 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "HERMES_MANAGED_DIR",
 		Value: managedScopeDir,
+	})
+	// The other half of the umask note at the top of this file. That umask governs what
+	// the entrypoints create; this governs what Hermes then re-tightens. Hermes chmods
+	// HERMES_HOME and ten named subdirectories to 0700 on every process start, and a cron
+	// or kanban worker runs with HERMES_HOME pointed at profiles/platform — so 0700 locks
+	// every other uid on this volume out of the profile. The case that found it was the
+	// credential proxy, which ran in this Pod as uid 10001 and got EACCES filing a
+	// kubeconfig under the profile; #913 moved the proxy to a Pod of its own, so every
+	// container the operator itself renders onto this volume is one uid now. Two readers
+	// remain. The dashboard container runs Hermes against the same directories, and a
+	// container the CR supplies under spec.deployment.sidecars with a runAsUser of its own
+	// mounts the claim under a second uid with nothing to refuse it
+	// (platformagent_data_volume_uid_test.go). Group access is what keeps either from
+	// being a lockout: every container on the volume is in gid 10000, and no uid on it
+	// reaches `other`. Setgid so children keep inheriting the group the way the umask
+	// already assumes.
+	//
+	// A chmod cannot substitute for this. `ensure_hermes_home` re-applies the mode before
+	// the worker does any work, so a directory widened by hand is 0700 again by the time
+	// the first process runs.
+	//
+	// Appended after the plugin merge like HERMES_MANAGED_DIR above it: an arbitrary value
+	// here would widen every directory Hermes secures on the PVC, so it is not a plugin's
+	// to set.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HERMES_HOME_MODE",
+		Value: hermesHomeMode,
 	})
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
 	// own home while the shell is local. agent/file_safety.py checks the path prefix in
@@ -2287,34 +2435,43 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
-	// The A2A bus, under `next` only: address and credentials for the worker
-	// user, whose grants fit an agent-side reader — subscribe on a2a.topics.>,
-	// publish on the provisioned topics. From the same Secret the A2A gateway
-	// reads, and container env only: a copy in a profile .env on the PVC would
-	// be a second place to rotate and a first place to leak. A bridge sidecar
-	// declared in spec.deployment.sidecars shares the pod and declares the
-	// same three against the same Secret, so this is one Secret seam, not two.
+	// The A2A bus, under `next` only: the address, and the name this container
+	// authenticates as. There is no password here since A5. The credential is
+	// the projected ServiceAccount token mounted below, the callout resolves it
+	// against the cluster, and the grants it gets back are agentIdentity's —
+	// the blackboard and nothing else. What this replaced was NATS_USER=worker
+	// and a worker-password SecretKeyRef: a static credential, shared with the
+	// bridge sidecar, carrying publish on every addressee's task events.
 	//
-	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
-	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
-	// lands in the container whatever the address says; if a plugin could set
-	// NATS_URL, the client would hand the worker password to an address of the
-	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
-	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
-	// cluster. It cannot: the three names are dropped from plugin env above
-	// while the surface is up, and they are in SensitiveEnvVars so the CR's
-	// own spec.deployment.env cannot reach them either. Found by adversarial
-	// review before this shipped.
+	// A2A_BUS_USER is not decoration and not a second copy of a secret. A
+	// callout principal's grants carry its own inbox prefix (_INBOX.agent.>),
+	// and a client that does not pin a matching prefix authenticates fine and
+	// then hangs on every JetStream reply — the failure shape W6 found twice.
+	// The operator renders the name and the client reads it back, so the two
+	// cannot drift; the provision Job does the same thing with a literal in its
+	// script.
 	//
-	// The SecretKeyRef is Optional, and that is what keeps the skew branch of
-	// a2aAgentSurface inert rather than fatal: on a today-lineage install that
-	// hit skew the creds Secret has never existed, and a required ref there
-	// would roll the pod (strategy Recreate) into CreateContainerConfigError —
-	// a full agent outage bought by a helper that exists to prevent one. With
-	// Optional the kubelet omits the variable when the Secret is absent and
-	// injects it when a frozen next stack's Secret exists, which is the freeze
-	// the helper promises. Under plain next the Secret is reconciled into
-	// existence before anything dials, so Optional costs nothing there.
+	// APPENDED AFTER THE PLUGIN MERGE, and the reason survives the move off a
+	// password. A plugin that could set NATS_URL would point this container's
+	// bus client at an address of its choosing, and egress rule 7 permits 443
+	// to the internet whenever FQDN policy is off. A bearer token in a CONNECT
+	// frame to an attacker's server is the same exfiltration the password was;
+	// it is audience-bound, so it does not authenticate anywhere else, but it
+	// still names this ServiceAccount to whoever catches it. So the names stay
+	// dropped from plugin env above while the surface is up. The CR's own
+	// spec.deployment.env is a different layer: safeSandboxEnvOverrides is an
+	// allowlist and no bus name is on it, so a CR entry cannot reach this
+	// container at all — the SensitiveEnvVars membership is what turns the
+	// attempt into a webhook rejection instead of a silent no-op.
+	//
+	// Nothing here is Optional any more and nothing needs to be, which is the
+	// one thing the token makes simpler: the skew branch of a2aAgentSurface
+	// used to need Optional on the SecretKeyRef so a today-lineage install that
+	// hit skew would not roll the pod into CreateContainerConfigError against a
+	// Secret that had never existed. A projected token volume has no such
+	// failure — the kubelet mints it from the pod's own ServiceAccount, which
+	// exists on every lineage — so the freeze the helper promises costs two
+	// inert env vars and a mount.
 	if a2aAgentSurface(agent) {
 		envVars = append(envVars,
 			corev1.EnvVar{
@@ -2322,16 +2479,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
 			},
 			corev1.EnvVar{
-				Name:  "NATS_USER",
-				Value: "worker",
-			},
-			corev1.EnvVar{
-				Name: "NATS_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-					Key:                  "worker-password",
-					Optional:             ptr.To(true),
-				}},
+				Name:  a2aBusUserEnv,
+				Value: a2aAgentBusUser,
 			},
 		)
 	}
@@ -2433,6 +2582,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
 		Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
 	})
+	// The bus credential, under `next` only. Into the agent container alone and
+	// never into a sidecar: the pod's ServiceAccount is what the callout
+	// resolves, so a sidecar holding this token would be a second workload
+	// wearing the agent's identity, and the split A5 made would be undone by a
+	// volumeMount. The bridge sidecar authenticates with its own password for
+	// exactly that reason — see bridgeIdentity.
+	if a2aAgentSurface(agent) {
+		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2478,6 +2636,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// watcher here, and so does the token the agent presents across the network.
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	if a2aAgentSurface(agent) {
+		volumes = append(volumes, a2aBusTokenVolumeSource())
+	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -2514,15 +2675,22 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 		Spec: corev1.PodSpec{
 			// No ShareProcessNamespace, and under mode: next the field is
-			// load-bearing rather than a default. The agent container carries
-			// the A2A bus credential there (NATS_PASSWORD, by SecretKeyRef
-			// above), and a Pod that shares its process namespace hands every
-			// container's /proc/<pid>/environ — that value included — to every
-			// other container in it, spec.deployment.sidecars entries among
-			// them. Under mode: today the credential is absent and only the
-			// weaker reason applies: the next container added here should not
-			// inherit a shared namespace by default. Do not set this field on
-			// the strength of that weaker reason alone.
+			// load-bearing rather than a default. The agent container holds
+			// the A2A bus credential — since A5 not as NATS_PASSWORD in its
+			// env but as the projected token file at a2aBusTokenPath — and a
+			// Pod that shares its process namespace hands every container's
+			// /proc/<pid> to every other container in it,
+			// spec.deployment.sidecars entries among them. That reaches the
+			// file as well as the environment: /proc/<pid>/environ for an env
+			// var, /proc/<pid>/root for anything the process has mounted, and
+			// every container in this Pod runs as the same UID (see
+			// RunAsUser below), so the DAC check that would otherwise stop it
+			// passes. Moving the credential out of `env` narrowed which CR
+			// fields can reach it; it did not weaken this. Under mode: today
+			// the credential is absent and only the weaker reason applies:
+			// the next container added here should not inherit a shared
+			// namespace by default. Do not set this field on the strength of
+			// that weaker reason alone.
 			// See docs/security-requirements.md.
 			RuntimeClassName: runtimeClassName,
 			InitContainers:   initContainers,
@@ -3104,6 +3272,41 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
 		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
+		// 8 MiB, twice the proxy's own default. Every command an agent runs
+		// arrives here -- its `kubectl` in the sandbox is a shim that posts an
+		// argv vector to this pod -- so this cap, not the API server, is what
+		// bounds a cluster dump. On 2026-08-30 the fleet-audit workload dump
+		// for kube-agents-host measured 3,866,719 bytes against the 4 MiB
+		// default: 92% of it, roughly twelve more workloads from the edge.
+		// Crossing it truncates the JSON mid-string, which fails the
+		// collectors' parse gate and drops that whole cluster out of
+		// compliance-audit and ai-security-audit as a coverage gap.
+		//
+		// The cap does not bound the read: `_execute` takes the subprocess to
+		// completion with `communicate()` before it slices, so the full output
+		// is resident whatever this says. What it does bound is the slice that
+		// survives, and that copy is then JSON-escaped and encoded for the
+		// response -- so raising it costs on the order of three times the
+		// increase per in-flight request rather than nothing.
+		//
+		// Which is what puts a ceiling on it, and the ceiling is the proxy
+		// container's own memory limit (buildCredentialProxyContainer) rather
+		// than anything about the fleet. Count five live copies of a capped
+		// output per stream -- the subprocess bytes, the slice, the decoded str,
+		// the JSON-escaped str, the encoded response -- and two capped streams
+		// per command, because `_execute` truncates stdout and stderr in two
+		// independent calls, so the cap is a per-stream ceiling. Ten copies,
+		// then, against the five-way kanban fan-out resolveResources sizes the
+		// agent container for, plus the front-door session, each issuing one
+		// command. At 8 MiB that is 480 MiB of burst on top of the 256Mi the
+		// container requests at rest, which its 1Gi limit absorbs; at 16 MiB --
+		// the value this carried while the proxy was a sidecar with a 2Gi limit
+		// -- it does not, and an OOMKill here takes gcloud, kubectl, gh and git
+		// away from every agent the proxy serves. Raising this means raising the
+		// limit with it, and the cap test asserts the pair so the two cannot
+		// drift apart silently -- it is the arithmetic above, so believe it over
+		// this paragraph if they ever disagree again.
+		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
@@ -3317,6 +3520,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 			result = append(result, env)
 		}
 	}
+	// No dedup pass over `custom` here, deliberately. The reserved set above
+	// closes managed-vs-custom: every `managed` name is in it. Custom-vs-custom
+	// is closed a layer earlier -- `custom` is `spec.deployment.env` and
+	// nothing else, and DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so the API server refuses a CR that repeats a name
+	// before the operator ever sees it. Adding `lastWinsEnv` here would read as
+	// though that were in doubt.
 	return result
 }
 
@@ -3353,11 +3563,22 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// Any value parses: `excluded_namespaces` comma-splits the string and
 	// matches the parts literally, so an arbitrary one names namespaces that do
 	// not exist and excludes nothing. There is no validation to fail.
+	//
+	// FEEDBACK_PROMPT_ENABLED and FEEDBACK_PROMPT_DELAY are the feedback
+	// prompt's two per-install settings (`feedback_prompt.py`, a `no_agent`
+	// cron script). The first turns one fixed chat message off, the second
+	// moves when it is sent; neither names a path, a URL, a credential or an
+	// image, and a value that does not parse fails the run (exit 1, the reason
+	// on stderr, reported in chat like any other script failure) before the
+	// script arms or prints, so an arbitrary value reaches nothing but that
+	// one message and its own failure report.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
+		"FEEDBACK_PROMPT_DELAY":       {},
+		"FEEDBACK_PROMPT_ENABLED":     {},
 		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
@@ -3571,6 +3792,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
 		storages = agent.Spec.Deployment.Storages
 	}
+	// The fifth user-authored mount surface, and the one the A5 reservation
+	// missed. buildPodTemplateSpec strips the bus token out of sidecars,
+	// initContainers, sidecarVolumes and extraVolumes; this list is read here
+	// instead of there, and it is appended verbatim BOTH to the platform-agent
+	// container below and to platform-agent-dashboard further down. A CR that
+	// names the projected bus token here therefore puts the agent's own bus
+	// identity into a second container -- see a2aStripBusTokenVolumeMounts.
+	// Gated on the surface for the same reason the strips up there are: on a
+	// today install there is no such volume, and dropping a name only the next
+	// stack cares about would be one more way to tell the feature exists.
+	if a2aAgentSurface(agent) {
+		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
+	}
 
 	resources := resolveResources(agent.Spec.Deployment)
 
@@ -3630,10 +3864,11 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
 	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
 	// plugins mounted but never enabled — would look like the plugin was broken rather
-	// than the cause. Appending after the merge leaves the operator's entry last, and the
-	// kubelet collapses duplicate env names last-wins. Same mechanism, same reason, as
+	// than the cause. Appending after the merge leaves the operator's entry last, and
+	// lastWinsEnv below keeps the last of each name. Same mechanism, same reason, as
 	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
-	// reordering here is silent.
+	// reordering here is silent. What happens without that collapse is not the kubelet
+	// picking a winner -- see the comment on lastWinsEnv below, which owns that.
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
@@ -3667,6 +3902,21 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
 	})
+
+	// Every "appended after the merge" comment above rests on the kubelet collapsing a
+	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`
+	// carries `patchMergeKey=name` and the controller applies server-side, so the API
+	// server refuses the object before it exists:
+	//
+	//   .spec.template.spec.containers[name="platform-agent"].env:
+	//   duplicate entries for key [name="HERMES_HOME_MODE"]
+	//
+	// So a plugin naming one of those variables did not lose the argument -- it stalled
+	// the gateway's reconciliation outright, leaving the running pod on whatever it last
+	// had and nothing in the Deployment to show why. Collapse here, once, at the only
+	// point every append has already run, rather than at each of them; last-wins is the
+	// semantics they were all written for, so this changes no rendered value.
+	gatewayEnvVars = lastWinsEnv(gatewayEnvVars)
 
 	containers := []corev1.Container{
 		{
@@ -3717,6 +3967,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// agent had changed for itself.
 				Name:  "HERMES_MANAGED_DIR",
 				Value: managedScopeDir,
+			},
+			{
+				// Same value as the gateway's for a second reason: this container runs
+				// Hermes against the same directories, so a different mode here would mean
+				// the two containers took turns re-chmod'ing the PVC out from under each
+				// other on every start.
+				Name:  "HERMES_HOME_MODE",
+				Value: hermesHomeMode,
 			},
 			{
 				Name:  "HOME",

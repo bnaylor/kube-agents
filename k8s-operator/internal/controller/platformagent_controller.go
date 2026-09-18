@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -53,6 +54,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -62,6 +64,29 @@ const (
 	minIPv4CIDRPrefix      = 12
 	minIPv6CIDRPrefix      = 48
 	maxCIDRsPerAnnotation  = 50
+
+	// The two keys of the <agent>-gitops-state ConfigMap the minter policy is
+	// synced from: managed_repos renders write policies, context_repos read-only
+	// ones. gitops_workspace.py names the same two keys on the agent side.
+	gitopsStateManagedReposKey = "managed_repos"
+	gitopsStateContextReposKey = "context_repos"
+	// minterConfigMapName is the minty rule ConfigMap the chart and the kustomize
+	// template render; minterBaseTemplateKey is the policy every rendered key is
+	// derived from.
+	minterConfigMapName   = "github-token-minter-config"
+	minterBaseTemplateKey = "default.yaml"
+	// minterPolicyKeySuffix turns a bare repository name into its policy key. A
+	// repository whose key would be minterBaseTemplateKey is skipped: rendering
+	// it would overwrite the template every other policy is derived from.
+	minterPolicyKeySuffix = ".yaml"
+	// minterReadScope is the scope a context repository's policy carries and
+	// nothing else: contents: read, as the chart's default.yaml declares it. A
+	// default.yaml without it predates the read grant and renders no context
+	// policies. minterScopeField and minterRepositoriesField are the minty v2
+	// rule fields the read-only rendering rewrites.
+	minterReadScope         = "platform-agent-read-scope"
+	minterScopeField        = "scope"
+	minterRepositoriesField = "repositories"
 
 	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
 	// Identity tokens. It is only ever the pre-DNAT destination.
@@ -248,13 +273,15 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
-// `get` and nothing else on secrets, and checkShellSandboxKeys is the only caller. It asks
-// whether the sandbox's authorized-keys Secret exists so the status can say so; it never reads
-// a value out of one, and the operator creates that Secret nowhere. The read goes through
-// r.APIReader rather than the cached client on purpose: a cached Get of a type the manager does
-// not already watch starts a cluster-wide Secret informer, which would both hold every Secret in
-// the cluster in the operator's memory and, on any cluster where this grant is trimmed, block
-// WaitForCacheSync forever behind a forbidden LIST.
+// `get` and nothing else on secrets, for two callers. checkShellSandboxKeys asks whether
+// the sandbox's authorized-keys Secret exists so the status can say so; it never reads a
+// value out of one, and the operator creates that Secret nowhere. stampSecretEnvHash does
+// read values: it digests the Secret keys a pod consumes as environment onto that pod's
+// template, so rotating one rolls the pod (platformagent_secret_hash.go). Both read by
+// name. Both go through r.APIReader rather than the cached client on purpose: a cached Get
+// of a type the manager does not already watch starts a cluster-wide Secret informer, which
+// would both hold every Secret in the cluster in the operator's memory and, on any cluster
+// where this grant is trimmed, block WaitForCacheSync forever behind a forbidden LIST.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
@@ -670,17 +697,29 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
 	}
 
+	// Secret material reaches the gateway as environment, and a container's
+	// environment is fixed for the life of the pod. Secrets are deliberately
+	// outside this controller's watch set (see the grant above), so nothing
+	// wakes a reconcile when one changes: the pass that re-reads them is the
+	// only thing that notices a rotated key, and it has to be asked for.
+	// stampSecretEnvHash does the reading; this is what guarantees it happens
+	// while nothing else about the agent is changing.
+	requeueAfter := secretEnvReprobeInterval
+
 	// Default and None are the telemetry outcomes that can improve without anything else
 	// changing — someone installs a collector and nothing about this agent is touched.
 	// Reconciles are event-driven and can be quiet for hours, so nudge the probe rather
 	// than wait for an unrelated event. Every other source is explicit or already found
 	// something, and needs no polling. None especially: it is the outcome that leaves the
 	// agent exporting nowhere, so it is the one an operator most wants picked up promptly
-	// once they install a collector.
+	// once they install a collector. Taken as a deadline rather than the answer, because
+	// the secret re-read above has one of its own and the sooner of the two wins. The two
+	// intervals are equal today, so this min picks neither — it is here so that shortening
+	// one of them later does not silently lengthen the other.
 	if otlpSource == otlpSourceDefault || otlpSource == otlpSourceNone {
-		return ctrl.Result{RequeueAfter: otelRediscoverAfter}, nil
+		requeueAfter = min(requeueAfter, otelRediscoverAfter)
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // pluginStatusNeedsRecheck reports whether plugin status is still provisional.
@@ -969,7 +1008,7 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Create(ctx, cm); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data[gitopsStateManagedReposKey], cm.Data[gitopsStateContextReposKey])
 		}
 		return err
 	}
@@ -986,17 +1025,17 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Update(ctx, found); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo)
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo, found.Data[gitopsStateContextReposKey])
 		}
 		specEntries, err := parseManagedRepoEntries(cmRepo)
 		if err != nil {
 			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
 			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 		updated := false
 		for _, se := range specEntries {
@@ -1019,11 +1058,11 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Update(ctx, found); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 	}
 
-	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {
@@ -1078,22 +1117,128 @@ func renderRepoPolicy(baseTemplate string, repos []string) string {
 	})
 }
 
+// renderReadOnlyPolicy renders the policy a context repository gets: baseTemplate
+// with its scope map reduced to minterReadScope alone and that scope's
+// repositories replaced by repos. Everything else at the top level (version,
+// rule) is carried over as parsed.
+//
+// Parsed rather than edited by regex like renderRepoPolicy, because dropping
+// the write scope is a structural edit: a text substitution that removes one
+// mapping from a block it did not author is how a policy ends up carrying a
+// scope nobody meant it to. sigs.k8s.io/yaml marshals through JSON, so keys come
+// out sorted and the rendering is stable across reconciles.
+//
+// The second return is false when baseTemplate does not parse or carries no
+// minterReadScope; the caller then renders no context policies rather than
+// inventing a scope the minter was never told about.
+func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(baseTemplate), &doc); err != nil || doc == nil {
+		return "", false
+	}
+	scopes, ok := doc[minterScopeField].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	readScope, ok := scopes[minterReadScope].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	repoList := make([]interface{}, 0, len(repos))
+	for _, repo := range repos {
+		repoList = append(repoList, repo)
+	}
+	readScope[minterRepositoriesField] = repoList
+	doc[minterScopeField] = map[string]interface{}{minterReadScope: readScope}
+	rendered, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", false
+	}
+	return string(rendered), true
+}
+
+// minterBareRepos returns the bare repository names in reposStr (a managed_repos
+// or context_repos JSON list) that belong to primaryOrg, deduplicated and
+// sorted. An empty primaryOrg accepts every organisation, as the managed sync
+// always has. listName is for the log lines only. A list that is not JSON is
+// an error, never an empty result: the caller skips the whole sync on it,
+// because an empty result would read as "no repositories" and prune every
+// policy the operator tracks.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) ([]string, error) {
+	reposStr = strings.TrimSpace(reposStr)
+	if reposStr == "" {
+		return nil, nil
+	}
+	repos, err := parseManagedRepos(reposStr)
+	if err != nil {
+		return nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
+	}
+	seen := make(map[string]struct{}, len(repos))
+	var bare []string
+	for _, fullRepo := range repos {
+		fullRepo = strings.TrimSpace(fullRepo)
+		if fullRepo == "" {
+			continue
+		}
+		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
+		if err != nil {
+			logger.V(1).Info("skipping invalid repo in minter policy sync", "list", listName, "repo", fullRepo, "error", err)
+			continue
+		}
+		parts := strings.SplitN(slug, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		repoOrg, bareRepo := parts[0], parts[1]
+		if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
+			logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
+				"list", listName, "repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
+			continue
+		}
+		if bareRepo+minterPolicyKeySuffix == minterBaseTemplateKey {
+			// The base template is never claimed: a policy rendered under its
+			// key becomes the template the next reconcile derives every policy
+			// from, and a read-only rendering there strips the write scope from
+			// every managed repository.
+			logger.Info("skipping repository whose minter policy key would be the base template",
+				"list", listName, "repo", fullRepo, "key", minterBaseTemplateKey)
+			continue
+		}
+		if _, exists := seen[bareRepo]; exists {
+			continue
+		}
+		seen[bareRepo] = struct{}{}
+		bare = append(bare, bareRepo)
+	}
+	sort.Strings(bare)
+	return bare, nil
+}
+
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
 // to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
-// entry exists in github-token-minter-config ConfigMap.
+// entry exists in github-token-minter-config ConfigMap, and that every same-organization
+// repository in context_repos has a <repo>.yaml carrying the read-only scope alone.
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
 //
+// A managed repository's policy is default.yaml with the repository list replaced by every
+// same-org managed repository (renderRepoPolicy). A context repository's policy is default.yaml
+// reduced to minterReadScope, listing every same-org context repository (renderReadOnlyPolicy):
+// the broker mints from it for its own clone and nothing else, so a private context repository
+// is readable without a write token ever covering it. A repository in both lists is managed and
+// keeps the write rendering. A default.yaml without the read scope renders no context policies.
+//
 // Key ownership contract:
-// The operator owns every <repo>.yaml key for an active managed repository (including adopting
-// pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active managed repositories
-// is unsupported: custom edits will be overwritten with policy rendered from default.yaml on reconcile,
-// and the key will be pruned when the repository is unregistered. Keys for repositories not present in
-// managed_repos (and default.yaml itself) are never claimed or pruned.
-func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
+// The operator owns every <repo>.yaml key for an active managed or context repository (including
+// adopting pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active
+// repositories is unsupported: custom edits will be overwritten with policy rendered from
+// default.yaml on reconcile, and the key will be pruned when the repository is unregistered from
+// both lists. Keys for repositories present in neither list (and default.yaml itself) are never
+// claimed or pruned.
+func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}
-	err := r.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: agent.Namespace}, minterCM)
+	err := r.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, minterCM)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
@@ -1105,12 +1250,13 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		return nil
 	}
 
-	baseTemplate, ok := minterCM.Data["default.yaml"]
+	baseTemplate, ok := minterCM.Data[minterBaseTemplateKey]
 	if !ok || strings.TrimSpace(baseTemplate) == "" {
 		return nil
 	}
 
 	managedReposStr = strings.TrimSpace(managedReposStr)
+	contextReposStr = strings.TrimSpace(contextReposStr)
 
 	// Read operator-managed keys from annotation
 	existingAnn := ""
@@ -1119,8 +1265,8 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	}
 	operatorManagedKeys := parseManagedKeysAnnotation(existingAnn)
 
-	// If managed_repos is empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
-	if managedReposStr == "" && len(operatorManagedKeys) == 0 {
+	// If both lists are empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
+	if managedReposStr == "" && contextReposStr == "" && len(operatorManagedKeys) == 0 {
 		return nil
 	}
 
@@ -1138,48 +1284,54 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	repos, err := parseManagedRepos(managedReposStr)
+	// Both lists are parsed before anything is computed from either: an
+	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
+	// managed-only sync always did. Treating it as empty would prune every
+	// tracked policy and break every write until the JSON was repaired.
+	allBareRepos, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
 	if err != nil {
-		logger.Error(err, "skipping minter policy sync due to unparseable managed_repos in ConfigMap")
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
 		return nil
 	}
-	var allBareRepos []string
-	activeKeys := make(map[string]string, len(repos))
-	for _, fullRepo := range repos {
-		fullRepo = strings.TrimSpace(fullRepo)
-		if fullRepo == "" {
-			continue
+	contextCandidates, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	if err != nil {
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
+		return nil
+	}
+	// Managed wins: a repository registered in both lists is written to, so its
+	// policy is the write one, and it is left out of the read-only list too.
+	var contextBareRepos []string
+	for _, bareRepo := range contextCandidates {
+		if !slices.Contains(allBareRepos, bareRepo) {
+			contextBareRepos = append(contextBareRepos, bareRepo)
 		}
-		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
-		if err != nil {
-			logger.V(1).Info("skipping invalid repo in managed_repos for minter policy sync", "repo", fullRepo, "error", err)
-			continue
-		}
-		parts := strings.SplitN(slug, "/", 2)
-		if len(parts) == 2 {
-			repoOrg := parts[0]
-			bareRepo := parts[1]
-			if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
-				logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
-					"repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
-				continue
-			}
-			if _, exists := activeKeys[bareRepo+".yaml"]; !exists {
-				activeKeys[bareRepo+".yaml"] = bareRepo
-				allBareRepos = append(allBareRepos, bareRepo)
+	}
+
+	// key -> the content it must hold.
+	expected := make(map[string]string, len(allBareRepos)+len(contextBareRepos))
+	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
+	for _, bareRepo := range allBareRepos {
+		expected[bareRepo+minterPolicyKeySuffix] = writeContent
+	}
+	if len(contextBareRepos) > 0 {
+		readContent, ok := renderReadOnlyPolicy(baseTemplate, contextBareRepos)
+		if !ok {
+			logger.Info("skipping context_repos in minter policy sync; default.yaml has no read-only scope",
+				"scope", minterReadScope, "repos", contextBareRepos)
+		} else {
+			for _, bareRepo := range contextBareRepos {
+				expected[bareRepo+minterPolicyKeySuffix] = readContent
 			}
 		}
 	}
-	sort.Strings(allBareRepos)
 
 	updated := false
 
-	// Ensure all active managed repositories have policy entries containing all same-org managed repositories.
-	// The operator claims and owns every <repo>.yaml key for an active managed repository: if unmanaged (!managed),
-	// it adopts the key and overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml
-	// for an active managed repository is unsupported; when the repository is later unregistered, the key is pruned.
-	expectedContent := renderRepoPolicy(baseTemplate, allBareRepos)
-	for key := range activeKeys {
+	// Ensure every active repository has its policy entry. The operator claims and owns every
+	// <repo>.yaml key for an active repository: if unmanaged (!managed), it adopts the key and
+	// overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml for an
+	// active repository is unsupported; when the repository is later unregistered, the key is pruned.
+	for key, expectedContent := range expected {
 		currentVal, exists := minterCM.Data[key]
 		_, managed := operatorManagedKeys[key]
 		if !exists || !managed || currentVal != expectedContent {
@@ -1191,10 +1343,10 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active
 	for key := range operatorManagedKeys {
-		if key == "default.yaml" {
+		if key == minterBaseTemplateKey {
 			continue
 		}
-		if _, active := activeKeys[key]; !active {
+		if _, active := expected[key]; !active {
 			delete(minterCM.Data, key)
 			delete(operatorManagedKeys, key)
 			updated = true
@@ -1238,6 +1390,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		}
 
 		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+		if err := r.stampSecretEnvHash(ctx, agent, sts, &sts.Spec.Template); err != nil {
+			return err
+		}
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -1250,6 +1405,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 
 	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
+		return err
+	}
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -1507,9 +1665,18 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	// This pod, not the gateway, is where the Slack and Teams tokens and the
+	// model-provider keys are read out of a Secret as environment, so it needs
+	// the same digest — see platformagent_secret_hash.go. Stamping only the
+	// gateway would have left the credentials most likely to be rotated
+	// reaching a container that never restarts.
+	proxy := buildCredentialProxyDeployment(agent, policyHash)
+	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
+		return err
+	}
 	objs := []client.Object{
 		buildCredentialProxyService(agent),
-		buildCredentialProxyDeployment(agent, policyHash),
+		proxy,
 		buildCredentialProxyNetworkPolicy(agent),
 	}
 	for _, obj := range objs {
