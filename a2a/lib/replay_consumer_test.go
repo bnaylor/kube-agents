@@ -43,7 +43,8 @@ const (
 	replayStreamSubjects     = "a2a.tasks.>"
 	replayStreamMaxAge       = 72 * time.Hour
 	replayStreamMaxConsumers = 64
-	// replayAdminTimeout bounds each admin-side call (provision, list).
+	// replayAdminTimeout bounds each admin-side call (provision, list). It is
+	// per call, not per test: the poll loops below run longer than one of them.
 	replayAdminTimeout = 5 * time.Second
 
 	replayAdminUser   = "admin"
@@ -90,8 +91,11 @@ func startPermissionedServer(t *testing.T) *natsserver.Server {
 }
 
 // adminJetStream connects as the unrestricted admin, the way seed and web
-// reach the bus on an install, for provisioning and observation.
-func adminJetStream(t *testing.T, url string) (jetstream.JetStream, context.Context) {
+// reach the bus on an install, for provisioning and observation. Open it once
+// per test and pass the handle down: the consumer list below is read from a
+// poll loop at 20ms, so a connection per call would open hundreds of them and
+// hold every one open until cleanup.
+func adminJetStream(t *testing.T, url string) jetstream.JetStream {
 	t.Helper()
 	nc, err := nats.Connect(url, nats.UserInfo(replayAdminUser, replayPassword))
 	if err != nil {
@@ -102,9 +106,7 @@ func adminJetStream(t *testing.T, url string) (jetstream.JetStream, context.Cont
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), replayAdminTimeout)
-	t.Cleanup(cancel)
-	return js, ctx
+	return js
 }
 
 // provisionTasksStreamAsProvisioned creates TASKS with the provision script's
@@ -112,9 +114,10 @@ func adminJetStream(t *testing.T, url string) (jetstream.JetStream, context.Cont
 // provisionTasksStream because that one leaves allow_direct off, which
 // routes the horizon read through STREAM.MSG.GET -- a subject no rendered
 // grant carries.
-func provisionTasksStreamAsProvisioned(t *testing.T, url string) {
+func provisionTasksStreamAsProvisioned(t *testing.T, js jetstream.JetStream) {
 	t.Helper()
-	js, ctx := adminJetStream(t, url)
+	ctx, cancel := context.WithTimeout(context.Background(), replayAdminTimeout)
+	defer cancel()
 	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:         TasksStream,
 		Subjects:     []string{replayStreamSubjects},
@@ -131,9 +134,10 @@ func provisionTasksStreamAsProvisioned(t *testing.T, url string) {
 // tasksConsumers lists the consumers on TASKS as admin. The InactiveThreshold
 // it reports is the server's, read back off the consumer -- not the value the
 // caller put in the config struct.
-func tasksConsumers(t *testing.T, url string) []*jetstream.ConsumerInfo {
+func tasksConsumers(t *testing.T, js jetstream.JetStream) []*jetstream.ConsumerInfo {
 	t.Helper()
-	js, ctx := adminJetStream(t, url)
+	ctx, cancel := context.WithTimeout(context.Background(), replayAdminTimeout)
+	defer cancel()
 	st, err := js.Stream(ctx, TasksStream)
 	if err != nil {
 		t.Fatalf("stream: %v", err)
@@ -204,7 +208,8 @@ func replayReader(t *testing.T, url, name string, log *slog.Logger) *Client {
 func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
-	provisionTasksStreamAsProvisioned(t, url)
+	admin := adminJetStream(t, url)
+	provisionTasksStreamAsProvisioned(t, admin)
 	const taskID = "task-replay-threshold"
 	// The constant is the entire cleanup, so it has to be short on its own
 	// terms; asserting only that the server agrees with it would pass with
@@ -214,7 +219,7 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 	}
 	replayFixture(t, url, taskID, []TaskState{StateSubmitted, StateWorking, StateCompleted},
 		WithUserPassword(replayAdminUser, replayPassword))
-	if n := len(tasksConsumers(t, url)); n != 0 {
+	if n := len(tasksConsumers(t, admin)); n != 0 {
 		t.Fatalf("test bug: %d consumers on TASKS before the replay", n)
 	}
 
@@ -232,7 +237,7 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 		t.Fatalf("TasksGet took %s, want under %s: nothing on this path may wait out a refused request", took, replayReturnWithin)
 	}
 
-	after := tasksConsumers(t, url)
+	after := tasksConsumers(t, admin)
 	t.Logf("consumers on TASKS the instant TasksGet returned: %d %s", len(after), describeConsumers(after))
 	if len(after) != 1 {
 		t.Fatalf("consumers on TASKS after return = %d, want the one the replay created", len(after))
@@ -242,7 +247,7 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 	}
 
 	waitFor(t, thresholdReapWithin, "the inactive threshold to reap the replay consumer", func() bool {
-		return len(tasksConsumers(t, url)) == 0
+		return len(tasksConsumers(t, admin)) == 0
 	})
 	t.Logf("consumers on TASKS %s after return: 0 (reaped by the %s threshold, nothing deleted it)",
 		time.Since(start).Round(100*time.Millisecond), EphemeralConsumerInactiveThreshold)
@@ -261,7 +266,8 @@ func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 func TestTasksGet_EmitsNothingTheBridgeGrantRefuses(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
-	provisionTasksStreamAsProvisioned(t, url)
+	admin := adminJetStream(t, url)
+	provisionTasksStreamAsProvisioned(t, admin)
 	const taskID = "task-replay-no-refusal"
 	replayFixture(t, url, taskID, []TaskState{StateSubmitted, StateCompleted},
 		WithUserPassword(replayAdminUser, replayPassword))
@@ -304,7 +310,8 @@ func TestTasksGet_EmitsNothingTheBridgeGrantRefuses(t *testing.T) {
 func TestTasksGet_BurstBoundsReplayConsumersByTheThreshold(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
-	provisionTasksStreamAsProvisioned(t, url)
+	admin := adminJetStream(t, url)
+	provisionTasksStreamAsProvisioned(t, admin)
 	const taskID = "task-replay-burst"
 	replayFixture(t, url, taskID, []TaskState{StateSubmitted, StateWorking, StateCompleted},
 		WithUserPassword(replayAdminUser, replayPassword))
@@ -317,7 +324,7 @@ func TestTasksGet_BurstBoundsReplayConsumersByTheThreshold(t *testing.T) {
 			t.Fatalf("TasksGet #%d: %v", i+1, err)
 		}
 	}
-	after := tasksConsumers(t, url)
+	after := tasksConsumers(t, admin)
 	t.Logf("consumers on TASKS the instant the %d-call burst returned: %d %s", replayBurst, len(after), describeConsumers(after))
 	if len(after) > replayBurst {
 		t.Fatalf("%d consumers after %d calls: more than the calls that could be in flight", len(after), replayBurst)
@@ -331,7 +338,7 @@ func TestTasksGet_BurstBoundsReplayConsumersByTheThreshold(t *testing.T) {
 		}
 	}
 	waitFor(t, thresholdReapWithin, "every replay consumer to be reaped", func() bool {
-		return len(tasksConsumers(t, url)) == 0
+		return len(tasksConsumers(t, admin)) == 0
 	})
 	t.Logf("consumers on TASKS %s after the burst: 0", time.Since(start).Round(100*time.Millisecond))
 }
