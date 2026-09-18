@@ -33,9 +33,35 @@ WORKFLOWS = sorted(
 )
 
 
+def _workflows():
+    """The workflow set, which is never legitimately empty.
+
+    Most assertions over this glob compare it against a named allowlist, and
+    those defend themselves: an empty set makes the expected names missing and
+    the test red. Two do not. B2's `no_workflow_approves_or_merges_a_pull_
+    request` and B4's `no_pull_request_target_workflow_checks_out_the_pull_
+    request` assert an absence, and an absence is true of the empty set. Both
+    go green over nothing, which is the shape the rest of the suite reds.
+
+    So whether the glob needs a guard is decided by the shape of the assertion
+    reading it, and the two that need one are the two that cannot announce it
+    themselves. Reading nothing is checked here instead, once, for the same
+    reason `_harness.text()` raises rather than returning an empty string.
+
+    Latent rather than live: the glob resolves today. One rename of
+    `.github/workflows` is what turns it.
+    """
+    if not WORKFLOWS:
+        raise AssertionError(
+            f"no workflows matched {h.REPO_ROOT / '.github' / 'workflows'}/*.y*ml; "
+            "the directory moved and the gates over it assert nothing"
+        )
+    return WORKFLOWS
+
+
 def _workflow_documents():
     """Every workflow, parsed, with YAML 1.1's `on:` -> True quirk normalised."""
-    for path in WORKFLOWS:
+    for path in _workflows():
         document = yaml.safe_load(path.read_text())
         if True in document:  # `on:` is the YAML 1.1 boolean `y`/`yes`/`on`
             document["on"] = document.pop(True)
@@ -311,7 +337,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             r"hmarr/auto-approve-action",
         )
         offences = []
-        for path in WORKFLOWS:
+        for path in _workflows():
             text = path.read_text()
             for pattern in assenting:
                 for match in re.finditer(pattern, text):
