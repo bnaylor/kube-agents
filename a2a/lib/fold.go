@@ -50,7 +50,7 @@ const (
 	// hand everything carrying the bridge password delete on any consumer on
 	// TASKS -- the gateway's own gateway-relay durable included. That is the
 	// same argument sessionConsumer makes for MSG.NEXT in the worker adapter
-	// (adapter.go:801), and the stated reason the adapter uses named
+	// (adapter.go:816), and the stated reason the adapter uses named
 	// consumers rather than ordered ones. Reclaim the slot sooner by
 	// shortening this constant, not by adding a delete or a grant.
 	EphemeralConsumerInactiveThreshold = 5 * time.Second

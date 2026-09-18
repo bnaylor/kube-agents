@@ -295,13 +295,16 @@ const (
 	// outside this number and are not counted anywhere. lib.TasksGet opens an
 	// ordered consumer and its cleanup stops the local subscription only --
 	// the consumer itself waits out its InactiveThreshold, which TasksGet
-	// leaves unset, so nats.go's five-minute default applies. Every call
-	// therefore leaves one consumer on the stream for five minutes after it
-	// returns. That makes the missing term a call RATE over a rolling
-	// five-minute window rather than a concurrency, and the callers are not
-	// just the web rail: the gateway's sweep, reap and relay paths replay
-	// too. gke-labs#1739 owns the term and the number; this constant
-	// deliberately does not move for it here.
+	// sets to five seconds (lib.EphemeralConsumerInactiveThreshold). A call
+	// that finds events therefore leaves one consumer on the stream for five
+	// seconds after it returns. That makes the missing term a call RATE over
+	// a rolling five-second window rather than a concurrency, and the callers
+	// are not just the web rail: the gateway's sweep, reap and relay paths
+	// replay too. The window was five minutes -- nats.go's default, left in
+	// place -- until TasksGet set the threshold, so the rate this constant
+	// absorbs is 60x lower than the number was sized against. gke-labs#1739
+	// owns the term and the number; this constant deliberately does not move
+	// for it here.
 	a2aTasksReservedConsumers = 16
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a

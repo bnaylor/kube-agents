@@ -1,11 +1,9 @@
 package lib
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -169,25 +167,6 @@ func describeConsumers(infos []*jetstream.ConsumerInfo) string {
 	return b.String()
 }
 
-// lockedBuffer is a bytes.Buffer the connection's async error handler can
-// write to from its own goroutine.
-type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (l *lockedBuffer) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuffer) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
-}
-
 // replayReader connects a reader under the bridge-shaped grant.
 func replayReader(t *testing.T, url, name string, log *slog.Logger) *Client {
 	t.Helper()
@@ -286,8 +265,11 @@ func TestTasksGet_EmitsNothingTheBridgeGrantRefuses(t *testing.T) {
 	replayFixture(t, url, taskID, []TaskState{StateSubmitted, StateCompleted},
 		WithUserPassword(replayAdminUser, replayPassword))
 
-	var logs lockedBuffer
-	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// logCapture is the package's slog sink (resilience_test.go); it is
+	// already mutex-guarded, which this needs because the violation arrives
+	// on the connection's async error handler, from its own goroutine.
+	logs := &logCapture{}
+	log := slog.New(logs)
 	reader := replayReader(t, url, "no-refusal-reader", log)
 	task, err := reader.TasksGet(testCtx(t), replayAddressee(taskID), taskID)
 	if err != nil {
