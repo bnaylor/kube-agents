@@ -39,13 +39,16 @@ const (
 	// that reservation key on.
 	A2ABusTokenAudience = "a2a-bus"
 
-	// a2aNATSNameSuffix and a2aCredsSecretSuffix build the names of the bus
-	// objects the operator renders off the PlatformAgent's own name. Here for
-	// the same reason as the audience: the webhook has to recognise the
-	// credentials Secret by name, and a second spelling of the suffix in the
-	// webhook package would drift from the one the render uses.
+	// The suffixes that build the names of the bus objects the operator
+	// renders off the PlatformAgent's own name. Here for the same reason as
+	// the audience: the webhook has to recognise the Secrets that carry bus
+	// credentials by name, and a second spelling of a suffix in the webhook
+	// package would drift from the one the render uses.
 	a2aNATSNameSuffix    = "-a2a-nats"
 	a2aCredsSecretSuffix = "-creds"
+	a2aNATSConfigSuffix  = "-config"
+	a2aCalloutNameSuffix = "-a2a-callout"
+	a2aCalloutKeysSuffix = "-keys"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -56,6 +59,35 @@ func A2ANATSName(agentName string) string { return agentName + a2aNATSNameSuffix
 // (`bridge-password` among them) for a PlatformAgent of that name.
 func A2ACredsSecretName(agentName string) string {
 	return A2ANATSName(agentName) + a2aCredsSecretSuffix
+}
+
+// A2ANATSConfigSecretName is the Secret holding the rendered nats.conf, which
+// carries every static password inline.
+func A2ANATSConfigSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSConfigSuffix
+}
+
+// A2ACalloutName is the name of the auth callout's objects, and the stem of
+// A2ACalloutKeysSecretName.
+func A2ACalloutName(agentName string) string { return agentName + a2aCalloutNameSuffix }
+
+// A2ACalloutKeysSecretName is the Secret holding the callout's keypairs,
+// among them the issuer seed that signs every identity the bus accepts.
+func A2ACalloutKeysSecretName(agentName string) string {
+	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
+}
+
+// A2ACredentialSecretNames is every Secret the operator renders with a bus
+// credential in it, for a PlatformAgent of that name. It is the set
+// BusCredentialRoutes refuses a user volume for; a Secret added to the bus
+// render that carries a credential belongs here, or the reservation has the
+// hole it was written to close, one Secret over.
+func A2ACredentialSecretNames(agentName string) []string {
+	return []string{
+		A2ACredsSecretName(agentName),
+		A2ANATSConfigSecretName(agentName),
+		A2ACalloutKeysSecretName(agentName),
+	}
 }
 
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
@@ -138,14 +170,15 @@ var SensitiveEnvVars = map[string]struct{}{
 // volume under the name plus a "-vol" suffix, so it cannot collide with a
 // reserved name or carry a token projection.
 //
-// What this reservation does NOT cover is the volume SOURCE. It is a check on
-// names, so a differently-named projected volume whose
-// serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
-// same credential and is admitted. The only source-type check on
-// sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
-// Established by execution rather than by reading the render: a sidecarVolumes
-// entry named innocuous-cache projecting that audience renders intact and the
-// sidecar authenticates as `agent`.
+// This map is the NAME half. It shipped alone first, and a check on names
+// alone left the volume SOURCE unexamined: a differently-named projected
+// volume whose serviceAccountToken.audience is `a2a-bus`, mounted into a
+// sidecar, minted the same credential and was admitted (established by
+// execution: a sidecarVolumes entry named innocuous-cache projecting that
+// audience rendered intact and the sidecar authenticated as `agent`), and a
+// volume mounting the credentials Secret needed no token at all. The SOURCE
+// half is BusCredentialRoutes below, keyed on the audience and on the Secrets
+// the operator renders with bus credentials in them.
 //
 // Which fixes the terms this should be read on. KSA tokens are pod-scoped and
 // the callout cannot see which container presented one, so neither a name nor
@@ -184,21 +217,22 @@ const (
 	// audience is A2ABusTokenAudience: a valid bus token for the pod's
 	// ServiceAccount, under whatever volume name the CR chose.
 	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
-	// BusCredentialRouteSecret is a volume that mounts the credentials Secret
-	// the operator renders (A2ACredsSecretName), whose `bridge-password` is a
-	// static bus credential, either as a `secret` volume or as a projected
-	// `secret` source.
+	// BusCredentialRouteSecret is a volume that mounts one of the Secrets the
+	// operator renders with a bus credential in it (A2ACredentialSecretNames),
+	// either as a `secret` volume or as a projected `secret` source.
 	BusCredentialRouteSecret BusCredentialRouteKind = "secret"
 )
 
 // BusCredentialRoute is one way a user-authored volume would hand the A2A bus
 // credential to whichever container mounts it. Source is the index into
 // projected.sources the route was found at, or BusCredentialRouteVolumeSource
-// when it is the volume's own `secret` field. Not an API type, so no deepcopy.
+// when it is the volume's own `secret` field. Secret is the Secret's name for
+// a Secret route, empty otherwise. Not an API type, so no deepcopy.
 // +kubebuilder:object:generate=false
 type BusCredentialRoute struct {
 	Kind   BusCredentialRouteKind
 	Source int
+	Secret string
 }
 
 // BusCredentialRouteVolumeSource is the Source of a route found on the volume
@@ -215,14 +249,28 @@ const BusCredentialRouteVolumeSource = -1
 // Two routes. A projected serviceAccountToken for A2ABusTokenAudience is the
 // token the platform-agent container presents, minted for the pod's
 // ServiceAccount, so the name on the volume changes nothing about what the
-// callout sees. The credentials Secret (A2ACredsSecretName) holds
-// `bridge-password`, which needs no token minting at all and is the cheaper of
-// the two; a check on the audience alone would narrow the expensive route and
-// advertise the cheap one. A `secret` volume and a projected `secret` source
-// are the two shapes that put a Secret's data in the container. The other
+// callout sees. The Secrets in A2ACredentialSecretNames need no token minting
+// at all and are the cheaper route; a check on the audience alone would narrow
+// the expensive route and advertise the cheap one. There are three of them
+// because the same credentials sit in three places: the creds Secret holds
+// the static passwords (`bridge-password` among them), the nats-config Secret
+// holds nats.conf with every one of those passwords inline, and the
+// callout-keys Secret holds the issuer seed that signs every identity the bus
+// accepts, which is worth more than any password in the other two.
+//
+// Volume shapes only. A `secret` volume and a projected `secret` source are
+// the two volume shapes that put a Secret's data in the container; the other
 // volume sources that name a Secret (csi.nodePublishSecretRef, the storage
 // drivers' secretRef fields) hand it to a node plugin rather than to the
-// container, and are not routes to the credential's bytes.
+// container. What this does NOT cover is env: `env[].valueFrom.secretKeyRef`
+// and `envFrom[].secretRef` on a sidecar deliver the same bytes and are not
+// checked here. That is deliberate rather than an oversight. The bridge
+// sidecar's documented configuration (a2a/docs/hermes-bridge.md) is a
+// secretKeyRef to `bridge-password` on the creds Secret, so a refusal on env
+// would refuse the supported bridge; which keys a sidecar may read by env is
+// a policy this reservation does not set. The issue this closes scoped the
+// Secret half to volumes (its precedent, agentForbiddenVolumeNames, is
+// volume-keyed too); the env half is a decision still owed.
 //
 // What this is, so the guard is not read as more than it is: KSA tokens are
 // pod-scoped and the callout cannot tell which container presented one, so
@@ -231,18 +279,26 @@ const BusCredentialRouteVolumeSource = -1
 // the platform operator (ReservedVolumeNames says why that is the actor), and
 // it is worth having on those terms because nothing else would notice.
 func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute {
-	creds := A2ACredsSecretName(agentName)
+	credentialSecrets := A2ACredentialSecretNames(agentName)
+	isCredential := func(name string) bool {
+		for _, s := range credentialSecrets {
+			if name == s {
+				return true
+			}
+		}
+		return false
+	}
 	var routes []BusCredentialRoute
-	if v.Secret != nil && v.Secret.SecretName == creds {
-		routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource})
+	if v.Secret != nil && isCredential(v.Secret.SecretName) {
+		routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: v.Secret.SecretName})
 	}
 	if v.Projected != nil {
 		for i, src := range v.Projected.Sources {
 			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
 				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
 			}
-			if src.Secret != nil && src.Secret.Name == creds {
-				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i})
+			if src.Secret != nil && isCredential(src.Secret.Name) {
+				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
 			}
 		}
 	}

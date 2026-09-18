@@ -59,7 +59,7 @@ const DefaultPort = 10250
 // author reading the field error knows which line to change and why.
 const (
 	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone"
-	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which holds the A2A bus credentials the operator renders; it may not be mounted by the CR"
+	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"
 )
 
 // restrictedServiceAccounts is the set of high-privilege service account names forbidden in PlatformAgent spec.
@@ -339,9 +339,10 @@ func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
 
 // validateBusCredentialSource refuses a user-supplied volume whose SOURCE
 // would deliver the A2A bus credential, whatever the volume is called: a
-// projected serviceAccountToken for the bus audience, or the credentials
-// Secret the operator renders, as a `secret` volume or a projected `secret`
-// source. validateReservedVolumeName above is the name half of the same
+// projected serviceAccountToken for the bus audience, or one of the Secrets
+// the operator renders with bus credentials in them, as a `secret` volume or
+// a projected `secret` source. Volumes only; env is not checked, and
+// BusCredentialRoutes says why. validateReservedVolumeName above is the name half of the same
 // reservation; agentv1alpha1.BusCredentialRoutes is the source half, and the
 // render strips what this refuses, because the chart's default failurePolicy
 // is Ignore. The error lands on the field that matched, not on the volume, so
@@ -365,9 +366,7 @@ func validateBusCredentialSource(vol corev1.Volume, agentName string, path *fiel
 			if route.Source != agentv1alpha1.BusCredentialRouteVolumeSource {
 				at = path.Child("projected", "sources").Index(route.Source).Child("secret", "name")
 			}
-			errs = append(errs, field.Forbidden(
-				at, fmt.Sprintf(busCredsSecretForbiddenFmt, vol.Name, agentv1alpha1.A2ACredsSecretName(agentName)),
-			))
+			errs = append(errs, field.Forbidden(at, fmt.Sprintf(busCredsSecretForbiddenFmt, vol.Name, route.Secret)))
 		}
 	}
 	return errs

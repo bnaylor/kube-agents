@@ -31,8 +31,8 @@ import (
 // The source half of the bus-token reservation at admission. The name half
 // (validateReservedVolumeName) refuses a volume CALLED a2a-bus-token and
 // nothing else, so a projected serviceAccountToken for the bus audience under
-// any other name, or a mount of the credentials Secret the operator renders,
-// was admitted. Each refusal has to land on the field that matched and name
+// any other name, or a mount of one of the Secrets the operator renders with
+// bus credentials in them, was admitted. Each refusal has to land on the field that matched and name
 // the audience or the Secret, because a bare "forbidden" on the volume leaves
 // the author guessing which of the volume's sources did it.
 //
@@ -86,6 +86,10 @@ func TestBusCredentialSourcesAreRefusedOnBothVolumeLists(t *testing.T) {
 			".projected.sources[1].serviceAccountToken.audience", `"a2a-bus"`},
 		{"the creds Secret as a secret volume", corev1.Volume{Name: "cache", VolumeSource: secretVolume(credsSecret)},
 			".secret.secretName", `"` + credsSecret + `"`},
+		{"the nats.conf Secret as a secret volume", corev1.Volume{Name: "cache", VolumeSource: secretVolume("platform-agent-a2a-nats-config")},
+			".secret.secretName", `"platform-agent-a2a-nats-config"`},
+		{"the callout keys Secret as a secret volume", corev1.Volume{Name: "cache", VolumeSource: secretVolume("platform-agent-a2a-callout-keys")},
+			".secret.secretName", `"platform-agent-a2a-callout-keys"`},
 		{"the creds Secret as a projected source", corev1.Volume{Name: "bundle", VolumeSource: projected(
 			corev1.VolumeProjection{Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: credsSecret}}})},
 			".projected.sources[0].secret.name", `"` + credsSecret + `"`},

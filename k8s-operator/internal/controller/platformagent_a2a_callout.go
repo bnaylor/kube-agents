@@ -254,8 +254,9 @@ func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
 // a2aBusCredentialVolumeNames is the set of user-authored volumes, on both of
 // the CR's volume lists, whose SOURCE would deliver the bus credential to
 // whichever container mounts them: a projected serviceAccountToken for the
-// bus audience under any name, or the credentials Secret the operator renders
-// (agentv1alpha1.BusCredentialRoutes has the two routes and why both). It is
+// bus audience under any name, or one of the Secrets the operator renders
+// with bus credentials in them (agentv1alpha1.BusCredentialRoutes has the two
+// routes, the three Secrets, and why env is not among them). It is
 // what the mount strips below key on, and it is empty for a CR that carries
 // neither, in which case every strip below returns its input unchanged. A
 // pure function of the CR, so buildBaseContainers recomputes it rather than
