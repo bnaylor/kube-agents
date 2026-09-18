@@ -83,7 +83,7 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
 	gatewayPW := string(creds.Data["gateway-password"])
-	workerPW := string(creds.Data["worker-password"])
+	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 	webPW := string(creds.Data["web-password"])
 
@@ -140,13 +140,14 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	allowed("CONSUMER.CREATE TASKS gateway-relay, back to the pair (the update lib does)", err)
 
 	// Submission, then an executor's event for the relay to deliver. The
-	// executor is the worker, which is the principal that may write events.
+	// executor is the bridge, which is the principal that may write events
+	// on the platform addressee.
 	_, err = js.Publish(ctx, inSubject, []byte(`{"kind":"message"}`))
 	allowed("publish a2a.tasks.platform.t1.in (task submission)", err)
-	worker, workerJS := a2aConnectAs(t, s.ClientURL(), "worker", workerPW)
-	_ = worker
-	if _, err := workerJS.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update"}`)); err != nil {
-		t.Fatalf("executor event as worker: %v", err)
+	bridge, bridgeJS := a2aConnectAs(t, s.ClientURL(), "bridge", bridgePW)
+	_ = bridge
+	if _, err := bridgeJS.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update"}`)); err != nil {
+		t.Fatalf("executor event as bridge: %v", err)
 	}
 
 	batch, err := relay.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
@@ -266,7 +267,7 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		{"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".a2a.topics.shared.blueprint", ""},
 		{"$JS.API.STREAM.INFO." + a2aTopicsJournalStream, ""},
 		{"$JS.API.STREAM.DELETE." + a2aTopicsJournalStream, ""},
-		// The other two buckets: the worker's registry and the capability
+		// The other two buckets: the bridge's registry and the capability
 		// envelope's.
 		{"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aRuntimeStateBucket, ""},
 		{"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aRuntimeStateBucket + ".$KV." + a2aRuntimeStateBucket + ".k", ""},
@@ -328,10 +329,10 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		// has no ownership concept for a consumer name. The bridge's
 		// durable is another principal's; the gateway can retune it
 		// without ever naming CONSUMER.DELETE.
-		if _, err := workerJS.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
+		if _, err := bridgeJS.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
 			Durable: "bridge-platform", FilterSubject: "a2a.tasks.platform.*.in", AckPolicy: jetstream.AckExplicitPolicy,
 		}); err != nil {
-			t.Fatalf("the bridge's durable, as worker: %v", err)
+			t.Fatalf("the bridge's own durable: %v", err)
 		}
 		const bridgeCreate = "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".bridge-platform"
 		body := []byte(`{"stream_name":"TASKS","config":{"durable_name":"bridge-platform","name":"bridge-platform",` +
@@ -454,7 +455,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
 	gatewayPW := string(creds.Data["gateway-password"])
-	workerPW := string(creds.Data["worker-password"])
+	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 
 	// A port the restarted server can come back on.
@@ -529,18 +530,18 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 		}
 	}()
 
-	eventAsWorker := func(body string) {
+	eventAsBridge := func(body string) {
 		t.Helper()
-		nc, err := nats.Connect(url, nats.UserInfo("worker", workerPW), nats.CustomInboxPrefix("_INBOX.worker"))
+		nc, err := nats.Connect(url, nats.UserInfo("bridge", bridgePW), nats.CustomInboxPrefix("_INBOX.bridge"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer nc.Close()
-		wjs, err := jetstream.New(nc)
+		bjs, err := jetstream.New(nc)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := wjs.Publish(ctx, "a2a.tasks.platform.t1.events", []byte(body)); err != nil {
+		if _, err := bjs.Publish(ctx, "a2a.tasks.platform.t1.events", []byte(body)); err != nil {
 			t.Fatalf("executor event %q: %v", body, err)
 		}
 	}
@@ -557,7 +558,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 		}
 	}
 
-	eventAsWorker("before-restart")
+	eventAsBridge("before-restart")
 	expect(relayed, "before-restart")
 	expect(replayed, "before-restart")
 
@@ -574,7 +575,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 		t.Fatal("the gateway client did not reconnect to the restarted server")
 	}
 
-	eventAsWorker("after-restart")
+	eventAsBridge("after-restart")
 	expect(relayed, "after-restart")
 	expect(replayed, "after-restart")
 

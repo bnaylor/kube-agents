@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
@@ -28,32 +28,10 @@ import (
 // budget pays for exactly one extra consumer rather than one per run.
 const liveTestRelayDurable = "gateway-relay-livetest"
 
-// liveLastPlatformSubmission answers "the newest submission on the platform
-// inbound leg" in one request, with the subject filter in the API subject's
-// trailing token.
-//
-// Direct get rather than STREAM.MSG.GET, because neither bus user this file
-// connects as holds the latter any more: #1393 scoped the worker's JetStream
-// grant and the narrowing #1666 asked for scoped the gateway's, and both
-// landed on
-// `$JS.API.DIRECT.GET.TASKS.>` — every stream the provision script creates is
-// created `--allow-direct`, so direct get is the route nats.go itself takes
-// and the one the grants are written for. Read as a raw request because this
-// is a raw request in the client too.
-const liveLastPlatformSubmission = "$JS.API.DIRECT.GET." + lib.TasksStream + ".a2a.tasks.platform.*.in"
-
-// liveDirectGetStatusHeader is how a direct get reports that it found
-// nothing: an empty body carrying a status header, 404 for no message. Any
-// other status is a real failure.
-const (
-	liveDirectGetStatusHeader = "Status"
-	liveDirectGetNoMessages   = "404"
-)
-
 // TestLiveAgainstInstallNATS runs the gateway (fake chat adapter, real bus
 // client) against a real deployment's NATS — the W6 install via
 // port-forward — under the REAL gateway user's deny-by-default grants, with
-// a stand-in executor on the worker user. This is the half of the DoD unit
+// a stand-in executor on the bridge user. This is the half of the DoD unit
 // tests cannot prove: that every JetStream interaction the gateway performs
 // (durable consumer on TASKS, ordered replay for tasks/get, KV on
 // session-state, acks, inbox traffic) survives the permission lists.
@@ -61,13 +39,13 @@ const (
 // Skipped unless the env is set:
 //
 //	A2A_LIVE_NATS_URL=nats://127.0.0.1:4222 \
-//	A2A_LIVE_GATEWAY_PASSWORD=... A2A_LIVE_WORKER_PASSWORD=... \
+//	A2A_LIVE_GATEWAY_PASSWORD=... A2A_LIVE_BRIDGE_PASSWORD=... \
 //	go test ./gateway -run TestLive -v -count=1
 func TestLiveAgainstInstallNATS(t *testing.T) {
 	url := os.Getenv("A2A_LIVE_NATS_URL")
 	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
-	wkPass := os.Getenv("A2A_LIVE_WORKER_PASSWORD")
-	if url == "" || gwPass == "" || wkPass == "" {
+	brPass := os.Getenv("A2A_LIVE_BRIDGE_PASSWORD")
+	if url == "" || gwPass == "" || brPass == "" {
 		t.Skip("live NATS env not set; see comment")
 	}
 
@@ -85,16 +63,16 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	}
 	defer client.Close()
 
-	worker, err := lib.Connect(ctx, url,
-		lib.WithName("a2a-worker-livetest"),
+	bridge, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-bridge-livetest"),
 		lib.WithNATSOptions(
-			nats.UserInfo("worker", wkPass),
-			nats.CustomInboxPrefix("_INBOX.worker"),
+			nats.UserInfo("bridge", brPass),
+			nats.CustomInboxPrefix("_INBOX.bridge"),
 		))
 	if err != nil {
-		t.Fatalf("worker connect: %v", err)
+		t.Fatalf("bridge connect: %v", err)
 	}
-	defer worker.Close()
+	defer bridge.Close()
 
 	mapFile := t.TempDir() + "/principal-map"
 	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
@@ -123,12 +101,12 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		AuthorID: "1001", MessageID: "live-1", Text: marker,
 	}
 
-	// The stand-in executor finds the task the way W7's bridge will: from
-	// the stream, under the worker user. Match on the marker so a stale task
-	// from an earlier run can never satisfy this.
+	// The stand-in executor finds the task the way the bridge does: from the
+	// stream, under the bridge user. Match on the marker so a stale task from
+	// an earlier run can never satisfy this.
 	var origin *lib.Envelope
 	waitFor(t, "task on the real TASKS stream", func() bool {
-		task, err := findLatestLiveTask("worker", wkPass, url)
+		task, err := findLatestLiveTask("bridge", brPass, url)
 		if err != nil || task == nil {
 			return false
 		}
@@ -140,12 +118,12 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		return true
 	})
 
-	exec, err := worker.NewTaskExecution(origin, lib.Party{Session: "platform", AgentType: "livetest-executor"}, "platform")
+	exec, err := bridge.NewTaskExecution(origin, lib.Party{Session: "platform", AgentType: "livetest-executor"}, "platform")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
-		t.Fatalf("submitted under worker grants: %v", err)
+		t.Fatalf("submitted under bridge grants: %v", err)
 	}
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
@@ -191,31 +169,47 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		}
 		return false
 	})
-	t.Log("live DoD (bus half) held: submit under gateway grants, execute under worker grants, relay + replay under gateway grants")
+	t.Log("live DoD (bus half) held: submit under gateway grants, execute under bridge grants, relay + replay under gateway grants")
 }
 
 // findLatestLiveTask fetches the newest message on the platform in subjects
-// as the named bus user, by direct get (liveLastPlatformSubmission says why
-// it is not a stream msg-get). A stream with no matching message answers 404,
-// which is a legitimate "not yet" for the poll above rather than a failure.
+// as the named bus user.
+//
+// Through lib.Connect and (*lib.Client).ReadTopicLatest, which is this exact
+// read -- stream, GetLastMsgForSubject, ParseEnvelope. A hand-rolled second
+// connection here would be a copy of library code that the live path does not
+// exercise, so a change to how the client reads a stream would leave this test
+// still passing against the old shape. The one thing it does not delegate is
+// the empty case: ReadTopicLatest reports it as ErrTopicEmpty and this
+// caller polls, so it becomes (nil, nil).
+//
+// It reads through GetLastMsgForSubject rather than a hand-rolled
+// $JS.API.STREAM.MSG.GET request, because MSG.GET is granted to nobody: every
+// stream the provision script creates sets --allow-direct, so nats.go picks
+// DIRECT.GET from the stream's own config and the grant lists carry only that
+// route. The wildcard is legal on it — the permission check reads the filter
+// subject's `*` as an ordinary token under the grant's trailing `>`, measured
+// for the bridge against a real server in the operator's
+// TestBridgeJetStreamGrantOnARealServer.
 func findLatestLiveTask(user, pass, url string) (*lib.Envelope, error) {
-	nc, err := nats.Connect(url, nats.UserInfo(user, pass), nats.CustomInboxPrefix("_INBOX."+user))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-gateway-livefind"),
+		lib.WithNATSOptions(nats.UserInfo(user, pass), nats.CustomInboxPrefix("_INBOX."+user)))
 	if err != nil {
 		return nil, err
 	}
-	defer nc.Close()
-	msg, err := nc.Request(liveLastPlatformSubmission, nil, 5*time.Second)
+	defer client.Close()
+	env, err := client.ReadTopicLatest(ctx, "TASKS", "a2a.tasks.platform.*.in")
 	if err != nil {
-		return nil, err
-	}
-	if status := msg.Header.Get(liveDirectGetStatusHeader); status != "" {
-		if status == liveDirectGetNoMessages {
+		// No task on those subjects yet; the caller polls.
+		if errors.Is(err, lib.ErrTopicEmpty) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("direct get on %s: status %s (%s)",
-			lib.TasksStream, status, msg.Header.Get("Description"))
+		return nil, err
 	}
-	return lib.ParseEnvelope(msg.Data)
+	return env, nil
 }
 
 // TestLiveEndToEndThroughBridge is the W3 DoD's bus path with no stand-ins:
@@ -223,7 +217,7 @@ func findLatestLiveTask(user, pass, url string) (*lib.Envelope, error) {
 // the real install, W7's bridge drives the real platform agent, and the
 // real answer relays back — plus "what is it doing" answered by replay
 // while the task runs. Requires the same env as TestLiveAgainstInstallNATS
-// (worker password unused here but kept for the shared gate).
+// (bridge password unused here but kept for the shared gate).
 func TestLiveEndToEndThroughBridge(t *testing.T) {
 	url := os.Getenv("A2A_LIVE_NATS_URL")
 	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
