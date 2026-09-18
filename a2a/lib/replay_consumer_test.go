@@ -14,21 +14,25 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// The consumer TasksGet creates on TASKS must be gone when TasksGet returns,
-// and where the principal cannot delete it, gone within
-// EphemeralConsumerInactiveThreshold (#1739). Both are measured on a real
-// server against a gateway-shaped permission set, because the answer depends
-// on the grant: the delete is a $JS.API.CONSUMER.DELETE.TASKS.<name> publish,
-// and a principal without it gets a refusal and no reply.
+// The consumer TasksGet creates on TASKS must be gone within
+// EphemeralConsumerInactiveThreshold of the call returning, and TasksGet must
+// not try to delete it by hand (#1739). Both are measured on a real server
+// against the rendered worker grant, because the second one only matters
+// under that grant: the delete would be a $JS.API.CONSUMER.DELETE.TASKS.<name>
+// publish, and this principal does not hold the subject.
 const (
-	// replayDeleteWithin is how long the explicit delete gets to land. It is
-	// well inside EphemeralConsumerInactiveThreshold so that a pass here is
-	// the delete and not the threshold.
-	replayDeleteWithin = 2 * time.Second
 	// thresholdReapWithin is how long the server gets to reap a consumer by
 	// its inactive threshold once the client is gone: the threshold itself
 	// plus the server's scan interval and slack.
 	thresholdReapWithin = 3 * EphemeralConsumerInactiveThreshold
+	// replayReturnWithin is the budget for one tasks/get. It is well inside
+	// the threshold, so a synchronous delete refused without a reply -- the
+	// shape a re-added explicit delete would take under this grant -- shows
+	// up here as a slow return rather than passing unnoticed.
+	replayReturnWithin = 2 * time.Second
+	// logWithin is how long an async error gets to travel from the server to
+	// the connection's error handler.
+	logWithin = 2 * time.Second
 	// replayBurst is how many tasks/get calls the burst case makes.
 	replayBurst = 20
 
@@ -42,47 +46,43 @@ const (
 	// replayAdminTimeout bounds each admin-side call (provision, list).
 	replayAdminTimeout = 5 * time.Second
 
-	replayAdminUser    = "admin"
-	replayGatewayUser  = "gateway"
-	replayNoDeleteUser = "gateway-nodelete"
-	replayPassword     = "pw"
+	replayAdminUser   = "admin"
+	replayReaderUser  = "worker-shaped"
+	replayPassword    = "pw"
+	replayControlSubj = "$JS.API.STREAM.DELETE.TASKS"
 )
 
-// replayGrant is a gateway-shaped grant: the JetStream API subjects TasksGet
-// emits on TASKS, enumerated per stream and verb the way the operator renders
-// the worker's grant today and gke-labs/kube-agents#1672 proposes for the
-// gateway, plus the ack, flow-control and inbox subjects beside them in the
-// identity. withDelete adds the one subject that proposal withholds and this
-// change needs.
-func replayGrant(user string, withDelete bool) *natsserver.Permissions {
-	publish := []string{
-		"$JS.API.STREAM.INFO.TASKS",
-		"$JS.API.CONSUMER.CREATE.TASKS.>",
-		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-		"$JS.API.DIRECT.GET.TASKS.>",
-		"$JS.ACK.TASKS.>",
-		"$JS.FC.>",
-		"_INBOX." + user + ".>",
-	}
-	if withDelete {
-		publish = append(publish, "$JS.API.CONSUMER.DELETE.TASKS.*")
-	}
+// replayGrant is the reader grant in the shape the operator renders for the
+// `worker` principal: the JetStream API subjects TasksGet emits on TASKS,
+// enumerated per stream and verb, plus the ack, flow-control and inbox
+// subjects beside them in the identity. CONSUMER.DELETE is deliberately not
+// in the list -- that is the grant TasksGet has to work within, and the whole
+// point of the tests below.
+func replayGrant(user string) *natsserver.Permissions {
 	return &natsserver.Permissions{
-		Publish:   &natsserver.SubjectPermission{Allow: publish},
+		Publish: &natsserver.SubjectPermission{Allow: []string{
+			"$JS.API.STREAM.INFO.TASKS",
+			"$JS.API.CONSUMER.CREATE.TASKS.>",
+			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+			"$JS.API.DIRECT.GET.TASKS.>",
+			"$JS.ACK.TASKS.>",
+			"$JS.FC.>",
+			"_INBOX." + user + ".>",
+		}},
 		Subscribe: &natsserver.SubjectPermission{Allow: []string{"_INBOX." + user + ".>"}},
 	}
 }
 
-// startPermissionedServer runs a JetStream server whose users carry the grants
-// above. admin is unrestricted: it provisions the stream, publishes the task
-// and reads the consumer list back, the way seed and web do on an install.
+// startPermissionedServer runs a JetStream server whose reader carries the
+// grant above. admin is unrestricted: it provisions the stream, publishes the
+// task and reads the consumer list back, the way seed and web do on an
+// install.
 func startPermissionedServer(t *testing.T) *natsserver.Server {
 	t.Helper()
 	s := runJetStreamServer(t, -1, t.TempDir(), func(o *natsserver.Options) {
 		o.Users = []*natsserver.User{
 			{Username: replayAdminUser, Password: replayPassword},
-			{Username: replayGatewayUser, Password: replayPassword, Permissions: replayGrant(replayGatewayUser, true)},
-			{Username: replayNoDeleteUser, Password: replayPassword, Permissions: replayGrant(replayNoDeleteUser, false)},
+			{Username: replayReaderUser, Password: replayPassword, Permissions: replayGrant(replayReaderUser)},
 		}
 	})
 	t.Cleanup(s.Shutdown)
@@ -128,7 +128,9 @@ func provisionTasksStreamAsProvisioned(t *testing.T, url string) {
 	}
 }
 
-// tasksConsumers lists the consumers on TASKS as admin.
+// tasksConsumers lists the consumers on TASKS as admin. The InactiveThreshold
+// it reports is the server's, read back off the consumer -- not the value the
+// caller put in the config struct.
 func tasksConsumers(t *testing.T, url string) []*jetstream.ConsumerInfo {
 	t.Helper()
 	js, ctx := adminJetStream(t, url)
@@ -177,107 +179,129 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
-// replayAs connects a reader as user and folds taskID once.
-func replayAs(t *testing.T, url, user, taskID string, log *slog.Logger) *Task {
+// replayReader connects a reader under the worker-shaped grant.
+func replayReader(t *testing.T, url, name string, log *slog.Logger) *Client {
 	t.Helper()
-	ctx := testCtx(t)
-	opts := []ClientOption{WithName(user + "-reader"), WithUserPassword(user, replayPassword)}
+	opts := []ClientOption{WithName(name), WithUserPassword(replayReaderUser, replayPassword)}
 	if log != nil {
 		opts = append(opts, WithLogger(log))
 	}
-	reader, err := Connect(ctx, url, opts...)
+	c, err := Connect(testCtx(t), url, opts...)
 	if err != nil {
-		t.Fatalf("Connect as %s: %v", user, err)
+		t.Fatalf("Connect as %s: %v", replayReaderUser, err)
 	}
-	t.Cleanup(reader.Close)
-	task, err := reader.TasksGet(ctx, replayAddressee(taskID), taskID)
-	if err != nil {
-		t.Fatalf("TasksGet as %s: %v", user, err)
-	}
-	return task
+	t.Cleanup(c.Close)
+	return c
 }
 
-// A principal holding CONSUMER.DELETE on TASKS leaves nothing behind: the
-// consumer is deleted by name when TasksGet returns, well inside the
-// threshold, so a burst of replays costs slots for the replays in flight and
-// not for the last five minutes of them.
-func TestTasksGet_DeletesItsReplayConsumer(t *testing.T) {
+// The ordered consumer TasksGet creates carries the five-second inactive
+// threshold on the server, not nats.go's five-minute ordered default, and the
+// server reaps it on that clock once the replay stops pulling. This is the
+// whole of the cleanup: nothing deletes the consumer by name, so if the
+// threshold does not reach the server the slot is held for five minutes
+// (#1739). The threshold is read back off the consumer as the server holds
+// it, not off the config struct TasksGet passed in.
+func TestTasksGet_ReplayConsumerCarriesTheInactiveThreshold(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
 	provisionTasksStreamAsProvisioned(t, url)
-	const taskID = "task-replay-delete"
+	const taskID = "task-replay-threshold"
+	// The constant is the entire cleanup, so it has to be short on its own
+	// terms; asserting only that the server agrees with it would pass with
+	// the five minutes this change exists to get rid of.
+	if EphemeralConsumerInactiveThreshold >= time.Minute {
+		t.Fatalf("EphemeralConsumerInactiveThreshold = %s: nothing deletes the replay consumer, so the threshold is the slot's whole lifetime and must be seconds", EphemeralConsumerInactiveThreshold)
+	}
 	replayFixture(t, url, taskID, []TaskState{StateSubmitted, StateWorking, StateCompleted},
 		WithUserPassword(replayAdminUser, replayPassword))
 	if n := len(tasksConsumers(t, url)); n != 0 {
 		t.Fatalf("test bug: %d consumers on TASKS before the replay", n)
 	}
 
-	task := replayAs(t, url, replayGatewayUser, taskID, nil)
+	reader := replayReader(t, url, "threshold-reader", nil)
+	start := time.Now()
+	task, err := reader.TasksGet(testCtx(t), replayAddressee(taskID), taskID)
+	if err != nil {
+		t.Fatalf("TasksGet: %v", err)
+	}
+	took := time.Since(start)
 	if task.State != StateCompleted || !task.Final {
 		t.Fatalf("fold = %s final=%v, want completed final", task.State, task.Final)
 	}
+	if took > replayReturnWithin {
+		t.Fatalf("TasksGet took %s, want under %s: nothing on this path may wait out a refused request", took, replayReturnWithin)
+	}
+
 	after := tasksConsumers(t, url)
 	t.Logf("consumers on TASKS the instant TasksGet returned: %d %s", len(after), describeConsumers(after))
-	waitFor(t, replayDeleteWithin, "the replay consumer to be deleted", func() bool {
+	if len(after) != 1 {
+		t.Fatalf("consumers on TASKS after return = %d, want the one the replay created", len(after))
+	}
+	if got := after[0].Config.InactiveThreshold; got != EphemeralConsumerInactiveThreshold {
+		t.Fatalf("replay consumer inactive_threshold on the server = %s, want %s (nats.go's ordered default is 5m)", got, EphemeralConsumerInactiveThreshold)
+	}
+
+	waitFor(t, thresholdReapWithin, "the inactive threshold to reap the replay consumer", func() bool {
 		return len(tasksConsumers(t, url)) == 0
 	})
-	t.Logf("consumers on TASKS within %s of return: 0", replayDeleteWithin)
+	t.Logf("consumers on TASKS %s after return: 0 (reaped by the %s threshold, nothing deleted it)",
+		time.Since(start).Round(100*time.Millisecond), EphemeralConsumerInactiveThreshold)
 }
 
-// A principal WITHOUT CONSUMER.DELETE on TASKS -- the rendered worker grant,
-// and the gateway's under #1672 as opened -- has its delete refused without a
-// reply. The consumer then lingers, but only until the threshold TasksGet set
-// on it, not nats.go's five-minute default; and the refusal is visible in
-// the client's own log rather than silent.
-func TestTasksGet_ReplayConsumerFallsBackToTheInactiveThreshold(t *testing.T) {
+// TasksGet emits nothing the worker grant refuses. The grant withholds
+// $JS.API.CONSUMER.DELETE.TASKS.*, and a refused publish gets no reply: it
+// costs one Error-level "Permissions Violation" line per call from the
+// connection's async error handler, which is the line an operator is taught
+// to read as a missing grant. A replay must not make that line routine, so
+// this asserts its absence -- and proves the assertion is not vacuous by
+// driving a known refusal down the same connection afterwards and requiring
+// that one to show up. Refusals arrive in the order the publishes left, so
+// the control line landing is the barrier: anything the replay itself was
+// refused is already in the buffer by then.
+func TestTasksGet_EmitsNothingTheWorkerGrantRefuses(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
 	provisionTasksStreamAsProvisioned(t, url)
-	const taskID = "task-replay-nodelete"
+	const taskID = "task-replay-no-refusal"
 	replayFixture(t, url, taskID, []TaskState{StateSubmitted, StateCompleted},
 		WithUserPassword(replayAdminUser, replayPassword))
 
 	var logs lockedBuffer
 	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	start := time.Now()
-	task := replayAs(t, url, replayNoDeleteUser, taskID, log)
+	reader := replayReader(t, url, "no-refusal-reader", log)
+	task, err := reader.TasksGet(testCtx(t), replayAddressee(taskID), taskID)
+	if err != nil {
+		t.Fatalf("TasksGet: %v", err)
+	}
 	if task.State != StateCompleted {
 		t.Fatalf("fold = %s, want completed", task.State)
 	}
-	if took := time.Since(start); took > replayDeleteWithin {
-		// The refused delete must not be on the caller's path: a
-		// synchronous delete under this grant would hold every tasks/get
-		// for replayConsumerDeleteTimeout.
-		t.Fatalf("TasksGet took %s under a grant without CONSUMER.DELETE; the delete is holding the caller", took)
-	}
 
-	lingering := tasksConsumers(t, url)
-	t.Logf("consumers on TASKS the instant TasksGet returned: %d %s", len(lingering), describeConsumers(lingering))
-	if len(lingering) != 1 {
-		t.Fatalf("consumers on TASKS after return = %d, want the one the refused delete left", len(lingering))
+	nc, _ := reader.conn()
+	if err := nc.Publish(replayControlSubj, nil); err != nil {
+		t.Fatalf("control publish: %v", err)
 	}
-	if got := lingering[0].Config.InactiveThreshold; got != EphemeralConsumerInactiveThreshold {
-		t.Fatalf("lingering consumer inactive_threshold = %s, want %s (nats.go's default is 5m)", got, EphemeralConsumerInactiveThreshold)
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("control flush: %v", err)
 	}
-
-	waitFor(t, replayDeleteWithin, "the client to log the refused delete", func() bool {
+	waitFor(t, logWithin, "the control refusal to reach the async error handler", func() bool {
 		out := logs.String()
-		return strings.Contains(out, "Permissions Violation") && strings.Contains(out, "$JS.API.CONSUMER.DELETE.TASKS.")
+		return strings.Contains(out, "Permissions Violation") && strings.Contains(out, replayControlSubj)
 	})
-	waitFor(t, thresholdReapWithin, "the inactive threshold to reap the consumer", func() bool {
-		return len(tasksConsumers(t, url)) == 0
-	})
-	t.Logf("consumers on TASKS %s after return: 0 (reaped by the %s threshold)", time.Since(start).Round(100*time.Millisecond), EphemeralConsumerInactiveThreshold)
-	// The delete's own deadline is replayConsumerDeleteTimeout, on the same
-	// clock as the reap above, so the outcome line can land just after it.
-	waitFor(t, replayDeleteWithin, "the client to log the delete's outcome", func() bool {
-		return strings.Contains(logs.String(), "a2a replay consumer not deleted")
-	})
+
+	out := logs.String()
+	if strings.Contains(out, "CONSUMER.DELETE") {
+		t.Fatalf("TasksGet was refused a CONSUMER.DELETE under the worker grant; the log line operators read as a missing grant is now one per tasks/get:\n%s", out)
+	}
+	t.Logf("client log after the replay, with a known refusal appended as the barrier:\n%s", out)
 }
 
 // Twenty replays in a row leave twenty consumers on upstream/main, one per
-// call, each for five minutes. Here they leave none.
-func TestTasksGet_BurstLeavesNoReplayConsumers(t *testing.T) {
+// call, each for five MINUTES -- a count that tracks the call rate over that
+// window against a max_consumers sized for the replays in flight (#1739).
+// Here every one of them carries the five-second threshold and the stream is
+// clear within it.
+func TestTasksGet_BurstBoundsReplayConsumersByTheThreshold(t *testing.T) {
 	s := startPermissionedServer(t)
 	url := clientURL(s)
 	provisionTasksStreamAsProvisioned(t, url)
@@ -286,11 +310,8 @@ func TestTasksGet_BurstLeavesNoReplayConsumers(t *testing.T) {
 		WithUserPassword(replayAdminUser, replayPassword))
 
 	ctx := testCtx(t)
-	reader, err := Connect(ctx, url, WithName("burst-reader"), WithUserPassword(replayGatewayUser, replayPassword))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(reader.Close)
+	reader := replayReader(t, url, "burst-reader", nil)
+	start := time.Now()
 	for i := 0; i < replayBurst; i++ {
 		if _, err := reader.TasksGet(ctx, replayAddressee(taskID), taskID); err != nil {
 			t.Fatalf("TasksGet #%d: %v", i+1, err)
@@ -301,46 +322,16 @@ func TestTasksGet_BurstLeavesNoReplayConsumers(t *testing.T) {
 	if len(after) > replayBurst {
 		t.Fatalf("%d consumers after %d calls: more than the calls that could be in flight", len(after), replayBurst)
 	}
-	waitFor(t, replayDeleteWithin, "every replay consumer to be deleted", func() bool {
+	if len(after) == 0 {
+		t.Fatalf("test bug: the burst left no consumers to measure; the reap raced the list")
+	}
+	for _, info := range after {
+		if got := info.Config.InactiveThreshold; got != EphemeralConsumerInactiveThreshold {
+			t.Fatalf("burst consumer %s inactive_threshold on the server = %s, want %s", info.Name, got, EphemeralConsumerInactiveThreshold)
+		}
+	}
+	waitFor(t, thresholdReapWithin, "every replay consumer to be reaped", func() bool {
 		return len(tasksConsumers(t, url)) == 0
 	})
-	t.Logf("consumers on TASKS within %s of the burst: 0", replayDeleteWithin)
-}
-
-// The delete runs on its own context, not the caller's. TasksGet's caller may
-// be canceled or past its deadline by the time the defer runs -- a tasks/get
-// that timed out mid-replay -- and that is precisely when the consumer it
-// created must still be removed. deleteReplayConsumer takes no context at
-// all, so this drives it directly with a consumer created the way TasksGet
-// creates one, and TestTasksGet_ContextCanceled in replay_test.go keeps the
-// cancellation path itself honest.
-func TestDeleteReplayConsumer_NeedsNoLiveCallerContext(t *testing.T) {
-	s := startPermissionedServer(t)
-	url := clientURL(s)
-	provisionTasksStreamAsProvisioned(t, url)
-	const taskID = "task-replay-orphan"
-
-	ctx := testCtx(t)
-	c, err := Connect(ctx, url, WithName("orphan-reader"), WithUserPassword(replayGatewayUser, replayPassword))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(c.Close)
-	_, js := c.conn()
-	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    TaskReplaySubjects(replayAddressee(taskID), taskID),
-		DeliverPolicy:     jetstream.DeliverAllPolicy,
-		InactiveThreshold: EphemeralConsumerInactiveThreshold,
-	})
-	if err != nil {
-		t.Fatalf("ordered consumer: %v", err)
-	}
-	if n := len(tasksConsumers(t, url)); n != 1 {
-		t.Fatalf("consumers on TASKS after create = %d, want 1", n)
-	}
-
-	c.deleteReplayConsumer(js, cons, taskID)
-	waitFor(t, replayDeleteWithin, "the orphaned replay consumer to be deleted", func() bool {
-		return len(tasksConsumers(t, url)) == 0
-	})
+	t.Logf("consumers on TASKS %s after the burst: 0", time.Since(start).Round(100*time.Millisecond))
 }

@@ -494,18 +494,19 @@ func a2aSeedJetStreamGrants() []string {
 // no consumer re-verifies itself with it after a reconnect either --
 // TestWorkerConsumersSurviveABusRestart holds that across a server restart).
 //
-// CONSUMER.DELETE on TASKS is withheld, and it is the one subject the worker
-// path does emit without a grant, from two places. nats.go's ordered-consumer
-// reset fires DeleteConsumer for the consumer it is replacing, in a goroutine,
-// ignoring the result. And lib.TasksGet deletes its replay consumer on every
-// return, best-effort and off the caller's path (a refused publish gets no
-// reply, so the request waits out its own deadline rather than the caller's);
-// the bridge calls TasksGet on every task it dispatches. Either way the
-// refused delete costs one async-error line in the caller's log, and the
-// consumer is reaped by the inactive threshold TasksGet sets on it,
-// lib.EphemeralConsumerInactiveThreshold (five seconds; nats.go's own
-// ordered default is five minutes, which is what the replay carried before
-// gke-labs/kube-agents#1739).
+// CONSUMER.DELETE on TASKS is withheld, and it is the one subject nats.go
+// does emit here without a grant. The only emitter is the ordered consumer's
+// reset path, which fires DeleteConsumer for the consumer it is replacing in
+// a goroutine and ignores the result; the ephemeral it could not delete is
+// reaped by the inactive threshold lib.TasksGet sets on it,
+// lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
+// ordered default is five MINUTES, which is what the replay carried before
+// gke-labs/kube-agents#1739). TasksGet does not delete its own replay
+// consumer, and that is a decision rather than an omission: under this grant
+// the delete is a refused publish on a subject with no reply, so the bridge
+// would pay an Error-level permissions violation on every task it dispatches
+// -- the line an operator is taught to read as a missing grant -- to reclaim
+// the last five seconds of one consumer slot.
 //
 // Withholding it raises the price of reaching another principal's durable and
 // does not close the route, which is the correction to what this comment said
@@ -526,9 +527,9 @@ func a2aSeedJetStreamGrants() []string {
 // NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
 // literally named that. What closes it is the auth callout giving each
 // principal its own user. DELETE stays out as the one destructive verb here
-// the worker path emits without needing: the two emitters above both fall
-// back to a threshold, so the grant's absence costs a log line and up to five
-// seconds of a consumer slot, not a behaviour.
+// that nothing on the worker path needs: its one emitter ignores the result
+// and the threshold gets there anyway, so the grant's absence costs a log
+// line on a reset and up to five seconds of a consumer slot, not a behaviour.
 //
 // One route this list narrows but cannot close, because it lives in a request
 // body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the

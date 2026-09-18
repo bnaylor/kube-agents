@@ -73,21 +73,24 @@ running (the executor role). That collapse is exactly what makes it a stand-in -
 the real dispatcher arrives, the roles separate again and the bridge has nothing left to
 do.
 
-On the W6 install the bridge connects as the static `worker` user, whose grants cover
-it with one stated exception: subscribe `a2a.tasks.>`, publish `a2a.tasks.*.*.events`,
-plus the JetStream tax and `$KV.runtime-state.>` for the in-flight registry below. The
-tax is not `$JS.API.>`: it is the `$JS.API` subjects the bridge emits on TASKS and
+On the W6 install the bridge connects as the static `worker` user, whose grants already
+cover it: subscribe `a2a.tasks.>`, publish `a2a.tasks.*.*.events`, plus the JetStream
+tax and `$KV.runtime-state.>` for the in-flight registry below. The tax is not
+`$JS.API.>`: it is the `$JS.API` subjects the bridge emits on TASKS and
 `KV_runtime-state` — stream info, consumer create, pull, direct get, and the KV
 watcher's consumer delete — named one by one, with the CLI's topic-stream reads, in the
 operator's `a2aWorkerJetStreamGrants`; `$JS.ACK.TASKS.>`, ack scoped to the one stream this user
 consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM); `$JS.FC.>`;
-and `_INBOX.worker.>`. The exception is `$JS.API.CONSUMER.DELETE.TASKS.<name>`, which
-`lib.TasksGet` now emits on every return to delete the replay consumer it created and
-which this grant refuses. The delete is best-effort and off the caller's path, so the
-bridge's dispatch check and sweep are not slowed by the refusal; the consumer is reaped
-by the five-second inactive threshold `TasksGet` sets on it instead, and each refusal is
-one `nats async error` line in the bridge's log. Granting the subject is the call of
-whichever change owns this principal, not this program's.
+and `_INBOX.worker.>`.
+
+Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
+for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
+`lib.TasksGet` on every task it dispatches, and each call creates an ordered consumer on
+TASKS; nothing deletes it. It is reaped by the five-second inactive threshold `TasksGet`
+sets on it, which is why the replay costs a consumer slot for the calls in flight rather
+than for the last five minutes of them (gke-labs/kube-agents#1739) without the bridge
+needing a destructive verb on TASKS. A `tasks/get` under this user emits no refused
+publish, so a `Permissions Violation` in the bridge's log still means what it says.
 
 **This is now the bridge's own debt rather than the deployment's posture.** The auth
 callout has armed and session pods authenticate as themselves, so the shared static user

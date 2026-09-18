@@ -28,17 +28,19 @@ const (
 	// the default in place every tasks/get left a consumer on TASKS for five
 	// minutes, so the count tracked the call rate over that window rather
 	// than the replays in flight, against a max_consumers sized for the
-	// latter (#1739). Five seconds is the fallback when the explicit delete
-	// below cannot land; it is not the primary cleanup.
+	// latter (#1739).
+	//
+	// The threshold is the only cleanup: TasksGet does not delete the
+	// consumer it creates, and must not be made to. The delete is a publish
+	// on $JS.API.CONSUMER.DELETE.TASKS.*, a subject the rendered worker
+	// grant withholds, and a refused publish gets no reply -- nats.go routes
+	// a permissions violation to subscriptions only. Under that principal an
+	// explicit delete would buy back the last few seconds of one consumer
+	// slot in exchange for an Error-level permissions violation on every
+	// call, which is the line an operator is taught to read as a missing
+	// grant. Reclaim the slot sooner by shortening this constant, not by
+	// adding a delete.
 	EphemeralConsumerInactiveThreshold = 5 * time.Second
-
-	// replayConsumerDeleteTimeout bounds the explicit delete of a replay
-	// consumer. A refused publish gets no reply -- nats.go routes a
-	// permissions violation to subscriptions only (processTransientError),
-	// so a request on a subject the principal lacks waits out its context --
-	// and past the inactive threshold the server has reaped the consumer
-	// anyway, so there is nothing to wait longer for.
-	replayConsumerDeleteTimeout = EphemeralConsumerInactiveThreshold
 )
 
 // Task is the A2A Task materialized by folding a task's event stream —
@@ -198,10 +200,6 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 	if err != nil {
 		return nil, fmt.Errorf("ordered consumer for %s: %w", taskID, err)
 	}
-	// Registered before the iterator's Stop so that it runs after it (defers
-	// unwind in reverse), and before Messages so a failed iterator still
-	// releases the consumer it was created for.
-	defer c.deleteReplayConsumer(js, cons, taskID)
 	it, err := cons.Messages()
 	if err != nil {
 		return nil, fmt.Errorf("replay messages for %s: %w", taskID, err)
@@ -268,46 +266,6 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			"task", taskID, "dropped", task.PostFinalDropped)
 	}
 	return task, nil
-}
-
-// deleteReplayConsumer removes the ordered consumer TasksGet created, under
-// the name it carries when TasksGet returns. Stopping the iterator does not
-// do this (nats.go v1.53.1, orderedSubscription.Stop), and the name is read
-// at return time rather than at creation because an ordered consumer that
-// reset mid-replay -- a reconnect, a sequence gap -- is a new consumer under
-// a new name, and the old one is the reset's to delete, not this function's.
-//
-// Best effort, off the caller's path. It runs in its own goroutine with its
-// own deadline because the principal may not hold
-// $JS.API.CONSUMER.DELETE.TASKS.* -- a grant enumerated per stream and verb
-// can withhold it, and the rendered worker grant does -- and a request on a
-// subject the principal lacks is refused without a reply, so a synchronous
-// delete would hold every tasks/get for the whole timeout under that grant. The
-// refusal itself reaches the connection's async error handler, which logs it
-// at Error naming the subject; this logs the outcome at Debug because the
-// inactive threshold on the consumer reaps it within
-// EphemeralConsumerInactiveThreshold either way, and a not-found answer is
-// the threshold having got there first.
-func (c *Client) deleteReplayConsumer(js jetstream.JetStream, cons jetstream.Consumer, taskID string) {
-	info := cons.CachedInfo()
-	if info == nil {
-		return
-	}
-	name := info.Name
-	go func() {
-		// Deliberately not derived from the caller's context: by the time
-		// this runs that context may be canceled or past its deadline (a
-		// tasks/get that timed out mid-replay is the common case), and the
-		// consumer it left behind is exactly the one that must still go.
-		ctx, cancel := context.WithTimeout(context.Background(), replayConsumerDeleteTimeout)
-		defer cancel()
-		err := js.DeleteConsumer(ctx, TasksStream, name)
-		if err == nil || errors.Is(err, jetstream.ErrConsumerNotFound) {
-			return
-		}
-		c.log.Debug("a2a replay consumer not deleted; the inactive threshold reaps it",
-			"task", taskID, "consumer", name, "threshold", EphemeralConsumerInactiveThreshold, "err", err)
-	}()
 }
 
 // ValidateArtifacts enforces assertion 18: a completed task carries at least
