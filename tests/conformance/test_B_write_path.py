@@ -665,8 +665,8 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # deciding. `shell: python` is the other language -- `os.environ["GITHUB_EVENT_" +
 # "PATH"]` and `os.getenv(...)` are the same reach, and an earlier round
 # claimed to handle `shell: python` while reading neither. So the rule is the
-# accessor in both: `process.env`, `os.environ`, the name `environ` however
-# it got into scope, and `getenv`.
+# accessor rather than the name: `process.env`, `os.environ`, the name
+# `environ` however it got into scope, and `getenv`.
 #
 # `environ` is refused as a bare word rather than as a word with a subscript
 # after it. `from os import environ as e` binds the mapping to a name this
@@ -676,6 +676,23 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # not already costing -- a step that writes `environ` and does not read it is
 # a step that wrote it for nothing -- and it picks up `/proc/self/environ`,
 # which is the same mapping a third way, in the shell.
+#
+# Two languages is not the language list. A `run:` step runs whatever is
+# installed on the runner, and `perl` and `awk` are both on the hosted image,
+# each with the same mapping under a spelling the two accessors above do not
+# contain. awk's is `ENVIRON`, which is the word already in the rule in the
+# only case awk writes it, so it is reached by matching the word without
+# regard to case rather than by a fifth alternative -- `ENVIRONMENT` keeps
+# its word boundary and stays green, which is the only thing the case
+# insensitivity could have cost. perl's is `%ENV` for the hash and
+# `$ENV{...}` for one element of it, and both are refused, because perl is
+# the language where the element read is the hole: python and node spell the
+# accessor the same way whether the name is a literal or a variable, so the
+# accessor rule already covers `os.environ[k]`, while perl changes sigil and
+# `$ENV{$k}` would otherwise reach the same value with no accessor and no
+# name anywhere in the text. `$ENV` without the brace is the shell's
+# startup-file variable and is not this mapping, so the brace is required and
+# `echo "$ENV"` stays green.
 #
 # Refusing the accessor rather than the name is a rule about reach rather
 # than about spelling, and it is affordable for a reason specific to these
@@ -695,7 +712,9 @@ _EVENT_PAYLOAD_FILE = re.compile(
     r"|event\.json"
     r"|\bprocess\s*[.\[]\s*['\"]?env\b"
     r"|\bos\s*[.\[]\s*['\"]?environ\b"
-    r"|\benviron\b"
+    r"|\b(?i:environ)\b"
+    r"|%ENV\b"
+    r"|\$ENV\s*\{"
     r"|\bgetenv\b"
 )
 
@@ -2470,8 +2489,9 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         A step that splits the accessor itself, in either language:
         `globalThis['proc'+'ess']['e'+'nv']['GITHUB_EVENT_'+'PATH']`, or
         `getattr(__import__("o"+"s"), "environ")`. `process.env`,
-        `process['env']`, `os.environ`, a bare `environ[...]` and `getenv`
-        are all refused as of 2026-09-19, and so is the directory the file
+        `process['env']`, `os.environ`, a bare `environ[...]` in any case,
+        perl's `%ENV` and `$ENV{...}`, and `getenv` are all refused as of
+        2026-09-19, and so is the directory the file
         sits in, so this residual now takes string arithmetic over the
         accessor rather than over the variable's name. Narrower is not
         closed.
@@ -2998,7 +3018,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "container job sees that directory at, or the "
                             "process environment that holds the path, "
                             "reached through `process.env`, `os.environ`, "
-                            "`environ` or `getenv`. Every field in that "
+                            "`environ` in any case, perl's `%ENV` or "
+                            "`$ENV{...}`, or `getenv`. Every field in that "
                             "file came from the pull request, and it is the "
                             "one language neither allowlist reads",
                         )

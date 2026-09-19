@@ -78,7 +78,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Sixteen today, which `--list` is the
+    #: and KILLED is the failure. Seventeen today, which `--list` is the
     #: authority on rather than this comment -- it named ten on 2026-09-19
     #: when there were eleven, and one of the ten by an id no row had:
     #: A3-fastpath-redundant,
@@ -89,6 +89,7 @@ class Mutation:
     #: B4-pull-request-target-api-gh-argv-vector-write,
     #: B4-pull-request-target-api-gh-wrapped-readable-program,
     #: B4-pull-request-target-run-env-ordinary-shell,
+    #: B4-pull-request-target-run-environment-word,
     #: B4-pull-request-target-run-array-index-walk,
     #: B4-pull-request-target-run-local-ref-file,
     #: B4-pull-request-target-shell-ordinary,
@@ -2486,6 +2487,96 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "alias the environment mapping on import and match its keys by "
         "suffix, which spells neither the accessor nor the variable",
+    ),
+    Mutation(
+        # The same mapping in the language a `run:` step reaches for when it
+        # wants a field out of a line. awk's environment is `ENVIRON`, and
+        # `for (n in ENVIRON)` walks it, so the branch is chosen by a name
+        # this file never sees and the reserved prefix is never written. The
+        # word was already in the rule; what was not was awk's case. Two
+        # languages was never the language list -- a `run:` step runs what is
+        # installed on the runner, and perl and awk both are.
+        "B4-pull-request-target-awk-environ-enumeration",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(awk 'BEGIN { for (n in ENVIRON) "
+         "if (n ~ /HEAD_REF$/) print ENVIRON[n] }')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "walk the environment from awk, whose mapping is spelled `ENVIRON` "
+        "in the only case awk accepts",
+    ),
+    Mutation(
+        # perl's whole environment, which is `%ENV`. The copy into `%e` is
+        # not obfuscation for its own sake: it is what keeps this row a pin
+        # on the hash sigil rather than on the element accessor below, since
+        # the natural spelling of this loop reads `$ENV{$_}` and would be
+        # refused by either alternative.
+        "B4-pull-request-target-perl-env-hash",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(perl -e 'my %e = %ENV; for (keys %e) "
+         "{ print $e{$_} if /HEAD_REF/ }')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "copy perl's whole environment out of `%ENV` and match its keys by "
+        "suffix, which spells neither the accessor python and node use nor "
+        "the variable",
+    ),
+    Mutation(
+        # One element of it, by a name assembled at run time. perl is the
+        # language where the element read is the hole rather than a
+        # narrower case of the enumeration above: python and node spell the
+        # accessor the same way whether the key is a literal or a variable,
+        # so `os.environ[k]` is already refused, while perl changes sigil
+        # between the hash and its element and `$ENV{$k}` would otherwise
+        # reach the value with no accessor either rule knew and no name
+        # anywhere in the text.
+        "B4-pull-request-target-perl-env-element",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          N=GITHUB\n"
+         "          B=$(perl -e 'print $ENV{$ARGV[0] . \"_HEAD_REF\"}' "
+         '"$N")\n'
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read one element of perl's environment by a key the step builds "
+        "out of an argument, which is the sigil the hash rule above does "
+        "not cover",
+    ),
+    Mutation(
+        # The false-positive direction both of the alternatives above open,
+        # in one step. Matching `environ` without regard to case puts
+        # `ENVIRONMENT` one word boundary away from a red, and `$ENV` is the
+        # shell's startup-file variable rather than the mapping, which is
+        # why the perl element rule wants the brace. Neither is a read of
+        # the runner's environment and neither may go red.
+        "B4-pull-request-target-run-environment-word",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Name the deployment\n"
+         "        run: |\n"
+         "          ENVIRONMENT=staging\n"
+         '          echo "deploying to $ENVIRONMENT, '
+         'startup file ${ENV:-none}, raw $ENV"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name a deployment environment and mention the shell's own `$ENV`, "
+        "neither of which reaches the runner's environment",
+        must_survive=True,
     ),
     Mutation(
         # The environment read whole, in the shell. `env` hands the step
