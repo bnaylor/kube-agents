@@ -23,9 +23,9 @@ the file with `git checkout`, and reports:
     OVERSHOT a `must_survive` control was caught: the suite goes red on a
              change that weakens nothing.
     SURVIVED (expected)
-             a `must_survive` control was not caught, which is its pass. Two
-             rows on every run print this, and the SURVIVED line above is
-             exactly the wrong reading of them: the suite staying green is
+             a `must_survive` control was not caught, which is its pass.
+             Three rows on every run print this, and the SURVIVED line above
+             is exactly the wrong reading of them: the suite staying green is
              the property they assert.
     BASELINE POLLUTED
              not a per-row verdict but a line printed after the run: the
@@ -78,7 +78,9 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Two today, B1-denylist-rule and A3-fastpath-redundant.
+    #: and KILLED is the failure. Three today: B1-denylist-rule,
+    #: A3-fastpath-redundant, and
+    #: B4-pull-request-target-checkout-ref-env-case.
     must_survive: bool = False
 
 
@@ -883,6 +885,241 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "build the fetch's arguments out of a second env value, so the name "
         "the script reads is one hop from the name that matters",
+    ),
+    Mutation(
+        # The same hazard as B4-pull-request-target-script-input written on
+        # one line. `_step_scripts` folded in only the `with:` values spanning
+        # more than one line, on the reasoning that a program has newlines in
+        # it, so a `script:` short enough to fit on one was never read at all.
+        # The real action at its real SHA, so C4's pin sweep is not the thing
+        # that catches this.
+        "B4-pull-request-target-script-input-one-line",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: await exec.exec('git', ['fetch', 'origin', "
+         "context.payload.pull_request.head.sha])\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write the fetch as a one-line `script:`, which is how anybody writes "
+        "a script that fits on one line",
+    ),
+    Mutation(
+        # The same one-line value wearing a multi-line coat. A `>-` scalar is
+        # folded to one line by the YAML parser -- folding it is what the
+        # scalar means -- so a filter keyed on the newline read it as an
+        # ordinary input while it looks like a program in the file, which is
+        # the worse half of the pair: a reviewer sees a program and the test
+        # does not.
+        "B4-pull-request-target-script-input-folded",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: >-\n"
+         "            await exec.exec('git', ['fetch', 'origin',\n"
+         "            context.payload.pull_request.head.sha])\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reflow the same one-line script across two lines with a folded "
+        "scalar, which reads as line-length housekeeping",
+    ),
+    Mutation(
+        # `context.payload.after` is `${{ github.event.after }}` in the
+        # language `actions/github-script` actually runs, and it interpolates
+        # nothing, so no expression allowlist ever sees it. Distinct from the
+        # two rows above on purpose: their scripts say `pull_request.head`,
+        # which the literal backstop matches, and this one says none of the
+        # three words. What kills it is the `context` allowlist and nothing
+        # else.
+        "B4-pull-request-target-script-context-payload",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            await exec.exec('git', ['fetch', 'origin',\n"
+         "              context.payload.after]);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name the head through the payload object the script is handed, "
+        "rather than through an expression anything here can read",
+    ),
+    Mutation(
+        # A step whose `shell:` is not a shell. `os.environ["REV"]` is a read
+        # of REV that writes no `$REV` and calls no `printenv`, so the pickup
+        # folds nothing in and every scan over the script comes back empty.
+        # The answer is not to learn Python: the step fetches and its
+        # environment carries the head, which is a question this file can
+        # settle without reading the program at all.
+        "B4-pull-request-target-run-fetch-python-shell",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: python\n"
+         "        env:\n"
+         "          REV: ${{ github.event.pull_request.head.sha }}\n"
+         "        run: |\n"
+         "          import os, subprocess\n"
+         '          subprocess.run(["git", "fetch", "origin", os.environ["REV"]])\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write the fetch in Python, which `shell:` makes a supported thing to "
+        "do and which no scan over shell syntax reads",
+    ),
+    Mutation(
+        # The same read without declaring a `shell:` at all: one `python3 -c`
+        # under the default bash and the environment is reached by a program
+        # this file does not parse. It is the row that says the rule cannot be
+        # about which shell the step names -- any program a script starts
+        # inherits the whole environment without naming a field of it.
+        "B4-pull-request-target-run-fetch-inline-interpreter",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          REV: ${{ github.event.pull_request.head.sha }}\n"
+         "        run: |\n"
+         "          python3 -c 'import os, subprocess; "
+         "subprocess.run([\"git\", \"fetch\", \"origin\", os.environ[\"REV\"]])'\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reach the environment through an inline interpreter, under the "
+        "default shell, with nothing in the step declaring anything unusual",
+    ),
+    Mutation(
+        # GitHub reads an index into a context as the property access it is,
+        # so this is `github.event.pull_request.head.sha` spelled so that
+        # `pull_request\.head` does not match it. One pair of brackets.
+        "B4-pull-request-target-run-fetch-index-syntax",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          git fetch --depth=1 origin "
+         "\"${{ github.event.pull_request['head'].sha }}\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "index the property rather than naming it, which GitHub resolves to "
+        "the same field and a pattern over dots does not match",
+    ),
+    Mutation(
+        # Expressions are case-insensitive to GitHub and a Python regex is
+        # not. Same field as B4-pull-request-target-run-fetch-after, same
+        # runner behaviour, shifted key.
+        "B4-pull-request-target-run-fetch-upper-case",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          git fetch --depth=1 origin \"${{ GITHUB.EVENT.AFTER }}\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "shift the case of an event field, which changes nothing about what "
+        "the runner resolves and everything about what a regex matches",
+    ),
+    Mutation(
+        # `github.event.before` is the commit the push moved *from* on a
+        # `synchronize`. It is the pull request's code one commit back, which
+        # the fork also wrote, and it names none of `pull_request`, `head` or
+        # `merge`. This row and the one below are the two fields that made
+        # widening the denylist look like the fix.
+        "B4-pull-request-target-run-fetch-before",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          git fetch --depth=1 origin \"${{ github.event.before }}\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the commit the push moved from, which is the same fork's code "
+        "under a field name that sounds like the base",
+    ),
+    Mutation(
+        # The merge commit GitHub computes for the pull request: the fork's
+        # code merged into the base, which is the fork's code. Spelled through
+        # `pull_request` but not through `pull_request.head`, so the literal
+        # backstop does not match it either.
+        "B4-pull-request-target-run-fetch-merge-commit",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          git fetch --depth=1 origin "
+         "\"${{ github.event.pull_request.merge_commit_sha }}\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the computed merge commit, which contains the fork's code and "
+        "is not spelled `head` anywhere",
+    ),
+    Mutation(
+        # What pins the loop *around* the pickup, which nothing else does now
+        # that a fetching step's environment is refused wholesale: every other
+        # chained row carries the head in `env:` and dies on that rule whether
+        # or not the pickup ever ran. Here `env:` carries no head at all -- the
+        # head is in the script, in plain sight -- and what is laundered is the
+        # fetch verb, two hops deep. Nothing in the script says `fetch`, so the
+        # gate opens only after `$CMD` is folded in, `$VERB` is found in what
+        # that folded in, and the haystack is rebuilt a second time. Measured:
+        # reduce that loop to a single iteration and this row is the one that
+        # goes green.
+        "B4-pull-request-target-run-fetch-verb-chain",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          VERB: fetch\n"
+         "          CMD: git $VERB\n"
+         '        run: $CMD --depth=1 origin "${{ github.event.after }}"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the fetch verb itself out of two env values, so the step's "
+        "script never contains a word this test is watching for",
+    ),
+    Mutation(
+        # A control on the substitution rather than on a hole. GitHub resolves
+        # `env.SAFE`, `env.safe` and `Env.SAFE` to one value, and this is the
+        # allowlisted ref reached through the third spelling -- the same ref,
+        # the same checkout, nothing weakened. A case-sensitive substitution
+        # left it unexpanded, and an unexpanded expression is off the ref
+        # allowlist, so the suite reddened on a workflow that had done nothing
+        # wrong. That is the failure mode a `must_survive` row exists for: a
+        # suite that reds on a harmless change is a suite people learn to
+        # override. KILLED here means the substitution has gone
+        # case-sensitive again.
+        "B4-pull-request-target-checkout-ref-env-case",
+        ".github/workflows/risk_classify.yml",
+        ("        with:\n"
+         "          ref: ${{ github.event.repository.default_branch }}",
+         "        env:\n"
+         "          SAFE: ${{ github.event.repository.default_branch }}\n"
+         "        with:\n"
+         "          ref: ${{ Env.SAFE }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name an env value in the case GitHub accepts and this file did not, "
+        "carrying the one ref the allowlist holds",
+        must_survive=True,
     ),
     Mutation(
         "B4-pull-request-target-checkout-guard",
