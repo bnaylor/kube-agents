@@ -51,16 +51,32 @@ _FETCHES = re.compile(
     # scripts say. What is dangerous is the command: `git pull origin "$REV"`
     # merges the fetched head into the working tree, which is the same hazard
     # as a fetch and a checkout spelled in one verb. So it is matched as `git`
-    # and `pull` on the same line, which keeps `git -C repo pull` and loses
-    # the noun. What that still reds: a `git` command whose trailing comment
-    # says "pull request", in a step that also names the head. That is a
-    # false red -- a line of review -- rather than a miss.
+    # and `pull` in the same *command*, which keeps `git -C repo pull` and
+    # loses the noun. What that still reds: a `git` command whose trailing
+    # comment says "pull request", in a step that also names the head. That is
+    # a false red -- a line of review -- rather than a miss.
+    #
+    # A command is not a line. A backslash before the newline continues one,
+    # so `git \` and `  pull origin "$REV"` on the next line is a single `git
+    # pull`, and a single-line match reads it as the word `git` and the word
+    # `pull` in two different places and sees nothing. That is a
+    # two-character edit away from every `git pull` this alternative exists
+    # for, so the gap between the two words is "anything but a newline, or a
+    # backslash and a newline".
     r"\b(fetch|checkout|clone)\b"
-    r"|\bgit\b[^\n]*\bpull\b"
+    r"|\bgit\b(?:[^\n]|\\\n)*\bpull\b"
 )
 
-# Any `${{ ... }}` an interpolated value carries.
-_EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
+# Any `${{ ... }}` an interpolated value carries. `re.DOTALL` because `.` is
+# otherwise blind to a newline and an expression is allowed to contain one: a
+# block scalar keeps `${{ format('{0}',` / `github.event.after) }}` exactly as
+# written, newline and all. Without the flag `findall` returned nothing for
+# that ref -- so the allowlist loop below never ran, `sub` removed nothing,
+# and the whole expression reached the literal scan as text, where
+# `github.event.after` contains none of `pull`, `head` or `merge`. One missing
+# flag, open in both directions, and the reason the ref half now also refuses
+# a `$` left behind in the residue.
+_EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}", re.DOTALL)
 
 # The expressions a `pull_request_target` checkout ref may name. This is an
 # allowlist because the denylist it replaces could not work: it looked for
@@ -71,32 +87,89 @@ _EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
 # value laundered through `$GITHUB_ENV` -- reads as unsafe rather than as
 # innocent text, which is the direction to be wrong in.
 #
-# One entry, and deliberately: see the test's docstring for why the base-branch
-# spellings are not on it. A fork cannot write any of those anyway -- that
-# needs push access here -- so leaving them off is about the author of the pull
-# request rather than about the fork, and costs nothing today.
+# One entry, and deliberately: see the test's docstring for what each of the
+# three omitted spellings costs, because the three are not one argument.
+# `github.ref` and `github.sha` have been synonyms for the entry below since
+# GitHub moved this trigger's ref to the default branch on 2025-12-08, so
+# leaving them off is a one-spelling rule rather than a safety one.
+# `github.base_ref` is the pull request's base branch, which its author picks
+# from the branches that already exist here -- a stale unprotected one is not
+# the default branch. No fork can write any of the three anyway; that needs
+# push access here. So this list is about the author of the pull request
+# rather than about the fork, and costs nothing today.
 _SAFE_CHECKOUT_EXPRESSIONS = frozenset({"github.event.repository.default_branch"})
 
-# The same treatment for `repository:`, because `ref:` alone does not say
-# what gets checked out. `actions/checkout` resolves the ref *inside*
-# whatever `repository:` names, so a ref from the allowlist above still
-# reaches fork-controlled code when the repository is the fork:
-#
-#     repository: ${{ github.event.pull_request.head.repo.full_name }}
-#     ref: ${{ github.event.repository.default_branch }}
-#
-# is the fork's own default branch, which the fork wrote. Absent is the
-# safe case -- the default is the workflow's own repository -- and
-# `github.repository` is that default spelled out. A literal is refused as
-# well, including this repository's own name: `github.repository` exists, and
-# nothing here can tell `gke-labs/kube-agents` from a lookalike. That is a
-# difference from the `ref:` half, whose literal check only looks for the
-# fragments `pull`, `head` and `merge` -- `someone/else` contains none of
-# them, and a literal ref in the base repository is ordinary.
+# The same treatment for `repository:`, because a ref is resolved *inside* a
+# repository and `ref:` alone therefore does not say what gets checked out.
+# Absent is the safe case -- the default is the workflow's own repository --
+# and `github.repository` is that default spelled out. Why this half refuses a
+# literal outright where the `ref:` half tolerates one is argued in the test's
+# docstring, which is where the `_SAFE_CHECKOUT_EXPRESSIONS` argument lives
+# too; this is the list.
 _SAFE_CHECKOUT_REPOSITORIES = frozenset({"github.repository"})
 
-# Enough passes to settle any chain a workflow would plausibly write.
+# Enough passes to settle any chain a workflow would plausibly write. Both
+# fixed-point loops that read it -- `_expand_env` and the `run:` half's
+# pickup -- are capped by this rather than run to exhaustion, so a
+# self-referential pair cannot spin.
 _ENV_EXPANSION_LIMIT = 10
+
+# Shell this file cannot follow. Each of these reaches a variable's value
+# without naming it anywhere a regex over `$NAME` can see it: `printenv NAME`
+# passes the name as an argument, `${!PTR}` names the variable that holds the
+# name, and `eval`, `env`, `declare` and `source` build or import an
+# environment wholesale. Enumerating the ways a shell can spell an expansion
+# is not a contest this file wins, so the `run:` half does the other thing --
+# a script that fetches, in a step whose `env:` carries the pull request's
+# head, and which contains any of these, is refused for being unreadable.
+# "I cannot read this script" is the verdict an unresolvable ref expression
+# already gets, and this is the same rule one field along.
+_UNREADABLE_SHELL = re.compile(r"printenv|\$\{!|\beval\b|\benv\b|\bdeclare\b|\bsource\b")
+
+#: Every scope a `permissions:` block can name, so that `write-all` expands to
+#: what GitHub means by it. Only `contents` and `id-token` are read today; a
+#: shorthand expanded over a partial list would be a quieter way to be wrong
+#: than not expanding it at all.
+_PERMISSION_SCOPES = frozenset({
+    "actions", "attestations", "checks", "contents", "deployments",
+    "discussions", "id-token", "issues", "models", "packages", "pages",
+    "pull-requests", "repository-projects", "security-events", "statuses",
+})
+_PERMISSION_SHORTHANDS = {"write-all": "write", "read-all": "read"}
+
+
+def _permission_scopes(document):
+    """Every `permissions:` block in a workflow, as {scope: level} mappings.
+
+    Workflow level and each job's, because GitHub honours either and a job
+    inherits the workflow's when it declares none.
+
+    The shorthand is why this is a function rather than a list comprehension
+    at each call site. `permissions:` usually takes a mapping, but it also
+    takes the bare strings `write-all` and `read-all`, and `write-all` is the
+    widest grant a workflow can make -- every scope, `contents` and `id-token`
+    among them. Both call sites filtered on `isinstance(scope, dict)`, so the
+    string fell through the filter and a `pull_request_target` workflow with
+    `permissions: write-all` at the top satisfied every assertion about its
+    token. Job-level `write-all` was caught, but by `test_B2_...`, which is a
+    different test asking a different question -- a neighbour's red is not
+    this assertion working.
+
+    An unknown string yields no grant, which is how `permissions: {}` reads;
+    the ones that matter are the two GitHub documents.
+    """
+    blocks = [document.get("permissions")] + [
+        (job or {}).get("permissions")
+        for job in (document.get("jobs") or {}).values()
+    ]
+    for block in blocks:
+        if isinstance(block, dict):
+            yield block
+        elif isinstance(block, str) and block.strip().lower() in _PERMISSION_SHORTHANDS:
+            level = _PERMISSION_SHORTHANDS[block.strip().lower()]
+            yield {scope: level for scope in _PERMISSION_SCOPES}
+        else:
+            yield {}
 
 
 def _env_values(block):
@@ -160,13 +233,54 @@ def _with_inputs(step, name):
     is returned whole rather than skipped, so it reaches the allowlist and is
     refused as the unresolvable thing it is. Returning nothing there would
     fail open, which is the one direction this test does not go.
+
+    A null value is `""` and not `"None"`. `ref:` with nothing after it is
+    valid YAML and parses to `None`, and `str(None)` is a four-character
+    truthy string that satisfies `any(refs)`, carries no expression for the
+    allowlist to check, and contains none of `pull`, `head` or `merge`. So a
+    bare `ref:` -- which is a checkout with no ref, the case the caller
+    refuses `actions/checkout` for -- read as an ordinary literal ref and
+    passed, while the honest spelling `ref: ""` reddened. That is the
+    fail-open direction reached by the shortest possible diff.
     """
     inputs = (step or {}).get("with")
     if inputs is None:
         return []
     if not isinstance(inputs, dict):
         return [str(inputs)]
-    return [str(value) for key, value in inputs.items() if str(key).lower() == name]
+    return [
+        "" if value is None else str(value)
+        for key, value in inputs.items()
+        if str(key).lower() == name
+    ]
+
+
+def _step_scripts(step):
+    """Everything in a step that is a script, as one text.
+
+    `run:` is the obvious one and it is not the only one.
+    `actions/github-script` takes JavaScript as its `script:` input and runs
+    it in the job, with the same token and the same working directory, so
+    `await exec.exec('git', ['fetch', 'origin', head])` written there is the
+    identical hazard in a different language -- and a scan of `run:` alone
+    reads none of it.
+
+    The rule is over the shape rather than over the action: every `with:`
+    value spanning more than one line is folded in. Naming
+    `actions/github-script` would make this a rule about that vendor, which is
+    the objection this test already makes to a rule about `actions/checkout`,
+    and there are several actions that run a script they are handed. What
+    separates a script from an input is the newline: `ref:`,
+    `python-version:` and `fetch-depth:` are one line each, and nobody writes
+    a multi-line value that is not a program.
+    """
+    scripts = [str((step or {}).get("run", ""))]
+    inputs = (step or {}).get("with")
+    if isinstance(inputs, dict):
+        scripts += [
+            value for value in inputs.values() if isinstance(value, str) and "\n" in value
+        ]
+    return "\n".join(scripts)
 
 
 def _workflows():
@@ -690,13 +804,30 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         branch, so the code that runs is code already merged — and the
         dangerous ingredient is specifically a ref derived from the pull
         request. So every checkout step in such a workflow must carry an
-        explicit `ref:` that does not reference the pull request. A checkout
-        with no `ref:` takes `GITHUB_REF`, which on this trigger is the pull
-        request's base branch -- an unreviewed ref anyone with push access
-        can aim a pull request at. (`refs/pull/N/merge` is the `pull_request`
-        trigger's default, not this one. `risk_classify.yml:63-66` and
-        `hold-unresolved-threads.yml:67-70` both say so at the checkout step
-        that relies on it.)
+        explicit `ref:` that does not reference the pull request.
+
+        `actions/checkout` carries one obligation more: it must say `ref:` at
+        all. That rule was a security rule and is now an explicitness rule,
+        and the difference is a dated fact worth getting right. A checkout
+        with no `ref:` takes `GITHUB_REF`, and until 2025-12-08 `GITHUB_REF`
+        on this trigger was the pull request's *base* branch -- a ref its
+        author picks from the branches that already exist here, so a stale
+        unprotected one would serve. GitHub's changelog of 2025-11-07
+        ("Actions pull_request_target and environment branch protections
+        changes") moved it: from 2025-12-08, `GITHUB_REF` for
+        `pull_request_target` resolves to the default branch and `GITHUB_SHA`
+        to the latest commit on it, which is what the
+        events-that-trigger-workflows reference records for this event today.
+        So the implicit ref is now the one expression this test allows
+        explicitly, and the rule buys review rather than safety: an explicit
+        ref is a line somebody can read and check against the list, and a
+        default is a line that is not there. Worth keeping, and not worth
+        claiming more for. (The Actions *variables* reference page still says
+        this trigger takes its ref from the base branch. That page is stale
+        against the changelog and is not the citation here.
+        `refs/pull/N/merge` is the `pull_request` trigger's default, not this
+        one; `risk_classify.yml` and `hold-unresolved-threads.yml` both carry
+        the dated note at the checkout step that relies on it.)
 
         Both filters are asserted non-empty for the same reason B4's
         `workflow_run` gate asserts its own: this test says nothing at all
@@ -713,8 +844,16 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `pull/N/head` refspec, and a fetch of `pull_request.head` by any
         spelling.
 
-        Both are read over the step's `run:` script and its `env:` values
-        together, not over `run:` alone. Passing an event field through
+        "The step's script" is not the same thing as its `run:`.
+        `actions/github-script` takes JavaScript as an input and runs it in
+        the job with the same token, so the fetch can be written in the
+        `with:` block instead and a scan of `run:` reads nothing at all.
+        `_step_scripts` therefore folds in every `with:` value that spans
+        more than one line -- by shape rather than by action name, for the
+        same reason the `ref:` rule below is not about `actions/checkout`.
+
+        Both patterns are read over that script and the step's `env:` values
+        together, not over the script alone. Passing an event field through
         `env:` is this repository's house style rather than an exotic dodge
         -- `risk_classify.yml` does exactly that with `PR_NUMBER`, on the
         stated grounds that event fields are attacker-controlled input -- so
@@ -735,13 +874,27 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         followed. So the script is expanded, the pickup runs over the
         expansion, the picked-up values are expanded too, and the pickup
         repeats until it stops finding names. Both shapes were live against
-        the first version of this half and both have mutation rows now.
+        the first version of this half and both have mutation rows now, as do
+        `printenv NAME` and the indirect `${!PTR}` -- two more ways to spell a
+        read that a pickup keyed on `$NAME` cannot see. The repeat is capped
+        by `_ENV_EXPANSION_LIMIT`, the cap `_expand_env` uses.
+
+        Past that, the answer is refusal rather than more syntax. A shell has
+        unboundedly many ways to reach a variable, and a test that enumerates
+        them is a test that is one idiom behind. So `_UNREADABLE_SHELL` names
+        the constructs that defeat the pickup -- `printenv`, indirect
+        expansion, `eval`, `env`, `declare`, `source` -- and a step that
+        fetches, carries the pull request's head somewhere in its `env:`, and
+        contains one of them is refused for being unreadable. Same verdict an
+        unresolvable ref expression gets, one field along: "this file cannot
+        tell what this does" reads as unsafe. It costs a false red on a step
+        that prints a head-naming variable and separately fetches something
+        harmless, which is the false red `$NAME` has always cost.
 
         The `git pull` form is matched as a command rather than as a word,
-        which is the one concession this half makes to prose. `\bpull\b`
-        over a haystack containing shell comments matches the words "pull
-        request", and a step that mentions the pull request in an `echo` and
-        separately uses `github.head_ref` for a label is ordinary here.
+        and as a command that a backslash before the newline can continue;
+        the argument for both, including why the bare word is useless over a
+        haystack full of prose, is at `_FETCHES`.
 
         The `ref:` half, by contrast, is an allowlist, and that is the whole
         design. It began as a denylist over three nouns -- `pull_request`,
@@ -755,12 +908,22 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         somebody adds a legitimately safe expression, which is a line of
         review, and the docstring is where they will look.
 
-        The list is one entry. `github.ref`, `github.sha` and
-        `github.base_ref` are all the base branch on this trigger, and a
-        checkout carrying no `ref:` at all is refused a few lines down on
-        exactly that ground, so allowing the explicit spelling of the ref the
-        implicit case is refused for would be the same hole with a longer
-        name. Both live carriers use the default branch anyway.
+        The list -- `_SAFE_CHECKOUT_EXPRESSIONS` -- is one entry, and the
+        three obvious candidates are off it for two different reasons, only
+        one of which is about safety. Since the 2025-12-08 change above,
+        `github.ref` and `github.sha` *are* the entry that is on the list:
+        the default branch, and the head commit of the default branch.
+        Refusing them is a one-spelling rule, which is worth having for its
+        own sake -- one way to write a thing is one thing to review -- and it
+        is not a tightening; reporting it as one overstates what it bought.
+        `github.base_ref` is the omission that stands on its own. It is the
+        pull request's base branch, chosen by the pull request's *author*
+        from the branches that already exist in this repository, and a stale
+        unprotected branch here is not the default branch and is not
+        necessarily code anyone has read this year. No fork can write any of
+        the three -- that needs push access here -- so this entry is about
+        the author of the pull request rather than about the fork the test is
+        named for. Both live carriers use the default branch anyway.
 
         `ref:` is only half of what a checkout resolves. The action looks the
         ref up inside whatever `repository:` says, so the allowlist above
@@ -768,20 +931,22 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         github.event.pull_request.head.repo.full_name }}` with `ref: ${{
         github.event.repository.default_branch }}` is the fork's copy of its
         own default branch, which the fork wrote, and every assertion on the
-        ref passes. `repository:`
-        therefore gets the same allowlist -- absent, or `github.repository`
-        -- and unlike the ref half it refuses a literal outright, including
+        ref passes. `repository:` therefore gets its own allowlist,
+        `_SAFE_CHECKOUT_REPOSITORIES` -- absent, or `github.repository` -- and unlike the ref half it refuses a literal outright, including
         this repository's own name. The ref half tolerates literals because
         `main` is an ordinary ref; there is no equivalent reason to write
         out a repository when the expression for it exists, and a literal is
         exactly where a lookalike owner would go unread.
 
-        Both inputs are read case-insensitively, which is not decoration.
+        Both inputs are read through `_with_inputs`, case-insensitively,
+        which is not decoration.
         The runner passes an input to an action as `INPUT_<NAME>`,
         upper-casing the key, and `core.getInput` looks it up the same way,
         so `Ref:` is the ref `actions/checkout` checks out and a
-        `with.get("ref")` reads none of it. This is the `uses:` bug one
-        field along -- that filter was case-sensitive too until
+        `with.get("ref")` reads none of it. The same helper maps a YAML null
+        to the empty string, because `str(None)` is a truthy `"None"` and a
+        bare `ref:` is a checkout with no ref wearing a literal's clothes.
+        This is the `uses:` bug one field along -- that filter was case-sensitive too until
         `Actions/checkout` was found walking past it -- and the pattern in
         both is the same: each round of review finds the input the last
         round did not read.
@@ -789,9 +954,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         The rule is over any step that takes a `ref:`, not over
         `actions/checkout`. A third-party checkout action fetches the same
         code, and a rule about one vendor is a rule about that vendor.
-        `actions/checkout` keeps one extra obligation -- it must carry a
-        `ref:` at all -- because it is the action whose no-ref default is the
-        base branch. And a job that calls a reusable workflow is refused
+        `actions/checkout` keeps the one extra obligation argued at the top
+        of this docstring -- it must carry a `ref:` at all -- because it is
+        the action whose no-ref behaviour is documented and therefore the one
+        this file can say anything about. And a job that calls a reusable
+        workflow is refused
         outright: its steps live in a file keyed `workflow_call`, so it is
         not in `consumers` either, and this test would inspect nothing while
         reporting `ok`.
@@ -845,9 +1012,12 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             saw_a_checkout = True
                             self.assertTrue(
                                 any(refs),
-                                "a checkout on pull_request_target with no ref: "
-                                "takes GITHUB_REF, which on this trigger is the "
-                                "pull request's base branch",
+                                "a checkout on pull_request_target with no "
+                                "ref: takes GITHUB_REF, which is the default "
+                                "branch on this trigger and was the pull "
+                                "request's base branch until 2025-12-08. Say "
+                                "which ref you mean: an explicit ref is "
+                                "reviewable and a default is not",
                             )
                         # Every action that takes a `ref:`, not only
                         # `actions/checkout`. A third-party checkout action
@@ -870,6 +1040,21 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             # is literal text, where `refs/pull/N/head` needs
                             # no interpolation at all.
                             literal = _EXPRESSION.sub("", resolved).lower()
+                            # Belt and braces around the loop above: literal
+                            # text holding a `$` is an expression
+                            # `_EXPRESSION` did not match, and an expression
+                            # nothing checked against the allowlist has
+                            # reached the three-word scan below as innocent
+                            # prose. That is exactly what a missing
+                            # `re.DOTALL` did. A regex that misses one should
+                            # red here rather than fall through.
+                            self.assertNotIn(
+                                "$",
+                                literal,
+                                f"{path.name}: the checkout ref carries an "
+                                "expression this test could not parse, so "
+                                "nothing checked it against the allowlist",
+                            )
                             for fragment in ("pull", "head", "merge"):
                                 self.assertNotIn(
                                     fragment,
@@ -922,7 +1107,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # same cap `_expand_env` uses, and reaching it leaves
                         # an unexpanded `${{ ... }}`, which the ref half
                         # refuses and this half simply does not match.
-                        script = _expand_env(str((step or {}).get("run", "")), step_env)
+                        script = _expand_env(_step_scripts(step), step_env)
                         named: dict[str, str] = {}
                         for _ in range(_ENV_EXPANSION_LIMIT):
                             haystack = "\n".join([script] + list(named.values()))
@@ -931,7 +1116,17 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                                 for name, value in step_env.items()
                                 if name not in named
                                 and re.search(
-                                    r"\$\{?" + re.escape(name) + r"\b", haystack
+                                    # `$NAME`, `${NAME}`, `${!NAME}` and
+                                    # `printenv NAME` are four spellings of
+                                    # the same read. The `!` form names the
+                                    # variable holding the name rather than
+                                    # the value, which this pickup follows
+                                    # one hop and no further -- the hop it
+                                    # cannot follow is what `_UNREADABLE_SHELL`
+                                    # is for.
+                                    r"\$\{?!?" + re.escape(name) + r"\b"
+                                    r"|\bprintenv\s+" + re.escape(name) + r"\b",
+                                    haystack,
                                 )
                             }
                             if not picked:
@@ -951,13 +1146,59 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "request's head, which is the checkout action's "
                             "hazard without the checkout action",
                         )
-                for scope in [document.get("permissions") or {}] + [
-                    (job or {}).get("permissions") or {}
-                    for job in (document.get("jobs") or {}).values()
-                ]:
-                    if isinstance(scope, dict):
-                        self.assertNotEqual("write", scope.get("contents"))
-                        self.assertNotEqual("write", scope.get("id-token"))
+                        # And the script this file cannot read at all. The
+                        # pickup above follows the spellings it knows; a
+                        # script that reaches its environment through
+                        # `_UNREADABLE_SHELL` has as many more as the shell
+                        # has syntax, so the shape is refused rather than
+                        # parsed. The carried value is looked for across the
+                        # whole step scope rather than in what the pickup
+                        # found, because the premise is that the pickup found
+                        # nothing useful. What keeps this off the documented
+                        # false positive -- `env: BRANCH: ${{ github.head_ref
+                        # }}` beside `git fetch --tags origin` -- is that such
+                        # a step reads its environment in the ordinary way and
+                        # matches none of these.
+                        unreadable = _UNREADABLE_SHELL.search(script)
+                        if unreadable and _FETCHES.search(script):
+                            carried = sorted(
+                                name
+                                for name, value in step_env.items()
+                                if _PULL_REQUEST_HEAD.search(
+                                    _expand_env(value, step_env)
+                                )
+                                or _PULL_REQUEST_REF.search(
+                                    _expand_env(value, step_env)
+                                )
+                            )
+                            self.assertEqual(
+                                [],
+                                carried,
+                                f"{path.name}: a run: step fetches, reaches "
+                                f"its environment through "
+                                f"`{unreadable.group()}` -- which this test "
+                                f"cannot follow -- and that environment "
+                                f"carries the pull request's head as "
+                                f"{carried}. Unreadable is refused, the same "
+                                "as a ref expression that cannot be resolved",
+                            )
+                # `_permission_scopes` rather than the blocks themselves:
+                # `permissions: write-all` is a string, and a filter that
+                # read only mappings granted this workflow every scope
+                # without either assertion below seeing a thing.
+                for scope in _permission_scopes(document):
+                    self.assertNotEqual(
+                        "write",
+                        scope.get("contents"),
+                        f"{path.name}: a pull_request_target workflow holds "
+                        "contents: write",
+                    )
+                    self.assertNotEqual(
+                        "write",
+                        scope.get("id-token"),
+                        f"{path.name}: a pull_request_target workflow holds "
+                        "id-token: write",
+                    )
         self.assertTrue(
             saw_a_checkout,
             "no pull_request_target workflow runs a checkout step any more; "
@@ -976,12 +1217,12 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         """
         holders = set()
         for path, document in _workflow_documents():
-            scopes = [document.get("permissions") or {}] + [
-                (job or {}).get("permissions") or {}
-                for job in (document.get("jobs") or {}).values()
-            ]
-            for scope in scopes:
-                if isinstance(scope, dict) and scope.get("contents") == "write":
+            # Through `_permission_scopes`, which expands `write-all`: the
+            # widest grant GitHub offers is spelled as a string, and reading
+            # only the mappings would leave the holder set below silent about
+            # the one workflow that granted everything.
+            for scope in _permission_scopes(document):
+                if scope.get("contents") == "write":
                     holders.add(path.name)
         self.assertEqual(
             {
