@@ -78,13 +78,14 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Seven today: B1-assent-rule-weakened,
+    #: and KILLED is the failure. Eight today: B1-assent-rule-weakened,
     #: A3-fastpath-redundant,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
     #: B4-pull-request-target-api-web-link-comment,
-    #: B4-pull-request-target-api-gh-issue-comment-write, and
-    #: B4-pull-request-target-api-gh-argv-vector-write.
+    #: B4-pull-request-target-api-gh-issue-comment-write,
+    #: B4-pull-request-target-api-gh-argv-vector-write, and
+    #: B4-pull-request-target-container-pinned-image.
     must_survive: bool = False
 
 
@@ -2315,6 +2316,97 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "name an env value in the case GitHub accepts and this file did not, "
         "carrying the one ref the allowlist holds",
+        must_survive=True,
+    ),
+    Mutation(
+        # The image the job runs in, which is the job's code. Nothing read
+        # `container:` until 2026-09-19: the steps below it are the live
+        # carrier's own innocent ones, every rule over `run:`, `uses:` and
+        # `ref:` passes, and the job runs inside something the fork pushed.
+        # This is the row that says the rule is over the block rather than
+        # over the steps.
+        "B4-pull-request-target-container-image-fork",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    container:\n"
+         "      image: ghcr.io/${{ github.event.pull_request.head.repo"
+         ".full_name }}/runner:latest"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run every step of the job inside an image the fork pushed, which "
+        "no rule over the steps can see",
+    ),
+    Mutation(
+        # The same image in GitHub's string shorthand. `container: <image>`
+        # is `container: {image: <image>}`, and a rule that reads only the
+        # mapping is a rule the shorthand walks past while looking like the
+        # form the rule reads. Separate row because it pins
+        # `_container_mapping` rather than the block walk: normalise the
+        # string away and the row above still dies while this one lives.
+        "B4-pull-request-target-container-image-shorthand",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    container: ghcr.io/${{ github.event.pull_request.head.repo"
+         ".full_name }}/runner:latest"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name the fork's image in the one-line form, which is the form "
+        "somebody writes when the image is the only thing they are setting",
+    ),
+    Mutation(
+        # The container's `env:`, which is the fourth level `_env_values`
+        # claimed to consult and did not. A container `env:` is set in the
+        # container every step of the job runs in, so it reaches the steps
+        # exactly as the job's own does -- and the head sitting in it is the
+        # head sitting in theirs.
+        "B4-pull-request-target-container-env-head",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    container:\n"
+         "      image: ubuntu:24.04\n"
+         "      env:\n"
+         "        REV: ${{ github.event.after }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put the head in the container's environment, one level below the "
+        "job's, where every step of the job still has it",
+    ),
+    Mutation(
+        # And a service container, which is the same choice of image made
+        # once per entry under a different key. It starts before the steps,
+        # on the job's network, with the job's secrets available to whatever
+        # the workflow hands it.
+        "B4-pull-request-target-service-image-fork",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    services:\n"
+         "      db:\n"
+         "        image: ghcr.io/${{ github.event.pull_request.head.repo"
+         ".full_name }}/db:latest"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "start a service container from the fork's image, which runs beside "
+        "the steps rather than under them",
+    ),
+    Mutation(
+        # The container from the safe side, and the reason the rule over it
+        # is an expression allowlist rather than a refusal. A pinned public
+        # image is the ordinary way to run a job with a toolchain in it, and
+        # both live forms -- the mapping and the string -- have to stay
+        # green. KILLED here means the block rule has been tightened into a
+        # ban on `container:`, which is a suite that reds on a workflow doing
+        # nothing wrong.
+        "B4-pull-request-target-container-pinned-image",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    container:\n"
+         "      image: ubuntu:24.04\n"
+         "    services:\n"
+         "      cache: redis:7"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run the job in a pinned public image with a pinned public service "
+        "beside it, naming nothing that came from the pull request",
         must_survive=True,
     ),
     Mutation(

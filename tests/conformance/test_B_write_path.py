@@ -648,7 +648,11 @@ def _env_values(block):
     """The `env:` values of a workflow, job or step, as {NAME: text}.
 
     Every level is consulted because GitHub merges them, and a ref laundered
-    through any one of them is the same ref.
+    through any one of them is the same ref. Four levels: the workflow, the
+    job, the job's `container:`, and the step. The container's was missing
+    until 2026-09-19, while this docstring said what it says now -- a
+    container `env:` is set in the container every step of the job runs in,
+    so it reaches the steps exactly as the job's own does.
 
     An `env:` that is not a mapping is an expression standing in for the whole
     block -- `env: ${{ fromJSON(...) }}` is valid, and GitHub evaluates it into
@@ -1014,6 +1018,82 @@ def _step_scripts(step):
     elif inputs is not None:
         scripts.append(str(inputs))
     return "\n".join(scripts)
+
+
+def _container_blocks(job):
+    """A job's `container:` and every one of its `services:`, as (label, map).
+
+    The third place a job runs code, after its steps and the reusable
+    workflow it might call, and the one nothing here read until 2026-09-19. A
+    job that names `container:` runs every one of its steps inside that
+    image, so the image is the code: `image: ghcr.io/${{
+    github.event.pull_request.head.repo.full_name }}/runner:latest` pulls
+    something the fork pushed and runs the job's own steps in it, and every
+    rule over `run:`, `uses:` and `ref:` passes, because the workflow's steps
+    are innocent. `services:` is the same thing once per entry -- a service
+    container is started before the steps, on the job's network, and the
+    image is chosen the same way.
+
+    The two are one function because the shape is identical: an image, an
+    `env:`, `options`, `credentials`, `volumes` and `ports`. Only the label
+    differs, and that is for the failure message.
+
+    `container: ubuntu:24.04` is the same block as `container: {image:
+    ubuntu:24.04}` -- GitHub accepts a bare string as the image -- so the
+    string form is normalised rather than skipped. Skipping it would be a
+    rule the string form walks past while looking like the form the rule
+    reads, which is the shape of every finding this file has had.
+    """
+    blocks = []
+    container = (job or {}).get("container")
+    if container is not None:
+        blocks.append(("container", _container_mapping(container)))
+    services = (job or {}).get("services") or {}
+    if isinstance(services, dict):
+        blocks += [
+            (f"services.{name}", _container_mapping(service))
+            for name, service in services.items()
+        ]
+    elif services is not None:
+        blocks.append(("services", _container_mapping(services)))
+    return blocks
+
+
+def _container_mapping(block):
+    """One `container:` or `services.<name>:` block as a mapping.
+
+    A string is the image, which is GitHub's shorthand. Anything else that is
+    not a mapping -- an expression standing in for the whole block, which is
+    valid and which GitHub evaluates at run time -- is returned under the
+    same key rather than dropped, so that the expression allowlist sees it
+    and refuses it for being unresolvable. This is `_env_values`' rule for a
+    non-mapping `env:`, one field along, and for the same reason: the one
+    direction this file does not go is failing open on what it cannot parse.
+    """
+    if isinstance(block, dict):
+        return block
+    return {"image": "" if block is None else str(block)}
+
+
+def _flatten(value):
+    """Every scalar in a nested YAML value, keys included, as a list of text.
+
+    The block above is read whole rather than field by field. An image, an
+    `env:` value, a `--entrypoint` inside `options:`, a `credentials:`
+    password: each is a place an expression can go, and naming the fields
+    that matter is the denylist this file keeps replacing. Keys are folded in
+    with the values because a mapping key is text a workflow author wrote
+    too, and an expression is refused wherever it appears.
+    """
+    if isinstance(value, dict):
+        return [
+            text
+            for key, item in value.items()
+            for text in [str(key), *_flatten(item)]
+        ]
+    if isinstance(value, list):
+        return [text for item in value for text in _flatten(item)]
+    return [] if value is None else [str(value)]
 
 
 def _workflows():
@@ -1905,6 +1985,50 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         "teach this test to follow it",
                     )
                     scope_env = workflow_env | _env_values(job)
+                    # The image the steps run in, and the images started
+                    # beside them. A job's `container:` is where the job's
+                    # code actually is -- the steps are innocent and the
+                    # image is the fork's -- and nothing here read it until
+                    # 2026-09-19. Read as one text rather than field by
+                    # field, and held against the same expression allowlist
+                    # the scripts are, so an image, a `--entrypoint` in
+                    # `options:` and a `credentials:` password are covered by
+                    # the same rule. See `_container_blocks`.
+                    for label, block in _container_blocks(job):
+                        # The container's `env:` is set in the container, so
+                        # every step of the job has it. A service's is not:
+                        # it belongs to a process on the job's network, and
+                        # it is read below as part of that block's own text.
+                        if label == "container":
+                            scope_env = scope_env | _env_values(block)
+                        container_text = "\n".join(_flatten(block))
+                        unsafe_container = sorted({
+                            expression
+                            for expression in _EXPRESSION.findall(container_text)
+                            if _normalise_expression(expression)
+                            not in _SAFE_SCRIPT_EXPRESSIONS
+                        })
+                        self.assertEqual(
+                            [],
+                            unsafe_container,
+                            f"{path.name}:{job_name} names "
+                            f"{unsafe_container} in its `{label}:`, which is "
+                            "not among the expressions known to be "
+                            "independent of the pull request. The image a "
+                            "job runs in is the job's code, whatever its "
+                            "steps say",
+                        )
+                        # The literal backstops the scripts get, for text
+                        # carrying no expression for the allowlist to read.
+                        for pattern, what in (
+                            (_PULL_REQUEST_HEAD, "head"),
+                            (_PULL_REQUEST_REF, "ref namespace"),
+                        ):
+                            self.assertIsNone(
+                                pattern.search(container_text),
+                                f"{path.name}:{job_name} names the pull "
+                                f"request's {what} in its `{label}:`",
+                            )
                     for step in (job or {}).get("steps") or []:
                         step_env = scope_env | _env_values(step)
                         # GitHub resolves `uses:` case-insensitively, so this
