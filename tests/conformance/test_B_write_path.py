@@ -148,12 +148,14 @@ def _permission_scopes(document):
     at each call site. `permissions:` usually takes a mapping, but it also
     takes the bare strings `write-all` and `read-all`, and `write-all` is the
     widest grant a workflow can make -- every scope, `contents` and `id-token`
-    among them. Both call sites filtered on `isinstance(scope, dict)`, so the
+    among them. Every call site filtered on `isinstance(scope, dict)`, so the
     string fell through the filter and a `pull_request_target` workflow with
     `permissions: write-all` at the top satisfied every assertion about its
     token. Job-level `write-all` was caught, but by `test_B2_...`, which is a
     different test asking a different question -- a neighbour's red is not
-    this assertion working.
+    this assertion working. The one site that wants a single job's effective
+    grant rather than every block in the file uses `_effective_permissions`;
+    the shorthand is the same there, the inheritance rule is not.
 
     An unknown string yields no grant, which is how `permissions: {}` reads;
     the ones that matter are the two GitHub documents.
@@ -163,13 +165,35 @@ def _permission_scopes(document):
         for job in (document.get("jobs") or {}).values()
     ]
     for block in blocks:
-        if isinstance(block, dict):
-            yield block
-        elif isinstance(block, str) and block.strip().lower() in _PERMISSION_SHORTHANDS:
-            level = _PERMISSION_SHORTHANDS[block.strip().lower()]
-            yield {scope: level for scope in _PERMISSION_SCOPES}
-        else:
-            yield {}
+        yield _permission_mapping(block)
+
+
+def _permission_mapping(block):
+    """One `permissions:` block as a {scope: level} mapping.
+
+    A mapping is itself, the two shorthands expand, and anything else -- a
+    missing block, or a string GitHub does not document -- is no grant.
+    """
+    if isinstance(block, dict):
+        return block
+    if isinstance(block, str) and block.strip().lower() in _PERMISSION_SHORTHANDS:
+        level = _PERMISSION_SHORTHANDS[block.strip().lower()]
+        return {scope: level for scope in _PERMISSION_SCOPES}
+    return {}
+
+
+def _effective_permissions(document, job):
+    """What a job's token actually carries.
+
+    `_permission_scopes` reads every block in the file and cannot answer this:
+    a job inherits the workflow's block only when it declares none of its own,
+    and a caller asking "is this job a deploy" needs the one that applies to
+    it rather than the union of all of them.
+    """
+    block = (job or {}).get("permissions")
+    if block is None:
+        block = document.get("permissions")
+    return _permission_mapping(block)
 
 
 def _env_values(block):
@@ -748,13 +772,14 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         for path, document in consumers:
             for job_name, job in (document.get("jobs") or {}).items():
                 condition = str((job or {}).get("if", ""))
-                # Effective permissions: a job with no permissions block
-                # inherits the workflow-level block wholesale, so reading
-                # only the job's would let id-token: write hoisted to the top
-                # of the file mint the deploy credential past the strict gate.
-                permissions = (job or {}).get("permissions")
-                if permissions is None:
-                    permissions = document.get("permissions") or {}
+                # A job with no permissions block inherits the
+                # workflow-level one wholesale, so reading only the job's
+                # would let id-token: write hoisted to the top of the file
+                # mint the deploy credential past the strict gate. The
+                # helper also expands `write-all`, which grants id-token
+                # among the rest and is a string -- read raw it used to
+                # raise AttributeError here rather than answer the question.
+                permissions = _effective_permissions(document, job)
                 with self.subTest(workflow=path.name, job=job_name):
                     # Every workflow_run job gates on the repository — the
                     # AGENTS.md fork rule, and the credential half of it.
