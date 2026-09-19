@@ -1456,6 +1456,32 @@ Mutation(
         "with a long argument list",
     ),
     Mutation(
+        # The same unreadable `gh`, written as a plain scalar so that the
+        # program name is the last two bytes of everything the rules read.
+        # `_GH_COMMAND` needed a character after `gh` until 2026-09-19, and
+        # every terminator it had was a character, so this was green while
+        # the row above -- the identical command in a `|` block scalar, which
+        # keeps the trailing newline -- was red. Two YAML spellings of one
+        # step, opposite verdicts. It is reachable here because the text the
+        # rules read is the script joined to the step's `env:` values and
+        # this workflow declares none above the step, so a step that declares
+        # none of its own ends where its script does; the token is passed as
+        # a one-command assignment for the same reason.
+        "B4-pull-request-target-api-gh-trailing-program-word",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         '        run: echo "pr checkout '
+         '${{ github.event.pull_request.number }}"'
+         " | GH_TOKEN=${{ github.token }} xargs gh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write the one-line step as a plain scalar rather than a block one, "
+        "which is what a step running a single command usually looks like "
+        "and which puts the program name at the end of the file",
+    ),
+    Mutation(
         # The verb renamed, and the row the verb allowlist exists for. `gh
         # alias set` writes a user-level alias into the CLI's config, so the
         # second line *is* `gh pr checkout` to the CLI and is `gh co` to any

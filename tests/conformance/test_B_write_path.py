@@ -264,13 +264,32 @@ _SUBCOMMAND_GOVERNED_GH_VERBS = frozenset({"pr", "issue"})
 # that input into the text read here, and the character after `gh` is a quote
 # followed by a comma.
 #
-# So the lookahead is whitespace, either quote, or a comma. It costs a false
-# red on the two letters `gh` written as prose immediately before a quote or a
-# comma inside a step -- "install gh, then run it" -- which is refused because
-# the word after it is not an allowlisted verb. That is a line of review on a
-# comment in a step of a workflow holding a writable token, which is the
-# direction to be wrong in.
-_GH_COMMAND = re.compile(r"(?<![\w-])gh(?=[\s'\",])")
+# So the lookahead is whitespace, either quote, a comma, or the end of the
+# text. It costs a false red on the two letters `gh` written as prose
+# immediately before a quote or a comma inside a step -- "install gh, then run
+# it" -- which is refused because the word after it is not an allowlisted
+# verb. That is a line of review on a comment in a step of a workflow holding
+# a writable token, which is the direction to be wrong in.
+#
+# The end of the text is the fourth terminator and it was missing until
+# 2026-09-19. Every other one is a character, so a command word that is the
+# last two bytes of what the rules read was never a command word at all:
+# `run: echo "pr checkout $N" | GH_TOKEN=... xargs gh` written as a plain
+# scalar ends there, and it was green. A block scalar keeps the trailing
+# newline and was refused, which is the whole difference -- the same step,
+# the same command, two YAML spellings, opposite verdicts. It is reachable
+# because the text these rules read is the step's script joined to the
+# step's `env:` values, and `risk_classify.yml` declares no `env:` at the
+# workflow or the job level, so a step whose own `env:` is empty ends where
+# its script does.
+#
+# `\Z` rather than `$` because `$` in a multiline pattern is also the end of
+# every line, and `\n` is already in `\s`: the two spellings differ only in
+# what they would match before a trailing newline, and taking `\Z` keeps this
+# a rule about the end of the text rather than a second spelling of the one
+# above it.
+_COMMAND_WORD_END = r"(?=[\s'\",]|\Z)"
+_GH_COMMAND = re.compile(r"(?<![\w-])gh" + _COMMAND_WORD_END)
 
 # The same walk anchored one word later, and the answer to the thing a regex
 # over a program name cannot do. Every rule above keys on the literal word
@@ -306,7 +325,15 @@ _GH_COMMAND = re.compile(r"(?<![\w-])gh(?=[\s'\",])")
 # checkout` is an unknown command -- which is also what keeps
 # `auto-assign-milestone.yml`'s `echo "PR #${PR_NUMBER} was merged"` from
 # reading as an invocation.
-_GH_PULL_REQUEST_WORD = re.compile(r"(?<![\w-])pr(?=[\s'\",])")
+#
+# The terminator is `_COMMAND_WORD_END`, shared with the rule above rather
+# than written out again, because "what may follow a command word" is one
+# question and two spellings of it are two things to keep true. Here the end
+# of the text decides nothing on its own -- a `pr` with no word after it
+# yields no subcommand and is not refused, which is argued at
+# `_unsafe_pull_request_subcommands` -- and sharing the terminator is what
+# keeps that a property of the walk rather than an accident of the pattern.
+_GH_PULL_REQUEST_WORD = re.compile(r"(?<![\w-])pr" + _COMMAND_WORD_END)
 
 # And what keeps the backstop under the allowlist rather than over it. A rule
 # on argument shape alone refuses `./tools/high pr checkout 42`, which runs a
