@@ -44,7 +44,20 @@ _PULL_REQUEST_REF = re.compile(
 _PULL_REQUEST_HEAD = re.compile(
     r"pull_request\.head|github\.head_ref|github\.event\.after"
 )
-_FETCHES = re.compile(r"\b(fetch|checkout|clone)\b")
+_FETCHES = re.compile(
+    # `pull` is not a bare alternative. The haystack below carries prose --
+    # shell comments, `echo` text, a job name -- and `\bpull\b` matches the
+    # words "pull request", which is most of what a pull-request workflow's
+    # scripts say. What is dangerous is the command: `git pull origin "$REV"`
+    # merges the fetched head into the working tree, which is the same hazard
+    # as a fetch and a checkout spelled in one verb. So it is matched as `git`
+    # and `pull` on the same line, which keeps `git -C repo pull` and loses
+    # the noun. What that still reds: a `git` command whose trailing comment
+    # says "pull request", in a step that also names the head. That is a
+    # false red -- a line of review -- rather than a miss.
+    r"\b(fetch|checkout|clone)\b"
+    r"|\bgit\b[^\n]*\bpull\b"
+)
 
 # Any `${{ ... }}` an interpolated value carries.
 _EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
@@ -66,6 +79,24 @@ _SAFE_CHECKOUT_EXPRESSIONS = frozenset(
         "github.sha",
     }
 )
+
+# The same treatment for `repository:`, because `ref:` alone does not say
+# what gets checked out. `actions/checkout` resolves the ref *inside*
+# whatever `repository:` names, so a ref from the allowlist above still
+# reaches fork-controlled code when the repository is the fork:
+#
+#     repository: ${{ github.event.pull_request.head.repo.full_name }}
+#     ref: ${{ github.base_ref }}
+#
+# is the fork's copy of the base branch, which the fork wrote. Absent is the
+# safe case -- the default is the workflow's own repository -- and
+# `github.repository` is that default spelled out. A literal is refused as
+# well, including this repository's own name: `github.repository` exists, and
+# nothing here can tell `gke-labs/kube-agents` from a lookalike. That is a
+# difference from the `ref:` half, whose literal check only looks for the
+# fragments `pull`, `head` and `merge` -- `someone/else` contains none of
+# them, and a literal ref in the base repository is ordinary.
+_SAFE_CHECKOUT_REPOSITORIES = frozenset({"github.repository"})
 
 # Enough passes to settle any chain a workflow would plausibly write.
 _ENV_EXPANSION_LIMIT = 10
@@ -113,6 +144,32 @@ def _expand_env(text, env):
         if text == before:
             break
     return text
+
+
+def _with_inputs(step, name):
+    """A step's `with:` values under `name`, matched case-insensitively.
+
+    Case matters here and it is not obvious. The runner hands an input to an
+    action as `INPUT_<NAME>`, upper-casing the key, and `core.getInput("ref")`
+    looks it up by upper-casing too -- so `Ref:` and `REF:` reach
+    `actions/checkout` as the ref it checks out. A `with.get("ref")` reads
+    none of them. This is the `uses:` bug one field along: that filter was
+    case-sensitive too, `Actions/checkout` walked past it, and the mutation
+    row that found it is still in the harness. A list rather than a value
+    because both spellings can be present at once, and the rule has to hold
+    for each.
+
+    A `with:` that is not a mapping -- `with: ${{ fromJSON(env.CONFIG) }}` --
+    is returned whole rather than skipped, so it reaches the allowlist and is
+    refused as the unresolvable thing it is. Returning nothing there would
+    fail open, which is the one direction this test does not go.
+    """
+    inputs = (step or {}).get("with")
+    if inputs is None:
+        return []
+    if not isinstance(inputs, dict):
+        return [str(inputs)]
+    return [str(value) for key, value in inputs.items() if str(key).lower() == name]
 
 
 def _workflows():
@@ -670,6 +727,25 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         separately fetches something harmless. For the same reason the two
         halves are not required to appear in order, or on one line.
 
+        "Names" has to mean both ways of naming, and expansion has to run
+        first. A script can reach an `env:` value as `$REV`, which is a
+        shell variable, or as `${{ env.REV }}`, which GitHub substitutes
+        before the shell ever starts -- and the second spelling is not a
+        shell variable reference, so a pickup keyed on `$NAME` folds in
+        nothing and the fetch reads as innocent. A value can also name
+        another value, `REV: ${{ env.A }}`, which is text that matches
+        neither the refspec nor the head pattern while `A` never gets
+        followed. So the script is expanded, the pickup runs over the
+        expansion, the picked-up values are expanded too, and the pickup
+        repeats until it stops finding names. Both shapes were live against
+        the first version of this half and both have mutation rows now.
+
+        The `git pull` form is matched as a command rather than as a word,
+        which is the one concession this half makes to prose. `\bpull\b`
+        over a haystack containing shell comments matches the words "pull
+        request", and a step that mentions the pull request in an `echo` and
+        separately uses `github.head_ref` for a label is ordinary here.
+
         The `ref:` half, by contrast, is an allowlist, and that is the whole
         design. It began as a denylist over three nouns -- `pull_request`,
         `head`, `merge` -- and `${{ github.event.after }}` is the pull
@@ -681,6 +757,29 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         the direction to be wrong in. The cost is a false red the day
         somebody adds a legitimately safe expression, which is a line of
         review, and the docstring is where they will look.
+
+        `ref:` is only half of what a checkout resolves. The action looks the
+        ref up inside whatever `repository:` says, so the allowlist above
+        says nothing on its own: `repository: ${{
+        github.event.pull_request.head.repo.full_name }}` with `ref: ${{
+        github.base_ref }}` is the fork's copy of the base branch, which the
+        fork wrote, and every assertion on the ref passes. `repository:`
+        therefore gets the same allowlist -- absent, or `github.repository`
+        -- and unlike the ref half it refuses a literal outright, including
+        this repository's own name. The ref half tolerates literals because
+        `main` is an ordinary ref; there is no equivalent reason to write
+        out a repository when the expression for it exists, and a literal is
+        exactly where a lookalike owner would go unread.
+
+        Both inputs are read case-insensitively, which is not decoration.
+        The runner passes an input to an action as `INPUT_<NAME>`,
+        upper-casing the key, and `core.getInput` looks it up the same way,
+        so `Ref:` is the ref `actions/checkout` checks out and a
+        `with.get("ref")` reads none of it. This is the `uses:` bug one
+        field along -- that filter was case-sensitive too until
+        `Actions/checkout` was found walking past it -- and the pattern in
+        both is the same: each round of review finds the input the last
+        round did not read.
 
         The rule is over any step that takes a `ref:`, not over
         `actions/checkout`. A third-party checkout action fetches the same
@@ -696,7 +795,15 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         text at all, a local composite action, which moves the checkout into
         a file this test does not read, and the `run:` half's own laundering
         -- a `$GITHUB_ENV` write in an earlier step, or a `steps.X.outputs.Y`
-        the script interpolates. Read that list as examples rather than as
+        the script interpolates. Nor is the implicit ref audited as strictly
+        as the explicit one: `github.base_ref`, `github.ref` and
+        `github.sha` are all on the allowlist and are all the pull request's
+        *base* branch, which is the same ref the no-ref case above is
+        refused for taking. Nothing a fork can write reaches any of them --
+        that needs push access to this repository -- so the allowlist is
+        about fork-controlled code and the no-ref rule is about stating
+        which base ref you meant. Worth knowing they are not the same
+        standard. Read that list as examples rather than as
         the boundary. An earlier version of it was written as though it were
         complete and did not mention `github.event.after`, which turned out
         to be both live and shorter than either path it did name.
@@ -736,11 +843,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # match has to be too. `Actions/checkout` runs the same
                         # action and would otherwise walk past the filter.
                         uses = str((step or {}).get("uses", "")).lower()
-                        ref = str(((step or {}).get("with") or {}).get("ref", ""))
+                        refs = _with_inputs(step, "ref")
                         if uses.startswith("actions/checkout"):
                             saw_a_checkout = True
                             self.assertTrue(
-                                ref,
+                                any(refs),
                                 "a checkout on pull_request_target with no ref: "
                                 "takes GITHUB_REF, which on this trigger is the "
                                 "pull request's base branch",
@@ -749,7 +856,9 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `actions/checkout`. A third-party checkout action
                         # fetches the same code, and naming one vendor turns
                         # the rule into a rule about that vendor.
-                        if ref:
+                        for ref in refs:
+                            if not ref:
+                                continue
                             resolved = _expand_env(ref, step_env)
                             for expression in _EXPRESSION.findall(resolved):
                                 self.assertIn(
@@ -771,23 +880,67 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                                     f"{path.name}: the checkout ref derives "
                                     "from the pull request",
                                 )
+                        # A ref is resolved inside a repository, so the ref
+                        # allowlist says nothing on its own: `github.base_ref`
+                        # in the fork's copy of this repository is the fork's
+                        # code. Same shape of rule, one input along.
+                        for repository in _with_inputs(step, "repository"):
+                            resolved = _expand_env(repository, step_env)
+                            for expression in _EXPRESSION.findall(resolved):
+                                self.assertIn(
+                                    expression,
+                                    _SAFE_CHECKOUT_REPOSITORIES,
+                                    f"{path.name}: the checkout names the "
+                                    f"repository `{expression}`, which is not "
+                                    "known to be this repository -- a safe "
+                                    "ref resolved there is somebody else's "
+                                    "code",
+                                )
+                            self.assertEqual(
+                                "",
+                                _EXPRESSION.sub("", resolved).strip(),
+                                f"{path.name}: the checkout names a literal "
+                                "repository; say `${{ github.repository }}` "
+                                "or leave it out, which is the same thing and "
+                                "cannot be a lookalike",
+                            )
                         # The script, plus the `env:` values it actually
                         # names -- see the docstring on why `run:` alone is
                         # not enough and why order is not required. Only the
                         # values it names: folding in everything in scope
                         # reds a job that mentions `github.head_ref` for a
                         # label and separately fetches something harmless.
-                        script = str((step or {}).get("run", ""))
-                        haystack = "\n".join(
-                            [script]
-                            + [
-                                value
+                        #
+                        # Everything is expanded before it is matched, and
+                        # the pickup runs over what expansion produced. A
+                        # script naming its value as `${{ env.REV }}` rather
+                        # than as `$REV` is never a shell variable reference,
+                        # so the shell-style pickup alone reads nothing; and
+                        # a value that names another value -- `REV: ${{
+                        # env.A }}` -- is text that matches neither pattern,
+                        # so a pickup that stopped at one hop would fold in
+                        # `A`'s name and not `A`. Iterating both closes the
+                        # pair. The loop terminates because `named` only
+                        # grows and `step_env` is finite; the limit is the
+                        # same cap `_expand_env` uses, and reaching it leaves
+                        # an unexpanded `${{ ... }}`, which the ref half
+                        # refuses and this half simply does not match.
+                        script = _expand_env(str((step or {}).get("run", "")), step_env)
+                        named: dict[str, str] = {}
+                        for _ in range(_ENV_EXPANSION_LIMIT):
+                            haystack = "\n".join([script] + list(named.values()))
+                            picked = {
+                                name: _expand_env(value, step_env)
                                 for name, value in step_env.items()
-                                if re.search(
-                                    r"\$\{?" + re.escape(name) + r"\b", script
+                                if name not in named
+                                and re.search(
+                                    r"\$\{?" + re.escape(name) + r"\b", haystack
                                 )
-                            ]
-                        )
+                            }
+                            if not picked:
+                                break
+                            named.update(picked)
+                        haystack = "\n".join([script] + list(named.values()))
                         self.assertIsNone(
                             _PULL_REQUEST_REF.search(haystack),
                             f"{path.name}: a run: step fetches a pull/N/head "
