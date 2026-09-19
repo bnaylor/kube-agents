@@ -5233,12 +5233,12 @@ spec:
                         (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
                         as either a secret volume or a projected secret source. The refusal is on
                         the name and the shape of the source, not on what a given Secret happens to
-                        hold at the time. Reading those
-                        Secrets through env is not refused here. On an install running the A2A
-                        surface the same entries are dropped from the render as well, which is the
-                        half that holds when admission does not run: a default chart install does
-                        not register the webhooks at all (operator.webhooks.enabled=false), and one
-                        that does registers them at failurePolicy Ignore by default.
+                        hold at the time. Reading those Secrets through env is not refused here. On
+                        an install running the A2A surface the same entries are dropped from the
+                        render as well, which is the half that holds when admission does not run:
+                        a default chart install does not register the webhooks at all
+                        (operator.webhooks.enabled=false), and one that does registers them at
+                        failurePolicy Ignore by default.
                       items:
                         description:
                           Volume represents a named volume in a pod that
