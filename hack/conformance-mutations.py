@@ -78,15 +78,16 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Nine today: B1-assent-rule-weakened,
+    #: and KILLED is the failure. Ten today: B1-assent-rule-weakened,
     #: A3-fastpath-redundant,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
-    #: B4-pull-request-target-container-pinned-image, and
-    #: B4-pull-request-target-run-runner-repository-name.
+    #: B4-pull-request-target-container-pinned-image,
+    #: B4-pull-request-target-run-runner-repository-name, and
+    #: B4-pull-request-target-run-clone-bare.
     must_survive: bool = False
 
 
@@ -2317,6 +2318,54 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "name an env value in the case GitHub accepts and this file did not, "
         "carrying the one ref the allowlist holds",
+        must_survive=True,
+    ),
+    Mutation(
+        # The ref space copied rather than enumerated. `git clone --mirror`
+        # sets up a refmap of `+refs/*:refs/*`, so it brings
+        # `refs/pull/N/head` onto the runner while writing no refspec, no
+        # `ls-remote` and no HTTP path -- none of the four spellings the
+        # enumeration rule was built out of. `for-each-ref` in the clone
+        # reads the head SHA back out.
+        "B4-pull-request-target-run-clone-mirror",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          git clone --mirror "https://github.com/'
+         '$GITHUB_REPOSITORY" m\n'
+         "          SHA=$(git -C m for-each-ref --format='%(objectname)"
+         " %(refname)' | grep \"/$PR_NUMBER/head\" | cut -d' ' -f1)\n"
+         '          git fetch origin "$SHA"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "take a mirror clone and read the head out of it, which writes none "
+        "of the four spellings the enumeration rule collected",
+    ),
+    Mutation(
+        # And the neighbouring flag, from the safe side. `git clone --bare`
+        # copies the branches an ordinary clone does and not the pull
+        # namespace, so refusing it would be a rule about the shape of a
+        # clone rather than about what the clone reaches. KILLED here means
+        # `--mirror\b` has been widened to `--(?:mirror|bare)` or to
+        # `--mir`, and a release step that takes a bare clone of this
+        # repository now reds.
+        "B4-pull-request-target-run-clone-bare",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Archive the default branch\n"
+         "        run: |\n"
+         '          git clone --bare "https://github.com/'
+         '$GITHUB_REPOSITORY" archive.git\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "take a bare clone of this repository, which is what an archiving "
+        "step does and which reaches no ref an ordinary clone does not",
         must_survive=True,
     ),
     Mutation(

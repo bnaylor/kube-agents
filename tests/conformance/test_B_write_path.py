@@ -476,6 +476,17 @@ _PULL_REQUEST_API = re.compile(
 # nothing in a workflow has. What it concedes is a URL assembled out of
 # pieces, which is the string arithmetic the residual list already carries.
 #
+# The fifth is a clone rather than a fetch, and it names no refspec at all.
+# `git clone --mirror URL m` is documented as setting up a refmap of
+# `+refs/*:refs/*`, so it copies `refs/pull/N/head` onto the runner with none
+# of the four alternatives above appearing anywhere: no `ls-remote`, no
+# `refs/*` written down, no HTTP path. `git for-each-ref` in the clone then
+# reads the head SHA out, and a fetch by object name serves it. It was green.
+# Only `--mirror` is refused. `--bare` is the neighbouring flag and copies
+# only the branches an ordinary clone would, so refusing it would be a rule
+# about the shape of a clone rather than about what the clone reaches, and
+# `git clone --bare` of this repository is a thing a release step does.
+#
 # No carrier here runs either, so what this costs today is nothing, and what
 # it costs later is a line of review on a step that wants to survey a remote
 # from inside a `pull_request_target` job. What it concedes is a fetch that
@@ -488,6 +499,7 @@ _REMOTE_REF_ENUMERATION = re.compile(
     r"|refs/[^/\s'\"]*\*"
     r"|/info/refs\b"
     r"|\bgit-upload-pack\b"
+    r"|--mirror\b"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -2343,7 +2355,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertIsNone(
                             _REMOTE_REF_ENUMERATION.search(reachable),
                             f"{path.name}: a step enumerates the remote's "
-                            "refs, which advertises `refs/pull/N/head` "
+                            "refs, or copies them whole with `clone "
+                            "--mirror`, which reaches `refs/pull/N/head` "
                             "without the step naming it -- grep the listing "
                             "and the head SHA is a fetch by object name away",
                         )
