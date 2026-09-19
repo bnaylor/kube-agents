@@ -170,9 +170,10 @@ kubectl -n kubeagents-system set env deploy/kubeagents-controller-manager ENABLE
 ```
 
 That leaves the cluster with the validation coverage a chart install with
-`operator.webhooks.enabled=false` has — none from admission, and whatever the render
-enforces on its own. Re-apply with
-`make deploy IMG=$IMG` once the cause is fixed.
+`operator.webhooks.enabled=false` has. The CRD's own schema and CEL rules still run -- those
+belong to the API server, not to the webhook -- as does whatever the render enforces on its own.
+What goes away is everything the operator's admission checks add on top, the bus-credential
+refusals among them. Re-apply with `make deploy IMG=$IMG` once the cause is fixed.
 
 ## An image ahead of its ClusterRole
 
