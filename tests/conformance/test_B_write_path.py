@@ -270,10 +270,27 @@ def _env_values(block):
 
     Every level is consulted because GitHub merges them, and a ref laundered
     through any one of them is the same ref.
+
+    An `env:` that is not a mapping is an expression standing in for the whole
+    block -- `env: ${{ fromJSON(...) }}` is valid, and GitHub evaluates it into
+    the environment at run time -- and it is returned whole under a
+    placeholder name rather than dropped. Dropping it read as "this step
+    declares no environment", which is the loudest possible way to be wrong
+    here: a block built by `fromJSON` out of `github.event.after` satisfied
+    every rule about what a step's environment may carry by carrying nothing
+    this function could see. Yielding the text instead puts it in front of the
+    expression allowlist, which refuses it for being unresolvable. The name is
+    `<env>` because there is no key to use and the name only ever appears in a
+    failure message; an angle-bracketed one cannot collide with a variable,
+    which `NAME` could.
+
+    This is `_with_inputs`'s rule for a non-mapping `with:`, one field along,
+    and for the same reason: the one direction this test does not go is
+    failing open on something it cannot parse.
     """
     env = (block or {}).get("env") or {}
     if not isinstance(env, dict):
-        return {}
+        return {"<env>": str(env)}
     return {str(k): str(v) for k, v in env.items()}
 
 
