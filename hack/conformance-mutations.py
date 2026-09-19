@@ -1587,6 +1587,34 @@ Mutation(
         "of the command is a readable program and the one that runs is not",
     ),
     Mutation(
+        # The same fix read from the other end. The row above is an
+        # unreadable program with a readable word in front of it, and it
+        # pins the last of the two positions `_invocation_programs` returns;
+        # this is an unreadable program with a readable word *behind* it, and
+        # it is the only thing pinning the first. `-R owner/repo` is how `gh`
+        # is told which repository to act on, and the flag's value is a plain
+        # name, so the word nearest the `pr` is readable and the word that
+        # runs is not. KILLED here means the wrapper fix has been narrowed to
+        # the word before the subcommand, which is the round-6 shape wearing
+        # a flag.
+        "B4-pull-request-target-api-gh-flagged-unreadable-program",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          g'h' -R gke-labs/kube-agents pr checkout "
+         '"$PR_NUMBER"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put the repository flag between the quote-broken name and the "
+        "subcommand, so the word nearest the `pr` is a readable program and "
+        "the one that runs is not",
+    ),
+    Mutation(
         # The safe side of the same word, and the hole `_READABLE_PROGRAM`
         # leaves open on purpose. A program with a plain name of its own and
         # `gh`'s argument shape is conceded -- closing it means a denylist of
