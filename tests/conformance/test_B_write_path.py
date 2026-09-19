@@ -213,10 +213,78 @@ _SCRIPT_CONTEXT = re.compile(
 # the same price `_SAFE_SCRIPT_EXPRESSIONS` charges and the same answer.
 _SAFE_GH_PULL_REQUEST_SUBCOMMANDS = frozenset({"edit", "comment"})
 
+# The allowlist one noun further up, and the round-9 half of the same
+# argument. Until 2026-09-19 the walk read the first word, skipped every
+# invocation whose verb was not `pr`, and so governed one verb of a CLI that
+# has about forty. `gh alias set co 'pr checkout'` followed by `gh co "$N"` is
+# `gh pr checkout` with the verb renamed, and neither line is a `gh pr` for the
+# subcommand allowlist to read -- the first is `alias`, the second is a word
+# GitHub never shipped. Adding `alias` by name would leave `gh extension
+# install`, `gh repo sync`, and whatever the next release adds; a list of the
+# ones that have been seen is the shape that keeps losing here.
+#
+# So the verb is an allowlist too. Three are on it and each has a carrier or a
+# reason. `pr` is `auto-assign-milestone.yml`'s milestone write, and its
+# subcommands stay governed by the list above. `issue` is the same object: a
+# pull request *is* an issue to GitHub's data model, `gh issue comment 1781`
+# comments on this one, and a labelling carrier reaching for it would be doing
+# exactly what the `pr` carrier does -- so it is governed by the same
+# subcommand allowlist rather than trusted, which is what keeps `gh issue
+# view` off it. `api` takes no subcommand at all; what governs it is the path
+# it requests, and `_PULL_REQUEST_API` reads that out of the whole script text
+# whoever makes the request.
+#
+# Everything else -- `alias`, `extension`, `repo`, `run`, `release`, `search`,
+# `workflow`, and the one after that -- is refused for not being on the list.
+# That kills the alias shape permanently rather than by name: a verb this file
+# has never heard of is refused *because* it has never heard of it, so the
+# rename has nowhere to land. What it concedes is a line of review the day a
+# carrier needs a fourth verb, which is the price `_SAFE_SCRIPT_EXPRESSIONS`
+# and `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS` both charge, and the same answer.
+_SAFE_GH_VERBS = frozenset({"pr", "issue", "api"})
+
+# Which of those verbs the subcommand allowlist is read against. `api` is not
+# one: it is a path rather than a verb tree, and reading `repos/...` as a
+# subcommand would refuse the live milestone carrier while telling its author
+# to allowlist a URL.
+_SUBCOMMAND_GOVERNED_GH_VERBS = frozenset({"pr", "issue"})
+
 # `gh` as a command word. The lookbehind refuses a word ending in `gh` and a
 # flag spelled `--gh`, and deliberately allows a path prefix, because
 # `/usr/bin/gh` is the same program.
-_GH_COMMAND = re.compile(r"(?<![\w-])gh(?=\s)")
+#
+# The lookahead was `\s` until 2026-09-19, and a quote is what walked past it.
+# `'gh' pr checkout "$N"` is what a shell runs when the program name is
+# quoted -- quoting a bare word changes nothing about what executes -- and
+# `gh'' pr checkout "$N"` is the same trick with the quotes empty. Neither is
+# `gh` followed by whitespace, so neither invocation was ever handed to the
+# walk at all. The third spelling is not an obfuscation: `await exec.exec('gh',
+# ['pr', 'checkout', N])` in an `actions/github-script` body is the ordinary
+# way to run a program from a `script:` input, `_step_scripts` already folds
+# that input into the text read here, and the character after `gh` is a quote
+# followed by a comma.
+#
+# So the lookahead is whitespace, either quote, or a comma. It costs a false
+# red on the two letters `gh` written as prose immediately before a quote or a
+# comma inside a step -- "install gh, then run it" -- which is refused because
+# the word after it is not an allowlisted verb. That is a line of review on a
+# comment in a step of a workflow holding a writable token, which is the
+# direction to be wrong in.
+_GH_COMMAND = re.compile(r"(?<![\w-])gh(?=[\s'\",])")
+
+# What comes off a word before the walk reads it. Quotes were already stripped
+# because `gh pr "edit"` runs `edit`; the brackets and the comma are the
+# round-9 half, and without them widening the lookahead above buys nothing.
+# `exec.exec('gh', ['pr', 'checkout', N])` splits on whitespace into `',`,
+# `['pr',`, `'checkout',` -- so the verb reads as `['pr'`, which is not `pr`,
+# and the invocation is skipped exactly as it was before. Stripping this
+# punctuation off both ends of every word, and dropping whatever that empties,
+# is what makes an argument vector read as the command line it is. It is a
+# strip rather than a parse, so a word is never split and a quoted string with
+# a space in it still arrives as two words; that can only produce more words
+# than the CLI sees, never fewer, and an extra word reads as an unrecognised
+# subcommand rather than as an allowlisted one.
+_GH_WORD_PUNCTUATION = "\"'[],"
 
 # Where the walk stops. Not a shell parser: a separator inside a quoted
 # string ends an invocation early, which can lose the tail of one and cannot
@@ -257,10 +325,78 @@ _GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 # names `issues` and is untouched, which is what a labelling carrier reaches
 # for. It concedes a false red on a shell path that happens to contain
 # `pulls.` or `/pulls`, which nothing here has.
+#
+# The web endpoint is the third alternative, and it is the one that needs no
+# token at all. `https://github.com/O/R/pull/N.diff` and its `.patch` sibling
+# are the fork's changes served off the pull request's *web* page: `curl -fsSL
+# ".../pull/${N}.diff" | git apply` puts them on the default-branch checkout
+# and `.patch` does it through `git am` with the authorship attached. Neither
+# is `/pulls`, so the path rule above never read one; neither names `refs/pull`
+# or a `/head` segment, so `_PULL_REQUEST_REF` never did either; and because
+# these are public URLs, the request succeeds whether or not the step has the
+# token, which makes them the cheapest reach on this list rather than the most
+# exotic. The rule is the `pull/` web path *with a diff extension*, so the
+# concession the ref half made on purpose stays made -- a bare
+# `https://github.com/gke-labs/kube-agents/pull/1781` in a comment is a link
+# to a page and a workflow that comments on one has every reason to write it
+# down. `[^\n'\"]*?` rather than a tighter class because the number is
+# usually interpolated and `${{ github.event.number }}` has spaces in it; it
+# stops at a line end and at either quote, so the match cannot wander out of
+# the URL it started in.
+#
+# The fourth and fifth are the issues endpoints that hand back a commit, and
+# they are an exception to a namespace this file leaves open on purpose. A
+# pull request is an issue to the REST API, so `GET /repos/O/R/issues/N/timeline`
+# returns this pull request's timeline, `committed` events and all, each
+# carrying the head SHA -- `--jq '.[] | select(.event=="committed") | .sha'`
+# and the fetch on the next line is the whole evasion. `/issues/N/events` is
+# the same shape one endpoint along. `listEvents` and `listEventsForTimeline`
+# are those two from a `script:`, through the Octokit the action hands it.
+# Everything else under `issues` stays allowed, because `issues.createComment`
+# and `issues.addLabels` are what a labelling carrier is *for* and refusing the
+# namespace wholesale would red the neighbour of every live carrier here. These
+# two are the exception because they are the only issues endpoints that return
+# a commit rather than a comment, a label or a title -- the reach is the same
+# one `/pulls` has, reached through the noun this file does not police.
 _PULL_REQUEST_API = re.compile(
     r"/pulls\b"
     r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?pulls\b"
     r"|\bpulls\s*[.\[]"
+    r"|pull/[^\n'\"]*?\.(?:diff|patch)\b"
+    r"|/issues/[^\n'\"]*?/(?:timeline|events)\b"
+    r"|\blistEvents(?:ForTimeline)?\b"
+)
+
+# Enumerating the remote's refs, which reaches `refs/pull/N/head` without
+# spelling any of it. `_PULL_REQUEST_REF` refuses three spellings of the
+# namespace and git needs none of them: `refs/pull/N/head` is advertised to a
+# plain `git ls-remote origin`, so `git ls-remote origin | grep "/$N/head" |
+# cut -f1` reads the head SHA out of the advertisement and `git fetch origin
+# "$SHA"` is then a fetch by object name that the server serves. The refspec
+# form is the same reach with the filtering moved local: `git fetch origin
+# '+refs/*:refs/remotes/all/*'` copies the whole ref space onto the runner,
+# including the pull namespace, and `git for-each-ref` reads it back. Both
+# were live and green against every rule above.
+#
+# So the rule is written about reach rather than about the two spellings that
+# happened to turn up. Two alternatives. Any `ls-remote` is refused -- the
+# command's only job is to list what a remote advertises, and a step of a
+# workflow that must not have the fork's code has no question for it. And a
+# fetch refspec whose source side globs before the namespace is fixed:
+# `refs/*` and `refs/p*` both reach the pull namespace, while `refs/heads/*`
+# and `refs/tags/*` name a namespace first and are untouched, which is the
+# ordinary mirror fetch and the reason this is not a ban on wildcards.
+#
+# No carrier here runs either, so what this costs today is nothing, and what
+# it costs later is a line of review on a step that wants to survey a remote
+# from inside a `pull_request_target` job. What it concedes is a fetch that
+# names a safe namespace and then walks into an unsafe one -- there is no such
+# refspec, but `git fetch origin && git for-each-ref` against a remote whose
+# config already carries a wildcard refmap is not read here, because the
+# config is not in this file.
+_REMOTE_REF_ENUMERATION = re.compile(
+    r"\bls-remote\b"
+    r"|refs/[^/\s'\"]*\*"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -501,8 +637,8 @@ def _join_continuations(text):
     return _LINE_CONTINUATION.sub("", text)
 
 
-def _unsafe_gh_pull_request_commands(text):
-    """Every `gh pr ...` in `text` whose subcommand is not allowlisted.
+def _gh_invocations(text):
+    """Every `gh ...` in `text`, as `(verb, subcommand, invocation)` triples.
 
     A regex cannot answer this and the last one did not. `gh` takes its flags
     anywhere, so `gh pr -R "$REPO" checkout "$N"` *is* `gh pr checkout` as
@@ -511,47 +647,89 @@ def _unsafe_gh_pull_request_commands(text):
     two different questions and only the second one is about what runs. This
     walks the words of each invocation instead, drops anything beginning with
     `-`, drops the value after a flag known to take one, and reads the first
-    two that survive: `pr`, and then the subcommand.
+    two that survive: the verb, and then the subcommand under it.
 
     It is a walk and not a parser, and every place it is wrong is wrong in
     the refusing direction. A flag this does not know takes a value costs a
     false red rather than a false green: the value is read as the subcommand,
-    is not on the allowlist, and the step is refused. That is why the caller's
-    message quotes the whole invocation rather than the word it objected to --
-    the word can be the wrong one. The walk stops at the first newline, `;`,
-    `|`, `&`, parenthesis or backtick, so a separator inside a quoted string ends it
-    early; that loses the tail of an invocation and cannot invent one. A
-    `gh pr` with no subcommand at all is refused too, on the same reasoning
-    the ref allowlist refuses an expression it cannot resolve.
+    is not on the allowlist, and the step is refused. That is why the callers'
+    messages quote the whole invocation rather than the word they objected to
+    -- the word can be the wrong one. The walk stops at the first newline,
+    `;`, `|`, `&`, parenthesis or backtick, so a separator inside a quoted
+    string ends it early; that loses the tail of an invocation and cannot
+    invent one. A verb with no subcommand under it reads as the empty string,
+    which is on no allowlist, on the same reasoning the ref allowlist refuses
+    an expression it cannot resolve.
 
-    Quotes come off each word because `gh pr "edit"` runs `edit`. What is not
-    covered is a `gh` whose subcommand is built out of a variable -- `gh
-    "$SUB" checkout` reads `$SUB` as the subcommand and refuses it, but `$C
-    pr checkout` with `C: gh` is not read as a `gh` invocation at all. That
-    is the same residue the expression allowlist leaves, and the same answer:
-    an `env:` carrying the head is refused whatever the script does with it.
+    Punctuation comes off each word and an emptied word is dropped, which is
+    what makes a JavaScript argument vector read as the command line it is:
+    `exec.exec('gh', ['pr', 'checkout', N])` runs `gh pr checkout` and splits
+    into `',`, `['pr',`, `'checkout',`. The argument for the exact set is at
+    `_GH_WORD_PUNCTUATION`. What is not covered is a `gh` whose verb is built
+    out of a variable -- `gh "$SUB" checkout` reads `$SUB` as the verb and
+    refuses it, but `$C pr checkout` with `C: gh` is not read as a `gh`
+    invocation at all. That is the same residue the expression allowlist
+    leaves, and the same answer: an `env:` carrying the head is refused
+    whatever the script does with it.
     """
-    unsafe = set()
     for match in _GH_COMMAND.finditer(text):
         rest = text[match.end():]
-        end = _COMMAND_END.search(rest)
-        invocation = (rest[: end.start()] if end else rest).strip()
+        stop = _COMMAND_END.search(rest)
+        invocation = (rest[: stop.start()] if stop else rest).strip()
         words = []
         skip_value = False
-        for word in _GH_EXPRESSION.sub("EXPR", invocation).split():
+        stripped = (
+            word.strip(_GH_WORD_PUNCTUATION)
+            for word in _GH_EXPRESSION.sub("EXPR", invocation).split()
+        )
+        for word in (word for word in stripped if word):
             if skip_value:
                 skip_value = False
                 continue
             if word.startswith("-"):
                 skip_value = word in _GH_VALUE_FLAGS
                 continue
-            words.append(word.strip("\"'"))
-        if not words or words[0] != "pr":
+            words.append(word)
+        if not words:
             continue
-        subcommand = words[1] if len(words) > 1 else ""
-        if subcommand not in _SAFE_GH_PULL_REQUEST_SUBCOMMANDS:
-            unsafe.add(f"gh {invocation}"[:120])
-    return sorted(unsafe)
+        yield words[0], (words[1] if len(words) > 1 else ""), invocation
+
+
+def _unsafe_gh_verbs(text):
+    """Every `gh ...` in `text` whose verb is not allowlisted.
+
+    The outer half of the pair: `_SAFE_GH_VERBS` is read before the
+    subcommand allowlist is, because a verb nobody here recognises has no
+    subcommands this file can have an opinion about. `gh alias set co 'pr
+    checkout'` is refused as `alias` and the `gh co "$N"` it installs is
+    refused as `co`, neither of them for resembling anything.
+
+    A `gh` with no words after it at all -- the bare program name, or an
+    invocation the walk truncated at a separator before it reached a word --
+    is not yielded by the walk and so is not refused here. It runs nothing.
+    """
+    return sorted({
+        f"gh {invocation}"[:120]
+        for verb, _, invocation in _gh_invocations(text)
+        if verb not in _SAFE_GH_VERBS
+    })
+
+
+def _unsafe_gh_pull_request_commands(text):
+    """Every allowlisted-verb `gh` in `text` whose subcommand is not.
+
+    The inner half. Only the verbs in `_SUBCOMMAND_GOVERNED_GH_VERBS` reach
+    here: `gh api` takes a path rather than a subcommand and is governed by
+    `_PULL_REQUEST_API` instead, and every other verb was already refused by
+    `_unsafe_gh_verbs`. What is left is `gh pr` and `gh issue`, which address
+    the same object and are held to the same two write subcommands.
+    """
+    return sorted({
+        f"gh {invocation}"[:120]
+        for verb, subcommand, invocation in _gh_invocations(text)
+        if verb in _SUBCOMMAND_GOVERNED_GH_VERBS
+        and subcommand not in _SAFE_GH_PULL_REQUEST_SUBCOMMANDS
+    })
 
 
 def _with_inputs(step, name):
@@ -1184,9 +1362,9 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `workflow_run` gate asserts its own: this test says nothing at all
         about a repository with no `pull_request_target` workflows, or one
         where none of them checks anything out, so it cannot tell "the trigger
-        is gone" from "the parse stopped seeing it". Three workflows carry the
-        trigger today and two of them run a checkout. If either reaches zero
-        the test should be read again, not passed by default.
+        is gone" from "the parse stopped seeing it". Four workflows carry the
+        trigger today and three of them run a checkout. If either reaches
+        zero the test should be read again, not passed by default.
 
         The `run:` half is two rules over every step of the workflow, and
         it is not a proof: a script can reach a ref any number of ways and
@@ -1194,7 +1372,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         literal. The `refs/pull` namespace is refused wherever it appears,
         along with the two short forms that reach it without the prefix,
         because it is the checkout action's own documented manual equivalent
-        and needs no interpolation at all. The second is the `ref:` half's
+        and needs no interpolation at all. Its counterpart is further down,
+        among the rules read over everything a step can say rather than over
+        its script alone: a step that enumerates the remote's refs holds
+        `refs/pull/N/head` whether or not it spelled `pull`, because the
+        remote advertises the whole namespace to anyone who asks.
+        `_REMOTE_REF_ENUMERATION` has the two shapes and what refusing them
+        concedes. The second is the `ref:` half's
         rule one field along: a step may name only the expressions in
         `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only those, an
         `actions/github-script` body may reach only the `context` properties
@@ -1262,7 +1446,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
 
         What the allowlist costs is measured rather than assumed, and
         dropping the gate is what made it cost anything. Every step of all
-        three carriers is read now, and two expressions had to go on the
+        four carriers is read now, and two expressions had to go on the
         list for them to stay green: `github.event.pull_request.number`,
         which two of them label and comment with, and `inputs.dry_run`, a
         `workflow_dispatch` boolean. Both arguments are at
@@ -1431,28 +1615,47 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         Not covered, each line re-run against this version of the file on
         2026-09-19 rather than carried forward:
 
-        The API in a spelling none of the three rules over it read. Those
-        three are an allowlist of two `gh pr` subcommands, the `/pulls` path
-        segment, and the `pulls` namespace of the Octokit client a `script:`
-        is handed. They were a four-alternative denylist until 2026-09-19 and
-        four shapes walked past it -- `gh pr list --json headRefOid`, the
-        `/pulls?state=all` collection, `gh pr -R "$REPO" checkout "$N"` with
-        a flag interposed before the verb, and `github.rest.pulls.get({
-        ...context.repo, pull_number: N })` -- which is the same lesson the
-        ref half learned and the reason two of the three are allowlists now.
+        The API in a spelling none of the rules over it read. Those rules
+        are an allowlist of three `gh` verbs, an allowlist of two subcommands
+        under the two of them that take one, the `/pulls` path segment, the
+        `pull/N.diff` web endpoint, the two `/issues/N/...` endpoints that
+        return a commit, and the `pulls` namespace of the Octokit client a
+        `script:` is handed. Every allowlist among them replaced a denylist
+        that lost, and each loss is recorded at the constant. The verb
+        allowlist is the newest and the reason is the sharpest: `gh alias set
+        co 'pr checkout'` renames a governed verb into an ungoverned one, so
+        no list of dangerous verbs can be finished.
 
-        What is left is the call made without naming `pulls` or `gh pr` at
-        all: a GraphQL query for `pullRequest(number:)`, `github.request("GET
+        What is left is the call made without naming `pulls`, an issues
+        timeline, or an allowlisted `gh` verb: a GraphQL query for
+        `pullRequest(number:)`, or `github.request("GET
         /repos/{owner}/{repo}/pulls/{n}")` spelled with the path in a
-        variable, or a `gh` whose own name arrives through the environment.
-        Indexing the namespace rather than accessing it -- `github.rest[
-        "pulls"].get` -- was on this list for an hour on 2026-09-19 and is
-        not on it now: it is one quote away from the shape the round closed,
-        which is too close to write down and leave, so the rule reads `rest`
-        and the punctuation between it and `pulls` rather than a dot. What is
-        left is the GraphQL query, and it is the one worth writing down: that
+        variable. A `gh` whose own name arrives through the environment came
+        off this list only partly -- `$C pr checkout` with `C: gh` is still
+        unread, but the `env:` that carries `gh` is now the only place it can
+        come from, and the environment is refused wholesale for the head
+        rather than for a program name, so this one is narrower than it
+        reads. Indexing the namespace rather than accessing it --
+        `github.rest["pulls"].get` -- was on this list for an hour on
+        2026-09-19 and is not on it now: it is one quote away from the shape
+        the round closed, which is too close to write down and leave, so the
+        rule reads `rest` and the punctuation between it and `pulls` rather
+        than a dot. What is worth writing down is the GraphQL query: that
         endpoint is a single URL with no `/pulls` in it, and nothing in this
         file reads a query document.
+
+        The remote's refs enumerated through something that is not `git`. A
+        step that enumerates them with `git` is refused -- `ls-remote`, and a
+        fetch refspec that globs before the namespace is fixed -- because
+        `refs/pull/N/head` is advertised to any client that asks and served
+        to a fetch by object name afterwards, so the namespace does not have
+        to be spelled to be reached. What is not read is the same
+        advertisement fetched over HTTP: `curl
+        "https://github.com/O/R.git/info/refs?service=git-upload-pack"` is
+        the protocol's own discovery endpoint, it is unauthenticated, and it
+        returns the identical list. It is one more thing `curl` can do that
+        this file does not model, alongside the diff endpoint the round did
+        close.
 
         A local composite action. `uses: ./.github/actions/x` moves the
         steps into a file keyed `runs.steps` that nothing here reads, and
@@ -1765,6 +1968,28 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # about a ref, and a request assembled out of an
                         # `env:` value is the same request.
                         reachable = "\n".join([script, *environment.values()])
+                        # The ref namespace reached without being named.
+                        # `refs/pull/N/head` is advertised to a plain
+                        # `ls-remote` and copied by a `refs/*` refspec, so a
+                        # step that enumerates the remote's refs holds the
+                        # head whether or not it spelled `pull` anywhere.
+                        # Read over `reachable` rather than over the script
+                        # and the values the pickup followed, for the reason
+                        # the three rules below are: this is a rule about a
+                        # command, and a command assembled out of an `env:`
+                        # value is the same command -- the wholesale refusal
+                        # above reads those values for the *head*, which an
+                        # enumeration does not carry. See
+                        # `_REMOTE_REF_ENUMERATION` for why the rule is about
+                        # that reach rather than about the two spellings that
+                        # demonstrated it.
+                        self.assertIsNone(
+                            _REMOTE_REF_ENUMERATION.search(reachable),
+                            f"{path.name}: a step enumerates the remote's "
+                            "refs, which advertises `refs/pull/N/head` "
+                            "without the step naming it -- grep the listing "
+                            "and the head SHA is a fetch by object name away",
+                        )
                         # And the payload as a file, which is neither an
                         # expression nor a `context` property and so reaches
                         # neither allowlist. Refused on the read rather than
@@ -1784,28 +2009,56 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertIsNone(
                             _PULL_REQUEST_API.search(reachable),
                             f"{path.name}: a step reads the pull request "
-                            "through the API -- a `/pulls` request, or the "
+                            "through the API -- a `/pulls` request, the "
                             "`pulls` namespace of the Octokit client a "
-                            "`script:` input is handed as `github` -- which "
-                            "is the event's own fields fetched over HTTP, in "
-                            "the one language none of the rules above read",
+                            "`script:` input is handed as `github`, the "
+                            "tokenless `pull/N.diff` web endpoint, or the "
+                            "`/issues/N/timeline` and `/issues/N/events` "
+                            "endpoints, which hand back the same head "
+                            "through the noun this file otherwise leaves "
+                            "open -- which is the event's own fields fetched "
+                            "over HTTP, in the one language none of the "
+                            "rules above read",
                         )
-                        # The same request made by the CLI, where the rule is
-                        # an allowlist of subcommands rather than a pattern
-                        # over the ones that have been seen. `gh pr` is a
-                        # tree of about twenty verbs and all but two of them
-                        # hand back the pull request, its diff or its head;
-                        # naming the dangerous ones is a list that GitHub
-                        # gets to extend. See `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS`
-                        # for what the two on it are and why the walk that
-                        # finds them is a function rather than a regex.
+                        # The same request made by the CLI, where the rule
+                        # is an allowlist twice over rather than a pattern
+                        # over the shapes that have been seen. The outer one
+                        # is the verb. The walk read only `gh pr` until
+                        # 2026-09-19 and skipped every other verb of the CLI,
+                        # so `gh alias set co 'pr checkout'` renamed the verb
+                        # out of its sight and `gh co "$N"` then ran the
+                        # checkout under a word GitHub never shipped. See
+                        # `_SAFE_GH_VERBS` for the three that are on the list
+                        # and what each is doing there.
+                        unsafe_verbs = _unsafe_gh_verbs(reachable)
+                        self.assertEqual(
+                            [],
+                            unsafe_verbs,
+                            f"{path.name}: a step runs {unsafe_verbs}. The "
+                            "only `gh` verbs a step of a workflow holding "
+                            "this token may run are "
+                            f"{sorted(_SAFE_GH_VERBS)}; every other one is "
+                            "refused for not being on the list rather than "
+                            "for being recognised, because an alias renames "
+                            "a verb this file does recognise into one it "
+                            "does not. If a new one is safe, add it to "
+                            "_SAFE_GH_VERBS and say why",
+                        )
+                        # And the inner one, the subcommand under a verb that
+                        # got past it. `gh pr` is a tree of about twenty and
+                        # all but two of them hand back the pull request, its
+                        # diff or its head; naming the dangerous ones is a
+                        # list that GitHub gets to extend. See
+                        # `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS` for what the two
+                        # on it are and why the walk that finds them is a
+                        # function rather than a regex.
                         unsafe_gh = _unsafe_gh_pull_request_commands(reachable)
                         self.assertEqual(
                             [],
                             unsafe_gh,
                             f"{path.name}: a step runs {unsafe_gh}. The only "
-                            "`gh pr` subcommands a step of a workflow holding "
-                            "this token may run are "
+                            "`gh pr` and `gh issue` subcommands a step of a "
+                            "workflow holding this token may run are "
                             f"{sorted(_SAFE_GH_PULL_REQUEST_SUBCOMMANDS)}; "
                             "every other one returns the pull request, its "
                             "diff or its head. If a new one is safe, add it "
