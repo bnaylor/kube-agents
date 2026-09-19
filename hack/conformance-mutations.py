@@ -1026,6 +1026,12 @@ Mutation(
         # keyed on a name can follow -- but the pin it was credited with
         # belongs to the row below, which is the only one here whose `env:`
         # carries the head with no expression in it for the allowlist to see.
+        #
+        # `_INDIRECT_EXPANSION` arrived 2026-09-19 and refuses `${!PTR}` on
+        # sight, so this row now has two killers and still pins neither: the
+        # allowlist fires first either way. The rule's own pin is
+        # `B4-pull-request-target-run-indirect-assembled-name`, whose `env:`
+        # holds no expression at all.
         "B4-pull-request-target-run-indirect-expansion",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2456,9 +2462,15 @@ Mutation(
         "operands does and what `set -euo pipefail` does not",
     ),
     Mutation(
-        # The names alone, expanded indirectly afterwards. `compgen -e`
-        # prints what is exported and `${!N}` reads it, so neither the dump
-        # nor the expansion has the variable's name written in it anywhere.
+        # The names alone, with the value read afterwards. `compgen -e`
+        # prints what is exported and the `eval` reads one of them, so
+        # neither half has the variable's name written in it anywhere.
+        #
+        # The read was `${!N}` until 2026-09-19, and `_INDIRECT_EXPANSION`
+        # now refuses that outright -- which would have left this row killed
+        # by a rule it is not aimed at, and the compgen alternative pinned
+        # by nothing. `eval` is the same read spelled so that only the dump
+        # is refusable.
         "B4-pull-request-target-run-compgen-dump",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2466,14 +2478,190 @@ Mutation(
          "        run: |\n"
          "          for N in $(compgen -e); do\n"
          "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
-         ' B="${!N}";; esac\n'
+         ' eval "B=\\$$N";; esac\n'
          "          done\n"
          '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "list the names of the exported variables and expand the match "
-        "indirectly, which reaches the value with neither half written down",
+        "list the names of the exported variables and read the value of the "
+        "match through `eval`, which reaches it with neither half written "
+        "down",
+    ),
+    Mutation(
+        # The same dump with stderr folded into it, which is what somebody
+        # writes when a program is noisy. `>` was a terminator and `2>` was
+        # not, so this walked past a rule that caught the identical line
+        # without the `2` in it. It pins the `\d+[<>]` alternative in
+        # `_ENUMERATION_END`, which no other row reaches.
+        "B4-pull-request-target-run-env-dump-fd-redirect",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(env 2>&1 | grep -i '^github_head_ref=' "
+         "| sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write the file descriptor in front of the redirect, which is the "
+        "same dump with stderr folded in and was not a terminator",
+    ),
+    Mutation(
+        # The same dump run by its path. `env` is a program, and the
+        # lookbehind that keeps `venv` and `foo.env` from reading as one
+        # excluded a `/` in front of it -- which was how the shebang stayed
+        # green and how this did too. It pins the narrower
+        # `_ENUMERATION_PROGRAM_START`; the shebang is exempted by its
+        # operand now and is held green by the control below.
+        "B4-pull-request-target-run-env-dump-by-path",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(/usr/bin/env | grep -i '^github_head_ref=' "
+         "| sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run the same program by its absolute path, which is the spelling "
+        "the shebang exemption used to cover",
+    ),
+    Mutation(
+        # `compgen -e` lists what is exported; `compgen -v` lists every
+        # variable the shell has, which is a superset of it. The rule read
+        # the narrower one only. The `eval` rather than `${!N}` is
+        # deliberate: with the indirect read here as well this row would die
+        # on `_INDIRECT_EXPANSION` and the `v` in the compgen alternative
+        # would be pinned by nothing.
+        "B4-pull-request-target-run-compgen-variable-dump",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          for N in $(compgen -v); do\n"
+         "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
+         ' eval "B=\\$$N";; esac\n'
+         "          done\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask compgen for every shell variable rather than for the exported "
+        "ones, which is the superset and the same read",
+    ),
+    Mutation(
+        # And the long spelling of the pair. `-A variable` is `-v` and `-A
+        # export` is `-e`, written as the action rather than as the letter,
+        # so a rule that reads only the letters misses both. Its own
+        # alternative, and its own row.
+        "B4-pull-request-target-run-compgen-variable-action",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          for N in $(compgen -A variable); do\n"
+         "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
+         ' eval "B=\\$$N";; esac\n'
+         "          done\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "spell the same action as a word rather than as a letter, which is "
+        "the documented long form and reads nothing like `-v`",
+    ),
+    Mutation(
+        # Bash's own listing, with no program in it at all. `${!GITHUB_@}`
+        # expands to the *names* of every variable with that prefix, so the
+        # enumeration is a parameter expansion and the six alternatives
+        # above -- all of them anchored on a command word -- read none of
+        # it. The `eval` keeps this off `_INDIRECT_EXPANSION`'s pattern, so
+        # the name listing is what kills it.
+        "B4-pull-request-target-run-prefix-name-listing",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          for v in "${!GITHUB_@}"; do\n'
+         '            case $v in *HEAD_REF) eval "B=\\$$v";; esac\n'
+         "          done\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the shell itself for the names, which is a parameter expansion "
+        "and not a command the enumeration rule can anchor on",
+    ),
+    Mutation(
+        # The name assembled a piece at a time and then read through it.
+        # Nothing here enumerates anything -- one variable, chosen by the
+        # script -- and `GITHUB_HEAD_REF` appears nowhere for
+        # `_RUNNER_VARIABLE` to hold against the allowlist. This is the only
+        # row that pins `_INDIRECT_EXPANSION`: the `env:` carries no
+        # expression, so the allowlist that kills
+        # `B4-pull-request-target-run-indirect-expansion` first has nothing
+        # to read here.
+        "B4-pull-request-target-run-indirect-assembled-name",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          v=GITHUB\n"
+         '          v="${v}_HEAD_REF"\n'
+         '          git fetch origin "${!v}" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the variable's name out of two halves and read it "
+        "indirectly, so the name the read resolves to is never in the text",
+    ),
+    Mutation(
+        # The same table out of the kernel rather than out of the shell.
+        # `ps eww $$` prints this process's environment, which is the bytes
+        # `env` prints, and BSD's `e` carries no `-` -- which is what tells
+        # it from the `ps -ef` every ordinary script writes and what the
+        # control below holds green.
+        "B4-pull-request-target-run-ps-environment",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(ps eww $$ | tr ' ' '\\n' "
+         "| grep -i '^github_head_ref=' | sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the environment out of the process table with BSD's `e` "
+        "option, which is neither a shell builtin nor a program named for "
+        "the environment",
+    ),
+    Mutation(
+        # The safe side of `_INDIRECT_EXPANSION`, and the reason that rule
+        # needs a lookahead at all. `${!xs[@]}` is an array's indices and
+        # `for i in "${!xs[@]}"` is the ordinary way to walk one in bash --
+        # no environment in it, no name assembled anywhere. KILLED here
+        # means the rule has been widened into a ban on the `${!` sigil,
+        # which is a suite that reds on the first bash array somebody
+        # iterates.
+        "B4-pull-request-target-run-array-index-walk",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Walk the tool list\n"
+         "        run: |\n"
+         "          xs=(jq yq shellcheck)\n"
+         '          for i in "${!xs[@]}"; do\n'
+         '            echo "$i ${xs[$i]}"\n'
+         "          done\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "iterate an array by its indices, which is the one spelling of "
+        "`${!` that asks for nothing but a subscript",
+        must_survive=True,
     ),
     Mutation(
         # The safe side of the rule above, and the reason it is anchored on
@@ -2481,7 +2669,10 @@ Mutation(
         # contains a word the enumeration rule reads and none of them is a
         # read: `set -euo pipefail` is a directive, `export PATH=...` and
         # `declare -a` are assignments, `env FOO=1 cmd` sets a variable for
-        # one command, and `/usr/bin/env` is a shebang's program. KILLED
+        # one command, `/usr/bin/env python3` runs an interpreter with an
+        # operand rather than dumping anything, and `ps -ef` is the UNIX
+        # spelling of "every process", which says nothing about an
+        # environment and is not BSD's `ps e`. KILLED
         # here means the rule has been widened into a ban on the words,
         # which is a suite that reds on the first ordinary shell script
         # somebody writes.
@@ -2496,6 +2687,7 @@ Mutation(
          '          echo "${tools[@]}" > tools.txt\n'
          "          env GOFLAGS=-mod=readonly ./bin/build\n"
          "          /usr/bin/env python3 ./bin/check.py\n"
+         "          ps -ef | head -3\n"
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",

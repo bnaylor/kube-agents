@@ -772,48 +772,184 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # The reason there was nothing here already is worth writing down, because
 # this file removed it on purpose. Until 2026-09-19 the wholesale refusal of
 # the step's environment was gated on `_UNREADABLE_SHELL`, a list of the
-# shell constructs that defeat the pickup -- `printenv`, `eval`, `env`,
-# `declare`, indirect expansion -- and the gate was removed for being a
-# denylist over idioms with the interpreters already past it. Removing it was
-# right: the refusal it gated is unconditional now, which is strictly more
-# than it was. What went with it was not a condition, though. It was the only
-# thing in the file that had ever read a dump, and a dump does not reach the
-# step's declared `env:` -- which the unconditional refusal reads in full --
-# it reaches the runner's own variables, which nothing reads except by name.
-# The gate and the enumeration were the same code and only one of them was
-# the mistake.
+# shell constructs that defeated the `$NAME` pickup this file carried then --
+# `printenv`, `eval`, `env`, `declare`, indirect expansion -- and the gate
+# was removed for being a denylist over idioms with the interpreters already
+# past it. Removing it was right: the refusal it gated is unconditional now,
+# which is strictly more than it was. What went with it was not a condition,
+# though. It was the only thing in the file that had ever read a dump, and a
+# dump does not reach the step's declared `env:` -- which the unconditional
+# refusal reads in full -- it reaches the runner's own variables, which
+# nothing reads except by name. The gate and the enumeration were the same
+# code and only one of them was the mistake.
 #
 # So this is a list of spellings, which is what the deleted rule was, and the
 # difference is what it decides. The deleted one said "a step that writes
 # `eval` may not have the head in its `env:`", which is a claim about a
 # program; this one says "a step may not ask for its environment", which is a
-# claim about a request, and the requests are a closed set in a way that the
-# ways to read a variable are not: `env` and `printenv` with no operand,
-# `declare -p`, `declare -x`, `export -p`, `compgen -e`, a bare `set`. Each
-# is anchored on a terminator -- end of line, a pipe, a redirect, a
-# semicolon, an `&&`, a closing paren -- because that is what distinguishes
-# the dump from the ordinary use: `env FOO=1 cmd` and `env -i PATH=/bin cmd`
-# set a variable, `declare -a xs` and `export PATH` and `set -euo pipefail`
-# are not reads, and `#!/usr/bin/env bash` is a shebang, so none of them
-# match. What it costs is `conda env` at the end of a line and `python -m
-# venv env`, which are a line of review, and nothing in any carrier here.
+# claim about a request. Requests can be enumerated in a way that the ways to
+# read one variable cannot, so what follows is the enumeration of them -- and
+# what it does *not* reach is written down at the end rather than left to be
+# discovered, because a comment claiming a closed set is the thing round 13
+# found false here.
 #
-# `os.environ`, a bare `environ` and `process.env` are the same request in
-# the two other languages a step can be written in, and they are refused at
-# `_EVENT_PAYLOAD_FILE` already, because there the same mapping is the thing
-# that carries the path to the payload. They are not repeated here: a second
-# pattern for a read the file already refuses is a second thing to keep true,
-# and the mutation table would credit whichever assertion ran first.
+# Eight alternatives in three groups. The two programs that print the
+# environment, `env` and `printenv`, with no operand. The four builtins that
+# print a variable table -- `declare -p` and `declare -x` with `typeset`'s
+# spelling of both, `export -p`, a bare `set`, and `compgen`'s variable
+# actions. And two requests the shell answers itself: `ps` with BSD's `e`
+# option, which prints a process's environment table, and `${!prefix@}`,
+# which expands to the *names* of every variable with that prefix.
+#
+# `compgen -e` was the whole of that builtin until 2026-09-19 and it lists
+# the exported names only. `compgen -v` lists every shell variable, which is
+# a superset -- everything the runner exported into the step is in it -- and
+# `-A variable` and `-A export` are the long spellings of the pair. All three
+# were green, and `for N in $(compgen -v); do case $N in [Gg][Ii]...` reaches
+# `GITHUB_HEAD_REF` with the name spelled in neither case the shell uses.
+# compgen's other actions list something that is not a variable (`-c`
+# commands, `-f` files, `-W` a word list) and are untouched, which is why
+# this is about the action rather than about the program.
+#
+# `ps eww $$` is the same table read out of the kernel rather than out of the
+# shell, and it was green too. BSD's `e` is the request and it carries no
+# `-`, which is exactly what separates it from `ps -ef` and `ps -eo pid,cmd`
+# -- the UNIX spelling of "every process", which says nothing about an
+# environment and which ordinary scripts write. What the alternative costs is
+# the two letters `ps` in prose followed by a word with an `e` in it, which
+# is a line of review on a comment inside a step of a workflow that holds a
+# writable token.
+#
+# `${!prefix@}` is bash's own listing and the reason this comment no longer
+# claims what it claimed. `${!v}` -- the same syntax reading a *value*
+# instead of listing names -- is deliberately not here: it asks for one
+# variable rather than for all of them, and it is refused next door at
+# `_INDIRECT_EXPANSION`, which is a rule about a name this file cannot read.
+# The two patterns are written not to overlap, so each has a mutation row
+# that pins it alone.
+#
+# Each of the first six alternatives is anchored on a terminator -- end of
+# line, a pipe, a redirect, a semicolon, an `&&`, a closing paren -- because
+# that is what distinguishes the dump from the ordinary use: `env FOO=1 cmd`
+# and `env -i PATH=/bin cmd` set a variable, `declare -a xs` and `export
+# PATH` and `set -euo pipefail` are not reads, and `#!/usr/bin/env bash` runs
+# an interpreter, so none of them match. What the anchor costs is `conda env`
+# at the end of a line and `python -m venv env`, which are a line of review,
+# and nothing in any carrier here.
+#
+# A redirect spelled with its file descriptor in front is part of that
+# terminator set as of 2026-09-19 and was not before. `>` was a terminator
+# and `2>` was not, so `env 2>&1 | grep -i '^github_head_ref='` -- the dump
+# with stderr folded in, which is what somebody writes when a program is
+# noisy -- walked past a rule that caught the identical line without the `2`.
+# `\d+[<>]` is the fix, and it takes `1>`, `2>>` and `3<` with it rather than
+# the one spelling that turned up.
+#
+# The lookbehind is two lookbehinds now, and that is the round-13 correction
+# to one. It was `(?<![\w./-])` for every alternative, which is what keeps
+# `foo.env`, `my-env` and `venv` from reading as `env` -- and the `/` in it
+# is also what exempted `#!/usr/bin/env bash`, and therefore also what let
+# `/usr/bin/env | grep -i '^github_head_ref='` through. Those two are the
+# same lookbehind and they are not the same case, so the shebang is no longer
+# what the path prefix is for. `env` and `printenv` are programs, and a
+# program is the same program by path, so their lookbehind drops the `/` and
+# an absolute or relative path in front of either is refused. The shebang is
+# exempted by its own shape instead: its `env` takes the interpreter as an
+# operand, and an operand is not a terminator, so `#!/usr/bin/env bash` and
+# `#!/usr/bin/env -S python3 -u` match nothing. The other four are shell
+# builtins, which cannot be invoked by a path at all, so theirs keeps the `/`
+# and `cat conf/set` stays green.
+#
+# What dropping the `/` costs is a file *named* `env` or `printenv` read at a
+# terminator -- `. ./env` is the shape a repository with a checked-in
+# environment file writes, and it reds now. That is a line of review and a
+# rename, and it is the direction to be wrong in; nothing in this repository
+# writes one, measured rather than assumed.
+#
+# What this rule does not reach, written down rather than implied. A program
+# the step starts inherits the whole environment without asking for it, and
+# no pattern over the step's text can see that happen -- the wholesale
+# refusal of the step's own `env:` is what answers it, which is why this rule
+# is a backstop over the *runner's* variables rather than the rule. And the
+# environment read as a language's own global rather than as a request to the
+# shell -- `os.environ`, `process.env`, perl's `%ENV`, awk's `ENVIRON` -- is
+# refused at `_EVENT_PAYLOAD_FILE`, where the accessor list lives because
+# there the same mapping is the thing that carries the path to the payload.
+# Those are not repeated here: a second pattern for a read the file already
+# refuses is a second thing to keep true, and the mutation table would credit
+# whichever assertion ran first.
+
+#: Where an environment dump ends, and the half of each alternative that
+#: tells a read from an ordinary use of the same word. A redirect counts
+#: whether or not its file descriptor is written out.
+_ENUMERATION_END = r"(?:$|[|>;&)]|\d+[<>])"
+#: A shell builtin cannot be invoked by a path, so a `/` in front of one
+#: belongs to some other word -- a file called `set`, read with `cat` or `.`.
+_ENUMERATION_BUILTIN_START = r"(?<![\w./-])"
+#: A program is the same program by path, so `/usr/bin/env` is `env`. What
+#: used to need the `/` here is the shebang, and the shebang is exempted by
+#: its operand instead.
+_ENUMERATION_PROGRAM_START = r"(?<![\w.-])"
 _ENVIRONMENT_ENUMERATION = re.compile(
-    r"(?<![\w./-])env(?:[ \t]+-[\w-]+)*[ \t]*(?:$|[|>;&)])"
-    r"|(?<![\w./-])printenv(?:[ \t]+-[\w-]+)*[ \t]*(?:$|[|>;&)])"
-    r"|(?<![\w./-])(?:declare|typeset)"
-    r"(?:[ \t]+-[a-zA-Z]*[px][a-zA-Z]*)?[ \t]*(?:$|[|>;&)])"
-    r"|(?<![\w./-])export(?:[ \t]+-p)?[ \t]*(?:$|[|>;&)])"
-    r"|(?<![\w./-])set[ \t]*(?:$|[|>;&)])"
-    r"|(?<![\w./-])compgen[ \t]+-[\w-]*e\b",
+    "|".join((
+        _ENUMERATION_PROGRAM_START
+        + r"env(?:[ \t]+-[\w-]+)*[ \t]*" + _ENUMERATION_END,
+        _ENUMERATION_PROGRAM_START
+        + r"printenv(?:[ \t]+-[\w-]+)*[ \t]*" + _ENUMERATION_END,
+        _ENUMERATION_BUILTIN_START
+        + r"(?:declare|typeset)(?:[ \t]+-[a-zA-Z]*[px][a-zA-Z]*)?[ \t]*"
+        + _ENUMERATION_END,
+        _ENUMERATION_BUILTIN_START
+        + r"export(?:[ \t]+-p)?[ \t]*" + _ENUMERATION_END,
+        _ENUMERATION_BUILTIN_START + r"set[ \t]*" + _ENUMERATION_END,
+        _ENUMERATION_BUILTIN_START
+        + r"compgen[ \t]+(?:-[\w-]*[ev]\b|-A[ \t]*(?:variable|export)\b)",
+        r"\bps[ \t]+(?!-)[a-zA-Z]*e[a-zA-Z]*\b",
+        r"\$\{!\w*[@*]\}",
+    )),
     re.MULTILINE,
 )
+
+# A variable read by a name the text does not contain, and the axis this
+# pull request deleted. `${!v}` expands to the value of the variable *named*
+# by `v`, so `v=GITHUB` / `v="${v}_HEAD_REF"` / `git fetch origin "${!v}"`
+# fetches the fork's branch with `GITHUB_HEAD_REF` written nowhere, no
+# enumeration anywhere for the rule above to read, and nothing on any
+# allowlist to refuse. It was green.
+#
+# This is `_READABLE_PROGRAM`'s argument one noun along. There the point is
+# that a program name assembled out of a variable, a quote or a substitution
+# is a name review cannot read, so the invocation is refused for being
+# unreadable rather than for being recognised. Here the assembled name is a
+# variable's, `_RUNNER_VARIABLE` is the allowlist it would have been held
+# against, and an allowlist over names decides nothing about a name that is
+# not in the text. So the read is refused for being unreadable, which is the
+# answer this file gives an unresolvable ref one field along.
+#
+# It is its own rule rather than one more alternative above because it is not
+# an enumeration: one variable, chosen by the script, with no request for the
+# rest. Round 4 refused `${!` outright inside `_UNREADABLE_SHELL`, this pull
+# request deleted that list with the gate it belonged to, and the deletion is
+# what reopened this -- so it comes back as a rule of its own rather than as
+# a condition on somebody else's, which is what it was before and why it went
+# out with the gate.
+#
+# `${!` has three meanings in bash and the lookahead sorts them. `${!v}` is
+# the indirect read, and `${!v:-x}` is the same read with a default; both are
+# refused. `${!v[0]}` is the indirect read through an array element and is
+# refused with them. `${!xs[@]}` and `${!xs[*]}` are an array's *indices* --
+# `for i in "${!xs[@]}"` is the ordinary way to walk an array and has no
+# environment in it -- so those are excluded rather than refused, and the
+# excluding is why this pattern needs the lookahead at all. `${!prefix@}` and
+# `${!prefix*}` are the third meaning, they belong to the enumeration rule
+# above, and the lookahead excludes them here so that the two rules do not
+# overlap and each keeps a mutation row that pins it alone.
+#
+# What it costs is a step that reads a variable indirectly for an innocent
+# reason -- a lookup table keyed by name is the usual one. That is a line of
+# review and one `case` statement away from naming the variables outright,
+# which is what the failure message asks for.
+_INDIRECT_EXPANSION = re.compile(r"\$\{!\w+\b(?![@*]\}|\[[@*]\]\})")
 
 # A backslash before a newline is not a line break: the shell removes both
 # before the command runs. Every pattern here is line-oriented -- `[^\n]*?`
@@ -2748,11 +2884,29 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             _ENVIRONMENT_ENUMERATION.search(reachable),
                             f"{path.name}: a step reads its whole "
                             "environment -- `env`, `printenv`, `declare "
-                            "-p`, `export -p`, `compgen -e` or a bare "
-                            "`set` -- which hands it `GITHUB_HEAD_REF` and "
-                            "`GITHUB_ACTOR` without naming either, so the "
-                            "allowlist over the names decides nothing. Name "
-                            "the variable you want",
+                            "-p`, `export -p`, a bare `set`, `compgen`'s "
+                            "variable actions, `ps` with BSD's `e`, or "
+                            "bash's own `${!prefix@}` name listing -- which "
+                            "hands it `GITHUB_HEAD_REF` and `GITHUB_ACTOR` "
+                            "without naming either, so the allowlist over "
+                            "the names decides nothing. Name the variable "
+                            "you want",
+                        )
+                        # One variable rather than all of them, reached by a
+                        # name the text does not contain. The rule above is
+                        # about the request; this one is about the name, for
+                        # the reason `_READABLE_PROGRAM` is about the
+                        # program: an allowlist cannot read what is not
+                        # written down.
+                        self.assertIsNone(
+                            _INDIRECT_EXPANSION.search(reachable),
+                            f"{path.name}: a step reads a variable through "
+                            "`${!NAME}`, which expands the variable "
+                            "*named* by NAME, so the name this resolves to "
+                            "is assembled at run time and is not in the "
+                            "text for the allowlist to hold against "
+                            "_SAFE_RUNNER_VARIABLES. Name the variable you "
+                            "want",
                         )
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(reachable),
