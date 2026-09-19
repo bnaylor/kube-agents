@@ -850,7 +850,10 @@ Mutation(
         # field. The job-level spelling reddened -- but through
         # test_B2_no_workflow_grants_a_bot_the_ability_to_approve, which is a
         # neighbour asking a different question, and a neighbour's red is not
-        # this assertion working.
+        # this assertion working. NOISY by construction now that both halves
+        # read the shorthand: `write-all` includes `contents: write`, so
+        # test_B4_contents_write_is_confined_to_the_release_path gains a
+        # holder too. That second red is the other half of the same fix.
         "B4-pull-request-target-permissions-write-all",
         ".github/workflows/risk_classify.yml",
         ("permissions: {}", "permissions: write-all"),
