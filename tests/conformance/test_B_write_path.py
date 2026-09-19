@@ -1221,19 +1221,47 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         not in `consumers` either, and this test would inspect nothing while
         reporting `ok`.
 
-        Not covered: `gh pr checkout` and `gh pr diff`, which need no ref
-        text at all, a local composite action, which moves the checkout into
-        a file this test does not read, and the `run:` half's own laundering
-        -- a `$GITHUB_ENV` write in an earlier step, which arrives in a later
-        step's environment without appearing in its `env:` block. Read that
-        list as examples rather than as the boundary. An earlier version of
-        it was written as though it were complete and did not mention
-        `github.event.after`, which turned out to be both live and shorter
-        than either path it did name. Two entries have since come off it
-        rather than on: `steps.X.outputs.Y` is an expression like any other
-        and the allowlist refuses it for not being recognised, and a
-        `script:` that builds its own client still writes the word `context`
-        to reach the payload.
+        Not covered, each line re-run against this version of the file on
+        2026-09-19 rather than carried forward:
+
+        The API. `gh pr diff "$PR_NUMBER"`, `gh pr checkout "$PR_NUMBER"`,
+        and `gh api repos/O/R/pulls/$N --jq .head.sha` followed by a fetch
+        all pass, because the head arrives from an HTTP call rather than
+        from the event and nothing in the step names a refused expression.
+        Two of those three were refused before 2026-09-19 and are not now:
+        the pull request's number went on `_SAFE_SCRIPT_EXPRESSIONS` this
+        round so that the carriers that label with it stay green, and the
+        number is what those commands take. That is a coverage loss, it is
+        measured rather than inferred, and the argument for paying it is at
+        the list. A `gh pr` backstop is not available: `auto-assign-
+        milestone.yml` runs `gh pr edit`.
+
+        A local composite action. `uses: ./.github/actions/x` moves the
+        steps into a file keyed `runs.steps` that nothing here reads, and
+        the job's own file shows one innocent line.
+
+        The half of `$GITHUB_ENV` laundering that does not name an
+        expression. A step that writes `REV=${{ github.event.after }}` to
+        `$GITHUB_ENV` for a later step to read is refused now -- the writing
+        step names the field, and every step is read -- but a step that
+        writes what `gh pr view --json headRefOid` returned is not, for the
+        same reason the API line above is not.
+
+        A `script:` that splits both halves of the payload path:
+        `globalThis['proc'+'ess']['e'+'nv']['GITHUB_EVENT_'+'PATH']`.
+        `process.env` on its own is refused as of this round, so the
+        residual is narrower than it was -- it now takes string arithmetic
+        over the accessor as well as over the name -- but narrower is not
+        closed.
+
+        Read that list as examples rather than as the boundary. An earlier
+        version of it was written as though it were complete and did not
+        mention `github.event.after`, which turned out to be both live and
+        shorter than either path it did name. Entries have come off it as
+        well as on: `steps.X.outputs.Y` is an expression like any other and
+        the allowlist refuses it for not being recognised, a `script:` that
+        builds its own client still writes the word `context` to reach the
+        payload, and the `$GITHUB_ENV` write above lost its easy half.
         """
         consumers = [
             (path, document)
