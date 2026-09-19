@@ -1735,14 +1735,23 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `workflow_run` gate asserts its own: this test says nothing at all
         about a repository with no `pull_request_target` workflows, or one
         where none of them checks anything out, so it cannot tell "the trigger
-        is gone" from "the parse stopped seeing it". Four workflows carry the
-        trigger today and three of them run a checkout. If either reaches
-        zero the test should be read again, not passed by default.
+        is gone" from "the parse stopped seeing it". Three workflows carry
+        the trigger today -- `auto-assign-milestone.yml`,
+        `hold-unresolved-threads.yml` and `risk_classify.yml` -- and two of
+        them run a checkout; the milestone one runs a single `gh` step and
+        checks nothing out. If either count reaches zero the test should be
+        read again, not passed by default. This said four and three until
+        2026-09-19, which was a grep's answer rather than the parser's:
+        `flaky-check-notify.yml` contains the words `pull_request_target` in
+        a comment explaining why it does not use the trigger, and its `on:`
+        is `workflow_run`. The numbers here are the ones the filter above
+        produces, re-measured against it.
 
-        The `run:` half is two rules over every step of the workflow, and
-        it is not a proof: a script can reach a ref any number of ways and
-        no assertion over YAML will catch all of them. The first rule is
-        literal. The `refs/pull` namespace is refused wherever it appears,
+        The `run:` half is a stack of rules over every step of the
+        workflow, and it is not a proof: a script can reach a ref any number
+        of ways and no assertion over YAML will catch all of them. Two of
+        them are the shapes everything else here was built out of, and they
+        are worth reading in that order. The first is literal. The `refs/pull` namespace is refused wherever it appears,
         along with the two short forms that reach it without the prefix,
         because it is the checkout action's own documented manual equivalent
         and needs no interpolation at all. Its counterpart is further down,
@@ -1750,15 +1759,26 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         its script alone: a step that enumerates the remote's refs holds
         `refs/pull/N/head` whether or not it spelled `pull`, because the
         remote advertises the whole namespace to anyone who asks.
-        `_REMOTE_REF_ENUMERATION` has the two shapes and what refusing them
+        `_REMOTE_REF_ENUMERATION` has the five shapes and what refusing them
         concedes. The second is the `ref:` half's
         rule one field along: a step may name only the expressions in
         `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only those, an
         `actions/github-script` body may reach only the `context` properties
-        in `_SAFE_SCRIPT_CONTEXTS`, and nothing in it may reach the webhook
-        payload as a file. Those are the three languages the payload is
-        written in here -- an expression, a JavaScript property path, and a
-        file on disk -- and the rule is the same in each.
+        in `_SAFE_SCRIPT_CONTEXTS`, it may name only the runner variables in
+        `_SAFE_RUNNER_VARIABLES`, and nothing in it may reach the webhook
+        payload as a file or fetch it over HTTP. Those are the five languages
+        the payload arrives in here -- an expression, a JavaScript property
+        path, a file on disk, a variable the runner set without being asked,
+        and an API request -- and the rule is the same in each: name what is
+        known to be independent of the pull request, and everything else
+        reads as unsafe for not being on a list.
+
+        A sixth thing a job runs is not a language the payload arrives in at
+        all: the image. `container:` and each entry of `services:` are read
+        at the job level rather than the step level, because a job that
+        names one runs every one of its steps inside it, and steps that are
+        innocent line by line are innocent inside the fork's image too. See
+        `_container_blocks`.
 
         "Every step" was "every step that fetches" until 2026-09-19, and the
         gate that said so is gone for the reason every other denylist in
@@ -1819,7 +1839,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
 
         What the allowlist costs is measured rather than assumed, and
         dropping the gate is what made it cost anything. Every step of all
-        four carriers is read now, and two expressions had to go on the
+        three carriers is read now, and two expressions had to go on the
         list for them to stay green: `github.event.pull_request.number`,
         which two of them label and comment with, and `inputs.dry_run`, a
         `workflow_dispatch` boolean. Both arguments are at
@@ -1990,32 +2010,33 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
 
         The API in a spelling none of the rules over it read. Those rules
         are an allowlist of three `gh` verbs, an allowlist of two subcommands
-        under the two of them that take one, the `/pulls` path segment, the
-        `pull/N.diff` web endpoint, the two `/issues/N/...` endpoints that
-        return a commit, and the `pulls` namespace of the Octokit client a
-        `script:` is handed. Every allowlist among them replaced a denylist
-        that lost, and each loss is recorded at the constant. The verb
-        allowlist is the newest and the reason is the sharpest: `gh alias set
-        co 'pr checkout'` renames a governed verb into an ungoverned one, so
-        no list of dangerous verbs can be finished.
+        under the two of them that take one, the same subcommand allowlist
+        again anchored on the argument rather than on the program, the
+        `/pulls` and `/issues` path segments, the `pull/N.diff` web endpoint,
+        and either of those two namespaces on the Octokit client a `script:`
+        is handed. Every allowlist among them replaced a denylist that lost,
+        and each loss is recorded at the constant. The verb allowlist is the
+        sharpest reason: `gh alias set co 'pr checkout'` renames a governed
+        verb into an ungoverned one, so no list of dangerous verbs can be
+        finished.
 
-        What is left is the call made without naming `pulls`, an issues
-        timeline, or an allowlisted `gh` verb: a GraphQL query for
+        What is left is the call made without naming `pulls` or `issues` and
+        without an allowlisted `gh` verb: a GraphQL query for
         `pullRequest(number:)`, or `github.request("GET
         /repos/{owner}/{repo}/pulls/{n}")` spelled with the path in a
-        variable. A `gh` whose own name arrives through the environment came
-        off this list only partly -- `$C pr checkout` with `C: gh` is still
-        unread, but the `env:` that carries `gh` is now the only place it can
-        come from, and the environment is refused wholesale for the head
-        rather than for a program name, so this one is narrower than it
-        reads. Indexing the namespace rather than accessing it --
-        `github.rest["pulls"].get` -- was on this list for an hour on
-        2026-09-19 and is not on it now: it is one quote away from the shape
-        the round closed, which is too close to write down and leave, so the
-        rule reads `rest` and the punctuation between it and `pulls` rather
-        than a dot. What is worth writing down is the GraphQL query: that
-        endpoint is a single URL with no `/pulls` in it, and nothing in this
-        file reads a query document.
+        variable. The GraphQL one is the one worth writing down: that
+        endpoint is a single URL with no path in it at all, and nothing in
+        this file reads a query document.
+
+        A client that is not `gh`, spelled plainly. The argument-shape
+        backstop fires on `pr <subcommand>` only where the program word is
+        one review cannot read, so `hub pr checkout "$N"` -- a real client,
+        with a plain name of its own -- is not refused. That is a hole left
+        open rather than one unnoticed: closing it means a denylist of
+        program names, which is the thing the allowlists here exist to stop
+        needing, and the alternative measured against a live probe was
+        refusing `./tools/high pr checkout 42`, a local program that cannot
+        reach GitHub at all. The argument is at `_READABLE_PROGRAM`.
 
         A local composite action. `uses: ./.github/actions/x` moves the
         steps into a file keyed `runs.steps` that nothing here reads, and
@@ -2029,12 +2050,25 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         line above is not: the backstop reads four spellings and that is
         not one of them.
 
-        A `script:` that splits both halves of the payload path:
-        `globalThis['proc'+'ess']['e'+'nv']['GITHUB_EVENT_'+'PATH']`.
-        `process.env` on its own is refused as of this round, so the
-        residual is narrower than it was -- it now takes string arithmetic
-        over the accessor as well as over the name -- but narrower is not
+        A step that splits the accessor itself, in either language:
+        `globalThis['proc'+'ess']['e'+'nv']['GITHUB_EVENT_'+'PATH']`, or
+        `getattr(__import__("o"+"s"), "environ")`. `process.env`,
+        `process['env']`, `os.environ`, a bare `environ[...]` and `getenv`
+        are all refused as of 2026-09-19, and so is the directory the file
+        sits in, so this residual now takes string arithmetic over the
+        accessor rather than over the variable's name. Narrower is not
         closed.
+
+        A container image that names the fork without an expression.
+        `container:` and `services:` are read as of 2026-09-19 and held
+        against the expression allowlist, which refuses `image: ghcr.io/${{
+        github.event.pull_request.head.repo.full_name }}/x`. A literal
+        `image: ghcr.io/somefork/x:latest` is not refused, and cannot be: a
+        pinned literal image is how a job gets a toolchain, and the rule that
+        refuses a literal `repository:` on a checkout has an expression to
+        recommend instead, which this one does not. The same goes for a
+        literal `--entrypoint` inside `options:`. What is reviewable here is
+        the registry path, which is a line in a diff.
 
         Read that list as examples rather than as the boundary. An earlier
         version of it was written as though it were complete and did not
@@ -2044,7 +2078,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         the allowlist refuses it for not being recognised, a `script:` that
         builds its own client still writes the word `context` to reach the
         payload, the `$GITHUB_ENV` write above lost its easy half, and the
-        API line lost the three shapes a backstop could name.
+        API line lost the three shapes a backstop could name. On 2026-09-19
+        it lost `$C pr checkout` with `C: gh`, which the argument-shape
+        backstop now reads, and the whole of the `issues` namespace, which
+        this list described as two endpoints that return a commit -- a claim
+        that was simply false, because `GET /repos/O/R/issues/N` hands back
+        the pull request's `patch_url` and this repository routes no read
+        through that namespace at all.
         """
         consumers = [
             (path, document)
