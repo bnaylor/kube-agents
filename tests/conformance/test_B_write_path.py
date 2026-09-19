@@ -533,6 +533,37 @@ _PULL_REQUEST_API = re.compile(
 # there -- `--master` is the other candidate -- so that one rung is covered
 # for a command git would have errored on anyway, which is free.
 #
+# The sixth is the same advertisement asked for over REST, and it is the
+# round-13 addition. `GET /repos/{owner}/{repo}/git/matching-refs/{ref}`
+# prefix-matches: the documented behaviour of the endpoint is that it
+# returns every ref beginning with what is asked for, so `gh api
+# "repos/$GITHUB_REPOSITORY/git/matching-refs/pul"` returns the whole pull
+# namespace and `--jq` reads a head SHA out of it. It carries no `ls-remote`,
+# no `*`, no `/info/refs` and no `--mirror`, and it was green. The legacy
+# spelling `git/refs/{ref}` prefix-matches the same way and was green beside
+# it.
+#
+# It belongs to this rule rather than to the `gh` allowlists on the argument
+# this comment already makes: refusing `ls-remote` while conceding the HTTP
+# request underneath it would be a rule about which program is on the runner.
+# `gh api`, `curl` and `fetch()` reach this endpoint identically, so the
+# alternative is the path, and the program is not read.
+#
+# Aimed at the prefix rather than at `pull`. A pattern pinned to
+# `matching-refs/pull` would be walked past by `pul`, by `p`, or by the empty
+# string -- `git/matching-refs/` with nothing after it is every ref in the
+# repository -- so what is refused is the endpoint. What that costs is
+# reading one ref by its full name over REST, which is a line of review and a
+# one-word change: `git/ref/heads/main`, singular, is the exact-match
+# endpoint, it cannot enumerate, and it is deliberately left green as the way
+# to do this.
+#
+# The lookbehind is `(?<![\w.])`, which is what tells the REST path from the
+# directory of the same shape. `.git/refs/heads/main` is a file in the
+# checkout and `cat`ting it reads a ref this repository already has; the `.`
+# in front is the whole difference, and the control that holds it green is a
+# row.
+#
 # The same question asked of everything else this file refuses by name: none
 # of it abbreviates. `ls-remote` is a subcommand and `git-upload-pack` is a
 # service name in a URL, and git abbreviates neither -- there is no `git
@@ -559,6 +590,7 @@ _REMOTE_REF_ENUMERATION = re.compile(
     r"|/info/refs\b"
     r"|\bgit-upload-pack\b"
     r"|--m(?:i(?:r(?:r(?:o(?:r)?)?)?)?)?(?![\w-])"
+    r"|(?<![\w.])git/(?:matching-)?refs\b"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -2141,7 +2173,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         its script alone: a step that enumerates the remote's refs holds
         `refs/pull/N/head` whether or not it spelled `pull`, because the
         remote advertises the whole namespace to anyone who asks.
-        `_REMOTE_REF_ENUMERATION` has the five shapes, what refusing them
+        `_REMOTE_REF_ENUMERATION` has the six shapes, what refusing them
         concedes, and the argument about abbreviation that applies to every
         long option named anywhere in this file: git's parser takes any
         unambiguous prefix of a long option, so `--mirror` is refused as a
@@ -2786,11 +2818,15 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertIsNone(
                             _REMOTE_REF_ENUMERATION.search(reachable),
                             f"{path.name}: a step enumerates the remote's "
-                            "refs, or copies them whole with `clone "
-                            "--mirror` or any prefix of it git accepts, "
-                            "which reaches `refs/pull/N/head` "
-                            "without the step naming it -- grep the listing "
-                            "and the head SHA is a fetch by object name away",
+                            "refs -- over git, over the wire protocol "
+                            "underneath it, or over the REST endpoints that "
+                            "prefix-match a ref -- or copies them whole with "
+                            "`clone --mirror` or any prefix of it git "
+                            "accepts, which reaches `refs/pull/N/head` "
+                            "without the step naming it. Grep the listing "
+                            "and the head SHA is a fetch by object name "
+                            "away. To read one ref by its full name, "
+                            "`git/ref/...` is the exact-match endpoint",
                         )
                         # And the payload over HTTP, which none of the
                         # rules above read either. Refused on the request

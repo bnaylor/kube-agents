@@ -78,7 +78,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Fourteen today, which `--list` is the
+    #: and KILLED is the failure. Sixteen today, which `--list` is the
     #: authority on rather than this comment -- it named ten on 2026-09-19
     #: when there were eleven, and one of the ten by an id no row had:
     #: A3-fastpath-redundant,
@@ -89,6 +89,8 @@ class Mutation:
     #: B4-pull-request-target-api-gh-argv-vector-write,
     #: B4-pull-request-target-api-gh-wrapped-readable-program,
     #: B4-pull-request-target-run-env-ordinary-shell,
+    #: B4-pull-request-target-run-array-index-walk,
+    #: B4-pull-request-target-run-local-ref-file,
     #: B4-pull-request-target-shell-ordinary,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-run-clone-bare,
@@ -993,6 +995,72 @@ Mutation(
         "ask the remote for its ref advertisement over plain HTTP, which "
         "needs no token, no `gh` and no `git` subcommand the rule above "
         "knows by name",
+    ),
+    Mutation(
+        # The advertisement over REST. `git/matching-refs/{ref}` returns
+        # every ref beginning with what is asked for, so a truncated prefix
+        # is the whole pull namespace in one authenticated request -- no
+        # `ls-remote`, no `*`, no `/info/refs`, no `--mirror`, and a verb and
+        # a variable both on their allowlists. `pul` rather than `pull` is
+        # the point: a rule pinned to the namespace would be walked past by
+        # dropping a letter, or by asking for the empty prefix.
+        "B4-pull-request-target-run-matching-refs-endpoint",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         '          S=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs'
+         "/pul\" --jq '.[0].object.sha')\n"
+         '          git fetch origin "$S" && git reset --hard FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the REST endpoint that prefix-matches refs for a prefix of the "
+        "pull namespace, which advertises it without naming it",
+    ),
+    Mutation(
+        # And the legacy spelling of the same endpoint, which prefix-matches
+        # the same way and is what the older documentation and every
+        # half-remembered example write. Its own alternative and its own row:
+        # `git/refs` is not a substring of `git/matching-refs`, so neither
+        # covers the other.
+        "B4-pull-request-target-run-git-refs-endpoint",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         '          S=$(gh api "repos/$GITHUB_REPOSITORY/git/refs'
+         "/pul\" --jq '.[0].object.sha')\n"
+         '          git fetch origin "$S" && git reset --hard FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the older spelling of the same prefix-matching endpoint, which "
+        "returns the identical listing",
+    ),
+    Mutation(
+        # The safe side of both, and the reason the alternative carries a
+        # lookbehind. `.git/refs/heads/main` is a file in the checkout this
+        # workflow already has, and reading it reaches nothing the base
+        # repository did not decide -- the `.` in front is the entire
+        # difference between it and a request to GitHub. KILLED here means
+        # the endpoint has been refused as a bare `refs` path, which reds on
+        # every step that reads its own git directory.
+        "B4-pull-request-target-run-local-ref-file",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Record the base commit\n"
+         "        run: cat .git/refs/heads/main > base.sha\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read a ref out of the checkout's own git directory, which is a "
+        "path on disk rather than a request to the remote",
+        must_survive=True,
     ),
     Mutation(
         # `printenv NAME` is a read of NAME that never writes `$NAME`. The
