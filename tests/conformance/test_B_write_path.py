@@ -550,13 +550,12 @@ _PULL_REQUEST_API = re.compile(
 # alternative is the path, and the program is not read.
 #
 # Aimed at the prefix rather than at `pull`. A pattern pinned to
-# `matching-refs/pull` would be walked past by `pul`, by `p`, or by the empty
-# string -- `git/matching-refs/` with nothing after it is every ref in the
-# repository -- so what is refused is the endpoint. What that costs is
-# reading one ref by its full name over REST, which is a line of review and a
-# one-word change: `git/ref/heads/main`, singular, is the exact-match
-# endpoint, it cannot enumerate, and it is deliberately left green as the way
-# to do this.
+# `matching-refs/pull` would be refused by `pul`, `p`, or the empty string --
+# `git/matching-refs/` with nothing after it is every ref in the repository
+# -- so the refusal is of the endpoint. What that costs is reading one ref by
+# its full name over REST, which is a line of review and a one-word change:
+# `git/ref/heads/main`, singular, is the exact-match endpoint, it cannot
+# enumerate, and it is deliberately left green as the way to do this.
 #
 # The lookbehind is `(?<![\w.])`, which is what tells the REST path from the
 # directory of the same shape. `.git/refs/heads/main` is a file in the
@@ -804,8 +803,9 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # The reason there was nothing here already is worth writing down, because
 # this file removed it on purpose. Until 2026-09-19 the wholesale refusal of
 # the step's environment was gated on `_UNREADABLE_SHELL`, a list of the
-# shell constructs that defeated the `$NAME` pickup this file carried then --
-# `printenv`, `eval`, `env`, `declare`, indirect expansion -- and the gate
+# shell constructs that defeated the `$NAME` pickup this file carried then
+# -- `printenv`, `${!`, `eval`, `env`, `declare` and `source`, read off
+# commit fbfe08ac rather than off a later description of it -- and the gate
 # was removed for being a denylist over idioms with the interpreters already
 # past it. Removing it was right: the refusal it gated is unconditional now,
 # which is strictly more than it was. What went with it was not a condition,
@@ -1141,10 +1141,13 @@ def _expand_env(text, env):
     `${{ env.REV }}`, `${{ env.rev }}` and `${{ Env.REV }}` are one reference
     to one value. A case-sensitive substitution left the third spelling
     standing, where it was neither resolved here nor picked up by the caller
-    as a shell variable, because it is not one. The `run:` half's own pickup
-    is case-*sensitive* and stays that way for the opposite reason: `$rev` is
-    not `$REV` to a shell, so folding in a value the script cannot be reading
-    would be a false red rather than a catch.
+    as a shell variable, because it is not one -- the `run:` half had a pickup
+    that would have caught it, and it does not any more. That pickup was
+    case-*sensitive*, for the opposite reason to this one: `$rev` is not
+    `$REV` to a shell, so folding in a value the script cannot be reading
+    would have been a false red rather than a catch. It went on 2026-09-19
+    and this loop is the only expansion left, which is why the paragraph
+    above is the whole of what "expanded" means here.
 
     The substitution is total: an unknown name is left alone rather than
     blanked, so a miss cannot quietly turn a suspicious ref into an innocent
@@ -2289,49 +2292,43 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         stated grounds that event fields are attacker-controlled input -- so
         a scan of `run:` by itself reads `$PR_HEAD` and sees nothing.
 
-        Which of those values get folded in is a question that stopped
-        deciding anything when the gate went, and saying so is worth more
-        than the loop that answers it. The pickup below folds in the values
-        the script names, following a chain one hop at a time, and the two
-        literal backstops read the result. Those backstops also read every
-        environment value singly, because the wholesale refusal below does,
-        and the folded text is a subset of the values that refusal already
-        walks -- neither pattern can match across the newline the fold joins
-        on, so there is no string the pickup puts in front of a pattern that
-        the pattern was not going to see anyway. That is an argument, so it
-        was also measured: neutering the pickup to an empty mapping leaves
-        all twelve round-7 cases, all fifteen round-6 cases and all
-        forty-two evasion cases at exactly the verdicts they hold with it.
+        Which of those values get folded into the script is a question
+        that stopped deciding anything when the gate went, and there is no
+        loop answering it any more. For three rounds there was one -- a
+        pickup keyed on `$NAME`, `${NAME}`, `${!NAME}` and `printenv NAME`,
+        folding in the values the script appeared to name and following a
+        chain one hop at a time -- and by the end it changed no verdict. The
+        wholesale refusal below reads every value in the step's environment
+        whether or not the script names it, and neither literal backstop can
+        match across the newline a fold joins on, so every string the pickup
+        put in front of a pattern was one some rule already read singly.
+        That is an argument, so it was measured, three rounds running:
+        neutered to the empty mapping it left all twelve round-7 cases, all
+        fifteen round-6 cases and all forty-two evasion cases at exactly the
+        verdicts they held with it.
 
-        It stays because it is cheap and because the wholesale refusal is
-        one edit from being narrowed again, and it stays *unpinned*, which
-        is the part to write down: no mutation row covers it, and none can
-        while no workflow in this repository carries a head in an `env:`
-        value. A row that neutered it would be green forever and would be
-        theatre. Read it as redundancy that is deliberate rather than as a
-        rule -- and if the next round wants it gone, the measurement above
-        is the permission slip.
+        It went on 2026-09-19, and what is left is the one expansion
+        `_expand_env` does -- `${{ env.NAME }}`, which GitHub substitutes
+        before the shell starts and which is therefore redundant with
+        nothing. A loop that changes no verdict is a loop every reader has
+        to disprove, and that is a worse cost than redundancy is worth.
 
         "Names" has to mean both ways of naming, and expansion has to run
         first. A script can reach an `env:` value as `$REV`, which is a
         shell variable, or as `${{ env.REV }}`, which GitHub substitutes
         before the shell ever starts -- and the second spelling is not a
-        shell variable reference, so a pickup keyed on `$NAME` folds in
-        nothing and the fetch reads as innocent. The substitution is
+        shell variable reference, so the pickup that used to run here
+        folded in nothing and the fetch read as innocent. The substitution is
         case-insensitive because GitHub's is, which `${{ Env.REV }}` walked
-        past; the pickup below is case-sensitive because a shell's variables
-        are, and folding in a value `$rev` cannot be reading would be a false
-        red rather than a catch. A value can also name
-        another value, `REV: ${{ env.A }}`, which is text that matches
-        neither the refspec nor the head pattern while `A` never gets
-        followed. So the script is expanded, the pickup runs over the
-        expansion, the picked-up values are expanded too, and the pickup
-        repeats until it stops finding names. Both shapes were live against
-        the first version of this half and both have mutation rows now, as do
-        `printenv NAME` and the indirect `${!PTR}` -- two more ways to spell a
-        read that a pickup keyed on `$NAME` cannot see, and two the rule
-        below now refuses without reading them at all. The repeat is capped
-        by `_ENV_EXPANSION_LIMIT`, the cap `_expand_env` uses.
+        past. A value can also name another value, `REV: ${{ env.A }}`, which
+        is text that matches neither the refspec nor the head pattern while
+        `A` never gets followed -- so the expansion is a fixed-point loop
+        rather than a pass, capped by `_ENV_EXPANSION_LIMIT`. Both shapes
+        were live against the first version of this half and both have
+        mutation rows. So do `printenv NAME` and the indirect `${!PTR}`, two
+        more ways to spell a read no pickup keyed on `$NAME` could have
+        seen, and two the rule below refuses without reading them at all --
+        which is why there is no pickup left to keep case-sensitive.
 
         Past that, the answer is refusal rather than more syntax, and what
         is refused is the environment rather than the script. A step whose
@@ -2341,7 +2338,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         written anywhere; an inline `python3 -c` does the same under the
         default shell; and any program a script starts inherits the whole
         environment without naming a field of it. An earlier version
-        enumerated the shell constructs that defeat the pickup --
+        enumerated the shell constructs that defeated the pickup --
         `printenv`, indirect expansion, `eval`, `env`, `declare`, `source` --
         and refused only a step that used one of them. The verdict was right
         and the condition on it was a guess: a denylist over idioms, one
@@ -2709,8 +2706,9 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "hazard without the checkout action",
                         )
                         # Everything the step's environment will actually
-                        # hold, resolved. Every value rather than the ones
-                        # the pickup found: the rules below are about what
+                        # hold, resolved. Every value rather than the
+                        # ones a script appears to name: the rules below are
+                        # about what
                         # the step can reach, and a program reaches all of
                         # its environment without naming a field of it.
                         environment = {
@@ -2805,8 +2803,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `ls-remote` and copied by a `refs/*` refspec, so a
                         # step that enumerates the remote's refs holds the
                         # head whether or not it spelled `pull` anywhere.
-                        # Read over `reachable` rather than over the script
-                        # and the values the pickup followed, for the reason
+                        # Read over `reachable` rather than over the
+                        # script alone, for the reason
                         # the three rules below are: this is a rule about a
                         # command, and a command assembled out of an `env:`
                         # value is the same command -- the wholesale refusal

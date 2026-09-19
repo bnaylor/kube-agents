@@ -544,9 +544,11 @@ Mutation(
         # measured: the ref is still unresolved, an unresolved ref is still
         # off the allowlist, and the runner records verdicts rather than
         # message text. So this row does not pin that loop and the order does
-        # not make it pin it. Nor does anything else: the pickup's loop was
-        # credited to B4-pull-request-target-run-fetch-verb-chain and is
-        # measured unpinned as of 2026-09-19, for the reason set out there.
+        # not make it pin it. Nor did anything else: the `$NAME` pickup's
+        # own loop was credited to
+        # B4-pull-request-target-run-fetch-verb-chain, was measured unpinned
+        # on 2026-09-19, and went the same day. The loop this row is about
+        # is `_expand_env`'s, which is the one that survived.
         "B4-pull-request-target-checkout-env",
         ".github/workflows/risk_classify.yml",
         ("        with:\n"
@@ -695,9 +697,10 @@ Mutation(
     ),
     Mutation(
         # The run half's version of the `env:` dodge, named the way GitHub
-        # names it. `${{ env.REV }}` is substituted before the shell starts,
-        # so the script never contains a `$REV` for a shell-style pickup to
-        # find, and the value is never folded in.
+        # names it. `${{ env.REV }}` is substituted before the shell
+        # starts, so the script never contains a `$REV`, which is what the
+        # shell-style pickup of the time looked for and what anything keyed
+        # on a sigil still would.
         "B4-pull-request-target-run-fetch-interpolated",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1083,9 +1086,9 @@ Mutation(
     ),
     Mutation(
         # Indirect expansion: `${!PTR}` is the value of the variable *named*
-        # by PTR. Following it is a hop the pickup does not take -- it folds
-        # in PTR, whose value is the string `REV`, and nothing in the haystack
-        # then names the head.
+        # by PTR. Following it was a hop the `$NAME` pickup of the time did
+        # not take -- it folded in PTR, whose value is the string `REV`, and
+        # nothing in the haystack then named the head.
         #
         # This comment used to say the row pinned the environment refusal,
         # and it does not. Measured 2026-09-19: the expression allowlist
@@ -1123,11 +1126,12 @@ Mutation(
         # allowlist refuses before this rule is reached, so deleting the rule
         # leaves all of them KILLED and the pin is imaginary. Here the value
         # is a literal refspec -- no expression at all -- and the script never
-        # names REV, so the pickup folds nothing in and the haystack the two
-        # literal backstops read holds one line of shell that mentions
-        # nothing. What is left is the question the refusal exists for: this
-        # step's environment holds the pull request's head, and whether the
-        # Python file it runs reads it is not a thing this file can know.
+        # names REV, so nothing folds the value in and the text the two
+        # literal backstops read over the script holds one line of shell that
+        # mentions nothing. What is left is the question the refusal
+        # exists for: this step's environment holds the pull request's
+        # head, and whether the Python file it runs reads it is not a thing
+        # this file can know.
         # Measured both ways -- KILLED as it stands, SURVIVED with the
         # `carried` assertion deleted.
         "B4-pull-request-target-run-carried-literal",
@@ -1920,9 +1924,10 @@ Mutation(
         # not been that for two rounds; the correction it then got --
         # crediting the environment refusal -- was wrong too. Measured
         # 2026-09-19: the expression allowlist kills it, on
-        # `github.event.after` in B's value, ahead of both. Reduce the pickup
-        # to a single iteration, or delete the environment refusal, and this
-        # row still dies either way. It pins the expression allowlist over a
+        # `github.event.after` in B's value, ahead of both. With the pickup
+        # reduced to a single iteration, and again with the environment
+        # refusal deleted, this row died either way -- and the pickup itself
+        # went on 2026-09-19. It pins the expression allowlist over a
         # chained `env:`, which is worth a row, and it pins nothing else.
         "B4-pull-request-target-run-fetch-shell-chain",
         ".github/workflows/risk_classify.yml",
@@ -2009,8 +2014,9 @@ Mutation(
     ),
     Mutation(
         # A step whose `shell:` is not a shell. `os.environ["REV"]` is a read
-        # of REV that writes no `$REV` and calls no `printenv`, so the pickup
-        # folds nothing in and every scan over the script comes back empty.
+        # of REV that writes no `$REV` and calls no `printenv`, so nothing
+        # keyed on a name reads it and every scan over the script comes back
+        # empty.
         # The answer is not to learn Python -- what this step reaches is
         # answerable without reading the program.
         #
@@ -2177,15 +2183,15 @@ Mutation(
     Mutation(
         # The fetch verb built two hops deep out of `env:`, so that nothing
         # in the script says `fetch` at all. This was the row credited with
-        # pinning the loop around the pickup, and that was true only while a
-        # gate stood in front of this half: the loop had to run twice for the
-        # gate to open. The gate is gone, and measured 2026-09-19 so is the
-        # pin -- the head is in the `run:` line in plain sight, the expression
-        # allowlist reads it there, and neutering the pickup entirely leaves
-        # this row KILLED. Nothing pins that loop now, which the test's
-        # docstring says in as many words rather than leaving a row to imply
-        # otherwise. The shape stays because two-hop verb laundering is a
-        # thing somebody will write.
+        # pinning the loop around the `$NAME` pickup, and that was true
+        # only while a gate stood in front of this half: the loop had to run
+        # twice for the gate to open. The gate went, and measured 2026-09-19
+        # so had the pin -- the head is in the `run:` line in plain sight,
+        # the expression allowlist reads it there, and neutering the pickup
+        # entirely left this row KILLED. Nothing pinned that loop, and the
+        # loop went the same day; what is left is `_expand_env`'s, which this
+        # row does not pin either. The shape stays because two-hop verb
+        # laundering is a thing somebody will write.
         "B4-pull-request-target-run-fetch-verb-chain",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2206,10 +2212,11 @@ Mutation(
         # and `${{ env['CMD'] }}` is none of them: GitHub substitutes the verb
         # in before the shell starts, so the YAML this file reads says `fetch`
         # nowhere. Two rows already launder the verb through a shell variable;
-        # this one launders it through an expression, which no pickup keyed on
-        # `$NAME` can follow because there is no `$CMD` to find. Killed by the
-        # expression allowlist, which reads `env['CMD']` as `env.cmd` -- not a
-        # recognised expression -- and the head on the same line.
+        # this one launders it through an expression, which nothing keyed on
+        # `$NAME` could follow because there is no `$CMD` to find. Killed
+        # by the expression allowlist, which reads `env['CMD']` as
+        # `env.cmd` -- not a recognised expression -- and the head on the
+        # same line.
         "B4-pull-request-target-run-verb-indexed-env",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
