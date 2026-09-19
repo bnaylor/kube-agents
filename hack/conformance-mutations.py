@@ -528,8 +528,9 @@ Mutation(
         # measured: the ref is still unresolved, an unresolved ref is still
         # off the allowlist, and the runner records verdicts rather than
         # message text. So this row does not pin that loop and the order does
-        # not make it pin it. What pins the pickup's loop is
-        # B4-pull-request-target-run-fetch-verb-chain, one loop along.
+        # not make it pin it. Nor does anything else: the pickup's loop was
+        # credited to B4-pull-request-target-run-fetch-verb-chain and is
+        # measured unpinned as of 2026-09-19, for the reason set out there.
         "B4-pull-request-target-checkout-env",
         ".github/workflows/risk_classify.yml",
         ("        with:\n"
@@ -813,13 +814,16 @@ Mutation(
         # Indirect expansion: `${!PTR}` is the value of the variable *named*
         # by PTR. Following it is a hop the pickup does not take -- it folds
         # in PTR, whose value is the string `REV`, and nothing in the haystack
-        # then names the head. This is the row for the rule that answers the
-        # class rather than the idiom: a step that fetches and carries the
-        # head in its `env:` is refused, whether or not this file can see the
-        # read. The list of unreadable shell constructs that used to gate
-        # that refusal is gone -- it was a denylist over idioms, and
-        # `shell: python` was not on it -- but the pointer is still worth a
-        # row, because it is a read no pickup keyed on a name can follow.
+        # then names the head.
+        #
+        # This comment used to say the row pinned the environment refusal,
+        # and it does not. Measured 2026-09-19: the expression allowlist
+        # fires first, on `github.event.after` inside REV's value, and
+        # deleting the environment refusal outright leaves this row KILLED.
+        # The shape is still worth a row, because it is a read no pickup
+        # keyed on a name can follow -- but the pin it was credited with
+        # belongs to the row below, which is the only one here whose `env:`
+        # carries the head with no expression in it for the allowlist to see.
         "B4-pull-request-target-run-indirect-expansion",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -835,6 +839,32 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "name the variable that names the ref, so the script mentions the "
         "pointer and never the pull request",
+    ),
+    Mutation(
+        # The environment refusal, and the only row that pins it. Every other
+        # candidate carries the head as `${{ ... }}`, which the expression
+        # allowlist refuses before this rule is reached, so deleting the rule
+        # leaves all of them KILLED and the pin is imaginary. Here the value
+        # is a literal refspec -- no expression at all -- and the script never
+        # names REV, so the pickup folds nothing in and the haystack the two
+        # literal backstops read holds one line of shell that mentions
+        # nothing. What is left is the question the refusal exists for: this
+        # step's environment holds the pull request's head, and whether the
+        # Python file it runs reads it is not a thing this file can know.
+        # Measured both ways -- KILLED as it stands, SURVIVED with the
+        # `carried` assertion deleted.
+        "B4-pull-request-target-run-carried-literal",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          REV: refs/pull/42/head\n"
+         "        run: python3 .ci/fetch.py\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "hand the refspec to a helper script through the environment, which "
+        "is tidier than interpolating it and hides it from every scan here",
     ),
     Mutation(
         # Not a `run:` step at all. `actions/github-script` takes JavaScript
@@ -883,13 +913,14 @@ Mutation(
     Mutation(
         # A fetch whose arguments are assembled out of a second env value,
         # so the name the script reads is one hop from the name that matters.
-        # This was the row for the pickup's outer loop, and it is not any
-        # more: B carries the head, and a fetching step whose environment
-        # carries the head is now refused whether or not anything found the
-        # name. Measured: reduce that loop to a single iteration and this row
-        # still dies. B4-pull-request-target-run-fetch-verb-chain is the same
-        # shape with nothing in `env:` for the other rules to catch, and is
-        # what pins the loop now.
+        # This was written as the row for the pickup's outer loop and it has
+        # not been that for two rounds; the correction it then got --
+        # crediting the environment refusal -- was wrong too. Measured
+        # 2026-09-19: the expression allowlist kills it, on
+        # `github.event.after` in B's value, ahead of both. Reduce the pickup
+        # to a single iteration, or delete the environment refusal, and this
+        # row still dies either way. It pins the expression allowlist over a
+        # chained `env:`, which is worth a row, and it pins nothing else.
         "B4-pull-request-target-run-fetch-shell-chain",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -977,9 +1008,15 @@ Mutation(
         # A step whose `shell:` is not a shell. `os.environ["REV"]` is a read
         # of REV that writes no `$REV` and calls no `printenv`, so the pickup
         # folds nothing in and every scan over the script comes back empty.
-        # The answer is not to learn Python: the step fetches and its
-        # environment carries the head, which is a question this file can
-        # settle without reading the program at all.
+        # The answer is not to learn Python -- what this step reaches is
+        # answerable without reading the program.
+        #
+        # Which rule answers it was miscredited here until 2026-09-19. The
+        # comment claimed the environment refusal; measured, the expression
+        # allowlist gets there first, on
+        # `github.event.pull_request.head.sha` in REV's value. The
+        # environment refusal is pinned by
+        # B4-pull-request-target-run-carried-literal and by nothing else.
         "B4-pull-request-target-run-fetch-python-shell",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1135,16 +1172,17 @@ Mutation(
         "is not spelled `head` anywhere",
     ),
     Mutation(
-        # What pins the loop *around* the pickup, which nothing else does now
-        # that a fetching step's environment is refused wholesale: every other
-        # chained row carries the head in `env:` and dies on that rule whether
-        # or not the pickup ever ran. Here `env:` carries no head at all -- the
-        # head is in the script, in plain sight -- and what is laundered is the
-        # fetch verb, two hops deep. Nothing in the script says `fetch`, so the
-        # gate opens only after `$CMD` is folded in, `$VERB` is found in what
-        # that folded in, and the haystack is rebuilt a second time. Measured:
-        # reduce that loop to a single iteration and this row is the one that
-        # goes green.
+        # The fetch verb built two hops deep out of `env:`, so that nothing
+        # in the script says `fetch` at all. This was the row credited with
+        # pinning the loop around the pickup, and that was true only while a
+        # gate stood in front of this half: the loop had to run twice for the
+        # gate to open. The gate is gone, and measured 2026-09-19 so is the
+        # pin -- the head is in the `run:` line in plain sight, the expression
+        # allowlist reads it there, and neutering the pickup entirely leaves
+        # this row KILLED. Nothing pins that loop now, which the test's
+        # docstring says in as many words rather than leaving a row to imply
+        # otherwise. The shape stays because two-hop verb laundering is a
+        # thing somebody will write.
         "B4-pull-request-target-run-fetch-verb-chain",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
