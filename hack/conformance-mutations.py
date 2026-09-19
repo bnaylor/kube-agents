@@ -78,7 +78,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Thirteen today, which `--list` is the
+    #: and KILLED is the failure. Fourteen today, which `--list` is the
     #: authority on rather than this comment -- it named ten on 2026-09-19
     #: when there were eleven, and one of the ten by an id no row had:
     #: A3-fastpath-redundant,
@@ -87,6 +87,7 @@ class Mutation:
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
+    #: B4-pull-request-target-api-gh-wrapped-readable-program,
     #: B4-pull-request-target-run-env-ordinary-shell,
     #: B4-pull-request-target-shell-ordinary,
     #: B4-pull-request-target-checkout-ref-env-case,
@@ -1486,6 +1487,54 @@ Mutation(
         "write the one-line step as a plain scalar rather than a block one, "
         "which is what a step running a single command usually looks like "
         "and which puts the program name at the end of the file",
+    ),
+    Mutation(
+        # A readable word in front of an unreadable program, which is the
+        # round-13 correction to the backstop under all of this. `timeout` is
+        # not the program here and neither is `60`: `g'h'` is, and the rule
+        # that refuses an unreadable one read the first word of the segment.
+        # Nine other wrappers put the same readable word there -- `exec`,
+        # `env`, `nice`, `command`, `sudo`, `xargs`, `time`, `stdbuf`. It
+        # pins the second word `_invocation_programs` returns, the one
+        # immediately before the `pr`, and nothing else reaches it: `g'h'`
+        # has no `gh` in it for `_GH_COMMAND` to find.
+        "B4-pull-request-target-api-gh-wrapped-unreadable-program",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          timeout 60 g'h' pr checkout \"$PR_NUMBER\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put a wrapper in front of the quote-broken name, so the first word "
+        "of the command is a readable program and the one that runs is not",
+    ),
+    Mutation(
+        # The safe side of the same word, and the hole `_READABLE_PROGRAM`
+        # leaves open on purpose. A program with a plain name of its own and
+        # `gh`'s argument shape is conceded -- closing it means a denylist of
+        # client names, which is the thing that rule exists to stop needing
+        # -- and a wrapper in front of a readable program must not change
+        # that. KILLED here means the wrapper fix has been written as "any
+        # `pr` behind more than one word", which reds on every local tool
+        # this repository runs under `timeout`. The `gh` inside `high` is
+        # deliberate: it is preceded by a word character, which is what
+        # `_GH_COMMAND`'s lookbehind is for.
+        "B4-pull-request-target-api-gh-wrapped-readable-program",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Summarise the pull request\n"
+         "        run: timeout 60 ./tools/high pr checkout 42\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run a local tool with a readable name under a wrapper, which is a "
+        "program this file concedes and a shape it must not read as `gh`",
+        must_survive=True,
     ),
     Mutation(
         # The verb renamed, and the row the verb allowlist exists for. `gh

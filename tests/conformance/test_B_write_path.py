@@ -1202,22 +1202,58 @@ def _invocation_words(text, offset):
     return words, invocation
 
 
-def _invocation_program(text, offset):
-    """The program word of the invocation containing `offset`, if it is one.
+def _invocation_programs(text, offset):
+    """The words that could be the program of the invocation around `offset`.
 
     The walk backwards that `_invocation_words` is forwards: from a word in
-    the middle of a command to the word that command started with. It stops
-    at the same separators, so what it returns is the first word of the same
-    segment `_invocation_words` would read to the end of.
+    the middle of a command to the words that command could have started
+    with. It stops at the same separators, so it reads the same segment
+    `_invocation_words` would read to the end of.
 
-    An empty string is an answer, and it is the refusing one: a `pr` with
-    nothing before it on its own segment is the far side of a pipe, which is
-    where `echo "pr checkout $N" | xargs gh` puts its arguments.
+    Two words rather than one, and that is the round-13 correction. It
+    returned the first word of the segment, on the reading that the first
+    word is the program -- which is true of `g'h' pr checkout` and false of
+    every invocation with a wrapper in front of it. `timeout`, `exec`, `env`,
+    `nice`, `command`, `sudo`, `xargs`, `time` and `stdbuf` all put a
+    perfectly readable word at the head of a segment whose actual program is
+    the next one along, so `timeout 60 g'h' pr checkout "$N"` had a readable
+    program by that reading and was skipped. It was green.
+
+    The answer is not a list of the wrappers -- that is the denylist of
+    program names `_READABLE_PROGRAM` exists to stop needing, and it would be
+    wrong again for the tenth wrapper. It is that "which word is the program"
+    has two answers here and the file cannot parse its way to one of them.
+    The first word of the segment is one. The word immediately before the
+    `pr` is the other, because `pr` is the invocation's first argument, so
+    whatever precedes it is the program once however many wrappers have been
+    peeled. Both are returned and the caller refuses if either is unreadable,
+    which is the refusing direction on a question with two readings.
+
+    Punctuation comes off each word and an emptied word is dropped, the same
+    strip `_invocation_words` makes and for the same reason: without it the
+    `"` in `echo "pr merged"` is the word before the `pr`, and a quote is not
+    a name review can read, so a line of prose would be refused for being a
+    quote. `${{ ... }}` is *not* substituted here, unlike in the forward
+    walk: an expression standing where a program goes is a program this file
+    cannot read, and folding it to a placeholder would make it readable.
+
+    An empty list of words is an answer, and it is the refusing one: a `pr`
+    with nothing before it on its own segment is the far side of a pipe,
+    which is where `echo "pr checkout $N" | xargs gh` puts its arguments, and
+    it is also what is left of `"$(command -v gh)" pr checkout` once the walk
+    stops at the closing parenthesis.
     """
     head = text[:offset]
     starts = [match.end() for match in _COMMAND_END.finditer(head)]
-    words = head[starts[-1] :].split() if starts else head.split()
-    return words[0] if words else ""
+    words = [
+        word
+        for word in (
+            raw.strip(_GH_WORD_PUNCTUATION)
+            for raw in (head[starts[-1] :] if starts else head).split()
+        )
+        if word
+    ]
+    return [words[0], words[-1]] if words else [""]
 
 
 def _gh_invocations(text):
@@ -1323,11 +1359,22 @@ def _unsafe_pull_request_subcommands(text):
     the argument at `_READABLE_PROGRAM`. What is left is the shape with no
     readable name in front of it, which is what each of the four spellings
     that walked past `_GH_COMMAND` has in common.
+
+    "In front of it" is two words rather than one, and the argument for that
+    is at `_invocation_programs`: a wrapper puts a readable word at the head
+    of a segment whose program is the next one along, and this rule read the
+    head. Either word being unreadable is enough. What that costs is a line
+    of prose whose last word before `pr` is a variable -- `echo "$TITLE pr is
+    open"` reds -- which is a line of review on a step of a workflow holding
+    a writable token, and is the direction to be wrong in.
     """
     return sorted({
         f"pr {invocation}"[:120]
         for match in _GH_PULL_REQUEST_WORD.finditer(text)
-        if not _READABLE_PROGRAM.match(_invocation_program(text, match.start()))
+        if not all(
+            _READABLE_PROGRAM.match(word)
+            for word in _invocation_programs(text, match.start())
+        )
         for words, invocation in [_invocation_words(text, match.end())]
         if words and words[0] not in _SAFE_GH_PULL_REQUEST_SUBCOMMANDS
     })
