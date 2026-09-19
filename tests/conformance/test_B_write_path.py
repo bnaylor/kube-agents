@@ -501,26 +501,54 @@ _REMOTE_REF_ENUMERATION = re.compile(
 #
 # So does the variable. The variable is a convenience: the file is at
 # `$RUNNER_TEMP/_github_workflow/event.json` and a script that writes the path
-# out reads the same bytes while naming `GITHUB_EVENT_PATH` nowhere. Both
-# halves of that path are alternatives here rather than one joined pattern,
-# because either half alone is already an answer nobody has -- nothing in a
-# workflow legitimately names the runner's internal `_github_workflow`
-# directory, and an `event.json` a step wrote itself is a file the step could
-# have called anything.
+# out reads the same bytes while naming `GITHUB_EVENT_PATH` nowhere. Each
+# piece of that path is its own alternative rather than one joined pattern,
+# because each alone is already an answer nobody has -- nothing in a workflow
+# legitimately names the runner's internal `_github_workflow` directory, and
+# an `event.json` a step wrote itself is a file the step could have called
+# anything.
 #
-# `process.env` is the fourth, and it is refused as an accessor rather than
-# as a name. `process.env['GITHUB_EVENT_' + 'PATH']` is the path with the
-# string split in two, which no pattern over the name can see and which a
-# minifier would produce by accident. Refusing the whole accessor is a rule
-# about reach rather than about spelling, and it is affordable for a reason
-# specific to this input: a `script:` is handed everything it needs as
-# `context`, `github`, `core` and its own `with:` inputs, so a body that goes
-# to the process environment is going somewhere the action already offered it
-# a supported route to. It costs a false red on a `script:` reading an
-# unrelated variable, which is a line of review and one `core.getInput` away
-# from not needing the environment at all.
+# `_github_workflow` was spelled out until 2026-09-19, and a glob is what
+# walked past it: `jq -r .after "$RUNNER_TEMP"/_github_*/*.json` reads the
+# payload with no string arithmetic anywhere, and `_github_*` is not
+# `_github_workflow`. The prefix is the alternative now, and `RUNNER_TEMP`
+# joins it, which makes the directory half of this rule complete rather than
+# a spelling: the payload lives under that variable and nowhere else, so a
+# step that has the variable has the file. It costs a step that wanted
+# scratch space, which writes `$(mktemp -d)` instead -- and which could not
+# have written `${{ runner.temp }}` either, because the expression allowlist
+# refuses that already.
+#
+# The process environment is the last piece, and it is refused as an accessor
+# rather than as a name, in each of the two languages a step can be written
+# in. `process.env['GITHUB_EVENT_' + 'PATH']` is the path with the string
+# split in two, which no pattern over the name can see and which a minifier
+# would produce by accident; `process['env'][...]` is the same read with the
+# accessor itself indexed, and it walked past a pattern that wanted a literal
+# dot. `shell: python` is the other language -- `os.environ["GITHUB_EVENT_" +
+# "PATH"]` and `os.getenv(...)` are the same reach, and an earlier round
+# claimed to handle `shell: python` while reading neither. So the rule is the
+# accessor in both: `process.env`, `os.environ`, a bare `environ[...]` from
+# `from os import environ`, and `getenv`.
+#
+# Refusing the accessor rather than the name is a rule about reach rather
+# than about spelling, and it is affordable for a reason specific to these
+# inputs: a `script:` is handed everything it needs as `context`, `github`,
+# `core` and its own `with:` inputs, and a `run:` step is handed its `env:`
+# block as ordinary shell variables. A body that goes to the process
+# environment programmatically is going somewhere the step already offered it
+# a supported route to. It costs a false red on a script reading an unrelated
+# variable, which is a line of review and one `core.getInput` or one `$NAME`
+# away from not needing the accessor at all.
 _EVENT_PAYLOAD_FILE = re.compile(
-    r"GITHUB_EVENT_PATH|_github_workflow|event\.json|process\s*\.\s*env"
+    r"GITHUB_EVENT_PATH"
+    r"|RUNNER_TEMP"
+    r"|_github"
+    r"|event\.json"
+    r"|\bprocess\s*[.\[]\s*['\"]?env\b"
+    r"|\bos\s*[.\[]\s*['\"]?environ\b"
+    r"|\benviron\s*[.\[]"
+    r"|\bgetenv\b"
 )
 
 # `context.repo` is `{owner, repo}` for the repository the workflow lives in,
@@ -2124,10 +2152,12 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # arrived from the pull request, and no step in a
                         # workflow that must not have the fork's code has
                         # business in any of them. What counts as the read is
-                        # argued at `_EVENT_PAYLOAD_FILE`, and it is four
-                        # patterns rather than one because the variable, the
-                        # path it holds and the process environment that
-                        # carries it are three ways to the same bytes.
+                        # argued at `_EVENT_PAYLOAD_FILE`, and it is eight
+                        # patterns rather than one because the variable, each
+                        # piece of the path it holds, and the process
+                        # environment that carries it in each of the two
+                        # languages a step can be written in are all ways to
+                        # the same bytes.
                         # And the payload over HTTP, which none of the
                         # rules above read either. Refused on the request
                         # rather than on what comes back, for the same reason
@@ -2218,11 +2248,12 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             _EVENT_PAYLOAD_FILE.search(reachable),
                             f"{path.name}: a step reaches the webhook "
                             "payload on disk -- `GITHUB_EVENT_PATH`, the "
-                            "runner's `_github_workflow/event.json`, or "
-                            "`process.env`, which is where the path lives "
-                            "for a `script:`. Every field in that file came "
-                            "from the pull request, and it is the one "
-                            "language neither allowlist reads",
+                            "runner's `$RUNNER_TEMP/_github_workflow/"
+                            "event.json`, or the process environment that "
+                            "holds the path, reached through `process.env`, "
+                            "`os.environ` or `getenv`. Every field in that "
+                            "file came from the pull request, and it is the "
+                            "one language neither allowlist reads",
                         )
                 # `_permission_scopes` rather than the blocks themselves:
                 # `permissions: write-all` is a string, and a filter that

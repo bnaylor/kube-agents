@@ -2112,6 +2112,77 @@ Mutation(
         "what a minifier does and what nothing reading for the name sees",
     ),
     Mutation(
+        # The accessor itself indexed rather than dotted. `process['env']` is
+        # `process.env` to JavaScript and not `process.env` to a pattern that
+        # wanted a literal dot, so the row above could be repaired by writing
+        # one more bracket. This is the row that says the rule is the accessor
+        # and not its punctuation: `process` reaching `env` by either route is
+        # refused, and the name it goes on to build is not read at all.
+        "B4-pull-request-target-script-event-file-indexed-accessor",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const fs = require('fs');\n"
+         "            const p = JSON.parse(fs.readFileSync("
+         "process['env']['GITHUB_EVENT_' + 'PATH']));\n"
+         "            await exec.exec('git', ['fetch', 'origin', p.after]);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "index the accessor instead of dotting it, which is the same read "
+        "with the one character a pattern over `process.env` required",
+    ),
+    Mutation(
+        # The directory half globbed. `_github_*` is the runner's payload
+        # directory and is not the string `_github_workflow`, so the path row
+        # above could be repaired with a wildcard and no string arithmetic
+        # anywhere. This pins the prefix and `RUNNER_TEMP` together: the
+        # payload lives under that variable and nowhere else, so naming the
+        # variable is naming the file whatever the rest of the path says.
+        "B4-pull-request-target-run-event-file-glob",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          REV=$(jq -r .after "$RUNNER_TEMP"/_github_*/*.json)\n'
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "glob the runner's payload directory, which reaches the file without "
+        "writing any of the names the path was pinned by",
+    ),
+    Mutation(
+        # And the same reach in the other language a step can be written in.
+        # An earlier round claimed `shell: python` was handled while reading
+        # only the JavaScript accessor, so `os.environ["GITHUB_EVENT_" +
+        # "PATH"]` was the split name with nothing watching for it. Python's
+        # accessors are refused for the reason JavaScript's are: a `run:` step
+        # is handed its `env:` block as ordinary variables, so a body that
+        # goes to the process environment programmatically is going around
+        # the route it was given.
+        "B4-pull-request-target-python-event-file-environ",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: python\n"
+         "        run: |\n"
+         "          import json, os, subprocess\n"
+         '          rev = json.load(open(os.environ["GITHUB_EVENT_" + '
+         '"PATH"]))["after"]\n'
+         '          subprocess.run(["git", "fetch", "origin", rev])\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the payload from Python, where the variable's name splits the "
+        "same way and the accessor is spelled `os.environ`",
+    ),
+    Mutation(
         # `git remote add` and `git remote update`, which put the fork's code
         # on the runner using none of the four words the old gate watched for.
         # This is the row that says that gate could not have been repaired by
