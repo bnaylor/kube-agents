@@ -78,14 +78,15 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Eight today: B1-assent-rule-weakened,
+    #: and KILLED is the failure. Nine today: B1-assent-rule-weakened,
     #: A3-fastpath-redundant,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
-    #: B4-pull-request-target-api-gh-argv-vector-write, and
-    #: B4-pull-request-target-container-pinned-image.
+    #: B4-pull-request-target-api-gh-argv-vector-write,
+    #: B4-pull-request-target-container-pinned-image, and
+    #: B4-pull-request-target-run-runner-repository-name.
     must_survive: bool = False
 
 
@@ -2316,6 +2317,67 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "name an env value in the case GitHub accepts and this file did not, "
         "carrying the one ref the allowlist holds",
+        must_survive=True,
+    ),
+    Mutation(
+        # The head branch with nothing naming it. `GITHUB_HEAD_REF` is set by
+        # the runner on this trigger and holds the pull request's branch, so
+        # this fetches the fork's code with no expression, no `context`, no
+        # `env:` block, and none of the words `pull`, `head` or `merge`
+        # reaching a pattern that reads for them. It was green.
+        "B4-pull-request-target-run-runner-head-ref",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          git fetch origin "$GITHUB_HEAD_REF"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the branch the runner already put in the environment, which "
+        "is the shortest way to write this and names nothing",
+    ),
+    Mutation(
+        # And the fork itself, assembled out of two more of them.
+        # `GITHUB_ACTOR` is whoever opened the pull request and is therefore
+        # the owner half of the fork's clone URL, and `GITHUB_REPOSITORY`
+        # trimmed at the slash is the other half. Separate row from the one
+        # above because it pins a different entry off the list: repair the
+        # allowlist by adding `GITHUB_HEAD_REF` back to it and this row still
+        # dies.
+        "B4-pull-request-target-run-runner-actor-fork",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          git fetch "https://github.com/$GITHUB_ACTOR/'
+         '${GITHUB_REPOSITORY#*/}" "$GITHUB_HEAD_REF"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the fork's clone URL out of the author's login, which the "
+        "runner hands every step whether or not the workflow asks",
+    ),
+    Mutation(
+        # The runner's environment from the safe side. `GITHUB_REPOSITORY`
+        # and `GITHUB_SHA` are what the base repository decides -- this
+        # repository, and the head commit of its default branch on this
+        # trigger -- and naming them in a log line is ordinary. KILLED here
+        # means the allowlist above has been replaced by a refusal of the
+        # prefix, which reds on a step doing nothing wrong.
+        "B4-pull-request-target-run-runner-repository-name",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Describe the build\n"
+         "        run: |\n"
+         '          echo "building ${GITHUB_REPOSITORY} at ${GITHUB_SHA}"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "log which repository and commit the job is building, naming two "
+        "variables the pull request has no say in",
         must_survive=True,
     ),
     Mutation(

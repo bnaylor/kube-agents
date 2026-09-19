@@ -557,6 +557,84 @@ _EVENT_PAYLOAD_FILE = re.compile(
 # on this trigger, and are not on it.
 _SAFE_SCRIPT_CONTEXTS = frozenset({"repo"})
 
+# And the third language the payload arrives in, after the expression and the
+# `context` object: the variables the runner sets itself. A step names none of
+# them in its `env:` and they are all there -- `GITHUB_HEAD_REF` is the pull
+# request's head branch and `GITHUB_ACTOR` is whoever opened it, so `git fetch
+# "https://github.com/$GITHUB_ACTOR/${GITHUB_REPOSITORY#*/}" "$GITHUB_HEAD_REF"`
+# is the fork's branch fetched from the fork, with no expression, no `context`,
+# no `env:` block and none of the words `pull`, `head` or `merge` reaching any
+# pattern that reads for them. Both were green until 2026-09-19.
+#
+# This is the same allowlist the expressions get, over the same event. It can
+# be an allowlist rather than a list of dangerous names because the namespace
+# is closed: GitHub reserves the `GITHUB_` and `RUNNER_` prefixes and
+# documents every variable it sets, so an unrecognised one is either a
+# variable this file has not read about or a variable a step invented under a
+# reserved prefix, and both of those are questions rather than answers.
+#
+# What is on the list is what the base repository decides. `GITHUB_REPOSITORY`
+# and its owner and id name the repository the workflow is in, which is this
+# one whoever opened the pull request. `GITHUB_REF` and `GITHUB_SHA` are the
+# default branch and its head commit on this trigger, since the 2025-12-08
+# change the test's docstring dates and cites -- the same value
+# `_SAFE_CHECKOUT_EXPRESSIONS` holds, arriving another way. `GITHUB_WORKSPACE`,
+# `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE` and
+# `GITHUB_STEP_SUMMARY` are paths the runner owns; the run and job and workflow
+# identifiers, the three URLs and the event name are facts about the run; and
+# `GITHUB_TOKEN` is the credential this whole test is about, which every
+# carrier names and which B2 and the `permissions:` rules below govern
+# separately. `RUNNER_OS` and `RUNNER_ARCH` are the machine.
+#
+# What is off it is everything the pull request decides. `GITHUB_HEAD_REF` is
+# the head branch; `GITHUB_BASE_REF` is the base branch, off for the reason
+# `github.base_ref` is off `_SAFE_CHECKOUT_EXPRESSIONS`; `GITHUB_ACTOR`,
+# `GITHUB_ACTOR_ID` and `GITHUB_TRIGGERING_ACTOR` are its author, whose login
+# is the owner half of the fork's clone URL; `GITHUB_EVENT_PATH` and
+# `RUNNER_TEMP` are the payload on disk, which `_EVENT_PAYLOAD_FILE` refuses
+# for itself. A step that wants any of them is a step to read, which is what a
+# red here asks for.
+_RUNNER_VARIABLE = re.compile(r"\b(?:GITHUB|RUNNER)_[A-Z0-9_]+\b")
+_SAFE_RUNNER_VARIABLES = frozenset({
+    "GITHUB_ACTION",
+    "GITHUB_ACTIONS",
+    "GITHUB_ACTION_PATH",
+    "GITHUB_ACTION_REPOSITORY",
+    "GITHUB_API_URL",
+    "GITHUB_ENV",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_GRAPHQL_URL",
+    "GITHUB_JOB",
+    "GITHUB_OUTPUT",
+    "GITHUB_PATH",
+    "GITHUB_REF",
+    "GITHUB_REF_NAME",
+    "GITHUB_REF_PROTECTED",
+    "GITHUB_REF_TYPE",
+    "GITHUB_REPOSITORY",
+    "GITHUB_REPOSITORY_ID",
+    "GITHUB_REPOSITORY_OWNER",
+    "GITHUB_REPOSITORY_OWNER_ID",
+    "GITHUB_RETENTION_DAYS",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_NUMBER",
+    "GITHUB_SERVER_URL",
+    "GITHUB_SHA",
+    "GITHUB_STATE",
+    "GITHUB_STEP_SUMMARY",
+    "GITHUB_TOKEN",
+    "GITHUB_WORKFLOW",
+    "GITHUB_WORKFLOW_REF",
+    "GITHUB_WORKFLOW_SHA",
+    "GITHUB_WORKSPACE",
+    "RUNNER_ARCH",
+    "RUNNER_DEBUG",
+    "RUNNER_NAME",
+    "RUNNER_OS",
+    "RUNNER_TOOL_CACHE",
+})
+
 # A backslash before a newline is not a line break: the shell removes both
 # before the command runs. Every pattern here is line-oriented -- `[^\n]*?`
 # in the refspec, a walk that stops at `\n` in the `gh` helper -- so
@@ -2368,6 +2446,33 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # environment that carries it in each of the two
                         # languages a step can be written in are all ways to
                         # the same bytes.
+                        # And the variables the runner sets without being
+                        # asked, which are the payload again in the one
+                        # language a step does not have to write anything to
+                        # get: `$GITHUB_HEAD_REF` is the pull request's
+                        # branch and `$GITHUB_ACTOR` is its author. An
+                        # allowlist, over the environment's names as well as
+                        # its values, because a name is where a step would
+                        # shadow one. See `_SAFE_RUNNER_VARIABLES` for what
+                        # the base repository decides and what the pull
+                        # request does.
+                        runner_named = sorted({
+                            name
+                            for text in [reachable, *environment]
+                            for name in _RUNNER_VARIABLE.findall(text)
+                            if name not in _SAFE_RUNNER_VARIABLES
+                        })
+                        self.assertEqual(
+                            [],
+                            runner_named,
+                            f"{path.name}: a step names {runner_named}, "
+                            "which the runner sets from the pull request "
+                            "rather than from this repository. The variables "
+                            "a step of a workflow holding this token may "
+                            "name are the ones the base repository decides; "
+                            "if one of these is safe, add it to "
+                            "_SAFE_RUNNER_VARIABLES and say why",
+                        )
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(reachable),
                             f"{path.name}: a step reaches the webhook "
