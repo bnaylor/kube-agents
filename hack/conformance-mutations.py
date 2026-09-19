@@ -16,10 +16,12 @@ the file with `git checkout`, and reports:
              Not a failure, but worth reading: it usually means two assertions
              overlap, and occasionally means the mutation was blunter than
              intended.
-    STALE    the `old` text is not in the file, so nothing was mutated and
-             nothing was proved. Reads like silence -- always a bug in the
-             row, usually a pin or a neighbouring line that moved.
-    OVERSHOT the mutation matched in more places than intended.
+    STALE    the file is gone, or the `old` text is not in it, so nothing was
+             mutated and nothing was proved. Reads like silence -- always a
+             bug in the row, usually a renamed file, a pin, or a neighbouring
+             line that moved.
+    OVERSHOT a `must_survive` control was caught: the suite goes red on a
+             change that weakens nothing.
 
 An expected failure that a mutation turns into an *unexpected success* also
 counts as KILLED: the recorded gap moved, which is exactly the signal wanted.

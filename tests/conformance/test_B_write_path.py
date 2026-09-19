@@ -80,16 +80,19 @@ def _workflows():
     merges a pull request" -- asserts an absence, and an absence is true of
     the empty set.
 
-    That one is not defenceless. Moving `.github/workflows` reds four of this
-    file's twenty tests and three more elsewhere: C4's SHA-pin sweep keeps its
-    own copy of this glob and guards it, and `autopush-deploy.yml` is a
-    registered `_harness.SOURCES` entry, so the harness self-check goes red
-    too. But what B2 inherits from that is an answer to somebody else's
-    question, and a count of neighbours is not a thing to depend on. Two
-    counts in this docstring were wrong and corrected during review, which is
-    the argument against writing a third. This is B2 answering its own
-    question, in the place the set is built, for the same reason
-    `_harness.text()` raises rather than returning an empty string.
+    That one is not defenceless. Moving `.github/workflows` reds tests in this
+    file and elsewhere: C4's SHA-pin sweep keeps its own copy of this glob and
+    guards it, and `autopush-deploy.yml` is a registered `_harness.SOURCES`
+    entry, so the harness self-check goes red too. But what B2 inherits from
+    that is an answer to somebody else's question, and a count of neighbours
+    is not a thing to depend on. Three counts in this docstring have been
+    wrong and corrected during review -- the last of them by a change in this
+    same pull request, which added a precondition and so moved the number it
+    had just been corrected to. That is the argument against writing a fourth,
+    so this paragraph names the mechanisms and leaves the counting to whoever
+    runs it. This is B2 answering its own question, in the place the set is
+    built, for the same reason `_harness.text()` raises rather than returning
+    an empty string.
 
     The name is private by convention only -- all five consumers live in this
     module and nothing stops them reading `_WORKFLOWS` directly. What the
