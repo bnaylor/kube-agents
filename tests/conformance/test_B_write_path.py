@@ -148,6 +148,16 @@ _SAFE_SCRIPT_EXPRESSIONS = _SAFE_CHECKOUT_EXPRESSIONS | {
 _SCRIPT_CONTEXT = re.compile(
     r"""\bcontext\b(?:\s*\.\s*(\w+)|\s*\[\s*['"](\w+)['"]\s*\])?"""
 )
+# The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
+# whole webhook event as a file on disk, so a script can read the head SHA out
+# of it without naming an expression for `_SAFE_SCRIPT_EXPRESSIONS` to read or
+# a `context` property for the rule below -- `jq -r .after "$GITHUB_EVENT_PATH"`
+# in a shell, `JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH))` in a
+# `script:` input. Both were live and green against the allowlists above, which
+# is the same lesson a third time: the rule is about reaching the payload, and
+# the payload has more spellings than any one of them covers.
+_EVENT_PAYLOAD_FILE = re.compile(r"GITHUB_EVENT_PATH")
+
 # `context.repo` is `{owner, repo}` for the repository the workflow lives in,
 # which is `github.repository` from the list above in the other language.
 # `context.payload`, `context.sha` and `context.ref` are all the pull request
@@ -949,8 +959,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         and needs no interpolation at all. The second is the `ref:` half's
         rule one field along: a step that fetches may name only the
         expressions in `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only
-        those, and an `actions/github-script` body may reach only the
-        `context` properties in `_SAFE_SCRIPT_CONTEXTS`.
+        those, an `actions/github-script` body may reach only the `context`
+        properties in `_SAFE_SCRIPT_CONTEXTS`, and nothing in it may read
+        `GITHUB_EVENT_PATH`. Those are the three languages the webhook
+        payload is written in here -- an expression, a JavaScript property
+        path, and a file on disk -- and the rule is the same in each.
 
         The second rule was a denylist over three spellings until
         2026-09-19, and it failed the way the `ref:` half's denylist failed,
@@ -1120,14 +1133,17 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
 
         Not covered: `gh pr checkout` and `gh pr diff`, which need no ref
         text at all, a local composite action, which moves the checkout into
-        a file this test does not read, a `script:` input that reaches the
-        payload through its own `require('@actions/github')` rather than
-        through the `context` it is handed, and the `run:` half's own
-        laundering -- a `$GITHUB_ENV` write in an earlier step, or a
-        `steps.X.outputs.Y` the script interpolates. Read that list as examples rather than as
-        the boundary. An earlier version of it was written as though it were
-        complete and did not mention `github.event.after`, which turned out
-        to be both live and shorter than either path it did name.
+        a file this test does not read, and the `run:` half's own laundering
+        -- a `$GITHUB_ENV` write in an earlier step, which arrives in a later
+        step's environment without appearing in its `env:` block. Read that
+        list as examples rather than as the boundary. An earlier version of
+        it was written as though it were complete and did not mention
+        `github.event.after`, which turned out to be both live and shorter
+        than either path it did name. Two entries have since come off it
+        rather than on: `steps.X.outputs.Y` is an expression like any other
+        and the allowlist refuses it for not being recognised, and a
+        `script:` that builds its own client still writes the word `context`
+        to reach the payload.
         """
         consumers = [
             (path, document)
@@ -1391,6 +1407,22 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             f"{carried}. Whether the script reads it is not a "
                             "question this test can answer, so it does not "
                             "assume the answer",
+                        )
+                        # And the payload as a file, which is neither an
+                        # expression nor a `context` property and so reaches
+                        # neither allowlist. Refused on the read rather than
+                        # on what is read out of it: every field in that file
+                        # arrived from the pull request, and a step that
+                        # fetches has no business in any of them.
+                        self.assertIsNone(
+                            _EVENT_PAYLOAD_FILE.search(
+                                "\n".join([script, *environment.values()])
+                            ),
+                            f"{path.name}: a run: step fetches and reads "
+                            "`GITHUB_EVENT_PATH`, which is the whole webhook "
+                            "payload on disk -- the same fields both "
+                            "allowlists refuse, in the one language neither "
+                            "of them reads",
                         )
                 # `_permission_scopes` rather than the blocks themselves:
                 # `permissions: write-all` is a string, and a filter that
