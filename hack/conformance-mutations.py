@@ -529,7 +529,7 @@ Mutation(
         # off the allowlist, and the runner records verdicts rather than
         # message text. So this row does not pin that loop and the order does
         # not make it pin it. What pins the pickup's loop is
-        # B4-pull-request-target-run-fetch-shell-chain, one loop along.
+        # B4-pull-request-target-run-fetch-verb-chain, one loop along.
         "B4-pull-request-target-checkout-env",
         ".github/workflows/risk_classify.yml",
         ("        with:\n"
@@ -618,18 +618,21 @@ Mutation(
     ),
     Mutation(
         # The allowlist is one entry, and this row is why it stays that way.
-        # `github.base_ref` is the base branch on this trigger, which is the
-        # ref a checkout carrying no `ref:` at all is refused for taking; an
-        # allowlist holding both would refuse the implicit spelling and allow
-        # the explicit one. No fork can write it, so this is the pull request
-        # author rather than the attacker the test is named for.
+        # `github.base_ref` is the pull request's base branch, which its
+        # *author* picks from the branches that already exist here: a stale
+        # unprotected one is not the default branch and is not necessarily
+        # code anybody has read this year. No fork can write it -- that needs
+        # push access -- so what this row keeps out is the pull request's
+        # author rather than the fork the test is named for. It is not the
+        # ref an implicit checkout takes: since 2025-12-08 that is the default
+        # branch, which is what the test's own assertion message says.
         "B4-pull-request-target-checkout-base-ref",
         ".github/workflows/risk_classify.yml",
         ("          ref: ${{ github.event.repository.default_branch }}",
          "          ref: ${{ github.base_ref }}"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "name the base branch outright, the one ref the no-ref case is "
-        "already refused for taking",
+        "name the base branch outright, which is a ref the pull request's "
+        "author chooses and nobody re-reviews",
     ),
     Mutation(
         # The literal spelling of B4-pull-request-target-checkout-repository
@@ -694,14 +697,14 @@ Mutation(
         "the shell does",
     ),
     Mutation(
-        # Two hops, both taken inside one pass of the pickup. `$REV` is a
-        # shell reference so REV is picked up, and what the pickup folds in is
-        # `_expand_env(value)` rather than the value -- so `${{ env.A }}`
-        # becomes the SHA before the haystack is rebuilt, and the loop around
-        # the pickup is never reached. Measured: reduce that loop to a single
-        # iteration and this row still dies. It pins the expansion inside the
-        # pickup; B4-pull-request-target-run-fetch-shell-chain pins the loop
-        # around it, which no row did until it was added.
+        # Two hops through `env:`, both in GitHub's own syntax. Written to
+        # pin the expansion inside the pickup -- `${{ env.A }}` becomes the
+        # SHA before the haystack is rebuilt -- and it stopped pinning it on
+        # 2026-09-19, when the rules over a fetching step started reading
+        # every `env:` value in scope rather than the ones the pickup found:
+        # A and REV are now both refused where they stand. Kept as the
+        # two-hop spelling of the `env:` dodge. The loop it used to be about
+        # is pinned by B4-pull-request-target-run-fetch-verb-chain.
         "B4-pull-request-target-run-fetch-chained",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -810,10 +813,13 @@ Mutation(
         # Indirect expansion: `${!PTR}` is the value of the variable *named*
         # by PTR. Following it is a hop the pickup does not take -- it folds
         # in PTR, whose value is the string `REV`, and nothing in the haystack
-        # then names the head. This is the row for the rule that answers
-        # that class rather than that idiom: a step that fetches, carries the
-        # head in its `env:`, and reaches its environment through shell this
-        # file cannot read is refused for being unreadable.
+        # then names the head. This is the row for the rule that answers the
+        # class rather than the idiom: a step that fetches and carries the
+        # head in its `env:` is refused, whether or not this file can see the
+        # read. The list of unreadable shell constructs that used to gate
+        # that refusal is gone -- it was a denylist over idioms, and
+        # `shell: python` was not on it -- but the pointer is still worth a
+        # row, because it is a read no pickup keyed on a name can follow.
         "B4-pull-request-target-run-indirect-expansion",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -875,13 +881,15 @@ Mutation(
         "that hands a pull-request-triggered job the push credential",
     ),
     Mutation(
-        # The shape the pickup's outer loop exists for, which nothing pinned
-        # until this row. `$A` is picked up, and A's value names B in *shell*
-        # syntax -- `origin $B` -- which `_expand_env` does not touch, because
-        # it resolves `${{ env.X }}` and nothing else. So the second name is
-        # found only by rebuilding the haystack and picking up again.
-        # Measured both ways: reduce that loop to a single iteration and this
-        # row goes green while every other run-half row still dies.
+        # A fetch whose arguments are assembled out of a second env value,
+        # so the name the script reads is one hop from the name that matters.
+        # This was the row for the pickup's outer loop, and it is not any
+        # more: B carries the head, and a fetching step whose environment
+        # carries the head is now refused whether or not anything found the
+        # name. Measured: reduce that loop to a single iteration and this row
+        # still dies. B4-pull-request-target-run-fetch-verb-chain is the same
+        # shape with nothing in `env:` for the other rules to catch, and is
+        # what pins the loop now.
         "B4-pull-request-target-run-fetch-shell-chain",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
