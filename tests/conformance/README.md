@@ -93,10 +93,11 @@ and B4's `workflow_run` gate and its `pull_request_target` checkout test each
 assert their own filtered subset non-empty. The fifth asserts an absence, and
 an absence is true of the empty set, so `_workflows()` in
 `test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
-copy of the glob and guards it the same way. C4 is the invariant; its stricter form, which
-also requires the version comment beside each SHA and a digest on a `docker://`
-ref, and the fork-guard check on every auto-triggered credentialed workflow,
-run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
+copy of the glob and guards it the same way. C4 is the invariant. Its stricter
+form — which also requires the version comment beside each SHA and a digest
+on a `docker://` ref — and the fork-guard check on every auto-triggered
+credentialed workflow both run under `make test-python`, in
+`tests/test_workflow_pins_and_fork_guards.py`.
 
 ## Invariant → test → bucket → historical attack
 
@@ -260,12 +261,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-102 mutations: 79 KILLED, 21 NOISY, two `must_survive` controls (one on the
+106 mutations: 83 KILLED, 21 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-17 against
+handling), zero genuine survivors, zero stale — measured 2026-09-18 against
 this branch merged with `main`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 100 of the 102: a
+Note that the summary line the harness prints accounts for 104 of the 106: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
