@@ -272,6 +272,67 @@ _SUBCOMMAND_GOVERNED_GH_VERBS = frozenset({"pr", "issue"})
 # direction to be wrong in.
 _GH_COMMAND = re.compile(r"(?<![\w-])gh(?=[\s'\",])")
 
+# The same walk anchored one word later, and the answer to the thing a regex
+# over a program name cannot do. Every rule above keys on the literal word
+# `gh`, and a shell has unlimited ways to spell a program: `echo "pr checkout
+# $N" | xargs gh` puts the arguments on the far side of a pipe, `"$(command -v
+# gh)" pr checkout "$N"` is how four of this repository's own
+# `scripts/release/*.sh` name a program and puts a `)` where the lookahead
+# wants a quote, `GH=gh` then `"$GH" pr checkout "$N"` moves the name into a
+# variable, and `g'h' pr checkout "$N"` executes `gh` while containing the
+# substring nowhere. All four were live and green. Identifying a program name
+# in shell text is not a thing a regex does, and the next spelling is free.
+#
+# So this rule is about the *argument shape* instead: the word `pr` followed
+# by a subcommand, refused anywhere in a step whatever ran it. The walk is the
+# same one `_gh_invocations` uses, started at the `pr` rather than at the
+# program, so it reads the subcommand through the same interposed flags and
+# the same argv-vector punctuation -- `gh pr -R "$REPO" edit` still resolves to
+# `edit`, and `['pr', 'checkout', N]` still resolves to `checkout`. What it is
+# held against is `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS`, the list the `gh pr`
+# walk already uses, so a subcommand GitHub ships next is refused here for the
+# same reason it is refused there.
+#
+# Read it as a backstop *under* the verb allowlist rather than as the rule.
+# The allowlist is what makes a verb or a subcommand nobody has heard of
+# refused by default; this catches the invocation the allowlist never sees
+# because the program word was unreadable. Keeping both matters: this one
+# cannot see `gh api repos/O/R/pulls/$N`, which has no `pr` word in it, and
+# the allowlist cannot see any of the four spellings above.
+#
+# The lookbehind is what keeps the live carriers green: `--pr "$PR_NUMBER"` is
+# how `risk_classify.yml` passes the number to its script, and a flag is not a
+# command word. The match is case-sensitive because `gh` is -- `gh PR
+# checkout` is an unknown command -- which is also what keeps
+# `auto-assign-milestone.yml`'s `echo "PR #${PR_NUMBER} was merged"` from
+# reading as an invocation.
+_GH_PULL_REQUEST_WORD = re.compile(r"(?<![\w-])pr(?=[\s'\",])")
+
+# And what keeps the backstop under the allowlist rather than over it. A rule
+# on argument shape alone refuses `./tools/high pr checkout 42`, which runs a
+# program in this repository that is not `gh` and cannot reach GitHub, so the
+# shape is only half the rule: the other half is that the program word was
+# one review could not read. `"$GH"`, `g'h'` and `"$(command -v gh)"` are
+# each a name assembled out of something -- a variable, quoting, a
+# substitution -- and a name assembled out of something is a name this file
+# has already lost. A word made only of the characters a path is made of is a
+# name review can read, and for the one such name that reaches GitHub the
+# verb allowlist above is the rule.
+#
+# This is the same trade the arguments make in the other direction. `xargs
+# gh` is refused for having no readable arguments while naming the program;
+# these are refused for having no readable program while naming the
+# arguments. Something has to be readable.
+#
+# It costs `hub pr checkout` and any other client with `gh`'s argument shape
+# and a plain name of its own -- a hole this leaves open deliberately rather
+# than one it does not know about, because closing it means a denylist of
+# program names, which is the thing this rule exists to stop needing. It is
+# also what keeps `is:pr` inside a `gh api search/issues` query green: the
+# `:` is not a word character so the lookbehind matches, but `gh` is a name,
+# and the query is refused by its path anyway.
+_READABLE_PROGRAM = re.compile(r"\A[\w./@-]+\Z")
+
 # What comes off a word before the walk reads it. Quotes were already stripped
 # because `gh pr "edit"` runs `edit`; the brackets and the comma are the
 # round-9 half, and without them widening the lookahead above buys nothing.
@@ -651,6 +712,70 @@ def _join_continuations(text):
     return _LINE_CONTINUATION.sub("", text)
 
 
+def _invocation_words(text, offset):
+    """The command words of the invocation starting at `offset`, and its text.
+
+    Shared by the two walks below, which ask the same question at different
+    anchors: `_gh_invocations` starts at the program name, and the pull
+    request backstop starts at the `pr` word because the program name is not
+    something this file can read. Everything either of them relies on --
+    where an invocation ends, which words are flags, which punctuation comes
+    off a word -- is the same question in both, so it is one function.
+
+    It is a walk and not a parser, and every place it is wrong is wrong in
+    the refusing direction. A flag it does not know takes a value costs a
+    false red rather than a false green: the value is read as the next
+    command word, is not on an allowlist, and the step is refused. That is
+    why the callers' messages quote the whole invocation rather than the word
+    they objected to -- the word can be the wrong one. The walk stops at the
+    first newline, `;`, `|`, `&`, parenthesis or backtick, so a separator
+    inside a quoted string ends it early; that loses the tail of an
+    invocation and cannot invent one.
+
+    Punctuation comes off each word and an emptied word is dropped, which is
+    what makes a JavaScript argument vector read as the command line it is:
+    `exec.exec('gh', ['pr', 'checkout', N])` runs `gh pr checkout` and splits
+    into `',`, `['pr',`, `'checkout',`. The argument for the exact set is at
+    `_GH_WORD_PUNCTUATION`.
+    """
+    rest = text[offset:]
+    stop = _COMMAND_END.search(rest)
+    invocation = (rest[: stop.start()] if stop else rest).strip()
+    words = []
+    skip_value = False
+    stripped = (
+        word.strip(_GH_WORD_PUNCTUATION)
+        for word in _GH_EXPRESSION.sub("EXPR", invocation).split()
+    )
+    for word in (word for word in stripped if word):
+        if skip_value:
+            skip_value = False
+            continue
+        if word.startswith("-"):
+            skip_value = word in _GH_VALUE_FLAGS
+            continue
+        words.append(word)
+    return words, invocation
+
+
+def _invocation_program(text, offset):
+    """The program word of the invocation containing `offset`, if it is one.
+
+    The walk backwards that `_invocation_words` is forwards: from a word in
+    the middle of a command to the word that command started with. It stops
+    at the same separators, so what it returns is the first word of the same
+    segment `_invocation_words` would read to the end of.
+
+    An empty string is an answer, and it is the refusing one: a `pr` with
+    nothing before it on its own segment is the far side of a pipe, which is
+    where `echo "pr checkout $N" | xargs gh` puts its arguments.
+    """
+    head = text[:offset]
+    starts = [match.end() for match in _COMMAND_END.finditer(head)]
+    words = head[starts[-1] :].split() if starts else head.split()
+    return words[0] if words else ""
+
+
 def _gh_invocations(text):
     """Every `gh ...` in `text`, as `(verb, subcommand, invocation)` triples.
 
@@ -658,55 +783,35 @@ def _gh_invocations(text):
     anywhere, so `gh pr -R "$REPO" checkout "$N"` *is* `gh pr checkout` as
     far as the CLI is concerned -- it strips flags before it resolves the
     subcommand -- while "the word immediately after `pr`" is `-R`. Those are
-    two different questions and only the second one is about what runs. This
-    walks the words of each invocation instead, drops anything beginning with
-    `-`, drops the value after a flag known to take one, and reads the first
-    two that survive: the verb, and then the subcommand under it.
+    two different questions and only the second one is about what runs. So
+    `_invocation_words` walks the words instead, and this reads the first two
+    that survive: the verb, and then the subcommand under it. Everything the
+    walk itself concedes is argued there.
 
-    It is a walk and not a parser, and every place it is wrong is wrong in
-    the refusing direction. A flag this does not know takes a value costs a
-    false red rather than a false green: the value is read as the subcommand,
-    is not on the allowlist, and the step is refused. That is why the callers'
-    messages quote the whole invocation rather than the word they objected to
-    -- the word can be the wrong one. The walk stops at the first newline,
-    `;`, `|`, `&`, parenthesis or backtick, so a separator inside a quoted
-    string ends it early; that loses the tail of an invocation and cannot
-    invent one. A verb with no subcommand under it reads as the empty string,
-    which is on no allowlist, on the same reasoning the ref allowlist refuses
-    an expression it cannot resolve.
+    A verb with no subcommand under it reads as the empty string, which is on
+    no allowlist, on the same reasoning the ref allowlist refuses an
+    expression it cannot resolve. So does an invocation with no *words* at
+    all, and that changed on 2026-09-19. It used to be skipped, on the
+    reasoning that a bare `gh` runs nothing -- which is true of `gh` alone at
+    a prompt and false of `echo "pr checkout $N" | xargs gh`, where the
+    arguments arrive on stdin and the walk sees an empty invocation followed
+    by a newline. A `gh` this file cannot read the arguments of is now refused
+    for that, rather than passed for it. What it costs is a false red on a
+    bare `gh` written to print its own help, which nothing here does.
 
-    Punctuation comes off each word and an emptied word is dropped, which is
-    what makes a JavaScript argument vector read as the command line it is:
-    `exec.exec('gh', ['pr', 'checkout', N])` runs `gh pr checkout` and splits
-    into `',`, `['pr',`, `'checkout',`. The argument for the exact set is at
-    `_GH_WORD_PUNCTUATION`. What is not covered is a `gh` whose verb is built
-    out of a variable -- `gh "$SUB" checkout` reads `$SUB` as the verb and
-    refuses it, but `$C pr checkout` with `C: gh` is not read as a `gh`
-    invocation at all. That is the same residue the expression allowlist
-    leaves, and the same answer: an `env:` carrying the head is refused
-    whatever the script does with it.
+    What is not covered is a `gh` whose program name is unreadable -- through
+    a variable, a command substitution, or a quote in the middle of the word.
+    Nothing over the *name* can close that, and the answer is a second rule
+    over the argument shape rather than a wider pattern here: see
+    `_GH_PULL_REQUEST_WORD`.
     """
     for match in _GH_COMMAND.finditer(text):
-        rest = text[match.end():]
-        stop = _COMMAND_END.search(rest)
-        invocation = (rest[: stop.start()] if stop else rest).strip()
-        words = []
-        skip_value = False
-        stripped = (
-            word.strip(_GH_WORD_PUNCTUATION)
-            for word in _GH_EXPRESSION.sub("EXPR", invocation).split()
+        words, invocation = _invocation_words(text, match.end())
+        yield (
+            words[0] if words else "",
+            words[1] if len(words) > 1 else "",
+            invocation,
         )
-        for word in (word for word in stripped if word):
-            if skip_value:
-                skip_value = False
-                continue
-            if word.startswith("-"):
-                skip_value = word in _GH_VALUE_FLAGS
-                continue
-            words.append(word)
-        if not words:
-            continue
-        yield words[0], (words[1] if len(words) > 1 else ""), invocation
 
 
 def _unsafe_gh_verbs(text):
@@ -718,9 +823,12 @@ def _unsafe_gh_verbs(text):
     checkout'` is refused as `alias` and the `gh co "$N"` it installs is
     refused as `co`, neither of them for resembling anything.
 
-    A `gh` with no words after it at all -- the bare program name, or an
-    invocation the walk truncated at a separator before it reached a word --
-    is not yielded by the walk and so is not refused here. It runs nothing.
+    A `gh` with no words after it at all -- the bare program name, an
+    invocation the walk truncated at a separator before it reached a word, or
+    a `gh` reading its argument vector off a pipe -- is yielded with the empty
+    string as its verb, and the empty string is not on the list. That is the
+    round-10 correction to this docstring, which used to say such a `gh` "runs
+    nothing": `echo "pr checkout $N" | xargs gh` runs whatever arrives.
     """
     return sorted({
         f"gh {invocation}"[:120]
@@ -743,6 +851,41 @@ def _unsafe_gh_pull_request_commands(text):
         for verb, subcommand, invocation in _gh_invocations(text)
         if verb in _SUBCOMMAND_GOVERNED_GH_VERBS
         and subcommand not in _SAFE_GH_PULL_REQUEST_SUBCOMMANDS
+    })
+
+
+def _unsafe_pull_request_subcommands(text):
+    """Every `pr <subcommand>` in `text` whose subcommand is not allowlisted.
+
+    The backstop under both allowlists above, and the only one of the three
+    that does not care what program is running. `_GH_PULL_REQUEST_WORD` has
+    the four spellings of the program name that walked past `_GH_COMMAND` and
+    the argument that no fifth one can be ruled out; this is the rule those
+    four share, which is that each of them writes `pr checkout` in the sense
+    the CLI reads it.
+
+    Held against `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS`, the same list
+    `_unsafe_gh_pull_request_commands` uses, through the same walk -- so a
+    subcommand GitHub adds tomorrow is refused here for not being on the list,
+    exactly as it is there, and the two rules cannot disagree about what `pr`
+    may do.
+
+    A `pr` with no word after it is not yielded. Unlike the `gh` case above
+    there is nothing to be refused for: `pr` is not a program, so a `pr` at
+    the end of a line is a word in a sentence rather than an invocation whose
+    arguments went somewhere this file cannot see.
+
+    Neither is a `pr` whose own invocation names a program review can read --
+    the argument at `_READABLE_PROGRAM`. What is left is the shape with no
+    readable name in front of it, which is what each of the four spellings
+    that walked past `_GH_COMMAND` has in common.
+    """
+    return sorted({
+        f"pr {invocation}"[:120]
+        for match in _GH_PULL_REQUEST_WORD.finditer(text)
+        if not _READABLE_PROGRAM.match(_invocation_program(text, match.start()))
+        for words, invocation in [_invocation_words(text, match.end())]
+        if words and words[0] not in _SAFE_GH_PULL_REQUEST_SUBCOMMANDS
     })
 
 
@@ -2029,6 +2172,29 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "every other one returns the pull request, its "
                             "diff or its head. If a new one is safe, add it "
                             "to _SAFE_GH_PULL_REQUEST_SUBCOMMANDS and say why",
+                        )
+                        # And the same list once more, anchored on the
+                        # argument rather than on the program, because the
+                        # program name is the half of a command line a regex
+                        # cannot read. `xargs gh`, `"$(command -v gh)"`,
+                        # `"$GH"` and `g'h'` are four ways to run the CLI
+                        # without writing `gh` where `_GH_COMMAND` looks for
+                        # it, all four were green, and the fifth is free. Each
+                        # of them still writes `pr` and then a subcommand, so
+                        # that is what this reads. See `_GH_PULL_REQUEST_WORD`
+                        # for why it is a backstop under the two allowlists
+                        # rather than a replacement for them.
+                        unsafe_pr = _unsafe_pull_request_subcommands(reachable)
+                        self.assertEqual(
+                            [],
+                            unsafe_pr,
+                            f"{path.name}: a step runs {unsafe_pr}. Whatever "
+                            "program a step names, `pr` followed by anything "
+                            "outside "
+                            f"{sorted(_SAFE_GH_PULL_REQUEST_SUBCOMMANDS)} is "
+                            "the pull request being read, and the program "
+                            "name is the part of a command line this test "
+                            "cannot identify",
                         )
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(reachable),

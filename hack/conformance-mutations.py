@@ -1335,6 +1335,87 @@ Mutation(
         "as a name and a list of arguments rather than as a command line",
     ),
     Mutation(
+        # The program name written the way four of this repository's own
+        # `scripts/release/*.sh` write one. `command -v gh` resolves the path
+        # and the command substitution runs it, so the character after the
+        # letters `gh` is a `)` -- where `_GH_COMMAND`'s lookahead wants
+        # whitespace, a quote or a comma -- and the walk over `gh` is never
+        # started at all. Nothing over the program *name* can close this: a
+        # shell has unlimited ways to spell one, and `"$GH"` and `g'h'` in the
+        # two rows below are two more. What closes it is
+        # `_GH_PULL_REQUEST_WORD`, which reads the argument shape instead and
+        # holds `pr checkout` to the same subcommand allowlist whatever ran
+        # it.
+        "B4-pull-request-target-api-gh-program-path",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          \"$(command -v gh)\" pr checkout \"$PR_NUMBER\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "resolve the CLI's path before running it, which is how the release "
+        "scripts in this repository invoke a tool they are not sure is on "
+        "PATH",
+    ),
+    Mutation(
+        # The same reach with the name in the environment, and the residual
+        # round 9 wrote down and left open: `$C pr checkout` with `C: gh` is
+        # not a `gh` invocation to any rule keyed on the word. The `env:`
+        # value carries no head, so the wholesale environment refusal does
+        # not reach it either. It is closed now for the same reason the row
+        # above is -- the arguments say `pr checkout` whoever runs them.
+        "B4-pull-request-target-api-gh-program-in-env",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          C: gh\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          $C pr checkout \"$PR_NUMBER\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put the program name in the environment with the rest of the step's "
+        "configuration, which is this repository's house style for "
+        "everything else a step needs",
+    ),
+    Mutation(
+        # A `gh` whose arguments this file cannot read at all, and the row
+        # for the other half of the round-10 `gh` fix. The vector is in a
+        # data file, so the step names no verb, no subcommand and no path --
+        # `_GH_PULL_REQUEST_WORD` sees no `pr` either, because there is none
+        # in the workflow. The walk used to skip an invocation with no words
+        # after it, on the reasoning that a bare `gh` runs nothing; a `gh`
+        # taking its argv off a pipe runs whatever arrives, so an unreadable
+        # invocation is refused for being unreadable, which is the answer
+        # this file gives an unresolvable ref one field along. This row is
+        # the only thing pinning that, because every other stdin spelling
+        # writes `pr` somewhere the backstop reads it.
+        "B4-pull-request-target-api-gh-arguments-unreadable",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          jq -r '.argv[]' .github/gh-argv.json | xargs gh\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "keep the CLI's arguments in a data file beside the workflow, which "
+        "is the tidying somebody does to a step that runs the same command "
+        "with a long argument list",
+    ),
+    Mutation(
         # The verb renamed, and the row the verb allowlist exists for. `gh
         # alias set` writes a user-level alias into the CLI's config, so the
         # second line *is* `gh pr checkout` to the CLI and is `gh co` to any
