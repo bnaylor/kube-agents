@@ -78,7 +78,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Seven today: B1-denylist-rule,
+    #: and KILLED is the failure. Seven today: B1-assent-rule-weakened,
     #: A3-fastpath-redundant,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
@@ -579,7 +579,7 @@ Mutation(
          "  classify:",
          "jobs:\n"
          "  prepare:\n"
-         "    uses: ./.github/workflows/k8s-operator-test.yml\n"
+         "    uses: ./.github/workflows/e2e-run.yml\n"
          "\n"
          "  classify:"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
@@ -709,7 +709,9 @@ Mutation(
         # every `env:` value in scope rather than the ones the pickup found:
         # A and REV are now both refused where they stand. Kept as the
         # two-hop spelling of the `env:` dodge. The loop it used to be about
-        # is pinned by B4-pull-request-target-run-fetch-verb-chain.
+        # is pinned by nothing and is gone as of 2026-09-19: it computed a
+        # haystack no verdict read, which is what three rounds of review kept
+        # finding and what the docstring kept promising to remove.
         "B4-pull-request-target-run-fetch-chained",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",

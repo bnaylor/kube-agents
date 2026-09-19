@@ -459,14 +459,16 @@ _SAFE_SCRIPT_CONTEXTS = frozenset({"repo"})
 # rules read, so that what is matched is what the shell will run.
 _LINE_CONTINUATION = re.compile(r"\\\n")
 
-# Enough passes to settle any chain a workflow would plausibly write. Both
-# fixed-point loops that read it -- `_expand_env` and the `run:` half's
-# pickup -- are capped by this rather than run to exhaustion, so a
-# self-referential pair cannot spin.
+# Enough passes to settle any chain a workflow would plausibly write.
+# `_expand_env` is the one fixed-point loop that reads it -- the `run:` half
+# had a second until 2026-09-19 -- and it is capped rather than run to
+# exhaustion, so a self-referential pair cannot spin.
 _ENV_EXPANSION_LIMIT = 10
 
 #: Every scope a `permissions:` block can name, so that `write-all` expands to
-#: what GitHub means by it. Only `contents` and `id-token` are read today; a
+#: what GitHub means by it. Three are read today -- `contents` and `id-token`
+#: by B4, `pull-requests` by B2's approval check, all three through this same
+#: expansion -- and the list is whole rather than those three, because a
 #: shorthand expanded over a partial list would be a quieter way to be wrong
 #: than not expanding it at all.
 _PERMISSION_SCOPES = frozenset({
@@ -1799,68 +1801,33 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                                 "or leave it out, which is the same thing and "
                                 "cannot be a lookalike",
                             )
-                        # The script, plus the `env:` values it actually
-                        # names -- see the docstring on why `run:` alone is
-                        # not enough and why order is not required.
+                        # The step's script, as the shell will see it:
+                        # `run:` plus every string `with:` input, with
+                        # `${{ env.NAME }}` substituted and backslash-newlines
+                        # joined. `run:` alone is not enough -- see the
+                        # docstring -- and neither is the raw text, because
+                        # GitHub substitutes an expression before the shell
+                        # starts and a shell joins a continued line before it
+                        # runs one.
                         #
-                        # This pickup decides nothing on its own any more.
-                        # Only the two literal backstops read what it
-                        # produces, the wholesale refusal further down reads
-                        # every environment value whether the script names it
-                        # or not, and neither backstop matches across a
-                        # newline -- so every string folded in here is one
-                        # that rule was going to look at singly. Measured, at
-                        # the empty mapping, against all three case
-                        # harnesses: not one verdict moves. It is kept as
-                        # redundancy against the day that rule is narrowed,
-                        # and the docstring says plainly that nothing pins
-                        # it, because a mutation row over a redundancy no
-                        # carrier exercises would be green forever.
-                        #
-                        # Everything is expanded before it is matched, and
-                        # the pickup runs over what expansion produced. A
-                        # script naming its value as `${{ env.REV }}` rather
-                        # than as `$REV` is never a shell variable reference,
-                        # so the shell-style pickup alone reads nothing; and
-                        # a value that names another value -- `REV: ${{
-                        # env.A }}` -- is text that matches neither pattern,
-                        # so a pickup that stopped at one hop would fold in
-                        # `A`'s name and not `A`. Iterating both closes the
-                        # pair. The loop terminates because `named` only
-                        # grows and `step_env` is finite; the limit is the
-                        # same cap `_expand_env` uses, and reaching it leaves
-                        # an unexpanded `${{ ... }}`, which the ref half
-                        # refuses and this half simply does not match.
+                        # There is no pickup of the `env:` values the script
+                        # appears to name, and there has not been since
+                        # 2026-09-19. There was one for three rounds, keyed on
+                        # `$NAME`, `${NAME}`, `${!NAME}` and `printenv NAME`,
+                        # and by the end it decided nothing: the wholesale
+                        # refusal below reads every value in the step's
+                        # environment whether or not the script names it, and
+                        # neither literal backstop matches across the newline
+                        # a fold would have joined on, so every string it
+                        # folded in was one some rule already read singly.
+                        # Measured at the empty mapping in three successive
+                        # rounds, and not one verdict moved. A loop that
+                        # changes no verdict is a loop a reader has to
+                        # disprove, which is a worse cost than the redundancy
+                        # was worth.
                         script = _join_continuations(
                             _expand_env(_step_scripts(step), step_env)
                         )
-                        named: dict[str, str] = {}
-                        for _ in range(_ENV_EXPANSION_LIMIT):
-                            haystack = "\n".join([script] + list(named.values()))
-                            picked = {
-                                name: _expand_env(value, step_env)
-                                for name, value in step_env.items()
-                                if name not in named
-                                and re.search(
-                                    # `$NAME`, `${NAME}`, `${!NAME}` and
-                                    # `printenv NAME` are four spellings of
-                                    # the same read. The `!` form names the
-                                    # variable holding the name rather than
-                                    # the value, which this pickup follows
-                                    # one hop and no further. Neither the hop
-                                    # it takes nor the one it cannot decides
-                                    # a verdict: what follows refuses the
-                                    # environment wholesale rather than by
-                                    # what the script appears to read.
-                                    r"\$\{?!?" + re.escape(name) + r"\b"
-                                    r"|\bprintenv\s+" + re.escape(name) + r"\b",
-                                    haystack,
-                                )
-                            }
-                            if not picked:
-                                break
-                            named.update(picked)
-                        haystack = "\n".join([script] + list(named.values()))
                         # The `refs/pull` namespace is refused wherever it
                         # appears, and so are the two short forms that reach
                         # it without the prefix: they are literals, they need
@@ -1870,7 +1837,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # named ref -- see `_PULL_REQUEST_REF` for the three
                         # spellings that taught it the difference.
                         self.assertIsNone(
-                            _PULL_REQUEST_REF.search(haystack),
+                            _PULL_REQUEST_REF.search(script),
                             f"{path.name}: a step names the pull request's "
                             "ref namespace, which is the checkout action's "
                             "hazard without the checkout action",
@@ -1932,7 +1899,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # Belt and braces behind both allowlists, for text
                         # that carries no expression for them to read.
                         self.assertIsNone(
-                            _PULL_REQUEST_HEAD.search(haystack),
+                            _PULL_REQUEST_HEAD.search(script),
                             f"{path.name}: a step names the pull "
                             "request's head, which is the checkout action's "
                             "hazard without the checkout action",
