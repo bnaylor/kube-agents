@@ -2145,19 +2145,6 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "without the step naming it -- grep the listing "
                             "and the head SHA is a fetch by object name away",
                         )
-                        # And the payload as a file, which is neither an
-                        # expression nor a `context` property and so reaches
-                        # neither allowlist. Refused on the read rather than
-                        # on what is read out of it: every field in that file
-                        # arrived from the pull request, and no step in a
-                        # workflow that must not have the fork's code has
-                        # business in any of them. What counts as the read is
-                        # argued at `_EVENT_PAYLOAD_FILE`, and it is eight
-                        # patterns rather than one because the variable, each
-                        # piece of the path it holds, and the process
-                        # environment that carries it in each of the two
-                        # languages a step can be written in are all ways to
-                        # the same bytes.
                         # And the payload over HTTP, which none of the
                         # rules above read either. Refused on the request
                         # rather than on what comes back, for the same reason
@@ -2244,6 +2231,19 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "name is the part of a command line this test "
                             "cannot identify",
                         )
+                        # And the payload as a file, which is neither an
+                        # expression nor a `context` property and so reaches
+                        # neither allowlist. Refused on the read rather than
+                        # on what is read out of it: every field in that file
+                        # arrived from the pull request, and no step in a
+                        # workflow that must not have the fork's code has
+                        # business in any of them. What counts as the read is
+                        # argued at `_EVENT_PAYLOAD_FILE`, and it is eight
+                        # patterns rather than one because the variable, each
+                        # piece of the path it holds, and the process
+                        # environment that carries it in each of the two
+                        # languages a step can be written in are all ways to
+                        # the same bytes.
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(reachable),
                             f"{path.name}: a step reaches the webhook "
