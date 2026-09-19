@@ -1209,7 +1209,7 @@ def _with_inputs(step, name):
     ]
 
 
-def _step_scripts(step):
+def _step_scripts(step, *scopes):
     """Everything in a step that is a script, as one text.
 
     `run:` is the obvious one and it is not the only one.
@@ -1242,13 +1242,43 @@ def _step_scripts(step):
     block, and is folded in whole rather than skipped, so that the scans see
     it rather than nothing.
 
+    `shell:` is folded in too, and it is a command line rather than a name.
+    The runner builds the step's command by substituting the script's
+    temporary file into the value at `{0}`, so `shell: bash -c "gh pr
+    checkout $PR_NUMBER && ./ci.sh" {0}` runs a checkout of the pull request
+    and the `run:` it decorates can be `true`. Every scan downstream of this
+    function reads `run:` and the `with:` values and read no `shell:` at all
+    until 2026-09-19, so that step was green with the whole hazard in a field
+    nothing opened. Folding the value in costs those scans the word `bash` or
+    `python`, which is not a fetch verb, an unrecognised expression or a
+    `context` reference.
+
+    `scopes` are the blocks that can set the shell for a step that does not
+    set its own: the job and the workflow, each through `defaults.run`. Both
+    are read here rather than only where they are written, because a default
+    is the step's command line as much as the step's own field is -- a job
+    whose `defaults.run.shell` carries the command line above runs it once
+    per step, and a rule that read only `steps[*].shell` would be a rule
+    about where the author put it. The whole `defaults.run` mapping is folded
+    in rather than the `shell` key alone, for the reason `_flatten` reads a
+    `container:` block whole: naming the field that matters today is the
+    denylist this file keeps replacing, and `working-directory` is a string
+    an author wrote too.
     """
     scripts = [str((step or {}).get("run", ""))]
+    shell = (step or {}).get("shell")
+    if shell is not None:
+        scripts.append(str(shell))
     inputs = (step or {}).get("with")
     if isinstance(inputs, dict):
         scripts += [value for value in inputs.values() if isinstance(value, str)]
     elif inputs is not None:
         scripts.append(str(inputs))
+    for scope in scopes:
+        defaults = (scope or {}).get("defaults")
+        run_defaults = defaults.get("run") if isinstance(defaults, dict) else defaults
+        if run_defaults is not None:
+            scripts += _flatten(run_defaults)
     return "\n".join(scripts)
 
 
@@ -2393,13 +2423,14 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                                 "cannot be a lookalike",
                             )
                         # The step's script, as the shell will see it:
-                        # `run:` plus every string `with:` input, with
-                        # `${{ env.NAME }}` substituted and backslash-newlines
-                        # joined. `run:` alone is not enough -- see the
-                        # docstring -- and neither is the raw text, because
-                        # GitHub substitutes an expression before the shell
-                        # starts and a shell joins a continued line before it
-                        # runs one.
+                        # `run:` plus every string `with:` input plus the
+                        # `shell:` that runs them and the `defaults.run` the
+                        # job and the workflow set, with `${{ env.NAME }}`
+                        # substituted and backslash-newlines joined. `run:`
+                        # alone is not enough -- see the docstring -- and
+                        # neither is the raw text, because GitHub substitutes
+                        # an expression before the shell starts and a shell
+                        # joins a continued line before it runs one.
                         #
                         # There is no pickup of the `env:` values the script
                         # appears to name, and there has not been since
@@ -2417,7 +2448,9 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # disprove, which is a worse cost than the redundancy
                         # was worth.
                         script = _join_continuations(
-                            _expand_env(_step_scripts(step), step_env)
+                            _expand_env(
+                                _step_scripts(step, job, document), step_env
+                            )
                         )
                         # The `refs/pull` namespace is refused wherever it
                         # appears, and so are the two short forms that reach

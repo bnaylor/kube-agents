@@ -2442,6 +2442,69 @@ Mutation(
         must_survive=True,
     ),
     Mutation(
+        # `shell:` is a command line, and nothing here opened it until
+        # 2026-09-19. The runner builds the step's command by substituting
+        # the script's temporary file in at `{0}`, so everything before that
+        # placeholder runs first -- and a `run:` of `true` is enough to make
+        # the step look like it does nothing. Every scan in the test reads
+        # `run:` and the `with:` values, and this field carried a checkout
+        # of the pull request past all of them.
+        "B4-pull-request-target-step-shell-command-line",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Lint\n"
+         '        shell: bash -c "gh pr checkout $PR_NUMBER && ./ci.sh" {0}\n'
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+         '        run: "true"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put the checkout in the step's `shell:` and leave the `run:` doing "
+        "nothing, which reads as a step that configures its interpreter",
+    ),
+    Mutation(
+        # And the same command line set once for the whole job, which is
+        # where a reader is least likely to look for a program. A job's
+        # `defaults.run.shell` is the command line every step of it runs
+        # under, so this is the row above applied to steps that do not
+        # mention `shell:` at all -- and a rule that read only
+        # `steps[*].shell` would be a rule about where the author put it.
+        "B4-pull-request-target-job-defaults-shell-command-line",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    env:\n"
+         "      PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "    defaults:\n"
+         "      run:\n"
+         '        shell: bash -c "gh pr checkout $PR_NUMBER && ./ci.sh" {0}'),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "set the job's default shell to a command line that checks the pull "
+        "request out, which runs once per step and appears in none of them",
+    ),
+    Mutation(
+        # The safe side of both rows above. `shell: bash` and a
+        # `defaults.run` block naming a shell and a working directory are
+        # ordinary workflow, and folding those values into the scripts must
+        # not red them. KILLED here means `shell:` has been turned into a
+        # field a `pull_request_target` job may not set, which is not what
+        # any of this is about.
+        "B4-pull-request-target-shell-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    defaults:\n"
+         "      run:\n"
+         "        shell: bash\n"
+         "        working-directory: scripts"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name the job's default shell and working directory, which is the "
+        "ordinary use of the block the rule above reads",
+        must_survive=True,
+    ),
+    Mutation(
         # `git remote add` and `git remote update`, which put the fork's code
         # on the runner using none of the four words the old gate watched for.
         # This is the row that says that gate could not have been repaired by
