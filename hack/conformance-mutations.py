@@ -792,6 +792,77 @@ Mutation(
         "line-length housekeeping and unmatches a single-line pattern",
     ),
     Mutation(
+        # A refspec that names no ref. `+refs/pull/${N}/*:refs/remotes/pr/*`
+        # copies the whole namespace onto the runner and the checkout of
+        # `pr/head` happens on the next line, where a pattern needing
+        # `pull/` and `head` on one line can never join them. Refused on the
+        # namespace now rather than on the two ref names.
+        "B4-pull-request-target-run-refspec-wildcard",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          git fetch origin"
+         " \"+refs/pull/${PR_NUMBER}/*:refs/remotes/pr/*\"\n"
+         "          git checkout pr/head\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the pull request namespace with one wildcard refspec, which "
+        "is how anybody mirrors several pull requests at once, and check the "
+        "branch out by its local name on the next line",
+    ),
+    Mutation(
+        # The glob without the `refs/` prefix, which is the third alternative
+        # of _PULL_REQUEST_REF and the only thing that reads it.
+        # `git ls-remote` matches a pattern against the tail of a refname, so
+        # `pull/N/h*` resolves `refs/pull/N/head` while spelling neither the
+        # namespace nor the ref, and what comes back is the SHA the fetch on
+        # the next line wants.
+        "B4-pull-request-target-run-refspec-ls-remote",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          SHA=$(git ls-remote origin"
+         " \"pull/${PR_NUMBER}/h*\" | cut -f1)\n"
+         "          git fetch origin \"$SHA\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "resolve the head with `ls-remote` before fetching it, which is the "
+        "careful way to write a fetch that must not fail on a closed pull "
+        "request",
+    ),
+    Mutation(
+        # The short-form refspec split across a backslash continuation, and
+        # the only row that reads `_join_continuations`. The namespace
+        # alternative does not see this one: there is no `refs/` prefix, and
+        # `pull/${N}/` and `head` are on different lines until the join puts
+        # them back together the way the shell does. Distinct from
+        # B4-pull-request-target-run-pull-continued, which wraps the *verb*
+        # and is caught by the expression allowlist instead.
+        "B4-pull-request-target-run-refspec-continued",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          git fetch origin pull/${PR_NUMBER}/\\\n"
+         "          head\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "wrap a long refspec over two lines with a backslash, which is "
+        "line-length housekeeping everywhere else in this repository",
+    ),
+    Mutation(
         # `printenv NAME` is a read of NAME that never writes `$NAME`. The
         # pickup was keyed on the sigil, so the value was never folded in and
         # the fetch read as innocent.
@@ -951,6 +1022,114 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "read the head out of the CLI's JSON, which is the API call with a "
         "friendlier front end",
+    ),
+    Mutation(
+        # The subcommand the three-verb backstop did not name. `gh pr list`
+        # returns every open pull request with `--json headRefOid`, and
+        # filtering the array by number is one `--jq` away -- so this is `gh
+        # pr view` with the lookup done client-side, past a pattern that read
+        # `checkout`, `diff` and `view` and nothing else. The four rows here
+        # and below are why that pattern is now an allowlist: this one, the
+        # collection endpoint, the interposed flag and the client library
+        # were all green at 5863df72.
+        "B4-pull-request-target-api-gh-pr-list",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          REV=$(gh pr list --state all --json number,headRefOid"
+         " --jq \".[] | select(.number == $PR_NUMBER) | .headRefOid\")\n"
+         "          git fetch origin \"$REV\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the list endpoint for the head rather than the item endpoint, "
+        "which is one subcommand's difference and reads as a survey of open "
+        "pull requests rather than a lookup of this one",
+    ),
+    Mutation(
+        # The same request as B4-pull-request-target-api-gh-api-pulls with
+        # the trailing slash gone. `/pulls?state=all` is the collection, and
+        # it hands back every head the item endpoint would -- the pattern
+        # wanted `/pulls/`, so a `?` where a `/` was expected was the whole
+        # evasion. The path segment is matched on its own boundary now.
+        "B4-pull-request-target-api-pulls-collection",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          REV=$(gh api \"repos/${{ github.repository }}"
+         "/pulls?state=all\" --jq '.[0].head.sha')\n"
+         "          git fetch origin \"$REV\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "page the pulls collection instead of naming a number, which is what "
+        "a workflow that handles several pull requests at once would write",
+    ),
+    Mutation(
+        # `gh pr checkout` with a flag in front of the verb. `-R` is a
+        # persistent flag and the CLI strips flags before it resolves the
+        # subcommand, so this runs exactly what
+        # B4-pull-request-target-api-gh-pr-checkout runs -- but a pattern
+        # anchored on `pr\s+checkout` sees `pr -R` and reports nothing. This
+        # row is the argument for walking the words rather than matching
+        # them, and it is the one that has to stay green if anybody puts the
+        # regex back.
+        "B4-pull-request-target-api-gh-pr-interposed-flag",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: gh pr -R \"${{ github.repository }}\" checkout"
+         " \"$PR_NUMBER\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name the repository explicitly on a checkout that already worked, "
+        "which is the tidying a reviewer asks for when a step runs `gh` "
+        "outside a checked-out tree",
+    ),
+    Mutation(
+        # The same endpoint from the language the shell rules cannot read.
+        # `actions/github-script` hands the step an authenticated Octokit as
+        # `github`, so this names no `gh`, no `/pulls` path and no refused
+        # expression: `context.repo` is on _SAFE_SCRIPT_CONTEXTS and the
+        # number is on _SAFE_SCRIPT_EXPRESSIONS. `data.head.sha` is a
+        # property of the response rather than of the event, so
+        # _PULL_REQUEST_HEAD does not see it either. Pinned to the real
+        # action's SHA, like B4-pull-request-target-script-input: an unpinned
+        # one would trip C4's sweep and the verdict would stop saying which
+        # rule caught this.
+        "B4-pull-request-target-api-octokit-pulls",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const { data } = await github.rest.pulls.get({\n"
+         "              ...context.repo,\n"
+         "              pull_number: ${{ github.event.pull_request.number }}"
+         "\n"
+         "            });\n"
+         "            await exec.exec('git', ['fetch','origin',"
+         " data.head.sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "use the client the action already hands the script, rather than "
+        "shelling out to `gh` -- which is the idiomatic way to write this "
+        "step and the way that names none of the nouns the shell rules read",
     ),
     Mutation(
         # Not a `run:` step at all. `actions/github-script` takes JavaScript
