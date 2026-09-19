@@ -125,7 +125,11 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-kubectl-kuberc-env",
         "agents/platform/scripts/credential_proxy.py",
-        ('"KUBECTL_KUBERC": "false"', '"KUBECTL_KUBERC_UNUSED": "false"'),
+        # Indented to pin the sandbox environment the test reads. The
+        # unindented spelling occurs first, in `_GIT_PROBE_ENVIRONMENT`,
+        # and a one-shot replace aimed there proves nothing.
+        ('            "KUBECTL_KUBERC": "false",',
+         '            "KUBECTL_KUBERC_UNUSED": "false",'),
         "test_A3_default_path_kuberc_is_disabled",
         "rename the env var while 'tidying', leaving the default-path kuberc "
         "feature on and the protection resting on mount geometry alone",
@@ -549,7 +553,9 @@ Mutation(
     Mutation(
         "C1-git-ext-transport",
         "agents/platform/scripts/credential_proxy.py",
-        ('"GIT_ALLOW_PROTOCOL": "https",', '"GIT_ALLOW_PROTOCOL": "https:ext",'),
+        # Indented for the same reason as A3-kubectl-kuberc-env above.
+        ('            "GIT_ALLOW_PROTOCOL": "https",',
+         '            "GIT_ALLOW_PROTOCOL": "https:ext",'),
         "test_C1_git_in_the_broker_cannot_execute_arbitrary_code",
         "re-admit the ext:: transport, which is the whole of the RCE: "
         "`git clone \'ext::sh -c <cmd>\'` runs <cmd> in the credential holder. "
