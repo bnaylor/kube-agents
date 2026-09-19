@@ -646,13 +646,11 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         """
         holders = []
         for path, document in _workflow_documents():
-            scopes = [document.get("permissions") or {}]
-            scopes += [
-                (job or {}).get("permissions") or {}
-                for job in (document.get("jobs") or {}).values()
-            ]
-            for scope in scopes:
-                if isinstance(scope, dict) and scope.get("pull-requests") == "write":
+            # `_permission_scopes`, so that `permissions: write-all` -- which
+            # is a string rather than a mapping, and grants this scope along
+            # with every other -- joins the list rather than slipping past it.
+            for scope in _permission_scopes(document):
+                if scope.get("pull-requests") == "write":
                     holders.append(path.name)
                     break
         self.assertEqual(
