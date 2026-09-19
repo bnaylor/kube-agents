@@ -382,10 +382,8 @@ _GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 # number is on `_SAFE_SCRIPT_EXPRESSIONS`. The refusal is over the `pulls`
 # namespace rather than over its methods, which is the allowlist move one
 # noun up: `get`, `list`, `listFiles` and `listCommits` are four ways to ask
-# the same endpoint the same question. `github.rest.issues.createComment`
-# names `issues` and is untouched, which is what a labelling carrier reaches
-# for. It concedes a false red on a shell path that happens to contain
-# `pulls.` or `/pulls`, which nothing here has.
+# the same endpoint the same question. It concedes a false red on a shell
+# path that happens to contain `pulls.` or `/pulls`, which nothing here has.
 #
 # The web endpoint is the third alternative, and it is the one that needs no
 # token at all. `https://github.com/O/R/pull/N.diff` and its `.patch` sibling
@@ -405,27 +403,47 @@ _GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 # stops at a line end and at either quote, so the match cannot wander out of
 # the URL it started in.
 #
-# The fourth and fifth are the issues endpoints that hand back a commit, and
-# they are an exception to a namespace this file leaves open on purpose. A
-# pull request is an issue to the REST API, so `GET /repos/O/R/issues/N/timeline`
-# returns this pull request's timeline, `committed` events and all, each
-# carrying the head SHA -- `--jq '.[] | select(.event=="committed") | .sha'`
-# and the fetch on the next line is the whole evasion. `/issues/N/events` is
-# the same shape one endpoint along. `listEvents` and `listEventsForTimeline`
-# are those two from a `script:`, through the Octokit the action hands it.
-# Everything else under `issues` stays allowed, because `issues.createComment`
-# and `issues.addLabels` are what a labelling carrier is *for* and refusing the
-# namespace wholesale would red the neighbour of every live carrier here. These
-# two are the exception because they are the only issues endpoints that return
-# a commit rather than a comment, a label or a title -- the reach is the same
-# one `/pulls` has, reached through the noun this file does not police.
+# The fourth is `issues`, closed as a namespace rather than as a list of
+# endpoints, and this is the round-10 correction to a comment that was simply
+# false. It read `/issues/N/timeline` and `/issues/N/events` and said the two
+# "are the only issues endpoints that return a commit rather than a comment, a
+# label or a title". `GET /repos/O/R/issues/N` -- the item endpoint, the
+# shortest URL in the namespace -- hands back `pull_request: {url, html_url,
+# diff_url, patch_url}` for any issue that is a pull request, because a pull
+# request *is* an issue to this API. So `curl -sL "$(gh api
+# "repos/$REPO/issues/$N" --jq .pull_request.patch_url)" | git am` puts the
+# fork's code on the runner while naming no `/pulls`, no `pull/N.diff`, no
+# refused expression and an allowlisted `gh` verb. `--jq .pull_request.url`
+# gives the `/pulls` URL to pass straight back to `gh api`,
+# `github.rest.issues.get` is the same field from a `script:`, and
+# `search/issues?q=repo:$REPO+is:pr` returns every open pull request's
+# `patch_url` without needing a number at all. Four shapes, one endpoint
+# family, and answering them with four more alternatives is the shape that
+# keeps losing here.
+#
+# Closing the namespace is affordable because no carrier in this repository
+# uses it: the three `pull_request_target` workflows make exactly two API
+# calls between them, `gh api repos/O/R/milestones?state=open` and `gh pr edit
+# --milestone`, and neither is an issues path. What it costs is
+# `issues.createComment` and `issues.addLabels`, which an earlier round kept
+# open as the neighbour a labelling carrier would reach for. That neighbour
+# still exists and is `gh issue comment`, which is the CLI, names no API path,
+# and survives on the verb-and-subcommand allowlist -- so what this refuses is
+# the REST spelling of a write that has a working CLI spelling, which is a
+# line of review and a documented alternative rather than a wall. The day a
+# carrier needs the REST form, the answer is an entry and a reason, the same
+# price every allowlist here charges.
+#
+# `listEvents` and `listEventsForTimeline` came off the pattern with the two
+# endpoint paths: every route to the Octokit issues namespace writes `issues`
+# once, including a destructured one, so the method names were alternatives
+# that could only ever match text the namespace rule already matched.
 _PULL_REQUEST_API = re.compile(
     r"/pulls\b"
-    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?pulls\b"
-    r"|\bpulls\s*[.\[]"
+    r"|/issues\b"
+    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?(?:pulls|issues)\b"
+    r"|\b(?:pulls|issues)\s*[.\[]"
     r"|pull/[^\n'\"]*?\.(?:diff|patch)\b"
-    r"|/issues/[^\n'\"]*?/(?:timeline|events)\b"
-    r"|\blistEvents(?:ForTimeline)?\b"
 )
 
 # Enumerating the remote's refs, which reaches `refs/pull/N/head` without
@@ -2118,16 +2136,16 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertIsNone(
                             _PULL_REQUEST_API.search(reachable),
                             f"{path.name}: a step reads the pull request "
-                            "through the API -- a `/pulls` request, the "
-                            "`pulls` namespace of the Octokit client a "
-                            "`script:` input is handed as `github`, the "
-                            "tokenless `pull/N.diff` web endpoint, or the "
-                            "`/issues/N/timeline` and `/issues/N/events` "
-                            "endpoints, which hand back the same head "
-                            "through the noun this file otherwise leaves "
-                            "open -- which is the event's own fields fetched "
-                            "over HTTP, in the one language none of the "
-                            "rules above read",
+                            "through the API -- a `/pulls` or `/issues` "
+                            "request, either of those namespaces on the "
+                            "Octokit client a `script:` input is handed as "
+                            "`github`, or the tokenless `pull/N.diff` web "
+                            "endpoint. A pull request is an issue to this "
+                            "API, so `/issues/N` hands back its `patch_url`; "
+                            "the write a labelling step wants is `gh issue "
+                            "comment`, which names no path. This is the "
+                            "event's own fields fetched over HTTP, in the "
+                            "one language none of the rules above read",
                         )
                         # The same request made by the CLI, where the rule
                         # is an allowlist twice over rather than a pattern

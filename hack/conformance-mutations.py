@@ -1468,15 +1468,15 @@ Mutation(
         "token and no authentication step ahead of it",
     ),
     Mutation(
-        # The head through the noun this file leaves open. A pull request is
-        # an issue to the REST API, and `/issues/N/timeline` returns its
-        # `committed` events, each carrying a head SHA -- so the verb is
-        # `api`, which is allowlisted, and the path says `issues`, which
-        # `_PULL_REQUEST_API` deliberately does not police as a namespace
-        # because `issues.createComment` is what a labelling carrier is for.
-        # The two timeline endpoints are the exception, and this row is why
-        # the exception is written as two endpoints rather than as the
-        # namespace.
+        # The head through the noun this file used to leave open. A pull
+        # request is an issue to the REST API, and `/issues/N/timeline`
+        # returns its `committed` events, each carrying a head SHA -- so the
+        # verb is `api`, which is allowlisted, and the path says `issues`.
+        # This row was the reason `_PULL_REQUEST_API` carried two named issues
+        # endpoints; as of round 10 it carries the namespace instead, because
+        # the item endpoint one segment shorter hands back `patch_url` and no
+        # list of endpoints was ever going to be finished. Kept as the
+        # timeline spelling of a reach the namespace now covers whole.
         "B4-pull-request-target-api-issues-timeline",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1496,14 +1496,79 @@ Mutation(
         "request, which is one endpoint over and returns the same commits",
     ),
     Mutation(
+        # The shortest URL in the namespace, and the round-10 finding the
+        # comment above `_PULL_REQUEST_API` was wrong about. `GET
+        # /repos/O/R/issues/N` is the *item* endpoint, and for an issue that
+        # is a pull request it returns `pull_request: {url, html_url,
+        # diff_url, patch_url}` -- so the fork's patch is one `--jq` away, the
+        # request names no `/pulls`, the `gh` verb is allowlisted, the only
+        # expression in the step is the number, and `git am` puts the fork's
+        # commits on the default-branch checkout with `make test` running them
+        # under the write token. Two rounds of rules over this namespace read
+        # `/issues/N/timeline` and `/issues/N/events` and let the endpoint
+        # they are both suffixes of straight through. This row is why the rule
+        # is the namespace.
+        "B4-pull-request-target-api-issues-item-patch-url",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "          REPO: ${{ github.repository }}\n"
+         "        run: |\n"
+         "          URL=$(gh api \"repos/$REPO/issues/$PR_NUMBER\""
+         " --jq .pull_request.patch_url)\n"
+         "          curl -sL \"$URL\" | git am\n"
+         "          make test\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the pull request off the issue it also is, which is one "
+        "endpoint the API documents as returning the same object and the "
+        "spelling a workflow that handles issues and pull requests together "
+        "already has to hand",
+    ),
+    Mutation(
+        # The same namespace with no number in it at all. `search/issues`
+        # takes a query rather than an identifier, so `repo:O/R+type:pr`
+        # returns every open pull request here, each item carrying the same
+        # `pull_request.patch_url` the row above reads -- which means a step
+        # does not even need `github.event.pull_request.number` on the
+        # expression allowlist to reach a fork's code. Written with `type:pr`
+        # rather than the more usual `is:pr` so that the row isolates the
+        # path alternative: `is:pr` is refused twice over, because the `:` is
+        # not a word character and `_GH_PULL_REQUEST_WORD` reads the rest of
+        # the query as a subcommand.
+        "B4-pull-request-target-api-search-issues",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          REPO: ${{ github.repository }}\n"
+         "        run: |\n"
+         "          U=$(gh api \"search/issues?q=repo:$REPO+type:pr\""
+         " --jq '.items[0].pull_request.patch_url')\n"
+         "          curl -sL \"$U\" | git am\n"
+         "          make test\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "search for the repository's open pull requests rather than naming "
+        "one, which is what a step that sweeps them all would write",
+    ),
+    Mutation(
         # The same endpoint from the language the shell rules cannot read,
         # and the pair to the row above the way
         # B4-pull-request-target-api-octokit-pulls is the pair to
         # B4-pull-request-target-api-gh-api-pulls. `listEventsForTimeline` is
         # the client method for `/issues/N/timeline`, so the path alternative
-        # never sees it -- there is no slash anywhere in the call -- and the
-        # method name is matched instead. Pinned to the real action's SHA for
-        # the same reason as its neighbours.
+        # never sees it -- there is no slash anywhere in the call. The method
+        # name was its own alternative until round 10 and is not one now: what
+        # matches is `rest.issues`, which every route to that namespace writes
+        # once, a destructured one included. Pinned to the real action's SHA
+        # for the same reason as its neighbours.
         "B4-pull-request-target-api-octokit-issues-timeline",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
