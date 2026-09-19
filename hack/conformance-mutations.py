@@ -24,9 +24,9 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Seven rows on every run print this, and the SURVIVED line above
-             is exactly the wrong reading of them: the suite staying green is
-             the property they assert.
+             Thirteen rows on every run print this, and the SURVIVED line
+             above is exactly the wrong reading of them: the suite staying
+             green is the property they assert.
     BASELINE POLLUTED
              not a per-row verdict but a line printed after the run: the
              suite is not green once every mutation has been restored, so
@@ -78,16 +78,22 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Ten today: B1-assent-rule-weakened,
+    #: and KILLED is the failure. Thirteen today, which `--list` is the
+    #: authority on rather than this comment -- it named ten on 2026-09-19
+    #: when there were eleven, and one of the ten by an id no row had:
     #: A3-fastpath-redundant,
-    #: B4-pull-request-target-checkout-ref-env-case,
+    #: B1-denylist-rule,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
-    #: B4-pull-request-target-container-pinned-image,
+    #: B4-pull-request-target-run-env-ordinary-shell,
+    #: B4-pull-request-target-shell-ordinary,
+    #: B4-pull-request-target-checkout-ref-env-case,
+    #: B4-pull-request-target-run-clone-bare,
+    #: B4-pull-request-target-run-log-m-flags,
     #: B4-pull-request-target-run-runner-repository-name, and
-    #: B4-pull-request-target-run-clone-bare.
+    #: B4-pull-request-target-container-pinned-image.
     must_survive: bool = False
 
 
