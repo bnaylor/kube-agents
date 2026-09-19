@@ -261,7 +261,7 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-173 mutations: 144 KILLED, 22 NOISY, seven `must_survive` controls, zero
+174 mutations: 145 KILLED, 22 NOISY, seven `must_survive` controls, zero
 genuine survivors, zero stale — measured 2026-09-19 against this branch;
 re-run the harness rather than trusting these numbers, which is the sentence
 this paragraph exists to make cheap. The seven controls are one on the harness
@@ -274,7 +274,7 @@ verb on its allowlist, and the bare `pull/N` web link that the rule against
 the `pull/N.diff` endpoint must not catch. Each of those edits is the _safe_
 spelling of something a workflow here legitimately does, and the control is
 that the suite does not object to it. Note that the summary line the harness
-prints accounts for 166 of the 173: a `must_survive` control's verdict is
+prints accounts for 167 of the 174: a `must_survive` control's verdict is
 `SURVIVED (expected)`, which is neither killed, noisy, nor a survivor. The run
 also prints `BASELINE POLLUTED` if the suite is not green once every mutation
 has been restored, which did not happen here and would invalidate every
