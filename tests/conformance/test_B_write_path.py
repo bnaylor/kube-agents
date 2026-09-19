@@ -69,16 +69,13 @@ _EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
 # and the whole test went quiet. Listing the safe refs instead means an
 # indirection this file cannot resolve -- `env.X`, `steps.X.outputs.Y`, a
 # value laundered through `$GITHUB_ENV` -- reads as unsafe rather than as
-# innocent text, which is the direction to be wrong in. On this trigger
-# `github.ref`, `github.sha` and `github.base_ref` are all the base branch.
-_SAFE_CHECKOUT_EXPRESSIONS = frozenset(
-    {
-        "github.event.repository.default_branch",
-        "github.base_ref",
-        "github.ref",
-        "github.sha",
-    }
-)
+# innocent text, which is the direction to be wrong in.
+#
+# One entry, and deliberately: see the test's docstring for why the base-branch
+# spellings are not on it. A fork cannot write any of those anyway -- that
+# needs push access here -- so leaving them off is about the author of the pull
+# request rather than about the fork, and costs nothing today.
+_SAFE_CHECKOUT_EXPRESSIONS = frozenset({"github.event.repository.default_branch"})
 
 # The same treatment for `repository:`, because `ref:` alone does not say
 # what gets checked out. `actions/checkout` resolves the ref *inside*
@@ -86,9 +83,9 @@ _SAFE_CHECKOUT_EXPRESSIONS = frozenset(
 # reaches fork-controlled code when the repository is the fork:
 #
 #     repository: ${{ github.event.pull_request.head.repo.full_name }}
-#     ref: ${{ github.base_ref }}
+#     ref: ${{ github.event.repository.default_branch }}
 #
-# is the fork's copy of the base branch, which the fork wrote. Absent is the
+# is the fork's own default branch, which the fork wrote. Absent is the
 # safe case -- the default is the workflow's own repository -- and
 # `github.repository` is that default spelled out. A literal is refused as
 # well, including this repository's own name: `github.repository` exists, and
@@ -758,12 +755,20 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         somebody adds a legitimately safe expression, which is a line of
         review, and the docstring is where they will look.
 
+        The list is one entry. `github.ref`, `github.sha` and
+        `github.base_ref` are all the base branch on this trigger, and a
+        checkout carrying no `ref:` at all is refused a few lines down on
+        exactly that ground, so allowing the explicit spelling of the ref the
+        implicit case is refused for would be the same hole with a longer
+        name. Both live carriers use the default branch anyway.
+
         `ref:` is only half of what a checkout resolves. The action looks the
         ref up inside whatever `repository:` says, so the allowlist above
         says nothing on its own: `repository: ${{
         github.event.pull_request.head.repo.full_name }}` with `ref: ${{
-        github.base_ref }}` is the fork's copy of the base branch, which the
-        fork wrote, and every assertion on the ref passes. `repository:`
+        github.event.repository.default_branch }}` is the fork's copy of its
+        own default branch, which the fork wrote, and every assertion on the
+        ref passes. `repository:`
         therefore gets the same allowlist -- absent, or `github.repository`
         -- and unlike the ref half it refuses a literal outright, including
         this repository's own name. The ref half tolerates literals because
@@ -795,15 +800,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         text at all, a local composite action, which moves the checkout into
         a file this test does not read, and the `run:` half's own laundering
         -- a `$GITHUB_ENV` write in an earlier step, or a `steps.X.outputs.Y`
-        the script interpolates. Nor is the implicit ref audited as strictly
-        as the explicit one: `github.base_ref`, `github.ref` and
-        `github.sha` are all on the allowlist and are all the pull request's
-        *base* branch, which is the same ref the no-ref case above is
-        refused for taking. Nothing a fork can write reaches any of them --
-        that needs push access to this repository -- so the allowlist is
-        about fork-controlled code and the no-ref rule is about stating
-        which base ref you meant. Worth knowing they are not the same
-        standard. Read that list as examples rather than as
+        the script interpolates. Read that list as examples rather than as
         the boundary. An earlier version of it was written as though it were
         complete and did not mention `github.event.after`, which turned out
         to be both live and shorter than either path it did name.
@@ -880,10 +877,10 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                                     f"{path.name}: the checkout ref derives "
                                     "from the pull request",
                                 )
-                        # A ref is resolved inside a repository, so the ref
-                        # allowlist says nothing on its own: `github.base_ref`
-                        # in the fork's copy of this repository is the fork's
-                        # code. Same shape of rule, one input along.
+                        # A ref is resolved inside a repository, so the
+                        # ref allowlist says nothing on its own: the default
+                        # branch of the *fork* is code the fork wrote. Same
+                        # shape of rule, one input along.
                         for repository in _with_inputs(step, "repository"):
                             resolved = _expand_env(repository, step_env)
                             for expression in _EXPRESSION.findall(resolved):

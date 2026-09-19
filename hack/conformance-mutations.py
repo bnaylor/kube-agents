@@ -569,17 +569,33 @@ Mutation(
     ),
     Mutation(
         # `ref:` is resolved inside `repository:`, so the ref allowlist on its
-        # own does not say what gets checked out. Every assertion in the ref
-        # half passes on this step: `github.base_ref` is on the allowlist --
-        # and it is the fork's copy of the base branch, which the fork wrote.
+        # own does not say what gets checked out. The ref here is left exactly
+        # as the carrier ships it -- the one expression the allowlist holds --
+        # so every assertion in the ref half passes, and what gets checked out
+        # is the fork's own default branch, which the fork wrote.
         "B4-pull-request-target-checkout-repository",
         ".github/workflows/risk_classify.yml",
         ("          ref: ${{ github.event.repository.default_branch }}",
          "          repository: ${{ github.event.pull_request.head.repo.full_name }}\n"
+         "          ref: ${{ github.event.repository.default_branch }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "redirect the one allowlisted ref into the fork, which is the same "
+        "code the ref allowlist exists to keep out",
+    ),
+    Mutation(
+        # The allowlist is one entry, and this row is why it stays that way.
+        # `github.base_ref` is the base branch on this trigger, which is the
+        # ref a checkout carrying no `ref:` at all is refused for taking; an
+        # allowlist holding both would refuse the implicit spelling and allow
+        # the explicit one. No fork can write it, so this is the pull request
+        # author rather than the attacker the test is named for.
+        "B4-pull-request-target-checkout-base-ref",
+        ".github/workflows/risk_classify.yml",
+        ("          ref: ${{ github.event.repository.default_branch }}",
          "          ref: ${{ github.base_ref }}"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "redirect a safe-looking ref into the fork, which is the same code "
-        "the ref allowlist exists to keep out",
+        "name the base branch outright, the one ref the no-ref case is "
+        "already refused for taking",
     ),
     Mutation(
         # The literal spelling of the row above. It carries no expression to
