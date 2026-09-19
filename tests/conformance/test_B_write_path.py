@@ -222,6 +222,21 @@ _GH_COMMAND = re.compile(r"(?<![\w-])gh(?=\s)")
 # string ends an invocation early, which can lose the tail of one and cannot
 # invent one.
 _COMMAND_END = re.compile(r"[\n;|&()`]")
+# `-R`/`--repo` is the flag worth knowing about by name. The walk drops
+# `-`-prefixed words, but a flag's *value* is an ordinary word, so a bare drop
+# reads `gh pr -R owner/repo edit` as the subcommand `owner/repo` and refuses a
+# legitimate label write -- and tells the reader to allowlist a repository
+# name, which is the wrong advice in the wrong place. Skipping the value fixes
+# the diagnostic; `--repo=owner/repo` needs no entry here because the `=` form
+# is one word and the `-` prefix already drops it. Any other value-taking flag
+# left off this set costs a false red, never a false green, which is the
+# direction to be wrong in.
+_GH_VALUE_FLAGS = frozenset({"-R", "--repo"})
+# A workflow expression holds spaces -- `${{ github.repository }}` is three
+# words to `split()` and one word to the runner, which substitutes it before
+# the shell ever sees it. Collapsing each to a single token is what makes the
+# flag-value skip above land on the value rather than partway through it.
+_GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 
 # The two halves a regex still answers. `/pulls` as a path segment is the
 # same request spelled as a URL, whether `gh api` or `curl` makes it, and it
@@ -244,7 +259,7 @@ _COMMAND_END = re.compile(r"[\n;|&()`]")
 # `pulls.` or `/pulls`, which nothing here has.
 _PULL_REQUEST_API = re.compile(
     r"/pulls\b"
-    r"|\brest\s*\.\s*pulls\b"
+    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?pulls\b"
     r"|\bpulls\s*[.\[]"
 )
 
@@ -495,15 +510,16 @@ def _unsafe_gh_pull_request_commands(text):
     subcommand -- while "the word immediately after `pr`" is `-R`. Those are
     two different questions and only the second one is about what runs. This
     walks the words of each invocation instead, drops anything beginning with
-    `-`, and reads the first two that survive: `pr`, and then the subcommand.
+    `-`, drops the value after a flag known to take one, and reads the first
+    two that survive: `pr`, and then the subcommand.
 
     It is a walk and not a parser, and every place it is wrong is wrong in
-    the refusing direction. A flag's *value* is a word like any other, so
-    `gh pr -R owner/repo checkout` reads `owner/repo` as the subcommand and
-    refuses it for not being on the list -- the verdict is right and the
-    reason is not, which is why the caller's message quotes the invocation
-    rather than the word. The walk stops at the first newline, `;`, `|`, `&`,
-    parenthesis or backtick, so a separator inside a quoted string ends it
+    the refusing direction. A flag this does not know takes a value costs a
+    false red rather than a false green: the value is read as the subcommand,
+    is not on the allowlist, and the step is refused. That is why the caller's
+    message quotes the whole invocation rather than the word it objected to --
+    the word can be the wrong one. The walk stops at the first newline, `;`,
+    `|`, `&`, parenthesis or backtick, so a separator inside a quoted string ends it
     early; that loses the tail of an invocation and cannot invent one. A
     `gh pr` with no subcommand at all is refused too, on the same reasoning
     the ref allowlist refuses an expression it cannot resolve.
@@ -520,11 +536,16 @@ def _unsafe_gh_pull_request_commands(text):
         rest = text[match.end():]
         end = _COMMAND_END.search(rest)
         invocation = (rest[: end.start()] if end else rest).strip()
-        words = [
-            word.strip("\"'")
-            for word in invocation.split()
-            if not word.startswith("-")
-        ]
+        words = []
+        skip_value = False
+        for word in _GH_EXPRESSION.sub("EXPR", invocation).split():
+            if skip_value:
+                skip_value = False
+                continue
+            if word.startswith("-"):
+                skip_value = word in _GH_VALUE_FLAGS
+                continue
+            words.append(word.strip("\"'"))
         if not words or words[0] != "pr":
             continue
         subcommand = words[1] if len(words) > 1 else ""
@@ -1423,11 +1444,15 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         What is left is the call made without naming `pulls` or `gh pr` at
         all: a GraphQL query for `pullRequest(number:)`, `github.request("GET
         /repos/{owner}/{repo}/pulls/{n}")` spelled with the path in a
-        variable, `octokit.rest["pulls"].get` with the namespace indexed
-        rather than accessed, or a `gh` whose own name arrives through the
-        environment. The first of those is the one worth writing down: the
-        GraphQL endpoint is a single URL with no `/pulls` in it, and nothing
-        in this file reads a query document.
+        variable, or a `gh` whose own name arrives through the environment.
+        Indexing the namespace rather than accessing it -- `github.rest[
+        "pulls"].get` -- was on this list for an hour on 2026-09-19 and is
+        not on it now: it is one quote away from the shape the round closed,
+        which is too close to write down and leave, so the rule reads `rest`
+        and the punctuation between it and `pulls` rather than a dot. What is
+        left is the GraphQL query, and it is the one worth writing down: that
+        endpoint is a single URL with no `/pulls` in it, and nothing in this
+        file reads a query document.
 
         A local composite action. `uses: ./.github/actions/x` moves the
         steps into a file keyed `runs.steps` that nothing here reads, and

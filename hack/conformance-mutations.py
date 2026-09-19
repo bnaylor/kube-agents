@@ -78,9 +78,10 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Three today: B1-denylist-rule,
-    #: A3-fastpath-redundant, and
-    #: B4-pull-request-target-checkout-ref-env-case.
+    #: and KILLED is the failure. Four today: B1-denylist-rule,
+    #: A3-fastpath-redundant,
+    #: B4-pull-request-target-checkout-ref-env-case, and
+    #: B4-pull-request-target-api-gh-pr-interposed-flag-write.
     must_survive: bool = False
 
 
@@ -1096,6 +1097,61 @@ Mutation(
         "name the repository explicitly on a checkout that already worked, "
         "which is the tidying a reviewer asks for when a step runs `gh` "
         "outside a checked-out tree",
+    ),
+    Mutation(
+        # The namespace indexed rather than accessed. One quote is the whole
+        # difference from B4-pull-request-target-api-octokit-pulls, which is
+        # why _PULL_REQUEST_API reads `rest` and the punctuation after it
+        # instead of a literal `rest.pulls`. Without that this row survives
+        # and the row above still kills, so the pair is what pins the
+        # difference rather than either one alone.
+        "B4-pull-request-target-api-octokit-pulls-indexed",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const { data } = await github.rest['pulls'].get({\n"
+         "              ...context.repo,\n"
+         "              pull_number: ${{ github.event.pull_request.number }}"
+         "\n"
+         "            });\n"
+         "            await exec.exec('git', ['fetch','origin',"
+         " data.head.sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reach the same namespace through a string index, which is ordinary "
+        "JavaScript and defeats a rule written against a dot",
+    ),
+    Mutation(
+        # The flag-value skip, from the other side: this is a *legitimate*
+        # label write with `-R` interposed, and the suite must stay green on
+        # it. Delete _GH_VALUE_FLAGS or the expression collapse and the walk
+        # reads the repository as the subcommand, refuses it, and this row
+        # reds -- which is backwards for a mutation, so the row inverts: the
+        # edit is the safe spelling and `must_survive` says the suite has no
+        # business objecting to it. Without this, nothing pins the skip and a
+        # future round could delete it and see a clean sweep.
+        "B4-pull-request-target-api-gh-pr-interposed-flag-write",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Label the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          gh pr -R \"${{ github.repository }}\" edit"
+         " ${{ github.event.pull_request.number }} --add-label triage\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name the repository explicitly on a label write, which is the same "
+        "command the live carrier runs with one persistent flag in front of "
+        "the verb",
+        must_survive=True,
     ),
     Mutation(
         # The same endpoint from the language the shell rules cannot read.
