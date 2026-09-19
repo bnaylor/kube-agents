@@ -1160,6 +1160,217 @@ Mutation(
         "script never contains a word this test is watching for",
     ),
     Mutation(
+        # The fetch verb itself, laundered through an index into `env`. The
+        # gate that used to stand in front of this half matched four words,
+        # and `${{ env['CMD'] }}` is none of them: GitHub substitutes the verb
+        # in before the shell starts, so the YAML this file reads says `fetch`
+        # nowhere. Two rows already launder the verb through a shell variable;
+        # this one launders it through an expression, which no pickup keyed on
+        # `$NAME` can follow because there is no `$CMD` to find. Killed by the
+        # expression allowlist, which reads `env['CMD']` as `env.cmd` -- not a
+        # recognised expression -- and the head on the same line.
+        "B4-pull-request-target-run-verb-indexed-env",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          CMD: git fetch origin\n"
+         "        run: ${{ env['CMD'] }} ${{ github.event.after }} && "
+         "git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "assemble the command out of an env value indexed by name, which is "
+        "the tidying that keeps a long `run:` line under the margin",
+    ),
+    Mutation(
+        # The same laundering with an interpreter instead of an expression.
+        # `os.environ["CMD"].split()` builds the argv out of the environment in
+        # a language nothing here parses, so neither the verb nor the ref is in
+        # any text a pattern could read. It is
+        # B4-pull-request-target-run-fetch-python-shell one field further along
+        # -- there the ref was in Python and the verb was in the open, here both
+        # are -- and it dies on the same assertion, which is the answer to the
+        # whole family: the rule never needed to know what the program does.
+        "B4-pull-request-target-run-verb-python-env",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: python\n"
+         "        env:\n"
+         "          CMD: git fetch origin\n"
+         "          REV: ${{ github.event.after }}\n"
+         "        run: |\n"
+         "          import os, subprocess\n"
+         '          subprocess.run(os.environ["CMD"].split() + '
+         '[os.environ["REV"]])\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "move both halves of the command into the environment and assemble "
+        "them in Python, which `shell:` makes a supported thing to do",
+    ),
+    Mutation(
+        # The payload file reached by its path rather than by its variable.
+        # `GITHUB_EVENT_PATH` is a convenience the runner sets;
+        # `$RUNNER_TEMP/_github_workflow/event.json` is where it points, and a
+        # step that writes the path out reads the same bytes while naming the
+        # variable nowhere. Separate from B4-pull-request-target-run-fetch-
+        # event-file for the reason that row exists at all: the same read, one
+        # spelling along, is how this half has been wrong every round.
+        "B4-pull-request-target-run-event-file-path",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          REV=$(jq -r .after "$RUNNER_TEMP/_github_workflow/'
+         'event.json")\n'
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the event file by its path, which is what a script does when "
+        "it wants the payload from somewhere the variable is not set",
+    ),
+    Mutation(
+        # And the variable's name split in two. `'GITHUB_EVENT_' + 'PATH'` is
+        # one string to JavaScript and no string to a regex, which puts every
+        # row that pins the name two characters from useless. The answer is not
+        # a longer pattern over names: `process.env` is refused whole, because
+        # a `script:` is handed `context`, `github`, `core` and its own inputs
+        # and has no business in the process environment at all. Pinned to the
+        # real action's SHA so C4's sweep is not what catches this.
+        "B4-pull-request-target-script-event-file-split",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const fs = require('fs');\n"
+         "            const p = JSON.parse(fs.readFileSync("
+         "process.env['GITHUB_EVENT_' + 'PATH']));\n"
+         "            await exec.exec('git', ['fetch', 'origin', p.after]);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the environment variable's name out of two literals, which is "
+        "what a minifier does and what nothing reading for the name sees",
+    ),
+    Mutation(
+        # `git remote add` and `git remote update`, which put the fork's code
+        # on the runner using none of the four words the old gate watched for.
+        # This is the row that says that gate could not have been repaired by
+        # adding a fifth: `remote update` is a fetch spelled as configuration,
+        # and the three rows after it are three more spellings from three more
+        # tools. What catches it reads what the step names -- the fork's clone
+        # URL, and its head branch -- rather than what the step does.
+        "B4-pull-request-target-run-remote-update",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          git remote add pr "${{ github.event.pull_request.head'
+         '.repo.clone_url }}"\n'
+         "          git remote update pr\n"
+         '          git reset --hard "pr/${{ github.event.pull_request.head'
+         '.ref }}"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "add the fork as a remote and update it, which is how anybody who "
+        "wants the branch rather than the commit writes this",
+    ),
+    Mutation(
+        # The fork's tree as a tarball over HTTP. No git verb at all: the API
+        # serves a commit as an archive, `tar xz` unpacks it, and the next line
+        # runs something out of it. A reviewer scanning for `git` sees nothing,
+        # and the gate saw nothing either. Killed by the two expressions in the
+        # URL, which is the point -- the URL has to say which repository and
+        # which commit, and saying that is naming the pull request.
+        "B4-pull-request-target-run-tarball",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          curl -sL "https://api.github.com/repos/${{ github.event'
+         '.pull_request.head.repo.full_name }}/tarball/${{ github.event.after '
+         '}}" | tar xz\n'
+         "          ./kube-agents/ci/run.sh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "download the commit as an archive instead of cloning it, which is "
+        "the fast way to get one tree without a git history",
+    ),
+    Mutation(
+        # The same code arriving through a package manager. `pip install
+        # "git+https://...@<sha>"` clones the fork and runs its build backend
+        # -- arbitrary code at install time, on a runner holding a writable
+        # token -- and the word `git` appears only inside a URL scheme. A gate
+        # over verbs would have to know pip's requirement grammar to see it.
+        # The allowlist only has to notice that the requirement names a
+        # repository the pull request chose.
+        "B4-pull-request-target-run-pip-vcs",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          pip install "git+https://github.com/${{ github.event'
+         '.pull_request.head.repo.full_name }}@${{ github.event.after }}"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "install the pull request as a package, which reads as testing the "
+        "change the way a consumer would get it",
+    ),
+    Mutation(
+        # And through a build context. `docker build "https://host/repo.git
+        # #<sha>"` is a documented remote context: the daemon clones the
+        # repository at that ref and builds it, so every `RUN` in the fork's
+        # Dockerfile executes. Fourth tool, fourth grammar, same one-line
+        # answer. Four rows for four tools rather than one representative one,
+        # because "there are more of these than the gate knew" is a claim that
+        # has to be able to fail.
+        "B4-pull-request-target-run-docker-context",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          docker build "https://github.com/fork/kube-agents.git'
+         '#${{ github.event.after }}"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "hand docker a remote build context, which is one line shorter than "
+        "checking the tree out and building it",
+    ),
+    Mutation(
+        # An `env:` block that is an expression rather than a mapping. GitHub
+        # evaluates `env: ${{ fromJSON(...) }}` into the environment at run
+        # time, and `_env_values` returned {} for it -- so every rule about
+        # what a step's environment may carry read a whole environment built
+        # out of the head as "this step carries nothing". Folded in whole under
+        # a placeholder name now, which puts it in front of the expression
+        # allowlist, where `fromJSON(...)` is refused for being unresolvable.
+        # Same answer `with:` gets when it is not a mapping either.
+        "B4-pull-request-target-env-expression",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env: ${{ fromJSON(format('{{\"REV\":\"{0}\"}}', "
+         "github.event.after)) }}\n"
+         '        run: git fetch --depth=1 origin "$REV" && '
+         "git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the whole `env:` block from one expression, which is how a "
+        "workflow shares one environment between several steps",
+    ),
+    Mutation(
         # A control on the substitution rather than on a hole. GitHub resolves
         # `env.SAFE`, `env.safe` and `Env.SAFE` to one value, and this is the
         # allowlisted ref reached through the third spelling -- the same ref,
