@@ -22,6 +22,21 @@ the file with `git checkout`, and reports:
              line that moved.
     OVERSHOT a `must_survive` control was caught: the suite goes red on a
              change that weakens nothing.
+    SURVIVED (expected)
+             a `must_survive` control was not caught, which is its pass. Two
+             rows on every run print this, and the SURVIVED line above is
+             exactly the wrong reading of them: the suite staying green is
+             the property they assert.
+    BASELINE POLLUTED
+             not a per-row verdict but a line printed after the run: the
+             suite is not green once every mutation has been restored, so
+             every verdict after whatever caused it is untrustworthy. It
+             changes the exit code, and the usual cause is stale bytecode --
+             see `_purge_bytecode`.
+
+The summary line's `survived=` count is survivors *and* OVERSHOT controls,
+because both are the same news: a row whose verdict is not what it was
+written to be.
 
 An expected failure that a mutation turns into an *unexpected success* also
 counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
@@ -399,12 +414,14 @@ Mutation(
     ),
     Mutation(
         # Originally inserted a checkout into auto_request_review.yml, which
-        # has since moved off pull_request_target (it is workflow_run-gated on
-        # the AI Review check now), so the insertion landed outside the test's
-        # trigger filter and proved nothing. risk_classify.yml is the live
-        # pull_request_target workflow, and its safety is exactly the pinned
-        # ref — so the mutation is the one-line flip an author debugging the
-        # classifier against their own PR would make.
+        # has since moved off pull_request_target -- read its `on:` block: it
+        # is `check_run: [completed]`, plus an `issue_comment` escape hatch --
+        # so the insertion landed outside the test's trigger filter and proved
+        # nothing. risk_classify.yml carries the trigger and runs a checkout
+        # whose safety is exactly the pinned ref (three workflows carry
+        # `pull_request_target` and two of them check anything out), so the
+        # mutation is the one-line flip an author debugging the classifier
+        # against their own PR would make.
         "B4-pull-request-target-checkout",
         ".github/workflows/risk_classify.yml",
         ("          ref: ${{ github.event.repository.default_branch }}",
@@ -494,8 +511,13 @@ Mutation(
         # still holding `${{ env.UPSTREAM_REV }}` is not on the allowlist
         # either, which is the allowlist's whole point. What the order buys
         # is that the fixed-point loop is exercised rather than accidentally
-        # satisfied, so deleting the loop shows up here as a changed
-        # expansion rather than as nothing at all.
+        # satisfied -- but only in the assertion message. Crippling
+        # `_expand_env` to a single pass leaves this row KILLED either way,
+        # measured: the ref is still unresolved, an unresolved ref is still
+        # off the allowlist, and the runner records verdicts rather than
+        # message text. So this row does not pin that loop and the order does
+        # not make it pin it. What pins the pickup's loop is
+        # B4-pull-request-target-run-fetch-shell-chain, one loop along.
         "B4-pull-request-target-checkout-env",
         ".github/workflows/risk_classify.yml",
         ("        with:\n"
@@ -598,11 +620,16 @@ Mutation(
         "already refused for taking",
     ),
     Mutation(
-        # The literal spelling of the row above. It carries no expression to
-        # check against the allowlist, and the ref half's literal test looks
-        # only for `pull`, `head` and `merge` -- which `someone/else` and
-        # `main` both survive. A repository literal is refused outright for
-        # that reason.
+        # The literal spelling of B4-pull-request-target-checkout-repository
+        # -- named rather than described as "the row above", which it stopped
+        # being when the base-ref row was inserted between them. Neither value
+        # carries an expression for either allowlist, and the ref half sees
+        # only `main`, which is an ordinary ref and passes. `someone/else`
+        # never reaches the ref half's `pull`/`head`/`merge` scan at all: it
+        # is the `repository:` value, and what kills the row is the
+        # repository half's own assertion, which refuses a literal outright
+        # because nothing here can tell this repository's name from a
+        # lookalike.
         "B4-pull-request-target-checkout-repository-literal",
         ".github/workflows/risk_classify.yml",
         ("          ref: ${{ github.event.repository.default_branch }}",
@@ -655,11 +682,14 @@ Mutation(
         "the shell does",
     ),
     Mutation(
-        # Two hops. `$REV` is a shell reference so REV's value is folded in,
-        # but that value is `${{ env.A }}` -- which matches neither the
-        # refspec pattern nor the head pattern, and a pickup that stops at
-        # one hop never reaches A. The fix expands what it picks up and
-        # picks up again.
+        # Two hops, both taken inside one pass of the pickup. `$REV` is a
+        # shell reference so REV is picked up, and what the pickup folds in is
+        # `_expand_env(value)` rather than the value -- so `${{ env.A }}`
+        # becomes the SHA before the haystack is rebuilt, and the loop around
+        # the pickup is never reached. Measured: reduce that loop to a single
+        # iteration and this row still dies. It pins the expansion inside the
+        # pickup; B4-pull-request-target-run-fetch-shell-chain pins the loop
+        # around it, which no row did until it was added.
         "B4-pull-request-target-run-fetch-chained",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -692,13 +722,175 @@ Mutation(
         "git verb the fetch list did not name",
     ),
     Mutation(
+        # The allowlist reads `${{ ... }}` with a regex, and a regex without
+        # `re.DOTALL` cannot see an expression with a newline in it. A block
+        # scalar keeps the line break exactly as written, so `findall`
+        # returned nothing, the allowlist loop never ran, `sub` removed
+        # nothing, and the whole expression arrived at the literal scan as
+        # text -- where `github.event.after` spells none of `pull`, `head` or
+        # `merge`. The same ref in a double-quoted scalar folds to one line
+        # and was always caught, which is what made this one quiet.
+        "B4-pull-request-target-checkout-ref-newline",
+        ".github/workflows/risk_classify.yml",
+        ("          ref: ${{ github.event.repository.default_branch }}",
+         "          ref: |\n"
+         "            ${{ format('{0}',\n"
+         "            github.event.after) }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reflow a long interpolated ref across two lines, which a block "
+        "scalar makes look like ordinary YAML tidying",
+    ),
+    Mutation(
+        # A ref that is present and says nothing. `ref:` with no value is
+        # valid YAML and parses to None; `str(None)` is `"None"`, which is
+        # truthy, so the must-carry-a-`ref:` rule was satisfied by a checkout
+        # that carries no ref, and `"none"` holds none of the three words the
+        # literal scan looks for. The honest spelling, `ref: ""`, reddened.
+        "B4-pull-request-target-checkout-ref-null",
+        ".github/workflows/risk_classify.yml",
+        ("          ref: ${{ github.event.repository.default_branch }}",
+         "          ref:"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "delete a ref's value without deleting its key, which is what a "
+        "half-finished edit leaves behind and what the default-branch "
+        "fallback quietly restores",
+    ),
+    Mutation(
+        # The `git pull` alternative was matched on a single line by
+        # construction, and one backslash is all it takes to spell the same
+        # command over two. A continuation is how anybody writes a git
+        # command with more flags than fit, so this is not even a dodge.
+        "B4-pull-request-target-run-pull-continued",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          REV: ${{ github.event.after }}\n"
+         "        run: |\n"
+         "          git \\\n"
+         '            pull origin "$REV"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "wrap a `git pull` over two lines with a backslash, which reads as "
+        "line-length housekeeping and unmatches a single-line pattern",
+    ),
+    Mutation(
+        # `printenv NAME` is a read of NAME that never writes `$NAME`. The
+        # pickup was keyed on the sigil, so the value was never folded in and
+        # the fetch read as innocent.
+        "B4-pull-request-target-run-printenv",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          REV: ${{ github.event.after }}\n"
+         "        run: |\n"
+         '          git fetch --depth=1 origin "$(printenv REV)"\n'
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the laundered ref with `printenv` rather than with a sigil, "
+        "which is the same read spelled as a command",
+    ),
+    Mutation(
+        # Indirect expansion: `${!PTR}` is the value of the variable *named*
+        # by PTR. Following it is a hop the pickup does not take -- it folds
+        # in PTR, whose value is the string `REV`, and nothing in the haystack
+        # then names the head. This is the row for the rule that answers
+        # that class rather than that idiom: a step that fetches, carries the
+        # head in its `env:`, and reaches its environment through shell this
+        # file cannot read is refused for being unreadable.
+        "B4-pull-request-target-run-indirect-expansion",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          REV: ${{ github.event.after }}\n"
+         "          PTR: REV\n"
+         "        run: |\n"
+         '          git fetch --depth=1 origin "${!PTR}"\n'
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name the variable that names the ref, so the script mentions the "
+        "pointer and never the pull request",
+    ),
+    Mutation(
+        # Not a `run:` step at all. `actions/github-script` takes JavaScript
+        # as an input and runs it in the job with the same token and the same
+        # working directory, so the fetch is the identical hazard in another
+        # language -- and a haystack built from `run:` alone reads none of it.
+        # Pinned to the real action's SHA: an unpinned one would trip C4's
+        # sweep and the verdict would stop saying which rule caught this.
+        "B4-pull-request-target-script-input",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            await exec.exec('git', ['fetch','origin',\n"
+         "              context.payload.pull_request.head.sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "move the fetch into a `script:` input, where the shell the test "
+        "reads is not the language that runs",
+    ),
+    Mutation(
+        # The widest grant GitHub offers, spelled as a string rather than as
+        # a mapping. Both halves of this test filtered on `isinstance(scope,
+        # dict)`, so `write-all` at the workflow level granted `contents:
+        # write` and `id-token: write` without either assertion seeing a
+        # field. The job-level spelling reddened -- but through
+        # test_B2_no_workflow_grants_a_bot_the_ability_to_approve, which is a
+        # neighbour asking a different question, and a neighbour's red is not
+        # this assertion working.
+        "B4-pull-request-target-permissions-write-all",
+        ".github/workflows/risk_classify.yml",
+        ("permissions: {}", "permissions: write-all"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "widen the top-level grant to `write-all` while adding a step that "
+        "needs one more scope, rather than naming the scope -- the tidying "
+        "that hands a pull-request-triggered job the push credential",
+    ),
+    Mutation(
+        # The shape the pickup's outer loop exists for, which nothing pinned
+        # until this row. `$A` is picked up, and A's value names B in *shell*
+        # syntax -- `origin $B` -- which `_expand_env` does not touch, because
+        # it resolves `${{ env.X }}` and nothing else. So the second name is
+        # found only by rebuilding the haystack and picking up again.
+        # Measured both ways: reduce that loop to a single iteration and this
+        # row goes green while every other run-half row still dies.
+        "B4-pull-request-target-run-fetch-shell-chain",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          B: ${{ github.event.after }}\n"
+         "          A: origin $B\n"
+         '        run: git fetch --depth=1 $A && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the fetch's arguments out of a second env value, so the name "
+        "the script reads is one hop from the name that matters",
+    ),
+    Mutation(
         "B4-pull-request-target-checkout-guard",
         "tests/conformance/test_B_write_path.py",
         ('if uses.startswith("actions/checkout"):',
          'if uses.startswith("actions/checkout-nonesuch"):'),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "stop the ref half of the test from matching any step, which is the "
-        "vacuity `saw_a_checkout` exists to refuse",
+        "stop `actions/checkout` matching its own name. The ref allowlist "
+        "sits outside this guard and goes on reading every step, so what "
+        "this removes is `saw_a_checkout` and the must-carry-a-`ref:` rule -- "
+        "which is the vacuity `saw_a_checkout` exists to refuse",
     ),
     Mutation(
         "B6-codeowners-bot",
