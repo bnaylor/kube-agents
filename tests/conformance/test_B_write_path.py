@@ -379,13 +379,23 @@ _PULL_REQUEST_API = re.compile(
 # were live and green against every rule above.
 #
 # So the rule is written about reach rather than about the two spellings that
-# happened to turn up. Two alternatives. Any `ls-remote` is refused -- the
+# happened to turn up. Four alternatives. Any `ls-remote` is refused -- the
 # command's only job is to list what a remote advertises, and a step of a
 # workflow that must not have the fork's code has no question for it. And a
 # fetch refspec whose source side globs before the namespace is fixed:
 # `refs/*` and `refs/p*` both reach the pull namespace, while `refs/heads/*`
 # and `refs/tags/*` name a namespace first and are untouched, which is the
 # ordinary mirror fetch and the reason this is not a ban on wildcards.
+#
+# The other two are the same advertisement asked for without `git`.
+# `curl "https://github.com/O/R.git/info/refs?service=git-upload-pack"` is
+# the wire protocol underneath `ls-remote`: unauthenticated, and it returns
+# the identical list for `grep "/$N/head"` to read. Refusing the command and
+# conceding the request it makes would be a rule about which program is on
+# the runner rather than about what the step reaches, so the path and the
+# service name are alternatives here, either half alone being an answer
+# nothing in a workflow has. What it concedes is a URL assembled out of
+# pieces, which is the string arithmetic the residual list already carries.
 #
 # No carrier here runs either, so what this costs today is nothing, and what
 # it costs later is a line of review on a step that wants to survey a remote
@@ -397,6 +407,8 @@ _PULL_REQUEST_API = re.compile(
 _REMOTE_REF_ENUMERATION = re.compile(
     r"\bls-remote\b"
     r"|refs/[^/\s'\"]*\*"
+    r"|/info/refs\b"
+    r"|\bgit-upload-pack\b"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -1643,19 +1655,6 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         than a dot. What is worth writing down is the GraphQL query: that
         endpoint is a single URL with no `/pulls` in it, and nothing in this
         file reads a query document.
-
-        The remote's refs enumerated through something that is not `git`. A
-        step that enumerates them with `git` is refused -- `ls-remote`, and a
-        fetch refspec that globs before the namespace is fixed -- because
-        `refs/pull/N/head` is advertised to any client that asks and served
-        to a fetch by object name afterwards, so the namespace does not have
-        to be spelled to be reached. What is not read is the same
-        advertisement fetched over HTTP: `curl
-        "https://github.com/O/R.git/info/refs?service=git-upload-pack"` is
-        the protocol's own discovery endpoint, it is unauthenticated, and it
-        returns the identical list. It is one more thing `curl` can do that
-        this file does not model, alongside the diff endpoint the round did
-        close.
 
         A local composite action. `uses: ./.github/actions/x` moves the
         steps into a file keyed `runs.steps` that nothing here reads, and

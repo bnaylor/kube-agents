@@ -924,6 +924,34 @@ Mutation(
         "and read the head back out of it",
     ),
     Mutation(
+        # The advertisement asked for without `git`. `info/refs` with
+        # `service=git-upload-pack` is the wire protocol underneath
+        # `ls-remote`: unauthenticated, and it answers with the same listing,
+        # so `grep "/$PR_NUMBER/head"` reads the head out of it and the fetch
+        # by object name follows. Refusing the command while conceding the
+        # request it makes would have been a rule about which program is
+        # installed rather than about what the step reaches, which is why the
+        # path and the service name are their own alternatives.
+        "B4-pull-request-target-run-smart-http-advertisement",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          SHA=$(curl -fsSL"
+         " \"https://github.com/${{ github.repository }}.git"
+         "/info/refs?service=git-upload-pack\""
+         " | grep \"/$PR_NUMBER/head\" | cut -c5-44)\n"
+         "          git fetch origin \"$SHA\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the remote for its ref advertisement over plain HTTP, which "
+        "needs no token, no `gh` and no `git` subcommand the rule above "
+        "knows by name",
+    ),
+    Mutation(
         # `printenv NAME` is a read of NAME that never writes `$NAME`. The
         # pickup was keyed on the sigil, so the value was never folded in and
         # the fetch read as innocent.
