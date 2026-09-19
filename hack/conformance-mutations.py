@@ -867,6 +867,92 @@ Mutation(
         "is tidier than interpolating it and hides it from every scan here",
     ),
     Mutation(
+        # The pull request over HTTP, which is the channel the number opened.
+        # Deleting the fetch gate meant every step is read, and two
+        # expressions had to go on the script allowlist for the carriers to
+        # stay green; one of them is the pull request's number, and the number
+        # plus the token is all `gh pr checkout` takes. This row and the three
+        # below are the four spellings `_PULL_REQUEST_API` reads. They exist
+        # because the concession is a real one: without that backstop these
+        # three were refused at 866fa939 and passed after it, which is a
+        # coverage loss a row has to be able to see.
+        "B4-pull-request-target-api-gh-pr-checkout",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          N: ${{ github.event.pull_request.number }}\n"
+         "        run: gh pr checkout \"$N\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "let the CLI do the fetch and the checkout in one word, so the step "
+        "names no ref and no remote",
+    ),
+    Mutation(
+        # The same call spelled as a URL rather than as a subcommand, which is
+        # why the backstop reads `/pulls/` as well as the four verbs. `curl`
+        # against api.github.com is this row with the client swapped.
+        "B4-pull-request-target-api-gh-api-pulls",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          REV=$(gh api \"repos/${{ github.repository }}"
+         "/pulls/${{ github.event.pull_request.number }}\" --jq .head.sha)\n"
+         "          git fetch --depth=1 origin \"$REV\"\n"
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the API for the head rather than reading it off the event, so "
+        "the SHA arrives over HTTP and no expression names it",
+    ),
+    Mutation(
+        # The fork's code without its history. A diff applied to the base tree
+        # is the same arbitrary code arriving, and it was green before this
+        # round as well as after the number went on the allowlist -- the one
+        # shape here the backstop closed rather than reopened.
+        "B4-pull-request-target-api-gh-pr-diff",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          gh pr diff ${{ github.event.pull_request.number }}"
+         " | git apply\n"
+         "          ./run.sh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "apply the diff instead of checking the branch out, which touches no "
+        "remote at all",
+    ),
+    Mutation(
+        # The head without the code, which is enough: the SHA is what the
+        # fetch on the next line needs. `gh pr view` is on the backstop for
+        # this and not because viewing is dangerous.
+        "B4-pull-request-target-api-gh-pr-view",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          REV=$(gh pr view ${{ github.event.pull_request.number }}"
+         " --json headRefOid --jq .headRefOid)\n"
+         "          git fetch origin \"$REV\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head out of the CLI's JSON, which is the API call with a "
+        "friendlier front end",
+    ),
+    Mutation(
         # Not a `run:` step at all. `actions/github-script` takes JavaScript
         # as an input and runs it in the job with the same token and the same
         # working directory, so the fetch is the identical hazard in another
