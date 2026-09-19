@@ -556,12 +556,28 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # walked past it: `jq -r .after "$RUNNER_TEMP"/_github_*/*.json` reads the
 # payload with no string arithmetic anywhere, and `_github_*` is not
 # `_github_workflow`. The prefix is the alternative now, and `RUNNER_TEMP`
-# joins it, which makes the directory half of this rule complete rather than
-# a spelling: the payload lives under that variable and nowhere else, so a
-# step that has the variable has the file. It costs a step that wanted
-# scratch space, which writes `$(mktemp -d)` instead -- and which could not
-# have written `${{ runner.temp }}` either, because the expression allowlist
-# refuses that already.
+# joins it. That was written up the same day as making the directory half
+# complete rather than a spelling, on the reasoning that the payload lives
+# under that variable and nowhere else, so a step that has the variable has
+# the file. The reasoning holds and the conclusion did not, because a step
+# can have the directory without having the variable. `jq -r .after
+# /home/runner/work/_temp/*/*.json` is that variable's value on a
+# GitHub-hosted Linux runner written out with the `_github_workflow`
+# component globbed away: no variable, no `_github`, no `event.json`, and it
+# was green. So was the same read from inside a `container:` job, where the
+# runner bind-mounts that directory at `/github/workflow` and the path it
+# gives the step has no underscore in it at all -- `/github/workflow/*.json`.
+# Both literals are alternatives now, `work/_temp` rather than the whole
+# absolute path because a self-hosted runner's is `.../_work/_temp` and the
+# component is what identifies it.
+#
+# The directory half is a list of spellings and this comment says so rather
+# than claiming otherwise: `D:\a\_temp` is the Windows runner's and is not
+# here, because nothing in this repository runs on one and a pattern for a
+# platform no carrier uses is a pattern nothing measures. `RUNNER_TEMP`
+# costs a step that wanted scratch space, which writes `$(mktemp -d)`
+# instead -- and which could not have written `${{ runner.temp }}` either,
+# because the expression allowlist refuses that already.
 #
 # Both `GITHUB_EVENT_PATH` and `RUNNER_TEMP` are also off
 # `_SAFE_RUNNER_VARIABLES`, so for either of those spellings the
@@ -591,8 +607,17 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # deciding. `shell: python` is the other language -- `os.environ["GITHUB_EVENT_" +
 # "PATH"]` and `os.getenv(...)` are the same reach, and an earlier round
 # claimed to handle `shell: python` while reading neither. So the rule is the
-# accessor in both: `process.env`, `os.environ`, a bare `environ[...]` from
-# `from os import environ`, and `getenv`.
+# accessor in both: `process.env`, `os.environ`, the name `environ` however
+# it got into scope, and `getenv`.
+#
+# `environ` is refused as a bare word rather than as a word with a subscript
+# after it. `from os import environ as e` binds the mapping to a name this
+# file cannot predict and then reads it as `e.items()`, so the import is the
+# last point at which the accessor is spelled at all, and it was green while
+# the pattern wanted a `.` or a `[` next. The bare word costs nothing it was
+# not already costing -- a step that writes `environ` and does not read it is
+# a step that wrote it for nothing -- and it picks up `/proc/self/environ`,
+# which is the same mapping a third way, in the shell.
 #
 # Refusing the accessor rather than the name is a rule about reach rather
 # than about spelling, and it is affordable for a reason specific to these
@@ -606,11 +631,13 @@ _REMOTE_REF_ENUMERATION = re.compile(
 _EVENT_PAYLOAD_FILE = re.compile(
     r"GITHUB_EVENT_PATH"
     r"|RUNNER_TEMP"
+    r"|work/_temp\b"
+    r"|/github/workflow\b"
     r"|_github"
     r"|event\.json"
     r"|\bprocess\s*[.\[]\s*['\"]?env\b"
     r"|\bos\s*[.\[]\s*['\"]?environ\b"
-    r"|\benviron\s*[.\[]"
+    r"|\benviron\b"
     r"|\bgetenv\b"
 )
 
@@ -697,6 +724,69 @@ _SAFE_RUNNER_VARIABLES = frozenset({
     "RUNNER_OS",
     "RUNNER_TOOL_CACHE",
 })
+
+# The rule above reads names, and a step that reads its whole environment at
+# once writes none of them. `A=$(env | grep -i '^github_head_ref=' | cut -d=
+# -f2)` puts the pull request's branch in `$A` with `GITHUB_HEAD_REF` spelled
+# nowhere the allowlist can see it -- the only spelling on the line is lower
+# case, which is not the name the shell would expand and is exactly the name
+# `grep -i` matches -- and it was green. So was `env | grep -i
+# '^github_actor='`, which is the other half of a clone URL for the fork.
+#
+# This is `_REMOTE_REF_ENUMERATION`'s shape one language along, and the
+# argument is the same one. That rule exists because the ref half of its
+# neighbour is a scan for a name, and `git ls-remote` reaches
+# `refs/pull/N/head` without naming it; the answer was to refuse the
+# enumeration rather than to chase the spellings of the name. Here the
+# neighbour is `_RUNNER_VARIABLE`, the enumeration is the environment, and
+# the answer is the same: a step that asks for all of it has `GITHUB_HEAD_REF`
+# and `GITHUB_ACTOR` whether or not it could spell either.
+#
+# The reason there was nothing here already is worth writing down, because
+# this file removed it on purpose. Until 2026-09-19 the wholesale refusal of
+# the step's environment was gated on `_UNREADABLE_SHELL`, a list of the
+# shell constructs that defeat the pickup -- `printenv`, `eval`, `env`,
+# `declare`, indirect expansion -- and the gate was removed for being a
+# denylist over idioms with the interpreters already past it. Removing it was
+# right: the refusal it gated is unconditional now, which is strictly more
+# than it was. What went with it was not a condition, though. It was the only
+# thing in the file that had ever read a dump, and a dump does not reach the
+# step's declared `env:` -- which the unconditional refusal reads in full --
+# it reaches the runner's own variables, which nothing reads except by name.
+# The gate and the enumeration were the same code and only one of them was
+# the mistake.
+#
+# So this is a list of spellings, which is what the deleted rule was, and the
+# difference is what it decides. The deleted one said "a step that writes
+# `eval` may not have the head in its `env:`", which is a claim about a
+# program; this one says "a step may not ask for its environment", which is a
+# claim about a request, and the requests are a closed set in a way that the
+# ways to read a variable are not: `env` and `printenv` with no operand,
+# `declare -p`, `declare -x`, `export -p`, `compgen -e`, a bare `set`. Each
+# is anchored on a terminator -- end of line, a pipe, a redirect, a
+# semicolon, an `&&`, a closing paren -- because that is what distinguishes
+# the dump from the ordinary use: `env FOO=1 cmd` and `env -i PATH=/bin cmd`
+# set a variable, `declare -a xs` and `export PATH` and `set -euo pipefail`
+# are not reads, and `#!/usr/bin/env bash` is a shebang, so none of them
+# match. What it costs is `conda env` at the end of a line and `python -m
+# venv env`, which are a line of review, and nothing in any carrier here.
+#
+# `os.environ`, a bare `environ` and `process.env` are the same request in
+# the two other languages a step can be written in, and they are refused at
+# `_EVENT_PAYLOAD_FILE` already, because there the same mapping is the thing
+# that carries the path to the payload. They are not repeated here: a second
+# pattern for a read the file already refuses is a second thing to keep true,
+# and the mutation table would credit whichever assertion ran first.
+_ENVIRONMENT_ENUMERATION = re.compile(
+    r"(?<![\w./-])env(?:[ \t]+-[\w-]+)*[ \t]*(?:$|[|>;&)])"
+    r"|(?<![\w./-])printenv(?:[ \t]+-[\w-]+)*[ \t]*(?:$|[|>;&)])"
+    r"|(?<![\w./-])(?:declare|typeset)"
+    r"(?:[ \t]+-[a-zA-Z]*[px][a-zA-Z]*)?[ \t]*(?:$|[|>;&)])"
+    r"|(?<![\w./-])export(?:[ \t]+-p)?[ \t]*(?:$|[|>;&)])"
+    r"|(?<![\w./-])set[ \t]*(?:$|[|>;&)])"
+    r"|(?<![\w./-])compgen[ \t]+-[\w-]*e\b",
+    re.MULTILINE,
+)
 
 # A backslash before a newline is not a line break: the shell removes both
 # before the command runs. Every pattern here is line-oriented -- `[^\n]*?`
@@ -1151,6 +1241,7 @@ def _step_scripts(step):
     A `with:` that is not a mapping is an expression standing in for the whole
     block, and is folded in whole rather than skipped, so that the scans see
     it rather than nothing.
+
     """
     scripts = [str((step or {}).get("run", ""))]
     inputs = (step or {}).get("with")
@@ -2551,12 +2642,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # arrived from the pull request, and no step in a
                         # workflow that must not have the fork's code has
                         # business in any of them. What counts as the read is
-                        # argued at `_EVENT_PAYLOAD_FILE`, and it is eight
+                        # argued at `_EVENT_PAYLOAD_FILE`, and it is ten
                         # patterns rather than one because the variable, each
-                        # piece of the path it holds, and the process
-                        # environment that carries it in each of the two
-                        # languages a step can be written in are all ways to
-                        # the same bytes.
+                        # piece of the two paths it holds -- the runner's and
+                        # the one a container job sees it bind-mounted at --
+                        # and the process environment that carries it in each
+                        # of the two languages a step can be written in are
+                        # all ways to the same bytes.
                         # And the variables the runner sets without being
                         # asked, which are the payload again in the one
                         # language a step does not have to write anything to
@@ -2584,14 +2676,34 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "if one of these is safe, add it to "
                             "_SAFE_RUNNER_VARIABLES and say why",
                         )
+                        # And the same variables reached without being
+                        # named, which the allowlist above cannot see for
+                        # the reason `_REMOTE_REF_ENUMERATION` exists: a
+                        # scan for a name reads what the step spelled, and a
+                        # step that dumps its environment spelled nothing.
+                        # See `_ENVIRONMENT_ENUMERATION` for why this is a
+                        # rule about a request rather than the denylist over
+                        # idioms that came out of this file the same day.
+                        self.assertIsNone(
+                            _ENVIRONMENT_ENUMERATION.search(reachable),
+                            f"{path.name}: a step reads its whole "
+                            "environment -- `env`, `printenv`, `declare "
+                            "-p`, `export -p`, `compgen -e` or a bare "
+                            "`set` -- which hands it `GITHUB_HEAD_REF` and "
+                            "`GITHUB_ACTOR` without naming either, so the "
+                            "allowlist over the names decides nothing. Name "
+                            "the variable you want",
+                        )
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(reachable),
                             f"{path.name}: a step reaches the webhook "
                             "payload on disk -- `GITHUB_EVENT_PATH`, the "
                             "runner's `$RUNNER_TEMP/_github_workflow/"
-                            "event.json`, or the process environment that "
-                            "holds the path, reached through `process.env`, "
-                            "`os.environ` or `getenv`. Every field in that "
+                            "event.json` or the `/github/workflow` a "
+                            "container job sees that directory at, or the "
+                            "process environment that holds the path, "
+                            "reached through `process.env`, `os.environ`, "
+                            "`environ` or `getenv`. Every field in that "
                             "file came from the pull request, and it is the "
                             "one language neither allowlist reads",
                         )

@@ -2197,6 +2197,55 @@ Mutation(
         "names no variable and so reaches no allowlist over names",
     ),
     Mutation(
+        # That path with the directory component globbed, which is the row
+        # above repaired by one character. `_github_workflow` is the only
+        # thing under `$RUNNER_TEMP` and `*` is shorter to write, so this
+        # reads the same bytes while naming neither variable, neither
+        # prefix, nor `event.json`. It is the reason the directory half of
+        # `_EVENT_PAYLOAD_FILE` stopped claiming to be complete: the claim
+        # was that the payload lives under `RUNNER_TEMP` and nowhere else,
+        # which is true, and that a step therefore has to name the variable
+        # to reach it, which is not -- the variable has a value and the
+        # value can be typed out.
+        "B4-pull-request-target-run-event-file-temp-glob",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          REV=$(jq -r .after /home/runner/work/_temp/*/*.json)\n"
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "glob one directory further up the runner's temporary tree, which "
+        "is the same read with the only component a pattern was watching "
+        "for replaced by a star",
+    ),
+    Mutation(
+        # And the same directory seen from inside a container, where the
+        # path has no underscore in it anywhere. A `container:` job gets the
+        # runner's `_github_workflow` directory bind-mounted at
+        # `/github/workflow`, so the payload is at `/github/workflow/
+        # event.json` and a glob over it names nothing the runner's own path
+        # spelled. Separate row from the one above because it pins a
+        # separate alternative: they share no substring.
+        "B4-pull-request-target-run-event-file-container-mount",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          REV=$(jq -r .after /github/workflow/*.json)\n"
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the payload at the path a container job sees it at, which is "
+        "the same file the runner mounted and none of the words the "
+        "runner's own path is written in",
+    ),
+    Mutation(
         # And the same reach in the other language a step can be written in.
         # An earlier round claimed `shell: python` was handled while reading
         # only the JavaScript accessor, so `os.environ["GITHUB_EVENT_" +
@@ -2220,6 +2269,177 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "read the payload from Python, where the variable's name splits off "
         "the reserved prefix the same way and the accessor is `os.environ`",
+    ),
+    Mutation(
+        # The accessor imported under another name, which is the row above
+        # repaired by an import. `from os import environ as e` binds the
+        # mapping to a one-letter name and reads it as `e.items()`, so
+        # `os.environ` appears nowhere, the subscript a pattern wanted is on
+        # a name this file cannot predict, and the word `environ` survives
+        # only at the import. The rule reads the bare word for that reason.
+        "B4-pull-request-target-python-environ-aliased-import",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: python\n"
+         "        run: |\n"
+         "          from os import environ as e\n"
+         '          rev = [v for k, v in e.items() '
+         'if k.endswith("HEAD_REF")][0]\n'
+         "          import subprocess\n"
+         '          subprocess.run(["git", "fetch", "origin", rev])\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "alias the environment mapping on import and match its keys by "
+        "suffix, which spells neither the accessor nor the variable",
+    ),
+    Mutation(
+        # The environment read whole, in the shell. `env` hands the step
+        # every variable the runner set, `GITHUB_HEAD_REF` among them, and
+        # the only spelling of that name on the line is lower case -- which
+        # is not the name the shell would expand and is exactly the name
+        # `grep -i` matches. The allowlist over the names reads nothing
+        # here, and this was green until 2026-09-19. It is the row
+        # `_ENVIRONMENT_ENUMERATION` exists for, and the six that follow are
+        # its other spellings, one row each because they share no substring.
+        "B4-pull-request-target-run-env-dump-grep",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(env | grep -i '^github_head_ref=' | sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "dump the environment and pick the branch out of it by a "
+        "case-insensitive match, which is the shortest way to read a "
+        "variable without writing the name the shell knows it by",
+    ),
+    Mutation(
+        # The same dump from the program this file already refuses *with* an
+        # operand. `printenv GITHUB_HEAD_REF` names the variable and dies on
+        # the allowlist over the names; `printenv` alone names nothing and
+        # prints the same value. The pair is the whole argument for this
+        # rule in two rows.
+        "B4-pull-request-target-run-printenv-dump",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(printenv | grep -i '^github_head_ref=' "
+         "| sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "use the other program that prints the environment, with the "
+        "operand that would have named a variable left off",
+    ),
+    Mutation(
+        # The shell builtin that prints the table, rather than the program
+        # that prints the environment. `declare -p` is a dump and `declare
+        # -a xs` is a declaration, which is why the rule is anchored on what
+        # follows the word rather than on the word.
+        "B4-pull-request-target-run-declare-dump",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(declare -p | grep -i 'github_head_ref=' "
+         "| sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "print the shell's own variable table, which is the environment "
+        "plus the shell's and is one flag away from an assignment",
+    ),
+    Mutation(
+        # And the builtin whose job is setting a variable, printing them
+        # instead. `export -p` and `export PATH=x` are the same word in
+        # opposite directions, and one of them is a read.
+        "B4-pull-request-target-run-export-dump",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(export -p | grep -i 'github_head_ref=' "
+         "| sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "print the exported variables, which is the environment under the "
+        "name of the builtin that sets it",
+    ),
+    Mutation(
+        # The word every script in this repository already writes, with the
+        # options left off. `set -euo pipefail` is a directive and a bare
+        # `set` is a dump of everything the shell has, and a rule that
+        # cannot tell them apart is a rule nobody can keep.
+        "B4-pull-request-target-run-set-dump",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(set | grep -i '^github_head_ref=' | sed -e 's/.*=//')\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "print everything the shell has, which is what `set` with no "
+        "operands does and what `set -euo pipefail` does not",
+    ),
+    Mutation(
+        # The names alone, expanded indirectly afterwards. `compgen -e`
+        # prints what is exported and `${!N}` reads it, so neither the dump
+        # nor the expansion has the variable's name written in it anywhere.
+        "B4-pull-request-target-run-compgen-dump",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          for N in $(compgen -e); do\n"
+         "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
+         ' B="${!N}";; esac\n'
+         "          done\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "list the names of the exported variables and expand the match "
+        "indirectly, which reaches the value with neither half written down",
+    ),
+    Mutation(
+        # The safe side of the rule above, and the reason it is anchored on
+        # a terminator rather than on the words. Every one of these lines
+        # contains a word the enumeration rule reads and none of them is a
+        # read: `set -euo pipefail` is a directive, `export PATH=...` and
+        # `declare -a` are assignments, `env FOO=1 cmd` sets a variable for
+        # one command, and `/usr/bin/env` is a shebang's program. KILLED
+        # here means the rule has been widened into a ban on the words,
+        # which is a suite that reds on the first ordinary shell script
+        # somebody writes.
+        "B4-pull-request-target-run-env-ordinary-shell",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Build the tools\n"
+         "        run: |\n"
+         "          set -euo pipefail\n"
+         '          export PATH="$PWD/bin:$PATH"\n'
+         "          declare -a tools=(jq yq)\n"
+         '          echo "${tools[@]}" > tools.txt\n'
+         "          env GOFLAGS=-mod=readonly ./bin/build\n"
+         "          /usr/bin/env python3 ./bin/check.py\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write an ordinary shell script that sets a variable, exports a "
+        "path, declares an array and runs a command under `env`, naming "
+        "nothing the pull request decides",
+        must_survive=True,
     ),
     Mutation(
         # `git remote add` and `git remote update`, which put the fork's code
