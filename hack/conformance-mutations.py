@@ -1036,6 +1036,50 @@ Mutation(
         "the same field and a pattern over dots does not match",
     ),
     Mutation(
+        # The payload as a file. `GITHUB_EVENT_PATH` holds the whole webhook
+        # event on disk, so the head SHA is reachable with no expression for
+        # the script allowlist to read and no `context` property for the
+        # JavaScript rule -- the same field, in the one language neither of
+        # them parses. Found by an adversarial pass over the allowlist that
+        # replaced the denylist, not by the review that prompted it.
+        "B4-pull-request-target-run-fetch-event-file",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          REV=$(jq -r .after \"$GITHUB_EVENT_PATH\")\n"
+         "          git fetch --depth=1 origin \"$REV\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head out of the event file, which names no expression and "
+        "no context property and so reaches neither allowlist",
+    ),
+    Mutation(
+        # The same file read from a `script:` input, where `process.env`
+        # rather than a shell gets at the path. Separate row because the two
+        # go through different halves of the read: this one is only visible
+        # at all because `_step_scripts` folds `with:` values in.
+        "B4-pull-request-target-script-event-file",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const fs = require('fs');\n"
+         "            const ev = JSON.parse(fs.readFileSync("
+         "process.env.GITHUB_EVENT_PATH, 'utf8'));\n"
+         "            await exec.exec('git', ['fetch', 'origin', ev.after]);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head out of the event file from JavaScript, which builds "
+        "its own path to the payload rather than using the one it is handed",
+    ),
+    Mutation(
         # Expressions are case-insensitive to GitHub and a Python regex is
         # not. Same field as B4-pull-request-target-run-fetch-after, same
         # runner behaviour, shifted key.
