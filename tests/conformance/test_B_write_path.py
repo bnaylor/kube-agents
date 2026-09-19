@@ -41,37 +41,15 @@ _PULL_REQUEST_REF = re.compile(
 )
 # The three spellings of the pull request's head that have turned up in a
 # workflow here. They are a backstop rather than the rule: what governs a
-# fetching step is the allowlist below, and these three are for the text that
-# carries no `${{ ... }}` for that allowlist to read -- a JavaScript property
-# path, a ref written into a shell string. Deliberately not extended.
+# step is the allowlist below, and these three are for the text that carries
+# no `${{ ... }}` for that allowlist to read -- a JavaScript property path, a
+# ref written into a shell string. Deliberately not extended.
 # `github.event.before` and `github.event.pull_request.merge_commit_sha` name
 # the same code, `${{ GITHUB.EVENT.AFTER }}` is a second spelling of the third
 # alternative because expressions are case-insensitive, and answering each of
 # those with one more alternative is the shape the allowlist replaced.
 _PULL_REQUEST_HEAD = re.compile(
     r"pull_request\.head|github\.head_ref|github\.event\.after"
-)
-_FETCHES = re.compile(
-    # `pull` is not a bare alternative. The haystack below carries prose --
-    # shell comments, `echo` text, a job name -- and `\bpull\b` matches the
-    # words "pull request", which is most of what a pull-request workflow's
-    # scripts say. What is dangerous is the command: `git pull origin "$REV"`
-    # merges the fetched head into the working tree, which is the same hazard
-    # as a fetch and a checkout spelled in one verb. So it is matched as `git`
-    # and `pull` in the same *command*, which keeps `git -C repo pull` and
-    # loses the noun. What that still reds: a `git` command whose trailing
-    # comment says "pull request", in a step that also names the head. That is
-    # a false red -- a line of review -- rather than a miss.
-    #
-    # A command is not a line. A backslash before the newline continues one,
-    # so `git \` and `  pull origin "$REV"` on the next line is a single `git
-    # pull`, and a single-line match reads it as the word `git` and the word
-    # `pull` in two different places and sees nothing. That is a
-    # two-character edit away from every `git pull` this alternative exists
-    # for, so the gap between the two words is "anything but a newline, or a
-    # backslash and a newline".
-    r"\b(fetch|checkout|clone)\b"
-    r"|\bgit\b(?:[^\n]|\\\n)*\bpull\b"
 )
 
 # Any `${{ ... }}` an interpolated value carries. `re.DOTALL` because `.` is
@@ -123,19 +101,43 @@ _SAFE_CHECKOUT_EXPRESSIONS = frozenset({"github.event.repository.default_branch"
 # too; this is the list.
 _SAFE_CHECKOUT_REPOSITORIES = frozenset({"github.repository"})
 
-# The expressions a step that fetches may name, in its script or anywhere in
-# its `env:`. The refs are the checkout list above, because a `git fetch`
-# resolves a ref the same way the action does and there is no reason for the
-# two halves to disagree about which refs are safe. The other three are not
-# refs at all: a fetch authenticates with a token, spelled either of the two
-# ways GitHub spells it, and names a remote, and none of that is code.
-# Anything else -- another event field, a
-# `steps.X.outputs.Y`, an `env.X` that did not resolve -- reads as unsafe,
-# which is the direction the ref half is wrong in and for the same reason.
+# The expressions any step of a `pull_request_target` workflow may name, in
+# its script or anywhere in its `env:`. The refs are the checkout list above,
+# because a `git fetch` resolves a ref the same way the action does and there
+# is no reason for the two halves to disagree about which refs are safe. The
+# rest are not refs at all, and each is here because a carrier in this
+# repository names it today. A step authenticates with a token, spelled
+# either of the two ways GitHub spells it, and names a remote. A workflow
+# that labels or comments on the pull request needs its number, which GitHub
+# types as an integer -- the fork chooses which number, not what a number
+# is, so it cannot be a ref, a path or a command. `inputs.dry_run` is a
+# `workflow_dispatch` boolean, which only somebody who can already push here
+# is able to set, and is not the pull request's at all.
+#
+# The pull request's number is a concession and should be read as one. It is
+# the only entry here that is not independent of the pull request -- it
+# identifies it -- and with it and the token in the same step, the head is one
+# `gh api repos/O/R/pulls/$N --jq .head.sha` away. Measured: that step was
+# refused before this entry existed and is not refused now, and so is `gh pr
+# checkout "$PR_NUMBER"`. Both are in the test's "Not covered" list with the
+# measurement. The concession is made because two carriers label and comment
+# with the number and there is no way to tell that use from the other one
+# without reading the program, which is the thing this file declines to do;
+# and because the alternative on offer is a denylist over `gh pr`, which
+# `auto-assign-milestone.yml` would be the first to trip on with `gh pr edit`.
+# What the number does *not* open is the direct path: `pull/N/head` built out
+# of it is refused by `_PULL_REQUEST_REF` over every step, whatever is on this
+# list.
+#
+# Anything else -- another event field, a `steps.X.outputs.Y`, an `env.X`
+# that did not resolve -- reads as unsafe, which is the direction the ref
+# half is wrong in and for the same reason.
 _SAFE_SCRIPT_EXPRESSIONS = _SAFE_CHECKOUT_EXPRESSIONS | {
     "github.repository",
     "github.token",
     "secrets.github_token",
+    "github.event.pull_request.number",
+    "inputs.dry_run",
 }
 
 # The JavaScript half of the same rule. `actions/github-script` hands its
@@ -951,19 +953,49 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         trigger today and two of them run a checkout. If either reaches zero
         the test should be read again, not passed by default.
 
-        The `run:` half is two rules over any step that fetches, and it is
-        not a proof: a script can reach a ref any number of ways and no
-        assertion over YAML will catch all of them. The first rule is
+        The `run:` half is two rules over every step of the workflow, and
+        it is not a proof: a script can reach a ref any number of ways and
+        no assertion over YAML will catch all of them. The first rule is
         literal. A `pull/N/head` refspec is refused wherever it appears,
         because it is the checkout action's own documented manual equivalent
         and needs no interpolation at all. The second is the `ref:` half's
-        rule one field along: a step that fetches may name only the
-        expressions in `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only
-        those, an `actions/github-script` body may reach only the `context`
-        properties in `_SAFE_SCRIPT_CONTEXTS`, and nothing in it may read
-        `GITHUB_EVENT_PATH`. Those are the three languages the webhook
-        payload is written in here -- an expression, a JavaScript property
-        path, and a file on disk -- and the rule is the same in each.
+        rule one field along: a step may name only the expressions in
+        `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only those, an
+        `actions/github-script` body may reach only the `context` properties
+        in `_SAFE_SCRIPT_CONTEXTS`, and nothing in it may reach the webhook
+        payload as a file. Those are the three languages the payload is
+        written in here -- an expression, a JavaScript property path, and a
+        file on disk -- and the rule is the same in each.
+
+        "Every step" was "every step that fetches" until 2026-09-19, and the
+        gate that said so is gone for the reason every other denylist in
+        this file went: it was a list of verbs. `fetch`, `checkout`, `clone`
+        and `git pull` are four ways to put a fork's code on the runner and
+        there are not four -- `git remote add` and `git remote update`,
+        `curl .../tarball/... | tar xz`, `pip install "git+https://..."`,
+        `docker build "https://...#<sha>"` -- and a verb laundered through
+        `env:` is not a verb this file can read at all, which `${{
+        env['CMD'] }}` and `os.environ["CMD"].split()` each demonstrated
+        while green. The gate was asking "does this step run the fork's
+        code", which is a question about programs and about a package
+        manager's argument grammar, and a regex over four words cannot
+        answer it. What this file can answer is "does this step reach the
+        pull request", and that question needs no gate: reaching the payload
+        is the thing the rules below already read for. So the condition went
+        and the verdicts stayed. It is the same move the environment
+        refusal below made one round earlier against the same objection, and
+        it is the whole argument of this half -- a denylist of nouns loses,
+        and an allowlist of what is reachable wins.
+
+        What that costs is that every step is now read, including the ones
+        that do nothing but call an API. A step that carries the pull
+        request's head in its `env:` for a label or a log line is refused
+        exactly as a fetching one is, because "does the program read this
+        variable" is a question about a program. That is a wider cost than
+        the gated version's and it is the same kind: a line of review, on a
+        trigger where the job holds a writable token, on a step whose author
+        can say in one line why the value is there. Measured against the
+        carriers, below.
 
         The second rule was a denylist over three spellings until
         2026-09-19, and it failed the way the `ref:` half's denylist failed,
@@ -981,12 +1013,17 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         text that carries no expression for the allowlist to read, and are
         deliberately not extended.
 
-        What the allowlist costs is measured rather than assumed: no step in
-        any `pull_request_target` workflow here fetches anything, so the gate
-        fires on none of them and the cost today is zero. The day one does
-        fetch, an expression that is genuinely safe is a line of review and a
-        line in `_SAFE_SCRIPT_EXPRESSIONS` saying why -- the same price, and
-        the same answer, as the ref allowlist.
+        What the allowlist costs is measured rather than assumed, and
+        dropping the gate is what made it cost anything. Every step of all
+        three carriers is read now, and two expressions had to go on the
+        list for them to stay green: `github.event.pull_request.number`,
+        which two of them label and comment with, and `inputs.dry_run`, a
+        `workflow_dispatch` boolean. Both arguments are at
+        `_SAFE_SCRIPT_EXPRESSIONS`. That is the bill in full -- two entries
+        and two reasons, paid once, for a rule that no longer depends on
+        recognising a verb. The next genuinely safe expression somebody
+        needs is a line of review and a line on the list saying why, which
+        is the same price and the same answer as the ref allowlist.
 
         "The step's script" is not the same thing as its `run:`.
         `actions/github-script` takes JavaScript as an input and runs it in
@@ -1006,14 +1043,30 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `env:` is this repository's house style rather than an exotic dodge
         -- `risk_classify.yml` does exactly that with `PR_NUMBER`, on the
         stated grounds that event fields are attacker-controlled input -- so
-        a scan of `run:` by itself reads `$PR_HEAD` and sees nothing. Only
-        the values the script actually names are folded into the script text,
-        and that narrowing is now about the gate rather than about the
-        verdict: what a fetching step's environment carries is answered
-        below, wholesale. What folding the named values in still buys is
-        seeing a fetch at all when the verb or its arguments are themselves
-        laundered through `env:`. For the same reason the two halves are not
-        required to appear in order, or on one line.
+        a scan of `run:` by itself reads `$PR_HEAD` and sees nothing.
+
+        Which of those values get folded in is a question that stopped
+        deciding anything when the gate went, and saying so is worth more
+        than the loop that answers it. The pickup below folds in the values
+        the script names, following a chain one hop at a time, and the two
+        literal backstops read the result. Those backstops also read every
+        environment value singly, because the wholesale refusal below does,
+        and the folded text is a subset of the values that refusal already
+        walks -- neither pattern can match across the newline the fold joins
+        on, so there is no string the pickup puts in front of a pattern that
+        the pattern was not going to see anyway. That is an argument, so it
+        was also measured: neutering the pickup to an empty mapping leaves
+        all twelve round-7 cases, all fifteen round-6 cases and all
+        forty-two evasion cases at exactly the verdicts they hold with it.
+
+        It stays because it is cheap and because the wholesale refusal is
+        one edit from being narrowed again, and it stays *unpinned*, which
+        is the part to write down: no mutation row covers it, and none can
+        while no workflow in this repository carries a head in an `env:`
+        value. A row that neutered it would be green forever and would be
+        theatre. Read it as redundancy that is deliberate rather than as a
+        rule -- and if the next round wants it gone, the measurement above
+        is the permission slip.
 
         "Names" has to mean both ways of naming, and expansion has to run
         first. A script can reach an `env:` value as `$REV`, which is a
@@ -1037,13 +1090,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         by `_ENV_EXPANSION_LIMIT`, the cap `_expand_env` uses.
 
         Past that, the answer is refusal rather than more syntax, and what
-        is refused is the environment rather than the script. A step that
-        fetches and whose `env:` carries the pull request's head is refused,
-        whether or not anything in the script appears to read that value. It
-        has to be. `shell: python` makes the read `os.environ["REV"]` and no
-        `$REV` is written anywhere; an inline `python3 -c` does the same
-        under the default shell; and any program a script starts inherits the
-        whole environment without naming a field of it. An earlier version
+        is refused is the environment rather than the script. A step whose
+        `env:` carries the pull request's head is refused, whether or not
+        anything in the script appears to read that value. It has to be.
+        `shell: python` makes the read `os.environ["REV"]` and no `$REV` is
+        written anywhere; an inline `python3 -c` does the same under the
+        default shell; and any program a script starts inherits the whole
+        environment without naming a field of it. An earlier version
         enumerated the shell constructs that defeat the pickup --
         `printenv`, indirect expansion, `eval`, `env`, `declare`, `source` --
         and refused only a step that used one of them. The verdict was right
@@ -1053,16 +1106,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         unresolvable ref expression gets, one field along: "this file cannot
         tell what this does" reads as unsafe.
 
-        It costs a false red on a step that fetches something harmless while
-        carrying the head in its environment for another purpose. That is a
-        line of review, it is the trade the ref allowlist already makes, and
-        on a trigger where the job holds a writable token it is a line worth
-        reading.
-
-        The `git pull` form is matched as a command rather than as a word,
-        and as a command that a backslash before the newline can continue;
-        the argument for both, including why the bare word is useless over a
-        haystack full of prose, is at `_FETCHES`.
+        The same reasoning took the fetch gate off this rule a round later,
+        which is the only change of substance: the head in a step's
+        environment is refused now whatever else the step does, where before
+        it was refused only if the step also said `fetch`. A step that reads
+        `github.head_ref` to name a label reds today. That is the trade the
+        ref allowlist already makes, and a step is a place where a comment
+        fits.
 
         The `ref:` half, by contrast, is an allowlist, and that is the whole
         design. It began as a denylist over three nouns -- `pull_request`,
@@ -1261,12 +1311,21 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             )
                         # The script, plus the `env:` values it actually
                         # names -- see the docstring on why `run:` alone is
-                        # not enough and why order is not required. What the
-                        # pickup buys, now that the rules below read the
-                        # whole environment anyway, is the gate: a fetch
-                        # whose verb or whose arguments are themselves
-                        # laundered through `env:` is a fetch, and the only
-                        # way to see one is to fold those values in.
+                        # not enough and why order is not required.
+                        #
+                        # This pickup decides nothing on its own any more.
+                        # Only the two literal backstops read what it
+                        # produces, the wholesale refusal further down reads
+                        # every environment value whether the script names it
+                        # or not, and neither backstop matches across a
+                        # newline -- so every string folded in here is one
+                        # that rule was going to look at singly. Measured, at
+                        # the empty mapping, against all three case
+                        # harnesses: not one verdict moves. It is kept as
+                        # redundancy against the day that rule is narrowed,
+                        # and the docstring says plainly that nothing pins
+                        # it, because a mutation row over a redundancy no
+                        # carrier exercises would be green forever.
                         #
                         # Everything is expanded before it is matched, and
                         # the pickup runs over what expansion produced. A
@@ -1296,11 +1355,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                                     # the same read. The `!` form names the
                                     # variable holding the name rather than
                                     # the value, which this pickup follows
-                                    # one hop and no further. The hop it
-                                    # cannot follow costs nothing: what
-                                    # follows refuses the environment
-                                    # wholesale rather than by what the
-                                    # script appears to read.
+                                    # one hop and no further. Neither the hop
+                                    # it takes nor the one it cannot decides
+                                    # a verdict: what follows refuses the
+                                    # environment wholesale rather than by
+                                    # what the script appears to read.
                                     r"\$\{?!?" + re.escape(name) + r"\b"
                                     r"|\bprintenv\s+" + re.escape(name) + r"\b",
                                     haystack,
@@ -1311,32 +1370,30 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             named.update(picked)
                         haystack = "\n".join([script] + list(named.values()))
                         # A `pull/N/head` refspec is refused wherever it
-                        # appears, fetch verb or no: it is a literal, it
-                        # needs no expression, and there is no innocent
-                        # reason to write one down here.
+                        # appears: it is a literal, it needs no expression,
+                        # and there is no innocent reason to write one down
+                        # in a workflow that must not have the fork's code.
                         self.assertIsNone(
                             _PULL_REQUEST_REF.search(haystack),
-                            f"{path.name}: a run: step fetches a pull/N/head "
+                            f"{path.name}: a step names a pull/N/head "
                             "refspec, which is the checkout action's hazard "
                             "without the checkout action",
                         )
-                        if not _FETCHES.search(haystack):
-                            continue
                         # Everything the step's environment will actually
                         # hold, resolved. Every value rather than the ones
-                        # the pickup found: the rules below are about what a
-                        # fetching step can reach, and a script can reach any
-                        # of it without naming a thing.
+                        # the pickup found: the rules below are about what
+                        # the step can reach, and a program reaches all of
+                        # its environment without naming a field of it.
                         environment = {
                             name: _expand_env(value, step_env)
                             for name, value in step_env.items()
                         }
-                        # The ref half's rule, one field along. A step that
-                        # fetches may name only expressions that are known
-                        # not to be the pull request, in its script or in
-                        # anything its environment carries, and everything
-                        # else -- an event field nobody here has heard of, an
-                        # `env.X` that did not resolve -- is refused for being
+                        # The ref half's rule, one field along. A step may
+                        # name only expressions that are known not to be the
+                        # pull request, in its script or in anything its
+                        # environment carries, and everything else -- an
+                        # event field nobody here has heard of, an `env.X`
+                        # that did not resolve -- is refused for being
                         # unrecognised rather than allowed for not matching a
                         # list of nouns.
                         unsafe = sorted({
@@ -1349,8 +1406,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertEqual(
                             [],
                             unsafe,
-                            f"{path.name}: a run: step fetches and names "
-                            f"{unsafe}, which is not among the expressions "
+                            f"{path.name}: a step names {unsafe}, which "
+                            "is not among the expressions "
                             "known to be independent of the pull request. If "
                             "one of them is, add it to "
                             "_SAFE_SCRIPT_EXPRESSIONS and say why",
@@ -1369,8 +1426,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertEqual(
                             [],
                             reached,
-                            f"{path.name}: a script: input in a step that "
-                            f"fetches reaches {reached}, which is the webhook "
+                            f"{path.name}: a script: input reaches "
+                            f"{reached}, which is the webhook "
                             "payload -- the same fields the expression "
                             "allowlist refuses, in the language that runs",
                         )
@@ -1378,7 +1435,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # that carries no expression for them to read.
                         self.assertIsNone(
                             _PULL_REQUEST_HEAD.search(haystack),
-                            f"{path.name}: a run: step fetches the pull "
+                            f"{path.name}: a step names the pull "
                             "request's head, which is the checkout action's "
                             "hazard without the checkout action",
                         )
@@ -1389,10 +1446,10 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `os.environ["REV"]`, an inline `python3 -c` does the
                         # same under bash, and any program a script starts
                         # inherits the lot without naming anything -- so a
-                        # fetching step that has the head in its environment
-                        # at all is refused. The cost is a false red on a step
-                        # that fetches something harmless while carrying the
-                        # head for another purpose, which is a line of review.
+                        # step that has the head in its environment at all is
+                        # refused. The cost is a false red on a step that
+                        # carries the head for a label or a log line, which
+                        # is a line of review.
                         carried = sorted(
                             name
                             for name, value in environment.items()
@@ -1402,11 +1459,10 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertEqual(
                             [],
                             carried,
-                            f"{path.name}: a run: step fetches and its "
-                            f"environment carries the pull request's head as "
-                            f"{carried}. Whether the script reads it is not a "
-                            "question this test can answer, so it does not "
-                            "assume the answer",
+                            f"{path.name}: a step's environment carries "
+                            f"the pull request's head as {carried}. Whether "
+                            "the script reads it is not a question this test "
+                            "can answer, so it does not assume the answer",
                         )
                         # And the payload as a file, which is neither an
                         # expression nor a `context` property and so reaches
