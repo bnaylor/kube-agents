@@ -261,14 +261,15 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-126 mutations: 102 KILLED, 22 NOISY, two `must_survive` controls (one on the
-harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-19 against
-this branch; re-run the harness rather than trusting these numbers, which is
-the sentence this paragraph exists to make cheap. Note that the summary line
-the harness prints accounts for 124 of the 126: a `must_survive` control's
-verdict is `SURVIVED (expected)`, which is neither killed, noisy, nor a
-survivor. The run also prints `BASELINE POLLUTED` if the suite is not green
+137 mutations: 112 KILLED, 22 NOISY, three `must_survive` controls (one on the
+harness itself, one pinning a deliberate redundancy in the shorthand handling,
+one pinning a case-insensitive `env:` expansion that closes no hole and would
+false-red a safe workflow if it were dropped), zero genuine survivors, zero
+stale — measured 2026-09-19 against this branch; re-run the harness rather
+than trusting these numbers, which is the sentence this paragraph exists to
+make cheap. Note that the summary line the harness prints accounts for 134 of
+the 137: a `must_survive` control's verdict is `SURVIVED (expected)`, which is
+neither killed, noisy, nor a survivor. The run also prints `BASELINE POLLUTED` if the suite is not green
 once every mutation has been restored, which did not happen here and would
 invalidate every verdict after whatever caused it. Each mutation names the
 control it removes, the test that must notice, and the plausible bad change it
