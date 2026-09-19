@@ -24,7 +24,7 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Three rows on every run print this, and the SURVIVED line above
+             Seven rows on every run print this, and the SURVIVED line above
              is exactly the wrong reading of them: the suite staying green is
              the property they assert.
     BASELINE POLLUTED
@@ -78,10 +78,13 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Four today: B1-denylist-rule,
+    #: and KILLED is the failure. Seven today: B1-denylist-rule,
     #: A3-fastpath-redundant,
-    #: B4-pull-request-target-checkout-ref-env-case, and
-    #: B4-pull-request-target-api-gh-pr-interposed-flag-write.
+    #: B4-pull-request-target-checkout-ref-env-case,
+    #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
+    #: B4-pull-request-target-api-web-link-comment,
+    #: B4-pull-request-target-api-gh-issue-comment-write, and
+    #: B4-pull-request-target-api-gh-argv-vector-write.
     must_survive: bool = False
 
 
@@ -864,6 +867,63 @@ Mutation(
         "line-length housekeeping everywhere else in this repository",
     ),
     Mutation(
+        # The namespace reached without being spelled, and the first of the
+        # two rows over `_REMOTE_REF_ENUMERATION`. Every refspec row above
+        # writes `pull` somewhere, which is what the three alternatives of
+        # `_PULL_REQUEST_REF` read. A bare `git ls-remote origin` writes
+        # none of it: the remote advertises `refs/pull/N/head` to anyone who
+        # asks, `grep` picks this pull request's line out of the listing, and
+        # `git fetch origin "$SHA"` is a fetch by object name the server
+        # serves. Distinct from B4-pull-request-target-run-refspec-ls-remote,
+        # which passes the remote a `pull/N/h*` pattern and is caught by the
+        # ref half for spelling it -- delete the enumeration rule and that
+        # row still kills while this one survives, which is what separates
+        # the pair.
+        "B4-pull-request-target-run-ls-remote-unfiltered",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          SHA=$(git ls-remote origin"
+         " | grep \"/$PR_NUMBER/head\" | cut -f1)\n"
+         "          git fetch origin \"$SHA\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "list what the remote advertises and filter it locally, which is "
+        "what somebody writes when they do not want to depend on the "
+        "server's pattern matching",
+    ),
+    Mutation(
+        # The same reach with the enumeration done by the fetch. `+refs/*`
+        # copies every namespace the remote has onto the runner, the pull
+        # namespace among them, and `git for-each-ref` then reads the head
+        # out of the local copy -- so the only thing naming `pull` is a
+        # `grep` pattern built from the number. This is the row that pins the
+        # second alternative: the rule refuses a refspec that globs *before*
+        # the namespace is fixed, and `refs/heads/*` a line away is an
+        # ordinary mirror fetch it leaves alone.
+        "B4-pull-request-target-run-wildcard-namespace-refspec",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          git fetch origin \"+refs/*:refs/remotes/all/*\"\n"
+         "          SHA=$(git for-each-ref"
+         " | grep \"/$PR_NUMBER/head\" | cut -d' ' -f1)\n"
+         "          git checkout \"$SHA\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "mirror the remote's whole ref space in one fetch, which is the "
+        "shape of a workflow that wants notes, tags and branches together, "
+        "and read the head back out of it",
+    ),
+    Mutation(
         # `printenv NAME` is a read of NAME that never writes `$NAME`. The
         # pickup was keyed on the sigil, so the value was never folded in and
         # the fetch read as innocent.
@@ -1186,6 +1246,263 @@ Mutation(
         "use the client the action already hands the script, rather than "
         "shelling out to `gh` -- which is the idiomatic way to write this "
         "step and the way that names none of the nouns the shell rules read",
+    ),
+    Mutation(
+        # The program name in quotes, which is what `_GH_COMMAND`'s
+        # whitespace lookahead never saw. A shell strips the quotes off a
+        # bare word before it execs, so this runs exactly what
+        # B4-pull-request-target-api-gh-pr-checkout runs -- but the character
+        # after `gh` is an apostrophe, the pattern wanted a space, and the
+        # walk was never handed the invocation at all. `gh'' pr checkout` is
+        # the same trick with the quotes empty and is not a second row: both
+        # die on the lookahead and nothing separates them.
+        "B4-pull-request-target-api-gh-quoted-command",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          'gh' pr checkout \"$PR_NUMBER\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "quote the program name, which a shell-quoting pass over a script "
+        "does to every word it is not sure about",
+    ),
+    Mutation(
+        # The same command as an argument vector, which is the ordinary way
+        # to run a program from a `script:` input rather than an
+        # obfuscation: `actions/github-script` hands the body an `exec` and
+        # this is what its documentation shows. What catches it is the
+        # widened `_GH_COMMAND` lookahead alone -- the character after `gh`
+        # is a quote followed by a comma, and without that the walk is never
+        # handed the invocation. Measured, because the obvious reading is
+        # wrong: revert `_GH_WORD_PUNCTUATION` to the old quote-only strip
+        # and this row still KILLS, because `['pr',` is then read as the verb
+        # and refused for not being on `_SAFE_GH_VERBS`. The punctuation
+        # strip earns its place on the safe side instead, at
+        # B4-pull-request-target-api-gh-argv-vector-write. Pinned to the real
+        # action's SHA, like the two rows above: an unpinned one would trip
+        # C4's sweep and the verdict would stop saying which rule caught this.
+        "B4-pull-request-target-api-gh-argv-vector",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        with:\n"
+         "          script: |\n"
+         "            await exec.exec('gh', ['pr', 'checkout',"
+         " '${{ github.event.pull_request.number }}']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run the CLI the way the action's own documentation runs a program, "
+        "as a name and a list of arguments rather than as a command line",
+    ),
+    Mutation(
+        # The verb renamed, and the row the verb allowlist exists for. `gh
+        # alias set` writes a user-level alias into the CLI's config, so the
+        # second line *is* `gh pr checkout` to the CLI and is `gh co` to any
+        # reader of the file -- a word GitHub never shipped and no denylist
+        # over subcommands can be written to contain. A walk that skips every
+        # invocation whose verb is not `pr` reads neither line: the first is
+        # `alias`, the second is `co`. Both are refused now for not being on
+        # `_SAFE_GH_VERBS`, which is the same move one noun up that
+        # `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS` made a round earlier.
+        "B4-pull-request-target-api-gh-alias-verb",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          gh alias set co 'pr checkout'\n"
+         "          gh co \"$PR_NUMBER\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "alias the checkout to a short name first, which is the tidying "
+        "somebody does to a script that runs the same subcommand repeatedly",
+    ),
+    Mutation(
+        # The fork's changes over HTTP with no token in the request at all.
+        # `https://github.com/O/R/pull/N.diff` is served off the pull
+        # request's web page, so this is
+        # B4-pull-request-target-api-gh-pr-diff with the client swapped for
+        # `curl` and the credential dropped -- and it named nothing any rule
+        # read: not `/pulls`, which is the API path and this is not; not
+        # `refs/pull`, which the web URL has no prefix for; not `gh`. The
+        # `.patch` sibling through `git am` is the same alternative and is
+        # not a second row.
+        "B4-pull-request-target-api-web-diff-endpoint",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          curl -fsSL \"https://github.com/"
+         "${{ github.repository }}/pull/${PR_NUMBER}.diff\" | git apply\n"
+         "          ./run.sh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the diff off the pull request's web page, which needs no "
+        "token and no authentication step ahead of it",
+    ),
+    Mutation(
+        # The head through the noun this file leaves open. A pull request is
+        # an issue to the REST API, and `/issues/N/timeline` returns its
+        # `committed` events, each carrying a head SHA -- so the verb is
+        # `api`, which is allowlisted, and the path says `issues`, which
+        # `_PULL_REQUEST_API` deliberately does not police as a namespace
+        # because `issues.createComment` is what a labelling carrier is for.
+        # The two timeline endpoints are the exception, and this row is why
+        # the exception is written as two endpoints rather than as the
+        # namespace.
+        "B4-pull-request-target-api-issues-timeline",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "          REPO: ${{ github.repository }}\n"
+         "        run: |\n"
+         "          SHA=$(gh api \"repos/$REPO/issues/$PR_NUMBER/timeline\""
+         " --jq '.[] | select(.event==\"committed\") | .sha' | tail -1)\n"
+         "          git fetch origin \"$SHA\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head off the issue timeline rather than off the pull "
+        "request, which is one endpoint over and returns the same commits",
+    ),
+    Mutation(
+        # The same endpoint from the language the shell rules cannot read,
+        # and the pair to the row above the way
+        # B4-pull-request-target-api-octokit-pulls is the pair to
+        # B4-pull-request-target-api-gh-api-pulls. `listEventsForTimeline` is
+        # the client method for `/issues/N/timeline`, so the path alternative
+        # never sees it -- there is no slash anywhere in the call -- and the
+        # method name is matched instead. Pinned to the real action's SHA for
+        # the same reason as its neighbours.
+        "B4-pull-request-target-api-octokit-issues-timeline",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const ev = await"
+         " github.rest.issues.listEventsForTimeline({\n"
+         "              ...context.repo,\n"
+         "              issue_number: ${{ github.event.pull_request.number }}"
+         "\n"
+         "            });\n"
+         "            const sha = ev.data.pop().sha;\n"
+         "            await exec.exec('git', ['fetch','origin', sha]);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the same timeline through the client the action already hands "
+        "the script, which names no path for a path rule to read",
+    ),
+    Mutation(
+        # The web link the diff rule must not catch, and the control that
+        # says so. `_PULL_REQUEST_API` now reads the `pull/` web path, and
+        # the ref half has always conceded a bare `.../pull/1781` on purpose:
+        # it is a link to a page, and a workflow that comments on a pull
+        # request has every reason to write one down. Widen the new
+        # alternative past the diff extension -- drop the `\.(?:diff|patch)`
+        # and match `pull/` -- and this row reds, which is backwards for a
+        # mutation, so the row inverts. Without it nothing pins the
+        # difference between the endpoint that serves the fork's code and the
+        # page a human reads.
+        "B4-pull-request-target-api-web-link-comment",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Link the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          # convention:"
+         " https://github.com/gke-labs/kube-agents/pull/1781\n"
+         "          gh pr comment"
+         " ${{ github.event.pull_request.number }} --body \"see above\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "cite a pull request by its web link in a comment the workflow "
+        "posts, which is what every reference to one in this repository "
+        "looks like",
+        must_survive=True,
+    ),
+    Mutation(
+        # The `issue` verb, from the safe side. A pull request is an issue to
+        # GitHub, so `gh issue comment 1781` comments on this pull request --
+        # the same write `gh pr comment` does, through the other noun, and
+        # the reason `issue` is on `_SAFE_GH_VERBS` at all. Take it off and
+        # this row reds: the suite would be refusing an ordinary labelling
+        # write and telling its author to allowlist a verb whose subcommands
+        # are already governed. So the row inverts, and it is the only thing
+        # pinning the third entry of that list against a future round
+        # tightening it to `pr` and `api` and seeing a clean sweep.
+        "B4-pull-request-target-api-gh-issue-comment-write",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Comment on the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          gh issue comment"
+         " ${{ github.event.pull_request.number }} --body \"triaged\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "post the comment through the issues noun rather than the pull "
+        "requests one, which is the same API call and the spelling somebody "
+        "reaches for when the workflow handles issues too",
+        must_survive=True,
+    ),
+    Mutation(
+        # The argument vector from the safe side, and the only thing that
+        # pins `_GH_WORD_PUNCTUATION`. This is the live milestone carrier's
+        # label write spelled the way a `script:` input spells it, and it has
+        # to stay green. Strip only quotes off each word, as the walk did
+        # before this round, and the verb reads as `['pr',` -- which is on no
+        # allowlist, so the suite refuses an ordinary label write and tells
+        # its author to allowlist a fragment of JavaScript. The killer row
+        # above cannot see that: refusing the fragment is the right verdict
+        # there for the wrong reason, so it kills either way. Pinned to the
+        # real action's SHA for the same reason as its neighbours.
+        "B4-pull-request-target-api-gh-argv-vector-write",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Label the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        with:\n"
+         "          script: |\n"
+         "            await exec.exec('gh', ['pr', 'edit',"
+         " '${{ github.event.pull_request.number }}',"
+         " '--add-label', 'triage']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write the label through the `exec` the action already hands the "
+        "script, which is one step fewer than shelling out and is the same "
+        "command the live carrier runs",
+        must_survive=True,
     ),
     Mutation(
         # Not a `run:` step at all. `actions/github-script` takes JavaScript
