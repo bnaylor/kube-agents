@@ -481,15 +481,18 @@ Mutation(
         # Laundering the same ref through `env:`, which is the dodge the
         # allowlist closes as a side effect: an expression the test cannot
         # resolve to a known-safe ref is refused rather than read as innocent
-        # text. Declared after the value it names, so a single-pass expansion
-        # would leave it half-resolved and looking harmless.
+        # text. The chain is declared before the value it names, so a
+        # single-pass expansion would leave it half-resolved and looking
+        # harmless.
         "B4-pull-request-target-checkout-env",
         ".github/workflows/risk_classify.yml",
-        ("    runs-on: ubuntu-latest",
-         "    runs-on: ubuntu-latest\n"
-         "    env:\n"
-         "      TARGET_REV: ${{ env.UPSTREAM_REV }}\n"
-         "      UPSTREAM_REV: ${{ github.event.pull_request.head.sha }}"),
+        ("        with:\n"
+         "          ref: ${{ github.event.repository.default_branch }}",
+         "        env:\n"
+         "          TARGET_REV: ${{ env.UPSTREAM_REV }}\n"
+         "          UPSTREAM_REV: ${{ github.event.pull_request.head.sha }}\n"
+         "        with:\n"
+         "          ref: ${{ env.TARGET_REV }}"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "pass the pull request head through two job-level env values so the "
         "checkout ref reads as a variable name",
@@ -497,14 +500,15 @@ Mutation(
     Mutation(
         # A `ref:` on something that is not `actions/checkout`. The action
         # fetches the same code; a rule written about one vendor is a rule
-        # about that vendor. Deliberately unpinned and fictitious -- this row
-        # is expected to move C4's SHA sweep as well, and a NOISY verdict here
-        # is the honest reading of a mutation that breaks two rules at once.
+        # about that vendor. The fictitious action is SHA-pinned with a
+        # version comment so it satisfies C4's sweep: an unpinned one breaks
+        # two rules at once and the verdict stops saying which rule caught it.
         "B4-pull-request-target-checkout-third-party",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
          "      - name: Check out the pull request with somebody else's action\n"
-         "        uses: some-vendor/checkout-action@v1\n"
+         "        uses: some-vendor/checkout-action"
+         "@1b0c5f0f0f0e5ec9b0f4a2e6d7c8b9a0f1e2d3c4 # v1.2.3\n"
          "        with:\n"
          "          ref: ${{ github.event.pull_request.head.sha }}\n"
          "\n"
