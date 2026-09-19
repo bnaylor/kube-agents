@@ -16,6 +16,10 @@ the file with `git checkout`, and reports:
              Not a failure, but worth reading: it usually means two assertions
              overlap, and occasionally means the mutation was blunter than
              intended.
+    STALE    the `old` text is not in the file, so nothing was mutated and
+             nothing was proved. Reads like silence -- always a bug in the
+             row, usually a pin or a neighbouring line that moved.
+    OVERSHOT the mutation matched in more places than intended.
 
 An expected failure that a mutation turns into an *unexpected success* also
 counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
@@ -438,6 +442,29 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "fetch the pull request by hand to get around a rule that only reads "
         "the checkout action's ref",
+    ),
+    Mutation(
+        "B4-pull-request-target-run-fetch-sha",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"\n'
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the pull request head by SHA rather than by refspec, which the "
+        "pull/N/head pattern does not match",
+    ),
+    Mutation(
+        "B4-pull-request-target-checkout-guard",
+        "tests/conformance/test_B_write_path.py",
+        ('if uses.startswith("actions/checkout"):',
+         'if uses.startswith("actions/checkout-nonesuch"):'),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "stop the ref half of the test from matching any step, which is the "
+        "vacuity `saw_a_checkout` exists to refuse",
     ),
     Mutation(
         "B6-codeowners-bot",

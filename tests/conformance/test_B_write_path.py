@@ -32,14 +32,41 @@ _WORKFLOWS = sorted(
 )
 
 # A `run:` step reaches the pull request's head without the checkout action.
-# `git fetch origin pull/N/head` is the documented way to do it by hand, and a
-# `ref:` assertion on `uses:` steps never sees it.
-_PULL_REQUEST_FETCH = (
+# `git fetch origin pull/N/head` is GitHub's own documented way to do it by
+# hand, and a `ref:` assertion on `uses:` steps never sees it.
+_PULL_REQUEST_REF = re.compile(
     # `[^\n]*?` rather than a tighter class: the ref is interpolated, and
     # `${{ github.event.number }}` has spaces in it.
-    re.compile(r"pull/[^\n]*?/(head|merge)\b"),
-    re.compile(r"(fetch|checkout)[^\n]*pull_request\.head"),
+    r"pull/[^\n]*?/(head|merge)\b"
 )
+_PULL_REQUEST_HEAD = re.compile(r"pull_request\.head|github\.head_ref")
+_FETCHES = re.compile(r"\b(fetch|checkout|clone)\b")
+
+
+def _env_values(block):
+    """The `env:` values of a workflow, job or step, as {NAME: text}.
+
+    Every level is consulted because GitHub merges them, and a ref laundered
+    through any one of them is the same ref.
+    """
+    env = (block or {}).get("env") or {}
+    if not isinstance(env, dict):
+        return {}
+    return {str(k): str(v) for k, v in env.items()}
+
+
+def _expand_env(text, env):
+    """`${{ env.NAME }}` replaced by NAME's value, one level deep.
+
+    One level is enough for the shape this guards against and keeps the
+    substitution total: an unknown name is left alone rather than blanked,
+    so a miss cannot quietly turn a suspicious ref into an innocent one.
+    """
+    for name, value in env.items():
+        text = re.sub(
+            r"\$\{\{\s*env\." + re.escape(name) + r"\s*\}\}", value, text
+        )
+    return text
 
 
 def _workflows():
@@ -53,18 +80,21 @@ def _workflows():
     merges a pull request" -- asserts an absence, and an absence is true of
     the empty set.
 
-    That one is not defenceless. Moving `.github/workflows` reds most of this
-    file anyway: C4's SHA-pin sweep keeps its own copy of this glob and guards
-    it, and `autopush-deploy.yml` is a registered `_harness.SOURCES` entry, so
-    the harness self-check goes red too. But what B2 inherits from that is an
-    answer to somebody else's question, and the count of neighbours that
-    happen to catch it is not a thing to depend on -- it changed twice while
-    this branch was in review. This is B2 answering its own question, in the
-    place the set is built, for the same reason `_harness.text()` raises
-    rather than returning an empty string.
+    That one is not defenceless. Moving `.github/workflows` reds four of this
+    file's twenty tests and three more elsewhere: C4's SHA-pin sweep keeps its
+    own copy of this glob and guards it, and `autopush-deploy.yml` is a
+    registered `_harness.SOURCES` entry, so the harness self-check goes red
+    too. But what B2 inherits from that is an answer to somebody else's
+    question, and a count of neighbours is not a thing to depend on. Two
+    counts in this docstring were wrong and corrected during review, which is
+    the argument against writing a third. This is B2 answering its own
+    question, in the place the set is built, for the same reason
+    `_harness.text()` raises rather than returning an empty string.
 
-    The name is private so that the guard is the only route to the set: an
-    assertion that reaches for the module global skips it silently.
+    The name is private by convention only -- all five consumers live in this
+    module and nothing stops them reading `_WORKFLOWS` directly. What the
+    underscore buys is that `_workflows()` reads as the intended route, so a
+    new assertion reaching past it looks wrong to a reviewer.
     """
     if not _WORKFLOWS:
         raise AssertionError(
@@ -557,9 +587,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         branch, so the code that runs is code already merged — and the
         dangerous ingredient is specifically a ref derived from the pull
         request. So every checkout step in such a workflow must carry an
-        explicit `ref:` that does not reference the pull request; a checkout
-        with no `ref:` defaults to the PR merge commit on this trigger, which
-        is the exact failure.
+        explicit `ref:` that does not reference the pull request. A checkout
+        with no `ref:` takes `GITHUB_REF`, which on this trigger is the pull
+        request's base branch -- an unreviewed ref anyone with push access
+        can aim a pull request at. (`refs/pull/N/merge` is the `pull_request`
+        trigger's default, not this one. `risk_classify.yml:63-66` and
+        `hold-unresolved-threads.yml:67-70` both say so at the checkout step
+        that relies on it.)
 
         Both filters are asserted non-empty for the same reason B4's
         `workflow_run` gate asserts its own: this test says nothing at all
@@ -571,9 +605,24 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
 
         The `run:` half is a named-shape check rather than a proof. A shell
         script can fetch a ref any number of ways and no assertion over YAML
-        will catch all of them. It covers the shape the checkout action's own
-        docs give for doing this by hand, which is the one somebody reaches
-        for when the `ref:` rule above sends them looking for a way around it.
+        will catch all of them. It covers the two shapes somebody reaches for
+        when the `ref:` rule above sends them looking for a way around it: a
+        `pull/N/head` refspec, and a fetch of `pull_request.head` by any
+        spelling.
+
+        Both are read over the step's `run:` script and its `env:` values
+        together, not over `run:` alone. Passing an event field through
+        `env:` is this repository's house style rather than an exotic dodge
+        -- `risk_classify.yml` does exactly that with `PR_NUMBER`, on the
+        stated grounds that event fields are attacker-controlled input -- so
+        a scan of `run:` by itself reads `$PR_HEAD` and sees nothing. For the
+        same reason the two halves are not required to appear in order, or on
+        one line.
+
+        Still not covered, and deliberately: `gh pr checkout`, which needs no
+        ref text at all, and a local composite action, which moves the
+        checkout into a file this test does not read. Both are worth a rule.
+        Neither is this one, and the docstring should not imply otherwise.
         """
         consumers = [
             (path, document)
@@ -588,8 +637,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         saw_a_checkout = False
         for path, document in consumers:
             with self.subTest(workflow=path.name):
+                workflow_env = _env_values(document)
                 for job in (document.get("jobs") or {}).values():
+                    scope_env = workflow_env | _env_values(job)
                     for step in (job or {}).get("steps") or []:
+                        step_env = scope_env | _env_values(step)
                         # GitHub resolves `uses:` case-insensitively, so this
                         # match has to be too. `Actions/checkout` runs the same
                         # action and would otherwise walk past the filter.
@@ -600,22 +652,41 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             self.assertTrue(
                                 ref,
                                 "a checkout on pull_request_target with no ref: "
-                                "checks out the pull request's merge commit",
+                                "takes GITHUB_REF, which on this trigger is the "
+                                "pull request's base branch",
                             )
+                            # Expanded and folded: `ref: ${{ env.PR_HEAD }}`
+                            # names the pull request one indirection away, and
+                            # `PR_HEAD` carries no lowercase `head` to match.
+                            resolved = _expand_env(ref, step_env).lower()
                             for fragment in ("pull_request", "head", "merge"):
                                 self.assertNotIn(
                                     fragment,
-                                    ref,
-                                    "the checkout ref derives from the pull request",
+                                    resolved,
+                                    f"{path.name}: the checkout ref derives "
+                                    "from the pull request",
                                 )
-                        script = str((step or {}).get("run", ""))
-                        for pattern in _PULL_REQUEST_FETCH:
-                            self.assertIsNone(
-                                pattern.search(script),
-                                f"{path.name}: a run: step fetches the pull "
-                                "request's head, which is the checkout action's "
-                                "hazard without the checkout action",
-                            )
+                        # The script and everything `env:` hands it, as one
+                        # body of text -- see the docstring on why `run:`
+                        # alone is not enough and why order is not required.
+                        haystack = "\n".join(
+                            [str((step or {}).get("run", ""))]
+                            + list(_env_values(step).values())
+                            + ([] if not (step or {}).get("run") else list(scope_env.values()))
+                        )
+                        self.assertIsNone(
+                            _PULL_REQUEST_REF.search(haystack),
+                            f"{path.name}: a run: step fetches a pull/N/head "
+                            "refspec, which is the checkout action's hazard "
+                            "without the checkout action",
+                        )
+                        self.assertFalse(
+                            _FETCHES.search(haystack)
+                            and _PULL_REQUEST_HEAD.search(haystack),
+                            f"{path.name}: a run: step fetches the pull "
+                            "request's head, which is the checkout action's "
+                            "hazard without the checkout action",
+                        )
                 for scope in [document.get("permissions") or {}] + [
                     (job or {}).get("permissions") or {}
                     for job in (document.get("jobs") or {}).values()
