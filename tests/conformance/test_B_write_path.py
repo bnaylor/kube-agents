@@ -563,13 +563,32 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # have written `${{ runner.temp }}` either, because the expression allowlist
 # refuses that already.
 #
+# Both `GITHUB_EVENT_PATH` and `RUNNER_TEMP` are also off
+# `_SAFE_RUNNER_VARIABLES`, so for either of those spellings the
+# runner-variable rule fires first and this one decides nothing. What it
+# decides on its own is the spelling that names no variable at all:
+# `/home/runner/work/_temp/_github_workflow/event.json` is where
+# `GITHUB_EVENT_PATH` points on a GitHub-hosted Linux runner, written out, and
+# the directory and the file name are the only things left to read it by. That
+# is the shape the mutation table pins this rule with, and it had to be added
+# for the purpose. Before it, the table's seven payload-file rows all named
+# one of the two variables somewhere and all seven died on the runner-variable
+# allowlist instead -- measured by neutering this whole assertion, at which
+# every one of them still went red, so the rule could have been deleted
+# outright and nothing would have reported it.
+#
 # The process environment is the last piece, and it is refused as an accessor
 # rather than as a name, in each of the two languages a step can be written
 # in. `process.env['GITHUB_EVENT_' + 'PATH']` is the path with the string
 # split in two, which no pattern over the name can see and which a minifier
 # would produce by accident; `process['env'][...]` is the same read with the
 # accessor itself indexed, and it walked past a pattern that wanted a literal
-# dot. `shell: python` is the other language -- `os.environ["GITHUB_EVENT_" +
+# dot. Where the name is split matters for what the row proves rather than for
+# what the runner does: `'GITHUB_EVENT_' + 'PATH'` leaves a reserved prefix
+# behind for the runner-variable allowlist to refuse, so a row written that way
+# pins that allowlist and not this rule, while `'GITHUB' + '_EVENT_PATH'`
+# leaves no `GITHUB_`-prefixed word anywhere and the accessor is the only thing
+# deciding. `shell: python` is the other language -- `os.environ["GITHUB_EVENT_" +
 # "PATH"]` and `os.getenv(...)` are the same reach, and an earlier round
 # claimed to handle `shell: python` while reading neither. So the rule is the
 # accessor in both: `process.env`, `os.environ`, a bare `environ[...]` from

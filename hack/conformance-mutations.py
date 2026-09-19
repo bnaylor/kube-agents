@@ -2089,13 +2089,21 @@ Mutation(
         "it wants the payload from somewhere the variable is not set",
     ),
     Mutation(
-        # And the variable's name split in two. `'GITHUB_EVENT_' + 'PATH'` is
+        # And the variable's name split in two. `'GITHUB' + '_EVENT_PATH'` is
         # one string to JavaScript and no string to a regex, which puts every
         # row that pins the name two characters from useless. The answer is not
         # a longer pattern over names: `process.env` is refused whole, because
         # a `script:` is handed `context`, `github`, `core` and its own inputs
         # and has no business in the process environment at all. Pinned to the
         # real action's SHA so C4's sweep is not what catches this.
+        #
+        # Split before the underscore rather than after `GITHUB_EVENT_`, which
+        # is where it was until 2026-09-19 and which aimed this row at the
+        # wrong rule: `GITHUB_EVENT_` is a reserved-prefix word and
+        # `_SAFE_RUNNER_VARIABLES` refuses it, so the row died on the
+        # runner-variable allowlist and would have died there with
+        # `_EVENT_PAYLOAD_FILE` deleted outright. `'GITHUB'` alone is not a
+        # reserved-prefix word, so the accessor is now the only thing deciding.
         "B4-pull-request-target-script-event-file-split",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2106,7 +2114,7 @@ Mutation(
          "          script: |\n"
          "            const fs = require('fs');\n"
          "            const p = JSON.parse(fs.readFileSync("
-         "process.env['GITHUB_EVENT_' + 'PATH']));\n"
+         "process.env['GITHUB' + '_EVENT_PATH']));\n"
          "            await exec.exec('git', ['fetch', 'origin', p.after]);\n"
          "\n"
          "      - name: Set up Python"),
@@ -2120,7 +2128,9 @@ Mutation(
         # wanted a literal dot, so the row above could be repaired by writing
         # one more bracket. This is the row that says the rule is the accessor
         # and not its punctuation: `process` reaching `env` by either route is
-        # refused, and the name it goes on to build is not read at all.
+        # refused, and the name it goes on to build is not read at all. The
+        # name is split off the reserved prefix for the reason the row above
+        # gives, so that this one is decided by the accessor too.
         "B4-pull-request-target-script-event-file-indexed-accessor",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2131,7 +2141,7 @@ Mutation(
          "          script: |\n"
          "            const fs = require('fs');\n"
          "            const p = JSON.parse(fs.readFileSync("
-         "process['env']['GITHUB_EVENT_' + 'PATH']));\n"
+         "process['env']['GITHUB' + '_EVENT_PATH']));\n"
          "            await exec.exec('git', ['fetch', 'origin', p.after]);\n"
          "\n"
          "      - name: Set up Python"),
@@ -2161,6 +2171,32 @@ Mutation(
         "writing any of the names the path was pinned by",
     ),
     Mutation(
+        # The payload named by neither variable. `GITHUB_EVENT_PATH` and
+        # `RUNNER_TEMP` are both off `_SAFE_RUNNER_VARIABLES`, so every row
+        # above that reaches the file through one of them dies on the
+        # runner-variable allowlist and would die there with
+        # `_EVENT_PAYLOAD_FILE` deleted -- measured by neutering that
+        # assertion, at which all seven still went red. This is the row that
+        # pins the rule: the path a GitHub-hosted Linux runner actually uses,
+        # written out, with no `GITHUB_`- or `RUNNER_`-prefixed word anywhere
+        # for the allowlist to read. The directory and the file name are what
+        # is left, and they are what the rule refuses.
+        "B4-pull-request-target-run-event-file-literal-path",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          REV=$(jq -r .after /home/runner/work/_temp/"
+         "_github_workflow/event.json)\n"
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the payload at the literal path the runner puts it at, which "
+        "names no variable and so reaches no allowlist over names",
+    ),
+    Mutation(
         # And the same reach in the other language a step can be written in.
         # An earlier round claimed `shell: python` was handled while reading
         # only the JavaScript accessor, so `os.environ["GITHUB_EVENT_" +
@@ -2176,14 +2212,14 @@ Mutation(
          "        shell: python\n"
          "        run: |\n"
          "          import json, os, subprocess\n"
-         '          rev = json.load(open(os.environ["GITHUB_EVENT_" + '
-         '"PATH"]))["after"]\n'
+         '          rev = json.load(open(os.environ["GITHUB" + '
+         '"_EVENT_PATH"]))["after"]\n'
          '          subprocess.run(["git", "fetch", "origin", rev])\n'
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "read the payload from Python, where the variable's name splits the "
-        "same way and the accessor is spelled `os.environ`",
+        "read the payload from Python, where the variable's name splits off "
+        "the reserved prefix the same way and the accessor is `os.environ`",
     ),
     Mutation(
         # `git remote add` and `git remote update`, which put the fork's code
