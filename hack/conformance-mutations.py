@@ -848,6 +848,37 @@ Mutation(
         "request",
     ),
     Mutation(
+        # The same glob with no enumeration verb on the line, which is the
+        # row that pins the third alternative. The row above does not, and
+        # says it does: `_REMOTE_REF_ENUMERATION` reads `ls-remote` and
+        # decides that one first, and deleting the glob alternative outright
+        # left all four refspec rows KILLED and the whole sweep
+        # byte-identical -- the same class round 11 found once and this is
+        # twice. `git rev-parse --glob=` prepends `refs/` itself, so
+        # `pull/N/h*` resolves `refs/pull/N/head` out of whatever refs the
+        # runner's clone already has, with no `refs/` prefix, no `head`, and
+        # nothing that asks the remote anything. Measured against git: the
+        # short globbed form is a pattern `git ls-remote` and `git rev-parse
+        # --glob` both take and `git fetch` does not -- a `+pull/N/*:...`
+        # refspec is accepted and silently matches nothing -- so this is the
+        # spelling, not a second one.
+        "B4-pull-request-target-run-refspec-glob-rev-parse",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          REV=$(git rev-parse --glob=\"pull/${PR_NUMBER}/h*\")\n"
+         "          git checkout --detach \"$REV\" && ./ci.sh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "resolve the head out of the refs already on the runner with a glob "
+        "rather than by asking the remote, which is the form somebody "
+        "writes when the fetch is somebody else's step",
+    ),
+    Mutation(
         # The short-form refspec split across a backslash continuation, and
         # the only row that reads `_join_continuations`. The namespace
         # alternative does not see this one: there is no `refs/` prefix, and
@@ -2843,11 +2874,12 @@ Mutation(
         "somebody writes when the image is the only thing they are setting",
     ),
     Mutation(
-        # The container's `env:`, which is the fourth level `_env_values`
-        # claimed to consult and did not. A container `env:` is set in the
-        # container every step of the job runs in, so it reaches the steps
-        # exactly as the job's own does -- and the head sitting in it is the
-        # head sitting in theirs.
+        # The head in the container's `env:`. This row is decided by the
+        # block rule above it and not by the merge into the steps: `_flatten`
+        # holds the whole container block against the expression allowlist
+        # before any step is read, so `${{ github.event.after }}` reds here
+        # wherever in the block it sits. The row below is the one that pins
+        # the merge.
         "B4-pull-request-target-container-env-head",
         ".github/workflows/risk_classify.yml",
         ("    runs-on: ubuntu-latest",
@@ -2859,6 +2891,32 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "put the head in the container's environment, one level below the "
         "job's, where every step of the job still has it",
+    ),
+    Mutation(
+        # The merge itself, which is the fourth level `_env_values` claimed
+        # to consult and which nothing pinned until now. A container `env:`
+        # is set in the container every step of the job runs in, so it
+        # reaches the steps exactly as the job's own does -- but the rules
+        # over the block are an expression allowlist and two literal
+        # backstops, and `$GITHUB_HEAD_REF` is none of the three. It carries
+        # no expression, it is not `pull_request.head`, and it names no ref
+        # namespace, so the block passes it. What refuses it is the
+        # runner-variable allowlist, which runs over the steps' environment
+        # and is not applied to the container block's text -- so it sees this
+        # value only because the merge put it there. Delete the merge and
+        # this row lives while the one above still dies.
+        "B4-pull-request-target-container-env-runner-head-ref",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    container:\n"
+         "      image: ubuntu:24.04\n"
+         "      env:\n"
+         "        HEAD_BRANCH: $GITHUB_HEAD_REF"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "hand every step the head branch through the container's "
+        "environment, in the one spelling the rules over the block itself "
+        "do not read",
     ),
     Mutation(
         # And a service container, which is the same choice of image made
