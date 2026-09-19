@@ -780,11 +780,13 @@ type DeploymentSpec struct {
 
 	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
 	// An entry is refused at admission if it takes a reserved volume name, or if
-	// its source would hand a sidecar the agent's A2A bus credential: a
+	// its source is one of the routes to the agent's A2A bus credentials: a
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
 	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
-	// as either a secret volume or a projected secret source. Reading those
+	// as either a secret volume or a projected secret source. The refusal is on
+	// the name and the shape of the source, not on what a given Secret happens to
+	// hold at the time. Reading those
 	// Secrets through env is not refused here. On an install running the A2A
 	// surface the same entries are dropped from the render as well, which is the
 	// half that holds when admission does not run: a default chart install does
