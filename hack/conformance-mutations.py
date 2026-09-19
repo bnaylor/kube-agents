@@ -464,6 +464,94 @@ Mutation(
         "pull/N/head pattern does not match",
     ),
     Mutation(
+        # The row that started the allowlist. `github.event.after` is the head
+        # SHA delivered on every `synchronize`, so it names the pull request's
+        # code using none of the words a denylist over `pull_request`, `head`
+        # and `merge` looks for. Found live: this one line went in and the
+        # whole suite stayed green.
+        "B4-pull-request-target-checkout-after",
+        ".github/workflows/risk_classify.yml",
+        ("          ref: ${{ github.event.repository.default_branch }}",
+         "          ref: ${{ github.event.after }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "check out the pull request under an event field that does not spell "
+        "out what it is",
+    ),
+    Mutation(
+        # Laundering the same ref through `env:`, which is the dodge the
+        # allowlist closes as a side effect: an expression the test cannot
+        # resolve to a known-safe ref is refused rather than read as innocent
+        # text. Declared after the value it names, so a single-pass expansion
+        # would leave it half-resolved and looking harmless.
+        "B4-pull-request-target-checkout-env",
+        ".github/workflows/risk_classify.yml",
+        ("    runs-on: ubuntu-latest",
+         "    runs-on: ubuntu-latest\n"
+         "    env:\n"
+         "      TARGET_REV: ${{ env.UPSTREAM_REV }}\n"
+         "      UPSTREAM_REV: ${{ github.event.pull_request.head.sha }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "pass the pull request head through two job-level env values so the "
+        "checkout ref reads as a variable name",
+    ),
+    Mutation(
+        # A `ref:` on something that is not `actions/checkout`. The action
+        # fetches the same code; a rule written about one vendor is a rule
+        # about that vendor. Deliberately unpinned and fictitious -- this row
+        # is expected to move C4's SHA sweep as well, and a NOISY verdict here
+        # is the honest reading of a mutation that breaks two rules at once.
+        "B4-pull-request-target-checkout-third-party",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Check out the pull request with somebody else's action\n"
+         "        uses: some-vendor/checkout-action@v1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.pull_request.head.sha }}\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reach the pull request through a checkout action the rule does not "
+        "name",
+    ),
+    Mutation(
+        # A job whose steps live in another file. The called workflow is keyed
+        # `workflow_call`, so it is not in the trigger filter either, and the
+        # test would have inspected nothing while reporting ok. Refusing the
+        # shape is the only answer that does not require following the call.
+        "B4-pull-request-target-reusable-job",
+        ".github/workflows/risk_classify.yml",
+        ("jobs:\n"
+         "  classify:",
+         "jobs:\n"
+         "  prepare:\n"
+         "    uses: ./.github/workflows/k8s-operator-test.yml\n"
+         "\n"
+         "  classify:"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "move the checkout into a called workflow, where a test that reads "
+        "`steps:` cannot see it",
+    ),
+    Mutation(
+        # The run half of B4-pull-request-target-checkout-after. The existing
+        # by-SHA row fetches `github.event.pull_request.head.sha`; this is the
+        # adjacent spelling, and the `env:` indirection is this repository's
+        # own house style rather than an exotic dodge.
+        "B4-pull-request-target-run-fetch-after",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          REV: ${{ github.event.after }}\n"
+         "        run: |\n"
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "fetch the same SHA under the event field the by-SHA row does not "
+        "cover, through the environment",
+    ),
+    Mutation(
         "B4-pull-request-target-checkout-guard",
         "tests/conformance/test_B_write_path.py",
         ('if uses.startswith("actions/checkout"):',

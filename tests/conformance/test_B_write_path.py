@@ -39,8 +39,36 @@ _PULL_REQUEST_REF = re.compile(
     # `${{ github.event.number }}` has spaces in it.
     r"pull/[^\n]*?/(head|merge)\b"
 )
-_PULL_REQUEST_HEAD = re.compile(r"pull_request\.head|github\.head_ref")
+# `github.event.after` is the head SHA delivered on every `synchronize`, so
+# it names the pull request's code without using any of the obvious words.
+_PULL_REQUEST_HEAD = re.compile(
+    r"pull_request\.head|github\.head_ref|github\.event\.after"
+)
 _FETCHES = re.compile(r"\b(fetch|checkout|clone)\b")
+
+# Any `${{ ... }}` an interpolated value carries.
+_EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
+
+# The expressions a `pull_request_target` checkout ref may name. This is an
+# allowlist because the denylist it replaces could not work: it looked for
+# `pull_request`, `head` and `merge`, and `${{ github.event.after }}` is the
+# pull request's head SHA spelled with none of them. One line in a workflow
+# and the whole test went quiet. Listing the safe refs instead means an
+# indirection this file cannot resolve -- `env.X`, `steps.X.outputs.Y`, a
+# value laundered through `$GITHUB_ENV` -- reads as unsafe rather than as
+# innocent text, which is the direction to be wrong in. On this trigger
+# `github.ref`, `github.sha` and `github.base_ref` are all the base branch.
+_SAFE_CHECKOUT_EXPRESSIONS = frozenset(
+    {
+        "github.event.repository.default_branch",
+        "github.base_ref",
+        "github.ref",
+        "github.sha",
+    }
+)
+
+# Enough passes to settle any chain a workflow would plausibly write.
+_ENV_EXPANSION_LIMIT = 10
 
 
 def _env_values(block):
@@ -56,16 +84,34 @@ def _env_values(block):
 
 
 def _expand_env(text, env):
-    """`${{ env.NAME }}` replaced by NAME's value, one level deep.
+    """`${{ env.NAME }}` replaced by NAME's value, to a fixed point.
 
-    One level is enough for the shape this guards against and keeps the
-    substitution total: an unknown name is left alone rather than blanked,
-    so a miss cannot quietly turn a suspicious ref into an innocent one.
+    Iterated rather than single-pass because one `env:` value may name
+    another, and a single pass resolves such a chain only when the mapping
+    happens to be ordered favourably. The same two declarations written in
+    the other order would leave the ref half-expanded and looking innocent,
+    which is a difference GitHub does not make. The cap stops a
+    self-referential pair from spinning; text that has not settled by then
+    keeps its `${{ ... }}`, and the caller refuses what it cannot resolve.
+
+    The substitution is total: an unknown name is left alone rather than
+    blanked, so a miss cannot quietly turn a suspicious ref into an innocent
+    one. The replacement goes through a lambda because `re.sub` reads a string
+    replacement as a template, and it parses that template whether or not the
+    pattern matches. A value holding a backslash -- a Windows path, a `sed`
+    snippet -- would otherwise raise for every ref in scope of the `env:` that
+    declared it, including the refs that never mention it.
     """
-    for name, value in env.items():
-        text = re.sub(
-            r"\$\{\{\s*env\." + re.escape(name) + r"\s*\}\}", value, text
-        )
+    for _ in range(_ENV_EXPANSION_LIMIT):
+        before = text
+        for name, value in env.items():
+            text = re.sub(
+                r"\$\{\{\s*env\." + re.escape(name) + r"\s*\}\}",
+                lambda _match, replacement=value: replacement,
+                text,
+            )
+        if text == before:
+            break
     return text
 
 
@@ -618,14 +664,42 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `env:` is this repository's house style rather than an exotic dodge
         -- `risk_classify.yml` does exactly that with `PR_NUMBER`, on the
         stated grounds that event fields are attacker-controlled input -- so
-        a scan of `run:` by itself reads `$PR_HEAD` and sees nothing. For the
-        same reason the two halves are not required to appear in order, or on
-        one line.
+        a scan of `run:` by itself reads `$PR_HEAD` and sees nothing. Only
+        the values the script actually names, though. Folding in everything
+        in scope reds a job that mentions `github.head_ref` for a label and
+        separately fetches something harmless. For the same reason the two
+        halves are not required to appear in order, or on one line.
 
-        Still not covered, and deliberately: `gh pr checkout`, which needs no
-        ref text at all, and a local composite action, which moves the
-        checkout into a file this test does not read. Both are worth a rule.
-        Neither is this one, and the docstring should not imply otherwise.
+        The `ref:` half, by contrast, is an allowlist, and that is the whole
+        design. It began as a denylist over three nouns -- `pull_request`,
+        `head`, `merge` -- and `${{ github.event.after }}` is the pull
+        request's head SHA on every `synchronize`, spelled with none of them.
+        One line in a workflow and this test reported `ok`. Naming the safe
+        refs instead means anything this file cannot resolve reads as unsafe
+        rather than as innocent text: an `env.X` chain, a
+        `steps.X.outputs.Y`, a value laundered through `$GITHUB_ENV`. That is
+        the direction to be wrong in. The cost is a false red the day
+        somebody adds a legitimately safe expression, which is a line of
+        review, and the docstring is where they will look.
+
+        The rule is over any step that takes a `ref:`, not over
+        `actions/checkout`. A third-party checkout action fetches the same
+        code, and a rule about one vendor is a rule about that vendor.
+        `actions/checkout` keeps one extra obligation -- it must carry a
+        `ref:` at all -- because it is the action whose no-ref default is the
+        base branch. And a job that calls a reusable workflow is refused
+        outright: its steps live in a file keyed `workflow_call`, so it is
+        not in `consumers` either, and this test would inspect nothing while
+        reporting `ok`.
+
+        Not covered: `gh pr checkout` and `gh pr diff`, which need no ref
+        text at all, a local composite action, which moves the checkout into
+        a file this test does not read, and the `run:` half's own laundering
+        -- a `$GITHUB_ENV` write in an earlier step, or a `steps.X.outputs.Y`
+        the script interpolates. Read that list as examples rather than as
+        the boundary. An earlier version of it was written as though it were
+        complete and did not mention `github.event.after`, which turned out
+        to be both live and shorter than either path it did name.
         """
         consumers = [
             (path, document)
@@ -641,7 +715,20 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         for path, document in consumers:
             with self.subTest(workflow=path.name):
                 workflow_env = _env_values(document)
-                for job in (document.get("jobs") or {}).values():
+                for job_name, job in (document.get("jobs") or {}).items():
+                    # A job that calls a reusable workflow carries no `steps:`
+                    # of its own, and the called file is keyed `workflow_call`
+                    # rather than `pull_request_target`, so it is not in
+                    # `consumers` either. Its checkout would be real and this
+                    # test would inspect nothing. Refuse rather than pass: the
+                    # rule this enforces is worth more than the convenience.
+                    self.assertNotIn(
+                        "uses",
+                        job or {},
+                        f"{path.name}:{job_name} calls a reusable workflow, "
+                        "whose steps this test cannot see; inline it, or "
+                        "teach this test to follow it",
+                    )
                     scope_env = workflow_env | _env_values(job)
                     for step in (job or {}).get("steps") or []:
                         step_env = scope_env | _env_values(step)
@@ -649,33 +736,57 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # match has to be too. `Actions/checkout` runs the same
                         # action and would otherwise walk past the filter.
                         uses = str((step or {}).get("uses", "")).lower()
+                        ref = str(((step or {}).get("with") or {}).get("ref", ""))
                         if uses.startswith("actions/checkout"):
                             saw_a_checkout = True
-                            ref = str(((step or {}).get("with") or {}).get("ref", ""))
                             self.assertTrue(
                                 ref,
                                 "a checkout on pull_request_target with no ref: "
                                 "takes GITHUB_REF, which on this trigger is the "
                                 "pull request's base branch",
                             )
-                            # Expanded and folded: `ref: ${{ env.PR_HEAD }}`
-                            # names the pull request one indirection away, and
-                            # `PR_HEAD` carries no lowercase `head` to match.
-                            resolved = _expand_env(ref, step_env).lower()
-                            for fragment in ("pull_request", "head", "merge"):
+                        # Every action that takes a `ref:`, not only
+                        # `actions/checkout`. A third-party checkout action
+                        # fetches the same code, and naming one vendor turns
+                        # the rule into a rule about that vendor.
+                        if ref:
+                            resolved = _expand_env(ref, step_env)
+                            for expression in _EXPRESSION.findall(resolved):
+                                self.assertIn(
+                                    expression,
+                                    _SAFE_CHECKOUT_EXPRESSIONS,
+                                    f"{path.name}: the checkout ref names "
+                                    f"`{expression}`, which is not one of the "
+                                    "refs known to be independent of the pull "
+                                    "request",
+                                )
+                            # Whatever is left once the expressions are gone
+                            # is literal text, where `refs/pull/N/head` needs
+                            # no interpolation at all.
+                            literal = _EXPRESSION.sub("", resolved).lower()
+                            for fragment in ("pull", "head", "merge"):
                                 self.assertNotIn(
                                     fragment,
-                                    resolved,
+                                    literal,
                                     f"{path.name}: the checkout ref derives "
                                     "from the pull request",
                                 )
-                        # The script and everything `env:` hands it, as one
-                        # body of text -- see the docstring on why `run:`
-                        # alone is not enough and why order is not required.
+                        # The script, plus the `env:` values it actually
+                        # names -- see the docstring on why `run:` alone is
+                        # not enough and why order is not required. Only the
+                        # values it names: folding in everything in scope
+                        # reds a job that mentions `github.head_ref` for a
+                        # label and separately fetches something harmless.
+                        script = str((step or {}).get("run", ""))
                         haystack = "\n".join(
-                            [str((step or {}).get("run", ""))]
-                            + list(_env_values(step).values())
-                            + ([] if not (step or {}).get("run") else list(scope_env.values()))
+                            [script]
+                            + [
+                                value
+                                for name, value in step_env.items()
+                                if re.search(
+                                    r"\$\{?" + re.escape(name) + r"\b", script
+                                )
+                            ]
                         )
                         self.assertIsNone(
                             _PULL_REQUEST_REF.search(haystack),
