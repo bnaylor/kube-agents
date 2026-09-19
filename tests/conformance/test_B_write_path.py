@@ -158,7 +158,30 @@ _SCRIPT_CONTEXT = re.compile(
 # `script:` input. Both were live and green against the allowlists above, which
 # is the same lesson a third time: the rule is about reaching the payload, and
 # the payload has more spellings than any one of them covers.
-_EVENT_PAYLOAD_FILE = re.compile(r"GITHUB_EVENT_PATH")
+#
+# So does the variable. The variable is a convenience: the file is at
+# `$RUNNER_TEMP/_github_workflow/event.json` and a script that writes the path
+# out reads the same bytes while naming `GITHUB_EVENT_PATH` nowhere. Both
+# halves of that path are alternatives here rather than one joined pattern,
+# because either half alone is already an answer nobody has -- nothing in a
+# workflow legitimately names the runner's internal `_github_workflow`
+# directory, and an `event.json` a step wrote itself is a file the step could
+# have called anything.
+#
+# `process.env` is the fourth, and it is refused as an accessor rather than
+# as a name. `process.env['GITHUB_EVENT_' + 'PATH']` is the path with the
+# string split in two, which no pattern over the name can see and which a
+# minifier would produce by accident. Refusing the whole accessor is a rule
+# about reach rather than about spelling, and it is affordable for a reason
+# specific to this input: a `script:` is handed everything it needs as
+# `context`, `github`, `core` and its own `with:` inputs, so a body that goes
+# to the process environment is going somewhere the action already offered it
+# a supported route to. It costs a false red on a `script:` reading an
+# unrelated variable, which is a line of review and one `core.getInput` away
+# from not needing the environment at all.
+_EVENT_PAYLOAD_FILE = re.compile(
+    r"GITHUB_EVENT_PATH|_github_workflow|event\.json|process\s*\.\s*env"
+)
 
 # `context.repo` is `{owner, repo}` for the repository the workflow lives in,
 # which is `github.repository` from the list above in the other language.
@@ -1468,17 +1491,24 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # expression nor a `context` property and so reaches
                         # neither allowlist. Refused on the read rather than
                         # on what is read out of it: every field in that file
-                        # arrived from the pull request, and a step that
-                        # fetches has no business in any of them.
+                        # arrived from the pull request, and no step in a
+                        # workflow that must not have the fork's code has
+                        # business in any of them. What counts as the read is
+                        # argued at `_EVENT_PAYLOAD_FILE`, and it is four
+                        # patterns rather than one because the variable, the
+                        # path it holds and the process environment that
+                        # carries it are three ways to the same bytes.
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(
                                 "\n".join([script, *environment.values()])
                             ),
-                            f"{path.name}: a run: step fetches and reads "
-                            "`GITHUB_EVENT_PATH`, which is the whole webhook "
-                            "payload on disk -- the same fields both "
-                            "allowlists refuse, in the one language neither "
-                            "of them reads",
+                            f"{path.name}: a step reaches the webhook "
+                            "payload on disk -- `GITHUB_EVENT_PATH`, the "
+                            "runner's `_github_workflow/event.json`, or "
+                            "`process.env`, which is where the path lives "
+                            "for a `script:`. Every field in that file came "
+                            "from the pull request, and it is the one "
+                            "language neither allowlist reads",
                         )
                 # `_permission_scopes` rather than the blocks themselves:
                 # `permissions: write-all` is a string, and a filter that
