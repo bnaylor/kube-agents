@@ -433,23 +433,33 @@ Mutation(
         "the new rules too -- arbitrary code execution with a writable token",
     ),
     Mutation(
-        # The same attack as the row above, spelled so a case-sensitive filter
-        # never sees it: GitHub resolves `uses:` case-insensitively, so this
-        # runs the identical action. The test walked straight past it and
-        # reported OK until the filter was lowercased. Pins the action SHA
-        # because the flip and the ref are not contiguous otherwise -- a pin
-        # bump reports STALE here, and the fix is to paste the new SHA in.
+        # GitHub resolves `uses:` case-insensitively, so `Actions/checkout`
+        # runs the identical action, and the `.lower()` on that filter is what
+        # keeps it matching its own name. This row pins that `.lower()`, and
+        # it did not until 2026-09-19. It used to capitalise the name *and*
+        # repoint the `ref:`, which measures nothing: the ref allowlist sits
+        # outside the `actions/checkout` guard and reads every step whatever
+        # it is called, so a repointed ref is RED with the `.lower()` and RED
+        # without it. What the guard actually gates is the rule that a
+        # checkout must carry a `ref:` at all, and `saw_a_checkout` with it.
+        # So the mutation deletes the ref line instead. Measured: RED with the
+        # `.lower()`, GREEN without. `persist-credentials: false` stays under
+        # `with:`, so the block is still valid YAML and still a real checkout.
+        #
+        # Pins the action SHA because the name and the `with:` block are not
+        # contiguous otherwise -- a pin bump reports STALE here, and the fix
+        # is to paste the new SHA in.
         "B4-pull-request-target-checkout-case",
         ".github/workflows/risk_classify.yml",
         ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
          "        with:\n"
-         "          ref: ${{ github.event.repository.default_branch }}",
+         "          ref: ${{ github.event.repository.default_branch }}\n",
          "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
-         "        with:\n"
-         "          ref: ${{ github.event.pull_request.head.sha }}"),
+         "        with:\n"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "capitalise the action name while repointing the ref, which is what a "
-        "flip that slipped through review would look like",
+        "drop a checkout's ref while capitalising the action name, so the "
+        "step falls back to the implicit ref under a name the rule about "
+        "implicit refs cannot see",
     ),
     Mutation(
         # The third route to the same code: no action at all. `git fetch
