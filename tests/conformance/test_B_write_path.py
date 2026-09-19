@@ -360,6 +360,14 @@ _COMMAND_END = re.compile(r"[\n;|&()`]")
 # is one word and the `-` prefix already drops it. Any other value-taking flag
 # left off this set costs a false red, never a false green, which is the
 # direction to be wrong in.
+#
+# An abbreviation needs no entry either, which is worth writing down because
+# the same question has a different answer for git. `gh` is built on a parser
+# that refuses a prefix outright -- `gh pr edit --rep owner/repo` is `unknown
+# flag: --rep`, measured against gh 2.101 -- so there is no `--rep` for the
+# walk to mis-read as a subcommand, and no ladder to write here or at the
+# `--approve` pattern in B2. Git is the opposite and `_REMOTE_REF_ENUMERATION`
+# carries the consequence.
 _GH_VALUE_FLAGS = frozenset({"-R", "--repo"})
 # A workflow expression holds spaces -- `${{ github.repository }}` is three
 # words to `split()` and one word to the runner, which substitutes it before
@@ -482,10 +490,34 @@ _PULL_REQUEST_API = re.compile(
 # of the four alternatives above appearing anywhere: no `ls-remote`, no
 # `refs/*` written down, no HTTP path. `git for-each-ref` in the clone then
 # reads the head SHA out, and a fetch by object name serves it. It was green.
-# Only `--mirror` is refused. `--bare` is the neighbouring flag and copies
-# only the branches an ordinary clone would, so refusing it would be a rule
-# about the shape of a clone rather than about what the clone reaches, and
-# `git clone --bare` of this repository is a thing a release step does.
+# Only `--mirror` is refused, and every abbreviation of it. Git's option
+# parser accepts any unambiguous prefix of a long option -- gitcli(7) says
+# long options "may be abbreviated only to their unique prefix" -- and no
+# other `git clone` or `git push` long option begins with `--m`, so `git
+# clone --mir URL m` sets up the identical refmap. It was green against a
+# pattern that wanted the full spelling. So the alternative is the ladder
+# from `--m` up, anchored so that the option has to *end* where the ladder
+# stops: `--milestone` is what `auto-assign-milestone.yml` writes on this
+# very trigger, `--max-count` and `--merges` are what a log step writes, and
+# no rung of the ladder ends before the next character of any of them. `--m`
+# is the bottom rung because that is the prefix git actually takes for
+# `clone` and for `push`, measured against git 2.55 rather than read off an
+# option list. The same measurement says `git remote add --m` is ambiguous
+# there -- `--master` is the other candidate -- so that one rung is covered
+# for a command git would have errored on anyway, which is free.
+#
+# The same question asked of everything else this file refuses by name: none
+# of it abbreviates. `ls-remote` is a subcommand and `git-upload-pack` is a
+# service name in a URL, and git abbreviates neither -- there is no `git
+# ls-rem`. `--approve` in B2 and `--repo` in `_GH_VALUE_FLAGS` belong to
+# `gh`, whose parser refuses a prefix outright (`unknown flag: --appr`,
+# measured against gh 2.101), so a ladder there would be a rule about an
+# input the CLI already rejects.
+#
+# `--bare` is the neighbouring flag and copies only the branches an ordinary
+# clone would, so refusing it would be a rule about the shape of a clone
+# rather than about what the clone reaches, and `git clone --bare` of this
+# repository is a thing a release step does.
 #
 # No carrier here runs either, so what this costs today is nothing, and what
 # it costs later is a line of review on a step that wants to survey a remote
@@ -499,7 +531,7 @@ _REMOTE_REF_ENUMERATION = re.compile(
     r"|refs/[^/\s'\"]*\*"
     r"|/info/refs\b"
     r"|\bgit-upload-pack\b"
-    r"|--mirror\b"
+    r"|--m(?:i(?:r(?:r(?:o(?:r)?)?)?)?)?(?![\w-])"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -1759,8 +1791,14 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         its script alone: a step that enumerates the remote's refs holds
         `refs/pull/N/head` whether or not it spelled `pull`, because the
         remote advertises the whole namespace to anyone who asks.
-        `_REMOTE_REF_ENUMERATION` has the five shapes and what refusing them
-        concedes. The second is the `ref:` half's
+        `_REMOTE_REF_ENUMERATION` has the five shapes, what refusing them
+        concedes, and the argument about abbreviation that applies to every
+        long option named anywhere in this file: git's parser takes any
+        unambiguous prefix of a long option, so `--mirror` is refused as a
+        ladder from `--m` up; `gh`'s parser takes none, so `--approve` and
+        `--repo` are refused and read at their full spellings; and neither
+        program abbreviates a *subcommand*, so `ls-remote` and `git-upload-pack`
+        need no ladder of their own. The second is the `ref:` half's
         rule one field along: a step may name only the expressions in
         `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only those, an
         `actions/github-script` body may reach only the `context` properties
@@ -2396,7 +2434,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             _REMOTE_REF_ENUMERATION.search(reachable),
                             f"{path.name}: a step enumerates the remote's "
                             "refs, or copies them whole with `clone "
-                            "--mirror`, which reaches `refs/pull/N/head` "
+                            "--mirror` or any prefix of it git accepts, "
+                            "which reaches `refs/pull/N/head` "
                             "without the step naming it -- grep the listing "
                             "and the head SHA is a fetch by object name away",
                         )

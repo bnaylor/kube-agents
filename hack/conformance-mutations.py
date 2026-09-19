@@ -2347,13 +2347,42 @@ Mutation(
         "of the four spellings the enumeration rule collected",
     ),
     Mutation(
+        # The same clone with the option abbreviated. Git takes any
+        # unambiguous prefix of a long option, and `--mirror` is the only
+        # `git clone` long option beginning with `--m`, so `git clone --m` is
+        # `git clone --mirror` and `--mir` and `--mirr` are too -- all of them
+        # green against a pattern that wanted the full spelling. `--m` rather
+        # than `--mir` because it is the shortest rung git accepts: a row at
+        # the bottom of the ladder dies wherever the pattern is cut, and a row
+        # further up survives a pattern narrowed beneath it.
+        "B4-pull-request-target-run-clone-mirror-abbreviated",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          git clone --m "https://github.com/'
+         '$GITHUB_REPOSITORY" m\n'
+         "          SHA=$(git -C m for-each-ref --format='%(objectname)"
+         " %(refname)' | grep \"/$PR_NUMBER/head\" | cut -d' ' -f1)\n"
+         '          git fetch origin "$SHA"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "abbreviate the mirror flag, which git resolves to the same option "
+        "and a pattern over its full spelling does not see",
+    ),
+    Mutation(
         # And the neighbouring flag, from the safe side. `git clone --bare`
         # copies the branches an ordinary clone does and not the pull
         # namespace, so refusing it would be a rule about the shape of a
         # clone rather than about what the clone reaches. KILLED here means
-        # `--mirror\b` has been widened to `--(?:mirror|bare)` or to
-        # `--mir`, and a release step that takes a bare clone of this
-        # repository now reds.
+        # the mirror pattern has been widened to `--(?:mirror|bare)`, and a
+        # release step that takes a bare clone of this repository now reds.
+        # The prefix ladder the pattern carries is not that widening: it runs
+        # `--m` to `--mirror` and `--bare` is on none of its rungs.
         "B4-pull-request-target-run-clone-bare",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2366,6 +2395,36 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "take a bare clone of this repository, which is what an archiving "
         "step does and which reaches no ref an ordinary clone does not",
+        must_survive=True,
+    ),
+    Mutation(
+        # And the ladder's neighbours, from the safe side. The mirror rule
+        # refuses every prefix of `--mirror` down to `--m`, and the price of
+        # that is a pattern that has to stop at the end of the option: `--m`
+        # also begins `--merges`, `--max-count` and `--milestone`. KILLED here
+        # means the ladder lost its anchor and every `--m...` option a
+        # workflow writes now reds.
+        #
+        # Today the anchor has a live control as well, which is worth saying
+        # so that this row is not read as the only one: `auto-assign-
+        # milestone.yml` writes `gh pr edit --milestone` on this same trigger,
+        # so replacing the ladder with a bare `--m` reds that carrier before a
+        # single mutation runs and the harness refuses the sweep outright.
+        # This row is what remains when a carrier changes, and that is
+        # measured rather than asserted -- with the carrier's flag renamed and
+        # the anchor dropped in the same tree, the baseline goes green again
+        # and this row reports OVERSHOT.
+        "B4-pull-request-target-run-log-m-flags",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Summarise the default branch\n"
+         "        run: |\n"
+         "          git log --merges --max-count=1 --format='%H'\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "log one merge commit from the checkout, whose two flags begin `--m` "
+        "and are no abbreviation of `--mirror`",
         must_survive=True,
     ),
     Mutation(
