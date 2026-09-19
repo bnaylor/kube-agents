@@ -82,7 +82,7 @@ class Mutation:
     #: authority on rather than this comment -- it named ten on 2026-09-19
     #: when there were eleven, and one of the ten by an id no row had:
     #: A3-fastpath-redundant,
-    #: B1-denylist-rule,
+    #: B1-assent-rule-weakened,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
