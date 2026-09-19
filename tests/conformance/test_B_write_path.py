@@ -117,15 +117,15 @@ _SAFE_CHECKOUT_REPOSITORIES = frozenset({"github.repository"})
 # The pull request's number is a concession and should be read as one. It is
 # the only entry here that is not independent of the pull request -- it
 # identifies it -- and with it and the token in the same step, the head is one
-# `gh api repos/O/R/pulls/$N --jq .head.sha` away. Measured: that step was
-# refused before this entry existed and is not refused now, and so is `gh pr
-# checkout "$PR_NUMBER"`. Both are in the test's "Not covered" list with the
-# measurement. The concession is made because two carriers label and comment
-# with the number and there is no way to tell that use from the other one
-# without reading the program, which is the thing this file declines to do;
-# and because the alternative on offer is a denylist over `gh pr`, which
-# `auto-assign-milestone.yml` would be the first to trip on with `gh pr edit`.
-# What the number does *not* open is the direct path: `pull/N/head` built out
+# `gh api repos/O/R/pulls/$N --jq .head.sha` away. Three shapes went green
+# when this entry was added, measured rather than inferred: that command, `gh
+# pr checkout "$PR_NUMBER"`, and `gh pr view --json headRefOid`. All three are
+# refused again by `_PULL_REQUEST_API`, which reads the subcommands that
+# return the pull request and not `gh pr` as a whole, so the labelling the
+# carriers do with the number is untouched. The concession is made because two
+# carriers label and comment with the number, and there is no way to tell that
+# use from the other one without reading the program, which is the thing this
+# file declines to do. What the number does *not* open is the direct path: `pull/N/head` built out
 # of it is refused by `_PULL_REQUEST_REF` over every step, whatever is on this
 # list.
 #
@@ -150,6 +150,24 @@ _SAFE_SCRIPT_EXPRESSIONS = _SAFE_CHECKOUT_EXPRESSIONS | {
 _SCRIPT_CONTEXT = re.compile(
     r"""\bcontext\b(?:\s*\.\s*(\w+)|\s*\[\s*['"](\w+)['"]\s*\])?"""
 )
+# The fourth language. The allowlists above read expressions and `context`
+# properties, and the rule below reads the payload off disk, but the head is
+# also an HTTP call away. `gh pr checkout "$N"` does the fetch and the
+# checkout in one word, and `gh api repos/O/R/pulls/$N --jq .head.sha` hands
+# back the same SHA the event carries. Neither names a refused expression,
+# because the only thing either needs from the event is the number, and the
+# number is on the allowlist so that the two carriers that label with it stay
+# green.
+#
+# So this is a backstop over the reading subcommands rather than over `gh pr`,
+# and that distinction is the whole reason it can exist: what the carriers
+# actually run is `gh pr edit` and `gh pr comment`, and neither is here. What
+# is here returns the pull request's code, its diff or its head, and a
+# workflow holding the base repository's token has no business asking for any
+# of the three. `/pulls/` catches the same request spelled as a URL, whether
+# `gh api` or `curl` makes it.
+_PULL_REQUEST_API = re.compile(r"\bgh\s+pr\s+(?:checkout|diff|view)\b|/pulls/")
+
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
 # whole webhook event as a file on disk, so a script can read the head SHA out
 # of it without naming an expression for `_SAFE_SCRIPT_EXPRESSIONS` to read or
@@ -1224,17 +1242,15 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         Not covered, each line re-run against this version of the file on
         2026-09-19 rather than carried forward:
 
-        The API. `gh pr diff "$PR_NUMBER"`, `gh pr checkout "$PR_NUMBER"`,
-        and `gh api repos/O/R/pulls/$N --jq .head.sha` followed by a fetch
-        all pass, because the head arrives from an HTTP call rather than
-        from the event and nothing in the step names a refused expression.
-        Two of those three were refused before 2026-09-19 and are not now:
-        the pull request's number went on `_SAFE_SCRIPT_EXPRESSIONS` this
-        round so that the carriers that label with it stay green, and the
-        number is what those commands take. That is a coverage loss, it is
-        measured rather than inferred, and the argument for paying it is at
-        the list. A `gh pr` backstop is not available: `auto-assign-
-        milestone.yml` runs `gh pr edit`.
+        The API in a spelling the backstop does not name.
+        `_PULL_REQUEST_API` reads `gh pr checkout`, `gh pr diff`, `gh pr
+        view` and any `/pulls/` request, which is what closed the three
+        shapes the pull request's number opened when it went on
+        `_SAFE_SCRIPT_EXPRESSIONS` this round. What is left is the same call
+        made without any of those four words: a GraphQL query for
+        `pullRequest(number:)`, or `gh pr` with the subcommand itself built
+        out of a variable. That backstop is a list of nouns and it will lose
+        the way lists of nouns lose here.
 
         A local composite action. `uses: ./.github/actions/x` moves the
         steps into a file keyed `runs.steps` that nothing here reads, and
@@ -1243,9 +1259,10 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         The half of `$GITHUB_ENV` laundering that does not name an
         expression. A step that writes `REV=${{ github.event.after }}` to
         `$GITHUB_ENV` for a later step to read is refused now -- the writing
-        step names the field, and every step is read -- but a step that
-        writes what `gh pr view --json headRefOid` returned is not, for the
-        same reason the API line above is not.
+        step names the field, and every step is read. A step that writes
+        what a GraphQL query returned is not, for the same reason the API
+        line above is not: the backstop reads four spellings and that is
+        not one of them.
 
         A `script:` that splits both halves of the payload path:
         `globalThis['proc'+'ess']['e'+'nv']['GITHUB_EVENT_'+'PATH']`.
@@ -1261,7 +1278,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         well as on: `steps.X.outputs.Y` is an expression like any other and
         the allowlist refuses it for not being recognised, a `script:` that
         builds its own client still writes the word `context` to reach the
-        payload, and the `$GITHUB_ENV` write above lost its easy half.
+        payload, the `$GITHUB_ENV` write above lost its easy half, and the
+        API line lost the three shapes a backstop could name.
         """
         consumers = [
             (path, document)
@@ -1543,6 +1561,22 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # patterns rather than one because the variable, the
                         # path it holds and the process environment that
                         # carries it are three ways to the same bytes.
+                        # And the payload over HTTP, which none of the
+                        # rules above read either. Refused on the request
+                        # rather than on what comes back, for the same reason
+                        # the file is: what returns is the head, the diff or
+                        # the branch, and there is no innocent one among them.
+                        self.assertIsNone(
+                            _PULL_REQUEST_API.search(
+                                "\n".join([script, *environment.values()])
+                            ),
+                            f"{path.name}: a step reads the pull request "
+                            "through the API -- `gh pr checkout`, `gh pr "
+                            "diff`, `gh pr view` or a `/pulls/` request -- "
+                            "which is the event's own fields fetched over "
+                            "HTTP, in the one language none of the rules "
+                            "above read",
+                        )
                         self.assertIsNone(
                             _EVENT_PAYLOAD_FILE.search(
                                 "\n".join([script, *environment.values()])
