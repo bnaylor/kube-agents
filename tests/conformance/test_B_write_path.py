@@ -930,24 +930,24 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         github.event.repository.default_branch }}` is the fork's copy of its
         own default branch, which the fork wrote, and every assertion on the
         ref passes. `repository:` therefore gets its own allowlist,
-        `_SAFE_CHECKOUT_REPOSITORIES` -- absent, or `github.repository` -- and unlike the ref half it refuses a literal outright, including
+        `_SAFE_CHECKOUT_REPOSITORIES` -- absent, or `github.repository` --
+        and unlike the ref half it refuses a literal outright, including
         this repository's own name. The ref half tolerates literals because
         `main` is an ordinary ref; there is no equivalent reason to write
         out a repository when the expression for it exists, and a literal is
         exactly where a lookalike owner would go unread.
 
         Both inputs are read through `_with_inputs`, case-insensitively,
-        which is not decoration.
-        The runner passes an input to an action as `INPUT_<NAME>`,
-        upper-casing the key, and `core.getInput` looks it up the same way,
-        so `Ref:` is the ref `actions/checkout` checks out and a
+        which is not decoration. The runner passes an input to an action as
+        `INPUT_<NAME>`, upper-casing the key, and `core.getInput` looks it up
+        the same way, so `Ref:` is the ref `actions/checkout` checks out and a
         `with.get("ref")` reads none of it. The same helper maps a YAML null
         to the empty string, because `str(None)` is a truthy `"None"` and a
         bare `ref:` is a checkout with no ref wearing a literal's clothes.
-        This is the `uses:` bug one field along -- that filter was case-sensitive too until
-        `Actions/checkout` was found walking past it -- and the pattern in
-        both is the same: each round of review finds the input the last
-        round did not read.
+        This is the `uses:` bug one field along -- that filter was
+        case-sensitive too until `Actions/checkout` was found walking past it
+        -- and the pattern in both is the same: each round of review finds the
+        input the last round did not read.
 
         The rule is over any step that takes a `ref:`, not over
         `actions/checkout`. A third-party checkout action fetches the same
