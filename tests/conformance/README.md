@@ -261,7 +261,7 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-269 mutations: 221 KILLED, 22 NOISY, twenty-six `must_survive` controls,
+274 mutations: 224 KILLED, 22 NOISY, twenty-eight `must_survive` controls,
 zero genuine survivors, zero stale — measured 2026-09-20 against this branch;
 re-run the harness rather than trusting these numbers, which is the sentence
 this paragraph exists to make cheap. It is also the sentence this paragraph
@@ -272,13 +272,13 @@ behind the tree again, and the round after that left every figure here nine
 rows behind and the list below one control short. Three rounds running, and
 each time the numbers were true of the round before. Count them with
 `--list`, which marks each one `[control]`, rather than by reading this.
-Two of the twenty-six are
+Two of the twenty-eight are
 outside B4 — `A3-fastpath-redundant`, which pins a deliberate redundancy in
 the shorthand handling, and `B1-denylist-rule`, which pins a rule-id rename
 in the operator's shipped denylist as a change that must not redden the
 suite. This paragraph called that second one "on the harness itself" until
 round 18, which is its own pretext read too quickly; no control here is on
-the harness. The remaining twenty-four are over B4's `pull_request_target`
+the harness. The remaining twenty-six are over B4's `pull_request_target`
 rules: a checkout whose allowlisted ref is reached through `${{ Env.SAFE }}`,
 a case the expansion must keep green and which closes no hole, the `gh`
 walk's skip of a flag's value, the same
@@ -301,7 +301,13 @@ refuse, a loop over an array's own indices written `${!xs[@]}`, which the
 rule against a `${!prefix@}` name listing and the rule against `${!name}`
 indirect expansion must both leave alone, a `cat` of `.git/refs/heads/main` in
 the checkout the step already has, which the rule against asking a remote to
-list its refs must not catch, a `pr checkout` run through `timeout` against a
+list its refs must not catch, a `gh api` of `git/ref/heads/main` and
+`git/ref/tags/v1.0.0`, which is the exact-match ref endpoint conceded for the
+two namespaces a fork cannot write and narrowed to them in round 23, a step
+that links the pull request's `files` tab, reads `head` and `merge` out of a
+report by quoted name and ends a pipeline with `head -3`, which are the
+ordinary uses of the four ref words the round-23 shell-word reading must
+leave alone, a `pr checkout` run through `timeout` against a
 local tool with a plain name, which the rule against a wrapper hiding an
 unreadable `gh` must not catch, a job declaring `defaults.run.shell:
 bash`, which reading the `shell:` field at all must not object to, a script
@@ -327,8 +333,8 @@ alone, and a `run:` step logging `context.repo` through `@actions/github`,
 which is the one property of that object the wide read of the word `context`
 lets through wherever it is written. Each of those edits is the _safe_
 spelling of something a workflow here legitimately does, and the control is
-that the suite does not object to it. Note that the summary line the harness prints accounts for 243
-of the 269: a `must_survive` control's verdict is
+that the suite does not object to it. Note that the summary line the harness prints accounts for 246
+of the 274: a `must_survive` control's verdict is
 `SURVIVED (expected)`, which is neither killed, noisy, nor a survivor. The run
 also prints `BASELINE POLLUTED` if the suite is not green once every mutation
 has been restored, which did not happen here and would invalidate every
