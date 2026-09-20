@@ -280,8 +280,8 @@ catch either, a script whose `set -euo pipefail`, `export PATH=...`,
 `declare -a tools=(...)` and `env GOFLAGS=... ./bin/build` are the ordinary
 shell that the refusal of a whole-environment read must not reach, a step
 naming a deployment `ENVIRONMENT` and mentioning the shell's own `$ENV`,
-neither of which is the process environment the `environ` and `%ENV` rules
-refuse, a loop over an array's own indices written `${!tools[@]}`, which the
+neither of which is the process environment the `environ` and `$ENV{` rules
+refuse, a loop over an array's own indices written `${!xs[@]}`, which the
 rule against a `${!prefix@}` name listing and the rule against `${!name}`
 indirect expansion must both leave alone, a `cat` of `.git/refs/heads/main` in
 the checkout the step already has, which the rule against asking a remote to
