@@ -80,11 +80,11 @@ class Mutation:
     #: run as a control on the harness itself. Neither of the two verdicts a
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
-    #: what the module docstring says and what `main` writes. Twenty today,
-    #: which `--list` is the authority on rather than this comment -- it
-    #: marks each control `[control]`, and the list below named ten on
-    #: 2026-09-19 when there were eleven, and one of the ten by an id no row
-    #: had:
+    #: what the module docstring says and what `main` writes. There are
+    #: twenty-one today, which `--list` is the authority on rather than this
+    #: comment -- it marks each control `[control]`, and the list below named
+    #: ten on 2026-09-19 when there were eleven, and one of the ten by an id
+    #: no row had:
     #: A3-fastpath-redundant,
     #: B1-denylist-rule,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
@@ -102,6 +102,7 @@ class Mutation:
     #: B4-pull-request-target-run-log-m-flags,
     #: B4-pull-request-target-run-runner-repository-name,
     #: B4-pull-request-target-run-backtick-and-comment,
+    #: B4-pull-request-target-run-quoted-word-ordinary,
     #: B4-pull-request-target-pwsh-named-variable,
     #: B4-pull-request-target-run-eval-ordinary, and
     #: B4-pull-request-target-container-pinned-image.
@@ -3053,6 +3054,88 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "end the dump with a comment rather than with an operator, which "
         "ends the command and was not in the terminator set",
+    ),
+    Mutation(
+        # The same dump with the program name quoted, which is the round-16
+        # hole. A quote inside a word ends and reopens the quoting rather
+        # than joining the name, so `$('env')` runs `env` -- and the letters
+        # were all there for the pattern to read. What was not there was a
+        # terminator: the character after the last letter is a `'`, and the
+        # terminator set is where an operator goes. `"printenv"`, `e"n"v`
+        # and `en''v` are the same step and were green with it.
+        #
+        # It pins `_enumeration_word`, the quoting written into the word
+        # rather than into the terminator. Make it return its argument
+        # unchanged and this row is SURVIVED with every other row still
+        # KILLED, including the glued-expansion row below, which carries no
+        # quote. The control beside them is what says the fix is the word
+        # and not the terminator: `grep "env" Makefile` has to stay green,
+        # and it does not if a quote is allowed to end a dump.
+        "B4-pull-request-target-run-env-dump-quoted-program",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          E=$('env')\n"
+         "          B=$(grep -i '^github_head_ref=' <<<\"$E\" | cut -d= -f2)\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "quote the program name, which changes nothing about what the shell "
+        "runs and puts a quote where the rule wanted an operator",
+    ),
+    Mutation(
+        # The same word finished with an expansion instead. `NOPE` is unset,
+        # an unset variable expands to nothing, and `env$NOPE` is therefore
+        # `env` -- with a `$` after the name where the rule wanted a
+        # terminator, which is the quoted row's mechanism in the one
+        # punctuation character quoting does not cover.
+        #
+        # It pins `_ENUMERATION_GLUE`. Drop it from `_ENUMERATION_STOP` and
+        # this row is SURVIVED on its own, the quoted row above staying
+        # KILLED. The glue is adjacency-only and the ordinary-shell controls
+        # are why: `export PATH="$PWD/bin:$PATH"` and `set $FLAGS` put a `$`
+        # one space along, and a space means the expansion is an argument
+        # rather than the rest of the program's name.
+        "B4-pull-request-target-run-env-dump-glued-expansion",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          E=$(env$NOPE)\n"
+         "          B=$(grep -i '^github_head_ref=' <<<\"$E\" | cut -d= -f2)\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "glue an unset variable to the end of the program name, which the "
+        "shell drops and the terminator set could not see past",
+    ),
+    Mutation(
+        # The safe side of the two rows above, and the reason the quoting
+        # went into the word rather than into the terminator set. Every line
+        # here writes one of the enumeration words next to a quote and none
+        # of them runs it: `grep "env"` and `jq '.env'` pass the word to a
+        # program as a pattern, and `echo 'export PATH=/x'` writes a line
+        # into a file. KILLED here means a quote has been let loose as a
+        # terminator, which is the naive fix for the rows above and a suite
+        # that reds on the first step that greps for a word.
+        "B4-pull-request-target-run-quoted-word-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Inspect the build files\n"
+         "        run: |\n"
+         '          grep "env" Makefile || true\n'
+         "          jq -r '.env' package.json || true\n"
+         "          echo 'export PATH=/x' >> ./profile\n"
+         "          cat ./profile\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "grep for one of the words the enumeration rule reads and write "
+        "another of them into a file, quoting both because a shell needs it",
+        must_survive=True,
     ),
     Mutation(
         # The safe side of both rows above. A backtick substitution and a

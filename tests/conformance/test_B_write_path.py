@@ -1004,6 +1004,34 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # quoted in a step's own comment is the shape -- which is a line of review
 # and nothing any carrier here writes, measured rather than assumed.
 #
+# The words admit the quoting a shell drops, and that is the round-16
+# correction to a rule that read letters. `E=$('env')` runs `env`: a quote
+# inside a word ends and reopens the quoting rather than joining the name, so
+# `'env'`, `"printenv"`, `e"n"v` and `en''v` are four spellings of two
+# programs, and all four were green. Not for want of the letters -- every one
+# of them is written out -- but because the character after the last letter
+# was a quote, and a quote was not a terminator. Putting one in the
+# terminator set is the fix that looks obvious and it reds `grep "env"
+# Makefile`, which is an ordinary line: the quote there closes a *pattern*,
+# and where a quote sits says nothing about whether the word in front of it
+# ran. So the quoting goes inside the word instead, at `_enumeration_word`,
+# which is where the shell puts it, and the terminator goes on deciding
+# exactly what it decided before -- `"env"` followed by a filename is an
+# argument to grep and stays green, measured both ways.
+#
+# `env$NOPE` is the same word from the other end. An unset variable expands
+# to nothing, so the word the shell runs is `env` and what follows the name
+# in the text is a `$`. `_ENUMERATION_GLUE` takes it, held to the character
+# immediately after the name and no further: `set $FLAGS` is a builtin with
+# an argument and stays green, and only a `$` with no space in front of it is
+# a name that finishes somewhere the text cannot show.
+#
+# What neither half reaches is a name assembled out of something that is not
+# written down -- `E=en; ${E}v`, or an `eval` over a string built at run
+# time. That is `_READABLE_PROGRAM`'s argument in the other half of this
+# file and it has the same answer here: no pattern over a name can read a
+# name that is not there. It is open, and it is written down as open.
+#
 # The lookbehind is two lookbehinds now, and that is the round-13 correction
 # to one. It was `(?<![\w./-])` for every alternative, which is what keeps
 # `foo.env`, `my-env` and `venv` from reading as `env` -- and the `/` in it
@@ -1081,22 +1109,76 @@ _ENUMERATION_BUILTIN_START = r"(?<![\w./-])"
 #: used to need the `/` here is the shebang, and the shebang is exempted by
 #: its operand instead.
 _ENUMERATION_PROGRAM_START = r"(?<![\w.-])"
+#: What a shell drops on its way from a word in the text to the word it runs:
+#: a quote of either kind, and the backslash that escapes the next character.
+#: `'env'`, `"env"`, `e"n"v` and `en\v` are four spellings of one program,
+#: and a shell reads all four as `env`.
+_ENUMERATION_QUOTING = r"[\"'\\]*"
+#: And the other half of the same problem: a word the shell *finishes* with an
+#: expansion. `env$NOPE` runs `env` when `NOPE` is unset, which it is, and no
+#: terminator follows the name for `_ENUMERATION_END` to read. Held to the
+#: character immediately after the word -- an expansion with a space in front
+#: of it is an argument, and `set $FLAGS` is not a dump.
+_ENUMERATION_GLUE = r"\$"
+#: Where an alternative's name stops: at a terminator, or at an expansion
+#: glued to the last letter of it.
+_ENUMERATION_STOP = (
+    r"(?:[ \t]*" + _ENUMERATION_END + r"|" + _ENUMERATION_GLUE + r")"
+)
+
+
+def _enumeration_word(word):
+    """`word` with the quoting a shell drops written into it.
+
+    A program name is not a string literal to a shell: it is a word, and a
+    quote inside a word ends and reopens the quoting rather than being part
+    of the name. `'env'`, `"printenv"`, `e"n"v` and `en''v` are what
+    `$('env')` and its four neighbours actually run, and each of them walked
+    past a pattern over the literal letters -- not because the letters were
+    absent but because the character after the last one was a quote, which
+    was not a terminator, and adding a quote to the terminator class would
+    red `grep "env" Makefile`. So the quoting goes into the word, where it
+    belongs, and the terminator keeps deciding what it decided before.
+
+    What this does not reach is a name assembled out of anything that is not
+    in the text: `E=en; ${E}v`, or `$(eval 'e''nv')`. That is
+    `_READABLE_PROGRAM`'s argument in the other half of this file, and it has
+    the same answer here -- no pattern over a name can read a name that is
+    not written down. It is open, and written down as open.
+    """
+    return (
+        _ENUMERATION_QUOTING
+        + _ENUMERATION_QUOTING.join(word)
+        + _ENUMERATION_QUOTING
+    )
+
+
 _ENVIRONMENT_ENUMERATION = re.compile(
     "|".join((
         _ENUMERATION_PROGRAM_START
-        + r"env(?:[ \t]+-[\w-]+)*[ \t]*" + _ENUMERATION_END,
+        + _enumeration_word("env")
+        + r"(?:[ \t]+-[\w-]+)*" + _ENUMERATION_STOP,
         _ENUMERATION_PROGRAM_START
-        + r"printenv(?:[ \t]+-[\w-]+)*[ \t]*" + _ENUMERATION_END,
+        + _enumeration_word("printenv")
+        + r"(?:[ \t]+-[\w-]+)*" + _ENUMERATION_STOP,
         _ENUMERATION_BUILTIN_START
-        + r"(?:declare|typeset)(?:[ \t]+-[a-zA-Z]*[px][a-zA-Z]*)?[ \t]*"
-        + _ENUMERATION_END,
+        + r"(?:" + _enumeration_word("declare")
+        + r"|" + _enumeration_word("typeset") + r")"
+        + r"(?:[ \t]+-[a-zA-Z]*[px][a-zA-Z]*)?"
+        + _ENUMERATION_STOP,
         _ENUMERATION_BUILTIN_START
-        + r"export(?:[ \t]+-p)?[ \t]*" + _ENUMERATION_END,
-        _ENUMERATION_BUILTIN_START + r"set[ \t]*" + _ENUMERATION_END,
-        r"\S[ \t]+(?i:env):[ \t]*" + _ENUMERATION_END,
+        + _enumeration_word("export")
+        + r"(?:[ \t]+-p)?" + _ENUMERATION_STOP,
         _ENUMERATION_BUILTIN_START
-        + r"compgen[ \t]+(?:-[\w-]*[ev]\b|-A[ \t]*(?:variable|export)\b)",
-        r"\bps[ \t]+(?!-)[a-zA-Z]*e[a-zA-Z]*\b",
+        + _enumeration_word("set") + _ENUMERATION_STOP,
+        r"\S[ \t]+(?i:" + _enumeration_word("env:") + r")"
+        + _ENUMERATION_STOP,
+        _ENUMERATION_BUILTIN_START
+        + _enumeration_word("compgen")
+        + r"[ \t]+(?:-[\w-]*[ev]\b|-A[ \t]*(?:variable|export)\b)",
+        _ENUMERATION_PROGRAM_START
+        + _enumeration_word("ps")
+        + r"[ \t]+(?!-)[a-zA-Z]*e[a-zA-Z]*\b",
         r"\$\{!\w*[@*]\}",
     )),
     re.MULTILINE,
