@@ -2752,6 +2752,75 @@ Mutation(
         "same dump with stderr folded in and was not a terminator",
     ),
     Mutation(
+        # The same dump inside the older command substitution. A backtick
+        # closes it, so ``E=`env` `` is `E=$(env)` with the paren spelled
+        # another way -- and `_COMMAND_END`, forty lines up the same file,
+        # has read a backtick as the end of a command since it was written.
+        # The terminator set had not, so this walked past a rule that caught
+        # the identical dump in the `$(...)` spelling. It pins the backtick
+        # in `_ENUMERATION_END`, which no other row reaches.
+        "B4-pull-request-target-run-env-dump-backtick",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          E=`env`\n"
+         "          B=$(grep -i '^github_head_ref=' <<<\"$E\" | cut -d= -f2)\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run the dump in the command substitution bash inherited from the "
+        "Bourne shell, whose closing character the terminator set left out",
+    ),
+    Mutation(
+        # And the same dump with prose after it. A `#` starts a comment, so
+        # the command ends there as surely as it ends at a newline, and
+        # `env  # every variable there is` with the `)` on the line below is
+        # a dump somebody annotated. It pins the `#` in `_ENUMERATION_END`.
+        "B4-pull-request-target-run-env-dump-comment",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          E=$(env  # every variable there is\n"
+         "          )\n"
+         "          B=$(grep -i '^github_head_ref=' <<<\"$E\" | cut -d= -f2)\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "end the dump with a comment rather than with an operator, which "
+        "ends the command and was not in the terminator set",
+    ),
+    Mutation(
+        # The safe side of both rows above. A backtick substitution and a
+        # trailing comment are ordinary shell, and this step writes three of
+        # the words the enumeration rule reads with one of the two new
+        # terminators after each of them: `set -euo pipefail`, `export
+        # PATH=...` and `declare -a` all carry a `#` further along the line,
+        # and the `REV=` line closes a backtick. None of them is a read.
+        # KILLED here means a terminator was let loose from the word it has
+        # to follow, which is a suite that reds on the first commented shell
+        # script somebody writes.
+        "B4-pull-request-target-run-backtick-and-comment",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Record the build\n"
+         "        run: |\n"
+         "          set -euo pipefail  # fail fast\n"
+         '          export PATH="$PWD/bin:$PATH"  # the tools we just built\n'
+         "          declare -a steps=(fetch build)  # in order\n"
+         "          REV=`git rev-parse HEAD`\n"
+         '          echo "built $REV for ${steps[*]}"  # done\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write an ordinary shell script that comments three of its lines "
+        "and takes a revision out of a backtick substitution",
+        must_survive=True,
+    ),
+    Mutation(
         # The same dump run by its path. `env` is a program, and the
         # lookbehind that keeps `venv` and `foo.env` from reading as one
         # excluded a `/` in front of it -- which was how the shebang stayed

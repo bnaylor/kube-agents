@@ -896,6 +896,21 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # `\d+[<>]` is the fix, and it takes `1>`, `2>>` and `3<` with it rather than
 # the one spelling that turned up.
 #
+# The terminator set was a list of operators until round 14, and the two
+# characters it left out are the two that end a command without being one.
+# A backtick closes the older command substitution, so ``E=`env` `` is
+# `E=$(env)` with the paren spelled another way -- and this file has read a
+# backtick as the end of a command since `_COMMAND_END` was written, which
+# makes the omission an inconsistency inside one file rather than a case
+# nobody had thought about. A `#` starts a comment, so `E=$(env  # every
+# variable there is` with the `)` on the line below is the same dump with
+# prose after it. Both were green, and the step then greps the *lower-case*
+# `github_head_ref=` out of the result, which is a spelling no allowlist over
+# the names can see. What the two cost is an enumeration word written
+# immediately before a backtick or a `#` for some other reason -- `` `set` ``
+# quoted in a step's own comment is the shape -- which is a line of review
+# and nothing any carrier here writes, measured rather than assumed.
+#
 # The lookbehind is two lookbehinds now, and that is the round-13 correction
 # to one. It was `(?<![\w./-])` for every alternative, which is what keeps
 # `foo.env`, `my-env` and `venv` from reading as `env` -- and the `/` in it
@@ -932,8 +947,10 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 
 #: Where an environment dump ends, and the half of each alternative that
 #: tells a read from an ordinary use of the same word. A redirect counts
-#: whether or not its file descriptor is written out.
-_ENUMERATION_END = r"(?:$|[|>;&)]|\d+[<>])"
+#: whether or not its file descriptor is written out, and so do the two
+#: characters that end a command without being operators: a backtick, which
+#: closes the older command substitution, and a `#`, which opens a comment.
+_ENUMERATION_END = r"(?:$|[|>;&)`#]|\d+[<>])"
 #: A shell builtin cannot be invoked by a path, so a `/` in front of one
 #: belongs to some other word -- a file called `set`, read with `cat` or `.`.
 _ENUMERATION_BUILTIN_START = r"(?<![\w./-])"
