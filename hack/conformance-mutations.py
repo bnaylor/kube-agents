@@ -2585,6 +2585,123 @@ Mutation(
         "not cover",
     ),
     Mutation(
+        # ruby, which is a `shell:` the moment somebody writes `ruby {0}`.
+        # Its environment is the constant `ENV` and `ENV.to_h` hands the lot
+        # over as a hash, so the walk that picks the head-ref key out of it
+        # spells neither the accessor python and node use nor the variable.
+        # It pins the `.` in the `ENV` alternative.
+        "B4-pull-request-target-ruby-env-mapping",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: ruby {0}\n"
+         "        run: |\n"
+         "          b = nil\n"
+         "          ENV.to_h.each { |k, v| b = v if k =~ /HEAD_REF/ }\n"
+         '          system("git fetch origin #{b} && git checkout FETCH_HEAD")\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "walk the environment from ruby, whose mapping is a constant read "
+        "as an object rather than a function called with a name",
+    ),
+    Mutation(
+        # The same constant subscripted, with the reserved prefix split off
+        # the way the python row splits it. `ENV["GITHUB" + "_HEAD_REF"]`
+        # leaves no `GITHUB_`-prefixed word for the runner-variable
+        # allowlist, so the accessor is the only thing deciding -- which is
+        # the argument for reading the accessor, made in a fifth language.
+        # It pins the `[` in the `ENV` alternative.
+        "B4-pull-request-target-ruby-env-element",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: ruby {0}\n"
+         "        run: |\n"
+         '          b = ENV["GITHUB" + "_HEAD_REF"]\n'
+         '          system("git fetch origin #{b} && git checkout FETCH_HEAD")\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read one element of ruby's environment by a key built out of two "
+        "literals, which is the subscript rather than the mapping",
+    ),
+    Mutation(
+        # go, and the reason this one is about case rather than about go.
+        # `getenv` was matched in lower case only -- the spelling C and php
+        # use, and the one spelling go does not -- so `os.Getenv` walked
+        # past the alternative written for it. It pins the `(?i:` on that
+        # alternative: with the case sensitivity back, nothing here matches.
+        "B4-pull-request-target-go-getenv-case",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          cat > m.go <<'EOF'\n"
+         "          package main\n"
+         '          import ("os"; "os/exec")\n'
+         "          func main() {\n"
+         '            b := os.Getenv("GITHUB" + "_HEAD_REF")\n'
+         '            exec.Command("git", "fetch", "origin", b).Run()\n'
+         "          }\n"
+         "          EOF\n"
+         "          go run m.go && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "compile the read out of a heredoc in go, whose getter is spelled "
+        "with the capital the lower-case alternative could not see",
+    ),
+    Mutation(
+        # The other half of go's pair. `os.LookupEnv` is `os.Getenv` with a
+        # second return value saying whether the variable was set at all,
+        # and it shares no substring with the first, so it is its own
+        # alternative and needs its own row.
+        "B4-pull-request-target-go-lookup-env",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          cat > m.go <<'EOF'\n"
+         "          package main\n"
+         '          import ("os"; "os/exec")\n'
+         "          func main() {\n"
+         '            b, _ := os.LookupEnv("GITHUB" + "_HEAD_REF")\n'
+         '            exec.Command("git", "fetch", "origin", b).Run()\n'
+         "          }\n"
+         "          EOF\n"
+         "          go run m.go && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "use the other getter go's os package exports, which asks the same "
+        "question and is spelled nothing like the first",
+    ),
+    Mutation(
+        # .NET's, which is what the word boundary on the *end* of the
+        # `getenv` alternative was costing. PowerShell reaches the whole
+        # mapping as `[Environment]::GetEnvironmentVariables()`, where
+        # `environ` has `ment` after it and `GetEnv` has `ironmentVariables`
+        # after it -- so the bare-word alternative missed it and a trailing
+        # `\b` on the getter alternative would miss it too. An identifier
+        # that begins `getenv` is a getter whatever it goes on to spell.
+        "B4-pull-request-target-dotnet-environment-variables",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: pwsh\n"
+         "        run: |\n"
+         "          $all = [Environment]::GetEnvironmentVariables()\n"
+         "          $k = $all.Keys | Where-Object { $_ -like '*HEAD_REF' }\n"
+         "          git fetch origin $all[$k]\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "take the whole mapping off .NET's static class, whose method name "
+        "buries both of the words this file reads for",
+    ),
+    Mutation(
         # The false-positive direction both of the alternatives above open,
         # in one step. Matching `environ` without regard to case puts
         # `ENVIRONMENT` one word boundary away from a red, and `$ENV` is the
@@ -2888,8 +3005,9 @@ Mutation(
     Mutation(
         # Bash's own listing, with no program in it at all. `${!GITHUB_@}`
         # expands to the *names* of every variable with that prefix, so the
-        # enumeration is a parameter expansion and the six alternatives
-        # above -- all of them anchored on a command word -- read none of
+        # enumeration is a parameter expansion and the eight alternatives
+        # above -- every one of them anchored on a command word or, for the
+        # `Env:` drive, on the cmdlet in front of it -- read none of
         # it. The `eval` keeps this off `_INDIRECT_EXPANSION`'s pattern, so
         # the name listing is what kills it.
         "B4-pull-request-target-run-prefix-name-listing",
@@ -2950,6 +3068,53 @@ Mutation(
         "read the environment out of the process table with BSD's `e` "
         "option, which is neither a shell builtin nor a program named for "
         "the environment",
+    ),
+    Mutation(
+        # The same listing in the shell GitHub documents beside `bash`.
+        # `pwsh` is a first-class `shell:` and is preinstalled on
+        # `ubuntu-latest`, and PowerShell exposes the environment as a
+        # filesystem, so `Get-ChildItem Env:` is `env` and the pipe into
+        # `Where-Object` is the `grep -i` -- with none of the five words the
+        # rule was five words of. It pins the `Env:` drive alternative.
+        "B4-pull-request-target-pwsh-env-drive",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: pwsh\n"
+         "        run: |\n"
+         "          $v = Get-ChildItem Env: | "
+         "Where-Object Name -like '*HEAD_REF'\n"
+         "          git fetch origin $v.Value\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "list the environment as a drive from PowerShell, which asks for "
+        "every variable without running any of the programs that print them",
+    ),
+    Mutation(
+        # The safe side of the row above, and the review finding this file
+        # declined. PowerShell has no bare `$NAME` for an environment
+        # variable: `$env:GITHUB_REPOSITORY` *is* how a `pwsh` step reads
+        # the value `bash` reads as `$GITHUB_REPOSITORY`, the name is
+        # written down either way, and `_SAFE_RUNNER_VARIABLES` holds it.
+        # KILLED here means `$env:` has been read as an accessor -- which is
+        # a suite that reds on every ordinary `pwsh` step for spelling a
+        # safe variable the only way its shell spells one.
+        "B4-pull-request-target-pwsh-named-variable",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Report the build\n"
+         "        shell: pwsh\n"
+         "        run: |\n"
+         '          Write-Host "building $env:GITHUB_REPOSITORY '
+         'at $env:GITHUB_SHA"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "name two allowlisted variables from PowerShell, which spells a "
+        "named read with the same `env` the drive listing uses",
+        must_survive=True,
     ),
     Mutation(
         # The safe side of `_INDIRECT_EXPANSION`, and the reason that rule

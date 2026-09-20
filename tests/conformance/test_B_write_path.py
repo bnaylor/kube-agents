@@ -694,6 +694,49 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # startup-file variable and is not this mapping, so the brace is required and
 # `echo "$ENV"` stays green.
 #
+# Two languages was not the language list and neither is four. What decides
+# whether a language belongs here is not how common it is but whether a
+# `shell:` can be it, and a `shell:` can be anything: GitHub documents
+# `bash`, `sh`, `pwsh`, `powershell`, `python` and `cmd` by name and takes
+# `<command> {0}` for everything else, so `shell: ruby {0}` and a `go run` out
+# of a heredoc are one line of workflow each. Three more accessors, argued
+# one at a time rather than transcribed off a list.
+#
+# ruby's is the constant `ENV`, which is a mapping and is read as one:
+# `ENV["GITHUB_" + "HEAD_REF"]` splits the reserved prefix off the way the
+# python row does and `ENV.to_h.each` walks the lot. It is refused as the
+# word indexed or messaged -- `ENV[` and `ENV.` -- rather than as the bare
+# word, because unlike `environ` the three letters are a word an ordinary
+# script writes: `ENVIRONMENT=staging` is a deployment target and
+# `${ENV:-none}` is the shell's own startup-file variable, and both keep
+# their green because neither is followed by a subscript or a dot.
+#
+# go's is `os.Getenv`, and the alternative it walked past is a lesson about
+# case rather than about go: `getenv` was matched in lower case only, which
+# is the spelling C and php use and the one spelling go does not. It is
+# matched without regard to case now, which takes `os.Getenv`, php's
+# `getenv()` and java's `System.getenv` with it. `os.LookupEnv` is the other
+# half of go's pair -- the same read returning a second value for "was it
+# set" -- and it is its own alternative because it shares no substring with
+# the first. `os.Environ()` needs neither: it is the word the case-insensitive
+# `environ` above already reads.
+#
+# Dropping the word boundary off the *end* of that alternative is the third
+# thing it buys, and it is .NET's. PowerShell's `[Environment]::
+# GetEnvironmentVariables()` is the whole mapping as an object, and it is
+# spelled so that nothing here saw it: `environ` has `ment` after it so the
+# bare word misses, and `GetEnv` has `ironmentVariables` after it so a
+# trailing `\b` misses too. An identifier that *begins* `getenv` or
+# `lookupenv` is an environment getter whatever it goes on to spell, which is
+# the rule, and the singular `GetEnvironmentVariable("GITHUB_HEAD_REF")`
+# names its variable and would have died on the allowlist anyway.
+#
+# PowerShell's `$env:NAME` is *not* here, and the reason is the whole of what
+# this rule is for. See `_ENVIRONMENT_ENUMERATION`, where the `Env:` drive is
+# refused as the enumeration it is: `pwsh` is a shell, `$env:NAME` is how a
+# shell names a variable, and the allowlist over the names reads it. An
+# accessor is what a *program* uses instead of being given the value.
+#
 # Refusing the accessor rather than the name is a rule about reach rather
 # than about spelling, and it is affordable for a reason specific to these
 # inputs: a `script:` is handed everything it needs as `context`, `github`,
@@ -715,7 +758,8 @@ _EVENT_PAYLOAD_FILE = re.compile(
     r"|\b(?i:environ)\b"
     r"|%ENV\b"
     r"|\$ENV\s*\{"
-    r"|\bgetenv\b"
+    r"|\bENV\s*[.\[]"
+    r"|\b(?i:(?:get|lookup)env)"
 )
 
 # `context.repo` is `{owner, repo}` for the repository the workflow lives in,
@@ -844,13 +888,16 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # discovered, because a comment claiming a closed set is the thing round 13
 # found false here.
 #
-# Eight alternatives in three groups. The two programs that print the
+# Nine alternatives in four groups. The two programs that print the
 # environment, `env` and `printenv`, with no operand. The four builtins that
 # print a variable table -- `declare -p` and `declare -x` with `typeset`'s
 # spelling of both, `export -p`, a bare `set`, and `compgen`'s variable
-# actions. And two requests the shell answers itself: `ps` with BSD's `e`
+# actions. Two requests the shell answers itself: `ps` with BSD's `e`
 # option, which prints a process's environment table, and `${!prefix@}`,
-# which expands to the *names* of every variable with that prefix.
+# which expands to the *names* of every variable with that prefix. And one
+# that is not a command: PowerShell's `Env:` drive, listed the way a
+# directory is, which is the same question asked of the one shell here that
+# keeps the environment in a filesystem.
 #
 # `compgen -e` was the whole of that builtin until 2026-09-19 and it lists
 # the exported names only. `compgen -v` lists every shell variable, which is
@@ -932,13 +979,43 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # rename, and it is the direction to be wrong in; nothing in this repository
 # writes one, measured rather than assumed.
 #
+# The sixth alternative is not a command at all: it is a *drive*. `pwsh` is
+# a first-class `shell:` -- GitHub documents it beside `bash` and preinstalls
+# it on `ubuntu-latest` -- and PowerShell exposes the environment as a
+# filesystem, so `Get-ChildItem Env:` is `env` and `Get-ChildItem Env: |
+# Where-Object Name -like '*HEAD_REF'` is `env | grep -i`. None of the five
+# words above appears in it. It is refused here rather than at
+# `_EVENT_PAYLOAD_FILE` because it is an enumeration and not an accessor: it
+# asks for every variable, which is the question this rule is about.
+#
+# `$env:NAME` is deliberately not refused, and that is the line this rule
+# draws between a shell and a program. PowerShell has no bare `$NAME` for an
+# environment variable -- `$env:GITHUB_REPOSITORY` *is* how a `pwsh` step
+# reads the `env:` block it was handed, exactly as `$GITHUB_REPOSITORY` is
+# under `bash` -- so the name is written down, `_RUNNER_VARIABLE` holds it
+# against the allowlist, and refusing the sigil would red every ordinary
+# `pwsh` step for spelling a safe variable the only way its shell spells one.
+# `os.environ["GITHUB_REPOSITORY"]` is refused and this is not, for the
+# reason argued at `_EVENT_PAYLOAD_FILE`: python is a program that went to
+# the process environment instead of taking the route the step offered it,
+# and `pwsh` is the route.
+#
+# So the drive is anchored like the five words: `Env:` at a terminator is
+# the listing, and `Env:GITHUB_SHA` or `Env:\` names something. The `\S[ \t]+`
+# in front is what keeps a YAML `env:` key -- which a step may well write
+# into a file with a heredoc -- from reading as a drive, since a key begins
+# its line and a drive follows a cmdlet. It also keeps the shell's own
+# `${ENV:-none}` out twice over: no whitespace in front of it, and `-none`
+# is not a terminator.
+#
 # What this rule does not reach, written down rather than implied. A program
 # the step starts inherits the whole environment without asking for it, and
 # no pattern over the step's text can see that happen -- the wholesale
 # refusal of the step's own `env:` is what answers it, which is why this rule
 # is a backstop over the *runner's* variables rather than the rule. And the
 # environment read as a language's own global rather than as a request to the
-# shell -- `os.environ`, `process.env`, perl's `%ENV`, awk's `ENVIRON` -- is
+# shell -- `os.environ`, `process.env`, perl's `%ENV`, awk's `ENVIRON`,
+# ruby's `ENV`, go's `os.Getenv` -- is
 # refused at `_EVENT_PAYLOAD_FILE`, where the accessor list lives because
 # there the same mapping is the thing that carries the path to the payload.
 # Those are not repeated here: a second pattern for a read the file already
@@ -970,6 +1047,7 @@ _ENVIRONMENT_ENUMERATION = re.compile(
         _ENUMERATION_BUILTIN_START
         + r"export(?:[ \t]+-p)?[ \t]*" + _ENUMERATION_END,
         _ENUMERATION_BUILTIN_START + r"set[ \t]*" + _ENUMERATION_END,
+        r"\S[ \t]+(?i:env):[ \t]*" + _ENUMERATION_END,
         _ENUMERATION_BUILTIN_START
         + r"compgen[ \t]+(?:-[\w-]*[ev]\b|-A[ \t]*(?:variable|export)\b)",
         r"\bps[ \t]+(?!-)[a-zA-Z]*e[a-zA-Z]*\b",
@@ -3003,7 +3081,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             f"{path.name}: a step reads its whole "
                             "environment -- `env`, `printenv`, `declare "
                             "-p`, `export -p`, a bare `set`, `compgen`'s "
-                            "variable actions, `ps` with BSD's `e`, or "
+                            "variable actions, `ps` with BSD's `e`, "
+                            "PowerShell's `Env:` drive, or "
                             "bash's own `${!prefix@}` name listing -- which "
                             "hands it `GITHUB_HEAD_REF` and `GITHUB_ACTOR` "
                             "without naming either, so the allowlist over "
@@ -3036,7 +3115,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "process environment that holds the path, "
                             "reached through `process.env`, `os.environ`, "
                             "`environ` in any case, perl's `%ENV` or "
-                            "`$ENV{...}`, or `getenv`. Every field in that "
+                            "`$ENV{...}`, ruby's `ENV[...]`, or a `getenv` "
+                            "or `LookupEnv` in any case. Every field in that "
                             "file came from the pull request, and it is the "
                             "one language neither allowlist reads",
                         )
