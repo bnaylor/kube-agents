@@ -24,7 +24,7 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Twenty-five rows print this on a green run, and the
+             Twenty-six rows print this on a green run, and the
              SURVIVED line above is exactly the wrong reading of them: the
              suite staying green is the property they assert. `--list` is
              the authority on how many there are, because it marks each one;
@@ -93,7 +93,7 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: twenty-five today, which `--list` is the authority on rather than
+    #: twenty-six today, which `--list` is the authority on rather than
     #: this comment -- it marks each control `[control]`, and the list below
     #: named ten on 2026-09-19 when there were eleven, and one of the ten by
     #: an id no row had:
@@ -104,6 +104,7 @@ class Mutation:
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
+    #: B4-pull-request-target-run-context-repo,
     #: B4-pull-request-target-api-gh-wrapped-readable-program,
     #: B4-pull-request-target-api-gh-pipeline-readable-program,
     #: B4-pull-request-target-api-gh-substitution-ordinary,
@@ -2898,6 +2899,55 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "name the head through the payload object the script is handed, "
         "rather than through an expression anything here can read",
+    ),
+    Mutation(
+        # The same object in a `run:` step, which is where the rule above
+        # was said not to apply. `@actions/github` is a dependency anyone
+        # can install in a line, its `context` reads `GITHUB_EVENT_PATH`
+        # inside the library, and what the step writes down is a property
+        # access -- no expression, no path, no payload file, nothing any
+        # other rule here reads. So the `context` allowlist is read over a
+        # step's whole script rather than over its `script:` input, and this
+        # is the row that says why: scope it to `script:` inputs and this
+        # goes green with every other rule still in place, which was
+        # measured before the round that proposed the scoping was answered.
+        "B4-pull-request-target-run-context-payload",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          npm install @actions/github\n"
+         "          node -e 'const a=require(\"@actions/github\");"
+         "require(\"child_process\").execSync(\"git fetch --depth=1 "
+         "origin \"+a.context.payload.after)'\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reach the payload from a `run:` through the library that reads it "
+        "for you, which is how a step gets the object without a `script:`",
+    ),
+    Mutation(
+        # And the allowlisted spelling in the same place, because the
+        # widening above is only honest if the entry it carries still means
+        # what it means in a `script:`. `context.repo` is this repository's
+        # own owner and name, in a `run:` as in a `script:`, and the step
+        # below reaches nothing else. It stays green, which is the other
+        # half of the round-22 answer: the wide read refuses the word
+        # `context` and not the program that writes it.
+        "B4-pull-request-target-run-context-repo",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Report the repository\n"
+         "        run: |\n"
+         "          npm install @actions/github\n"
+         "          node -e 'const a=require(\"@actions/github\");"
+         "console.log(a.context.repo)'\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "log the repository the workflow lives in through the same library, "
+        "naming the one context property that is not the pull request",
+        must_survive=True,
     ),
     Mutation(
         # A step whose `shell:` is not a shell. `os.environ["REV"]` is a read
