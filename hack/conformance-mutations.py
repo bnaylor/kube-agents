@@ -24,7 +24,7 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Twenty-six rows print this on a green run, and the
+             Twenty-eight rows print this on a green run, and the
              SURVIVED line above is exactly the wrong reading of them: the
              suite staying green is the property they assert. `--list` is
              the authority on how many there are, because it marks each one;
@@ -93,7 +93,7 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: twenty-six today, which `--list` is the authority on rather than
+    #: twenty-eight today, which `--list` is the authority on rather than
     #: this comment -- it marks each control `[control]`, and the list below
     #: named ten on 2026-09-19 when there were eleven, and one of the ten by
     #: an id no row had:
@@ -113,6 +113,8 @@ class Mutation:
     #: B4-pull-request-target-run-environment-word,
     #: B4-pull-request-target-run-array-index-walk,
     #: B4-pull-request-target-run-local-ref-file,
+    #: B4-pull-request-target-run-ref-endpoint-namespaced,
+    #: B4-pull-request-target-run-ref-quoted-word-ordinary,
     #: B4-pull-request-target-shell-ordinary,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-run-clone-bare,
