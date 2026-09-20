@@ -71,13 +71,35 @@ _PULL_REQUEST_REF = re.compile(
 # workflow here. They are a backstop rather than the rule: what governs a
 # step is the allowlist below, and these three are for the text that carries
 # no `${{ ... }}` for that allowlist to read -- a JavaScript property path, a
-# ref written into a shell string. Deliberately not extended.
-# `github.event.before` and `github.event.pull_request.merge_commit_sha` name
-# the same code, `${{ GITHUB.EVENT.AFTER }}` is a second spelling of the third
-# alternative because expressions are case-insensitive, and answering each of
-# those with one more alternative is the shape the allowlist replaced.
+# ref written into a shell string. Deliberately not extended by a fourth
+# noun. `github.event.before` and `github.event.pull_request.merge_commit_sha`
+# name the same code, `${{ GITHUB.EVENT.AFTER }}` is a second spelling of the
+# third alternative because expressions are case-insensitive, and answering
+# each of those with one more alternative is the shape the allowlist
+# replaced.
+#
+# What it *was* extended by, on 2026-09-20, is the punctuation, which is not
+# a fourth noun but the same three written the other way GitHub, jq and
+# JavaScript all spell a property access. `_EXPRESSION_INDEX` below says
+# exactly this about the expression half -- `pull_request['head']` and
+# `pull_request.head` "are the same expression and only the second one looks
+# like it" -- and this backstop was dots only, so the claim held for an
+# expression and not for the literal text beside it. Measured: `SHA=$(jq -r
+# '.pull_request["head"].sha' ./risk-report.json)` in a `run:` was green
+# while the dot spelling of the same line went red, and the brackets are the
+# whole difference. That is the bug the ref half had one field along, and
+# `B4-pull-request-target-run-head-indexed` is the row.
+#
+# `_PROPERTY` is the separator rather than a rewrite per alternative, and the
+# optional closing `']` in front of it is what lets the hops chain:
+# `github["event"]["after"]` is the third alternative with both of them
+# indexed, and without that piece the pattern would read the first bracket
+# and then want a dot.
+_PROPERTY = r"(?:['\"]\s*\])?(?:\.|\[\s*['\"])"
 _PULL_REQUEST_HEAD = re.compile(
-    r"pull_request\.head|github\.head_ref|github\.event\.after"
+    rf"pull_request{_PROPERTY}head"
+    rf"|github{_PROPERTY}head_ref"
+    rf"|github{_PROPERTY}event{_PROPERTY}after"
 )
 
 # Any `${{ ... }}` an interpolated value carries. `re.DOTALL` because `.` is
@@ -2574,7 +2596,15 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         with five more alternatives would have left the sixth.
         `_PULL_REQUEST_HEAD` and `_PULL_REQUEST_REF` stay as a backstop over
         text that carries no expression for the allowlist to read.
-        `_PULL_REQUEST_HEAD` is deliberately not extended. `_PULL_REQUEST_REF`
+        `_PULL_REQUEST_HEAD` is deliberately not extended by another noun,
+        and was extended once in the direction that is not one: the index
+        spelling of the three nouns it has. The third item on the list above
+        is why. `${{ github.event.pull_request['head'].sha }}` is resolved
+        for the allowlist by `_EXPRESSION_INDEX`, so the index costs an
+        attacker nothing inside an expression -- and the identical index in
+        text carrying no expression at all, `jq -r
+        '.pull_request["head"].sha'`, was read by nothing until 2026-09-20.
+        `_PULL_REQUEST_REF`
         was, once, and in the one direction that is not another noun: it read
         `pull/N/head` and `pull/N/merge`, and three refspecs reaching the
         same code walked past it on 2026-09-19 -- a wildcard over the whole

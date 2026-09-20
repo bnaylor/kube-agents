@@ -2322,9 +2322,19 @@ Mutation(
         "default shell, with nothing in the step declaring anything unusual",
     ),
     Mutation(
-        # GitHub reads an index into a context as the property access it is,
-        # so this is `github.event.pull_request.head.sha` spelled so that
-        # `pull_request\.head` does not match it. One pair of brackets.
+        # GitHub reads an index into a context as the property access it
+        # is, so this is `github.event.pull_request.head.sha` with one pair
+        # of brackets in it. This comment used to say the brackets were what
+        # `pull_request\.head` could not match, which named the wrong rule
+        # and stopped being true on 2026-09-20 besides: the ref is inside a
+        # `${{ ... }}`, so what refuses it is the expression allowlist,
+        # which reads an expression it does not recognise whichever way the
+        # property is spelled and runs before either literal backstop.
+        # Measured: neuter `_PULL_REQUEST_HEAD` and `_PULL_REQUEST_REF`
+        # together and this row is still KILLED. See
+        # B4-pull-request-target-run-head-indexed for the same brackets in
+        # text carrying no expression, where the backstop is the only reader
+        # and was blind to them until that date.
         "B4-pull-request-target-run-fetch-index-syntax",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2337,7 +2347,35 @@ Mutation(
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "index the property rather than naming it, which GitHub resolves to "
-        "the same field and a pattern over dots does not match",
+        "the same field",
+    ),
+    Mutation(
+        # The same index one language over, and the row that says the
+        # literal backstop had the bug the allowlist did not. The row above
+        # writes its brackets inside a `${{ ... }}`, so the expression
+        # allowlist reads it and refuses it before any literal pattern runs
+        # -- measured, by neutering `_PULL_REQUEST_HEAD` and
+        # `_PULL_REQUEST_REF` together, at which that row is still KILLED.
+        # This one carries no expression at all, a `jq` filter over a file
+        # an earlier step wrote, so `_PULL_REQUEST_HEAD` is the only thing
+        # that can read it -- and it was `pull_request\.head`, dots only,
+        # until 2026-09-20. Revert `_PROPERTY` to a bare `\.` and this row
+        # is SURVIVED with every other row still KILLED.
+        "B4-pull-request-target-run-head-indexed",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          SHA=$(jq -r '.pull_request[\"head\"].sha'"
+         " ./risk-report.json)\n"
+         "          git fetch --depth=1 origin \"$SHA\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head out of a JSON file with the index syntax jq and "
+        "JavaScript both take, which is the dot spelling with one pair of "
+        "brackets in it",
     ),
     Mutation(
         # The payload as a file. `GITHUB_EVENT_PATH` holds the whole webhook
