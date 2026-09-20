@@ -99,9 +99,13 @@ def _shell_word(word):
     belongs, and whatever terminator the caller writes after it keeps
     deciding what it decided before -- which is why there is no trailing run
     here. `_enumeration_word` adds one because its terminator is a character
-    class; `_PULL_REQUEST_REF` does not because its terminator is `\\b`, and a
-    trailing run would let a quote stand in for the word boundary and red
-    `pull/$N/head"x"`, which is a different ref.
+    class and the quotes a word *ends* with have to be consumed before it
+    reads the character after them. `_PULL_REQUEST_REF` terminates on `\\b`,
+    which already falls between the word's last letter and a quote, so a
+    trailing run there would match the same texts as no trailing run:
+    measured against `pull/$N/head`, `pull/$N/he"ad"` and `pull/$N/head"x"`,
+    all three the same either way. It is left off as the run that buys
+    nothing rather than as one that would cost something.
 
     What this does not reach is a word assembled out of anything that is not
     in the text: `r=head; "pull/$N/$r"`, or a segment carried in a separate
@@ -1388,8 +1392,8 @@ def _enumeration_word(word):
     than a second copy of the argument: the terminator here is a character
     class, so the quotes a word *ends* with have to be consumed before
     `_ENUMERATION_STOP` reads the character after them. `_PULL_REQUEST_REF`
-    terminates on `\\b`, where a trailing run would stand in for the word
-    boundary instead of preceding it.
+    terminates on `\\b`, which falls between the last letter and a quote on
+    its own, so the run is not needed there rather than harmful there.
 
     What this does not reach is a name assembled out of anything that is not
     in the text: `E=en; ${E}v`, or `$(eval 'e''nv')`. That is
