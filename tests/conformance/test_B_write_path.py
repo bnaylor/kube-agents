@@ -60,12 +60,75 @@ _WORKFLOWS = sorted(
 # does not do that, most likely. That is a line of review on a trigger whose
 # job holds a writable token, which is the price this half pays everywhere
 # else too.
+#
+# All three read a *shell word* rather than a run of letters, which is the
+# round-23 fix and the round-16 argument arriving one rule along. The three
+# alternatives were matched against the script as written, and a shell hands
+# git something else: `git fetch origin pull/$PR_NUMBER/he\ad` fetches
+# `refs/pull/N/head`, the backslash having gone before git ever saw it, and
+# `he""ad`, `'he'ad` and `"pull/$PR_NUMBER/h"ead` are three more spellings of
+# the same four letters. Each was measured green on a job holding a writable
+# token. `_shell_word` writes the quoting between the letters of `refs`,
+# `pull`, `head` and `merge`, which is where it belongs, and `\b` goes on
+# terminating the alternative exactly as it did.
+#
+# `_REF_SEPARATOR` is the other half of the same fix and answers the
+# `git/ref/` concession at `_REMOTE_REF_ENUMERATION`: `%2F` is a slash to
+# GitHub's `{ref}` path parameter, so `git/ref/pull%2F$N%2Fhead` is
+# `refs/pull/N/head` asked for over REST with no `pull/` written anywhere,
+# and `repos/O/R/commits/pull%2F$N%2Fhead` is the same trick at an endpoint
+# that rule does not read. The concession is narrowed there as well, because
+# the server decodes the letters too and no pattern over `pull` reads
+# `%70ull`; that argument is in that comment.
+#: What a shell drops on its way from a word in the text to the word it runs:
+#: a quote of either kind, and the backslash that escapes the next character.
+#: The environment-dump rule below found this hole first and the argument is
+#: written out at `_enumeration_word`; this is the same class, shared rather
+#: than spelled twice, because a second copy is a second thing to keep true.
+_SHELL_QUOTING = r"[\"'\\]*"
+
+
+def _shell_word(word):
+    """`word` with the quoting a shell drops written between its letters.
+
+    A word is not a string literal to a shell: a quote inside one ends and
+    reopens the quoting rather than being part of the word, and a backslash
+    escapes the character after it. `he\\ad`, `he""ad`, `'he'ad` and the `h`
+    of `"pull/$N/h"ead` are four spellings of `head`, and git is handed the
+    same four letters for each. So the quoting goes into the word, where it
+    belongs, and whatever terminator the caller writes after it keeps
+    deciding what it decided before -- which is why there is no trailing run
+    here. `_enumeration_word` adds one because its terminator is a character
+    class; `_PULL_REQUEST_REF` does not because its terminator is `\\b`, and a
+    trailing run would let a quote stand in for the word boundary and red
+    `pull/$N/head"x"`, which is a different ref.
+
+    What this does not reach is a word assembled out of anything that is not
+    in the text: `r=head; "pull/$N/$r"`, or a segment carried in a separate
+    `env:` value. That is `_enumeration_word`'s residual one rule along and
+    it has the same answer -- no pattern over a word can read a word that is
+    not written down. It is open, and written down as open, in the test's
+    docstring and in this file's residual list.
+    """
+    return _SHELL_QUOTING + _SHELL_QUOTING.join(word)
+
+
+#: The separator between a ref's segments, in both spellings that reach the
+#: same ref. A slash is a slash; `%2F` is the slash GitHub's REST API accepts
+#: inside a `{ref}` path parameter, which is how `git/ref/pull%2FN%2Fhead`
+#: asks the exact-match endpoint for the fork's head while spelling `pull/`
+#: nowhere. Case-insensitive in the hex digit because a URL escape is, and
+#: quoted on both sides for the same reason the words are.
+_REF_SEPARATOR = _SHELL_QUOTING + r"(?:/|%2[Ff])" + _SHELL_QUOTING
+
 _PULL_REQUEST_REF = re.compile(
     # `[^\n]*?` rather than a tighter class: the ref is interpolated, and
     # `${{ github.event.number }}` has spaces in it.
-    r"refs/pull\b"
-    r"|pull/[^\n]*?/(?:head|merge)\b"
-    r"|pull/[^\n]*?/[^\s'\"]*\*"
+    _shell_word("refs") + _REF_SEPARATOR + _shell_word("pull") + r"\b"
+    + r"|" + _shell_word("pull") + _REF_SEPARATOR + r"[^\n]*?" + _REF_SEPARATOR
+    + r"(?:" + _shell_word("head") + r"|" + _shell_word("merge") + r")\b"
+    + r"|" + _shell_word("pull") + _REF_SEPARATOR + r"[^\n]*?" + _REF_SEPARATOR
+    + r"[^\s'\"]*" + _SHELL_QUOTING + r"\*"
 )
 # The three spellings of the pull request's head that have turned up in a
 # workflow here. They are a backstop rather than the rule: what governs a
@@ -173,12 +236,23 @@ _SAFE_CHECKOUT_REPOSITORIES = frozenset({"github.repository"})
 # are refused again by the two rules at `_PULL_REQUEST_API`: a `/pulls`
 # request is refused as a path, and `gh pr` is an allowlist of two write
 # subcommands, so the labelling the carriers do with the number is untouched
-# and everything that returns the pull request is not. The concession is made because two
-# carriers label and comment with the number, and there is no way to tell that
-# use from the other one without reading the program, which is the thing this
-# file declines to do. What the number does *not* open is the direct path: `pull/N/head` built out
-# of it is refused by `_PULL_REQUEST_REF` over every step, whatever is on this
-# list.
+# and everything that returns the pull request is not. The concession is made
+# because two carriers label and comment with the number, and there is no way
+# to tell that use from the other one without reading the program, which is
+# the thing this file declines to do.
+#
+# What the number does *not* open is the direct path: `pull/N/head` built out
+# of it is refused by `_PULL_REQUEST_REF` over every step. That sentence read
+# "whatever is on this list" until round 23 and was false while it did, which
+# is worth keeping as a warning rather than restating as a guarantee: the
+# number, the token and one backslash -- `git fetch origin
+# pull/$PR_NUMBER/he\ad` -- was a green fetch of the fork's head, because the
+# refusal read the text and the shell read a word. It holds now for the
+# spellings `_shell_word` and `_REF_SEPARATOR` cover, and it does not hold for
+# a segment that is not written down anywhere this file looks: `r=head` in the
+# script, or a `pull/$PR_NUMBER` in one `env:` value with the `/head` in the
+# script that reads it. Both are open, both are measured, and both are written
+# down as open in the test's docstring.
 #
 # Anything else -- another event field, a `steps.X.outputs.Y`, an `env.X`
 # that did not resolve -- reads as unsafe, which is the direction the ref
@@ -751,6 +825,32 @@ _PULL_REQUEST_API = re.compile(
 # `git/ref/heads/main`, singular, is the exact-match endpoint, it cannot
 # enumerate, and it is deliberately left green as the way to do this.
 #
+# The seventh alternative is that concession read back, and it is the
+# round-23 addition. The singular endpoint cannot enumerate, but it resolves
+# whatever ref it is handed, and `refs/pull/N/head` is a ref: `gh api
+# "repos/$GITHUB_REPOSITORY/git/ref/pull%2F$PR_NUMBER%2Fhead" --jq
+# .object.sha` returns the fork's head SHA to fetch by object name. GitHub's
+# `{ref}` path parameter takes a percent-encoded slash, so the request names
+# no `pull/`, no plural `refs`, an allowlisted `gh` verb and an allowlisted
+# expression, and it was green. `_PULL_REQUEST_REF` now reads `%2F` as the
+# slash it is, which refuses that spelling and every quoted one beside it --
+# but leaving the concession to the backstop is the wrong way round, because
+# the backstop reads a ref *name* and the server decodes the whole path:
+# `git/ref/%70ull/$N/%68ead` is the identical request with the letters
+# escaped instead of the slashes, and no pattern over the four letters of
+# `pull` reaches it.
+#
+# So the concession is narrowed to what it was conceded for rather than
+# defended by a second rule. `git/ref/` is refused unless the namespace
+# immediately after it is `heads/` or `tags/`, which is the allowlist this
+# file reaches for everywhere else and is wrong in the same direction: a
+# namespace assembled out of an `env:` value, or escaped, or interpolated,
+# reads as unsafe for not being one of the two rather than as innocent for
+# not matching a noun. What it costs is reading a ref outside those two
+# namespaces by its full name over REST -- `git/ref/pull/...` and
+# `git/ref/notes/...` alike -- which is a line of review on a job holding a
+# writable token, and no carrier here makes the request at all.
+#
 # The lookbehind is `(?<![\w.])`, which is what tells the REST path from the
 # directory of the same shape. `.git/refs/heads/main` is a file in the
 # checkout and `cat`ting it reads a ref this repository already has; the `.`
@@ -783,7 +883,7 @@ _REMOTE_REF_ENUMERATION = re.compile(
     r"|/info/refs\b"
     r"|\bgit-upload-pack\b"
     r"|--m(?:i(?:r(?:r(?:o(?:r)?)?)?)?)?(?![\w-])"
-    r"|(?<![\w.])git/(?:matching-)?refs\b"
+    r"|(?<![\w.])git/(?:matching-refs\b|refs\b|ref/(?!(?:heads|tags)/))"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -1257,11 +1357,6 @@ _ENUMERATION_BUILTIN_START = r"(?<![\w./-])"
 #: used to need the `/` here is the shebang, and the shebang is exempted by
 #: its operand instead.
 _ENUMERATION_PROGRAM_START = r"(?<![\w.-])"
-#: What a shell drops on its way from a word in the text to the word it runs:
-#: a quote of either kind, and the backslash that escapes the next character.
-#: `'env'`, `"env"`, `e"n"v` and `en\v` are four spellings of one program,
-#: and a shell reads all four as `env`.
-_ENUMERATION_QUOTING = r"[\"'\\]*"
 #: And the other half of the same problem: a word the shell *finishes* with an
 #: expansion. `env$NOPE` runs `env` when `NOPE` is unset, which it is, and no
 #: terminator follows the name for `_ENUMERATION_END` to read. Held to the
@@ -1288,17 +1383,21 @@ def _enumeration_word(word):
     red `grep "env" Makefile`. So the quoting goes into the word, where it
     belongs, and the terminator keeps deciding what it decided before.
 
+    `_shell_word` is the interleaving and this is that plus a trailing run of
+    the same class, which is the difference between the two callers rather
+    than a second copy of the argument: the terminator here is a character
+    class, so the quotes a word *ends* with have to be consumed before
+    `_ENUMERATION_STOP` reads the character after them. `_PULL_REQUEST_REF`
+    terminates on `\\b`, where a trailing run would stand in for the word
+    boundary instead of preceding it.
+
     What this does not reach is a name assembled out of anything that is not
     in the text: `E=en; ${E}v`, or `$(eval 'e''nv')`. That is
     `_READABLE_PROGRAM`'s argument in the other half of this file, and it has
     the same answer here -- no pattern over a name can read a name that is
     not written down. It is open, and written down as open.
     """
-    return (
-        _ENUMERATION_QUOTING
-        + _ENUMERATION_QUOTING.join(word)
-        + _ENUMERATION_QUOTING
-    )
+    return _shell_word(word) + _SHELL_QUOTING
 
 
 _ENVIRONMENT_ENUMERATION = re.compile(
@@ -2787,7 +2886,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         its script alone: a step that enumerates the remote's refs holds
         `refs/pull/N/head` whether or not it spelled `pull`, because the
         remote advertises the whole namespace to anyone who asks.
-        `_REMOTE_REF_ENUMERATION` has the six shapes, what refusing them
+        `_REMOTE_REF_ENUMERATION` has the seven shapes, what refusing them
         concedes, and the argument about abbreviation that applies to every
         long option named anywhere in this file: git's parser takes any
         unambiguous prefix of a long option, so `--mirror` is refused as a
@@ -3125,6 +3224,25 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         tree and RED at 8afbbf68, so the line named a residual that had
         already closed under it -- the same failure as the sentence above,
         one rule along.
+
+        A ref whose last segment is not written down. `_PULL_REQUEST_REF`
+        reads a shell word as of round 23, so `pull/$PR_NUMBER/he\\ad` and its
+        quoted neighbours are refused -- but a word a shell *builds* is not a
+        word this file can read. `r=head` on one line and `git fetch origin
+        "pull/$PR_NUMBER/$r"` on the next was measured green on this tree and
+        stays green, and so does the same ref split across the boundary this
+        file does not join: `R: pull/$PR_NUMBER` in a step's `env:` with
+        `git fetch origin "$R/head"` in its script. The second is the more
+        uncomfortable of the two, because both halves *are* written down --
+        just not in one text. `_expand_env` resolves `${{ env.NAME }}` and
+        nothing else, the shell-variable pickup that would have joined them
+        having gone on 2026-09-19 for being case-sensitive and wrong, and
+        `_PULL_REQUEST_REF` is read over the script and over each `env:`
+        value separately rather than over the two concatenated. Closing it
+        means substituting shell variables into a script, which is a shell
+        parser, which is the thing this file declines to be. It is open, it
+        is measured, and this is where it is written down. The same argument
+        in its original form is at `_enumeration_word`.
 
         A container image that names the fork without an expression.
         `container:` and `services:` are read as of 2026-09-19 and held
@@ -3504,7 +3622,10 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "without the step naming it. Grep the listing "
                             "and the head SHA is a fetch by object name "
                             "away. To read one ref by its full name, "
-                            "`git/ref/...` is the exact-match endpoint",
+                            "`git/ref/heads/...` and `git/ref/tags/...` are "
+                            "the exact-match endpoint; the same endpoint "
+                            "aimed anywhere else resolves "
+                            "`refs/pull/N/head` too",
                         )
                         # And the payload over HTTP, which none of the
                         # rules above read either. Refused on the request

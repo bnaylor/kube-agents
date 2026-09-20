@@ -1180,6 +1180,162 @@ Mutation(
         must_survive=True,
     ),
     Mutation(
+        # The ref written as a shell word rather than as a run of letters,
+        # which is the round-23 hole and the round-16 one arriving at the
+        # other rule. A shell drops a backslash before it hands git the
+        # word, so `pull/$PR_NUMBER/he\ad` fetches `refs/pull/N/head` -- the
+        # number is on the expression allowlist because two carriers label
+        # with it, the token is in the job, and the backstop that is supposed
+        # to make that concession safe was reading the four letters and the
+        # shell was reading a word. `he""ad`, `'he'ad` and
+        # `"pull/$PR_NUMBER/h"ead` are the same step and were green beside
+        # it.
+        #
+        # It pins `_shell_word` inside `_PULL_REQUEST_REF`. Make it return
+        # its argument unchanged and this row is SURVIVED with every other
+        # ref row still KILLED, including the two below, which carry no
+        # quote. The control beneath them is what says the fix is the word
+        # and not the boundary: `_shell_word` deliberately writes no trailing
+        # run of the quoting class, because `\b` is this rule's terminator
+        # and a trailing run would let a quote stand in for it.
+        "B4-pull-request-target-run-ref-quoted-word",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          git fetch --depth=1 origin pull/$PR_NUMBER/he\\ad\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "escape one letter of the ref, which a shell drops before git sees "
+        "the word and which reads as a stray keystroke in a diff",
+    ),
+    Mutation(
+        # The same ref with the slashes escaped instead of the letters.
+        # GitHub's REST API takes a percent-encoded slash inside a `{ref}`
+        # path parameter, so `repos/O/R/commits/pull%2FN%2Fhead` is a request
+        # for the fork's head commit that writes no `pull/` anywhere, and
+        # `/commits/` is not on `_PULL_REQUEST_API`'s path list because a
+        # commit by SHA is what half this repository's workflows ask for.
+        # It was green.
+        #
+        # It pins `_REF_SEPARATOR`. Cut it back to a literal `/` and this row
+        # is SURVIVED with the quoted row above and the endpoint row below
+        # both still KILLED. Aimed at `/commits/` rather than at `git/ref/`
+        # deliberately: the endpoint concession below is narrowed by its own
+        # rule, so a row written there would be killed twice over and would
+        # pin neither half.
+        "B4-pull-request-target-run-ref-percent-encoded-slash",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          S=$(gh api "repos/$GITHUB_REPOSITORY/commits'
+         '/pull%2F$PR_NUMBER%2Fhead" --jq .sha)\n'
+         '          git fetch origin "$S" && git reset --hard FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "percent-encode the slashes of the ref, which the API decodes and "
+        "which looks like ordinary URL hygiene",
+    ),
+    Mutation(
+        # The exact-match ref endpoint, which `_REMOTE_REF_ENUMERATION` used
+        # to concede whole. It cannot enumerate, which is why it was left
+        # green -- but it resolves whatever ref it is handed, and
+        # `refs/pull/N/head` is a ref. The percent encoding here is over the
+        # *letters* rather than the slashes: `%70ull` is `pull` and `%68ead`
+        # is `head` once the server has decoded the path, so no pattern over
+        # the four letters of either word reaches this request, however much
+        # quoting or slash-spelling it reads. That is why the concession is
+        # narrowed instead of defended by a second backstop.
+        #
+        # It pins the `ref/(?!(?:heads|tags)/)` alternative. Put the
+        # alternative back as `git/(?:matching-)?refs` and this row is
+        # SURVIVED with the two rows above still KILLED; the control below is
+        # the other side of it.
+        "B4-pull-request-target-run-ref-endpoint-encoded-letters",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          S=$(gh api "repos/$GITHUB_REPOSITORY/git/ref'
+         '/%70ull/$PR_NUMBER/%68ead" --jq .object.sha)\n'
+         '          git fetch origin "$S" && git reset --hard FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask the exact-match ref endpoint for the pull ref with its letters "
+        "percent-encoded, which the server decodes and no pattern over the "
+        "word reads",
+    ),
+    Mutation(
+        # The safe side of the row above, and the concession the narrowing
+        # keeps. Reading one ref by its full name over REST is the thing
+        # `git/ref/` is for, and `heads/` and `tags/` are the two namespaces
+        # a job here has any business resolving -- neither can be written by
+        # a fork, both are exactly what a base-commit or a release step asks
+        # for. OVERSHOT here means the endpoint has been refused outright,
+        # which leaves the suite telling its author to enumerate instead.
+        "B4-pull-request-target-run-ref-endpoint-namespaced",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Record the base commit\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         '          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main"'
+         " --jq .object.sha > base.sha\n"
+         '          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v1.0.0"'
+         " --jq .object.sha > tag.sha\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "resolve the default branch and a tag by their full names over the "
+        "exact-match endpoint, which is what that endpoint is conceded for",
+        must_survive=True,
+    ),
+    Mutation(
+        # The safe side of the quoted-word row, and the reason the quoting
+        # went into the word rather than into the terminator. Every line here
+        # writes one of the four ref words next to a quote and none of them
+        # is a ref: the web link ends at the pull request's `files` tab, the
+        # `jq` filter indexes two fields of a report by name, and `head -3`
+        # is the end of a pipeline. OVERSHOT here means either the word
+        # boundary has been let go -- `head` inside `headers`, or a quote
+        # standing in for `\b` -- or the `[^\n]*?` between the ref's segments
+        # has been allowed across a newline, at which the first line's
+        # `pull/$PR_NUMBER/` and the third line's `head` become one match.
+        "B4-pull-request-target-run-ref-quoted-word-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Summarise the report\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          echo "the diff is at $GITHUB_SERVER_URL'
+         '/$GITHUB_REPOSITORY/pull/$PR_NUMBER/files"\n'
+         "          jq -r '.[\"head\"], .[\"merge\"]' ./risk-report.json"
+         " || true\n"
+         "          git log --format='%h' -n 5 | head -3\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "link the pull request's files tab, read two fields out of a report "
+        "by quoted name and end a pipeline with `head`, none of which is a "
+        "ref",
+        must_survive=True,
+    ),
+    Mutation(
         # `printenv NAME` is a read of NAME that never writes `$NAME`. The
         # pickup was keyed on the sigil, so the value was never folded in and
         # the fetch read as innocent.
