@@ -24,9 +24,12 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Twenty rows on every run print this, and the SURVIVED line
-             above is exactly the wrong reading of them: the suite staying
-             green is the property they assert.
+             Twenty-one rows print this on a green run, and the SURVIVED
+             line above is exactly the wrong reading of them: the suite
+             staying green is the property they assert. `--list` is the
+             authority on how many there are, because it marks each one;
+             this line said twenty through the round in which there were
+             twenty-one.
     BASELINE POLLUTED
              not a per-row verdict but a line printed after the run: the
              suite is not green once every mutation has been restored, so
@@ -796,9 +799,21 @@ Mutation(
         "is itself a name",
     ),
     Mutation(
-        # `git pull` is a fetch and a merge in one verb, and the verb list it
-        # dodges had only `fetch`, `checkout` and `clone`. Matched as a
-        # command rather than as the word, which the haystack is full of.
+        # `git pull` is a fetch and a merge in one verb, and the verb list
+        # it dodged named only `fetch`, `checkout` and `clone`. That list is
+        # gone and nothing replaced it: no rule in the test asks which git
+        # verb a step runs, because the question stopped being which verb
+        # and became which expression. The sentence this comment used to end
+        # on -- matched as a command rather than as the word -- described a
+        # pattern the file no longer contains.
+        #
+        # What the row pins now was settled by injecting the step and
+        # reading which assertion fires rather than by reasoning about it:
+        # the `_SAFE_SCRIPT_EXPRESSIONS` scan, `[] != ['github.event.after']`.
+        # That scan reads the step's `env:` values as well as its script, so
+        # the verb carries no weight here at all -- it is the pretext the
+        # row wears, and the property under test is that an event field on
+        # no allowlist is refused wherever a step carries it.
         "B4-pull-request-target-run-pull",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -847,10 +862,21 @@ Mutation(
         "fallback quietly restores",
     ),
     Mutation(
-        # The `git pull` alternative was matched on a single line by
-        # construction, and one backslash is all it takes to spell the same
-        # command over two. A continuation is how anybody writes a git
-        # command with more flags than fit, so this is not even a dodge.
+        # The same step over two lines. The `git pull` alternative was
+        # matched on a single line by construction, and one backslash was
+        # all it took to spell the same command over two; that alternative
+        # went with the rest of the verb list, and what catches this step
+        # now is the row above's assertion on the identical
+        # `github.event.after`.
+        #
+        # So this row does not pin the continuation join either, and saying
+        # it did was the second half of the same stale comment. Measured:
+        # neuter `_LINE_CONTINUATION` and one B4 row flips, and it is
+        # `run-refspec-continued` rather than this one -- a refspec really
+        # does have to be read across the backslash, and a step whose `env:`
+        # carries the ref does not. Kept as the two-line spelling of the row
+        # above, on the argument that a continuation is how anybody writes a
+        # git command with more flags than fit.
         "B4-pull-request-target-run-pull-continued",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1112,7 +1138,7 @@ Mutation(
         # lookbehind. `.git/refs/heads/main` is a file in the checkout this
         # workflow already has, and reading it reaches nothing the base
         # repository did not decide -- the `.` in front is the entire
-        # difference between it and a request to GitHub. KILLED here means
+        # difference between it and a request to GitHub. OVERSHOT here means
         # the endpoint has been refused as a bare `refs` path, which reds on
         # every step that reads its own git directory.
         "B4-pull-request-target-run-local-ref-file",
@@ -1527,14 +1553,25 @@ Mutation(
         # The program name written the way four of this repository's own
         # `scripts/release/*.sh` write one. `command -v gh` resolves the path
         # and the command substitution runs it, so the character after the
-        # letters `gh` is a `)` -- where `_GH_COMMAND`'s lookahead wants
-        # whitespace, a quote or a comma -- and the walk over `gh` is never
-        # started at all. Nothing over the program *name* can close this: a
-        # shell has unlimited ways to spell one, and `"$GH"` and `g'h'` in the
-        # two rows below are two more. What closes it is
-        # `_GH_PULL_REQUEST_WORD`, which reads the argument shape instead and
-        # holds `pr checkout` to the same subcommand allowlist whatever ran
-        # it.
+        # letters `gh` is a `)`. Nothing over the program *name* can close
+        # the general case: a shell has unlimited ways to spell one, and
+        # `"$GH"` and `g'h'` in the rows below are two more, which is what
+        # `_GH_PULL_REQUEST_WORD` is for.
+        #
+        # This row does not pin it, and that is the round-17 correction to
+        # this comment. It used to say the walk over `gh` was never started
+        # -- true until round 16 put `_COMMAND_SEPARATORS` into
+        # `_COMMAND_WORD_END`, and `)` is in that class -- and then credited
+        # `_GH_PULL_REQUEST_WORD` with the kill. Measured against each rule
+        # on its own: as it stands the verdict is the verb walk's,
+        # `_unsafe_gh_verbs` reporting `gh ` because `_invocation_words`
+        # stops at the same `)` before it reaches a word; neuter
+        # `_GH_PULL_REQUEST_WORD` and this row is still KILLED on that,
+        # while only the two `g'h'` rows below flip; neuter `_GH_COMMAND`
+        # instead and it is still KILLED, now on `pr checkout "$PR_NUMBER"`
+        # from the backstop; neuter both and it goes SURVIVED. Closed twice
+        # over and pinning neither half, which is the shape
+        # `api-gh-program-in-env` below already says it has.
         "B4-pull-request-target-api-gh-program-path",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1598,9 +1635,19 @@ Mutation(
         # after it, on the reasoning that a bare `gh` runs nothing; a `gh`
         # taking its argv off a pipe runs whatever arrives, so an unreadable
         # invocation is refused for being unreadable, which is the answer
-        # this file gives an unresolvable ref one field along. This row is
-        # the only thing pinning that, because every other stdin spelling
-        # writes `pr` somewhere the backstop reads it.
+        # this file gives an unresolvable ref one field along.
+        #
+        # It is not the only thing pinning that, which is the round-17
+        # correction: restore the old skip and three rows flip -- this one,
+        # `api-gh-trailing-program-word` and
+        # `api-gh-copied-to-a-readable-name`. The claim it replaces was read
+        # off the table rather than measured, and the reading was that every
+        # other stdin spelling writes a `pr` the backstop can reach.
+        # `echo "pr checkout $N" | xargs gh` does write one, but the word in
+        # front of it is `echo`, a name `_READABLE_PROGRAM` reads, so the
+        # backstop declines it on purpose. What is still true of this row
+        # alone is narrower: it is the only one of the three whose workflow
+        # text contains no `pr` anywhere.
         "B4-pull-request-target-api-gh-arguments-unreadable",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1744,7 +1791,7 @@ Mutation(
         # `gh`'s argument shape is conceded -- closing it means a denylist of
         # client names, which is the thing that rule exists to stop needing
         # -- and a wrapper in front of a readable program must not change
-        # that. KILLED here means the wrapper fix has been written as "any
+        # that. OVERSHOT here means the wrapper fix has been written as "any
         # `pr` behind more than one word", which reds on every local tool
         # this repository runs under `timeout`. The `gh` inside `high` is
         # deliberate: it is preceded by a word character, which is what
@@ -3255,7 +3302,7 @@ Mutation(
         # here writes one of the enumeration words next to a quote and none
         # of them runs it: `grep "env"` and `jq '.env'` pass the word to a
         # program as a pattern, and `echo 'export PATH=/x'` writes a line
-        # into a file. KILLED here means a quote has been let loose as a
+        # into a file. OVERSHOT here means a quote has been let loose as a
         # terminator, which is the naive fix for the rows above and a suite
         # that reds on the first step that greps for a word.
         "B4-pull-request-target-run-quoted-word-ordinary",
@@ -3281,7 +3328,7 @@ Mutation(
         # terminators after each of them: `set -euo pipefail`, `export
         # PATH=...` and `declare -a` all carry a `#` further along the line,
         # and the `REV=` line closes a backtick. None of them is a read.
-        # KILLED here means a terminator was let loose from the word it has
+        # OVERSHOT here means a terminator was let loose from the word it has
         # to follow, which is a suite that reds on the first commented shell
         # script somebody writes.
         "B4-pull-request-target-run-backtick-and-comment",
@@ -3462,7 +3509,7 @@ Mutation(
         # is how every workflow that loads a key starts and `eval "$cmd"`
         # runs a command line built earlier; both expand once, and neither
         # has a dollar that survives the first pass to name something the
-        # second one finds. KILLED here means `eval` has been banned, which
+        # second one finds. OVERSHOT here means `eval` has been banned, which
         # is a suite that reds on the standard two lines of ssh setup.
         "B4-pull-request-target-run-eval-ordinary",
         ".github/workflows/risk_classify.yml",
@@ -3529,7 +3576,7 @@ Mutation(
         # variable: `$env:GITHUB_REPOSITORY` *is* how a `pwsh` step reads
         # the value `bash` reads as `$GITHUB_REPOSITORY`, the name is
         # written down either way, and `_SAFE_RUNNER_VARIABLES` holds it.
-        # KILLED here means `$env:` has been read as an accessor -- which is
+        # OVERSHOT here means `$env:` has been read as an accessor -- which is
         # a suite that reds on every ordinary `pwsh` step for spelling a
         # safe variable the only way its shell spells one.
         "B4-pull-request-target-pwsh-named-variable",
@@ -3551,7 +3598,7 @@ Mutation(
         # The safe side of `_INDIRECT_EXPANSION`, and the reason that rule
         # needs a lookahead at all. `${!xs[@]}` is an array's indices and
         # `for i in "${!xs[@]}"` is the ordinary way to walk one in bash --
-        # no environment in it, no name assembled anywhere. KILLED here
+        # no environment in it, no name assembled anywhere. OVERSHOT here
         # means the rule has been widened into a ban on the `${!` sigil,
         # which is a suite that reds on the first bash array somebody
         # iterates.
@@ -3580,7 +3627,7 @@ Mutation(
         # one command, `/usr/bin/env python3` runs an interpreter with an
         # operand rather than dumping anything, and `ps -ef` is the UNIX
         # spelling of "every process", which says nothing about an
-        # environment and is not BSD's `ps e`. KILLED
+        # environment and is not BSD's `ps e`. OVERSHOT
         # here means the rule has been widened into a ban on the words,
         # which is a suite that reds on the first ordinary shell script
         # somebody writes.
@@ -3651,7 +3698,7 @@ Mutation(
         # The safe side of both rows above. `shell: bash` and a
         # `defaults.run` block naming a shell and a working directory are
         # ordinary workflow, and folding those values into the scripts must
-        # not red them. KILLED here means `shell:` has been turned into a
+        # not red them. OVERSHOT here means `shell:` has been turned into a
         # field a `pull_request_target` job may not set, which is not what
         # any of this is about.
         "B4-pull-request-target-shell-ordinary",
@@ -3787,7 +3834,7 @@ Mutation(
         # allowlist, so the suite reddened on a workflow that had done nothing
         # wrong. That is the failure mode a `must_survive` row exists for: a
         # suite that reds on a harmless change is a suite people learn to
-        # override. KILLED here means the substitution has gone
+        # override. OVERSHOT here means the substitution has gone
         # case-sensitive again.
         "B4-pull-request-target-checkout-ref-env-case",
         ".github/workflows/risk_classify.yml",
@@ -3860,7 +3907,7 @@ Mutation(
         # And the neighbouring flag, from the safe side. `git clone --bare`
         # copies the branches an ordinary clone does and not the pull
         # namespace, so refusing it would be a rule about the shape of a
-        # clone rather than about what the clone reaches. KILLED here means
+        # clone rather than about what the clone reaches. OVERSHOT here means
         # the mirror pattern has been widened to `--(?:mirror|bare)`, and a
         # release step that takes a bare clone of this repository now reds.
         # The prefix ladder the pattern carries is not that widening: it runs
@@ -3883,8 +3930,8 @@ Mutation(
         # And the ladder's neighbours, from the safe side. The mirror rule
         # refuses every prefix of `--mirror` down to `--m`, and the price of
         # that is a pattern that has to stop at the end of the option: `--m`
-        # also begins `--merges`, `--max-count` and `--milestone`. KILLED here
-        # means the ladder lost its anchor and every `--m...` option a
+        # also begins `--merges`, `--max-count` and `--milestone`. OVERSHOT
+        # here means the ladder lost its anchor and every `--m...` option a
         # workflow writes now reds.
         #
         # Today the anchor has a live control as well, which is worth saying
@@ -3954,7 +4001,7 @@ Mutation(
         # The runner's environment from the safe side. `GITHUB_REPOSITORY`
         # and `GITHUB_SHA` are what the base repository decides -- this
         # repository, and the head commit of its default branch on this
-        # trigger -- and naming them in a log line is ordinary. KILLED here
+        # trigger -- and naming them in a log line is ordinary. OVERSHOT here
         # means the allowlist above has been replaced by a refusal of the
         # prefix, which reds on a step doing nothing wrong.
         "B4-pull-request-target-run-runner-repository-name",
@@ -4072,7 +4119,7 @@ Mutation(
         # is an expression allowlist rather than a refusal. A pinned public
         # image is the ordinary way to run a job with a toolchain in it, and
         # both live forms -- the mapping and the string -- have to stay
-        # green. KILLED here means the block rule has been tightened into a
+        # green. OVERSHOT here means the block rule has been tightened into a
         # ban on `container:`, which is a suite that reds on a workflow doing
         # nothing wrong.
         "B4-pull-request-target-container-pinned-image",
