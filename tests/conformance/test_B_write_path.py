@@ -249,6 +249,13 @@ _SAFE_GH_VERBS = frozenset({"pr", "issue", "api"})
 # to allowlist a URL.
 _SUBCOMMAND_GOVERNED_GH_VERBS = frozenset({"pr", "issue"})
 
+#: Where one command ends and the next begins, as a character class. Read
+#: twice: `_COMMAND_END` stops the argument walk here, and `_COMMAND_WORD_END`
+#: below ends a command *word* here, because a word at the end of a command is
+#: at the end of itself. One constant rather than two lists, so that the two
+#: cannot drift.
+_COMMAND_SEPARATORS = r"[\n;|&()`]"
+
 # `gh` as a command word. The lookbehind refuses a word ending in `gh` and a
 # flag spelled `--gh`, and deliberately allows a path prefix, because
 # `/usr/bin/gh` is the same program.
@@ -288,7 +295,44 @@ _SUBCOMMAND_GOVERNED_GH_VERBS = frozenset({"pr", "issue"})
 # what they would match before a trailing newline, and taking `\Z` keeps this
 # a rule about the end of the text rather than a second spelling of the one
 # above it.
-_COMMAND_WORD_END = r"(?=[\s'\",]|\Z)"
+#
+# The separators are the fifth terminator and they were missing until
+# 2026-09-20, which is one file disagreeing with itself: `_COMMAND_SEPARATORS`
+# is where this file says a command ends, and a command word ends where its
+# command does. What the omission bought is a program *laundered into a name
+# review can read*. `cp "$(command -v gh)" ./g` followed by `./g pr checkout
+# "$N"` runs the CLI twice over -- `ln -s` and the backtick spelling of the
+# substitution are the same step -- and all three were green, because the
+# `gh` in `command -v gh)` was followed by a `)` and was therefore not a
+# command word, while the `pr` on the next line names `./g` as its program,
+# which `_READABLE_PROGRAM` reads, so the backstop under the allowlists
+# dropped it too. Both halves of the pair passed the same step for opposite
+# reasons.
+#
+# Taking the separators makes `command -v gh)` a `gh` with no words after it,
+# which `_unsafe_gh_verbs` already refuses as the empty verb -- the same
+# answer it gives `echo "pr checkout $N" | xargs gh`, and for the same
+# reason: a `gh` whose arguments this file cannot read is refused for that
+# rather than passed for it. It costs the ordinary guard `command -v gh` in a
+# step of a `pull_request_target` workflow, which is a line of review -- and
+# almost none of one, because `command -v gh >/dev/null` already reds today
+# for the redirect it is followed by. Measured, both spellings.
+#
+# `(` comes with them and is the one that is not a terminator: a word
+# immediately before an open parenthesis is a function being defined rather
+# than a program being run. It is taken anyway rather than filtered out,
+# because the alternative is a second list of separators maintained beside
+# the first, and `gh()` is refused for the empty verb like every other
+# spelling. The cost is the two letters written as a manpage reference,
+# `gh(1)`, in a comment inside such a step.
+#
+# What this does not reach is a launder whose `gh` is itself unreadable --
+# `cp "$(command -v g'h')" ./g`. Nothing over the name can, which is
+# `_READABLE_PROGRAM`'s argument, and there is no second rule to fall back on
+# here because the `pr` half has been told the program is readable. Written
+# down rather than implied: it is open, and closing it means knowing that
+# `./g` is a copy of something.
+_COMMAND_WORD_END = r"(?=[\s'\",]|" + _COMMAND_SEPARATORS + r"|\Z)"
 _GH_COMMAND = re.compile(r"(?<![\w-])gh" + _COMMAND_WORD_END)
 
 # The same walk anchored one word later, and the answer to the thing a regex
@@ -376,8 +420,10 @@ _GH_WORD_PUNCTUATION = "\"'[],"
 
 # Where the walk stops. Not a shell parser: a separator inside a quoted
 # string ends an invocation early, which can lose the tail of one and cannot
-# invent one.
-_COMMAND_END = re.compile(r"[\n;|&()`]")
+# invent one. The class is `_COMMAND_SEPARATORS`, named above the word end
+# that shares it, because "where does a command end" is one question and a
+# command word ends where its command does.
+_COMMAND_END = re.compile(_COMMAND_SEPARATORS)
 # `-R`/`--repo` is the flag worth knowing about by name. The walk drops
 # `-`-prefixed words, but a flag's *value* is an ordinary word, so a bare drop
 # reads `gh pr -R owner/repo edit` as the subcommand `owner/repo` and refuses a

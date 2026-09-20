@@ -1644,6 +1644,47 @@ Mutation(
         "and which puts the program name at the end of the file",
     ),
     Mutation(
+        # The CLI laundered into a name review *can* read, which is the
+        # round-16 hole and the one shape both halves of the `gh` pair passed
+        # for opposite reasons. `command -v gh` resolves the program and `cp`
+        # puts it at `./g`; the second line then runs the same binary under a
+        # name that says nothing. `_GH_COMMAND` never saw the first line,
+        # because the `gh` in it is followed by a `)` and the word end took
+        # whitespace, a quote, a comma or the end of the text; the `pr`
+        # backstop then read the second line and dropped it, because `./g`
+        # is a program name `_READABLE_PROGRAM` reads and the backstop is
+        # only for invocations whose program is unreadable. So the pair's
+        # division of labour had a seam in it, and this is the step that goes
+        # through the seam.
+        #
+        # It pins the `_COMMAND_SEPARATORS` alternative in
+        # `_COMMAND_WORD_END`: drop it and this row is SURVIVED with every
+        # other row still KILLED. One row for the whole class rather than one
+        # per character, unlike `_ENUMERATION_END`, and that is forced rather
+        # than chosen -- the class is a named constant `_COMMAND_END` reads
+        # too, so a neuter of one character out of it would change where the
+        # argument walk stops as well, which is not a neuter of the rule this
+        # row is about. The two other spellings measured on the same change,
+        # `ln -s` in place of `cp` and the backtick form of the substitution,
+        # are the same alternative and were green before it and red after.
+        "B4-pull-request-target-api-gh-copied-to-a-readable-name",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          cp "$(command -v gh)" ./g\n'
+         '          ./g pr checkout "$PR_NUMBER"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "copy the CLI to a name of their own choosing and run the copy, so "
+        "that the rule over the program name never sees the program and the "
+        "rule over the argument shape sees a name it can read",
+    ),
+    Mutation(
         # A readable word in front of an unreadable program, which is the
         # round-13 correction to the backstop under all of this. `timeout` is
         # not the program here and neither is `60`: `g'h'` is, and the rule
