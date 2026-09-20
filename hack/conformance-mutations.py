@@ -971,7 +971,9 @@ Mutation(
     Mutation(
         # The same glob with no enumeration verb on the line, which is the
         # row that pins the third alternative. The row above does not, and
-        # says it does: `_REMOTE_REF_ENUMERATION` reads `ls-remote` and
+        # no longer says it does: the row above was corrected in ddd347b9
+        # and this sentence went on citing it as a live error afterwards.
+        # What it got wrong: `_REMOTE_REF_ENUMERATION` reads `ls-remote` and
         # decides that one first, and deleting the glob alternative outright
         # left all four refspec rows KILLED and the whole sweep
         # byte-identical -- the same class round 11 found once and this is
@@ -4146,7 +4148,7 @@ Mutation(
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "write an ordinary shell script that comments three of its lines "
+        "write an ordinary shell script that comments four of its lines "
         "and takes a revision out of a backtick substitution",
         must_survive=True,
     ),
