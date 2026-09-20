@@ -136,6 +136,14 @@ class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
     source-reading assertions are careful about elsewhere. Any control
     character counts, not just the backspace: a stray form feed or escape
     sequence in a docstring is never intended either.
+
+    One exemption, and it used to be two. The newline is exempt because a
+    docstring is made of lines and every multi-line one here would red. The
+    tab was exempt beside it for no stated reason, and the sentence above
+    was false while it was: a tab in a docstring is an indentation nobody
+    can see, in a file whose every other indent is spaces. Measured before
+    dropping it -- no docstring in the twelve modules this walks contains
+    one -- so the exemption was buying nothing and costing the claim.
     """
 
     #: Docstrings are read from the AST rather than by importing, so this
@@ -145,7 +153,7 @@ class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
     _MODULES = sorted(
         list(Path(__file__).parent.glob("*.py"))
         + list((Path(__file__).parent / "bucket2").glob("*.py"))
-        + [Path(__file__).resolve().parents[2] / "hack" / "conformance-mutations.py"]
+        + [h.REPO_ROOT / "hack" / "conformance-mutations.py"]
     )
 
     def test_no_docstring_in_the_suite_contains_a_control_character(self) -> None:
@@ -167,7 +175,7 @@ class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
                     {
                         character
                         for character in docstring
-                        if ord(character) < 32 and character not in "\n\t"
+                        if ord(character) < 32 and character != "\n"
                     }
                 )
                 with self.subTest(module=path.name, node=getattr(node, "name", "<module>")):
