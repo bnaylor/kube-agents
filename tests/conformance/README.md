@@ -261,14 +261,14 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-229 mutations: 190 KILLED, 22 NOISY, seventeen `must_survive` controls, zero
+242 mutations: 200 KILLED, 22 NOISY, twenty `must_survive` controls, zero
 genuine survivors, zero stale — measured 2026-09-19 against this branch;
 re-run the harness rather than trusting these numbers, which is the sentence
-this paragraph exists to make cheap. The seventeen controls are one on the
+this paragraph exists to make cheap. The twenty controls are one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling, one pinning a case-insensitive `env:` expansion that closes no hole
-and would false-red a safe workflow if it were dropped, and ten over B4's
-`pull_request_target` rules: the `gh` walk's skip of a flag's value, the same
+and would false-red a safe workflow if it were dropped, and seventeen over
+B4's `pull_request_target` rules: the `gh` walk's skip of a flag's value, the same
 walk's stripping of quotes and brackets off an argument vector, the `issue`
 verb on its allowlist, the bare `pull/N` web link that the rule against the
 `pull/N.diff` endpoint must not catch, a job running in a pinned public image
@@ -287,11 +287,19 @@ indirect expansion must both leave alone, a `cat` of `.git/refs/heads/main` in
 the checkout the step already has, which the rule against asking a remote to
 list its refs must not catch, a `pr checkout` run through `timeout` against a
 local tool with a plain name, which the rule against a wrapper hiding an
-unreadable `gh` must not catch, and a job declaring `defaults.run.shell:
-bash`, which reading the `shell:` field at all must not object to. Each of those edits is the _safe_ spelling of something a
+unreadable `gh` must not catch, a job declaring `defaults.run.shell:
+bash`, which reading the `shell:` field at all must not object to, a script
+that comments three of its lines and takes a revision out of a backtick
+substitution, neither of which the two terminators added to the environment
+dump may reach on their own, a `pwsh` step naming `$env:GITHUB_REPOSITORY`
+and `$env:GITHUB_SHA`, which is how PowerShell names a variable rather than
+how a program reaches the mapping, and an `eval "$(ssh-agent -s)"` beside an
+`eval "$cmd"`, which are the two ordinary uses of the word the rule against
+a name assembled between two expansions must leave
+alone. Each of those edits is the _safe_ spelling of something a
 workflow here legitimately does, and the control is that the suite does not
-object to it. Note that the summary line the harness prints accounts for 212
-of the 229: a `must_survive` control's verdict is
+object to it. Note that the summary line the harness prints accounts for 222
+of the 242: a `must_survive` control's verdict is
 `SURVIVED (expected)`, which is neither killed, noisy, nor a survivor. The run
 also prints `BASELINE POLLUTED` if the suite is not green once every mutation
 has been restored, which did not happen here and would invalidate every
