@@ -1621,11 +1621,17 @@ def _invocation_programs(text, offset):
     walk: an expression standing where a program goes is a program this file
     cannot read, and folding it to a placeholder would make it readable.
 
-    An empty list of words is an answer, and it is the refusing one: a `pr`
-    with nothing before it on its own segment is the far side of a pipe,
-    which is where `echo "pr checkout $N" | xargs gh` puts its arguments, and
-    it is also what is left of `"$(command -v gh)" pr checkout` once the walk
-    stops at the closing parenthesis.
+    An empty list of words is an answer, and it is the refusing one: what is
+    left of `"$(command -v gh)" pr checkout` once the walk stops at the
+    closing parenthesis is a `pr` with nothing in front of it, and a `pr`
+    with nothing in front of it is an invocation whose program went where
+    this file cannot follow.
+
+    It is not what refuses `echo "pr checkout $N" | xargs gh`, which this
+    paragraph claimed until round 18 measured it. That `pr` is on the *near*
+    side of the pipe with `echo` in front of it, so this returns `['echo',
+    'echo']` and refuses nothing at all. Reading the far side is
+    `_receiving_programs`, a walk over the pipeline this one does not make.
     """
     head = text[:offset]
     starts = [match.end() for match in _COMMAND_END.finditer(head)]
@@ -1638,6 +1644,152 @@ def _invocation_programs(text, offset):
         if word
     ]
     return [words[0], words[-1]] if words else [""]
+
+
+def _receiving_programs(text, offset):
+    """Every program that could be handed the word at `offset` as an argument.
+
+    `_invocation_programs` reads the segment the word is written in, and a
+    segment is not where a shell keeps the program. `printf 'pr checkout %s'
+    "$N" | xargs g'h'` writes the argument vector in one segment and runs it
+    in the next, and both halves of the pair declined it: `_GH_COMMAND` has
+    no literal `gh` to find, and the backstop asked which program the `pr`'s
+    own segment names, got `printf`, and read that as a name review can
+    read. It was green, and it is the two known-closed shapes composed --
+    `echo "pr checkout $N" | xargs gh` is refused for naming the program and
+    hiding the arguments, `g'h' pr checkout "$N"` for naming the arguments
+    and hiding the program, and writing the arguments through a *third*
+    program leaves the pair with neither end to hold. It is not drift: the
+    same three cases measure the same way against the `06adabac` export,
+    which is the round before the one that widened these rules last.
+
+    So the question this answers is not "which word of this segment is the
+    program" but "which programs could this word reach", and there are two
+    edges out of a segment that a word travels along.
+
+    Downstream, over `|`: a segment's stdout is the next segment's stdin and
+    `xargs` turns stdin back into an argument vector, so every segment after
+    this one in the same pipeline is a program this word may be an argument
+    to. Each is read the way `_invocation_programs` reads the word's own
+    segment, first word and last word, and here the last word is the program
+    rather than a trailing argument for a reason that only holds downstream:
+    a command taking its argument vector off a pipe has no literal arguments
+    to trail, so `xargs -t -n9 -0 g'h'` ends on the thing that runs.
+
+    `||` is not crossed. The right-hand side of one runs *instead of* this
+    command rather than after it and is handed none of its output, so
+    `echo "pr checkout $N" || g'h' --version` is two commands rather than a
+    launder. `&&` and `;` are not crossed for the same reason and never
+    were: they are already where `_COMMAND_END` stops.
+
+    A substitution inside the word's own segment is stepped over rather than
+    read as the end of it, because `printf 'pr checkout %s' "$(cat n)" |
+    xargs g'h'` is the same pipeline with a parenthesis in the middle. That
+    is what the depth counter is doing, and the backtick spelling toggles it
+    instead of nesting because one character opens and closes it.
+
+    Outward, over `$(` and a backtick: a substitution's stdout is a word in
+    the command that encloses it, which is the same launder with the pipe
+    turned inside out. `g'h' $(printf 'pr checkout %s' "$N")` was green for
+    the reason the pipeline was, and the enclosing command is read the same
+    way -- from the `$` rather than from the parenthesis, so the `$` stays
+    with the punctuation it belongs to. Read from the parenthesis instead
+    and the word in front of every `echo "$(...)"` in this repository is a
+    lone `$`, which no name is made of, and the rule refuses the file.
+
+    It is a walk outward rather than a look at the separator immediately
+    behind the word, because a substitution holds as many commands as it
+    likes: `g'h' $(cat x; printf 'pr checkout %s' "$N")` puts a `;` between
+    two of them and the enclosing `$(` is then two separators back. Walking
+    means a substitution that has already *closed* has to be counted past --
+    `X=$(date)` on one line and `echo "pr is open"` on the next reaches a
+    `(` that the `)` before the word already matched -- which is what the
+    second depth counter is for. Nesting falls out of the same walk, one
+    substitution at a time, because `$( $( ... ) )` is written that way too.
+
+    Backticks are not counted, because the character that opens one closes
+    it. A backtick behind the word is read as an opener whether or not it is
+    one, so ``echo `date` "pr is open"`` reads the substitution's own body
+    as the enclosing command. Nothing turns on it: that line is refused
+    today regardless, for the empty segment a closing backtick leaves in
+    front of the `pr`.
+
+    A bare `(` ends the walk instead of being an edge, and that is the one
+    place this disagrees with `_COMMAND_SEPARATORS`. `( cd x && echo "pr is
+    open" )` is a subshell rather than a substitution: nothing of it is
+    handed to a word in front of it, and there is usually no word in front
+    of it. Requiring the `$` is what keeps a parenthesised group from
+    reading as an invocation of whatever precedes it.
+
+    What this costs is two lines of prose. A `pr <word>` piped into a
+    command whose last word is unreadable -- `echo "pr was merged" | grep -q
+    "$W"` -- reds, and so does one assembled inside a substitution that is
+    assigned rather than run -- `MSG="$(printf 'pr is open')"`, where the
+    word before the `$` is `MSG="`. Both are the cost
+    `_unsafe_pull_request_subcommands` already pays one segment over, where
+    `echo "$TITLE pr is open"` reds for the same reason, and both are a line
+    of review on a step of a `pull_request_target` workflow holding a
+    writable token, which is the direction to be wrong in.
+
+    What it does not reach is an argument vector that is not in the text at
+    all. `cat .github/gh-argv.txt | xargs g'h'` names no subcommand here for
+    any rule to read, which is the shape
+    `B4-pull-request-target-api-gh-arguments-unreadable` is about and the
+    reason that row is refused on the unreadable invocation instead.
+    """
+    programs = _invocation_programs(text, offset)
+    depth = 0
+    piped = False
+    position = offset
+    while True:
+        match = _COMMAND_END.search(text, position)
+        if piped and (match is None or depth == 0):
+            programs += _invocation_programs(
+                text, match.start() if match else len(text)
+            )
+        if match is None:
+            break
+        position = match.end()
+        separator = match.group()
+        if separator == "(":
+            depth += 1
+        elif separator == ")":
+            if not depth:
+                break
+            depth -= 1
+        elif separator == "`":
+            depth = 0 if depth else 1
+        elif depth:
+            continue
+        elif separator == "|" and not text.startswith("|", position):
+            piped = True
+        else:
+            break
+    position = offset
+    depth = 0
+    while True:
+        opener = None
+        for match in _COMMAND_END.finditer(text, 0, position):
+            opener = match
+        if opener is None:
+            break
+        position = opener.start()
+        separator = opener.group()
+        if separator == ")":
+            depth += 1
+        elif separator == "`":
+            if depth:
+                continue
+            programs += _invocation_programs(text, position)
+        elif separator == "(":
+            if depth:
+                depth -= 1
+            elif text[:position].endswith("$"):
+                position -= 1
+                programs += _invocation_programs(text, position)
+            else:
+                break
+    return programs
 
 
 def _gh_invocations(text):
@@ -1751,13 +1903,21 @@ def _unsafe_pull_request_subcommands(text):
     of prose whose last word before `pr` is a variable -- `echo "$TITLE pr is
     open"` reds -- which is a line of review on a step of a workflow holding
     a writable token, and is the direction to be wrong in.
+
+    "In front of it" is also not only its own segment, which is round 18 and
+    the argument for that is at `_receiving_programs`. A shell hands a word
+    to a program down a pipe and out of a substitution as readily as along a
+    command line, so `printf 'pr checkout %s' "$N" | xargs g'h'` has a
+    perfectly readable program in front of the `pr` -- `printf` -- and runs
+    the CLI anyway. Every program the word could reach is read, and any one
+    of them being unreadable is enough.
     """
     return sorted({
         f"pr {invocation}"[:120]
         for match in _GH_PULL_REQUEST_WORD.finditer(text)
         if not all(
             _READABLE_PROGRAM.match(word)
-            for word in _invocation_programs(text, match.start())
+            for word in _receiving_programs(text, match.start())
         )
         for words, invocation in [_invocation_words(text, match.end())]
         if words and words[0] not in _SAFE_GH_PULL_REQUEST_SUBCOMMANDS
@@ -3261,7 +3421,12 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # of them still writes `pr` and then a subcommand, so
                         # that is what this reads. See `_GH_PULL_REQUEST_WORD`
                         # for why it is a backstop under the two allowlists
-                        # rather than a replacement for them.
+                        # rather than a replacement for them, and
+                        # `_receiving_programs` for why "the program" is every
+                        # one the argument can reach rather than the one word
+                        # in front of it: `printf 'pr checkout %s' "$N" |
+                        # xargs g'h'` composes two shapes this pair refuses
+                        # separately into one it passed.
                         unsafe_pr = _unsafe_pull_request_subcommands(reachable)
                         self.assertEqual(
                             [],
