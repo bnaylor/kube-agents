@@ -84,7 +84,7 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: twenty-four today, which `--list` is the authority on rather than
+    #: twenty-five today, which `--list` is the authority on rather than
     #: this comment -- it marks each control `[control]`, and the list below
     #: named ten on 2026-09-19 when there were eleven, and one of the ten by
     #: an id no row had:
@@ -98,6 +98,7 @@ class Mutation:
     #: B4-pull-request-target-api-gh-wrapped-readable-program,
     #: B4-pull-request-target-api-gh-pipeline-readable-program,
     #: B4-pull-request-target-api-gh-substitution-ordinary,
+    #: B4-pull-request-target-run-backtick-closed-then-prose,
     #: B4-pull-request-target-run-env-ordinary-shell,
     #: B4-pull-request-target-run-environment-word,
     #: B4-pull-request-target-run-array-index-walk,
@@ -1926,9 +1927,10 @@ Mutation(
         # the outward half of `_receiving_programs`: delete the walk out of
         # a substitution and this row is SURVIVED with every other row still
         # KILLED, and deleting the pipeline walk beside it leaves it KILLED.
-        # The backtick spelling and a wrapper in front of the name --
-        # `timeout 60 g'h' $(...)` -- are the same edit and are measured
-        # rather than assumed.
+        # A wrapper in front of the name -- `timeout 60 g'h' $(...)` -- is
+        # the same edit and is measured rather than assumed. The backtick
+        # spelling was claimed here on the same footing until round 21,
+        # which found it carried by no row at all and gave it the one below.
         "B4-pull-request-target-api-gh-arguments-through-a-substitution",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1943,6 +1945,29 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "build the argument list in a substitution rather than writing it "
         "out, which is the line above with the pipe turned inside out",
+    ),
+    Mutation(
+        # The same launder in the older spelling of a substitution. One
+        # character opens a backtick and the same character closes it, so
+        # the walk out of one cannot be a depth count and is a parity check
+        # instead -- and this is the row that pins the reading half of it.
+        # Take the read out of that branch and this is SURVIVED with the
+        # `$( )` row above still KILLED, which is the two spellings pinned
+        # apart rather than together.
+        "B4-pull-request-target-api-gh-arguments-through-a-backtick",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          g'h' `printf 'pr checkout %s' \"$PR_NUMBER\"`\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write the same substitution the older way, which is the spelling a "
+        "script copied off a wiki page is written in",
     ),
     Mutation(
         # The safe side of the same word, and the hole `_READABLE_PROGRAM`
@@ -2009,6 +2034,34 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "put a generated message on a commit, which is the most ordinary "
         "command substitution a step writes",
+        must_survive=True,
+    ),
+    Mutation(
+        # The safe side of the backtick row above, and the round-21 false
+        # positive. A backtick substitution that has *closed* encloses
+        # nothing after it, so the walk has to count past it exactly as the
+        # depth counter counts past a `$( )` that has closed -- and it did
+        # not: it read the closing backtick as an opener, then the opening
+        # one as the opener of the command enclosing *that*, and arrived at
+        # `REV=`, which is not a name. An ordinary shell script and a line
+        # of prose two lines under it were refused together. OVERSHOT here
+        # means the parity pairing has come back out, and the `$( )`
+        # spelling of this same script was green throughout, which is how
+        # the false positive was measured rather than argued.
+        "B4-pull-request-target-run-backtick-closed-then-prose",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Note the pull request\n"
+         "        run: |\n"
+         "          set -euo pipefail\n"
+         "          REV=`git rev-parse --short HEAD`\n"
+         '          echo "the pr is open for $REV"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "take a revision out of a backtick substitution and mention the "
+        "pull request in prose on a later line, which is a shell script and "
+        "an echo",
         must_survive=True,
     ),
     Mutation(

@@ -1782,12 +1782,27 @@ def _receiving_programs(text, offset):
     second depth counter is for. Nesting falls out of the same walk, one
     substitution at a time, because `$( $( ... ) )` is written that way too.
 
-    Backticks are not counted, because the character that opens one closes
-    it. A backtick behind the word is read as an opener whether or not it is
-    one, so ``echo `date` "pr is open"`` reads the substitution's own body
-    as the enclosing command. Nothing turns on it: that line is refused
-    today regardless, for the empty segment a closing backtick leaves in
-    front of the `pr`.
+    Backticks are paired by parity rather than by a counter, because the
+    character that opens one closes it. Whether the backtick behind the word
+    opens the substitution the word is in is a question about how many came
+    before it: an even count in front of the backtick makes it the opener,
+    whose enclosing command is read, and an odd count makes it a closer,
+    whose own opener is then stepped over without being read. That is round
+    21, and the reading before it was that a backtick behind the word is an
+    opener whether or not it is one. What that cost was a false red on the
+    most ordinary shell script there is -- ``REV=`git rev-parse HEAD` `` on
+    one line and `echo "pr is open"` on the next reached back through the
+    closing backtick, read `git rev-parse HEAD` as the enclosing command,
+    and then read `REV=` as the command enclosing *that*. `REV=` is not a
+    name, so a line of prose two lines under an ordinary substitution was
+    refused. The `$( )` spelling of the same script was green throughout,
+    which is the argument for this: the depth counter above counts past a
+    substitution that has already closed, and the backtick spelling of one
+    has to be counted past too.
+
+    ``echo `date` "pr is open"`` on a single line is still refused, and not
+    by this walk: a closing backtick leaves an empty segment in front of the
+    `pr`, which `_invocation_programs` reads before anything here runs.
 
     A bare `(` ends the walk instead of being an edge, and that is the one
     place this disagrees with `_COMMAND_SEPARATORS`. `( cd x && echo "pr is
@@ -1842,6 +1857,7 @@ def _receiving_programs(text, offset):
             break
     position = offset
     depth = 0
+    closed = False
     while True:
         opener = None
         for match in _COMMAND_END.finditer(text, 0, position):
@@ -1855,7 +1871,12 @@ def _receiving_programs(text, offset):
         elif separator == "`":
             if depth:
                 continue
-            programs += _invocation_programs(text, position)
+            if closed:
+                closed = False
+            elif text.count("`", 0, position) % 2:
+                closed = True
+            else:
+                programs += _invocation_programs(text, position)
         elif separator == "(":
             if depth:
                 depth -= 1
