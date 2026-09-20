@@ -595,12 +595,77 @@ _GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 # concedes is a false red on a step that writes `activity.` or `activity[`
 # meaning something else -- `jq -r '.activity.total'` -- which is the same
 # concession `pulls.` and `issues.` make, on the same four workflows.
+# The sixth is the run, and it is the round-20 addition. `GET
+# /repos/{owner}/{repo}/actions/runs` is this repository's own workflow-run
+# list, and every entry on it carries `head_sha` beside `head_repository`,
+# whose `clone_url` is the fork -- so the remote to fetch from and the object
+# to fetch out of it arrive in the same response. `gh api
+# "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&per_page=1" --jq
+# '.workflow_runs[0] | .head_repository.clone_url + " " + .head_sha'` was
+# green against every rule above, and so was the shorter read that needs no
+# query string: `actions/runs/$GITHUB_RUN_ID` is *this* run, whose `head_sha`
+# on a `pull_request_target` is the fork's head, and `GITHUB_RUN_ID` is on
+# `_SAFE_RUNNER_VARIABLES` because it names a run rather than a ref. Neither
+# spells `/pulls`, `/issues`, `/events`, an Octokit namespace or a
+# `pull/N.diff`, and `api` is one of the three allowlisted `gh` verbs -- this
+# is the shape the "not covered" note used to describe as needing neither,
+# which it did not need.
+#
+# Four nouns under `/actions/`, because the run object is reachable as four
+# different last words and they are the same object. `runs` is the list and
+# the item, and it covers `runs/{id}/jobs`, `runs/{id}/logs` and
+# `runs/{id}/artifacts` by prefix. `workflows` is the same list scoped to one
+# file -- `actions/workflows/risk_classify.yml/runs` returns the identical
+# entries and writes no `actions/runs` anywhere. `jobs` is
+# `actions/jobs/{id}`, which carries `head_sha` of the run it belongs to.
+# `artifacts` is the repository-wide artifact list and the `{id}/zip`
+# download under it, which is not a SHA but the fork's build output, arriving
+# on a runner that holds this token. What is deliberately left out is the
+# rest of the namespace -- `secrets`, `variables`, `permissions`, `runners`,
+# `caches`, `oidc` -- which carries no head and answers a different question;
+# refusing it would be a rule about the word `actions` rather than about what
+# a step reaches.
+#
+# The leading `/` is what tells the endpoint from the directory. `uses:
+# actions/github-script@...` is not read here at all -- `uses:` is not part
+# of a step's script -- but `.github/actions/setup/action.yml` is an ordinary
+# path for a `run:` to name, and none of the four nouns follows `/actions/`
+# in it. A control row holds that green.
+#
+# `gh run view --log` and `gh workflow view` reach the same object through
+# the CLI and are already refused, by name, for not being on `_SAFE_GH_VERBS`
+# -- which is what that allowlist is for and why this alternative is about
+# the path rather than about the program. `curl` to `api.github.com` is the
+# same request with no `gh` word at all, and is why it has to be.
+#
+# And the client library for the third time, plus the one namespace the
+# `/issues` path has been closing since round 10 without its client spelling
+# being closed beside it. `github.rest.actions.listWorkflowRunsForRepo(
+# {...context.repo})` is the run list from a `script:`, naming no path, and
+# `github.rest.search.issuesAndPullRequests({q: 'repo:o/r'})` hands back
+# every matching item's `pull_request.patch_url` without a number and without
+# writing `search/issues`. Both were green. The `search` one is the round-10
+# mistake exactly: `gh api "search/issues?q=..."` has a row here and is
+# refused by the `/issues` path, and conceding the client while refusing the
+# path is the thing that lost then. So both join `pulls`, `issues` and
+# `activity` in both namespace alternatives, for the reason that trio
+# already has: `rest['actions']` puts a quote where the second alternative
+# wants a dot, and a destructured `const { search } = github.rest` writes no
+# `rest` before the namespace for the first one. One row pins each of the
+# four.
+#
+# What that concedes is a false red on a step that writes `actions.` or
+# `search.` meaning something else -- `cat docs/search.md`, `jq .actions[0]`
+# -- which is the same concession `pulls.`, `issues.` and `activity.` make,
+# on the same four workflows, and none of them writes either word.
 _PULL_REQUEST_API = re.compile(
     r"/pulls\b"
     r"|/issues\b"
     r"|/events(?!/?[\w.-])"
-    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?(?:pulls|issues|activity)\b"
-    r"|\b(?:pulls|issues|activity)\s*[.\[]"
+    r"|/actions/(?:runs|jobs|artifacts|workflows)\b"
+    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?"
+    r"(?:pulls|issues|activity|actions|search)\b"
+    r"|\b(?:pulls|issues|activity|actions|search)\s*[.\[]"
     r"|pull/[^\n'\"]*?\.(?:diff|patch)\b"
 )
 
@@ -2958,12 +3023,14 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         again anchored on the argument rather than on the program -- reading,
         since round 18, every program a pipeline or a substitution could hand
         that argument to rather than only the segment it is written in -- the
-        `/pulls`, `/issues` and `/events` path segments, the last of those
-        matched only where nothing follows it, so that a `docs/events/`
-        directory and an `events.yml` are not, the `pull/N.diff` and
-        `pull/N.patch` web endpoints, and any of the three namespaces
-        `pulls`, `issues` and `activity` on the Octokit client a `script:` is
-        handed. This said two path segments, one web spelling and two
+        `/pulls`, `/issues`, `/events` and `/actions/{runs,jobs,artifacts,
+        workflows}` path segments, `/events` matched only where nothing
+        follows it, so that a `docs/events/` directory and an `events.yml`
+        are not, and the `/actions/` four each needing a last word, so that
+        `.github/actions/setup` is not, the `pull/N.diff` and `pull/N.patch`
+        web endpoints, and any of the five namespaces `pulls`, `issues`,
+        `activity`, `actions` and `search` on the Octokit client a `script:`
+        is handed. This said two path segments, one web spelling and two
         namespaces until round 18: round 17 widened all three and the
         sentence did not move with them, which is the failure mode a
         summary written beside a pattern has. Every allowlist among them
@@ -2974,12 +3041,21 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         finished.
 
         What is left is the call made without naming any of those paths or
-        namespaces and without an allowlisted `gh` verb: a GraphQL query for
-        `pullRequest(number:)`, or `github.request("GET
-        /repos/{owner}/{repo}/pulls/{n}")` spelled with the path in a
-        variable. The GraphQL one is the one worth writing down: that
-        endpoint is a single URL with no path in it at all, and nothing in
-        this file reads a query document.
+        namespaces: a GraphQL query for `pullRequest(number:)`, or
+        `github.request("GET /repos/{owner}/{repo}/pulls/{n}")` spelled with
+        the path in a variable. The GraphQL one is the one worth writing
+        down: that endpoint is a single URL with no path in it at all, and
+        nothing in this file reads a query document.
+
+        That sentence said "and without an allowlisted `gh` verb" until
+        round 20, which read as a second condition and was not one. `gh api
+        "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request"` is an
+        allowlisted verb and a literal path written out in full, and it was
+        green -- not because it evaded the two conditions but because the
+        path list did not name it. The verb allowlist governs which programs
+        may run, not which URLs they may ask for; only the path list does
+        that, and a summary that offers a second lock a reader can check
+        against is worse than one that names the single lock honestly.
 
         A client that is not `gh`, spelled plainly. The argument-shape
         backstop fires on `pr <subcommand>` only where the program word is
@@ -3379,20 +3455,23 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertIsNone(
                             _PULL_REQUEST_API.search(reachable),
                             f"{path.name}: a step reads the pull request "
-                            "through the API -- a `/pulls`, `/issues` or "
-                            "`/events` request, any of those three "
-                            "namespaces on the Octokit client a `script:` "
-                            "input is handed as `github` (`activity` is "
-                            "where the event list lives), or the tokenless "
-                            "`pull/N.diff` web endpoint. A pull request is "
-                            "an issue to this API, so `/issues/N` hands back "
-                            "its `patch_url`, and a `PullRequestEvent` on "
-                            "the repository's timeline carries the whole "
-                            "pull request object; the write a labelling step "
-                            "wants is `gh issue comment`, which names no "
-                            "path. This is the event's own fields fetched "
-                            "over HTTP, in the one language none of the "
-                            "rules above read",
+                            "through the API -- a `/pulls`, `/issues`, "
+                            "`/events` or `/actions/runs` request, any of "
+                            "the five namespaces `pulls`, `issues`, "
+                            "`activity`, `actions` and `search` on the "
+                            "Octokit client a `script:` input is handed as "
+                            "`github`, or the tokenless `pull/N.diff` web "
+                            "endpoint. A pull request is an issue to this "
+                            "API, so `/issues/N` hands back its "
+                            "`patch_url`; a `PullRequestEvent` on the "
+                            "repository's timeline carries the whole pull "
+                            "request object, which is what `activity` "
+                            "reaches; and a workflow run carries `head_sha` "
+                            "beside the fork's `clone_url`. The write a "
+                            "labelling step wants is `gh issue comment`, "
+                            "which names no path. This is the event's own "
+                            "fields fetched over HTTP, in the one language "
+                            "none of the rules above read",
                         )
                         # The same request made by the CLI, where the rule
                         # is an allowlist twice over rather than a pattern

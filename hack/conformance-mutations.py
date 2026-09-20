@@ -84,13 +84,14 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: twenty-three today, which `--list` is the authority on rather than
+    #: twenty-four today, which `--list` is the authority on rather than
     #: this comment -- it marks each control `[control]`, and the list below
     #: named ten on 2026-09-19 when there were eleven, and one of the ten by
     #: an id no row had:
     #: A3-fastpath-redundant,
     #: B1-denylist-rule,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
+    #: B4-pull-request-target-api-actions-path-ordinary,
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
@@ -2283,6 +2284,276 @@ Mutation(
         "pull the namespace off the client once and call it by its own name, "
         "which is ordinary JavaScript and writes the namespace where no rule "
         "keyed on `rest` is looking",
+    ),
+    Mutation(
+        # The workflow run, which is this repository's own API telling a step
+        # what the fork pushed. Every entry of `GET /repos/O/R/actions/runs`
+        # carries `head_sha` beside `head_repository`, whose `clone_url` is
+        # the fork -- so one request hands back both halves of a fetch and
+        # the step never names a remote it did not learn from GitHub. It was
+        # green against every rule in the file before round 20: no `/pulls`,
+        # no `/issues`, no `/events`, no Octokit namespace, no `pull/N.diff`,
+        # and `api` is one of the three verbs on _SAFE_GH_VERBS. `gh run
+        # view` reaches the same object and has always been refused, by the
+        # verb allowlist rather than by anything here, which is why this
+        # alternative is about the path.
+        #
+        # It pins the `runs` word of the `/actions/` alternative. Take that
+        # one word out and this row is SURVIVED with the other three
+        # `/actions/` rows still KILLED.
+        "B4-pull-request-target-api-actions-runs-endpoint",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          read -r URL SHA < <(gh api \"repos/$GITHUB_REPOSITORY"
+         "/actions/runs?event=pull_request&per_page=1\" \\\n"
+         "            --jq '.workflow_runs[0] | .head_repository.clone_url"
+         " + \" \" + .head_sha')\n"
+         "          git fetch \"$URL\" \"$SHA\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the fork's clone URL and head SHA off this repository's own "
+        "workflow-run list, which is one request for both halves of a fetch",
+    ),
+    Mutation(
+        # The same list scoped to one workflow file, which writes no
+        # `actions/runs` anywhere: the run id goes in the middle of the path
+        # and `runs` comes after it. Written with `curl` and no `gh` word for
+        # the reason B4-pull-request-target-api-events-endpoint is -- a fix
+        # hung off the `gh` walk would not reach this shape -- and the SHA is
+        # grepped out rather than named, so no head-spelling rule is in the
+        # picture.
+        #
+        # It pins the `workflows` word. Take that one out and this row is
+        # SURVIVED with the other three still KILLED.
+        "B4-pull-request-target-api-actions-workflow-runs",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          SHA=$(curl -s \"https://api.github.com/repos"
+         "/$GITHUB_REPOSITORY/actions/workflows/risk_classify.yml/runs\""
+         " | grep -oE '[0-9a-f]{40}' | head -1)\n"
+         "          git fetch --depth=1 origin \"$SHA\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask one workflow file for its own runs, which is the same list with "
+        "the run word moved past the file name",
+    ),
+    Mutation(
+        # A job rather than the run it belongs to. `GET
+        # /repos/O/R/actions/jobs/{id}` carries the run's `head_sha`, so the
+        # noun changes and the answer does not. The id comes off disk here
+        # rather than out of another refused request, which is the point: a
+        # rule that only refused the list would leave the item endpoint
+        # reachable to anything that had written an id down.
+        #
+        # It pins the `jobs` word. Take that one out and this row is
+        # SURVIVED with the other three still KILLED.
+        "B4-pull-request-target-api-actions-job",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          J=$(cat .ci/job-id)\n"
+         "          SHA=$(gh api \"repos/$GITHUB_REPOSITORY/actions/jobs/$J\""
+         " --jq .head_sha)\n"
+         "          git fetch origin \"$SHA\" && git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head off a single job instead of the run that owns it, "
+        "which is the same field under a different noun",
+    ),
+    Mutation(
+        # The fork's code arriving as a build product rather than as a
+        # commit. `GET /repos/O/R/actions/artifacts` lists every artifact in
+        # the repository without naming a run, and the `{id}/zip` download
+        # under it is whatever the fork's own job uploaded -- so this row
+        # fetches no SHA at all and still puts attacker-controlled bytes on a
+        # runner holding this token, and then runs them. It is the reason the
+        # alternative is not only about `runs`.
+        #
+        # It pins the `artifacts` word. Take that one out and this row is
+        # SURVIVED with the other three still KILLED.
+        "B4-pull-request-target-api-actions-artifacts",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         "          A=$(gh api \"repos/$GITHUB_REPOSITORY/actions/artifacts"
+         "?per_page=1\" --jq '.artifacts[0].id')\n"
+         "          gh api \"repos/$GITHUB_REPOSITORY/actions/artifacts"
+         "/$A/zip\" > a.zip\n"
+         "          unzip -o a.zip -d ./incoming && ./incoming/run.sh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "download whatever the fork's own job uploaded and run it, which is "
+        "the fork's code without a commit anywhere in the story",
+    ),
+    Mutation(
+        # The safe side of the `/actions/` alternative, and the reason it
+        # carries four last words instead of closing the segment. A
+        # composite action lives at `.github/actions/<name>/action.yml` in
+        # this repository, so `/actions/` with an ordinary directory after it
+        # is a path a lint step has every reason to write, and the word
+        # `actions` next to a slash is not an endpoint. OVERSHOT here means
+        # the alternative has been widened to the segment -- which is the
+        # obvious tightening, and a suite that reds on the first step that
+        # looks at a composite action.
+        "B4-pull-request-target-api-actions-path-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Lint the composite actions\n"
+         "        run: |\n"
+         "          ls .github/actions/\n"
+         "          yamllint .github/actions/setup/action.yml\n"
+         "          echo \"searching the actions directory\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "list and lint this repository's own composite actions, which is a "
+        "path with the endpoint's first word in it and no endpoint anywhere",
+        must_survive=True,
+    ),
+    Mutation(
+        # The run list from the client instead of over a path, indexed, and
+        # the pair to B4-pull-request-target-api-octokit-actions-destructured
+        # the way the `activity` pair two rows up works: `rest['actions']`
+        # puts a quote where the bare-namespace alternative wants a dot, so
+        # only the `rest`-and-punctuation alternative reads it. Measured:
+        # take `actions` out of that alternative and this row is SURVIVED
+        # while the destructured row below stays KILLED. `head_sha` is a
+        # field of the response rather than of the event, so no
+        # head-spelling rule sees it. Pinned to the real action's SHA like
+        # its neighbours.
+        "B4-pull-request-target-api-octokit-actions-indexed",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const r = await github.rest['actions']"
+         ".listWorkflowRunsForRepo({\n"
+         "              ...context.repo\n"
+         "            });\n"
+         "            const sha = r.data.workflow_runs[0].head_sha;\n"
+         "            await exec.exec('git', ['fetch','origin', sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reach the workflow-run list through the client the action already "
+        "hands the script, indexing the namespace the way the `activity` "
+        "row above indexes its own",
+    ),
+    Mutation(
+        # The same namespace destructured off the client, which the
+        # `rest`-and-punctuation alternative cannot read: `const { actions }
+        # = github.rest` writes `rest` with a semicolon after it and the call
+        # below writes no `rest` at all. Measured: take `actions` out of the
+        # bare-namespace alternative and this row is SURVIVED while the
+        # indexed row above stays KILLED.
+        "B4-pull-request-target-api-octokit-actions-destructured",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const { actions } = github.rest;\n"
+         "            const r = await actions.listWorkflowRunsForRepo({\n"
+         "              ...context.repo\n"
+         "            });\n"
+         "            const sha = r.data.workflow_runs[0].head_sha;\n"
+         "            await exec.exec('git', ['fetch','origin', sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "pull the run namespace off the client once and call it by its own "
+        "name, which is ordinary JavaScript and writes no `rest` where a "
+        "rule keyed on `rest` is looking",
+    ),
+    Mutation(
+        # Search, indexed, and this is the round-10 lesson arriving one
+        # namespace late. `gh api "search/issues?q=..."` has had a row here
+        # since that round and is refused by the `/issues` path -- and the
+        # client spelling of the identical query was green until round 20,
+        # which is precisely the mistake round 10 was a correction for.
+        # `issuesAndPullRequests` needs no number: every item it returns that
+        # is a pull request carries `pull_request.patch_url`, and `git am` on
+        # the other end of a `curl` puts the fork's changes on the default
+        # branch. `is:pr` is deliberately *not* in the query -- the argument
+        # backstop reads the `pr` in it and would kill this row for a reason
+        # that has nothing to do with the namespace.
+        #
+        # It pins `search` in the `rest`-and-punctuation alternative, the way
+        # the indexed `actions` row does one namespace along: take that word
+        # out and this row is SURVIVED with the destructured row below still
+        # KILLED.
+        "B4-pull-request-target-api-octokit-search-indexed",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const r = await github.rest['search']"
+         ".issuesAndPullRequests({\n"
+         "              q: 'repo:${{ github.repository }} state:open'\n"
+         "            });\n"
+         "            const u = r.data.items[0].pull_request.patch_url;\n"
+         "            await exec.exec('bash', ['-c',\n"
+         "              'curl -sL ' + u + ' | git am']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "search the repository for its own open items and apply the first "
+        "one's patch, which needs no pull request number anywhere",
+    ),
+    Mutation(
+        # The same namespace destructured, which is the half no rule keyed on
+        # `rest` can read. Measured: take `search` out of the bare-namespace
+        # alternative and this row is SURVIVED while the indexed row above
+        # stays KILLED.
+        "B4-pull-request-target-api-octokit-search-destructured",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const { search } = github.rest;\n"
+         "            const r = await search.issuesAndPullRequests({\n"
+         "              q: 'repo:${{ github.repository }} state:open'\n"
+         "            });\n"
+         "            const u = r.data.items[0].pull_request.patch_url;\n"
+         "            await exec.exec('bash', ['-c',\n"
+         "              'curl -sL ' + u + ' | git am']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "pull the search namespace off the client once and call it by its "
+        "own name, which writes the namespace where no rule keyed on `rest` "
+        "is looking",
     ),
     Mutation(
         # The web link the diff rule must not catch, and the control that
