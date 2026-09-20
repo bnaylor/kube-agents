@@ -420,10 +420,20 @@ _GH_PULL_REQUEST_WORD = re.compile(r"(?<![\w-])pr" + _COMMAND_WORD_END)
 # It costs `hub pr checkout` and any other client with `gh`'s argument shape
 # and a plain name of its own -- a hole this leaves open deliberately rather
 # than one it does not know about, because closing it means a denylist of
-# program names, which is the thing this rule exists to stop needing. It is
-# also what keeps `is:pr` inside a `gh api search/issues` query green: the
-# `:` is not a word character so the lookbehind matches, but `gh` is a name,
-# and the query is refused by its path anyway.
+# program names, which is the thing this rule exists to stop needing.
+#
+# It was credited here with keeping `is:pr` inside a `gh api search/issues`
+# query green too, on the reading that `gh` is a name. It does not, and
+# round 18 measured that rather than read it: the walk hands the backstop
+# the first and the *last* word of the invocation, the last word of that one
+# is the query `"search/issues?q=repo:$REPO+is:pr"`, and a query is not a
+# name either. The backstop fires on that `pr` and the step is refused twice
+# over, by its path and by this rule -- which is what
+# B4-pull-request-target-api-search-issues already records and is measured
+# to hold. Identical at 8afbbf68, so nothing on this branch changed it; the
+# sentence was wrong when it was written. What this rule keeps green is a
+# readable program with a `pr` among its arguments, which is the
+# `./tools/high` case above.
 _READABLE_PROGRAM = re.compile(r"\A[\w./@-]+\Z")
 
 # What comes off a word before the walk reads it. Quotes were already stripped
@@ -2940,22 +2950,31 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         reporting `ok`.
 
         Not covered, each line re-run against this version of the file on
-        2026-09-19 rather than carried forward:
+        2026-09-20 rather than carried forward:
 
         The API in a spelling none of the rules over it read. Those rules
         are an allowlist of three `gh` verbs, an allowlist of two subcommands
         under the two of them that take one, the same subcommand allowlist
-        again anchored on the argument rather than on the program, the
-        `/pulls` and `/issues` path segments, the `pull/N.diff` web endpoint,
-        and either of those two namespaces on the Octokit client a `script:`
-        is handed. Every allowlist among them replaced a denylist that lost,
-        and each loss is recorded at the constant. The verb allowlist is the
+        again anchored on the argument rather than on the program -- reading,
+        since round 18, every program a pipeline or a substitution could hand
+        that argument to rather than only the segment it is written in -- the
+        `/pulls`, `/issues` and `/events` path segments, the last of those
+        matched only where nothing follows it, so that a `docs/events/`
+        directory and an `events.yml` are not, the `pull/N.diff` and
+        `pull/N.patch` web endpoints, and any of the three namespaces
+        `pulls`, `issues` and `activity` on the Octokit client a `script:` is
+        handed. This said two path segments, one web spelling and two
+        namespaces until round 18: round 17 widened all three and the
+        sentence did not move with them, which is the failure mode a
+        summary written beside a pattern has. Every allowlist among them
+        replaced a denylist that lost, and each loss is recorded at the
+        constant. The verb allowlist is the
         sharpest reason: `gh alias set co 'pr checkout'` renames a governed
         verb into an ungoverned one, so no list of dangerous verbs can be
         finished.
 
-        What is left is the call made without naming `pulls` or `issues` and
-        without an allowlisted `gh` verb: a GraphQL query for
+        What is left is the call made without naming any of those paths or
+        namespaces and without an allowlisted `gh` verb: a GraphQL query for
         `pullRequest(number:)`, or `github.request("GET
         /repos/{owner}/{repo}/pulls/{n}")` spelled with the path in a
         variable. The GraphQL one is the one worth writing down: that
@@ -2986,13 +3005,21 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
 
         A step that splits the accessor itself, in either language:
         `globalThis['proc'+'ess']['e'+'nv']['GITHUB_EVENT_'+'PATH']`, or
-        `getattr(__import__("o"+"s"), "environ")`. `process.env`,
-        `process['env']`, `os.environ`, a bare `environ[...]` in any case,
-        perl's `%ENV` and `$ENV{...}`, and `getenv` are all refused as of
+        `getattr(__import__("os"), "envi"+"ron")`. `process.env`,
+        `process['env']`, `os.environ`, a bare `environ` in any case, perl's
+        `%ENV` and `$ENV{...}`, and `getenv` are all refused as of
         2026-09-19, and so is the directory the file
-        sits in, so this residual now takes string arithmetic over the
-        accessor rather than over the variable's name. Narrower is not
-        closed.
+        sits in, so this residual takes string arithmetic over the accessor
+        rather than over the variable's name. Narrower is not closed.
+
+        The Python half of that pair read `getattr(__import__("o"+"s"),
+        "environ")` until round 18, which is a carrier this test refuses:
+        the arithmetic there is over the module's name and the accessor is
+        still written out, and `environ` is refused on its own, without the
+        subscript this list credited it with needing. Measured RED on this
+        tree and RED at 8afbbf68, so the line named a residual that had
+        already closed under it -- the same failure as the sentence above,
+        one rule along.
 
         A container image that names the fork without an expression.
         `container:` and `services:` are read as of 2026-09-19 and held

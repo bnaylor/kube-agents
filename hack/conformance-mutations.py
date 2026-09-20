@@ -24,12 +24,12 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Twenty-one rows print this on a green run, and the SURVIVED
-             line above is exactly the wrong reading of them: the suite
-             staying green is the property they assert. `--list` is the
-             authority on how many there are, because it marks each one;
+             Twenty-three rows print this on a green run, and the
+             SURVIVED line above is exactly the wrong reading of them: the
+             suite staying green is the property they assert. `--list` is
+             the authority on how many there are, because it marks each one;
              this line said twenty through the round in which there were
-             twenty-one.
+             twenty-one, and twenty-one through the round that added two.
     BASELINE POLLUTED
              not a per-row verdict but a line printed after the run: the
              suite is not green once every mutation has been restored, so
@@ -84,10 +84,10 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: twenty-one today, which `--list` is the authority on rather than this
-    #: comment -- it marks each control `[control]`, and the list below named
-    #: ten on 2026-09-19 when there were eleven, and one of the ten by an id
-    #: no row had:
+    #: twenty-three today, which `--list` is the authority on rather than
+    #: this comment -- it marks each control `[control]`, and the list below
+    #: named ten on 2026-09-19 when there were eleven, and one of the ten by
+    #: an id no row had:
     #: A3-fastpath-redundant,
     #: B1-denylist-rule,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
@@ -95,6 +95,8 @@ class Mutation:
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
     #: B4-pull-request-target-api-gh-wrapped-readable-program,
+    #: B4-pull-request-target-api-gh-pipeline-readable-program,
+    #: B4-pull-request-target-api-gh-substitution-ordinary,
     #: B4-pull-request-target-run-env-ordinary-shell,
     #: B4-pull-request-target-run-environment-word,
     #: B4-pull-request-target-run-array-index-walk,
@@ -1313,6 +1315,16 @@ Mutation(
         # The head without the code, which is enough: the SHA is what the
         # fetch on the next line needs. `gh pr view` is on the backstop for
         # this and not because viewing is dangerous.
+        #
+        # Two rules read it since round 18 rather than one, and both read
+        # the same list. The `pr` sits inside a `$(...)` whose enclosing
+        # word is `REV=`, which is no name, so `_receiving_programs` hands
+        # the argument backstop an unreadable program and it refuses `view`
+        # for not being in `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS` -- the
+        # allowlist `_unsafe_gh_pull_request_commands` was already refusing
+        # it against. Re-proved against the anchor rather than assumed: put
+        # `view` on that list and this row is SURVIVED, because the constant
+        # is what both readers read.
         "B4-pull-request-target-api-gh-pr-view",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1337,7 +1349,12 @@ Mutation(
         # `checkout`, `diff` and `view` and nothing else. The four rows here
         # and below are why that pattern is now an allowlist: this one, the
         # collection endpoint, the interposed flag and the client library
-        # were all green at 5863df72.
+        # were all green at 5863df72. Read twice since round 18, for the
+        # reason B4-pull-request-target-api-gh-pr-view is: the `pr` is
+        # inside a `REV=$(...)` and the argument backstop reaches it too.
+        # Re-proved the same way -- put `list` on
+        # `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS` and this row is SURVIVED,
+        # because the allowlist is what both readers read.
         "B4-pull-request-target-api-gh-pr-list",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1408,8 +1425,13 @@ Mutation(
         # difference from B4-pull-request-target-api-octokit-pulls, which is
         # why _PULL_REQUEST_API reads `rest` and the punctuation after it
         # instead of a literal `rest.pulls`. Without that this row survives
-        # and the row above still kills, so the pair is what pins the
-        # difference rather than either one alone.
+        # and B4-pull-request-target-api-octokit-pulls still kills, so the
+        # pair is what pins the difference rather than either one alone.
+        # Measured again in round 18: the plain-dot spelling leaves this row
+        # SURVIVED and that one KILLED. The row it names sits two rows
+        # *below* this one rather than above it, which is what this comment
+        # said until then -- counting neighbours is how a comment goes wrong
+        # when a row is inserted between them, so it names the id now.
         "B4-pull-request-target-api-octokit-pulls-indexed",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1529,8 +1551,13 @@ Mutation(
         # and refused for not being on `_SAFE_GH_VERBS`. The punctuation
         # strip earns its place on the safe side instead, at
         # B4-pull-request-target-api-gh-argv-vector-write. Pinned to the real
-        # action's SHA, like the two rows above: an unpinned one would trip
-        # C4's sweep and the verdict would stop saying which rule caught this.
+        # action's SHA, like B4-pull-request-target-api-octokit-pulls and
+        # B4-pull-request-target-api-octokit-pulls-indexed: an unpinned one
+        # would trip C4's sweep and the verdict would stop saying which rule
+        # caught this. Those are the two other rows here that run an action
+        # at all -- this said "the two rows above" until round 18, and the
+        # row immediately above is B4-pull-request-target-api-gh-quoted-
+        # command, which is a `run:` step with no `uses:` in it.
         "B4-pull-request-target-api-gh-argv-vector",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1677,6 +1704,16 @@ Mutation(
         # this workflow declares none above the step, so a step that declares
         # none of its own ends where its script does; the token is passed as
         # a one-command assignment for the same reason.
+        #
+        # It stopped pinning that terminator in round 18 and no longer pins
+        # anything on its own. The step writes `pr checkout` upstream of the
+        # pipe, and `_receiving_programs` now reads the far side of a pipe
+        # as a program those words could reach, so the backstop refuses this
+        # step whether or not `_GH_COMMAND` matched: neuter the `\Z`
+        # alternative and this row is still KILLED, where at 8afbbf68 it was
+        # SURVIVED. Both measured. What pins the end of the text now is
+        # B4-pull-request-target-api-gh-trailing-program-word-no-arguments
+        # below, whose step has no `pr` in it for the backstop to read.
         "B4-pull-request-target-api-gh-trailing-program-word",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
