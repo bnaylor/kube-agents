@@ -1097,6 +1097,46 @@ _ENVIRONMENT_ENUMERATION = re.compile(
 # which is what the failure message asks for.
 _INDIRECT_EXPANSION = re.compile(r"\$\{!\w+\b(?![@*]\}|\[[@*]\]\})")
 
+# The same read, in the two spellings that assemble the name without writing
+# `${!`. Round 13 refused one syntax and called it the axis; bash reaches a
+# variable by a computed name three ways, and the other two were green.
+#
+# `declare -n r=$v` is a nameref: `r` becomes another word for the variable
+# *named* by `v`, so every later `$r` is a read of a name this file cannot
+# see, and `v=GITHUB_; v=${v}HEAD_REF; declare -n r=$v` is
+# `_INDIRECT_EXPANSION`'s own row with the sigil swapped for a declaration.
+# `eval "B=\$$v"` is the same thing done by re-parsing: the backslash keeps
+# the first `$` out of the first expansion, so the shell expands `$v` into
+# `$GITHUB_HEAD_REF` and then runs the assignment against the text it just
+# built. Neither spells `${!`, and neither spells the variable.
+#
+# The nameref is refused by its flag rather than by what is bound to it,
+# which is the `_READABLE_PROGRAM` answer a third time. `declare -n
+# r=GITHUB_SHA` names a variable the allowlist can read and is refused with
+# the rest, because telling it from `declare -n r=$v` means reading an
+# assignment's right-hand side in a language nobody here parses, and the
+# flag is the part that is always written down. `-a`, `-i`, `-p`, `-r` and
+# `-x` keep their word: only the letter that makes a reference is refused,
+# so `declare -a tools=(jq yq)` stays green and the control that holds it
+# there is the one the enumeration rule already needed.
+#
+# The `eval` alternative is anchored on a *deferred* dollar -- `\$` or `$$`
+# -- rather than on the word, because the ordinary uses of `eval` expand
+# once and this one expands twice. `eval "$(ssh-agent -s)"` is how every
+# workflow that loads a key starts, `eval "$cmd"` runs a command line built
+# earlier, and neither has a dollar that survives the first pass. A dollar
+# that does survive is there to name something the second pass will find,
+# and what it finds is chosen at run time -- which is the property, not the
+# syntax.
+#
+# What this costs is a lookup table keyed by name and a `local -n` helper in
+# a long script, which are the same line of review `_INDIRECT_EXPANSION`
+# costs and the same `case` statement away from naming the variables.
+_COMPUTED_NAME_READ = re.compile(
+    r"\b(?:declare|typeset|local)[ \t]+-[a-zA-Z]*n[a-zA-Z]*\b"
+    r"|\beval\b[^\n]*?(?:\\\$|\$\$)\{?\$?\w"
+)
+
 # A backslash before a newline is not a line break: the shell removes both
 # before the command runs. Every pattern here is line-oriented -- `[^\n]*?`
 # in the refspec, a walk that stops at `\n` in the `gh` helper -- so
@@ -3101,6 +3141,25 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                             "`${!NAME}`, which expands the variable "
                             "*named* by NAME, so the name this resolves to "
                             "is assembled at run time and is not in the "
+                            "text for the allowlist to hold against "
+                            "_SAFE_RUNNER_VARIABLES. Name the variable you "
+                            "want",
+                        )
+                        # And the same read in the two spellings that carry
+                        # no `${!`. A nameref binds a second word to a
+                        # variable chosen at run time and an `eval` with a
+                        # deferred dollar builds the expansion and then runs
+                        # it, so both reach `GITHUB_HEAD_REF` with the name
+                        # assembled -- which is one rule with the one above,
+                        # kept as two patterns because the syntaxes share no
+                        # substring and a row has to be able to pin each.
+                        self.assertIsNone(
+                            _COMPUTED_NAME_READ.search(reachable),
+                            f"{path.name}: a step reads a variable whose "
+                            "name it assembles -- a `declare -n` nameref, or "
+                            "an `eval` over a `$` it escaped so that the "
+                            "second expansion resolves it. The name this "
+                            "lands on is built at run time and is not in the "
                             "text for the allowlist to hold against "
                             "_SAFE_RUNNER_VARIABLES. Name the variable you "
                             "want",

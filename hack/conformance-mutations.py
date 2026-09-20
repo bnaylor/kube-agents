@@ -2822,15 +2822,19 @@ Mutation(
         "operands does and what `set -euo pipefail` does not",
     ),
     Mutation(
-        # The names alone, with the value read afterwards. `compgen -e`
-        # prints what is exported and the `eval` reads one of them, so
-        # neither half has the variable's name written in it anywhere.
+        # The names alone, with nothing but the name written down.
+        # `compgen -e` prints what is exported and the loop picks the
+        # head-ref one out of the listing by a glob, so the variable's name
+        # is in the text in neither case the shell knows it by.
         #
-        # The read was `${!N}` until 2026-09-19, and `_INDIRECT_EXPANSION`
-        # now refuses that outright -- which would have left this row killed
-        # by a rule it is not aimed at, and the compgen alternative pinned
-        # by nothing. `eval` is the same read spelled so that only the dump
-        # is refusable.
+        # This row has been rewritten twice for the same reason, and the
+        # reason is worth keeping: a mutation that finishes its story with a
+        # read of the *value* gets killed by whichever rule refuses that
+        # read, and the alternative it was written to pin goes unpinned. It
+        # was `${!N}` until `_INDIRECT_EXPANSION` landed, then `eval
+        # "B=\$$N"` until `_COMPUTED_NAME_READ` landed, and it hands the
+        # name to `$GITHUB_OUTPUT` now -- which is a step the runner
+        # allowlists, so the listing is the only thing here to refuse.
         "B4-pull-request-target-run-compgen-dump",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2838,15 +2842,14 @@ Mutation(
          "        run: |\n"
          "          for N in $(compgen -e); do\n"
          "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
-         ' eval "B=\\$$N";; esac\n'
+         ' echo "name=$N" >> "$GITHUB_OUTPUT";; esac\n'
          "          done\n"
-         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "list the names of the exported variables and read the value of the "
-        "match through `eval`, which reaches it with neither half written "
-        "down",
+        "list the names of the exported variables and hand the head-ref "
+        "one's name to the next step, which reaches the listing with the "
+        "name written nowhere",
     ),
     Mutation(
         # The same dump with stderr folded into it, which is what somebody
@@ -2961,10 +2964,11 @@ Mutation(
     Mutation(
         # `compgen -e` lists what is exported; `compgen -v` lists every
         # variable the shell has, which is a superset of it. The rule read
-        # the narrower one only. The `eval` rather than `${!N}` is
-        # deliberate: with the indirect read here as well this row would die
-        # on `_INDIRECT_EXPANSION` and the `v` in the compgen alternative
-        # would be pinned by nothing.
+        # the narrower one only. The name handed on rather than the value
+        # read is deliberate, for the reason set out on the `-e` row: every
+        # spelling of the value read is refused by a rule of its own now,
+        # and any of them here would leave the `v` in the compgen
+        # alternative pinned by nothing.
         "B4-pull-request-target-run-compgen-variable-dump",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2972,14 +2976,13 @@ Mutation(
          "        run: |\n"
          "          for N in $(compgen -v); do\n"
          "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
-         ' eval "B=\\$$N";; esac\n'
+         ' echo "name=$N" >> "$GITHUB_OUTPUT";; esac\n'
          "          done\n"
-         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "ask compgen for every shell variable rather than for the exported "
-        "ones, which is the superset and the same read",
+        "ones, which is the superset and the same listing",
     ),
     Mutation(
         # And the long spelling of the pair. `-A variable` is `-v` and `-A
@@ -2993,9 +2996,8 @@ Mutation(
          "        run: |\n"
          "          for N in $(compgen -A variable); do\n"
          "            case $N in [Gg][Ii][Tt][Hh][Uu][Bb]_[Hh][Ee][Aa][Dd]*)"
-         ' eval "B=\\$$N";; esac\n'
+         ' echo "name=$N" >> "$GITHUB_OUTPUT";; esac\n'
          "          done\n"
-         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
@@ -3008,17 +3010,17 @@ Mutation(
         # enumeration is a parameter expansion and the eight alternatives
         # above -- every one of them anchored on a command word or, for the
         # `Env:` drive, on the cmdlet in front of it -- read none of
-        # it. The `eval` keeps this off `_INDIRECT_EXPANSION`'s pattern, so
-        # the name listing is what kills it.
+        # it. Only the name is handed on, which keeps this off both
+        # `_INDIRECT_EXPANSION` and `_COMPUTED_NAME_READ`, so the name
+        # listing is what kills it.
         "B4-pull-request-target-run-prefix-name-listing",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
          "      - name: Fetch the pull request\n"
          "        run: |\n"
          '          for v in "${!GITHUB_@}"; do\n'
-         '            case $v in *HEAD_REF) eval "B=\\$$v";; esac\n'
+         '            case $v in *HEAD_REF) echo "name=$v" >> "$GITHUB_OUTPUT";; esac\n'
          "          done\n"
-         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
@@ -3047,6 +3049,74 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "build the variable's name out of two halves and read it "
         "indirectly, so the name the read resolves to is never in the text",
+    ),
+    Mutation(
+        # The same assembled name bound to a second word instead of read
+        # through a sigil. `declare -n r=$v` is a bash nameref: `r` becomes
+        # another name for the variable *named* by `v`, so `"$r"` is an
+        # ordinary-looking expansion of a variable this file cannot
+        # identify. It is not `${!`, and it was green. It pins the nameref
+        # alternative of `_COMPUTED_NAME_READ`.
+        "B4-pull-request-target-run-nameref",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          v=GITHUB\n"
+         '          v="${v}_HEAD_REF"\n'
+         "          declare -n r=$v\n"
+         '          git fetch origin "$r" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "bind a nameref to the variable whose name the script assembled, "
+        "which reads it through a word of the script's own choosing",
+    ),
+    Mutation(
+        # And the same read done by re-parsing. The backslash keeps the
+        # first `$` out of the first expansion, so the shell expands `$v`
+        # into the text `$GITHUB_HEAD_REF` and then runs the assignment
+        # against what it just built. No `${!`, no nameref, and the variable
+        # spelled nowhere. It pins the `eval` alternative of
+        # `_COMPUTED_NAME_READ`, and it is the read three rows in the
+        # enumeration block used to finish their story with.
+        "B4-pull-request-target-run-eval-deferred-dollar",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          v=GITHUB\n"
+         '          v="${v}_HEAD_REF"\n'
+         '          eval "B=\\$$v"\n'
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "escape the dollar so the second expansion resolves it, which "
+        "reaches the variable with the name built between the two passes",
+    ),
+    Mutation(
+        # The safe side of the row above, and the reason it is anchored on a
+        # deferred dollar rather than on the word. `eval "$(ssh-agent -s)"`
+        # is how every workflow that loads a key starts and `eval "$cmd"`
+        # runs a command line built earlier; both expand once, and neither
+        # has a dollar that survives the first pass to name something the
+        # second one finds. KILLED here means `eval` has been banned, which
+        # is a suite that reds on the standard two lines of ssh setup.
+        "B4-pull-request-target-run-eval-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Load the deploy key\n"
+         "        run: |\n"
+         '          eval "$(ssh-agent -s)"\n'
+         '          cmd="git fetch origin main"\n'
+         '          eval "$cmd"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "start an ssh agent and run a command line held in a variable, "
+        "which is `eval` used the two ways a workflow legitimately uses it",
+        must_survive=True,
     ),
     Mutation(
         # The same table out of the kernel rather than out of the shell.
