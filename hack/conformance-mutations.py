@@ -1664,17 +1664,37 @@ Mutation(
         # invocation is refused for being unreadable, which is the answer
         # this file gives an unresolvable ref one field along.
         #
-        # It is not the only thing pinning that, which is the round-17
-        # correction: restore the old skip and three rows flip -- this one,
-        # `api-gh-trailing-program-word` and
-        # `api-gh-copied-to-a-readable-name`. The claim it replaces was read
-        # off the table rather than measured, and the reading was that every
-        # other stdin spelling writes a `pr` the backstop can reach.
-        # `echo "pr checkout $N" | xargs gh` does write one, but the word in
-        # front of it is `echo`, a name `_READABLE_PROGRAM` reads, so the
-        # backstop declines it on purpose. What is still true of this row
-        # alone is narrower: it is the only one of the three whose workflow
-        # text contains no `pr` anywhere.
+        # It is not the only thing pinning that, and the three rows are not
+        # the three round 17 measured. Re-measured 2026-09-20 on the full
+        # unfiltered sweep: restore the old skip and this one,
+        # `api-gh-copied-to-a-readable-name` and
+        # `api-gh-trailing-program-word-no-arguments` go SURVIVED, with the
+        # other 253 verdicts unmoved. The count survived round 18 and the
+        # membership did not. `api-gh-trailing-program-word` was the third
+        # and is not one now: `_receiving_programs` reads the far side of
+        # its pipe, the word standing there is `GH_TOKEN=${{`, which is no
+        # name, so the argument backstop refuses that step whether or not
+        # the verb walk ever saw a `gh`. The row added beside it in the same
+        # round took its place.
+        #
+        # The reason round 17 gave for listing it has not survived either,
+        # and that half was wrong in its own terms rather than overtaken.
+        # It said `echo "pr checkout $N" | xargs gh` is declined because the
+        # word in front of the `pr` is `echo`, a name `_READABLE_PROGRAM`
+        # reads. The bare shape is still declined -- measured -- but the
+        # backstop is handed `echo`, `xargs` and `gh` now and declines
+        # because all three are names, not because the first one is; and the
+        # row it was explaining does not write the bare shape.
+        #
+        # What is this row's alone is not the `pr` claim it replaces --
+        # `...-no-arguments` has no `pr` in its workflow text either. It is
+        # the terminator. This row's `gh` is followed by a newline, so it is
+        # a command word under the set this file started with, `[\s'",]`,
+        # while the other two are each the row for an alternative added to
+        # `_COMMAND_WORD_END` later: `_COMMAND_SEPARATORS` for the `)` in
+        # `copied-to-a-readable-name`, the end of the text for
+        # `...-no-arguments`. Measured over the three step texts against
+        # each terminator set in turn.
         "B4-pull-request-target-api-gh-arguments-unreadable",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
