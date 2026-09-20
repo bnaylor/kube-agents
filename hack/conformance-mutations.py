@@ -686,9 +686,24 @@ Mutation(
         # action as `INPUT_REF`, which is the same input `ref` sets. On
         # `actions/checkout` the uppercase spelling was caught by accident --
         # a `with.get("ref")` read nothing, and the must-carry-a-ref rule
-        # fired. On any other action there is no such rule, so this step went
-        # green. Same fictitious SHA-pinned vendor as the third-party row, so
-        # C4's pin sweep is not the thing that catches it.
+        # fired -- and on any other action there was no such rule, which is
+        # what `_with_inputs`'s case-fold closed.
+        #
+        # This row does not pin that case-fold, and its comment claimed to
+        # until round 16. `github.event.pull_request.head.sha` is on no
+        # allowlist in the file: `_step_scripts` folds every string `with:`
+        # value into the step's script, and the script-expression allowlist
+        # refuses the SHA there whether or not the checkout half ever reads
+        # the key. Fold the case away -- `str(key) == name` -- and the row is
+        # still KILLED, on that allowlist rather than on the ref one.
+        # Measured, not reasoned. So what it pins is the carrier: an
+        # upper-case input key on a third-party action is a checkout, and one
+        # of the two rules that read a checkout has to refuse it. The
+        # case-fold itself is pinned by the row below, which names an
+        # expression the script half allows.
+        #
+        # Same fictitious SHA-pinned vendor as the third-party row, so C4's
+        # pin sweep is not the thing that catches it.
         "B4-pull-request-target-checkout-ref-case",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -702,6 +717,36 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "spell the input key in a case a lowercase lookup does not read, "
         "which GitHub resolves to the same input",
+    ),
+    Mutation(
+        # The case-fold in `_with_inputs`, isolated -- the row above cannot
+        # isolate it, and this one is what proves the fold decides a verdict.
+        # The value is the pull request's *number*, which is on
+        # `_SAFE_SCRIPT_EXPRESSIONS` and not on `_SAFE_CHECKOUT_EXPRESSIONS`:
+        # the number is the concession the two labelling carriers need, and a
+        # number is not a ref, so nothing here can say what the checkout that
+        # resolves it lands on in the fork. The script half therefore passes
+        # this `with:` value and the checkout half is the only rule left that
+        # can refuse it -- and the only way that half reads an input spelled
+        # `Ref:` is the fold. Revert it to `str(key) == name` and this row
+        # goes SURVIVED while every other checkout row stays KILLED.
+        #
+        # The lower-case spelling of the same value reds either way, which is
+        # the measurement that says the fold is the difference rather than
+        # the expression.
+        "B4-pull-request-target-checkout-ref-case-number",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Check out a ref the script allowlist would pass\n"
+         "        uses: some-vendor/checkout-action"
+         "@1b0c5f0f0f0e5ec9b0f4a2e6d7c8b9a0f1e2d3c4 # v1.2.3\n"
+         "        with:\n"
+         "          Ref: ${{ github.event.pull_request.number }}\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "spell the input key in a case a lowercase lookup does not read, and "
+        "fill it with the one pull-request expression a step may name",
     ),
     Mutation(
         # The run half's version of the `env:` dodge, named the way GitHub
