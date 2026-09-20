@@ -2779,8 +2779,14 @@ Mutation(
         # is not the name the shell would expand and is exactly the name
         # `grep -i` matches. The allowlist over the names reads nothing
         # here, and this was green until 2026-09-19. It is the row
-        # `_ENVIRONMENT_ENUMERATION` exists for, and the six that follow are
-        # its other spellings, one row each because they share no substring.
+        # `_ENVIRONMENT_ENUMERATION` exists for, and the rule's eight other
+        # alternatives are spelled out one at a time below -- `printenv`,
+        # `declare`, `export`, `set`, `compgen`, the `${!prefix@}` listing,
+        # BSD's `ps e` and PowerShell's `Env:` drive. They share no
+        # substring, so no one mutation reaches two. A row each is the floor
+        # rather than the count: `compgen` takes three of its own for the two
+        # letters and the long form, and `env` takes four more for its
+        # terminators and for being run by its path.
         "B4-pull-request-target-run-env-dump-grep",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
