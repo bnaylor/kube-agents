@@ -311,7 +311,7 @@ leave alone, a `pr checkout` run through `timeout` against a
 local tool with a plain name, which the rule against a wrapper hiding an
 unreadable `gh` must not catch, a job declaring `defaults.run.shell:
 bash`, which reading the `shell:` field at all must not object to, a script
-that comments three of its lines and takes a revision out of a backtick
+that comments four of its lines and takes a revision out of a backtick
 substitution, neither of which the two terminators added to the environment
 dump may reach on their own, a second backtick substitution with the pull
 request mentioned in prose two lines under it, which the walk out of a
