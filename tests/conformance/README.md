@@ -261,27 +261,33 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-256 mutations: 211 KILLED, 22 NOISY, twenty-three `must_survive` controls,
+267 mutations: 220 KILLED, 22 NOISY, twenty-five `must_survive` controls,
 zero genuine survivors, zero stale — measured 2026-09-20 against this branch;
 re-run the harness rather than trusting these numbers, which is the sentence
 this paragraph exists to make cheap. It is also the sentence this paragraph
 keeps not taking: the control count was twenty here for the round in which
 `--list` marked twenty-one, the list below named seventeen of the eighteen
-B4 controls it claimed, and the round after that the numbers were four rows
-behind the tree again. Count them with `--list`, which marks each one
-`[control]`, rather than by reading this. Two of the twenty-three are
+B4 controls it claimed, the round after that the numbers were four rows
+behind the tree again, and the round after that left every figure here nine
+rows behind and the list below one control short. Three rounds running, and
+each time the numbers were true of the round before. Count them with
+`--list`, which marks each one `[control]`, rather than by reading this.
+Two of the twenty-five are
 outside B4 — `A3-fastpath-redundant`, which pins a deliberate redundancy in
 the shorthand handling, and `B1-denylist-rule`, which pins a rule-id rename
 in the operator's shipped denylist as a change that must not redden the
 suite. This paragraph called that second one "on the harness itself" until
 round 18, which is its own pretext read too quickly; no control here is on
-the harness. The remaining twenty-one are over B4's `pull_request_target`
+the harness. The remaining twenty-three are over B4's `pull_request_target`
 rules: a checkout whose allowlisted ref is reached through `${{ Env.SAFE }}`,
 a case the expansion must keep green and which closes no hole, the `gh`
 walk's skip of a flag's value, the same
 walk's stripping of quotes and brackets off an argument vector, the `issue`
 verb on its allowlist, the bare `pull/N` web link that the rule against the
-`pull/N.diff` endpoint must not catch, a job running in a pinned public image
+`pull/N.diff` endpoint must not catch, a step that lists and lints this
+repository's own composite actions under `.github/actions/`, which is a path
+with the `/actions/` endpoint's first word in it and no endpoint anywhere, a
+job running in a pinned public image
 with a pinned public service beside it, a step logging `${GITHUB_REPOSITORY}`
 and `${GITHUB_SHA}`, a `git clone --bare` of this repository, which the rule
 against `--mirror` must not catch, a `git log --merges --max-count=1`, whose
@@ -301,7 +307,10 @@ unreadable `gh` must not catch, a job declaring `defaults.run.shell:
 bash`, which reading the `shell:` field at all must not object to, a script
 that comments three of its lines and takes a revision out of a backtick
 substitution, neither of which the two terminators added to the environment
-dump may reach on their own, a `pwsh` step naming `$env:GITHUB_REPOSITORY`
+dump may reach on their own, a second backtick substitution with the pull
+request mentioned in prose two lines under it, which the walk out of a
+substitution has to count past in the older spelling exactly as it already
+counted past a `$( )` that had closed, a `pwsh` step naming `$env:GITHUB_REPOSITORY`
 and `$env:GITHUB_SHA`, which is how PowerShell names a variable rather than
 how a program reaches the mapping, an `eval "$(ssh-agent -s)"` beside an
 `eval "$cmd"`, which are the two ordinary uses of the word the rule against
@@ -316,8 +325,8 @@ pipe the argument backstop now reads across, and a `git commit -m
 in it, which the same backstop's walk out of a substitution must leave
 alone. Each of those edits is the _safe_
 spelling of something a workflow here legitimately does, and the control is
-that the suite does not object to it. Note that the summary line the harness prints accounts for 233
-of the 256: a `must_survive` control's verdict is
+that the suite does not object to it. Note that the summary line the harness prints accounts for 242
+of the 267: a `must_survive` control's verdict is
 `SURVIVED (expected)`, which is neither killed, noisy, nor a survivor. The run
 also prints `BASELINE POLLUTED` if the suite is not green once every mutation
 has been restored, which did not happen here and would invalidate every
