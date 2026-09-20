@@ -1692,6 +1692,39 @@ Mutation(
         "and which puts the program name at the end of the file",
     ),
     Mutation(
+        # The same last two bytes with no argument word anywhere in the
+        # step, and the row that pins the end of the text on its own. The
+        # row above stopped doing that in round 18: it writes `pr checkout`
+        # upstream of the pipe, `_receiving_programs` now reads the far side
+        # of that pipe as a program the words could reach, and the backstop
+        # refuses the step whether or not `_GH_COMMAND` ever matched -- so
+        # neuter the `\Z` alternative in `_COMMAND_WORD_END` and the row
+        # above is still KILLED, where before round 18 it was SURVIVED.
+        # Measured both ways round, against `8afbbf68` and against the
+        # commit that widened the walk.
+        #
+        # This one keeps the argument vector in the data file, so the step
+        # contains no `pr` for anything but `_GH_COMMAND` to read, and the
+        # only `gh` in it is the last two bytes of everything the rules see.
+        # Neuter `\Z` and it is SURVIVED with every other row still KILLED.
+        # It is `api-gh-arguments-unreadable` as a plain scalar, and the
+        # second line that row carries is dropped for the reason the row
+        # above is a plain scalar at all: a `gh` with anything after it is
+        # terminated by that instead.
+        "B4-pull-request-target-api-gh-trailing-program-word-no-arguments",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: jq -r '.argv[]' .github/gh-argv.json |"
+         " GH_TOKEN=${{ github.token }} xargs gh\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "keep the CLI's arguments in a data file and write the step as a "
+        "plain scalar, which is the tidying of the two rows it is between "
+        "applied at once",
+    ),
+    Mutation(
         # The CLI laundered into a name review *can* read, which is the
         # round-16 hole and the one shape both halves of the `gh` pair passed
         # for opposite reasons. `command -v gh` resolves the program and `cp`
@@ -1786,6 +1819,67 @@ Mutation(
         "the one that runs is not",
     ),
     Mutation(
+        # The arguments written by one program and run by another, which is
+        # the round-18 hole and the two closed shapes composed. `echo "pr
+        # checkout $N" | xargs gh` is refused for naming the program and
+        # hiding the arguments; `g'h' pr checkout "$N"` is refused for naming
+        # the arguments and hiding the program; this writes the arguments
+        # with a third program, so the word in front of the `pr` is `printf`
+        # -- a name `_READABLE_PROGRAM` reads, which is the backstop's own
+        # reason for declining -- and `g'h'` holds no `gh` for `_GH_COMMAND`
+        # to find. Neither half had anything to hold and it was green,
+        # measured the same way against the `06adabac` export rather than
+        # introduced by the round that widened these rules last.
+        #
+        # It pins the downstream half of `_receiving_programs`: delete the
+        # pipeline walk and this row is SURVIVED with every other row still
+        # KILLED, and deleting the outward walk beside it leaves it KILLED,
+        # so the two halves are pinned apart rather than together. `xargs`
+        # is not what is being read -- the walk has no list of wrappers --
+        # and the same line with `-I{}`, `-n9`, `-0`, `-t` or `env` between
+        # the `xargs` and the name is refused for the same reason, measured.
+        "B4-pull-request-target-api-gh-arguments-through-a-pipe",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          printf 'pr checkout %s' \"$PR_NUMBER\" | xargs g'h'\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the command line with `printf` and run it with `xargs`, which "
+        "is how a step assembles a command out of a number it was handed",
+    ),
+    Mutation(
+        # The same launder with the pipe turned inside out. A command
+        # substitution's output is a word in the command around it, so this
+        # runs what the row above runs and reads, to a rule that asks the
+        # `pr`'s own segment, as a `printf` with readable arguments. It pins
+        # the outward half of `_receiving_programs`: delete the walk out of
+        # a substitution and this row is SURVIVED with every other row still
+        # KILLED, and deleting the pipeline walk beside it leaves it KILLED.
+        # The backtick spelling and a wrapper in front of the name --
+        # `timeout 60 g'h' $(...)` -- are the same edit and are measured
+        # rather than assumed.
+        "B4-pull-request-target-api-gh-arguments-through-a-substitution",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          g'h' $(printf 'pr checkout %s' \"$PR_NUMBER\")\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "build the argument list in a substitution rather than writing it "
+        "out, which is the line above with the pipe turned inside out",
+    ),
+    Mutation(
         # The safe side of the same word, and the hole `_READABLE_PROGRAM`
         # leaves open on purpose. A program with a plain name of its own and
         # `gh`'s argument shape is conceded -- closing it means a denylist of
@@ -1806,6 +1900,50 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "run a local tool with a readable name under a wrapper, which is a "
         "program this file concedes and a shape it must not read as `gh`",
+        must_survive=True,
+    ),
+    Mutation(
+        # The same concession one pipe along, and the safe side of the
+        # round-18 walk. `_receiving_programs` reads every segment
+        # downstream of the `pr` as a program the words could reach, and
+        # every one of them is still held to `_READABLE_PROGRAM`: a plain
+        # name at the end of a pipeline is a program review can read, the
+        # same way a plain name at the head of a segment is. OVERSHOT here
+        # means the walk has been written as "any `pr` upstream of a pipe",
+        # which reds on every step in this repository that builds a command
+        # line and runs it.
+        "B4-pull-request-target-api-gh-pipeline-readable-program",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Summarise the pull request\n"
+         "        run: printf 'pr checkout %s' 42 | xargs ./tools/high\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "run a local tool with a readable name over a pipeline, which is a "
+        "program this file concedes and a shape it must not read as `gh`",
+        must_survive=True,
+    ),
+    Mutation(
+        # Where the walk out of a substitution starts reading, which is one
+        # character and the whole false-positive budget. The enclosing
+        # command is read from the `$` rather than from the parenthesis,
+        # because `$(` is the substitution's own punctuation and never a
+        # program: read from the parenthesis and the word in front of every
+        # `"$(...)"` in this repository is a lone `$`, which no name is made
+        # of. OVERSHOT here means that character was lost, and this is the
+        # most ordinary substitution there is.
+        "B4-pull-request-target-api-gh-substitution-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Describe the pull request\n"
+         "        run: git commit --allow-empty -m"
+         " \"$(printf 'pr is open')\"\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put a generated message on a commit, which is the most ordinary "
+        "command substitution a step writes",
         must_survive=True,
     ),
     Mutation(
