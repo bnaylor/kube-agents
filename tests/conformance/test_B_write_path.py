@@ -2796,9 +2796,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         program abbreviates a *subcommand*, so `ls-remote` and `git-upload-pack`
         need no ladder of their own. The second is the `ref:` half's
         rule one field along: a step may name only the expressions in
-        `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only those, an
-        `actions/github-script` body may reach only the `context` properties
-        in `_SAFE_SCRIPT_CONTEXTS`, it may name only the runner variables in
+        `_SAFE_SCRIPT_EXPRESSIONS`, its `env:` may carry only those, its
+        script may reach only the `context` properties in
+        `_SAFE_SCRIPT_CONTEXTS` -- an `actions/github-script` body is where
+        that object arrives without being asked for, and not the only place
+        it arrives -- it may name only the runner variables in
         `_SAFE_RUNNER_VARIABLES`, and nothing in it may reach the webhook
         payload as a file or fetch it over HTTP. Those are the five languages
         the payload arrives in here -- an expression, a JavaScript property
@@ -3394,6 +3396,36 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `github-script` body interpolates nothing: it is
                         # handed the payload as `context` and reaches the
                         # head by property access.
+                        #
+                        # Read over the step's whole script rather than over
+                        # its `script:` input, and that is the property
+                        # rather than an oversight: a `run:` step reaches
+                        # the same object by importing it. `npm install
+                        # @actions/github` and then `node -e '...
+                        # a.context.payload.after ...'` puts the fork's head
+                        # on the runner, and the library reads
+                        # `GITHUB_EVENT_PATH` itself, so the step spells no
+                        # path, no expression and no payload file for any
+                        # other rule here to read. Measured rather than
+                        # argued: scope this to `script:` inputs with every
+                        # other rule left in place and that step goes green.
+                        # `B4-pull-request-target-run-context-payload` is
+                        # the row, and it is the only one that flips.
+                        #
+                        # What the wider read costs is a false red on the
+                        # word `context` in a `run:` meaning something else
+                        # -- `kubectl config current-context`, `make
+                        # docs-check-context-budget` -- which is a line of
+                        # review on a trigger where nothing writes either
+                        # and the job holds a writable token.
+                        # `context.repo` is the one spelling that goes
+                        # through, in a `run:` as in a `script:`, and it
+                        # opens nothing: an Octokit built beside it is
+                        # refused over its namespace, a payload file read
+                        # beside it over the file, and there is no route
+                        # from the word itself to anything the shell can
+                        # resolve. `B4-pull-request-target-run-context-repo`
+                        # holds that green.
                         reached = sorted({
                             match.group(0).strip()
                             for match in _SCRIPT_CONTEXT.finditer(script)
@@ -3403,7 +3435,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertEqual(
                             [],
                             reached,
-                            f"{path.name}: a script: input reaches "
+                            f"{path.name}: a step's script reaches "
                             f"{reached}, which is the webhook "
                             "payload -- the same fields the expression "
                             "allowlist refuses, in the language that runs",
