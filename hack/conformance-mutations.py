@@ -38,8 +38,13 @@ the file with `git checkout`, and reports:
              not a per-row verdict but a line printed after the run: the
              suite is not green once every mutation has been restored, so
              every verdict after whatever caused it is untrustworthy. It
-             changes the exit code, and the usual cause is stale bytecode --
-             see `_purge_bytecode`.
+             changes the exit code. Stale bytecode is what taught this line
+             to exist and is not what it catches now: `_purge_bytecode` runs
+             before every suite run and the suite runs under `-B` with
+             `PYTHONDONTWRITEBYTECODE` set, so no cache outlives a restore.
+             What is left is whatever a mutated run leaves behind that the
+             restore does not reach, the restore being a `git checkout` of
+             the one path the row names and nothing else.
 
 The summary line's `survived=` count is survivors *and* OVERSHOT controls,
 because both are the same news: a row whose verdict is not what it was
@@ -874,17 +879,22 @@ Mutation(
         # matched on a single line by construction, and one backslash was
         # all it took to spell the same command over two; that alternative
         # went with the rest of the verb list, and what catches this step
-        # now is the row above's assertion on the identical
-        # `github.event.after`.
+        # now is `B4-pull-request-target-run-pull`'s assertion on the
+        # identical `github.event.after`. Three rows above rather than the
+        # row above: `checkout-ref-newline` and `checkout-ref-null` sit
+        # between, and neither carries that expression at all. Measured by
+        # injecting both steps and reading which assertion fires -- `[] !=
+        # ['github.event.after']` for each.
         #
         # So this row does not pin the continuation join either, and saying
         # it did was the second half of the same stale comment. Measured:
         # neuter `_LINE_CONTINUATION` and one B4 row flips, and it is
         # `run-refspec-continued` rather than this one -- a refspec really
         # does have to be read across the backslash, and a step whose `env:`
-        # carries the ref does not. Kept as the two-line spelling of the row
-        # above, on the argument that a continuation is how anybody writes a
-        # git command with more flags than fit.
+        # carries the ref does not. Kept as the two-line spelling of
+        # `B4-pull-request-target-run-pull`, on the argument that a
+        # continuation is how anybody writes a git command with more flags
+        # than fit.
         "B4-pull-request-target-run-pull-continued",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1560,8 +1570,12 @@ Mutation(
         # is a quote followed by a comma, and without that the walk is never
         # handed the invocation. Measured, because the obvious reading is
         # wrong: revert `_GH_WORD_PUNCTUATION` to the old quote-only strip
-        # and this row still KILLS, because `['pr',` is then read as the verb
-        # and refused for not being on `_SAFE_GH_VERBS`. The punctuation
+        # and this row still KILLS, but on a word nobody would guess. The
+        # walk starts after the letters `gh`, so its first word is what is
+        # left of `', ` -- a bare `,` once the quote comes off -- and *that*
+        # is the verb, refused for not being on `_SAFE_GH_VERBS`. `['pr',`
+        # is one place further along, in the subcommand's seat, and is never
+        # consulted because the verb failed first. The punctuation
         # strip earns its place on the safe side instead, at
         # B4-pull-request-target-api-gh-argv-vector-write. Pinned to the real
         # action's SHA, like B4-pull-request-target-api-octokit-pulls and

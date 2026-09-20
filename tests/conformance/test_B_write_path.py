@@ -438,16 +438,22 @@ _READABLE_PROGRAM = re.compile(r"\A[\w./@-]+\Z")
 
 # What comes off a word before the walk reads it. Quotes were already stripped
 # because `gh pr "edit"` runs `edit`; the brackets and the comma are the
-# round-9 half, and without them widening the lookahead above buys nothing.
+# round-9 half, and what they buy is the safe side rather than the refusal.
 # `exec.exec('gh', ['pr', 'checkout', N])` splits on whitespace into `',`,
-# `['pr',`, `'checkout',` -- so the verb reads as `['pr'`, which is not `pr`,
-# and the invocation is skipped exactly as it was before. Stripping this
-# punctuation off both ends of every word, and dropping whatever that empties,
-# is what makes an argument vector read as the command line it is. It is a
-# strip rather than a parse, so a word is never split and a quoted string with
-# a space in it still arrives as two words; that can only produce more words
-# than the CLI sees, never fewer, and an extra word reads as an unrecognised
-# subcommand rather than as an allowlisted one.
+# `['pr',`, `'checkout',`. The walk starts after the letters `gh`, so with
+# quotes alone coming off, the verb is the first of those three -- a bare `,`
+# -- and `['pr',` sits behind it in the subcommand's seat, never read because
+# the verb failed first. Neither word is `pr`. So the checkout vector is
+# refused either way, on a word that is not the one it ran, and the write
+# vector that must stay green is refused on that same `,`: revert the strip
+# and `B4-pull-request-target-api-gh-argv-vector-write` OVERSHOTs, measured
+# rather than reasoned. Stripping this punctuation off both ends of every
+# word, and dropping whatever that empties, is what makes an argument vector
+# read as the command line it is. It is a strip rather than a parse, so a
+# word is never split and a quoted string with a space in it still arrives
+# as two words; that can only produce more words than the CLI sees, never
+# fewer, and an extra word reads as an unrecognised subcommand rather than as
+# an allowlisted one.
 _GH_WORD_PUNCTUATION = "\"'[],"
 
 # Where the walk stops. Not a shell parser: a separator inside a quoted
