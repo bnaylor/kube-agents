@@ -1117,9 +1117,16 @@ Mutation(
     Mutation(
         # And the legacy spelling of the same endpoint, which prefix-matches
         # the same way and is what the older documentation and every
-        # half-remembered example write. Its own alternative and its own row:
-        # `git/refs` is not a substring of `git/matching-refs`, so neither
-        # covers the other.
+        # half-remembered example write. Not its own alternative -- this
+        # comment said so until round 20 and the regex has never had one.
+        # There is a single alternative, `git/(?:matching-)?refs`, and the
+        # optional group is the whole difference between the two spellings.
+        # Its own *row*, though, because `git/refs` is not a substring of
+        # `git/matching-refs` and neither spelling covers the other, so the
+        # group has two halves and each needs pinning. Measured both ways:
+        # make `matching-` mandatory and this row is SURVIVED with
+        # B4-pull-request-target-run-matching-refs-endpoint still KILLED;
+        # drop the group for a literal `git/refs` and the two verdicts swap.
         "B4-pull-request-target-run-git-refs-endpoint",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2160,10 +2167,24 @@ Mutation(
         # B4-pull-request-target-api-gh-api-pulls. `listEventsForTimeline` is
         # the client method for `/issues/N/timeline`, so the path alternative
         # never sees it -- there is no slash anywhere in the call. The method
-        # name was its own alternative until round 10 and is not one now: what
-        # matches is `rest.issues`, which every route to that namespace writes
-        # once, a destructured one included. Pinned to the real action's SHA
-        # for the same reason as its neighbours.
+        # name was its own alternative until round 10 and is not one now:
+        # what matches is the namespace, which every route to it writes once.
+        #
+        # Which alternative reads it is what this comment got wrong until
+        # round 20. It credited `rest.issues` with reading "a destructured
+        # one included", and that is the one route `rest.issues` cannot
+        # read: `const { issues } = github.rest` writes a semicolon where
+        # the `rest`-and-punctuation alternative wants a dot, and what picks
+        # it up is the bare-namespace alternative --
+        # B4-pull-request-target-api-octokit-activity-destructured is the
+        # row that pins that, one namespace along. This row writes the
+        # namespace plainly, as `github.rest.issues`, which *both*
+        # alternatives match, so it pins neither on its own. Measured: take
+        # `issues` out of the `rest`-and-punctuation alternative and this
+        # row stays KILLED, take it out of the bare-namespace alternative
+        # and it stays KILLED, and only with both gone is it SURVIVED.
+        # Pinned to the real action's SHA for the same reason as its
+        # neighbours.
         "B4-pull-request-target-api-octokit-issues-timeline",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -3768,10 +3789,22 @@ Mutation(
         #
         # It pins `_ENUMERATION_GLUE`. Drop it from `_ENUMERATION_STOP` and
         # this row is SURVIVED on its own, the quoted row above staying
-        # KILLED. The glue is adjacency-only and the ordinary-shell controls
-        # are why: `export PATH="$PWD/bin:$PATH"` and `set $FLAGS` put a `$`
-        # one space along, and a space means the expansion is an argument
-        # rather than the rest of the program's name.
+        # KILLED.
+        #
+        # What it does not pin is the glue being *adjacency-only*, and this
+        # comment credited two controls with holding that until round 20.
+        # Neither does. `set $FLAGS` -- the line the argument at
+        # `_ENUMERATION_GLUE` is written about, where a space means the
+        # expansion is an argument rather than the rest of the program's
+        # name -- is carried by no row in this table. And `export
+        # PATH="$PWD/bin:$PATH"`, which B4-pull-request-target-run-backtick-
+        # and-comment and B4-pull-request-target-run-env-ordinary-shell both
+        # do carry, puts its `$` after a `PATH="` rather than after the
+        # builtin, so a glue relaxed to `[ \t]*\$` never reaches it either.
+        # Measured: relax it that way and the whole sweep is unchanged --
+        # nothing OVERSHOT, nothing SURVIVED. The adjacency is an argument
+        # with no row behind it, which is what this now says instead of
+        # naming two rows that do not make it.
         "B4-pull-request-target-run-env-dump-glued-expansion",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
