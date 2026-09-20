@@ -1944,6 +1944,105 @@ Mutation(
         "the script, which names no path for a path rule to read",
     ),
     Mutation(
+        # The event stream, which is the same question with the noun changed.
+        # `GET /repos/O/R/events` returns the repository's public timeline
+        # and a `PullRequestEvent` on it carries the whole pull request
+        # object, head SHA included, so this reads the head out of an
+        # endpoint that spells no `/pulls`, no `/issues`, no Octokit
+        # namespace and no `pull/N.diff`. Written with `curl` and no `gh`
+        # word anywhere on purpose: a fix hung off the `gh` walk would not
+        # reach this shape, and the row is what says so. Nothing but the
+        # `/events` alternative of `_PULL_REQUEST_API` pins it -- neuter that
+        # one alternative and this goes SURVIVED with every other row still
+        # KILLED. The SHA is grepped rather than named, so no head-spelling
+        # rule is in the picture either.
+        "B4-pull-request-target-api-events-endpoint",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          SHA=$(curl -s "
+         "\"https://api.github.com/repos/$GITHUB_REPOSITORY/events\""
+         " | grep -oE '[0-9a-f]{40}' | head -1)\n"
+         "          git fetch --depth=1 origin \"$SHA\"\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read the head off the repository's own event timeline, over the "
+        "public endpoint that needs no token at all",
+    ),
+    Mutation(
+        # The event stream from the client instead of over a path, indexed.
+        # `activity` is the Octokit namespace `listRepoEvents` lives under,
+        # and one quote is the whole difference from the row below the way it
+        # is between B4-pull-request-target-api-octokit-pulls-indexed and its
+        # own pair: `rest['activity']` puts a quote where the second
+        # namespace alternative wants a dot, so only the `rest`-and-
+        # punctuation alternative reads it. Measured: take `activity` out of
+        # that alternative and this row is SURVIVED while the destructured
+        # row below stays KILLED. The plainest spelling,
+        # `github.rest.activity`, is matched by both and so pins neither,
+        # which is why neither row is written that way.
+        "B4-pull-request-target-api-octokit-activity-indexed",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const ev = await github.rest['activity']"
+         ".listRepoEvents({\n"
+         "              ...context.repo\n"
+         "            });\n"
+         "            const sha = JSON.stringify(ev.data)"
+         ".match(/[0-9a-f]{40}/)[0];\n"
+         "            await exec.exec('git', ['fetch','origin', sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "reach the event list through the client the action already hands "
+        "the script, indexing the namespace the way the neighbouring row "
+        "indexes `pulls`",
+    ),
+    Mutation(
+        # The same namespace destructured off the client, which is the half
+        # the `rest`-and-punctuation alternative cannot read: `const {
+        # activity } = github.rest` writes `rest` with a semicolon after it
+        # and the call two lines later writes no `rest` at all. What reads it
+        # is the bare-namespace alternative. Measured: take `activity` out of
+        # that one and this row is SURVIVED while the indexed row above stays
+        # KILLED, which is the pair doing the same job the `pulls` pair does
+        # one rule along. Worth saying that the bare-namespace alternative
+        # had no row of its own before this one -- `pulls` and `issues` are
+        # both written as `rest.pulls` and `rest['pulls']` in the table, and
+        # both of those are matched by the first alternative too.
+        "B4-pull-request-target-api-octokit-activity-destructured",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        uses: actions/github-script"
+         "@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1\n"
+         "        with:\n"
+         "          script: |\n"
+         "            const { activity } = github.rest;\n"
+         "            const ev = await activity.listRepoEvents({\n"
+         "              ...context.repo\n"
+         "            });\n"
+         "            const sha = JSON.stringify(ev.data)"
+         ".match(/[0-9a-f]{40}/)[0];\n"
+         "            await exec.exec('git', ['fetch','origin', sha]);\n"
+         "            await exec.exec('git', ['checkout','FETCH_HEAD']);\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "pull the namespace off the client once and call it by its own name, "
+        "which is ordinary JavaScript and writes the namespace where no rule "
+        "keyed on `rest` is looking",
+    ),
+    Mutation(
         # The web link the diff rule must not catch, and the control that
         # says so. `_PULL_REQUEST_API` now reads the `pull/` web path, and
         # the ref half has always conceded a bare `.../pull/1781` on purpose:

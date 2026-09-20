@@ -519,11 +519,56 @@ _GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 # endpoint paths: every route to the Octokit issues namespace writes `issues`
 # once, including a destructured one, so the method names were alternatives
 # that could only ever match text the namespace rule already matched.
+#
+# The fifth is the event stream, and it is the round-17 addition. `GET
+# /repos/{owner}/{repo}/events` is the repository's public timeline, and a
+# `PullRequestEvent` on it carries the whole pull request object -- head SHA,
+# and the fork's `clone_url` beside it -- so the endpoint answers the
+# question `/pulls` answers, with the noun changed. `gh api
+# "repos/$GITHUB_REPOSITORY/events" --jq '...payload.pull_request["head"].sha'`
+# was green against every rule above: no `/pulls`, no `/issues`, no Octokit
+# namespace, no `pull/N.diff`, and an allowlisted `gh` verb. `| grep -oE
+# '[0-9a-f]{40}' | head -1` instead of the `--jq` is the same read with no
+# field name anywhere for a pattern to anchor on, and `curl -s
+# "https://api.github.com/repos/$GITHUB_REPOSITORY/events"` is the same
+# request with no `gh` word at all -- which is why the alternative belongs
+# here rather than on the `gh` allowlists, the argument `/info/refs` settled
+# one rule down.
+#
+# Refused as the endpoint rather than as this repository's path, because the
+# stream has four routes and they differ only in what stands in front of
+# `/events`: `repos/O/R/events`, `networks/O/R/events` for the whole fork
+# network, `users/{login}/events` for the pull request's author, and
+# `orgs/{org}/events`. All four hand back the same `PullRequestEvent` and all
+# four were green. So the alternative is the last path segment, and the
+# lookahead is what keeps a directory of that name out of it: a `/events`
+# with another path component after it is `docs/events/index.md` in the
+# checkout and is not matched, while `/events`, `/events/`,
+# `/events?per_page=100` and `/events"` all are. A file called `events.yml`
+# is excluded by the same lookahead, `.` being the other character a name
+# puts there. What it costs is a step that wants the timeline for something
+# else, which is a line of review on a trigger where nothing here asks for
+# it: no carrier names any `/events` path, and the only `gh api` on this
+# trigger is `auto-assign-milestone.yml`'s `repos/O/R/milestones?state=open`.
+#
+# And the client library once more, because closing the path and conceding
+# the client was the round-10 mistake over `/issues` and there is no reason
+# to make it twice. `activity` is the Octokit namespace the repository event
+# list lives under -- `github.rest.activity.listRepoEvents({...context.repo})`
+# from a `script:` names no path at all and was green -- so it joins `pulls`
+# and `issues` in both alternatives, for the reason that pair already has:
+# `rest['activity']` puts a quote where the second alternative wants a dot,
+# and a destructured `const { activity } = github.rest` writes no `rest`
+# before the namespace for the first one. One row pins each. What this
+# concedes is a false red on a step that writes `activity.` or `activity[`
+# meaning something else -- `jq -r '.activity.total'` -- which is the same
+# concession `pulls.` and `issues.` make, on the same four workflows.
 _PULL_REQUEST_API = re.compile(
     r"/pulls\b"
     r"|/issues\b"
-    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?(?:pulls|issues)\b"
-    r"|\b(?:pulls|issues)\s*[.\[]"
+    r"|/events(?!/?[\w.-])"
+    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?(?:pulls|issues|activity)\b"
+    r"|\b(?:pulls|issues|activity)\s*[.\[]"
     r"|pull/[^\n'\"]*?\.(?:diff|patch)\b"
 )
 
@@ -3117,16 +3162,20 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         self.assertIsNone(
                             _PULL_REQUEST_API.search(reachable),
                             f"{path.name}: a step reads the pull request "
-                            "through the API -- a `/pulls` or `/issues` "
-                            "request, either of those namespaces on the "
-                            "Octokit client a `script:` input is handed as "
-                            "`github`, or the tokenless `pull/N.diff` web "
-                            "endpoint. A pull request is an issue to this "
-                            "API, so `/issues/N` hands back its `patch_url`; "
-                            "the write a labelling step wants is `gh issue "
-                            "comment`, which names no path. This is the "
-                            "event's own fields fetched over HTTP, in the "
-                            "one language none of the rules above read",
+                            "through the API -- a `/pulls`, `/issues` or "
+                            "`/events` request, any of those three "
+                            "namespaces on the Octokit client a `script:` "
+                            "input is handed as `github` (`activity` is "
+                            "where the event list lives), or the tokenless "
+                            "`pull/N.diff` web endpoint. A pull request is "
+                            "an issue to this API, so `/issues/N` hands back "
+                            "its `patch_url`, and a `PullRequestEvent` on "
+                            "the repository's timeline carries the whole "
+                            "pull request object; the write a labelling step "
+                            "wants is `gh issue comment`, which names no "
+                            "path. This is the event's own fields fetched "
+                            "over HTTP, in the one language none of the "
+                            "rules above read",
                         )
                         # The same request made by the CLI, where the rule
                         # is an allowlist twice over rather than a pattern
