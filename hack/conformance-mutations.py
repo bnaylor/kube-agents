@@ -24,12 +24,16 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Twenty-three rows print this on a green run, and the
+             Twenty-five rows print this on a green run, and the
              SURVIVED line above is exactly the wrong reading of them: the
              suite staying green is the property they assert. `--list` is
              the authority on how many there are, because it marks each one;
              this line said twenty through the round in which there were
-             twenty-one, and twenty-one through the round that added two.
+             twenty-one, twenty-one through the round that added two, and
+             twenty-three through the round that corrected the same count on
+             the field below and left this one where it was. Two places
+             carrying one number is why; `--list` is the third and the only
+             one that counts the rows.
     BASELINE POLLUTED
              not a per-row verdict but a line printed after the run: the
              suite is not green once every mutation has been restored, so
