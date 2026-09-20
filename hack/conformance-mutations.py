@@ -844,12 +844,20 @@ Mutation(
         "branch out by its local name on the next line",
     ),
     Mutation(
-        # The glob without the `refs/` prefix, which is the third alternative
-        # of _PULL_REQUEST_REF and the only thing that reads it.
-        # `git ls-remote` matches a pattern against the tail of a refname, so
-        # `pull/N/h*` resolves `refs/pull/N/head` while spelling neither the
-        # namespace nor the ref, and what comes back is the SHA the fetch on
-        # the next line wants.
+        # The glob without the `refs/` prefix. `git ls-remote` matches a
+        # pattern against the tail of a refname, so `pull/N/h*` resolves
+        # `refs/pull/N/head` while spelling neither the namespace nor the
+        # ref, and what comes back is the SHA the fetch on the next line
+        # wants.
+        #
+        # It pins neither rule it is refused by, and the row below is where
+        # that was found out. Measured one at a time: neuter the third
+        # alternative of `_PULL_REQUEST_REF` and this row is still KILLED,
+        # because `_REMOTE_REF_ENUMERATION` reads the `ls-remote` on the same
+        # line; neuter `ls-remote` and it is still KILLED on the glob; neuter
+        # both and it goes SURVIVED. The third alternative is pinned by the
+        # row below, which writes the same glob with no enumeration verb next
+        # to it.
         "B4-pull-request-target-run-refspec-ls-remote",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1161,10 +1169,18 @@ Mutation(
         # expressions had to go on the script allowlist for the carriers to
         # stay green; one of them is the pull request's number, and the number
         # plus the token is all `gh pr checkout` takes. This row and the three
-        # below are the four spellings `_PULL_REQUEST_API` reads. They exist
-        # because the concession is a real one: without that backstop these
-        # three were refused at 866fa939 and passed after it, which is a
-        # coverage loss a row has to be able to see.
+        # below are four spellings of that reach, and only one of them is
+        # `_PULL_REQUEST_API`'s: measured, neutering that rule outright leaves
+        # this row, `gh pr diff` and `gh pr view` all KILLED and sends
+        # `api-gh-api-pulls` alone to SURVIVED, and putting `checkout`, `diff`
+        # and `view` on `_SAFE_GH_PULL_REQUEST_SUBCOMMANDS` instead does the
+        # opposite. So what refuses a `gh pr` subcommand is that list, read
+        # twice -- once under the verb allowlist and once under the
+        # argument-shape backstop -- and the path rule reads the `gh api` row
+        # only. The four exist because the concession is a real one: without a
+        # backstop under the fetch gate these three were refused at 866fa939
+        # and passed after it, which is a coverage loss a row has to be able
+        # to see.
         "B4-pull-request-target-api-gh-pr-checkout",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1491,11 +1507,25 @@ Mutation(
     ),
     Mutation(
         # The same reach with the name in the environment, and the residual
-        # round 9 wrote down and left open: `$C pr checkout` with `C: gh` is
-        # not a `gh` invocation to any rule keyed on the word. The `env:`
+        # round 9 wrote down and left open: the `run:` line `$C pr checkout`
+        # is not a `gh` invocation to any rule keyed on the word. The `env:`
         # value carries no head, so the wholesale environment refusal does
-        # not reach it either. It is closed now for the same reason the row
-        # above is -- the arguments say `pr checkout` whoever runs them.
+        # not reach it either.
+        #
+        # It is closed twice over, and only the second half is the row
+        # above's reason. Measured: neuter `_GH_PULL_REQUEST_WORD` and this
+        # row is still KILLED, neuter `_GH_COMMAND` and it is still KILLED,
+        # neuter both and it goes SURVIVED. The first kill is the verb
+        # allowlist rather than the subcommand one, and it is the `env:`
+        # block that hands it over: the text these rules read is the script
+        # joined to the step's `env:` values, so `C: gh` is itself a `gh`
+        # with nothing after it before the value ends, and
+        # `_unsafe_gh_verbs` refuses an invocation whose arguments it cannot
+        # read. Allowlist `checkout` as well and the row is still KILLED on
+        # that; allowlist the empty verb beside it and it finally survives,
+        # while the `"$(command -v gh)"` row above survives the same pair of
+        # edits. The second kill is the argument shape, which holds here on
+        # its own -- the arguments say `pr checkout` whoever runs them.
         "B4-pull-request-target-api-gh-program-in-env",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1765,10 +1795,16 @@ Mutation(
         # `pull_request.patch_url` the row above reads -- which means a step
         # does not even need `github.event.pull_request.number` on the
         # expression allowlist to reach a fork's code. Written with `type:pr`
-        # rather than the more usual `is:pr` so that the row isolates the
-        # path alternative: `is:pr` is refused twice over, because the `:` is
-        # not a word character and `_GH_PULL_REQUEST_WORD` reads the rest of
-        # the query as a subcommand.
+        # rather than the more usual `is:pr`, which isolates nothing. The
+        # `:` in `type:pr` is not a word character either, so
+        # `_GH_PULL_REQUEST_WORD` reads that `pr` exactly as it reads
+        # `is:pr`'s and the query is refused twice over whichever is written.
+        # Measured: neuter the `/issues` alternative and this row is still
+        # KILLED, neuter `_GH_PULL_REQUEST_WORD` and it is still KILLED,
+        # neuter both and it goes SURVIVED -- and with `/issues` neutered the
+        # row rewritten as `is:pr` is KILLED too, which is the comparison the
+        # spelling was chosen on. Nothing here pins the path alternative
+        # alone.
         "B4-pull-request-target-api-search-issues",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2382,9 +2418,15 @@ Mutation(
         # The directory half globbed. `_github_*` is the runner's payload
         # directory and is not the string `_github_workflow`, so the path row
         # above could be repaired with a wildcard and no string arithmetic
-        # anywhere. This pins the prefix and `RUNNER_TEMP` together: the
-        # payload lives under that variable and nowhere else, so naming the
-        # variable is naming the file whatever the rest of the path says.
+        # anywhere. It pins neither half, and not the pair either, which is
+        # measured rather than reasoned: neuter the `_github` prefix
+        # alternative and this row is still KILLED, neuter `RUNNER_TEMP` and
+        # it is still KILLED, neuter both and it is still KILLED, because
+        # `RUNNER_TEMP` is off `_SAFE_RUNNER_VARIABLES` and the runner
+        # variable allowlist refuses the line a third time. Only with all
+        # three gone does it go SURVIVED. What the row records is the reach
+        # -- the payload read with a wildcard where a name used to be -- and
+        # that three rules answer it.
         "B4-pull-request-target-run-event-file-glob",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
