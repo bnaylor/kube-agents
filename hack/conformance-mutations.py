@@ -43,7 +43,7 @@ counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
 
 Usage:
     python3 hack/conformance-mutations.py            # every mutation
-    python3 hack/conformance-mutations.py --list
+    python3 hack/conformance-mutations.py --list     # ids, paths, controls
     python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 
 The tree must be clean. It edits tracked files in place and restores them, so a
@@ -77,10 +77,14 @@ class Mutation:
     pretext: str
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
-    #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Twenty today, which `--list` is the
-    #: authority on rather than this comment -- it named ten on 2026-09-19
-    #: when there were eleven, and one of the ten by an id no row had:
+    #: run as a control on the harness itself. Neither of the two verdicts a
+    #: row without this field can get is printed for one that has it: the
+    #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
+    #: what the module docstring says and what `main` writes. Twenty today,
+    #: which `--list` is the authority on rather than this comment -- it
+    #: marks each control `[control]`, and the list below named ten on
+    #: 2026-09-19 when there were eleven, and one of the ten by an id no row
+    #: had:
     #: A3-fastpath-redundant,
     #: B1-denylist-rule,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
@@ -4651,7 +4655,15 @@ def main() -> int:
     selected = [m for m in MUTATIONS if arguments.filter in m.id]
     if arguments.list:
         for mutation in selected:
-            print(f"{mutation.id:38} {mutation.path}")
+            # The `[control]` suffix rather than a column of its own: the
+            # `must_survive` comment calls this output the authority on which
+            # rows are controls, and it was not one while the two kinds
+            # printed identically. Nothing parses these lines -- `--list` is
+            # named in this file's usage and in the suite's README and
+            # nowhere else -- so the marker goes on the end, where it cannot
+            # move the two fields anybody reads.
+            control = "  [control]" if mutation.must_survive else ""
+            print(f"{mutation.id:38} {mutation.path}{control}")
         return 0
 
     if not _git_clean():
