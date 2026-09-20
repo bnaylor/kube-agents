@@ -2400,22 +2400,46 @@ Mutation(
     Mutation(
         # The widest grant GitHub offers, spelled as a string rather than as
         # a mapping. Both halves of this test filtered on `isinstance(scope,
-        # dict)`, so `write-all` at the workflow level granted `contents:
-        # write` and `id-token: write` without either assertion seeing a
-        # field. The job-level spelling reddened -- but through
+        # dict)`, so `write-all` at the workflow level put `contents: write`
+        # and `id-token: write` in a block neither assertion could see a
+        # field of. The job-level spelling reddened -- but through
         # test_B2_no_workflow_grants_a_bot_the_ability_to_approve, which is a
         # neighbour asking a different question, and a neighbour's red is not
         # this assertion working. NOISY by construction now that both halves
         # read the shorthand: `write-all` includes `contents: write`, so
         # test_B4_contents_write_is_confined_to_the_release_path gains a
         # holder too. That second red is the other half of the same fix.
+        #
+        # What the edit does *not* do is hand this workflow's job anything,
+        # and the pretext said it did until round 19. The row rewrites the
+        # workflow-level block; `risk_classify.yml` has one job and it
+        # declares a `permissions:` block of its own, and a job-level block
+        # replaces the workflow-level one whole rather than merging with it,
+        # so the token `classify` runs with is the same four scopes after the
+        # mutation as before it. That last step is GitHub's documented
+        # inheritance rule read against the file, not something this harness
+        # can measure -- what the file shows is the one job and the one
+        # block. Nor is it the thing `risk_classify.yml`'s own header
+        # comment is about: the paragraph there saying `permissions:` cannot
+        # raise a token is the argument for not using `pull_request`, where a
+        # fork's `GITHUB_TOKEN` is read-only whatever any block says. On
+        # `pull_request_target` the token is the base repository's and a
+        # block does decide it -- the job's block, here.
+        #
+        # So what the row removes is reach, not a credential.
+        # `_permission_scopes` reads every `permissions:` block in the file
+        # rather than a job's effective grant, deliberately -- the assertion
+        # is that no block in a `pull_request_target` workflow names these
+        # two scopes, wherever it is written and whoever inherits it -- and
+        # before the shorthand expanded, a block spelled as a string was a
+        # block it could not read at all.
         "B4-pull-request-target-permissions-write-all",
         ".github/workflows/risk_classify.yml",
         ("permissions: {}", "permissions: write-all"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "widen the top-level grant to `write-all` while adding a step that "
-        "needs one more scope, rather than naming the scope -- the tidying "
-        "that hands a pull-request-triggered job the push credential",
+        "widen the workflow-level default from `{}` to the string shorthand "
+        "GitHub documents, rather than naming a scope -- the one-word edit "
+        "somebody makes when a job turns out to be short of a permission",
     ),
     Mutation(
         # A fetch whose arguments are assembled out of a second env value,
