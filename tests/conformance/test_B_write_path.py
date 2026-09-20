@@ -3074,13 +3074,21 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # arrived from the pull request, and no step in a
                         # workflow that must not have the fork's code has
                         # business in any of them. What counts as the read is
-                        # argued at `_EVENT_PAYLOAD_FILE`, and it is ten
+                        # argued at `_EVENT_PAYLOAD_FILE`, and it is thirteen
                         # patterns rather than one because the variable, each
                         # piece of the two paths it holds -- the runner's and
                         # the one a container job sees it bind-mounted at --
-                        # and the process environment that carries it in each
-                        # of the two languages a step can be written in are
-                        # all ways to the same bytes.
+                        # and the process environment that carries it in
+                        # every language a step here can be written in are
+                        # all ways to the same bytes. Seven of the thirteen
+                        # are that last one: `process.env` is JavaScript,
+                        # `os.environ` and a bare `environ` are Python and
+                        # awk's `ENVIRON`, `%ENV` and `$ENV{` are Perl's two,
+                        # `ENV[` is Ruby's, and `getenv`/`lookupenv` read
+                        # case-insensitively for Go and for .NET's
+                        # `GetEnvironmentVariable`. The count was eight, then
+                        # ten, and is re-read off the pattern rather than
+                        # carried forward.
                         # And the variables the runner sets without being
                         # asked, which are the payload again in the one
                         # language a step does not have to write anything to
