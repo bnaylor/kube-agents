@@ -1280,6 +1280,24 @@ Mutation(
         "over the set vacuously green",
     ),
     Mutation(
+        # The other way the set empties: not the glob, but the parse. Every
+        # workflow here spells the trigger block `on:`, which YAML 1.1 reads
+        # as the boolean True, so the key a trigger filter asks for only
+        # exists because `_workflow_documents` puts it there. Aimed at the
+        # normalisation rather than at a filter because it is the one line
+        # whose removal empties every trigger-filtered subset in this file at
+        # once, which is what the preconditions on those subsets exist for.
+        "B-workflow-on-normalisation-dropped",
+        "tests/conformance/test_B_write_path.py",
+        ('        if True in document:  # `on:` is the YAML 1.1 boolean `y`/`yes`/`on`\n'
+         '            document["on"] = document.pop(True)\n', ""),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "drop the YAML 1.1 `on:` -> True normalisation, the way a tidy-up "
+        "deletes a workaround whose comment reads as trivia -- every trigger "
+        "filter in this file then selects nothing, and the tests that walk "
+        "those subsets pass over the empty set",
+    ),
+    Mutation(
         "harness-fixture-emptied",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("\nkind: StatefulSet\n", "\nkind: StatefulSetXX\n"),
