@@ -536,7 +536,23 @@ _GH_WORD_PUNCTUATION = "\"'[],"
 
 # Where the walk stops. Not a shell parser: a separator inside a quoted
 # string ends an invocation early, which can lose the tail of one and cannot
-# invent one. The class is `_COMMAND_SEPARATORS`, named above the word end
+# invent one.
+#
+# That second sentence is the whole argument where the question is what an
+# invocation runs -- `_invocation_words`, `_gh_invocations`, the two
+# allowlists over them -- because the tail it loses there is arguments, and
+# an argument this file cannot read is one it will not allowlist. It was
+# written as though it held everywhere, and round 25 measured that it does
+# not: in `_receiving_programs` the question is which programs a word can be
+# handed to, the tail is the `| xargs g'h'` or the enclosing `$(` that is the
+# only rule left able to see the step, and losing it passes the step rather
+# than refusing it. Five forward spellings of one quoted word and one
+# backward were green on that. `_command_end_readings` is the answer and
+# carries the measurements; this pattern is unchanged, because the fix is in
+# which of its matches a walk honours rather than in which characters it
+# finds.
+#
+# The class is `_COMMAND_SEPARATORS`, named above the word end
 # that shares it, because "where does a command end" is one question and a
 # command word ends where its command does.
 _COMMAND_END = re.compile(_COMMAND_SEPARATORS)
@@ -1742,7 +1758,10 @@ def _invocation_words(text, offset):
     they objected to -- the word can be the wrong one. The walk stops at the
     first newline, `;`, `|`, `&`, parenthesis or backtick, so a separator
     inside a quoted string ends it early; that loses the tail of an
-    invocation and cannot invent one.
+    invocation and cannot invent one. True of this walk, which is asking
+    what the invocation runs, and not of `_receiving_programs`, which asks
+    the other question of the same separators and takes both readings of the
+    quoting for it.
 
     Punctuation comes off each word and an emptied word is dropped, which is
     what makes a JavaScript argument vector read as the command line it is:
@@ -1828,6 +1847,92 @@ def _invocation_programs(text, offset):
         if word
     ]
     return [words[0], words[-1]] if words else [""]
+
+
+def _quoted_characters(text):
+    """Which characters of `text` sit inside a quoted word, by parity.
+
+    `'` and `"`, each of them an ordinary character inside the other, with a
+    backslash escaping the one after it inside `"` and outside both. That is
+    as much of the grammar as this needs, because the only thing read off it
+    is whether a separator's own position is inside a quote.
+
+    It is a reading and not a parse, and `_command_end_readings` is built
+    around that rather than around a hope: an unbalanced quote moves every
+    boundary after it, a `#` comment holding an apostrophe is one, and the
+    caller therefore takes this reading *beside* the quote-blind one rather
+    than instead of it.
+    """
+    inside = bytearray(len(text))
+    quote = None
+    escaped = False
+    for index, character in enumerate(text):
+        if escaped:
+            inside[index] = 1
+            escaped = False
+        elif quote is None:
+            if character == "\\":
+                escaped = True
+            elif character in "'\"":
+                quote = character
+                inside[index] = 1
+        else:
+            inside[index] = 1
+            if character == quote:
+                quote = None
+            elif character == "\\" and quote == '"':
+                escaped = True
+    return inside
+
+
+def _command_end_readings(text):
+    """`text`'s separators, once for each reading of its quoting.
+
+    `_COMMAND_END` is a character class and knows nothing about quotes, so
+    every walk in this file stops at a separator inside a quoted word. Where
+    the question is what an invocation runs, that is the refusing direction
+    and the comment over the pattern says why: what the early stop loses is
+    arguments, and an argument this file cannot read is one it will not
+    allowlist. Where the question is `_receiving_programs`' -- which
+    programs can be handed this word -- it is the *passing* direction,
+    because what the early stop loses is the `| xargs` or the enclosing `$(`
+    that is the only rule left with anything to see. Six spellings measured
+    against `f14997a5`: `printf 'pr checkout %s %.0s' 42 ")" | xargs g'h'`
+    and the `;`, `&`, `` ` `` and `(` spellings of that quoted word were all
+    green, against the same line without one, which reds, and so was
+    `g'h' $(true ")"; printf 'pr checkout %s' 42)` walking outward.
+
+    Teaching the walk about quotes is the obvious answer and it opens a hole
+    of its own. Quoting is a parse this file does not make: the scan above
+    is parity, an apostrophe in a comment desynchronises everything after
+    it, and a real separator read as quoted is one the walk does not stop at
+    -- which can leave the depth counter standing when the `|` after it
+    arrives, at which point the pipeline is never read and the step is
+    green. That is a false green an author can write on purpose and a
+    contributor can write by accident, which is worse than the one being
+    closed.
+
+    So this picks neither reading. It returns both -- the quote-blind one
+    every walk here has always used, and the one that skips a separator
+    inside a quoted word -- and `_receiving_programs` unions the programs
+    the two reach. Neither reading can hide a program the other finds, so
+    the answer is a superset of the answer before this existed: no step that
+    was refused stops being refused, and no verdict in the mutation table
+    moves except the rows about the quoted separator itself, which is
+    measured rather than reasoned. The readings are returned as one when
+    they agree, which is the common case and not a promise about any
+    particular file.
+
+    What the second reading costs is a false red on a step that writes a
+    separator inside a quoted word near the word `pr` and hands the result
+    to something whose name this file cannot read. That is a line of review
+    on a step of a workflow holding a writable token, which is the direction
+    to be wrong in.
+    """
+    every = list(_COMMAND_END.finditer(text))
+    inside = _quoted_characters(text)
+    unquoted = [end for end in every if not inside[end.start()]]
+    return [every] if len(unquoted) == len(every) else [every, unquoted]
 
 
 def _receiving_programs(text, offset):
@@ -1930,6 +2035,20 @@ def _receiving_programs(text, offset):
     of review on a step of a `pull_request_target` workflow holding a
     writable token, which is the direction to be wrong in.
 
+    Both walks run once for each reading of the text's quoting rather than
+    once, and that is round 25. `_COMMAND_END` is a character class, so a
+    separator inside a quoted word ended a command a shell keeps running:
+    `printf 'pr checkout %s %.0s' 42 ")" | xargs g'h'` was green because the
+    quoted `)` broke the walk before the pipe, and the `;`, `&`, `` ` `` and
+    `(` spellings of that word were green with it. Outward, the same quoted
+    `)` counted as a substitution that had closed, so the real `$(` in
+    `g'h' $(true ")"; printf 'pr checkout %s' 42)` was stepped over instead
+    of read, and that was green too. Every one of the six is a `pr checkout`
+    handed to a `g'h'` no other rule here can see. `_command_end_readings`
+    is where the readings come from and why there are two of them; the
+    walks are the two functions under this one, unchanged but for taking
+    the separators they honour as an argument.
+
     What it does not reach is an argument vector that is not in the text at
     all. `cat .github/gh-argv.txt | xargs g'h'` names no subcommand here for
     any rule to read, which is the shape
@@ -1937,11 +2056,31 @@ def _receiving_programs(text, offset):
     reason that row is refused on the unreadable invocation instead.
     """
     programs = _invocation_programs(text, offset)
+    readings = _command_end_readings(text)
+    for ends in readings:
+        programs += _downstream_programs(text, offset, ends)
+    for ends in readings:
+        programs += _enclosing_programs(text, offset, ends)
+    return programs
+
+
+def _downstream_programs(text, offset, ends):
+    """The programs the word at `offset` reaches along a pipe, over `ends`.
+
+    The downstream half of `_receiving_programs`, which argues everything
+    this reads and every edge it declines to cross. A function of its own
+    because the separators are a parameter now: the caller runs it once for
+    each reading `_command_end_readings` hands back.
+    """
+    programs = []
     depth = 0
     piped = False
     position = offset
+    pending = [end for end in ends if end.start() >= offset]
+    index = 0
     while True:
-        match = _COMMAND_END.search(text, position)
+        match = pending[index] if index < len(pending) else None
+        index += 1
         if piped and (match is None or depth == 0):
             programs += _invocation_programs(
                 text, match.start() if match else len(text)
@@ -1964,13 +2103,25 @@ def _receiving_programs(text, offset):
             piped = True
         else:
             break
+    return programs
+
+
+def _enclosing_programs(text, offset, ends):
+    """The programs the word at `offset` reaches outward, over `ends`.
+
+    The outward half of `_receiving_programs`, on the same terms as the
+    downstream half above: the argument for what it reads is there, and the
+    separators it honours are the caller's parameter rather than this
+    file's one character class.
+    """
+    programs = []
     position = offset
     depth = 0
     closed = False
     while True:
-        opener = None
-        for match in _COMMAND_END.finditer(text, 0, position):
-            opener = match
+        opener = next(
+            (end for end in reversed(ends) if end.end() <= position), None
+        )
         if opener is None:
             break
         position = opener.start()
@@ -3534,12 +3685,46 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `B4-pull-request-target-run-context-payload` is
                         # the row, and it is the only one that flips.
                         #
+                        # Read one field wider still, over the `env:`
+                        # values beside the script, and that is round 25.
+                        # It was the script alone, which is the one rule in
+                        # this half that read it: the expression allowlist
+                        # above and the four request rules below are all
+                        # over the environment too, on the stated principle
+                        # that a request assembled out of an `env:` value is
+                        # the same request. Moving the program text one
+                        # field over was the whole bypass -- `CMD: const a =
+                        # require("@actions/github"); ...
+                        # a.context.payload.after ...` with `node -e "$CMD"`
+                        # in the `run:` -- and it is the same program as the
+                        # row above, which reds inline. Nothing else here
+                        # reaches it: the library reads `GITHUB_EVENT_PATH`
+                        # itself, so the step still spells no path, no
+                        # expression and no payload file.
+                        #
+                        # Over the values one at a time rather than over the
+                        # `reachable` join the rules below share, for a
+                        # reason that is about this pattern rather than
+                        # about taste. `\s` matches a newline, so `context`
+                        # at the end of one value and `.repo` at the start
+                        # of the next read as one `context.repo` across the
+                        # join -- an allowlisted spelling assembled out of
+                        # two values that are not it, which is a green this
+                        # comprehension does not have. Measured both ways.
+                        # It also mirrors the expression comprehension
+                        # directly above, which is the half of this rule
+                        # written in the other language.
+                        #
                         # What the wider read costs is a false red on the
-                        # word `context` in a `run:` meaning something else
-                        # -- `kubectl config current-context`, `make
+                        # word `context` in a `run:` or an `env:` value
+                        # meaning something else -- `kubectl config
+                        # current-context`, `make
                         # docs-check-context-budget` -- which is a line of
                         # review on a trigger where nothing writes either
-                        # and the job holds a writable token.
+                        # and the job holds a writable token. No `env:`
+                        # value in the three live `pull_request_target`
+                        # workflows holds the word today, so the widening
+                        # reds nothing in the tree.
                         # `context.repo` is the one spelling that goes
                         # through, in a `run:` as in a `script:`, and it
                         # opens nothing: an Octokit built beside it is
@@ -3547,18 +3732,21 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # beside it over the file, and there is no route
                         # from the word itself to anything the shell can
                         # resolve. `B4-pull-request-target-run-context-repo`
-                        # holds that green.
+                        # holds that green in the script and
+                        # `B4-pull-request-target-run-context-repo-env`
+                        # holds it green in an `env:` value.
                         reached = sorted({
                             match.group(0).strip()
-                            for match in _SCRIPT_CONTEXT.finditer(script)
+                            for text in [script, *environment.values()]
+                            for match in _SCRIPT_CONTEXT.finditer(text)
                             if (match.group(1) or match.group(2) or "").lower()
                             not in _SAFE_SCRIPT_CONTEXTS
                         })
                         self.assertEqual(
                             [],
                             reached,
-                            f"{path.name}: a step's script reaches "
-                            f"{reached}, which is the webhook "
+                            f"{path.name}: a step's script or environment "
+                            f"reaches {reached}, which is the webhook "
                             "payload -- the same fields the expression "
                             "allowlist refuses, in the language that runs",
                         )

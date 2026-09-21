@@ -24,7 +24,7 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Twenty-eight rows print this on a green run, and the
+             Thirty rows print this on a green run, and the
              SURVIVED line above is exactly the wrong reading of them: the
              suite staying green is the property they assert. `--list` is
              the authority on how many there are, because it marks each one;
@@ -93,7 +93,7 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: twenty-eight today, which `--list` is the authority on rather than
+    #: thirty today, which `--list` is the authority on rather than
     #: this comment -- it marks each control `[control]`, and the list below
     #: named ten on 2026-09-19 when there were eleven, and one of the ten by
     #: an id no row had:
@@ -107,6 +107,8 @@ class Mutation:
     #: B4-pull-request-target-run-context-repo,
     #: B4-pull-request-target-api-gh-wrapped-readable-program,
     #: B4-pull-request-target-api-gh-pipeline-readable-program,
+    #: B4-pull-request-target-run-quoted-paren-ordinary,
+    #: B4-pull-request-target-run-context-repo-env,
     #: B4-pull-request-target-api-gh-substitution-ordinary,
     #: B4-pull-request-target-run-backtick-closed-then-prose,
     #: B4-pull-request-target-run-env-ordinary-shell,
@@ -2149,6 +2151,77 @@ Mutation(
         "script copied off a wiki page is written in",
     ),
     Mutation(
+        # The same launder with one character of punctuation inside a quoted
+        # word, which is where the walk downstream stopped. `_COMMAND_END`
+        # is a character class and knows nothing about quotes, so the `)` in
+        # `")"` -- an argument `%.0s` consumes and never prints -- ended the
+        # walk at a parenthesis the shell runs straight past. The
+        # `| xargs g'h'` was never read, both ends of the `pr`'s own segment
+        # came back `printf`, and `_READABLE_PROGRAM` reads that, so the
+        # backstop declined. Nothing else was left to decline: `g'h'` holds
+        # no `gh` for `_GH_COMMAND`, and there is no expression, no runner
+        # variable and no payload file anywhere in the step. Green at
+        # `f14997a5`, where the line without the quoted word is red.
+        #
+        # It pins the second reading in the downstream half of
+        # `_receiving_programs`: hand that walk the quote-blind reading
+        # alone and this row is SURVIVED with every other row still KILLED,
+        # the outward row below included. One row for the whole class rather
+        # than one per character, and that is measured rather than chosen --
+        # `;`, `&`, `` ` `` and `(` written in place of the `)` were green
+        # before the fix and are red after it, and the readings the walk is
+        # handed are one function rather than a branch per separator.
+        "B4-pull-request-target-api-gh-arguments-past-a-quoted-separator",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          printf 'pr checkout %s %.0s' \"$PR_NUMBER\" \")\" "
+         "| xargs g'h'\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put a parenthesis in a quoted argument of the line that builds the "
+        "command, so the walk to the program on the far side of the pipe "
+        "ends at a separator the shell does not have",
+    ),
+    Mutation(
+        # The same quoted separator read outward, which is the other walk
+        # and the other branch. Coming back from the `pr` for the command
+        # that encloses the substitution, the `;` is stepped over and the
+        # `)` inside `true \")\"` is counted as a substitution that has
+        # already closed -- so the real `$(` two separators back decrements
+        # that count instead of being read as the opener it is, the walk
+        # runs out of text, and the enclosing `g'h'` is never reached. Both
+        # programs come back `printf` again. Green at `f14997a5`.
+        #
+        # It pins the second reading in the outward half: hand that walk the
+        # quote-blind reading alone and this row is SURVIVED with the
+        # downstream row above still KILLED. The two halves are pinned apart
+        # rather than together, which is the division the pipe and `$( )`
+        # rows above are already kept in, and the quoting had to be measured
+        # in both because one fix does not reach both walks.
+        "B4-pull-request-target-api-gh-substitution-past-a-quoted-separator",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         "          g'h' $(true \")\"; printf 'pr checkout %s' "
+         "\"$PR_NUMBER\")\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "balance the substitution's own parenthesis with one inside a "
+        "quoted word, so the walk out to the enclosing program counts the "
+        "opener as already matched",
+    ),
+    Mutation(
         # The safe side of the same word, and the hole `_READABLE_PROGRAM`
         # leaves open on purpose. A program with a plain name of its own and
         # `gh`'s argument shape is conceded -- closing it means a denylist of
@@ -2191,6 +2264,32 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "run a local tool with a readable name over a pipeline, which is a "
         "program this file concedes and a shape it must not read as `gh`",
+        must_survive=True,
+    ),
+    Mutation(
+        # The ordinary side of the quoting, and the whole cost of the second
+        # reading the two rows above added. Skipping a separator inside a
+        # quoted word means the walk now reads *past* the parentheses in a
+        # log line and on down the pipe, where it was stopped by them
+        # before, so an ordinary step that says something about a pull
+        # request and pipes it somewhere is walked for the first time. What
+        # it finds is `tee` and `out.txt`, which `_READABLE_PROGRAM` reads.
+        # OVERSHOT here means the quoted separator has been made the
+        # objection itself rather than what it lets the walk reach, which
+        # reds on every step in this repository that puts a parenthesis in a
+        # message. Green before the second reading existed and green after,
+        # which is the only way this row says anything.
+        "B4-pull-request-target-run-quoted-paren-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Note the pull request\n"
+         "        run: |\n"
+         '          echo "the pr is open (stage 1)" | tee out.txt\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "pipe a log line with a parenthesis in it into a plain program, "
+        "which is the most ordinary thing a step does with a message",
         must_survive=True,
     ),
     Mutation(
@@ -3087,6 +3186,41 @@ Mutation(
         "for you, which is how a step gets the object without a `script:`",
     ),
     Mutation(
+        # The same program one field over. The row above writes it in the
+        # `run:`; this writes it in an `env:` value and runs `node -e
+        # "$FETCH"`, which is the same library, the same property access and
+        # the same fetch, and it was green at `f14997a5` with the row above
+        # red. The `context` scan was the one rule in this half read over
+        # the script alone: the expression allowlist above it and the four
+        # request rules below it are all read over the step's environment
+        # too, on the stated principle that a request assembled out of an
+        # `env:` value is the same request.
+        #
+        # It pins that read and nothing else pins it: scope the scan back to
+        # the script and this row is SURVIVED with every other row still
+        # KILLED, the row above included. Nothing else in the step is left
+        # to read -- `@actions/github` finds `GITHUB_EVENT_PATH` inside the
+        # library, so there is no expression, no path and no payload file
+        # written down anywhere.
+        "B4-pull-request-target-run-context-payload-env",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          FETCH: const a=require(\"@actions/github\");"
+         "require(\"child_process\").execSync(\"git fetch --depth=1 "
+         "origin \"+a.context.payload.after)\n"
+         "        run: |\n"
+         "          npm install @actions/github\n"
+         '          node -e "$FETCH"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "carry the program in an `env:` value and run it from the script, "
+        "which is where a step puts a one-liner it does not want to quote "
+        "twice",
+    ),
+    Mutation(
         # And the allowlisted spelling in the same place, because the
         # widening above is only honest if the entry it carries still means
         # what it means in a `script:`. `context.repo` is this repository's
@@ -3107,6 +3241,37 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "log the repository the workflow lives in through the same library, "
         "naming the one context property that is not the pull request",
+        must_survive=True,
+    ),
+    Mutation(
+        # And the allowlisted spelling in the field the rule has just
+        # started reading, for the reason the row above it exists one field
+        # over: the widening is only honest if `context.repo` still means in
+        # an `env:` value what it means in a `run:` and in a `script:`.
+        # OVERSHOT here means the env read was written as the word `context`
+        # rather than as the allowlist over the property after it, which
+        # reds on the one spelling that opens nothing -- and it is the whole
+        # false-positive budget of the widening, because a `\bcontext\b`
+        # with nothing after it matches `kubectl config current-context`
+        # too. No `env:` value in the three live `pull_request_target`
+        # workflows holds the word today, measured before the rule was
+        # widened, so this row is the only place the concession is written
+        # down.
+        "B4-pull-request-target-run-context-repo-env",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Report the repository\n"
+         "        env:\n"
+         "          REPORT: const a=require(\"@actions/github\");"
+         "console.log(a.context.repo)\n"
+         "        run: |\n"
+         "          npm install @actions/github\n"
+         '          node -e "$REPORT"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "carry the allowlisted property in an `env:` value, which is the "
+        "same one-liner the row above hides a payload read in",
         must_survive=True,
     ),
     Mutation(
