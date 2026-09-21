@@ -2017,8 +2017,10 @@ Mutation(
         # round-13 correction to the backstop under all of this. `timeout` is
         # not the program here and neither is `60`: `g'h'` is, and the rule
         # that refuses an unreadable one read the first word of the segment.
-        # Nine other wrappers put the same readable word there -- `exec`,
-        # `env`, `nice`, `command`, `sudo`, `xargs`, `time`, `stdbuf`. It
+        # Eight other wrappers put the same readable word there -- `exec`,
+        # `env`, `nice`, `command`, `sudo`, `xargs`, `time`, `stdbuf` --
+        # which is nine with `timeout`, the count `_invocation_programs`
+        # carries and the one this line took while naming eight of them. It
         # pins the second word `_invocation_programs` returns, the one
         # immediately before the `pr`, and nothing else reaches it: `g'h'`
         # has no `gh` in it for `_GH_COMMAND` to find.
@@ -3675,11 +3677,28 @@ Mutation(
         # above that reaches the file through one of them dies on the
         # runner-variable allowlist and would die there with
         # `_EVENT_PAYLOAD_FILE` deleted -- measured by neutering that
-        # assertion, at which all seven still went red. This is the row that
-        # pins the rule: the path a GitHub-hosted Linux runner actually uses,
-        # written out, with no `GITHUB_`- or `RUNNER_`-prefixed word anywhere
-        # for the allowlist to read. The directory and the file name are what
-        # is left, and they are what the rule refuses.
+        # assertion, at which all seven still went red.
+        #
+        # What this row does not do is pin the rule, which is what it
+        # claimed until the credit was measured. Neuter that assertion and
+        # three rows go SURVIVED together: this one, the temp glob below it
+        # and the container mount under that, all three of which reach the
+        # payload without naming a variable. Nor does it pin an alternative
+        # of the pattern on its own -- neuter `work/_temp` and it is still
+        # KILLED on `_github`, neuter `_github` and it is still KILLED on
+        # `event.json`, neuter `event.json` and it is still KILLED, and only
+        # with all three gone does it go SURVIVED, by which point
+        # `work/_temp` has taken the temp glob with it. That row pins
+        # `work/_temp` alone and the container mount pins
+        # `/github/workflow` alone; `_github` and `event.json` are pinned by
+        # no row at all, which is worth knowing and is not a claim this row
+        # gets to make.
+        #
+        # What it records is the reach: the path a GitHub-hosted Linux
+        # runner actually uses, written out, with no `GITHUB_`- or
+        # `RUNNER_`-prefixed word anywhere for the allowlist to read. The
+        # directory and the file name are what is left, and they are what
+        # the rule refuses.
         "B4-pull-request-target-run-event-file-literal-path",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
