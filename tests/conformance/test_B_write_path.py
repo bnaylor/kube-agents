@@ -113,8 +113,14 @@ def _shell_word(word):
     it has the same answer -- no pattern over a word can read a word that is
     not written down. It is open, and written down as open, in the test's
     docstring and in this file's residual list.
+
+    Each character is escaped on the way in, because the callers below hand
+    this whole path segments and file names rather than four letters: the
+    `.` of `event.json` is a dot and not "any character", and a caller that
+    had to remember which of its words needed escaping would be a caller
+    that eventually forgot.
     """
-    return _SHELL_QUOTING + _SHELL_QUOTING.join(word)
+    return _SHELL_QUOTING + _SHELL_QUOTING.join(re.escape(c) for c in word)
 
 
 #: The separator between a ref's segments, in both spellings that reach the
@@ -758,15 +764,46 @@ _GH_EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 # `search.` meaning something else -- `cat docs/search.md`, `jq .actions[0]`
 # -- which is the same concession `pulls.`, `issues.` and `activity.` make,
 # on the same four workflows, and none of them writes either word.
+#
+# The four path alternatives read a *shell word*, which is round 23's fix
+# arriving at the rule this pull request's own summary said refuses `gh api
+# repos/O/R/pulls/$N --jq .head.sha`. It did not: `gh api
+# "repos/$GITHUB_REPOSITORY/pul""ls/42" --jq .head.sha` requests the same
+# endpoint, because the quoting closes and reopens inside the word and the
+# path curl is handed still spells `/pulls`. Measured green at `d060691d`,
+# and so were `/iss""ues`, `/eve""nts`, `/acti""ons/runs`, `/actions/ru""ns`,
+# `pull/42.di""ff`, the backslash spelling `/pul\ls` and the separator
+# written as its own word, `"repos/$GITHUB_REPOSITORY"/"pulls"/42`. All are
+# one hole rather than seven: the letters were there in every one of them.
+#
+# The `rest.` and bare-namespace alternatives are left reading letters, and
+# that is a decision rather than an omission. They match JavaScript in a
+# `script:` block, where a quote is not something the reader drops on its way
+# to the program -- `rest['pulls']` is a string subscript the rule already
+# reads, and `rest['pul'+'ls']` is a string *expression*, which is
+# `_READABLE_PROGRAM`'s argument in the other half of this file rather than
+# this one's. Nothing between a JavaScript identifier's letters is dropped by
+# anything.
+#
+# What the words terminate on is unchanged, and that is the `_shell_word`
+# docstring's argument: `\b` falls between the last letter and a quote on its
+# own, so `/pulls"` is read exactly as it was read before, and the `/events`
+# lookahead goes on reading the character it read before. Widening the
+# terminators is a separate change with separate costs and is not made here.
 _PULL_REQUEST_API = re.compile(
-    r"/pulls\b"
-    r"|/issues\b"
-    r"|/events(?!/?[\w.-])"
-    r"|/actions/(?:runs|jobs|artifacts|workflows)\b"
-    r"|\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?"
-    r"(?:pulls|issues|activity|actions|search)\b"
-    r"|\b(?:pulls|issues|activity|actions|search)\s*[.\[]"
-    r"|pull/[^\n'\"]*?\.(?:diff|patch)\b"
+    _shell_word("/pulls") + r"\b"
+    + r"|" + _shell_word("/issues") + r"\b"
+    + r"|" + _shell_word("/events") + r"(?!/?[\w.-])"
+    + r"|" + _shell_word("/actions/")
+    + r"(?:" + r"|".join(
+        _shell_word(noun) for noun in ("runs", "jobs", "artifacts", "workflows")
+    ) + r")\b"
+    + r"|" + r"\brest['\"]?\s*\]?\s*[.\[]\s*['\"]?"
+    + r"(?:pulls|issues|activity|actions|search)\b"
+    + r"|" + r"\b(?:pulls|issues|activity|actions|search)\s*[.\[]"
+    + r"|" + _shell_word("pull/") + r"[^\n'\"]*?" + _shell_word(".diff")
+    + r"\b|" + _shell_word("pull/") + r"[^\n'\"]*?" + _shell_word(".patch")
+    + r"\b"
 )
 
 # Enumerating the remote's refs, which reaches `refs/pull/N/head` without
@@ -897,13 +934,26 @@ _PULL_REQUEST_API = re.compile(
 # refspec, but `git fetch origin && git for-each-ref` against a remote whose
 # config already carries a wildcard refmap is not read here, because the
 # config is not in this file.
+# Every alternative that is a word or a path reads a *shell word*, for the
+# reason `_shell_word` exists and the reason this rule kept needing new
+# alternatives: what git is handed is not what the step's text spells.
+# `git ls-remo""te origin`, `curl ".../info/re""fs?service=git-upload-pa""ck"`,
+# `git clone --"m"irror` and `git fetch origin +"refs/"*:refs/remotes/all/x`
+# are the same four requests as the four written plainly, and all four were
+# measured green at `d060691d` on a job holding a writable token. The
+# abbreviation alternative needed the quoting only in front of its `m`: every
+# quote *after* that already ends the flag where `(?![\w-])` can read it, so
+# `--mi"r"ror` was red before this and is red after it, measured both ways.
+# The `git/ref/` endpoint alternative is left reading letters, because its
+# lookbehind and its `heads|tags` concession are a URL path and the quoting
+# would have to be argued against both; nothing green turned up there.
 _REMOTE_REF_ENUMERATION = re.compile(
-    r"\bls-remote\b"
-    r"|refs/[^/\s'\"]*\*"
-    r"|/info/refs\b"
-    r"|\bgit-upload-pack\b"
-    r"|--m(?:i(?:r(?:r(?:o(?:r)?)?)?)?)?(?![\w-])"
-    r"|(?<![\w.])git/(?:matching-refs\b|refs\b|ref/(?!(?:heads|tags)/))"
+    r"\b" + _shell_word("ls-remote") + r"\b"
+    + r"|" + _shell_word("refs") + _REF_SEPARATOR + r"[^/\s]*\*"
+    + r"|" + _shell_word("/info/refs") + r"\b"
+    + r"|\b" + _shell_word("git-upload-pack") + r"\b"
+    + r"|" + _shell_word("--m") + r"(?:i(?:r(?:r(?:o(?:r)?)?)?)?)?(?![\w-])"
+    + r"|(?<![\w.])git/(?:matching-refs\b|refs\b|ref/(?!(?:heads|tags)/))"
 )
 
 # The third language the payload is written in. `GITHUB_EVENT_PATH` holds the
@@ -1060,18 +1110,106 @@ _REMOTE_REF_ENUMERATION = re.compile(
 # a supported route to. It costs a false red on a script reading an unrelated
 # variable, which is a line of review and one `core.getInput` or one `$NAME`
 # away from not needing the accessor at all.
+# The four path alternatives read a *shell word*, which is round 23's fix at
+# the third of the three rules that were still reading letters. The path is
+# an argument to `jq` or `cat` and the quoting comes off it on the way:
+# `jq -r .after /home/runner/work/_te""mp/_gith""ub_workflow/even""t.json`
+# reads the same file and was green at `d060691d`. The two variable names
+# above them are left alone, because a shell drops no quoting inside
+# `$GITHUB_EVENT_PATH` -- `"$GITHUB""_EVENT_PATH"` is `$GITHUB` followed by
+# six letters, which is a different expansion and not this one -- and so are
+# the accessors below them, because a quote between the letters of
+# `os.environ` or `process.env` is a syntax error in the language that reads
+# it rather than something dropped before it does. The quoting class belongs
+# to the shell, and these are the alternatives the shell reads.
+#
+# Two alternatives for a *glob*, which is the same lesson with a different
+# character: a path assembled by the shell out of what is on disk is a path
+# this file cannot read, and both of the things this rule guards can be named
+# without spelling them.
+#
+# `/proc/<pid>/environ` is the environment as a file the kernel writes, and
+# `\b(?i:environ)\b` above was credited with catching it. `cat
+# /proc/self/env*` is the same file with the last four letters left to the
+# shell, `cat /proc/self/e*` leaves it six, and `cat /proc/*/environ` globs
+# the pid instead; the first two were green at `d060691d`. Chasing the
+# spellings of `environ` is the losing half of this: the alternative reads
+# the glob, anywhere under `/proc`, and the literal `environ` above goes on
+# covering the path written out. What it concedes is a step that globs
+# procfs for some other reason -- `ls /proc/*/cmdline` -- and what it
+# deliberately does not touch is the procfs paths written out in full, so
+# `grep VmRSS /proc/self/status` and `/proc/cpuinfo` stay green, measured.
+#
+# The payload file is the same shape one directory along, and this rule has
+# already lost to it once: round 22 closed `_github_*` by naming the prefix
+# `_github`, and `/home/runner/work/_t*/_g*/*.json` walks past that, past
+# `work/_temp`, past `event.json` and past `/github/workflow` -- every
+# segment of that path can be globbed, so naming a shorter prefix just moves
+# the same hole one directory up. `/home/runner/*/*/*/*.json` spells none of
+# the four, `/home/runner/work/*/_g*/*.json` and
+# `/home/runner/work/*/*/even*.json` spell one each, and all four were green
+# at `d060691d`. So the alternative reads what those spellings have in
+# common instead: a `.json` path in which a glob stands in for a *directory*
+# name, where the path starts at the filesystem root, at a `../` climbing out
+# of the workspace, or at an earlier glob.
+#
+# Two narrowings, each measured rather than reasoned, because this is the
+# rule in the file most likely to red an ordinary step. The glob has to be a
+# directory and not the file name, which keeps `find . -name '*.json'` and
+# `jq -s . coverage/*.json` green -- the two shapes an ordinary job writes.
+# And the start cannot follow a word character, a `.`, a `:` or another `/`,
+# which keeps `cp dist/*/bundle.json out/`, `cat reports/*/summary.json` and
+# a URL green: `curl -s https://api.example.com/v1/*/data.json` and a
+# `milestones?state=open` query string both matched before the `:` and the
+# `/` went into that class. A job globbing one directory inside its own
+# workspace is not reaching for the payload, which sits outside it.
+#
+# Measured on the compiled pattern, the shapes it still reds that an ordinary
+# job might write are a rooted path arriving at JSON through a globbed
+# directory -- `jq -s /opt/*/config.json` -- and a workspace-relative path
+# with *two* globbed directories, `cp dist/*/b*/x.json out/`, which reds
+# because the second glob's `/` is itself a start. Both are a line of review
+# on a job holding a writable token. What it concedes is a path rooted at a
+# *variable* other than the two named above with a single globbed directory:
+# `$HOME/work/_temp2/_g*/x.json` is green here and was green at `d060691d`
+# too, written down as open rather than closed by a rule that would have to
+# guess which variables name the runner's home. `$RUNNER_TEMP` and
+# `$GITHUB_EVENT_PATH`, the two that actually do, are alternatives of their
+# own above, and `$HOME/w*/_t*/_g*/x.json` -- the same path with the guessing
+# left to the shell -- is red. Grepped over all four `pull_request_target`
+# workflows on 2026-09-20: none of them writes a glob, a `/proc` path, a
+# `/home/runner` path or a `.json` path at all.
+#
+# And jq, which is the environment accessor list's eighth language and the
+# one already installed on the runner and embedded in `gh` as `--jq`. `$ENV`
+# is jq's whole environment as an object, so `jq -rn '$ENV | to_entries[] |
+# select(.key | test("head_ref"; "i")) | .value'` is the fork's branch with
+# no name anywhere in the text for `_RUNNER_VARIABLE` to hold against its
+# allowlist, and it was green. It is refused where it is *used* -- piped on,
+# or closing the jq program it is the whole of -- rather than as the bare
+# three letters, because `$ENV` in a shell is the startup-file variable this
+# rule has always conceded and `_ENVIRONMENT_ENUMERATION`'s control pins
+# `raw $ENV` in a message green. `$ENV.name` and `$ENV["name"]` need nothing
+# here: ruby's `ENV[`/`ENV.` alternative below already reads both, measured,
+# and crediting this alternative with them would be crediting it with
+# somebody else's row. jq's *lower-case* `env` is a shell word wherever it is
+# written, and it is answered at `_ENUMERATION_STOP` instead.
 _EVENT_PAYLOAD_FILE = re.compile(
     r"GITHUB_EVENT_PATH"
     r"|RUNNER_TEMP"
-    r"|work/_temp\b"
-    r"|/github/workflow\b"
-    r"|_github"
-    r"|event\.json"
+    + r"|" + _shell_word("work/_temp") + r"\b"
+    + r"|" + _shell_word("/github/workflow") + r"\b"
+    + r"|" + _shell_word("_github")
+    + r"|" + _shell_word("event.json")
+    + r"|\bproc/[^\s'\"]*[*?]"
+    + r"|(?:(?<![\w.:/])/|\.\./)[^\s'\"]*[*?][^\s'\"]*/[^\s'\"]*"
+    + r"\.j(?:son\b|[\w]*[*?])"
     r"|\bprocess\s*[.\[]\s*['\"]?env\b"
     r"|\bos\s*[.\[]\s*['\"]?environ\b"
     r"|\b(?i:environ)\b"
     r"|%ENV\b"
     r"|\$ENV\s*\{"
+    r"|\$ENV\s*['|]"
     r"|\bENV\s*[.\[]"
     r"|\b(?i:(?:get|lookup)env)"
 )
@@ -1342,13 +1480,32 @@ _SAFE_RUNNER_VARIABLES = frozenset({
 # the process environment instead of taking the route the step offered it,
 # and `pwsh` is the route.
 #
-# So the drive is anchored like the five words: `Env:` at a terminator is
-# the listing, and `Env:GITHUB_SHA` or `Env:\` names something. The `\S[ \t]+`
-# in front is what keeps a YAML `env:` key -- which a step may well write
-# into a file with a heredoc -- from reading as a drive, since a key begins
-# its line and a drive follows a cmdlet. It also keeps the shell's own
-# `${ENV:-none}` out twice over: no whitespace in front of it, and `-none`
-# is not a terminator.
+# So the drive is anchored like the five words -- `Env:` at a terminator is
+# the listing -- and then unlike them, because a drive has a second way of
+# naming more than one thing. `Env:GITHUB_SHA` names one variable and the
+# allowlist over the names reads it; `Env:*` is the provider's wildcard and
+# is every variable there is, which is the question this rule is about, and
+# it was green at `d060691d` because `*` is in neither the terminator set nor
+# the glue. So is the rest of that class, measured one at a time rather than
+# fixed one at a time: `Env:?*`, `Env:[A-Z]*`, `Env:/` and the prefix wildcard
+# `Env:GITHUB_*`, which enumerates the reserved namespace while naming no
+# variable in it for `_RUNNER_VARIABLE` to hold. `_ENUMERATION_DRIVE_END` is
+# the class, and `Env:GITHUB_SHA` stays green because a name with no wildcard
+# in it is still a name.
+#
+# `Env:\` is in that class too, and the comment here used to say it "names
+# something". It does not: a backslash is the drive's root and
+# `Get-ChildItem Env:\` lists the lot. It was red anyway, and for a reason
+# that had nothing to do with it being read as a listing -- the trailing
+# quoting run `_enumeration_word` puts after the word ate the backslash, and
+# the end of the line behind it was the terminator. A row that would have
+# been passing for the wrong reason is now passing for the stated one.
+#
+# The `\S[ \t]+` in front is what keeps a YAML `env:` key -- which a step may
+# well write into a file with a heredoc -- from reading as a drive, since a
+# key begins its line and a drive follows a cmdlet. It also keeps the shell's
+# own `${ENV:-none}` out twice over: no whitespace in front of it, and
+# `-none` is not a terminator.
 #
 # What this rule does not reach, written down rather than implied. A program
 # the step starts inherits the whole environment without asking for it, and
@@ -1383,10 +1540,28 @@ _ENUMERATION_PROGRAM_START = r"(?<![\w.-])"
 #: character immediately after the word -- an expansion with a space in front
 #: of it is an argument, and `set $FLAGS` is not a dump.
 _ENUMERATION_GLUE = r"\$"
+#: The other end of the drive: a PowerShell provider path that asks for more
+#: than the one variable a name would ask for. A wildcard anywhere in the
+#: name -- `Env:*`, `Env:?*`, `Env:[A-Z]*`, `Env:GITHUB_*` -- and the drive
+#: root, which is `Env:\` or `Env:/` and is the whole drive listed.
+_ENUMERATION_DRIVE_END = r"(?:[\w-]*[*?\[]|[\\/])"
 #: Where an alternative's name stops: at a terminator, or at an expansion
 #: glued to the last letter of it.
+#:
+#: The quoting run in the first branch is not the one `_enumeration_word`
+#: puts inside the word. It is the quote that closes something the word is
+#: *inside*: `jq -rn 'env ' | head -1` runs the jq program `env `, which is
+#: jq's own whole-environment builtin, and the character after the name there
+#: is a space -- so the word's trailing run never reaches the `'`, and the
+#: terminator behind it was never read. Measured green at `d060691d`, with
+#: `jq -rn 'env' | head -1` red beside it, which is the same dump one space
+#: shorter. A quote with a terminator behind it ends the command whatever
+#: opened it; a quote with an argument behind it does not, so `grep env
+#: "Makefile"` and `echo 'export PATH=/x' >> ./profile` stay green and the
+#: control that holds them there is the one this rule already had.
 _ENUMERATION_STOP = (
-    r"(?:[ \t]*" + _ENUMERATION_END + r"|" + _ENUMERATION_GLUE + r")"
+    r"(?:[ \t]*" + _SHELL_QUOTING + r"[ \t]*" + _ENUMERATION_END
+    + r"|" + _ENUMERATION_GLUE + r")"
 )
 
 
@@ -1439,7 +1614,7 @@ _ENVIRONMENT_ENUMERATION = re.compile(
         _ENUMERATION_BUILTIN_START
         + _enumeration_word("set") + _ENUMERATION_STOP,
         r"\S[ \t]+(?i:" + _enumeration_word("env:") + r")"
-        + _ENUMERATION_STOP,
+        + r"(?:" + _ENUMERATION_STOP + r"|" + _ENUMERATION_DRIVE_END + r")",
         _ENUMERATION_BUILTIN_START
         + _enumeration_word("compgen")
         + r"[ \t]+(?:-[\w-]*[ev]\b|-A[ \t]*(?:variable|export)\b)",
@@ -1515,21 +1690,45 @@ _INDIRECT_EXPANSION = re.compile(r"\$\{!\w+\b(?![@*]\}|\[[@*]\]\})")
 # so `declare -a tools=(jq yq)` stays green and the control that holds it
 # there is the one the enumeration rule already needed.
 #
-# The `eval` alternative is anchored on a *deferred* dollar -- `\$` or `$$`
-# -- rather than on the word, because the ordinary uses of `eval` expand
-# once and this one expands twice. `eval "$(ssh-agent -s)"` is how every
-# workflow that loads a key starts, `eval "$cmd"` runs a command line built
-# earlier, and neither has a dollar that survives the first pass. A dollar
-# that does survive is there to name something the second pass will find,
-# and what it finds is chosen at run time -- which is the property, not the
-# syntax.
+# The `eval` alternative is anchored on a *deferred* dollar rather than on
+# the word, because the ordinary uses of `eval` expand once and this one
+# expands twice. `eval "$(ssh-agent -s)"` is how every workflow that loads a
+# key starts, `eval "$cmd"` runs a command line built earlier, and neither
+# has a dollar that survives the first pass. A dollar that does survive is
+# there to name something the second pass will find, and what it finds is
+# chosen at run time -- which is the property, not the syntax.
+#
+# The property was right and two of the three spellings of it were missing,
+# which is round 23's lesson at the rule that states a property rather than a
+# list. A backslash is one way to carry a dollar past the first pass and a
+# *single quote* is the other: `v=GITHUB_; v+=HEAD_REF; B=$(eval echo '$'"$v")`
+# is `_INDIRECT_EXPANSION`'s own row with the sigil quoted instead of
+# escaped, and `eval 'echo ${'$v'}'`, `eval 'B=$'"$v"` and `eval B='$'$v` are
+# three more. All four were green at `d060691d`.
+#
+# What tells that dollar from the dollar inside an ordinary quoted program is
+# the character after it: the deferred one is at the *end* of its quoted run,
+# because the name it wants is the text that follows the closing quote.
+# `awk '{print $1}'` and `sed 's/$//p'` have a dollar inside single quotes
+# too, both of them are what an ordinary `eval "$(...)"` pipeline is made of,
+# and in neither does the quote come next. Measured green both ways.
+#
+# The tail is the same word with the quoting written into it, for
+# `_shell_word`'s reason one rule along: the shell drops the quotes between
+# the closing `'` and the name, so `'$'"$v"`, `'$'$v` and `${'$v` are the
+# same read and the tail has to walk all three.
 #
 # What this costs is a lookup table keyed by name and a `local -n` helper in
 # a long script, which are the same line of review `_INDIRECT_EXPANSION`
 # costs and the same `case` statement away from naming the variables.
+#: A dollar the first pass does not expand: escaped, doubled, or written at
+#: the end of a single-quoted run, which is where a quoted one has to be for
+#: the second pass to find a name behind it.
+_DEFERRED_DOLLAR = r"(?:\\\$|\$\$|'[^'\n]*\$\{?')"
 _COMPUTED_NAME_READ = re.compile(
     r"\b(?:declare|typeset|local)[ \t]+-[a-zA-Z]*n[a-zA-Z]*\b"
-    r"|\beval\b[^\n]*?(?:\\\$|\$\$)\{?\$?\w"
+    + r"|\beval\b[^\n]*?" + _DEFERRED_DOLLAR + _SHELL_QUOTING + r"\{?"
+    + _SHELL_QUOTING + r"\$?" + _SHELL_QUOTING + r"\w"
 )
 
 # A backslash before a newline is not a line break: the shell removes both

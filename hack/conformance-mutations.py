@@ -24,7 +24,7 @@ the file with `git checkout`, and reports:
              change that weakens nothing.
     SURVIVED (expected)
              a `must_survive` control was not caught, which is its pass.
-             Thirty rows print this on a green run, and the
+             Thirty-six rows print this on a green run, and the
              SURVIVED line above is exactly the wrong reading of them: the
              suite staying green is the property they assert. `--list` is
              the authority on how many there are, because it marks each one;
@@ -93,39 +93,46 @@ class Mutation:
     #: row without this field can get is printed for one that has it: the
     #: pass is `SURVIVED (expected)` and the failure is OVERSHOT, which is
     #: what the module docstring says and what `main` writes. There are
-    #: thirty today, which `--list` is the authority on rather than
+    #: thirty-six today, which `--list` is the authority on rather than
     #: this comment -- it marks each control `[control]`, and the list below
     #: named ten on 2026-09-19 when there were eleven, and one of the ten by
-    #: an id no row had:
+    #: an id no row had. Written in the order `--list` prints them so that
+    #: the two can be compared by eye:
     #: A3-fastpath-redundant,
     #: B1-denylist-rule,
+    #: B4-pull-request-target-run-local-ref-file,
+    #: B4-pull-request-target-run-ref-endpoint-namespaced,
+    #: B4-pull-request-target-run-ref-quoted-word-ordinary,
     #: B4-pull-request-target-api-gh-pr-interposed-flag-write,
+    #: B4-pull-request-target-api-gh-wrapped-readable-program,
+    #: B4-pull-request-target-api-gh-pipeline-readable-program,
+    #: B4-pull-request-target-run-quoted-paren-ordinary,
+    #: B4-pull-request-target-run-unbalanced-paren-ordinary,
+    #: B4-pull-request-target-api-gh-substitution-ordinary,
+    #: B4-pull-request-target-run-backtick-closed-then-prose,
     #: B4-pull-request-target-api-actions-path-ordinary,
     #: B4-pull-request-target-api-web-link-comment,
     #: B4-pull-request-target-api-gh-issue-comment-write,
     #: B4-pull-request-target-api-gh-argv-vector-write,
     #: B4-pull-request-target-run-context-repo,
-    #: B4-pull-request-target-api-gh-wrapped-readable-program,
-    #: B4-pull-request-target-api-gh-pipeline-readable-program,
-    #: B4-pull-request-target-run-quoted-paren-ordinary,
     #: B4-pull-request-target-run-context-repo-env,
-    #: B4-pull-request-target-api-gh-substitution-ordinary,
-    #: B4-pull-request-target-run-backtick-closed-then-prose,
-    #: B4-pull-request-target-run-env-ordinary-shell,
+    #: B4-pull-request-target-run-json-glob-ordinary,
     #: B4-pull-request-target-run-environment-word,
+    #: B4-pull-request-target-run-quoted-word-ordinary,
+    #: B4-pull-request-target-run-spaced-quoted-word-ordinary,
+    #: B4-pull-request-target-run-backtick-and-comment,
+    #: B4-pull-request-target-run-eval-ordinary,
+    #: B4-pull-request-target-run-eval-quoted-dollar-ordinary,
+    #: B4-pull-request-target-run-proc-path-ordinary,
+    #: B4-pull-request-target-pwsh-named-variable,
+    #: B4-pull-request-target-pwsh-drive-neighbourhood-ordinary,
     #: B4-pull-request-target-run-array-index-walk,
-    #: B4-pull-request-target-run-local-ref-file,
-    #: B4-pull-request-target-run-ref-endpoint-namespaced,
-    #: B4-pull-request-target-run-ref-quoted-word-ordinary,
+    #: B4-pull-request-target-run-env-ordinary-shell,
     #: B4-pull-request-target-shell-ordinary,
     #: B4-pull-request-target-checkout-ref-env-case,
     #: B4-pull-request-target-run-clone-bare,
     #: B4-pull-request-target-run-log-m-flags,
-    #: B4-pull-request-target-run-runner-repository-name,
-    #: B4-pull-request-target-run-backtick-and-comment,
-    #: B4-pull-request-target-run-quoted-word-ordinary,
-    #: B4-pull-request-target-pwsh-named-variable,
-    #: B4-pull-request-target-run-eval-ordinary, and
+    #: B4-pull-request-target-run-runner-repository-name, and
     #: B4-pull-request-target-container-pinned-image.
     must_survive: bool = False
 
@@ -1058,6 +1065,32 @@ Mutation(
         "server's pattern matching",
     ),
     Mutation(
+        # The same listing with the quoting inside the command's name, and
+        # the second of the three. A shell drops a quote between two letters
+        # of a word it is not part of, so `git ls-remo""te origin` runs the
+        # row above's command and `\bls-remote\b` sees a quote where it
+        # wanted a word boundary. Green at `d060691d`. It pins the
+        # `_shell_word` treatment of the `ls-remote` alternative; the
+        # `/info/refs` and `git-upload-pack` alternatives took the same
+        # treatment in the same change and are pinned by no row, which is
+        # written down rather than claimed here.
+        "B4-pull-request-target-run-ls-remote-quoted-word",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+         "        run: |\n"
+         '          SHA=$(git ls-remo""te origin'
+         ' | grep "/$PR_NUMBER/head" | cut -f1)\n'
+         '          git fetch origin "$SHA" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "quote two letters of the subcommand's name, which the shell drops "
+        "and the pattern over the letters could not see past",
+    ),
+    Mutation(
         # The same reach with the enumeration done by the fetch. `+refs/*`
         # copies every namespace the remote has onto the runner, the pull
         # namespace among them, and `git for-each-ref` then reads the head
@@ -1580,6 +1613,34 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "page the pulls collection instead of naming a number, which is what "
         "a workflow that handles several pull requests at once would write",
+    ),
+    Mutation(
+        # The same collection path with the shell's quoting inside it, and
+        # the first of three rows over the same finding. `_PULL_REQUEST_REF`
+        # has read a shell word since round 23 on the argument that the text
+        # and what the shell hands the program are not the same string;
+        # `_PULL_REQUEST_API` went on reading letters, so `/pul""ls` is the
+        # row above's request character for character by the time `gh` is
+        # handed it -- the two quotes come off between the two `l`s -- and it
+        # was green at `d060691d`. It pins the `_shell_word` treatment of the
+        # `/pulls` alternative: put the literal back and this row is the only
+        # one in the table that moves.
+        "B4-pull-request-target-api-pulls-quoted-word",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"
+         "        run: |\n"
+         '          SHA=$(gh api "repos/$GITHUB_REPOSITORY/pul""ls/42"'
+         " --jq .head.sha)\n"
+         '          git fetch --depth=1 origin "$SHA"\n'
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "close and reopen the quoting in the middle of the path, which is "
+        "one character of shell syntax and the same request",
     ),
     Mutation(
         # `gh pr checkout` with a flag in front of the verb. `-R` is a
@@ -2269,18 +2330,19 @@ Mutation(
         must_survive=True,
     ),
     Mutation(
-        # The ordinary side of the quoting, and the whole cost of the second
-        # reading the two rows above added. Skipping a separator inside a
-        # quoted word means the walk now reads *past* the parentheses in a
-        # log line and on down the pipe, where it was stopped by them
-        # before, so an ordinary step that says something about a pull
-        # request and pipes it somewhere is walked for the first time. What
-        # it finds is `tee` and `out.txt`, which `_READABLE_PROGRAM` reads.
+        # The ordinary side of the quoting. What this row does *not* do is
+        # show the second reading widening the walk, which is what its
+        # comment claimed for two rounds: the parentheses in this log line
+        # are balanced, and a balanced pair is stepped over by the depth
+        # counter whether or not the reading can see the quotes. Measured on
+        # 2026-09-20 -- both readings hand the walk `['tee', 'out.txt']`.
+        # The row the second reading actually changes is the unbalanced
+        # spelling, which is a control of its own below.
+        # What this one pins is the shape of the fix rather than its reach.
         # OVERSHOT here means the quoted separator has been made the
         # objection itself rather than what it lets the walk reach, which
         # reds on every step in this repository that puts a parenthesis in a
-        # message. Green before the second reading existed and green after,
-        # which is the only way this row says anything.
+        # message. Green before the second reading existed and green after.
         "B4-pull-request-target-run-quoted-paren-ordinary",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -2292,6 +2354,31 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "pipe a log line with a parenthesis in it into a plain program, "
         "which is the most ordinary thing a step does with a message",
+        must_survive=True,
+    ),
+    Mutation(
+        # The ordinary step the second quoting reading actually changes, and
+        # the row the control above turned out not to be. Measured on
+        # 2026-09-20: for `echo "the pr is open (stage 1)" | tee out.txt`
+        # both readings hand the walk `['tee', 'out.txt']`, because the
+        # parentheses are balanced and the depth counter steps over a pair
+        # whether or not it can see the quotes. An *unbalanced* one is where
+        # they differ -- the quote-blind reading counts the `(` open, never
+        # closes it, and returns no downstream program at all, while the
+        # quote-skipping reading crosses the pipe and finds `tee`. So this
+        # is the line that is walked for the first time, and what the walk
+        # finds at the end of it is a program review can read.
+        "B4-pull-request-target-run-unbalanced-paren-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Note the pull request\n"
+         "        run: |\n"
+         '          echo "the pr is open (stage 1" | tee out.txt\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "leave a parenthesis unclosed in a log line and pipe it into a "
+        "plain program, which is the step the quoted reading newly walks",
         must_survive=True,
     ),
     Mutation(
@@ -3653,10 +3740,14 @@ Mutation(
         # alternative and this row is still KILLED, neuter `RUNNER_TEMP` and
         # it is still KILLED, neuter both and it is still KILLED, because
         # `RUNNER_TEMP` is off `_SAFE_RUNNER_VARIABLES` and the runner
-        # variable allowlist refuses the line a third time. Only with all
-        # three gone does it go SURVIVED. What the row records is the reach
-        # -- the payload read with a wildcard where a name used to be -- and
-        # that three rules answer it.
+        # variable allowlist refuses the line a third time. Round 25 added a
+        # fourth: the glob alternative reads `_github_*/*.json` as a path
+        # arriving at JSON through a globbed directory, without reference to
+        # either name. Re-measured on 2026-09-20 -- with the two
+        # alternatives, the allowlist *and* the glob neutered it goes
+        # SURVIVED, and with any one of the four left it is KILLED. What the
+        # row records is the reach -- the payload read with a wildcard where
+        # a name used to be -- and that four readings answer it.
         "B4-pull-request-target-run-event-file-glob",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -3687,12 +3778,15 @@ Mutation(
         # of the pattern on its own -- neuter `work/_temp` and it is still
         # KILLED on `_github`, neuter `_github` and it is still KILLED on
         # `event.json`, neuter `event.json` and it is still KILLED, and only
-        # with all three gone does it go SURVIVED, by which point
-        # `work/_temp` has taken the temp glob with it. That row pins
-        # `work/_temp` alone and the container mount pins
-        # `/github/workflow` alone; `_github` and `event.json` are pinned by
-        # no row at all, which is worth knowing and is not a claim this row
-        # gets to make.
+        # with all three gone does it go SURVIVED. Where those three are
+        # pinned moved in round 25 and was re-measured on 2026-09-20 rather
+        # than carried: the temp glob below used to pin `work/_temp` alone,
+        # the new glob alternative reads that row's path too, and the `find`
+        # row under it -- which writes no wildcard -- pins `work/_temp`
+        # instead. The container mount still pins `/github/workflow` alone,
+        # its glob being in the file name rather than in a directory.
+        # `_github` and `event.json` are pinned by no row at all, which is
+        # worth knowing and is not a claim this row gets to make.
         #
         # What it records is the reach: the path a GitHub-hosted Linux
         # runner actually uses, written out, with no `GITHUB_`- or
@@ -3762,6 +3856,121 @@ Mutation(
         "read the payload at the path a container job sees it at, which is "
         "the same file the runner mounted and none of the words the "
         "runner's own path is written in",
+    ),
+    Mutation(
+        # The path with the shell's quoting inside it, and the third of the
+        # three rows over round 25's finding. The four path alternatives read
+        # letters while `_PULL_REQUEST_REF` read a shell word, so `jq -r
+        # .after /home/runner/work/_te""mp/_gith""ub_workflow/even""t.json`
+        # opens the same file as the literal-path row above and spells none
+        # of `work/_temp`, `_github` or `event.json` to a pattern reading
+        # them as letters. Green at `d060691d`. It records the `_shell_word`
+        # treatment of the path half rather than pinning one alternative of
+        # it, and the difference is measured rather than assumed: the step
+        # spells `work/_temp`, `_github` and `event.json` quoted, so any one
+        # of those three still reading a shell word keeps this row KILLED,
+        # and it is SURVIVED only with all three put back. Measured over
+        # every subset of the three on 2026-09-20, and at the suite level
+        # with all three reverted together, where it is the only row in the
+        # table that moves. `/github/workflow` took the same treatment in
+        # the same change, is not in this step, and is pinned by no row.
+        "B4-pull-request-target-run-event-file-quoted-word",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         '          REV=$(jq -r .after /home/runner/work/_te""mp/'
+         '_gith""ub_workflow/even""t.json)\n'
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "quote two letters of each directory and of the file name, which "
+        "the shell drops on the way to `jq` and the path rule read as text",
+    ),
+    Mutation(
+        # The same path with every component globbed, and the row the glob
+        # alternative exists for. The three rows above each leave one of the
+        # names written down -- `work/_temp` on the temp glob, `_github` on
+        # the runner glob, `/github/workflow` on the container mount -- and
+        # `/home/runner/*/*/*/*.json` leaves none: the shell assembles the
+        # path out of what is on disk, and what is on disk is the payload.
+        # Green at `d060691d`, where each of the other three is red.
+        #
+        # It pins the glob alternative alone: neuter it and this row is
+        # SURVIVED, measured on 2026-09-20, and it is the only row of the
+        # four that goes with it. That is also why the alternative is worth
+        # a row of its own rather than a wider reading of the names -- every
+        # segment of the path can be globbed, so a shorter prefix moves the
+        # hole one directory up rather than closing it.
+        "B4-pull-request-target-run-event-file-any-glob",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          REV=$(jq -r .after /home/runner/*/*/*/*.json)\n"
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "glob every component of the path, which reaches the payload with "
+        "none of the four names anywhere in the step",
+    ),
+    Mutation(
+        # The ordinary side of the row above, and the whole cost of reading
+        # a glob. A path rule that tolerates wildcards is the rule in this
+        # file most likely to red a step that is doing its job, so the three
+        # shapes an ordinary job writes are held green together: `find .
+        # -name '*.json'` and `jq -s . coverage/*.json` glob the file name
+        # rather than a directory, and `cp dist/*/bundle.json out/` globs a
+        # directory inside the workspace rather than one on a path rooted
+        # outside it. OVERSHOT here means the alternative has been written as
+        # "a glob and a `.json` somewhere in the same word", which was the
+        # first draft of it and reds on all three.
+        "B4-pull-request-target-run-json-glob-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Collect the reports\n"
+         "        run: |\n"
+         "          find . -name '*.json' -maxdepth 2 | head -5\n"
+         "          jq -s . coverage/*.json > all.json\n"
+         "          cp dist/*/bundle.json out/\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "glob for JSON three ways a build step does, which is the shape "
+        "the payload rule has to read past rather than refuse",
+        must_survive=True,
+    ),
+    Mutation(
+        # The payload found rather than named, and the row that carries a
+        # pin the glob alternative took off another one. `find` walks the
+        # runner's temporary tree and `head -1` takes the payload out of it,
+        # so the step names `work/_temp` and nothing else: no glob, no
+        # `_github`, no `event.json`, no variable. Before round 25 the temp
+        # glob two rows up pinned `work/_temp` alone; the glob alternative
+        # now reads that row's path too, so neutering `work/_temp` leaves it
+        # KILLED and would have left the alternative unpinned. Measured on
+        # 2026-09-20: with `work/_temp` neutered this row is SURVIVED and
+        # the temp glob is still KILLED, which is the pin moving here rather
+        # than being lost. Red at `d060691d` as well -- it is not a finding,
+        # it is where the finding's fix put the credit.
+        "B4-pull-request-target-run-event-file-temp-find",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          F=$(find /home/runner/work/_temp -type f | head -1)\n"
+         '          REV=$(jq -r .after "$F")\n'
+         '          git fetch --depth=1 origin "$REV"\n'
+         "          git reset --hard FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "search the runner's temporary tree for the payload instead of "
+        "spelling the two directories under it",
     ),
     Mutation(
         # And the same reach in the other language a step can be written in.
@@ -4246,6 +4455,55 @@ Mutation(
         "runs and puts a quote where the rule wanted an operator",
     ),
     Mutation(
+        # The same dump from the eighth language, and the one already on the
+        # runner. `jq` is preinstalled and embedded in `gh` as `--jq`, and
+        # `$ENV` is its whole environment as an object, so this is `env |
+        # grep` written as a jq program: no `env` word for the enumeration
+        # rule, no accessor any of the seven languages above spell, and no
+        # variable name for the runner allowlist to hold. Green at
+        # `d060691d`. It pins jq's `$ENV` in `_EVENT_PAYLOAD_FILE`, which is
+        # read where it is *used* rather than as three bare letters --
+        # `_ENVIRONMENT_ENUMERATION`'s control writes `raw $ENV` in a message
+        # and stays green, measured, which a `\$ENV\b` alternative would
+        # have OVERSHOT.
+        "B4-pull-request-target-run-jq-env-object",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(jq -rn '$ENV | to_entries[]"
+         ' | select(.key | test("head_ref"; "i")) | .value\')\n'
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "ask jq for its own environment as an object, which is the dump "
+        "written in the one language on this runner that has it built in",
+    ),
+    Mutation(
+        # The same dump with one space in it, and the hole the trailing
+        # quoting run left. `jq -rn 'env'` is refused because the word's
+        # trailing run eats the quote and the end of the line terminates it;
+        # `jq -rn 'env '` is the identical program -- jq ignores the space --
+        # and the run never reaches the quote, because a space is in front of
+        # it. Green at `d060691d`, where the line without the space is red.
+        # It pins the quoting run's new position in `_ENUMERATION_STOP`,
+        # which reads horizontal space on both sides of it.
+        "B4-pull-request-target-run-env-dump-spaced-quote",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          B=$(jq -rn 'env ' | grep -i head_ref"
+         " | head -1 | cut -d'\"' -f4)\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put one space between the dump and the quote that closes the jq "
+        "program, which is the same program and was not a terminator",
+    ),
+    Mutation(
         # The same word finished with an expansion instead. `NOPE` is unset,
         # an unset variable expands to nothing, and `env$NOPE` is therefore
         # `env` -- with a `$` after the name where the rule wanted a
@@ -4307,6 +4565,29 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "grep for one of the words the enumeration rule reads and write "
         "another of them into a file, quoting both because a shell needs it",
+        must_survive=True,
+    ),
+    Mutation(
+        # The ordinary side of the row that put a space in front of the
+        # quote. Both lines here write an enumeration word, a space and a
+        # quote, and neither is a read: `grep -n 'env ' Makefile` searches
+        # for the word with a trailing space in it, and `jq -r '.env | keys'`
+        # asks a JSON file for one of its keys. OVERSHOT here means the
+        # horizontal space around the quoting run has been let loose from
+        # the terminator that has to follow it, which reds on the first step
+        # that greps for a word and on the round-16 control above as well.
+        "B4-pull-request-target-run-spaced-quoted-word-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Check the makefile\n"
+         "        run: |\n"
+         "          grep -n 'env ' Makefile | head -5\n"
+         "          jq -r '.env | keys' package.json\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "grep for the enumeration word with a space inside the quotes, "
+        "which is the same two characters the dump above is refused for",
         must_survive=True,
     ),
     Mutation(
@@ -4492,6 +4773,33 @@ Mutation(
         "reaches the variable with the name built between the two passes",
     ),
     Mutation(
+        # The same re-parse with the dollar deferred by quotes instead of by
+        # a backslash. `'B=${'$v'}'` is three quoted runs the shell
+        # concatenates into `B=${GITHUB_HEAD_REF}`, which `eval` then runs:
+        # the dollar that survives the first pass is inside single quotes
+        # rather than behind a `\`, and `(?:\\\$|\$\$)` read neither of those
+        # spellings. Green at `d060691d`, as were `eval echo '$'"$v"` and
+        # `eval B='$v`. It pins the single-quoted branch of
+        # `_DEFERRED_DOLLAR`, which is anchored on the quote *closing* right
+        # after the dollar -- `awk '{print $1}'` and `sed 's/$//p'` carry a
+        # dollar inside single quotes too, and the control below holds them
+        # green.
+        "B4-pull-request-target-run-eval-quoted-dollar",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          v=GITHUB\n"
+         '          v="${v}_HEAD_REF"\n'
+         "          eval 'B=${'$v'}'\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "defer the dollar in single quotes rather than behind a backslash, "
+        "which is the same two passes with the other quoting character",
+    ),
+    Mutation(
         # The safe side of the row above, and the reason it is anchored on a
         # deferred dollar rather than on the word. `eval "$(ssh-agent -s)"`
         # is how every workflow that loads a key starts and `eval "$cmd"`
@@ -4512,6 +4820,77 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "start an ssh agent and run a command line held in a variable, "
         "which is `eval` used the two ways a workflow legitimately uses it",
+        must_survive=True,
+    ),
+    Mutation(
+        # The ordinary side of the quoted dollar, and the reason that branch
+        # requires the quote to close on it. `awk '{print $1}'` is the most
+        # ordinary thing downstream of an `eval "$cmd"` there is, and its
+        # dollar is inside single quotes with three characters after it.
+        # OVERSHOT here means the branch has been written as "a dollar
+        # anywhere inside single quotes on an `eval` line", which reds on
+        # every field an awk or sed program names.
+        "B4-pull-request-target-run-eval-quoted-dollar-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Summarise the log\n"
+         "        run: |\n"
+         '          cmd="git log -1 --format=%H"\n'
+         "          eval \"$cmd\" | awk '{print $1}' | tee out.txt\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "pipe an evaluated command line into awk, which puts a dollar in "
+        "single quotes on the same line as an `eval` and reads nothing",
+        must_survive=True,
+    ),
+    Mutation(
+        # The environment as the file the kernel writes, reached with a
+        # glob. `/proc/<pid>/environ` is the same bytes `env` prints and
+        # `\b(?i:environ)\b` was credited with catching it -- but the last
+        # four letters can be left to the shell, and `cat /proc/self/env*`
+        # reads the identical file with nothing for a pattern over the word
+        # to hold. Green at `d060691d`, as were `/proc/self/e*` and
+        # `/proc/*/environ`. It pins the `/proc` glob alternative, which
+        # reads a wildcard anywhere under procfs rather than chasing the
+        # spellings of one word; the literal `environ` goes on covering the
+        # path written out, and is pinned by no row.
+        "B4-pull-request-target-run-proc-environ-glob",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        run: |\n"
+         "          E=$(cat /proc/self/env* | tr '\\0' '\\n')\n"
+         '          B=$(echo "$E" | grep -i \'^github_head_ref=\''
+         " | cut -d= -f2)\n"
+         '          git fetch origin "$B" && git checkout FETCH_HEAD\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "leave the last four letters of the file name to the shell, which "
+        "opens the same file and writes none of the word",
+    ),
+    Mutation(
+        # The ordinary side of the row above, and the cost of reading a
+        # glob under procfs. A step asking the kernel about the machine it
+        # is on writes these paths out in full, and neither of them is an
+        # environment: `/proc/self/status` is this process's memory and
+        # `/proc/cpuinfo` is the runner's hardware. OVERSHOT here means
+        # procfs itself has been refused, which is a suite that reds on the
+        # first step that reports how big the runner is.
+        "B4-pull-request-target-run-proc-path-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Report the runner\n"
+         "        run: |\n"
+         "          grep VmRSS /proc/self/status\n"
+         "          head -3 /proc/cpuinfo\n"
+         "          nproc\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "read two procfs files by their full names, which is how a step "
+        "reports the machine and is not a dump of anything",
         must_survive=True,
     ),
     Mutation(
@@ -4580,6 +4959,61 @@ Mutation(
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "name two allowlisted variables from PowerShell, which spells a "
         "named read with the same `env` the drive listing uses",
+        must_survive=True,
+    ),
+    Mutation(
+        # The same drive with a wildcard on it. PowerShell's `Env:` is a
+        # provider drive, so `Env:*` is a path *pattern* over it and
+        # `Get-ChildItem Env:*` lists exactly what `Get-ChildItem Env:`
+        # lists -- with the terminator the drive row above is refused by
+        # replaced by a character that is not one. Green at `d060691d`, as
+        # were `Env:/`, `Env:?*`, `Env:[A-Z]*` and `Env:GITHUB_*`. It pins
+        # `_ENUMERATION_DRIVE_END`, the class that reads a drive still being
+        # a drive after the colon: a wildcard, a bracket, or the separator
+        # that makes it a root. `Env:\` was already red before that class
+        # existed, but only because the word's trailing quoting run ate the
+        # backslash and the end of the line terminated it -- a drive root
+        # read as a quoted name, which is the right verdict for the wrong
+        # reason and is now the same alternative as the rest of them.
+        "B4-pull-request-target-pwsh-env-drive-wildcard",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Fetch the pull request\n"
+         "        shell: pwsh\n"
+         "        run: |\n"
+         "          $v = Get-ChildItem Env:* | "
+         "Where-Object Name -like '*HEAD_REF'\n"
+         "          git fetch origin $v.Value\n"
+         "          git checkout FETCH_HEAD\n"
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "put a wildcard after the drive's colon, which lists the same "
+        "variables and is not the terminator the rule was reading for",
+    ),
+    Mutation(
+        # The ordinary side of the drive class. Both lines write `env:`
+        # followed by something in the class's neighbourhood and neither is
+        # a listing: `$env:GITHUB_WORKSPACE\dist` is a named read of an
+        # allowlisted variable with a Windows path separator after it, and
+        # `  env: production` is a line of YAML a step appends to a file.
+        # OVERSHOT here means the class has been let loose from the space
+        # that has to precede the drive, or the backslash from the colon it
+        # has to follow, which reds on every `pwsh` step that joins a path
+        # and on every step that writes a config file.
+        "B4-pull-request-target-pwsh-drive-neighbourhood-ordinary",
+        ".github/workflows/risk_classify.yml",
+        ("      - name: Set up Python",
+         "      - name: Write the build config\n"
+         "        shell: pwsh\n"
+         "        run: |\n"
+         '          Write-Host "artifacts in $env:GITHUB_WORKSPACE\\dist"\n'
+         '          Add-Content build.yml "  env: production"\n'
+         "\n"
+         "      - name: Set up Python"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "write a Windows path off an allowlisted variable and a YAML key "
+        "into a file, which is `env:` next to the class and reads nothing",
         must_survive=True,
     ),
     Mutation(
@@ -5764,6 +6198,26 @@ Mutation(
         "shorten an exemption's reason to a note. An exemption list is the only "
         "way out of the coverage floor, so it stays honest exactly as long as "
         "entering it costs an argument",
+    ),
+    Mutation(
+        # The guard over the suite's own prose, one character past the range
+        # it used to read. A docstring that is not a raw string hands its
+        # escapes to the parser, and what reaches the file is the character
+        # rather than the six letters somebody typed -- which is how a
+        # sentence about `\x1b` loses its point silently. The guard said "any
+        # control character" and stopped at 0x20, so DEL and the whole C1
+        # block went through it, and round 25 widened it to Unicode's `Cc`
+        # category. This row is that widening's only pin: the same edit is
+        # green with the class written `ord(character) < 0x20` and red with
+        # it written `unicodedata.category(character) == "Cc"`, measured both
+        # ways on 2026-09-21. No other row names this test.
+        "harness-docstring-control-character-outside-c0",
+        "tests/conformance/test_D_accountability.py",
+        ('"""D2: defaults off, earned per domain, never a global setting."""',
+         '"""D2: defaults off, earned per domain, never a global setting.\x7f"""'),
+        "test_no_docstring_in_the_suite_contains_a_control_character",
+        "leave a consumed escape at the end of a docstring, which is what a "
+        "pasted delete character is and what the guard exists to catch",
     ),
     Mutation(
         "C1-session-fence-selector-drift",
