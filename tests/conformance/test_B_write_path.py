@@ -3373,12 +3373,22 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         folding in the values the script appeared to name and following a
         chain one hop at a time -- and by the end it changed no verdict. The
         wholesale refusal below reads every value in the step's environment
-        whether or not the script names it, and neither literal backstop can
-        match across the newline a fold joins on, so every string the pickup
-        put in front of a pattern was one some rule already read singly.
-        That is an argument, so it was measured, three rounds running:
-        neutered to the empty mapping it left all twelve round-7 cases, all
-        fifteen round-6 cases and all forty-two evasion cases at exactly the
+        whether or not the script names it, so every string the pickup put
+        in front of a pattern was one some rule already read singly.
+
+        The second reason given for that here was that neither literal
+        backstop can match across the newline a fold joins on, and half of
+        it is wrong, corrected 2026-09-21. `_PULL_REQUEST_REF` cannot: its
+        one variable interior is a class that excludes a newline, and every
+        other piece of it is a literal or a run of quote characters.
+        `_PULL_REQUEST_HEAD` can, in all three of its alternatives, because
+        `_PROPERTY`'s index spelling allows any whitespace between the `[`
+        and the quote and a newline is whitespace -- `pull_request[` joined
+        to `'head']` is a match where neither half is one, measured. So what
+        holds this up is the measurement rather than the shape of the two
+        patterns, and it was made three rounds running: neutered to the
+        empty mapping the pickup left all twelve round-7 cases, all fifteen
+        round-6 cases and all forty-two evasion cases at exactly the
         verdicts they held with it.
 
         It went on 2026-09-19, and what is left is the one expansion
@@ -3720,6 +3730,24 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `actions/checkout`. A third-party checkout action
                         # fetches the same code, and naming one vendor turns
                         # the rule into a rule about that vendor.
+                        #
+                        # One consequence of that, measured 2026-09-21 and
+                        # not visible from this line: `_with_inputs` hands
+                        # back a non-mapping `with:` whole for every name
+                        # asked of it, so `with: ${{ fromJSON(env.CONFIG) }}`
+                        # on a step that is not a checkout at all --
+                        # `actions/setup-node@v4` was the probe -- enters
+                        # this loop and reds with a message that says "the
+                        # checkout ref". The verdict is right and it is not
+                        # this loop's alone: `_step_scripts` folds the same
+                        # opaque value into the step's script and the
+                        # `_SAFE_SCRIPT_EXPRESSIONS` scan below refuses it a
+                        # second time, naming it as an expression rather than
+                        # as a ref. It is the message that is over-specific,
+                        # not the refusal, and no step in any of the
+                        # forty-six workflows here writes a non-mapping
+                        # `with:` today, checked on 2026-09-21, so nothing
+                        # reads it yet.
                         for ref in refs:
                             if not ref:
                                 continue
@@ -3799,12 +3827,16 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                         # `$NAME`, `${NAME}`, `${!NAME}` and `printenv NAME`,
                         # and by the end it decided nothing: the wholesale
                         # refusal below reads every value in the step's
-                        # environment whether or not the script names it, and
-                        # neither literal backstop matches across the newline
-                        # a fold would have joined on, so every string it
-                        # folded in was one some rule already read singly.
-                        # Measured at the empty mapping in three successive
-                        # rounds, and not one verdict moved. A loop that
+                        # environment whether or not the script names it, so
+                        # every string it folded in was one some rule already
+                        # read singly. The newline argument that stood here
+                        # -- that neither literal backstop matches across the
+                        # join -- holds for `_PULL_REQUEST_REF` and not for
+                        # `_PULL_REQUEST_HEAD`, whose index spelling takes a
+                        # newline between the `[` and the quote; see the
+                        # docstring, corrected 2026-09-21. What is left is
+                        # the measurement: at the empty mapping in three
+                        # successive rounds, not one verdict moved. A loop that
                         # changes no verdict is a loop a reader has to
                         # disprove, which is a worse cost than the redundancy
                         # was worth.
