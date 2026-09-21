@@ -4851,8 +4851,10 @@ Mutation(
         # `\b(?i:environ)\b` was credited with catching it -- but the last
         # four letters can be left to the shell, and `cat /proc/self/env*`
         # reads the identical file with nothing for a pattern over the word
-        # to hold. Green at `d060691d`, as were `/proc/self/e*` and
-        # `/proc/*/environ`. It pins the `/proc` glob alternative, which
+        # to hold. Green at `d060691d`, as was `/proc/self/e*`.
+        # `/proc/*/environ` was not: it writes the word out, so the literal
+        # already covered it, and the claim that it did not was measured
+        # wrong. It pins the `/proc` glob alternative, which
         # reads a wildcard anywhere under procfs rather than chasing the
         # spellings of one word; the literal `environ` goes on covering the
         # path written out, and is pinned by no row.
