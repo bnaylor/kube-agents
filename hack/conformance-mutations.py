@@ -1888,13 +1888,26 @@ Mutation(
         "as a name and a list of arguments rather than as a command line",
     ),
     Mutation(
-        # The program name written the way four of this repository's own
-        # `scripts/release/*.sh` write one. `command -v gh` resolves the path
-        # and the command substitution runs it, so the character after the
-        # letters `gh` is a `)`. Nothing over the program *name* can close
-        # the general case: a shell has unlimited ways to spell one, and
-        # `"$GH"` and `g'h'` in the rows below are two more, which is what
-        # `_GH_PULL_REQUEST_WORD` is for.
+        # The program name written as a command substitution rather than as
+        # a word. `command -v gh` resolves the path and the substitution
+        # runs it, so the character after the letters `gh` is a `)`. Nothing
+        # over the program *name* can close the general case: a shell has
+        # unlimited ways to spell one, and `"$GH"` and `g'h'` in the rows
+        # below are two more, which is what `_GH_PULL_REQUEST_WORD` is for.
+        #
+        # This said the shape came from "four of this repository's own
+        # `scripts/release/*.sh`", and the pretext below said the release
+        # scripts invoke `gh` this way. Both were wrong, corrected
+        # 2026-09-21. Four release scripts do write `command -v gh` --
+        # dispatch_nightly_pipeline.sh:19, dispatch_release_pipeline.sh:21,
+        # publish_github_release.sh:79 and verify_release_eligibility.sh:96
+        # -- and all four write it as a presence guard, `command -v gh
+        # >/dev/null 2>&1`, then invoke the CLI as the bare word `gh`. No
+        # file in this repository runs anything as `"$(command -v gh)"`; the
+        # nearest real idiom is pr_evidence_screenshot.sh:145, which
+        # resolves chromium that way into a variable it runs later. The
+        # shape is a plausible thing for a contributor to write. It is not a
+        # thing written here, and the row does not need it to be.
         #
         # This row does not pin it, and that is the round-17 correction to
         # this comment. It used to say the walk over `gh` was never started
@@ -1924,9 +1937,8 @@ Mutation(
          "\n"
          "      - name: Set up Python"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "resolve the CLI's path before running it, which is how the release "
-        "scripts in this repository invoke a tool they are not sure is on "
-        "PATH",
+        "resolve the CLI's path before running it, which is how a script "
+        "invokes a tool it is not sure is on PATH",
     ),
     Mutation(
         # The same reach with the name in the environment, and the residual
@@ -3435,10 +3447,15 @@ Mutation(
     Mutation(
         # A step whose `shell:` is not a shell. `os.environ["REV"]` is a read
         # of REV that writes no `$REV` and calls no `printenv`, so nothing
-        # keyed on a name reads it and every scan over the script comes back
-        # empty.
+        # keyed on a variable *name* reads it.
         # The answer is not to learn Python -- what this step reaches is
         # answerable without reading the program.
+        #
+        # This said "every scan over the script comes back empty" until
+        # 2026-09-21 and that was never true of this script.
+        # `_EVENT_PAYLOAD_FILE` carries an alternative for `os.environ` and
+        # matches those ten characters on the script's second line,
+        # measured. What comes back empty is the scans keyed on a name.
         #
         # Which rule answers it was miscredited here until 2026-09-19. The
         # comment claimed the environment refusal; measured, the expression
@@ -3446,6 +3463,11 @@ Mutation(
         # `github.event.pull_request.head.sha` in REV's value. The
         # environment refusal is pinned by
         # B4-pull-request-target-run-carried-literal and by nothing else.
+        # `_EVENT_PAYLOAD_FILE` stands behind both: write this same step
+        # with `REV: deadbeef` so the expression allowlist has nothing to
+        # hold and the test reds at it instead, on `os.environ`. That is a
+        # probe rather than a row, because a row whose value carries no head
+        # is not this row.
         "B4-pull-request-target-run-fetch-python-shell",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
