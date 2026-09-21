@@ -4385,8 +4385,9 @@ Mutation(
     Mutation(
         # The same dump inside the older command substitution. A backtick
         # closes it, so ``E=`env` `` is `E=$(env)` with the paren spelled
-        # another way -- and `_COMMAND_END`, forty lines up the same file,
-        # has read a backtick as the end of a command since it was written.
+        # another way -- and `_COMMAND_END`, the command-separator class
+        # defined near the top of the same file, has read a backtick as the
+        # end of a command since it was written.
         # The terminator set had not, so this walked past a rule that caught
         # the identical dump in the `$(...)` spelling. It pins the backtick
         # in `_ENUMERATION_END`, which no other row reaches.
