@@ -2656,7 +2656,8 @@ Mutation(
     ),
     Mutation(
         # The same endpoint from the language the shell rules cannot read,
-        # and the pair to the row above the way
+        # and the pair to B4-pull-request-target-api-issues-timeline, which
+        # asks `/issues/N/timeline` over the shell, the way
         # B4-pull-request-target-api-octokit-pulls is the pair to
         # B4-pull-request-target-api-gh-api-pulls. `listEventsForTimeline` is
         # the client method for `/issues/N/timeline`, so the path alternative
@@ -2946,11 +2947,13 @@ Mutation(
     Mutation(
         # The run list from the client instead of over a path, indexed, and
         # the pair to B4-pull-request-target-api-octokit-actions-destructured
-        # the way the `activity` pair two rows up works: `rest['actions']`
-        # puts a quote where the bare-namespace alternative wants a dot, so
-        # only the `rest`-and-punctuation alternative reads it. Measured:
-        # take `actions` out of that alternative and this row is SURVIVED
-        # while the destructured row below stays KILLED. `head_sha` is a
+        # the way B4-pull-request-target-api-octokit-activity-indexed is the
+        # pair to B4-pull-request-target-api-octokit-activity-destructured:
+        # `rest['actions']` puts a quote where the bare-namespace
+        # alternative wants a dot, so only the `rest`-and-punctuation
+        # alternative reads it. Measured: take `actions` out of that
+        # alternative and this row is SURVIVED while the destructured row
+        # stays KILLED. `head_sha` is a
         # field of the response rather than of the event, so no
         # head-spelling rule sees it. Pinned to the real action's SHA like
         # its neighbours.
@@ -3858,26 +3861,47 @@ Mutation(
         # `RUNNER_TEMP` are both off `_SAFE_RUNNER_VARIABLES`, so every row
         # above that reaches the file through one of them dies on the
         # runner-variable allowlist and would die there with
-        # `_EVENT_PAYLOAD_FILE` deleted -- measured by neutering that
-        # assertion, at which all seven still went red.
+        # `_EVENT_PAYLOAD_FILE` deleted. Four rows write either variable --
+        # B4-pull-request-target-run-fetch-event-file,
+        # B4-pull-request-target-script-event-file,
+        # B4-pull-request-target-run-event-file-path and
+        # B4-pull-request-target-run-event-file-glob -- and each is read
+        # twice: neuter `_EVENT_PAYLOAD_FILE` and all four are still KILLED,
+        # neuter `_RUNNER_VARIABLE` and all four are still KILLED, and only
+        # with both gone do all four go SURVIVED.
         #
         # What this row does not do is pin the rule, which is what it
         # claimed until the credit was measured. Neuter that assertion and
-        # three rows go SURVIVED together: this one, the temp glob below it
-        # and the container mount under that, all three of which reach the
-        # payload without naming a variable. Nor does it pin an alternative
-        # of the pattern on its own -- neuter `work/_temp` and it is still
-        # KILLED on `_github`, neuter `_github` and it is still KILLED on
-        # `event.json`, neuter `event.json` and it is still KILLED, and only
-        # with all three gone does it go SURVIVED. Where those three are
-        # pinned moved in round 25 and was re-measured on 2026-09-20 rather
-        # than carried: the temp glob below used to pin `work/_temp` alone,
-        # the new glob alternative reads that row's path too, and the `find`
-        # row under it -- which writes no wildcard -- pins `work/_temp`
-        # instead. The container mount still pins `/github/workflow` alone,
-        # its glob being in the file name rather than in a directory.
-        # `_github` and `event.json` are pinned by no row at all, which is
-        # worth knowing and is not a claim this row gets to make.
+        # twenty rows go SURVIVED together, this one among them. Six reach
+        # the payload as a path: this row,
+        # B4-pull-request-target-run-event-file-temp-glob,
+        # B4-pull-request-target-run-event-file-container-mount,
+        # B4-pull-request-target-run-event-file-quoted-word,
+        # B4-pull-request-target-run-event-file-any-glob and
+        # B4-pull-request-target-run-event-file-temp-find. Thirteen reach
+        # the process environment through an accessor instead -- the two
+        # `github-script` rows that split the variable's name, the two
+        # python rows, and the awk, perl (two), ruby (two), Go (two), .NET
+        # and jq rows. The twentieth is
+        # B4-pull-request-target-run-proc-environ-glob, which reads the
+        # environment out of procfs. Both counts were measured on
+        # 2026-09-21, by neutering the assertion and running the named test
+        # against every row it kills rather than by the sweep. Nor does it
+        # pin an alternative of the pattern on its own -- neuter
+        # `work/_temp` and it is still KILLED on `_github`, neuter
+        # `_github` and it is still KILLED on `event.json`, neuter
+        # `event.json` and it is still KILLED, and only with all three gone
+        # does it go SURVIVED. Where those three are
+        # pinned moved in round 25 and was re-measured on 2026-09-21 rather
+        # than carried: B4-pull-request-target-run-event-file-temp-glob used
+        # to pin `work/_temp` alone, the glob alternative reads that row's
+        # path too, and B4-pull-request-target-run-event-file-temp-find --
+        # which writes no wildcard -- pins `work/_temp` instead.
+        # B4-pull-request-target-run-event-file-container-mount still pins
+        # `/github/workflow` alone, its glob being in the file name rather
+        # than in a directory. `_github` and `event.json` are pinned by no
+        # row at all, which is worth knowing and is not a claim this row
+        # gets to make.
         #
         # What it records is the reach: the path a GitHub-hosted Linux
         # runner actually uses, written out, with no `GITHUB_`- or

@@ -262,24 +262,19 @@ python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
 296 mutations: 238 KILLED, 22 NOISY, thirty-six `must_survive` controls,
-zero genuine survivors, zero stale — measured 2026-09-21 against this branch;
-re-run the harness rather than trusting these numbers, which is the sentence
-this paragraph exists to make cheap. It is also the sentence this paragraph
-keeps not taking: the control count was twenty here for the round in which
-`--list` marked twenty-one, the list below named seventeen of the eighteen
-B4 controls it claimed, the round after that the numbers were four rows
-behind the tree again, and the round after that left every figure here nine
-rows behind and the list below one control short. Three rounds running, and
-each time the numbers were true of the round before. Count them with
-`--list`, which marks each one `[control]`, rather than by reading this.
-Two of the thirty-six are
+zero genuine survivors, zero stale — measured 2026-09-21. Every one of those
+figures is a count of the table on the day it was taken, and one added row
+falsifies all of them at once, so re-run the harness rather than trusting
+them. `--list` is the authority on the control count in particular: it marks
+each control `[control]` and it counts the rows it marks, which is a thing
+this paragraph cannot do. Two of the thirty-six are
 outside B4 — `A3-fastpath-redundant`, which pins a deliberate redundancy in
 the shorthand handling, and `B1-denylist-rule`, which pins a rule-id rename
 in the operator's shipped denylist as a change that must not redden the
-suite. This paragraph called that second one "on the harness itself" until
-round 18, which is its own pretext read too quickly; no control here is on
-the harness. The remaining thirty-four are over B4's `pull_request_target`
-rules: a checkout whose allowlisted ref is reached through `${{ Env.SAFE }}`,
+suite. Both of those are over shipped code, as every control is: none is on
+the harness and none is on a test. The remaining thirty-four are over B4's
+`pull_request_target` rules: a checkout whose allowlisted ref is reached
+through `${{ Env.SAFE }}`,
 a case the expansion must keep green and which closes no hole, the `gh`
 walk's skip of a flag's value, the same
 walk's stripping of quotes and brackets off an argument vector, the `issue`
@@ -303,10 +298,10 @@ indirect expansion must both leave alone, a `cat` of `.git/refs/heads/main` in
 the checkout the step already has, which the rule against asking a remote to
 list its refs must not catch, a `gh api` of `git/ref/heads/main` and
 `git/ref/tags/v1.0.0`, which is the exact-match ref endpoint conceded for the
-two namespaces a fork cannot write and narrowed to them in round 23, a step
+two namespaces a fork cannot write and narrowed to them, a step
 that links the pull request's `files` tab, reads `head` and `merge` out of a
 report by quoted name and ends a pipeline with `head -3`, which are the
-ordinary uses of the four ref words the round-23 shell-word reading must
+ordinary uses of the four ref words the shell-word reading must
 leave alone, a `pr checkout` run through `timeout` against a
 local tool with a plain name, which the rule against a wrapper hiding an
 unreadable `gh` must not catch, a job declaring `defaults.run.shell:
@@ -332,18 +327,18 @@ in it, which the same backstop's walk out of a substitution must leave
 alone, a `run:` step logging `context.repo` through `@actions/github`,
 which is the one property of that object the wide read of the word `context`
 lets through wherever it is written, the same property carried in an `env:`
-value instead of in the script, which is the concession the round-25
-widening of that read over the environment had to keep and the whole
+value instead of in the script, which is the concession the widening of
+that read over the environment had to keep and the whole
 false-positive budget of it, an `echo` of a parenthesised line about a
 pull request piped into `tee`, which is an ordinary log line both readings of
 the text's quoting hand the same downstream program -- the parentheses there
 are balanced, and the depth counter steps over a pair whether or not it can
 see the quotes -- the same line with its parenthesis left open, which is
-where the two readings differ and so the step the round-25 second reading
-walks for the first time, a step that globs for JSON the three ways a build
+where the two readings differ and so the step the second reading walks for
+the first time, a step that globs for JSON the three ways a build
 step does, with `find . -name '*.json'`, `jq -s . coverage/*.json` and `cp
 dist/*/bundle.json out/`, none of which is the payload and all of which the
-glob added to the payload rule this round has to read past, a `grep -n 'env '
+glob alternative of the payload rule has to read past, a `grep -n 'env '
 Makefile` beside a `jq -r '.env | keys' package.json`, which write an
 enumeration word, a space and a quote and read nothing, and are what letting
 the terminator see across a space and a quoting run costs, an `eval "$cmd"`
