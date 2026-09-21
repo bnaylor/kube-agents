@@ -261,7 +261,7 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-279 mutations: 227 KILLED, 22 NOISY, thirty `must_survive` controls,
+296 mutations: 238 KILLED, 22 NOISY, thirty-six `must_survive` controls,
 zero genuine survivors, zero stale — measured 2026-09-20 against this branch;
 re-run the harness rather than trusting these numbers, which is the sentence
 this paragraph exists to make cheap. It is also the sentence this paragraph
@@ -272,13 +272,13 @@ behind the tree again, and the round after that left every figure here nine
 rows behind and the list below one control short. Three rounds running, and
 each time the numbers were true of the round before. Count them with
 `--list`, which marks each one `[control]`, rather than by reading this.
-Two of the thirty are
+Two of the thirty-six are
 outside B4 — `A3-fastpath-redundant`, which pins a deliberate redundancy in
 the shorthand handling, and `B1-denylist-rule`, which pins a rule-id rename
 in the operator's shipped denylist as a change that must not redden the
 suite. This paragraph called that second one "on the harness itself" until
 round 18, which is its own pretext read too quickly; no control here is on
-the harness. The remaining twenty-eight are over B4's `pull_request_target`
+the harness. The remaining thirty-four are over B4's `pull_request_target`
 rules: a checkout whose allowlisted ref is reached through `${{ Env.SAFE }}`,
 a case the expansion must keep green and which closes no hole, the `gh`
 walk's skip of a flag's value, the same
@@ -334,13 +334,30 @@ which is the one property of that object the wide read of the word `context`
 lets through wherever it is written, the same property carried in an `env:`
 value instead of in the script, which is the concession the round-25
 widening of that read over the environment had to keep and the whole
-false-positive budget of it, and an `echo` of a parenthesised line about a
-pull request piped into `tee`, which is an ordinary log line the round-25
-second reading of the text's quoting walks straight through the parentheses
-of and must not object to on the far side. Each of those edits is the _safe_
+false-positive budget of it, an `echo` of a parenthesised line about a
+pull request piped into `tee`, which is an ordinary log line both readings of
+the text's quoting hand the same downstream program -- the parentheses there
+are balanced, and the depth counter steps over a pair whether or not it can
+see the quotes -- the same line with its parenthesis left open, which is
+where the two readings differ and so the step the round-25 second reading
+walks for the first time, a step that globs for JSON the three ways a build
+step does, with `find . -name '*.json'`, `jq -s . coverage/*.json` and `cp
+dist/*/bundle.json out/`, none of which is the payload and all of which the
+glob added to the payload rule this round has to read past, a `grep -n 'env '
+Makefile` beside a `jq -r '.env | keys' package.json`, which write an
+enumeration word, a space and a quote and read nothing, and are what letting
+the terminator see across a space and a quoting run costs, an `eval "$cmd"`
+piped into `awk '{print $1}'`, which is a dollar inside single quotes on an
+`eval` line and the reason the deferred-dollar branch requires the quote to
+close on the dollar rather than merely to contain one, a `grep VmRSS
+/proc/self/status` and a `head -3 /proc/cpuinfo`, which are how a step reports
+the machine it is on and are what reading a glob under procfs costs, and a
+`pwsh` step joining `$env:GITHUB_WORKSPACE\dist` and appending `  env:
+production` to a file, which are `env:` beside the PowerShell drive class and
+neither of them a listing. Each of those edits is the _safe_
 spelling of something a workflow here legitimately does, and the control is
-that the suite does not object to it. Note that the summary line the harness prints accounts for 249
-of the 279: a `must_survive` control's verdict is
+that the suite does not object to it. Note that the summary line the harness prints accounts for 260
+of the 296: a `must_survive` control's verdict is
 `SURVIVED (expected)`, which is neither killed, noisy, nor a survivor. The run
 also prints `BASELINE POLLUTED` if the suite is not green once every mutation
 has been restored, which did not happen here and would invalidate every
