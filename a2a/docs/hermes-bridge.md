@@ -92,9 +92,10 @@ Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is
 for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
 `lib.TasksGet` on every task it dispatches, and a call that finds events creates an ordered
 consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
-`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls in flight
-rather than for the last five minutes of them (gke-labs/kube-agents#1739) without the bridge
-needing a destructive verb on TASKS. A call on a task the retention window no longer holds
+`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls of the last
+five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
+the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
+threshold runs from the call returning, not from it starting. A call on a task the retention window no longer holds
 creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
 created. Either way the call emits no refused publish of its own. One does arrive if the
 ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
