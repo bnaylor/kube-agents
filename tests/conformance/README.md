@@ -262,7 +262,7 @@ python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
 296 mutations: 238 KILLED, 22 NOISY, thirty-six `must_survive` controls,
-zero genuine survivors, zero stale — measured 2026-09-20 against this branch;
+zero genuine survivors, zero stale — measured 2026-09-21 against this branch;
 re-run the harness rather than trusting these numbers, which is the sentence
 this paragraph exists to make cheap. It is also the sentence this paragraph
 keeps not taking: the control count was twenty here for the round in which
