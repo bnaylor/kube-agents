@@ -96,8 +96,12 @@ consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive 
 rather than for the last five minutes of them (gke-labs/kube-agents#1739) without the bridge
 needing a destructive verb on TASKS. A call on a task the retention window no longer holds
 creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
-created. Either way a `tasks/get` under this user emits no refused publish, so a
-`Permissions Violation` in the bridge's log still means what it says.
+created. Either way the call emits no refused publish of its own. One does arrive if the
+ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
+the consumer it replaces: that publish on `$JS.API.CONSUMER.DELETE.TASKS.<name>` is refused,
+which costs a log line and leaves the consumer it could not delete to the same threshold.
+It is the one violation this grant produces by design, so any other `Permissions Violation`
+in the bridge's log still means what it says.
 
 **Static is the answer here, not a residue.** `bridge` replaced the shared `worker` user
 rather than inheriting it, and it stays a password principal on purpose. The auth
