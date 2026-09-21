@@ -399,8 +399,9 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
     self-check does not police its own coverage. That is a real gap and not a
     clean one to close: several assertions here have no string-replace that
     removes their control -- falsifying "no test module is left out" means
-    adding a file, not editing one. The four harness-* mutations cover four of
-    them; the rest are not covered.
+    adding a file, not editing one. There are thirteen tests here and five
+    harness-* mutations, one per test and no two naming the same one, so five
+    are covered and the other eight are not.
     """
 
     #: Assertions with no in-repo control to remove. Each needs a reason, and

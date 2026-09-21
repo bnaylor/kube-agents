@@ -3063,10 +3063,17 @@ Mutation(
         # says so. `_PULL_REQUEST_API` now reads the `pull/` web path, and
         # the ref half has always conceded a bare `.../pull/1781` on purpose:
         # it is a link to a page, and a workflow that comments on a pull
-        # request has every reason to write one down. Widen the new
-        # alternative past the diff extension -- drop the `\.(?:diff|patch)`
-        # and match `pull/` -- and this row reds, which is backwards for a
-        # mutation, so the row inverts. Without it nothing pins the
+        # request has every reason to write one down. There is no
+        # `\.(?:diff|patch)` fragment to widen past: both alternatives are
+        # built from `_shell_word`, which escapes per character and
+        # interleaves the quoting class between the letters, so
+        # `_PULL_REQUEST_API.pattern` holds zero occurrences of `diff` and
+        # zero of `patch`. The widening is at the source: cut the
+        # `[^\n'"]*?` and the `_shell_word(".diff")` and
+        # `_shell_word(".patch")` tail off both alternatives, leaving a bare
+        # `_shell_word("pull/")`, and this row is OVERSHOT -- measured, the
+        # suite green before the mutation and red on it, which is backwards
+        # for a mutation, so the row inverts. Without it nothing pins the
         # difference between the endpoint that serves the fork's code and the
         # page a human reads.
         "B4-pull-request-target-api-web-link-comment",
@@ -4496,13 +4503,27 @@ Mutation(
         # terminator set is where an operator goes. `"printenv"`, `e"n"v`
         # and `en''v` are the same step and were green with it.
         #
-        # It pins `_enumeration_word`, the quoting written into the word
-        # rather than into the terminator. Make it return its argument
-        # unchanged and this row is SURVIVED with every other row still
-        # KILLED, including the glued-expansion row below, which carries no
-        # quote. The control beside them is what says the fix is the word
-        # and not the terminator: `grep "env" Makefile` has to stay green,
-        # and it does not if a quote is allowed to end a dump.
+        # It used to pin `_enumeration_word` on its own. It does not now,
+        # and that claim is withdrawn rather than reworded. Measured: with
+        # `_enumeration_word` returning its argument unchanged the full
+        # sweep is `killed=238 noisy=22 survived=0 stale=0`, which is the
+        # baseline -- not one row flips, this one included. The reason is
+        # that `_ENUMERATION_STOP` opens with the same `_SHELL_QUOTING` run,
+        # so the terminator eats the closing `'` itself and the `)` behind
+        # it ends the command as it always did. Drop that run instead and
+        # keep the word and this row still does not flip, because the word's
+        # own trailing run eats the `'`: the nine env-dump rows come back
+        # `killed=8 noisy=0 survived=1`, and the survivor is the spaced-quote
+        # row below rather than this one. Both have to go before this row is
+        # SURVIVED. With both neutered the sweep is
+        # `killed=236 noisy=22 survived=2 stale=0` and the two survivors are
+        # this row and `B4-pull-request-target-run-env-dump-spaced-quote`.
+        # So the run in the terminator is the half a row pins alone, and what
+        # the interleaving still buys with that run in place is `e"n"v` and
+        # `en''v` -- which no row here carries, a gap in the rows rather than
+        # in the rule. The control beside them is what says the fix is the
+        # word and not the terminator: `grep "env" Makefile` has to stay
+        # green, and it does not if a quote is allowed to end a dump.
         "B4-pull-request-target-run-env-dump-quoted-program",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
