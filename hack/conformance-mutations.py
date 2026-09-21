@@ -1035,18 +1035,30 @@ Mutation(
         "line-length housekeeping everywhere else in this repository",
     ),
     Mutation(
-        # The namespace reached without being spelled, and the first of the
-        # two rows over `_REMOTE_REF_ENUMERATION`. Every refspec row above
-        # writes `pull` somewhere, which is what the three alternatives of
-        # `_PULL_REQUEST_REF` read. A bare `git ls-remote origin` writes
-        # none of it: the remote advertises `refs/pull/N/head` to anyone who
-        # asks, `grep` picks this pull request's line out of the listing, and
-        # `git fetch origin "$SHA"` is a fetch by object name the server
-        # serves. Distinct from B4-pull-request-target-run-refspec-ls-remote,
-        # which passes the remote a `pull/N/h*` pattern and is caught by the
-        # ref half for spelling it -- delete the enumeration rule and that
-        # row still kills while this one survives, which is what separates
-        # the pair.
+        # The namespace reached without being spelled, and the first of
+        # the nine rows over `_REMOTE_REF_ENUMERATION`. Nine is measured
+        # rather than counted by eye, and this comment said two until
+        # round 26: neuter that rule and the sweep at `82d2b964` turns
+        # exactly nine rows SURVIVED, in table order this one,
+        # B4-pull-request-target-run-ls-remote-quoted-word,
+        # B4-pull-request-target-run-wildcard-namespace-refspec,
+        # B4-pull-request-target-run-smart-http-advertisement,
+        # B4-pull-request-target-run-matching-refs-endpoint,
+        # B4-pull-request-target-run-git-refs-endpoint,
+        # B4-pull-request-target-run-ref-endpoint-encoded-letters,
+        # B4-pull-request-target-run-clone-mirror and
+        # B4-pull-request-target-run-clone-mirror-abbreviated. Every
+        # refspec row above writes `pull` somewhere, which is what the
+        # three alternatives of `_PULL_REQUEST_REF` read. A bare `git
+        # ls-remote origin` writes none of it: the remote advertises
+        # `refs/pull/N/head` to anyone who asks, `grep` picks this pull
+        # request's line out of the listing, and `git fetch origin "$SHA"`
+        # is a fetch by object name the server serves. Distinct from
+        # B4-pull-request-target-run-refspec-ls-remote, which passes the
+        # remote a `pull/N/h*` pattern and is caught by the ref half for
+        # spelling it -- neuter the enumeration rule and that
+        # row is still KILLED while this one goes SURVIVED, measured in the
+        # same sweep, which is what separates the pair.
         "B4-pull-request-target-run-ls-remote-unfiltered",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1174,14 +1186,23 @@ Mutation(
         # the same way and is what the older documentation and every
         # half-remembered example write. Not its own alternative -- this
         # comment said so until round 20 and the regex has never had one.
-        # There is a single alternative, `git/(?:matching-)?refs`, and the
-        # optional group is the whole difference between the two spellings.
+        # There is a single alternative, and it is read off the pattern
+        # rather than off this comment:
+        # `(?<![\w.])git/(?:matching-refs\b|refs\b|ref/(?!(?:heads|tags)/))`
+        # at `82d2b964`, one alternative shared with the exact-match
+        # endpoint and three branches inside it. It was
+        # `git/(?:matching-)?refs\b` until `50b7d89a` widened it, which is
+        # the spelling this comment described until round 26 -- the
+        # optional group is gone and the two prefix-matching spellings are
+        # written out as branches of their own.
+        #
         # Its own *row*, though, because `git/refs` is not a substring of
-        # `git/matching-refs` and neither spelling covers the other, so the
-        # group has two halves and each needs pinning. Measured both ways:
-        # make `matching-` mandatory and this row is SURVIVED with
+        # `git/matching-refs` and neither spelling covers the other, so
+        # each branch needs pinning. Measured both ways at `82d2b964`:
+        # delete the `refs\b` branch and this row is SURVIVED with
         # B4-pull-request-target-run-matching-refs-endpoint still KILLED;
-        # drop the group for a literal `git/refs` and the two verdicts swap.
+        # delete the `matching-refs\b` branch instead and the two verdicts
+        # swap.
         "B4-pull-request-target-run-git-refs-endpoint",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1233,10 +1254,25 @@ Mutation(
         # It pins `_shell_word` inside `_PULL_REQUEST_REF`. Make it return
         # its argument unchanged and this row is SURVIVED with every other
         # ref row still KILLED, including the two below, which carry no
-        # quote. The control beneath them is what says the fix is the word
-        # and not the boundary: `_shell_word` deliberately writes no trailing
-        # run of the quoting class, because `\b` is this rule's terminator
-        # and a trailing run would let a quote stand in for it.
+        # quote. Four rows in the whole sweep flip on that neuter at
+        # `82d2b964`, measured: this one and the `-quoted-word` row over
+        # each of the three other rules that call the helper --
+        # `ls-remote-quoted-word`, `api-pulls-quoted-word` and
+        # `event-file-quoted-word`.
+        #
+        # The control beneath them is what says the fix is the word and not
+        # the boundary. `_shell_word` writes no *trailing* run of the
+        # quoting class, and the reason is not that a trailing run would let
+        # a quote stand in for `\b` -- this comment said that until round
+        # 26, and it is the claim `_shell_word`'s docstring retracts. `\b`
+        # already falls between a word's last letter and a quote, so the run
+        # changes no verdict either way: add one to every word of
+        # `_PULL_REQUEST_REF` and the sweep is identical row for row
+        # (killed=238 noisy=22 survived=0), and the only text that reads
+        # differently is the span of the match on `pull/$N/head"x"`. It is
+        # left off as the run that buys nothing, not as one that would cost
+        # something; `_enumeration_word` adds one because its terminator is
+        # a character class rather than `\b`.
         "B4-pull-request-target-run-ref-quoted-word",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1349,11 +1385,26 @@ Mutation(
         # writes one of the four ref words next to a quote and none of them
         # is a ref: the web link ends at the pull request's `files` tab, the
         # `jq` filter indexes two fields of a report by name, and `head -3`
-        # is the end of a pipeline. OVERSHOT here means either the word
-        # boundary has been let go -- `head` inside `headers`, or a quote
-        # standing in for `\b` -- or the `[^\n]*?` between the ref's segments
-        # has been allowed across a newline, at which the first line's
-        # `pull/$PR_NUMBER/` and the third line's `head` become one match.
+        # is the end of a pipeline.
+        #
+        # What reaches this step is measured rather than reasoned, and
+        # round 26 corrected it: no single weakening of `_PULL_REQUEST_REF`
+        # measured at `82d2b964` does. Let the `\b` after `head|merge` go
+        # and this row is SURVIVED (expected); let the `[^\n]*?` between
+        # the ref's segments run across a newline and it is SURVIVED
+        # (expected); widen `_REF_SEPARATOR` from a slash to any
+        # punctuation and it is SURVIVED (expected). A trailing run of the
+        # quoting class is the row above's note and moves no verdict
+        # anywhere in the sweep. The cross-newline half is what this
+        # comment credited on its own until round 26, and on its own it
+        # matches nothing here.
+        #
+        # It takes two at once. Cross the newline *and* widen the separator
+        # and this row is OVERSHOT, on the first line's `pull/$PR_NUMBER/`
+        # reaching the `head` of the *second* line's `.["head"]`, where the
+        # `["` stands in for the slash. Not the third line's `head -3`: a
+        # space is in front of that one, which no widening of a separator
+        # written as punctuation reaches.
         "B4-pull-request-target-run-ref-quoted-word-ordinary",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1801,14 +1852,23 @@ Mutation(
         # is one place further along, in the subcommand's seat, and is never
         # consulted because the verb failed first. The punctuation
         # strip earns its place on the safe side instead, at
-        # B4-pull-request-target-api-gh-argv-vector-write. Pinned to the real
-        # action's SHA, like B4-pull-request-target-api-octokit-pulls and
-        # B4-pull-request-target-api-octokit-pulls-indexed: an unpinned one
-        # would trip C4's sweep and the verdict would stop saying which rule
-        # caught this. Those are the two other rows here that run an action
-        # at all -- this said "the two rows above" until round 18, and the
-        # row immediately above is B4-pull-request-target-api-gh-quoted-
-        # command, which is a `run:` step with no `uses:` in it.
+        # B4-pull-request-target-api-gh-argv-vector-write. Pinned to the
+        # real action's SHA, because an unpinned one would trip C4's sweep
+        # and the verdict would stop saying which rule caught this.
+        #
+        # It is not the only row that runs an action, and counting them by
+        # eye is what went wrong here twice. Counted over the table at
+        # `82d2b964`: twenty-three rows insert a `uses:`, twenty-two of
+        # them at a forty-character SHA and the twenty-third at a local
+        # `./.github/workflows/` reusable job, and eighteen of the
+        # twenty-three -- this one among them -- run actions/github-script
+        # at the same pin written here. This comment said "the two rows
+        # above" until round 18 and then named
+        # B4-pull-request-target-api-octokit-pulls and
+        # B4-pull-request-target-api-octokit-pulls-indexed as the only two
+        # others until round 26. The row immediately above is
+        # B4-pull-request-target-api-gh-quoted-command, which is a `run:`
+        # step with no `uses:` in it, and that much is still true.
         "B4-pull-request-target-api-gh-argv-vector",
         ".github/workflows/risk_classify.yml",
         ("      - name: Set up Python",
@@ -1845,9 +1905,11 @@ Mutation(
         # `_unsafe_gh_verbs` reporting `gh ` because `_invocation_words`
         # stops at the same `)` before it reaches a word; neuter
         # `_GH_PULL_REQUEST_WORD` and this row is still KILLED on that,
-        # while only the two `g'h'` rows below flip; neuter `_GH_COMMAND`
-        # instead and it is still KILLED, now on `pr checkout "$PR_NUMBER"`
-        # from the backstop; neuter both and it goes SURVIVED. Closed twice
+        # while seven rows below flip -- every `g'h'` row there is, and
+        # nothing else in the sweep, measured at `82d2b964`; this comment
+        # said two until round 26. Neuter `_GH_COMMAND` instead and it is
+        # still KILLED, now on `pr checkout "$PR_NUMBER"` from the
+        # backstop; neuter both and it goes SURVIVED. Closed twice
         # over and pinning neither half, which is the shape
         # `api-gh-program-in-env` below already says it has.
         "B4-pull-request-target-api-gh-program-path",
