@@ -135,7 +135,13 @@ class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
     rather than the source -- which is the same failure mode the suite's
     source-reading assertions are careful about elsewhere. Any control
     character counts, not just the backspace: a stray form feed or escape
-    sequence in a docstring is never intended either.
+    sequence in a docstring is never intended either. The check reads
+    Unicode's `Cc` category rather than a numeric ceiling, because the
+    sentence was false while the ceiling was 0x1F: `\\x7f` is a delete and
+    `\\x85` is a line break the parser consumes the same way, and neither is
+    below the ceiling. Measured before widening it -- no docstring in the
+    twelve modules this walks contains a control character of any kind, so
+    the wider reading costs nothing and the claim is now true.
 
     One exemption, and it used to be two. The newline is exempt because a
     docstring is made of lines and every multi-line one here would red. The
@@ -158,6 +164,7 @@ class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
 
     def test_no_docstring_in_the_suite_contains_a_control_character(self) -> None:
         import ast
+        import unicodedata
 
         self.assertGreater(len(self._MODULES), 5, "the module glob found nothing")
         for path in self._MODULES:
@@ -175,7 +182,8 @@ class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
                     {
                         character
                         for character in docstring
-                        if ord(character) < 32 and character != "\n"
+                        if unicodedata.category(character) == "Cc"
+                        and character != "\n"
                     }
                 )
                 with self.subTest(module=path.name, node=getattr(node, "name", "<module>")):
