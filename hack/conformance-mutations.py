@@ -421,10 +421,10 @@ Mutation(
          "          ref: ${{ github.event.repository.default_branch }}",
          "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
          "        with:\n"
-         "          ref: ${{ github.event.pull_request.head.sha }}"),
+         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
-        "capitalise the action name while repointing the ref, which is what a "
-        "flip that slipped through review would look like",
+        "capitalise both the action name and the expression context while "
+        "repointing the ref, which is the shape a case-flip evasion takes",
     ),
     Mutation(
         "B6-codeowners-bot",

@@ -577,15 +577,22 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                     for step in (job or {}).get("steps") or []:
                         # GitHub resolves `uses:` case-insensitively, so this
                         # match has to be too. `Actions/checkout` runs the same
-                        # action and would otherwise walk past the filter.
+                        # action and would otherwise walk past the filter. The
+                        # same holds for the expression context in `ref:`:
+                        # `github.event.Pull_Request.HEAD.sha` names the pull
+                        # request head just as the lowercase spelling does, so
+                        # the ref is lowercased before it is examined below.
                         uses = str((step or {}).get("uses", "")).lower()
                         if uses.startswith("actions/checkout"):
                             saw_a_checkout = True
-                            ref = str(((step or {}).get("with") or {}).get("ref", ""))
+                            ref = str(
+                                ((step or {}).get("with") or {}).get("ref", "")
+                            ).lower()
                             self.assertTrue(
                                 ref,
-                                "a checkout on pull_request_target with no ref: "
-                                "checks out the pull request's merge commit",
+                                "a checkout on pull_request_target with no "
+                                "ref: leaves the commit it checks out unstated "
+                                "in the workflow",
                             )
                             for fragment in ("pull_request", "head", "merge"):
                                 self.assertNotIn(
