@@ -682,9 +682,10 @@ as the primitive, unused, like the other backends.
   `grants` decision-grade by resolution.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, the slack adapter, `grants`,
-and anything that makes `authority` decision-grade. (The gchat adapter was on this
-list until 9/5; it now has its own section above.)
+Not in stage 2: the classifier, the LCD permissions tool, and the slack adapter. (The
+gchat adapter was on this list until 9/5; it now has its own section above. `grants` and
+"anything that makes `authority` decision-grade" were on it until 9/9, when they landed
+— the bullet above is what replaced them.)
 
 ## Inherited from the kanban retirement (added 8/24)
 

@@ -205,10 +205,16 @@ Three KV buckets ride the same JetStream deployment:
   is a statement about grants, not a property the subject list enforces. The residue's
   closes are the residue paragraph's: the callout, or a separate account with an
   export/import.
-- A bucket reserved for capability entries per the capability envelope design
+- `cap` - capability entries per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`), which landed on KV-backed
-  capabilities. Reserved so the account layout allows for it; it arms with the
-  authority work.
+  capabilities. **Armed 9/9**, and the one bucket here whose grant story is a read
+  *denial* rather than a writer narrowing: the gateway may publish under
+  `$KV.cap.root.*` and may not read the bucket by any route, no broker may read it at
+  all, and the capability verifier is the only principal holding read. That asymmetry is
+  the point - the minter must not be able to see what anyone else minted - and because
+  it is a denial it has to be enumerated over every principal on the bus rather than
+  asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
+  `a2a/authcallout` against the config the operator renders.
 
 ## Accounts and connection-time authorization
 
