@@ -37,7 +37,7 @@ import (
 
 // capMap is the operator's render, read from the same fixture contract_test.go
 // parses. The identities it carries are provision, session (narrowed) and
-// verifier; gateway, worker and seed are static users in the rendered
+// verifier; gateway, bridge and seed are static users in the rendered
 // nats.conf and are reached with connectStatic instead.
 func capMap(t *testing.T) string {
 	t.Helper()
@@ -56,13 +56,14 @@ const (
 	tokenProvision = "token-for-the-provision-serviceaccount-padded-to-a-realistic-l"
 )
 
-// capTokens attests the three ServiceAccounts the rendered map keys on. The
-// session pods reuse the pod-bound tokens the narrowing tests already define,
-// so a session's grants here are the derived ones, not a fixture.
+// capTokens attests the callout-issued ServiceAccounts the rendered map keys
+// on. The session pods reuse the pod-bound tokens the narrowing tests already
+// define, so a session's grants here are the derived ones, not a fixture.
 func capTokens() map[string]Attested {
 	return map[string]Attested{
 		tokenVerifier:  {ServiceAccount: verifierSA},
 		tokenProvision: {ServiceAccount: provisionSA},
+		agentToken:     {ServiceAccount: agentSA},
 		tokenPodA:      {ServiceAccount: sessionSA, PodName: podA, PodUID: "uid-a"},
 		tokenPodB:      {ServiceAccount: sessionSA, PodName: podB, PodUID: "uid-b"},
 	}
@@ -101,18 +102,26 @@ func refuseAll(subjects []string) map[string]bool {
 // holds, not a consumer, not a snapshot, and not the bucket's own subject
 // space.
 //
-// `gateway` holds `$JS.API.>`, the whole JetStream API on every stream. That
-// wildcard is a standing debt (gke-labs#1306) and this test is what stops it
-// from also being the capability design's undoing: the deny subtracted from it
-// is the only thing between a broker and every capability in flight, and it is
-// asserted here rather than read. `worker` and `seed` were wildcards too until
-// gke-labs#1316 enumerated them, and they are still asked the same question —
-// an enumerated list is narrower by construction but only until someone adds a
-// line to it.
+// Every broker here now reaches JetStream through an enumerated list rather
+// than a wildcard: gke-labs#1316 enumerated the worker and seed grants and
+// gke-labs#1666 did the same for the gateway, retiring the `$JS.API.>` that
+// gke-labs#1306 was filed against. That makes the cap bucket unreachable by
+// construction rather than by subtraction — which is exactly why the question
+// still has to be asked here. An enumerated list is narrower only until
+// someone adds a line to it, and the line that would matter is a one-word
+// edit. So each principal is asked for every subject that would read, copy or
+// destroy the bucket, and the answer is read off the wire.
+//
+// The four principals are the whole set that could hold one. `gateway`,
+// `bridge` and `seed` are the static users in the rendered nats.conf;
+// gke-labs#1653 split the old `worker` credential into `bridge` (static, the
+// executor for the platform addressee) and `agent` (callout-authenticated,
+// blackboard only), so both halves of what used to be one answer are asked
+// separately below.
 func TestNoBrokerCanReadTheCapabilityStore(t *testing.T) {
 	h, serverLog := startHarnessWithServerLogMap(t, capMap(t), capTokens())
 
-	for _, user := range []string{"gateway", "worker", "seed"} {
+	for _, user := range []string{"gateway", "bridge", "seed"} {
 		t.Run(user, func(t *testing.T) {
 			nc, violations := connectStatic(t, h, user, "pw-"+user)
 			want := refuseAll(capReadSubjects())
@@ -147,6 +156,28 @@ func TestNoBrokerCanReadTheCapabilityStore(t *testing.T) {
 			})
 		})
 	}
+
+	// The callout half of the old `worker`. It authenticates with a
+	// ServiceAccount token rather than a password, so its grants come from
+	// the operator's rendered identity map instead of the nats.conf, and
+	// the deny that covers the static users does not cover it at all --
+	// the map simply never grants it anything under the bucket. That is a
+	// different mechanism reaching the same answer, which is why it is
+	// asked rather than assumed.
+	t.Run("agent", func(t *testing.T) {
+		nc, violations := h.connectAs(t, "agent", agentToken)
+		checkPublish(t, nc, violations, refuseAll(capReadSubjects()))
+		if !subscribeRefused(t, nc, violations, capability.SubjectPrefix+">") {
+			t.Errorf("agent may subscribe to %s>; it would see every capability as it is minted",
+				capability.SubjectPrefix)
+		}
+		// The control: a subject this principal really does hold, so the
+		// refusals above are its grants at work and not a connection
+		// that can publish nothing.
+		checkPublish(t, nc, violations, map[string]bool{
+			"a2a.topics.shared.blueprint": false,
+		})
+	})
 
 	t.Run("session", func(t *testing.T) {
 		nc, violations := h.connectAs(t, podA, tokenPodA)
@@ -202,10 +233,21 @@ func TestACapabilityWriterCannotWriteOutsideItsOwnNamespace(t *testing.T) {
 		capability.Subject("hop." + podB + ".0"): true,
 	})
 
-	// The worker credential is the one a compromised agent-side sidecar
-	// holds. It writes nothing in this namespace either.
-	worker, workerViolations := connectStatic(t, h, "worker", "pw-worker")
-	checkPublish(t, worker, workerViolations, map[string]bool{
+	// Both halves of the credential a compromised agent-side sidecar could
+	// hold -- gke-labs#1653 split the old static `worker` into the bridge's
+	// static executor credential and the callout-issued `agent`. Neither
+	// writes in this namespace, and they are asked separately because they
+	// are refused by different mechanisms: the bridge by a deny on an
+	// enumerated static grant, the agent by a rendered map that grants it
+	// nothing here.
+	bridge, bridgeViolations := connectStatic(t, h, "bridge", "pw-bridge")
+	checkPublish(t, bridge, bridgeViolations, map[string]bool{
+		capability.Subject("root.task-1"):        true,
+		capability.Subject("hop." + podA + ".0"): true,
+	})
+
+	agent, agentViolations := h.connectAs(t, "agent", agentToken)
+	checkPublish(t, agent, agentViolations, map[string]bool{
 		capability.Subject("root.task-1"):        true,
 		capability.Subject("hop." + podA + ".0"): true,
 	})
