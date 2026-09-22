@@ -390,11 +390,16 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"$KV.session-state.>",
 			"_INBOX.gateway.>",
 		},
-		// The one subtraction from `$JS.API.>` above. Nobody but the
-		// verifier reads the cap bucket, and a wildcard that wide would
-		// otherwise hand this principal every capability in flight through
-		// the JetStream API. See a2aCapBucketReadDeny; the wide allow it
-		// carves out of is gke-labs#1306's to narrow.
+		// Defence in depth rather than a live subtraction. This deny was
+		// written when the gateway held `$JS.API.>`, which reached every
+		// capability in flight; gke-labs#1666 replaced that wildcard with
+		// a2aGatewayJetStreamGrants(), so nothing above reaches the cap
+		// bucket and the pair denies nothing today. It stays because this
+		// principal is the one that MINTS — it holds `$KV.cap.root.*`, so
+		// a widening of its JetStream grants is the single most likely way
+		// for read on the store to arrive by accident. Pinned by
+		// TestGatewayHoldsNoWholesaleJetStreamAPI so that "it subtracts
+		// nothing" cannot become the argument for deleting it.
 		denyPublish:   capDenyPublish,
 		denySubscribe: capDenySubscribe,
 	}
@@ -726,12 +731,13 @@ func bridgeIdentity() a2aIdentity {
 			"$KV.runtime-state.>",
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
-		// Defence in depth rather than a live subtraction. #1316 replaced
-		// this principal's `$JS.API.>` with a2aWorkerJetStreamGrants(), so
-		// nothing above reaches the cap bucket and this pair denies nothing
-		// today. It is here for the widening #1306 will be asked to make:
-		// see a2aCapBucketReadDeny, and the deny is pinned by
-		// TestWorkerHoldsNoWholesaleJetStreamAPI so that "it subtracts
+		// Defence in depth rather than a live subtraction. This deny was
+		// written against the old `worker` credential and its `$JS.API.>`;
+		// A5 split that credential and scoped this half to
+		// a2aBridgeJetStreamGrants(), so nothing above reaches the cap
+		// bucket and the pair denies nothing today. It is here for the next
+		// widening: see a2aCapBucketReadDeny, and the deny is pinned by
+		// TestBridgeHoldsNoWholesaleJetStreamAPI so that "it subtracts
 		// nothing" cannot become the argument for deleting it.
 		denyPublish:   capDenyPublish,
 		denySubscribe: capDenySubscribe,
