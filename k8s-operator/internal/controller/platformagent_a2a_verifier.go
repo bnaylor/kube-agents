@@ -63,6 +63,13 @@ import (
 // being alive.
 
 const (
+	// The stage 1 dev registry, on the same terms as the gateway, the worker
+	// and the auth callout: built and published here rather than by the
+	// release pipeline, so deliberately absent from images.json and
+	// overridable only by env var until the stack graduates (#1557). The
+	// enumerations that have to name all four live in
+	// platformagent_a2a_manifests.go, hack/check-image-inventory.sh and
+	// docs/site/src/content/docs/deploy/docker-images.md.
 	defaultA2AVerifierImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/verifier:latest"
 	a2aVerifierImageEnvVar  = "A2A_VERIFIER_IMAGE"
 

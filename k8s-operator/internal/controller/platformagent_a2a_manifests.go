@@ -147,13 +147,15 @@ const (
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
 	//
-	// The first-party A2A images — this one, the worker below and the auth
-	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) — are not in
-	// images.json, deliberately: this repo builds them and publishes them
-	// only from that dev registry, off the release pipeline the inventory's
-	// first-party entries are copied from. That exemption is graduation debt
-	// alongside the registry move (#1557) — a mirrored or air-gapped install
-	// that flips next must override each of them via the env vars until then.
+	// The first-party A2A images — this one, the worker below, the auth
+	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) and the
+	// capability verifier (A2A_VERIFIER_IMAGE,
+	// platformagent_a2a_verifier.go) — are not in images.json,
+	// deliberately: this repo builds them and publishes them only from that
+	// dev registry, off the release pipeline the inventory's first-party
+	// entries are copied from. That exemption is graduation debt alongside
+	// the registry move (#1557) — a mirrored or air-gapped install that
+	// flips next must override each of them via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
 	// The session-pod image, on the same terms as the gateway above. The

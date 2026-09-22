@@ -247,9 +247,10 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
-#    The first-party next defaults (gateway, worker, callout) fit the same
-#    description and are deliberately not here: they are not inventory
-#    entries, so there is nothing to hold them to until the stack graduates.
+#    The first-party next defaults (gateway, worker, callout, capability
+#    verifier) fit the same description and are deliberately not here: they
+#    are not inventory entries, so there is nothing to hold them to until the
+#    stack graduates.
 # ---------------------------------------------------------------------------
 check_operator_pin() {
   local name=$1 gofile=$2 constant=$3
