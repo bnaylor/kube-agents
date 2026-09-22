@@ -185,10 +185,11 @@ const (
 	a2aCalloutCPULimit    = "500m"
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
 	// The first-party next-stack images the operator renders — this one, the
-	// worker below and the auth callout (platformagent_a2a_callout.go) — are
+	// worker below, the auth callout (platformagent_a2a_callout.go) and the
+	// capability verifier (platformagent_a2a_verifier.go) — are
 	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
 	// beside the other first-party images, images.json carries them (as
-	// a2a-gateway, a2a-worker and a2a-authcallout), and
+	// a2a-gateway, a2a-worker, a2a-authcallout and a2a-verifier), and
 	// hack/check-image-inventory.sh holds these names to the inventory's
 	// entries (the name, and the repository as that name under the agent
 	// image's registry). Bare names, like shellSandboxRepositoryName: the

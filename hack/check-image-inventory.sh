@@ -245,12 +245,13 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
-#    The first-party next defaults (gateway, worker, callout) are release
-#    images with no fixed tag in the inventory, so the operator compiles in
-#    the bare image name and takes registry and tag from its own or the
-#    agent image; the second check below holds each name to the inventory's
-#    entry, and that entry's repository to the name under the agent image's
-#    registry, which is what the operator renders when nothing overrides it.
+#    The first-party next defaults (gateway, worker, callout, capability
+#    verifier) are release images with no fixed tag in the inventory, so the
+#    operator compiles in the bare image name and takes registry and tag from
+#    its own or the agent image; the second check below holds each name to the
+#    inventory's entry, and that entry's repository to the name under the
+#    agent image's registry, which is what the operator renders when nothing
+#    overrides it.
 # ---------------------------------------------------------------------------
 check_operator_pin() {
   local name=$1 gofile=$2 constant=$3
