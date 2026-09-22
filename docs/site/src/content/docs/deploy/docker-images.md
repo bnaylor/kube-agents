@@ -11,16 +11,18 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout and
-the Hermes bridge sidecar, and each is in the tables below. The first-party ones (`a2a-gateway`,
-`a2a-worker`, `a2a-authcallout`, `hermes-bridge`) are built and tagged with the rest of the
-release. The operator derives the three it renders from its own image (`OPERATOR_IMAGE`, which
+The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout,
+the capability verifier and the Hermes bridge sidecar, and each is in the tables below. The
+first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`, `a2a-verifier`,
+`hermes-bridge`) are built and tagged with the rest of the
+release. The operator derives the four it renders from its own image (`OPERATOR_IMAGE`, which
 the chart sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it
 resolves for itself:
 the same registry and tag, so an install at a release pulls them at that release and a mirrored
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;
-`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` on the operator override one at a
+`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE` and `A2A_VERIFIER_IMAGE` on the
+operator override one at a
 time. The bridge is
 built from the `platform-agent` image of the same commit and is declared on the `PlatformAgent`
 as a sidecar rather than rendered by the operator, so it has no operator override: the sidecar's
@@ -31,7 +33,8 @@ the copies by hand.
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
-`a2a/Dockerfile.gateway`, `a2a/Dockerfile.worker` and `a2a/Dockerfile.hermes-bridge` alongside
+`a2a/Dockerfile.gateway`, `a2a/Dockerfile.verifier`, `a2a/Dockerfile.worker` and
+`a2a/Dockerfile.hermes-bridge` alongside
 every other builder, so a build in a mirrored environment can resolve them like any other.
 
 Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
