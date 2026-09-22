@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -393,4 +394,182 @@ func startCapabilityVerifier(t *testing.T, ctx context.Context, h *harness) {
 		t.Fatalf("the verifier could not subscribe under its rendered grants: %v", err)
 	}
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// The browser credential cannot join the verifier's queue group.
+//
+// This is not a confidentiality test and the distinction is the finding. `web`
+// subscribes `a2a.>` -- it is the read surface, and the whole task plane is
+// deliberately visible to it -- and `a2a.>` covered `a2a.cap.verify.*`, the
+// verifier's REQUEST subject. NATS lets any principal permitted to subscribe
+// to a subject join any queue group on it, so the credential published to a
+// browser could join `cap-verifier` and take a share of every verify request
+// in the install. It could not answer them, holding no publish under
+// `a2a.cap.reply.>`; it would simply swallow them, the caller's Check would
+// time out, and a timeout is a denial by design. A browser credential would
+// have rejected a proportion of every task on the bus.
+//
+// The deny that closes it is on webIdentity. Asserted here rather than as a
+// render assertion because "the config has a deny line" and "the server
+// refuses the subscription" are different claims, and only the second one is
+// the control.
+func TestTheWebCredentialCannotReachTheVerifyPlane(t *testing.T) {
+	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	nc, violations := connectStatic(t, h, "web", "pw-web")
+
+	if !queueSubscribeRefused(t, nc, violations, capability.VerifySubscribe, capability.VerifyQueue) {
+		t.Errorf("web joined queue group %q on %s; it can swallow verify requests and every swallowed one is a task rejected",
+			capability.VerifyQueue, capability.VerifySubscribe)
+	}
+	// The plain subscription too: interception is the sharp end, but there
+	// is no reason for this credential to watch the verify plane either.
+	if !subscribeRefused(t, nc, violations, capability.VerifySubscribe) {
+		t.Errorf("web may subscribe to %s", capability.VerifySubscribe)
+	}
+	if !subscribeRefused(t, nc, violations, capability.ReplyPrefix+">") {
+		t.Errorf("web may subscribe to %s>", capability.ReplyPrefix)
+	}
+
+	// The control, and it is the point of the deny being scoped to
+	// `a2a.cap.>` rather than wider: this credential is still the read
+	// surface. If this half fails, the deny took the product's read
+	// surface away rather than one namespace.
+	if subscribeRefused(t, nc, violations, "a2a.tasks.>") {
+		t.Error("web can no longer subscribe to the task plane; the deny is too wide")
+	}
+}
+
+// The bridge -- the executor a stock install actually runs -- can verify, and
+// cannot ask in anybody else's name.
+//
+// The operator renders A2A_SPAWN_SESSIONS=true and renders no
+// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default of `platform`
+// and every turn a user types lands on this executor. A session pod is
+// reached only by an explicit `delegate:`. That makes this test, not the
+// session one above, the one that covers the shipped path.
+//
+// The identity is the thing worth reading twice. The bridge dials as the
+// static `bridge` user and asks as `platform`, because `platform` is what the
+// gateway wrote into the capability's delegate field. That is sound only
+// because the grant is exactly one subject: the second half of this test is
+// the server refusing `bridge` on a session pod's verify token, which is what
+// keeps the verifier's subject-derived caller identity from being a
+// self-assertion.
+func TestTheBridgeVerifiesOverItsShippedGrants(t *testing.T) {
+	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	provision, _ := h.connectAs(t, "provision", tokenProvision)
+	pjs, err := jetstream.New(provision)
+	if err != nil {
+		t.Fatalf("jetstream as provision: %v", err)
+	}
+	if _, err := pjs.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: capability.Bucket, History: 1,
+	}); err != nil {
+		t.Fatalf("creating the cap bucket: %v", err)
+	}
+	startCapabilityVerifier(t, ctx, h)
+
+	gw, _ := connectStatic(t, h, "gateway", renderedGatewayPassword)
+	gjs, err := jetstream.New(gw)
+	if err != nil {
+		t.Fatalf("jetstream as gateway: %v", err)
+	}
+	// Minted exactly as the gateway mints for a default install: the
+	// delegate is the addressee, and the addressee is the bridge's profile.
+	ref, err := capability.NewMinter(gjs).Mint(ctx, "task-bridge-1", capability.Entry{
+		Tier:     capability.TierDeveloperTeam,
+		Scope:    capability.NamespaceScope("kubeagents-system"),
+		Delegate: bridgeAddressee,
+	})
+	if err != nil {
+		t.Fatalf("the gateway could not mint for the bridge: %v", err)
+	}
+
+	bridge, _ := connectStatic(t, h, "bridge", "pw-bridge")
+	client, err := capability.NewClient(bridge, bridgeAddressee)
+	if err != nil {
+		t.Fatalf("NewClient(bridge): %v", err)
+	}
+	if err := client.Check(ctx, ref, capability.VerbTaskExecute,
+		capability.NamespaceScope("kubeagents-system")); err != nil {
+		t.Fatalf("the default install's executor was refused its own task's capability: %v", err)
+	}
+
+	// A verb the capability does not carry: refused by the verifier, not by
+	// the bus, which is what proves the round trip happened.
+	if err := client.Check(ctx, ref, capability.VerbFleetRead,
+		capability.NamespaceScope("kubeagents-system")); err == nil {
+		t.Error("a developer-team capability authorized a platform verb for the bridge")
+	}
+
+	// A capability minted for a session pod, presented by the bridge. The
+	// entry names podA and the subject says platform, so the walk refuses.
+	sessionRef, err := capability.NewMinter(gjs).Mint(ctx, "task-bridge-2", capability.Entry{
+		Tier:     capability.TierDeveloperTeam,
+		Scope:    capability.NamespaceScope("kubeagents-system"),
+		Delegate: podA,
+	})
+	if err != nil {
+		t.Fatalf("minting a session's capability: %v", err)
+	}
+	if err := client.Check(ctx, sessionRef, capability.VerbTaskExecute,
+		capability.NamespaceScope("kubeagents-system")); err == nil {
+		t.Error("the bridge used a capability minted for a session pod")
+	}
+
+	// And it cannot ask in that pod's name. The server holds the grant to
+	// one subject, so this is a permissions violation rather than a
+	// verifier refusal -- the request never leaves the client.
+	forged, err := capability.NewClient(bridge, podA)
+	if err != nil {
+		t.Fatalf("NewClient(bridge-as-podA): %v", err)
+	}
+	short, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer shortCancel()
+	if err := forged.Check(short, sessionRef, capability.VerbTaskExecute,
+		capability.NamespaceScope("kubeagents-system")); err == nil {
+		t.Fatal("the bridge asked the verifier a question in a session pod's name and was answered")
+	}
+
+	// A scope outside the pod's own namespace, refused: the executor is
+	// checked at where it runs, not merely at whether it holds anything.
+	if err := client.Check(ctx, ref, capability.VerbTaskExecute,
+		capability.NamespaceScope("kube-system")); err == nil {
+		t.Error("the bridge executed at a scope its capability does not contain")
+	}
+}
+
+// bridgeAddressee is the addressee the bridge executes for, which is also the
+// token on its verify subject and the delegate the gateway mints. The operator
+// spells it a2aBridgeAddressee and the bridge spells it defaultProfile; a
+// fourth spelling here is deliberate, because a test that imported one of them
+// could not catch the two disagreeing.
+const bridgeAddressee = "platform"
+
+// queueSubscribeRefused is subscribeRefused for a queue subscription. It is a
+// separate helper because it is a separate permission question: NATS checks
+// the subject for both, but a queue group is a claim on OTHER subscribers'
+// traffic, and a principal that may watch a subject can also steal from it.
+func queueSubscribeRefused(t *testing.T, nc *nats.Conn, violations chan error, subject, queue string) bool {
+	t.Helper()
+	sub, err := nc.QueueSubscribeSync(subject, queue)
+	if err != nil {
+		t.Fatalf("QueueSubscribeSync(%s, %s) returned a synchronous error: %v", subject, queue, err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("Flush after queue subscribing to %s: %v", subject, err)
+	}
+	select {
+	case e := <-violations:
+		if !strings.Contains(e.Error(), "ermissions") {
+			t.Fatalf("unexpected async error queue subscribing to %s: %v", subject, e)
+		}
+		return true
+	case <-time.After(500 * time.Millisecond):
+		return false
+	}
 }

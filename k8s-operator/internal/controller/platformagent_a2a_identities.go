@@ -711,6 +711,29 @@ func bridgeIdentity() a2aIdentity {
 		"_INBOX."+a2aBridgeUser+".>",
 	)
 
+	// The capability path, and the reason this static principal has one.
+	//
+	// The operator renders A2A_SPAWN_SESSIONS=true and renders no
+	// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default and every
+	// turn in a stock `mode: next` install is addressed to
+	// a2aBridgeAddressee and executed by the sidecar this principal
+	// belongs to. A session pod is reached only by an explicit `delegate:`.
+	// Without these two subjects the capability the gateway mints for those
+	// tasks is read by nobody: minted, referenced, and never checked.
+	//
+	// The ask is ONE subject and the token on the end is the addressee, not
+	// the user name. That is deliberate twice over. The verifier reads its
+	// caller off that last token and compares it to the entry's delegate,
+	// which the gateway set to the addressee; and a wildcard here would let
+	// this credential ask in a session pod's name, converting the
+	// verifier's identity check into a self-assertion — see the same
+	// argument at length in a2a/authcallout/session.go.
+	//
+	// Deliberately NOT granted, for the same reason session pods are not
+	// granted it: `$KV.cap.hop.<...>.*`. This executor never attenuates,
+	// because it never delegates onward.
+	publish = append(publish, "a2a.cap.verify."+a2aBridgeAddressee)
+
 	return a2aIdentity{
 		user:     a2aBridgeUser,
 		account:  a2aAccountApp,
@@ -729,6 +752,7 @@ func bridgeIdentity() a2aIdentity {
 		subscribe: []string{
 			"a2a.tasks." + a2aBridgeAddressee + ".*.in",
 			"$KV.runtime-state.>",
+			"a2a.cap.reply." + a2aBridgeAddressee + ".>",
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -862,6 +886,24 @@ func webIdentity() a2aIdentity {
 			"a2a.>",
 			"_INBOX.web.>",
 		},
+		// The one subtraction `a2a.>` needs, and it is not about
+		// confidentiality.
+		//
+		// A NATS subscriber may join ANY queue group on a subject it is
+		// permitted to subscribe to. `a2a.>` covers `a2a.cap.verify.*`,
+		// which is the verifier's request subject, and the verifier scales
+		// on queue group `cap-verifier` — so a holder of this password
+		// could join that group and take a share of every verify request
+		// in the install. It cannot answer them (it holds no publish under
+		// `a2a.cap.reply.>`), which is worse rather than better: the
+		// request is simply swallowed, the caller's Check times out, and a
+		// timeout is a denial by design. A browser credential would have
+		// been able to reject a proportion of every task on the bus.
+		//
+		// Denying the whole `a2a.cap.>` namespace rather than the verify
+		// subject alone also takes away the reply traffic, which this
+		// credential had no reason to see either.
+		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
 
