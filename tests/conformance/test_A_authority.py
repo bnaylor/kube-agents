@@ -731,7 +731,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision"):
+        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")

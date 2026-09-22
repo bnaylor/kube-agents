@@ -31,11 +31,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	hermesbridge "github.com/gke-labs/kube-agents/a2a/hermes-bridge"
 )
 
@@ -60,6 +62,16 @@ const (
 	defaultTaskDeadlineSeconds = 7200
 	defaultKillGraceSeconds    = 10
 	defaultKVBucket            = "runtime-state"
+
+	// saNamespaceFile is the kubelet's projection of the pod's own
+	// namespace. The bridge needs the namespace to build the scope it is
+	// checked at, and unlike every other A2A workload it cannot be handed
+	// POD_NAMESPACE by the operator: it is deployed through the CR's
+	// spec.deployment.sidecars (a2a/docs/hermes-bridge.md), which is a
+	// user-written container the operator copies verbatim. A file the
+	// kubelet always mounts is the one source that does not depend on
+	// whoever wrote that YAML remembering a variable.
+	saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 )
 
 // errUsage is what realMain returns when NATS_URL is missing, so run can
@@ -105,7 +117,13 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
 		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
 		Logger:       log,
+		// Unset means required: a submission with no capability is
+		// refused. "false" is the mixed-version window only — a gateway
+		// that predates the mint. It does not switch enforcement off; a
+		// capability that is present is always checked.
+		CapabilityOptional: os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
 	}
+	cfg.Scope = capabilityScope(log)
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
 		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
 	}
@@ -128,6 +146,39 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	log.Info("bridge shut down cleanly")
 	return nil
+}
+
+// capabilityScope resolves the scope this executor is checked at. It must be
+// one the gateway's minted capability contains, and the gateway's unconfigured
+// ceiling is namespace-scoped to the pod it runs in — which is this pod, since
+// the bridge is a sidecar in it. A2A_AUTHORITY_SCOPE overrides, for the same
+// reason the session executor takes one: an install whose gateway was given a
+// narrower ceiling has to be able to say so here too.
+//
+// A namespace this cannot resolve is deliberately left empty rather than
+// guessed. An empty scope is contained by nothing, so every task is refused
+// and the install fails loudly at the first turn — the alternative, defaulting
+// to a plausible namespace, would pass the check against a capability minted
+// for a different one.
+func capabilityScope(log *slog.Logger) capability.Scope {
+	if s := os.Getenv("A2A_AUTHORITY_SCOPE"); s != "" {
+		return capability.Scope(s)
+	}
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		b, err := os.ReadFile(saNamespaceFile)
+		if err != nil {
+			log.Error("cannot resolve this pod's namespace; every task will be refused for want of a scope",
+				"file", saNamespaceFile, "err", err)
+			return ""
+		}
+		ns = strings.TrimSpace(string(b))
+	}
+	if ns == "" {
+		log.Error("this pod's namespace resolved empty; every task will be refused for want of a scope")
+		return ""
+	}
+	return capability.NamespaceScope(ns)
 }
 
 func envOr(key, def string) string {

@@ -85,6 +85,22 @@ program and nothing else: subscribe `a2a.tasks.platform.*.in`, publish
 registry below, and `_INBOX.bridge.>`. Nothing wider - a bridge that can publish
 submissions is a bridge that can impersonate the gateway.
 
+Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
+subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,
+and that is load-bearing twice over. The verifier reads its caller off the last token of
+the subject it was asked on, so a principal granted `a2a.cap.verify.*` could name itself
+anything; and any principal permitted to subscribe to a request subject may join a queue
+group on it, so a wildcard in the reply space would let this user intercept other
+principals' verifications rather than merely observe them. The bridge asks as `platform`
+rather than as `bridge` because `platform` is the addressee the gateway writes into the
+capability's `delegate` - the name it is being asked about is the routing identity, not
+the connection's. `a2a/authcallout`'s conformance suite pins both halves, including that
+a forged caller name is refused by the server.
+
+The bridge holds no read on the `cap` bucket. It cannot resolve a capability itself, only
+ask; the verifier is the only principal on the bus that may read the store. See
+`docs/architecture/09-capability-envelope.md`.
+
 The JetStream tax is not `$JS.API.>`: it is the `$JS.API` subjects the bridge emits on
 TASKS and `KV_runtime-state` — stream info, consumer create, pull, direct get, and the
 KV watcher's consumer delete — named one by one in the operator's

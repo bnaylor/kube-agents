@@ -25,6 +25,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -68,6 +69,25 @@ type Config struct {
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
 	ResultChunkSize int
+	// Scope is the resource path this executor operates in, and it is what
+	// the capability is checked against: not "may this capability do
+	// anything" but "may it execute here". It has to be a scope the
+	// gateway's ceiling contains, which for an unconfigured install is
+	// `namespace/<the agent's namespace>`; the bridge shares that pod, so
+	// the two agree by construction. Resolved by the caller, never
+	// defaulted here — an executor that invented its own scope would be
+	// answering the question it was asked to pose.
+	Scope capability.Scope
+	// CapabilityOptional governs exactly one thing: what a submission with
+	// no capability at all means. Zero value — the safe one — refuses it.
+	// Set, it executes and says so at WARN. That is the mixed-version
+	// window: a gateway that predates the mint in front of an executor
+	// that enforces it, and nothing else.
+	//
+	// It is NOT a switch for enforcement. A capability that is present is
+	// always checked and its refusal is always honoured; there is no
+	// configuration in which this bridge runs work a verifier refused.
+	CapabilityOptional bool
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option
 	Logger      *slog.Logger
@@ -320,6 +340,20 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.mu.Lock()
 	b.tasks[env.TaskID] = run
 	b.mu.Unlock()
+
+	// Authorization before execution, and before the queue. The gateway
+	// minted a capability for this task at ingress; the verifier is the only
+	// thing that can say whether it permits this executor, at this
+	// executor's scope. Refused is terminal rejected, before hermes is
+	// invoked and before a model is called. It is registered above first so
+	// the refusal rides the same single-writer finalize every other terminal
+	// event does — idempotent, and it clears the in-flight registry the
+	// sweep reads. See capability.go.
+	if reason := b.capabilityRefusal(ctx, env); reason != "" {
+		b.finalize(run, lib.StateRejected, reason, nil)
+		return
+	}
+
 	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
 	select {
 	case b.queue <- run:

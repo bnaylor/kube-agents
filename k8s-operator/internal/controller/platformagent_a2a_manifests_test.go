@@ -3105,6 +3105,12 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 //     interest for a push consumer's deliver_subject, so widening it is a
 //     review conversation for the same reason widening publish is.
 //
+// The capability envelope's two subjects are on the allowed side, one each way,
+// and both are single subjects. The bridge is the default install's executor --
+// the operator renders no A2A_DEFAULT_ADDRESSEE, so an unqualified task arrives
+// here -- which is why it needs to ask at all. What it still may not do is
+// read the answer's source: no `$KV.cap` entry is in either list.
+//
 // The blackboard streams are on the forbidden side here, and that is the half
 // of A5 this test carries. `worker` held INFO and DIRECT.GET on TOPICS-STATE
 // and TOPICS-JOURNAL and publish on three topic subjects, because the `a2a`
@@ -3118,6 +3124,12 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	if sub, want := a2aGrantSubjects(t, conf, a2aBridgeUser, "subscribe"), []string{
 		"a2a.tasks." + a2aBridgeAddressee + ".*.in",
 		"$KV.runtime-state.>",
+		// The capability verifier's answers, scoped to this principal's
+		// own reply space. Not a wildcard, and the narrowness is the
+		// control rather than tidiness: a subscribe permission on
+		// another principal's reply subject is interception, because
+		// anyone who may subscribe may join a queue group.
+		"a2a.cap.reply." + a2aBridgeAddressee + ".>",
 		"_INBOX." + a2aBridgeUser + ".>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("bridge subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -3129,6 +3141,12 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	}
 	want = append(want, a2aBridgeJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX."+a2aBridgeUser+".>")
+	// Asking the verifier, on exactly one subject. The verifier reads its
+	// caller off the last token, so a `a2a.cap.verify.*` grant here would
+	// let this principal name itself anything; one subject is what makes
+	// the subject-as-identity check sound. No read on the cap bucket
+	// appears anywhere in this list, and that is the point of asking.
+	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bridge publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
