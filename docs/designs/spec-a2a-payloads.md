@@ -657,9 +657,12 @@ Verified identity (added 9/9):
     an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
     belong in `tests/conformance/` rather than in the library suite. That is a placement
     rule and not a pointer to existing coverage: read `tests/conformance/` itself before
-    relying on any of them being asserted. One of the three cannot pass as stated in any
-    case - the static `worker` user holds publish on every addressee's `…events`, so
-    that writer set is not yet single-writer, and it closes when `worker` is retired.
+    relying on any of them being asserted. The `…events` caveat this item used to carry
+    is closed: retiring the static `worker` user took away the one publish grant that
+    wildcarded the addressee token, and the writer set is asserted empty by
+    `test_A3_the_events_subject_has_no_rendered_writer`. The static half went to
+    `bridge`, whose grant names its one addressee literally; the callout half went to
+    `agent`, which holds no task-plane publish at all.
 25. A submission whose `authority.grants` is null, names a key the gateway never wrote,
     or names a capability whose `delegate` is a different principal is refused, and the
     refusal is a `rejected` terminal on the task's event subject rather than a log line.
