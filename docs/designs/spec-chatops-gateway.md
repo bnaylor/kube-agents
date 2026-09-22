@@ -373,7 +373,10 @@ metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds label
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
 gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
-lowest-common-denominator grant computation when the authority work lands.
+lowest-common-denominator grant computation if it is ever built. That one is still
+unbuilt (9/9): the authority work landed as the capability envelope, which answers
+"may this task do this" per task rather than computing a grant set per principal, so
+it does not reach this boundary.
 
 **The salt is `SESSION_KV_SALT`, the one the install already provisions** (settled
 8/31). It is generated once into `platform-agent-secrets`, deliberately never
