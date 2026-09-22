@@ -1130,11 +1130,12 @@ and an unescaped `<!channel>` in a result would ping the room.
   `grants` decision-grade by resolution.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, `grants`, anything that makes
-`authority` decision-grade, and the transition work "Sessions by default" names (the
-gateway-minted child task, the `chat` profile's skills, the warm
-pool). (The gchat and slack adapters were on this list until 9/5 and 9/4 respectively;
-each now has its own section above.)
+Not in stage 2: the classifier, the LCD permissions tool, and the transition work
+"Sessions by default" names (the gateway-minted child task, the `chat` profile's skills,
+the warm pool). (The gchat and slack adapters were on this list until 9/5 and 9/4
+respectively; each now has its own section above. `grants` and "anything that makes
+`authority` decision-grade" were on it until 9/9, when they landed — the bullet above is
+what replaced them.)
 
 ## Inherited from the kanban retirement (added 8/24)
 
