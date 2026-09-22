@@ -347,10 +347,10 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 			t.Errorf("provision script missing %q", want)
 		}
 	}
-	// The reserved capability bucket ("cap", capability envelope design) —
-	// checked as a distinct word so "cap" inside another token cannot satisfy it.
+	// The capability bucket ("cap", capability envelope design) — checked as
+	// a distinct word so "cap" inside another token cannot satisfy it.
 	if !strings.Contains(script, "kv add cap") {
-		t.Error("provision script missing the reserved capability bucket")
+		t.Error("provision script missing the capability bucket")
 	}
 }
 

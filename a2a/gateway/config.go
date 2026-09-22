@@ -253,8 +253,10 @@ type Config struct {
 	// 02-agent-personas §9 puts `tier` and `scope` on the Agent CRD, and
 	// that CRD does not exist — PlatformAgent carries neither, and inventing
 	// them on it is an API change this card is not. The operator renders
-	// both explicitly; the defaults below are for a local run, and they are
-	// the narrowest thing that could be true rather than a convenient one.
+	// neither — so the defaults below are what every rendered install runs
+	// on, not a local-run convenience, and they are deliberately the
+	// narrowest thing that could be true: the ceiling an operator has not
+	// chosen must not be a generous one.
 	AuthorityTier  capability.Tier
 	AuthorityScope capability.Scope
 

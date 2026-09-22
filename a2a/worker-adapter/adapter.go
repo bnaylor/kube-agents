@@ -92,9 +92,13 @@ type Config struct {
 	// narrowed below this pod's scope — or one a hop narrowed elsewhere —
 	// fails that question, which is the whole point of asking it.
 	//
-	// It comes from A2A_AUTHORITY_SCOPE, rendered by the operator with the
-	// same value it gives the gateway, because nothing in the CRDs carries
-	// a cluster identity yet. Unset means the gateway's unset default.
+	// It comes from A2A_AUTHORITY_SCOPE, rendered onto every session pod by
+	// the gateway's own spawner — not by the operator, which renders no
+	// authority environment at all. The gateway renders its own RESOLVED
+	// value rather than passing its variable through, because the scope the
+	// executor checks against has to be the one the gateway minted under.
+	// Unset falls back to Namespace above, which is right for a local run
+	// and wrong in a pod: see spawn.go's note on `namespace/-`.
 	Scope capability.Scope
 
 	// CapabilityOptional governs exactly one thing: what a submission with

@@ -1796,11 +1796,21 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
 # KV buckets: runtime-state (who is alive), session-state (the gateway's
-# registry; its user is the only writer), cap (reserved for capability
-# entries per docs/architecture/09-capability-envelope.md — arms with the
-# authority work). Capped at 256MiB each: the streams' max_bytes discipline
-# applies to KV too, or unbounded bucket growth eats the file store's
-# headroom and stalls every JetStream write.
+# registry; its user is the only writer), cap (the capability entries of
+# docs/architecture/09-capability-envelope.md; the gateway writes one per
+# task at ingress and only the verifier may read them). Capped at 256MiB
+# each: the streams' max_bytes discipline applies to KV too, or unbounded
+# bucket growth eats the file store's headroom and stalls every JetStream
+# write.
+#
+# The cap bucket has no TTL and nothing deletes from it, so it fills — at a ~180-byte
+# entry that is order 1.5M tasks. KV is discard=new, so the bucket REFUSES
+# the write rather than evicting: the gateway cannot mint, and a gateway
+# that cannot mint refuses the turn. That is the fail-closed direction, and
+# it is the reason there is no TTL here — an entry that expired under a
+# running task would refuse that task mid-flight instead. Reclaiming is a
+# "nats kv del cap" against a finished task's key; no tooling ships for it
+# and the runbook says so.
 $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456

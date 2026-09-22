@@ -114,7 +114,7 @@ type Entry struct {
 // exactly as §4 writes it. The conformance suite in a2a/authcallout is what
 // found this, by minting through a real permission set; every test in this
 // package passed with the stutter in place, because none of them crossed a
-// server. 09 §7's worked example is amended to match.
+// server. 09 §3's worked example is amended to match.
 const (
 	// RootPrefix is the gateway's namespace and only the gateway's. On the
 	// wire: `$KV.cap.root.<request-id>`.
