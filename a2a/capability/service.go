@@ -52,6 +52,19 @@ const (
 	// A namespace of its own costs one subscribe grant on each caller and
 	// buys the verifier a publish grant — `a2a.cap.reply.>` — that reaches
 	// nothing but capability answers.
+	//
+	// One consequence of living under `a2a.` rather than `_INBOX`, named
+	// here so it is a decision rather than an oversight: the read-only
+	// `web` user subscribes to `a2a.>`, so a browser holding that
+	// credential observes verify traffic — which caller asked about which
+	// key and revision for which verb, and whether the answer was yes. It
+	// does NOT observe the capability: the request carries a reference and
+	// the response carries a verdict, neither carries tier or scope (see
+	// Request and Response below), and `web` holds no read on the store by
+	// any route. That is a strict subset of what `web` already reads off
+	// `a2a.tasks.>`, which is the tasks themselves, so this widens no
+	// boundary. It would be worth revisiting if `web` were ever narrowed
+	// off the task plane.
 	ReplyPrefix = "a2a.cap.reply."
 	// ReplyPublish is the verifier's whole publish grant on this path.
 	ReplyPublish = ReplyPrefix + ">"
