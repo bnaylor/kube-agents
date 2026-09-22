@@ -89,9 +89,10 @@ To build kube-agents end-to-end from this design set:
    how a request's authority survives the hops between agents, once there are any.
 2. **Build by phase, verify, iterate.** Follow [07](07-implementation-roadmap.md) §2. After each
    phase, run its **acceptance criteria** _and_ the **Verification** checks of every spec the phase
-   touched (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7). 09 is absent from that list on purpose:
-   it is north-star, nothing in it is built, and its Verification suite has nothing to run against
-   yet. Wire it in with the phase that builds it. Do not advance a phase — or open the final
+   touched (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7, and 09 §9). **09 joined that list 9/9**,
+   when the first hop was built: its Verification suite now has something to run against, split
+   between `a2a/capability` and the permissions invariants in `tests/conformance/`. The bullets in
+   §9 that describe a second hop still have nothing to run against, and §0 says which. Do not advance a phase — or open the final
    PR — until its checks pass. The verification loop is defined in
    [07](07-implementation-roadmap.md) §5.
 3. **Decisions are already made — don't re-litigate.** Every decision is stated in its home spec

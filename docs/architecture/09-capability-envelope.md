@@ -151,17 +151,19 @@ the same shape as the NATS auth callout 09 proposes alongside it, and it produce
 an entry rather than work product from a peer. If that reading is wrong the design has a problem,
 so it is stated here to be argued with rather than left implicit.
 
-**Three components here do not exist in the design set, and 09 introduces all three.** The bus, the
-per-agent broker in front of each agent, and the verification service are named throughout as
-though they were furniture, and they are not: [05](05-system-architecture.md)'s component inventory
-runs C1-C15 with no message bus and no verifier, and its "broker" (C6) is the GitHub token minter,
-which is a different thing wearing the same word. Read every "the broker" below as something this
-document proposes. Adding them to 05 with C-numbers, so 09 can cite them instead of describing
-them, is the first thing to do if this moves toward being built.
+**Three components here did not exist in the design set, and 09 introduced all three.** The bus,
+the per-agent broker in front of each agent, and the verification service were named throughout as
+though they were furniture. **Resolved 9/9:** [05](05-system-architecture.md)'s inventory now
+carries them as C16 (the bus), C18 (the session pod, which is the broker on the hop that exists)
+and C19 (the verifier), alongside C17 for the auth callout -- four missing rather than three, which
+is the sort of thing you find only by going to add one. 05's "broker" (C6) is still the GitHub
+token minter, a different thing wearing the same word, so read every "the broker" below as this
+document's sense of the word and not C6.
 
-**What is settled and what is not.** The mechanism is agreed as the design. The topology it
-presumes does not exist, so the open question is not whether to do this but when there is anything
-to do it to -- see the north-star note at the top.
+**What is settled and what is not.** The mechanism is agreed, and as of 9/9 the first hop is built
+and enforcing -- section 0 says exactly what shipped and what did not. The multi-hop topology the
+rest of this document presumes still does not exist, so everything below section 0 that describes a
+second hop is a design rather than a description.
 
 ## 2. The recommendation, first
 
@@ -284,8 +286,15 @@ authenticates and evaluated by the server on every operation**. So, writing a bu
 
 - Only the gateway may publish under `$KV.cap.root.*`
 - Each broker may publish only under `$KV.cap.hop.<its-own-principal>.*`
-- **No broker may read the bucket at all.** Only the verification service holds read, and that
-  means both `$KV.cap.>` and the JetStream API subjects that serve the bucket.
+- **No broker may read the bucket at all.** Only the verification service holds read on
+  `$KV.cap.>` and on the JetStream API subjects that return a capability. One carve-out, stated
+  here rather than discovered: the seed Job holds `$JS.API.STREAM.INFO.KV_cap` and nothing else
+  on this path, because `kv info cap || kv add cap` is the provision script's idempotency guard.
+  `STREAM.INFO` returns stream state — a message count, a subject list, a first and last
+  sequence — and no capability. Every subject that does return one stays refused for seed as for
+  everyone else, which is what makes it a carve-out and not a hole, and it is asserted as an
+  allow in the conformance suite so that taking the grant away fails there instead of in an
+  install.
 
 > **The third bullet was false when it was first implemented, and it is worth knowing how** (9/9).
 > The verifier's own grants were correct. The hole was on the other side: the gateway, the worker
@@ -723,8 +732,8 @@ silent.
 
 **All of these now exist** (9/9), and the split between them turned out to matter more than the
 list did. The chain checks live in the capability package's own suite, written against an
-in-process resolver. The last four -- everything phrased as "the server refuses" -- live in the
-conformance suite, which starts a real `nats-server` from the config the operator actually renders
+in-process resolver. Four of them -- everything phrased as "the server refuses", the tenth through
+thirteenth below -- live in the conformance suite, which starts a real `nats-server` from the config the operator actually renders
 and connects as the rendered principals. That boundary is not bookkeeping: the whole unit suite,
 attacker tests included, passed against a key scheme that made minting impossible, because not one
 unit test crosses a subject permission. **A denial that names a subject has to be tested against a
