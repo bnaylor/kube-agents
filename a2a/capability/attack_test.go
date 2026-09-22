@@ -15,7 +15,7 @@ import (
 // well-formed capabilities has not been tested. Every test below is a thing an
 // attacker does, and each names the single rule that has to catch it.
 //
-// Three of 09 §9's fourteen are not here and cannot be: "no broker writes in
+// Three of 09 §9's checks are not here and cannot be: "no broker writes in
 // another's namespace", "no broker reads the store", and "the permissions are
 // actually configured" are properties of the rendered nats.conf and the running
 // server, not of this package. They live in the operator's conformance suite,
