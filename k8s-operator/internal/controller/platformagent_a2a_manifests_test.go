@@ -3427,6 +3427,11 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
+		// The mint, and the whole of it: one token under `root`, which is
+		// the request id. No read of the bucket by any path, and nothing
+		// under `cap.hop.>` -- the gateway mints each successor's root
+		// itself, so a hop grant here would be authority with no caller.
+		"$KV.cap.root.*",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")

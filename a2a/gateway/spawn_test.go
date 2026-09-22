@@ -343,7 +343,7 @@ func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T)
 
 			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",
 				BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
-			if _, err := s.Spawn(context.Background(), rec, "task-1", ""); err != nil {
+			if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
 				t.Fatal(err)
 			}
 			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
