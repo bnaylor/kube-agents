@@ -193,8 +193,18 @@ func TestTheVerifierFenceAllowsOnlyDNSAndTheBus(t *testing.T) {
 	// this reads its output rather than restating it: what is asserted is the
 	// shape a peer list has to keep, not the list.
 	dns := np.Spec.Egress[0]
+	// Both ports named, not merely counted. The loop above accepts either
+	// port on either rule, so a DNS rule carrying UDP 53 and TCP 4222 would
+	// have two ports, both in the accepted set, and the right peers -- and
+	// would be NATS client traffic to the cluster resolvers.
 	if len(dns.Ports) != 2 {
-		t.Errorf("DNS rule ports = %+v, want udp+tcp 53", dns.Ports)
+		t.Fatalf("DNS rule ports = %+v, want udp+tcp %d", dns.Ports, a2aDNSPort)
+	}
+	for i, want := range []corev1.Protocol{corev1.ProtocolUDP, corev1.ProtocolTCP} {
+		p := dns.Ports[i]
+		if p.Protocol == nil || *p.Protocol != want || p.Port == nil || int32(p.Port.IntValue()) != a2aDNSPort {
+			t.Errorf("DNS rule port %d = %+v, want %s %d", i, p, want, a2aDNSPort)
+		}
 	}
 	if !reflect.DeepEqual(dns.To, clusterDNSPeers([]string{"10.0.0.10"})) {
 		t.Errorf("the DNS rule no longer carries the cluster resolver peers: %+v", dns.To)
