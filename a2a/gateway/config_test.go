@@ -381,6 +381,7 @@ func TestFromEnvSessionTTL(t *testing.T) {
 		t.Fatal("expected refusal when SessionTTL <= TaskDeadline, got nil")
 	}
 }
+
 // pairs are exactly what a hand-enumerated switch leaves a hole in — the
 // two-backend switch this merged from only knew about one pair, and a fourth
 // backend must not be addable with a combination nobody checked. Exactly one
@@ -779,7 +780,7 @@ func TestFromEnvStrictEventsWriter(t *testing.T) {
 // TestDefaultAddresseeIsPlatform: "Sessions by default" phase 1 keeps the
 // platform agent as the default; /session is the per-conversation opt-in.
 func TestDefaultAddresseeIsPlatform(t *testing.T) {
-	setBaseEnv(t) // the file's shared FromEnv environment (NATS_URL, salt, principal map)
+	setBaseEnv(t)                         // the file's shared FromEnv environment (NATS_URL, salt, principal map)
 	t.Setenv("A2A_DEFAULT_ADDRESSEE", "") // envOr treats empty as unset
 	cfg, err := FromEnv()
 	if err != nil {
