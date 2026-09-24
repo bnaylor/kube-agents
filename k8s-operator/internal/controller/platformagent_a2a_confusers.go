@@ -88,10 +88,34 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 }
 
 // renderA2APermission renders one direction's allow list and, when the
-// principal has one, the deny list subtracted from it. A deny with no allow is
-// not rendered: NATS would read the empty allow as "everything", so a block
-// carrying only a deny would silently widen the principal to the whole subject
-// space minus a few names — the exact opposite of what writing a deny means.
+// principal has one, the deny list subtracted from it.
+//
+// A direction with no allow entries renders nothing, and that is NOT a
+// narrowing. An earlier version of this comment claimed it was — that omitting
+// the block avoided NATS reading an empty allow as "everything" — and it had
+// the semantics backwards in a way worth spelling out, because the mistake is
+// the kind that reads as caution:
+//
+//   - No `permissions` block at all: every direction unrestricted.
+//   - `permissions` present, one direction's key omitted: THAT direction
+//     unrestricted. nats-server builds `Permissions.Publish` only when the key
+//     is there, and the publish check returns true when it is nil.
+//   - The key present with an empty allow: that direction denied entirely,
+//     which is what the $SYS note above depends on.
+//
+// So for an identity that has publish entries and a subscribe deny but no
+// subscribe allow, the permissions block IS written, the subscribe key is NOT,
+// and the deny evaporates into allow-all. Returning "" is the widest of the
+// three readings, not the narrowest.
+//
+// Nothing is guessed here to repair that, because the two repairs mean opposite
+// things — deny-all, or allow-everything-but — and the render cannot know which
+// an author meant. What closes it is
+// TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow, which refuses the
+// configuration at build time instead. Every deny list in the identity table is
+// an operator-authored constant, so that test sees all of them; if a deny list
+// ever becomes CR-derived, this returns to being a live hole and the guard has
+// to move into the render.
 func renderA2APermission(indent, kind string, allow, deny []string) string {
 	if len(allow) == 0 {
 		return ""
