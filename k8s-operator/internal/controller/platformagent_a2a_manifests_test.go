@@ -5248,3 +5248,153 @@ func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
 			"surface, which is one more way to tell the next stack exists")
 	}
 }
+
+// TestTheBridgeSidecarCanResolveItsOwnScope pins the repair for the defect this
+// test's absence allowed: a default install whose bridge refuses every
+// `platform` task.
+//
+// The mechanism, end to end. capabilityScope (a2a/cmd/hermes-bridge/main.go)
+// resolves the scope the executor is checked at from A2A_AUTHORITY_SCOPE, then
+// POD_NAMESPACE, then /var/run/secrets/kubernetes.io/serviceaccount/namespace.
+// The pod template sets AutomountServiceAccountToken false, so the kubelet
+// projects nothing at that path and the third rung returns ENOENT; with the
+// first two unset the scope resolves empty, an empty scope is contained by no
+// capability, and the executor refuses the task before it spends anything.
+//
+// So the assertion is not "POD_NAMESPACE is present" for its own sake. It is
+// that the rung the pod can actually satisfy IS satisfied, and the automount
+// assertion below is here so that a future change flipping it back does not
+// quietly make this test pass for a reason that no longer holds.
+func TestTheBridgeSidecarCanResolveItsOwnScope(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "example.com/bridge:v1"}},
+	}
+
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
+
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("this pod now automounts the ServiceAccount token, so the kubelet projects a " +
+			"namespace file and capabilityScope's third rung resolves. That is a different " +
+			"world from the one this test was written for -- re-read it before changing it.")
+	}
+
+	var bridge *corev1.Container
+	for i, c := range pod.Spec.Containers {
+		if c.Name == "hermes-bridge" {
+			bridge = &pod.Spec.Containers[i]
+		}
+	}
+	if bridge == nil {
+		t.Fatal("the CR's bridge sidecar is not in the pod")
+	}
+
+	var ns *corev1.EnvVar
+	for i, e := range bridge.Env {
+		if e.Name == "POD_NAMESPACE" {
+			ns = &bridge.Env[i]
+		}
+	}
+	if ns == nil {
+		t.Fatal("the bridge sidecar carries no POD_NAMESPACE, so capabilityScope falls through to " +
+			"a namespace file this pod does not have, resolves an empty scope, and the install " +
+			"refuses every platform task at the first turn")
+	}
+	if ns.ValueFrom == nil || ns.ValueFrom.FieldRef == nil || ns.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+		t.Errorf("POD_NAMESPACE = %+v; it has to come from the downward API, because a baked value "+
+			"is a scope that is right until the install moves namespace", *ns)
+	}
+}
+
+// TestTheCapabilitySwitchReachesTheDefaultRoute is the other half of the single
+// switch the design claims. A2A_CAPABILITY_REQUIRED is described in three
+// places as arming or relaxing both halves from one variable on the gateway
+// Deployment; the gateway holds up its end by passing its resolved setting to
+// the session pods it spawns, which is the delegated route. The default route
+// is the bridge, which reads its OWN container's environment -- so without the
+// operator rendering it there, relaxing the gateway leaves an executor that
+// still refuses every capability-less submission, which is exactly the
+// half-armed state one switch was supposed to make unreachable.
+func TestTheCapabilitySwitchReachesTheDefaultRoute(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Sidecars: []corev1.Container{
+			{Name: "hermes-bridge", Image: "example.com/bridge:v1"},
+			{Name: "someone-elses", Image: "example.com/other:v1"},
+		},
+	}
+
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
+
+	// Both, deliberately. The render is not keyed on the container's name:
+	// matching "hermes-bridge" would send a renamed bridge straight back to
+	// the empty-scope refusal, silently, and neither variable does anything
+	// to a container that does not read it.
+	for _, want := range []string{"hermes-bridge", "someone-elses"} {
+		var got string
+		var found bool
+		for _, c := range pod.Spec.Containers {
+			if c.Name != want {
+				continue
+			}
+			for _, e := range c.Env {
+				if e.Name == a2aCapabilityRequiredEnvVar {
+					got, found = e.Value, true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("sidecar %q carries no %s; the switch does not reach it", want, a2aCapabilityRequiredEnvVar)
+			continue
+		}
+		if got != "true" {
+			t.Errorf("sidecar %q: %s = %q, want the armed default %q", want, a2aCapabilityRequiredEnvVar, got, "true")
+		}
+	}
+}
+
+// TestTheOperatorsExecutorEnvBeatsTheCRs is the precedence the switch depends
+// on. A CR that sets A2A_CAPABILITY_REQUIRED on its own sidecar is the drift
+// the one-switch design exists to prevent, so the operator's value wins rather
+// than deferring to the author's -- unlike every other env var on a
+// CR-authored container.
+func TestTheOperatorsExecutorEnvBeatsTheCRs(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Sidecars: []corev1.Container{{
+			Name:  "hermes-bridge",
+			Image: "example.com/bridge:v1",
+			Env: []corev1.EnvVar{
+				{Name: a2aCapabilityRequiredEnvVar, Value: "false"},
+				{Name: "POD_NAMESPACE", Value: "somewhere-else"},
+				{Name: "BRIDGE_PROFILE", Value: "mine"},
+			},
+		}},
+	}
+
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
+
+	var bridge corev1.Container
+	for _, c := range pod.Spec.Containers {
+		if c.Name == "hermes-bridge" {
+			bridge = c
+		}
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range bridge.Env {
+		env[e.Name] = e
+	}
+
+	if got := env[a2aCapabilityRequiredEnvVar].Value; got != "true" {
+		t.Errorf("%s = %q; a CR that disarms its own sidecar has re-created the drift the single "+
+			"switch prevents", a2aCapabilityRequiredEnvVar, got)
+	}
+	if e := env["POD_NAMESPACE"]; e.Value != "" || e.ValueFrom == nil {
+		t.Errorf("POD_NAMESPACE = %+v; a literal from the CR is a scope that outlives the namespace "+
+			"it names, so the downward API has to win", e)
+	}
+	if got := env["BRIDGE_PROFILE"].Value; got != "mine" {
+		t.Errorf("BRIDGE_PROFILE = %q, want %q: the override is the two variables the operator owns, "+
+			"not the container's environment", got, "mine")
+	}
+}

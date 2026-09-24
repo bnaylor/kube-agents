@@ -279,6 +279,56 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 // what is bus-specific is the name set a2aBusCredentialVolumeNames builds, not
 // the removal.
 
+// a2aExecutorSidecarEnv is the environment the operator owes any executor
+// riding spec.deployment.sidecars, and the reason it owes it is that the pod
+// cannot supply either value on its own.
+//
+// POD_NAMESPACE is the scope. capabilityScope (a2a/cmd/hermes-bridge/main.go)
+// resolves the scope the executor is checked at from A2A_AUTHORITY_SCOPE, then
+// POD_NAMESPACE, then the kubelet's namespace file -- and that last rung does
+// not exist in this pod. buildPodTemplateSpec sets AutomountServiceAccountToken
+// false, so the kubelet projects no serviceaccount directory at all and the
+// read returns ENOENT. capabilityScope then does the correct thing and returns
+// an empty scope rather than guessing a namespace, an empty scope is contained
+// by nothing, and every `platform` task on a default install is refused at the
+// first turn. The downward API is the one source that cannot be wrong here.
+//
+// A2A_CAPABILITY_REQUIRED is the mixed-version switch, and it is rendered for
+// the reason the gateway's copy of it is: both halves have to read one value or
+// they drift. The gateway passes its own resolved setting to the session pods
+// it spawns (a2a/gateway/spawn.go), which covers the delegated route; the
+// bridge reads its own container's environment, so the default route needs the
+// operator to put it there. Without this an install that relaxed the gateway
+// gets a bridge that still refuses every capability-less submission -- the
+// half-armed state the single switch exists to make unreachable.
+//
+// Rendered onto every CR-authored sidecar rather than onto one matched by name.
+// Matching `hermes-bridge` would make a renamed container silently take the
+// ENOENT path again, which is the failure this repairs; both variables are
+// inert in a container that does not read them.
+//
+// This is the operator's value, not a default the CR may quietly replace, so it
+// is passed to mergeEnvVars as the override. An install that means to check the
+// bridge at a narrower scope than its pod says A2A_AUTHORITY_SCOPE, which
+// capabilityScope prefers over POD_NAMESPACE and this does not touch.
+func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
+	if len(containers) == 0 {
+		return containers
+	}
+	owed := []corev1.EnvVar{
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+			FieldPath: "metadata.namespace",
+		}}},
+		{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+	}
+	out := make([]corev1.Container, 0, len(containers))
+	for _, c := range containers {
+		c.Env = mergeEnvVars(c.Env, owed)
+		out = append(out, c)
+	}
+	return out
+}
+
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
 // a bus identity: the callout authenticates to NATS with a password, because it
 // cannot authenticate through itself.
