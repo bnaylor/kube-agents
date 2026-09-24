@@ -150,10 +150,31 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 
 // capabilityScope resolves the scope this executor is checked at. It must be
 // one the gateway's minted capability contains, and the gateway's unconfigured
-// ceiling is namespace-scoped to the pod it runs in — which is this pod, since
-// the bridge is a sidecar in it. A2A_AUTHORITY_SCOPE overrides, for the same
-// reason the session executor takes one: an install whose gateway was given a
-// narrower ceiling has to be able to say so here too.
+// ceiling is namespace-scoped to the namespace the gateway runs in.
+//
+// The gateway is its OWN Deployment, not a container in this pod, and an
+// earlier version of this comment said otherwise ("which is this pod, since
+// the bridge is a sidecar in it"). What makes the two namespaces agree is not
+// co-location: it is that the operator renders every object it owns into the
+// CR's namespace. That is a property of the renderer, and it is the reason
+// this function may read a local namespace at all.
+//
+// A2A_AUTHORITY_SCOPE overrides, for the same reason the session executor
+// takes one: an install whose gateway was given a narrower ceiling has to be
+// able to say so here too.
+//
+// POD_NAMESPACE is what a rendered install actually takes. The operator sets
+// it from the downward API on every sidecar it renders (a2aExecutorSidecarEnv,
+// k8s-operator/internal/controller/platformagent_a2a_callout.go), because the
+// third rung below cannot resolve in this pod: buildPodTemplateSpec sets
+// AutomountServiceAccountToken false, so the kubelet projects no serviceaccount
+// directory and the read returns ENOENT. That was not a gap in coverage, it was
+// a default install refusing every `platform` task, and the fix is on the
+// operator rather than here because the pod cannot supply the value itself.
+//
+// The file read stays, for a bridge run outside the operator's render — the
+// live harness, a hand-written Deployment — where a projected token is the
+// normal thing to have. It is the last rung, not the expected one.
 //
 // A namespace this cannot resolve is deliberately left empty rather than
 // guessed. An empty scope is contained by nothing, so every task is refused

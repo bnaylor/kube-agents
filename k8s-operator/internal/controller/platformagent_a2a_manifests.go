@@ -278,8 +278,16 @@ const (
 	//
 	// It exists for exactly one situation: a mixed-version install, where a
 	// gateway that mints is in front of executors that predate the check, or
-	// the reverse. Both halves read this same variable (the gateway renders
-	// it onto the session pods it spawns), so the two cannot drift.
+	// the reverse. Both halves read this same variable, so the two cannot
+	// drift — but they reach it by two different routes, and the claim was
+	// only half true until both were rendered. The gateway passes its own
+	// resolved setting down to the session pods it spawns, which covers the
+	// `delegate:` route. The default route's executor is the bridge sidecar,
+	// which reads its own container's environment, so the operator renders
+	// this onto every CR-authored sidecar too (a2aExecutorSidecarEnv). Without
+	// that second render an install that relaxed the gateway got a bridge
+	// still refusing every capability-less submission: the half-armed state
+	// the single switch exists to make unreachable.
 	a2aCapabilityRequiredEnvVar = "A2A_CAPABILITY_REQUIRED"
 	defaultA2AWorkerImage       = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
 
@@ -2600,7 +2608,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// Deployment, not a variable an operator has to
 							// know exists. The gateway passes its own
 							// resolved setting down to every session pod it
-							// spawns, so this one line arms both halves.
+							// spawns; a2aExecutorSidecarEnv renders the same
+							// value onto the bridge sidecar, which reads its
+							// own environment rather than the gateway's. Both
+							// routes, one switch.
 							{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
