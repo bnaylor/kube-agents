@@ -134,6 +134,18 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 // authoring mistake, just no longer a security one. Refusing it at build time
 // says so where the author can see it. Every deny list in the identity table
 // is an operator-authored constant, so that test sees all of them.
+//
+// Why `deny = [">"]` and not `allow = []`: an empty allow is not a denial
+// either. parsePermSubjects (server/opts.go) starts from a nil []string and
+// appends, so `allow = []` yields nil rather than an empty slice;
+// setPermissions builds the allow sublist only when the slice is non-nil; and
+// the check passes everything when the sublist is nil. `publish { }` goes the
+// same way, parseSubjectPermission returning nil for an empty map. All three
+// spellings of "nothing" -- absent block, absent key, empty allow -- read as
+// unrestricted, which is why the only one written here is an explicit deny.
+// Read against v2.15.0, the version both modules build; the original
+// measurement was taken on v2.14.6 before #2232's bump and the nil-slice path
+// is unchanged.
 func renderA2APermission(indent, kind string, allow, deny []string) string {
 	if len(allow) == 0 {
 		return indent + kind + ` { deny = [">"] }` + "\n"
