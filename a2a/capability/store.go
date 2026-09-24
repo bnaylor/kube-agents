@@ -114,11 +114,21 @@ func (m *Minter) Write(ctx context.Context, key string, e Entry) (Ref, error) {
 }
 
 // Mint is the gateway's call: a root at key `root.<request-id>` — subject
-// `$KV.cap.root.<request-id>`, the gateway's whole grant — from the
-// requester's own authority, naming the principal the gateway is about to
-// dispatch to. The gateway allocates the request id and the principal's name in
-// the same breath, which is what makes the delegate predictable before the
-// credential exists.
+// `$KV.cap.root.<request-id>`, the gateway's whole grant — naming the principal
+// the gateway is about to dispatch to. The gateway allocates the request id and
+// the principal's name in the same breath, which is what makes the delegate
+// predictable before the credential exists.
+//
+// The entry is NOT derived from the requester. An earlier version of this
+// comment said it was ("from the requester's own authority"), and that sentence
+// described a product this one is not: mintCapability (a2a/gateway/authority.go)
+// fills Tier and Scope from g.cfg, which is install-wide configuration, and
+// varies only Delegate — by route, not by who asked. The requester appears in
+// the envelope's `authority` block, which is attribution and is advisory; it
+// reaches no check. Nothing in this tree intersects a capability with a
+// per-requester ceiling, because no per-requester ceiling exists to intersect
+// with, and a reader who takes this comment at its word will believe the
+// opposite. The bound an executor is held to is its install's shared one.
 func (m *Minter) Mint(ctx context.Context, requestID string, e Entry) (Ref, error) {
 	key, err := RootKey(requestID)
 	if err != nil {

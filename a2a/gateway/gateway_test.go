@@ -511,10 +511,20 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	if auth.Requester.Principal == originAuth.Requester.Principal {
 		t.Fatal("steer must be attributed to its own sender")
 	}
-	// ...and to the same capability. One task is one capability: re-minting
-	// per turn would hand the executor a root it never resolved, and would
-	// make the steerer's ceiling rather than the submitter's the one that
-	// governs work already underway.
+	// ...and to the same capability. One task is one capability, and the
+	// reason is the reference rather than the ceiling: Ref pins a key AND a
+	// revision, the executor resolved THAT pair when the task opened, and a
+	// second mint per turn would hand it a root it never resolved. The
+	// verifier walks what the envelope names, so the steer would be checked
+	// against an entry whose arrival nothing ordered against the work already
+	// in flight.
+	//
+	// Not a ceiling difference. A steerer has no ceiling of their own here --
+	// mintCapability fills Tier and Scope from install-wide config and varies
+	// only Delegate, so a re-mint on this turn would produce the same bound
+	// with a different revision. An earlier version of this comment said the
+	// re-mint would substitute "the steerer's ceiling for the submitter's",
+	// which reads as a per-requester bound that this tree does not have.
 	if string(auth.Grants) != string(originAuth.Grants) {
 		t.Fatalf("the steer carries a different capability:\n  steer  %s\n  origin %s", auth.Grants, originAuth.Grants)
 	}
