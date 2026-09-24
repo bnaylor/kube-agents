@@ -5354,10 +5354,19 @@ func TestTheCapabilitySwitchReachesTheDefaultRoute(t *testing.T) {
 }
 
 // TestTheOperatorsExecutorEnvBeatsTheCRs is the precedence the switch depends
-// on. A CR that sets A2A_CAPABILITY_REQUIRED on its own sidecar is the drift
-// the one-switch design exists to prevent, so the operator's value wins rather
-// than deferring to the author's -- unlike every other env var on a
-// CR-authored container.
+// on, and the precedence POD_NAMESPACE deliberately does NOT have.
+//
+// A CR that sets A2A_CAPABILITY_REQUIRED on its own sidecar has re-created the
+// drift the one-switch design exists to prevent, so the operator's value wins
+// -- unlike every other env var on a CR-authored container.
+//
+// POD_NAMESPACE is the opposite call and the reason is worth pinning, because
+// an earlier version of this test asserted the opposite: it is a conventional
+// Kubernetes name this product does not own, other containers read it, and
+// overriding it is not a control anyway -- capabilityScope prefers
+// A2A_AUTHORITY_SCOPE, which the webhook does not screen on a sidecar, so a CR
+// author can already name any scope. So it is a default the author may replace,
+// and the assertion below is that their value survives.
 func TestTheOperatorsExecutorEnvBeatsTheCRs(t *testing.T) {
 	agent := a2aTestAgent()
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
@@ -5389,12 +5398,50 @@ func TestTheOperatorsExecutorEnvBeatsTheCRs(t *testing.T) {
 		t.Errorf("%s = %q; a CR that disarms its own sidecar has re-created the drift the single "+
 			"switch prevents", a2aCapabilityRequiredEnvVar, got)
 	}
-	if e := env["POD_NAMESPACE"]; e.Value != "" || e.ValueFrom == nil {
-		t.Errorf("POD_NAMESPACE = %+v; a literal from the CR is a scope that outlives the namespace "+
-			"it names, so the downward API has to win", e)
+	if e := env["POD_NAMESPACE"]; e.Value != "somewhere-else" || e.ValueFrom != nil {
+		t.Errorf("POD_NAMESPACE = %+v, want the CR's literal %q; the downward API is the default "+
+			"here, not an override -- the operator does not own this name, and overriding it "+
+			"controls nothing that A2A_AUTHORITY_SCOPE does not already leave open", e, "somewhere-else")
 	}
 	if got := env["BRIDGE_PROFILE"].Value; got != "mine" {
-		t.Errorf("BRIDGE_PROFILE = %q, want %q: the override is the two variables the operator owns, "+
+		t.Errorf("BRIDGE_PROFILE = %q, want %q: the override is the one variable the operator owns, "+
 			"not the container's environment", got, "mine")
+	}
+}
+
+// TestTheExecutorEnvIsNotSharedBetweenSidecars is the aliasing mergeEnvVars
+// invites: it returns one of its arguments by reference when the other is
+// empty, so a single hoisted owed-slice would leave every env-less sidecar
+// pointing at one backing array and one *EnvVarSource. Nothing mutates a
+// rendered container's env in place today, which is exactly why this would go
+// unnoticed until something did.
+func TestTheExecutorEnvIsNotSharedBetweenSidecars(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Sidecars: []corev1.Container{
+			{Name: "first", Image: "example.com/a:v1"},
+			{Name: "second", Image: "example.com/b:v1"},
+		},
+	}
+
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
+
+	sources := map[string]*corev1.EnvVarSource{}
+	for _, c := range pod.Spec.Containers {
+		if c.Name != "first" && c.Name != "second" {
+			continue
+		}
+		for i := range c.Env {
+			if c.Env[i].Name == "POD_NAMESPACE" {
+				sources[c.Name] = c.Env[i].ValueFrom
+			}
+		}
+	}
+	if len(sources) != 2 {
+		t.Fatalf("POD_NAMESPACE reached %d of the two sidecars; the precondition for this test is gone", len(sources))
+	}
+	if sources["first"] == sources["second"] {
+		t.Error("both sidecars share one *EnvVarSource for POD_NAMESPACE; build the owed env inside " +
+			"the loop, or the first in-place edit to one container's env reaches the other")
 	}
 }

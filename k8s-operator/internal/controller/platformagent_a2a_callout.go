@@ -304,26 +304,48 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 //
 // Rendered onto every CR-authored sidecar rather than onto one matched by name.
 // Matching `hermes-bridge` would make a renamed container silently take the
-// ENOENT path again, which is the failure this repairs; both variables are
-// inert in a container that does not read them.
+// ENOENT path again, which is the failure this repairs.
 //
-// This is the operator's value, not a default the CR may quietly replace, so it
-// is passed to mergeEnvVars as the override. An install that means to check the
-// bridge at a narrower scope than its pod says A2A_AUTHORITY_SCOPE, which
-// capabilityScope prefers over POD_NAMESPACE and this does not touch.
+// The two are NOT merged the same way, and the difference is the point.
+//
+// A2A_CAPABILITY_REQUIRED is the override: a CR that sets it on its own sidecar
+// has re-created exactly the half-armed drift the single switch exists to make
+// unreachable, so the operator's value wins. The name is private to this
+// product, so nothing else can be reading it for its own reasons.
+//
+// POD_NAMESPACE is a default: an explicit CR value wins. It is the most
+// conventional downward-API name in Kubernetes and plenty of off-the-shelf
+// containers read it, so clobbering it on every sidecar overrides user intent
+// on a name this product does not own. An earlier version of this function did
+// exactly that and justified it as "inert in a container that does not read
+// them", which is true of the switch and false of this one. Nor is the override
+// a control: capabilityScope prefers A2A_AUTHORITY_SCOPE over POD_NAMESPACE,
+// sidecar env is unscreened by the webhook on purpose (a2a/docs/hermes-bridge.md),
+// and so whoever writes the sidecar can already name any scope they like. The
+// override bought nothing and cost a silent clobber. The bridge sets neither
+// name, so it still takes the downward API and still gets the ENOENT repair.
 func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 	if len(containers) == 0 {
 		return containers
 	}
-	owed := []corev1.EnvVar{
-		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
-			FieldPath: "metadata.namespace",
-		}}},
-		{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
-	}
 	out := make([]corev1.Container, 0, len(containers))
 	for _, c := range containers {
-		c.Env = mergeEnvVars(c.Env, owed)
+		// Both built per container, not hoisted. mergeEnvVars returns one of
+		// its arguments by reference when the other is empty, so a hoisted
+		// slice would leave every sidecar with no env of its own sharing one
+		// backing array and one *EnvVarSource.
+		namespaceDefault := []corev1.EnvVar{
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.namespace",
+			}}},
+		}
+		switchOverride := []corev1.EnvVar{
+			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		}
+		// mergeEnvVars' second argument wins, so the nesting IS the
+		// precedence: the container's own env beats the namespace default,
+		// and the switch beats both.
+		c.Env = mergeEnvVars(mergeEnvVars(namespaceDefault, c.Env), switchOverride)
 		out = append(out, c)
 	}
 	return out
