@@ -609,16 +609,27 @@ func assertTheBusRefusedTheForgedAsk(t *testing.T, vl *violationLog, impersonate
 	if err != nil {
 		t.Fatalf("VerifySubject(%q): %v", impersonated, err)
 	}
-	// Each needle carries the `Subject "` nats-server prints, so a name that
-	// is a prefix of another principal's cannot satisfy the wrong one. The
-	// publish needle closes with the quote because the verify subject is
-	// whole; the subscribe needle closes with the dot that precedes the nuid
-	// ReplySubject appends per request, which is also why `reply` above cannot
-	// be compared for equality -- a second call would name a different
-	// subject.
-	want := map[string]bool{
-		`Subject "` + verify + `"`:                                false,
-		`Subject "` + capability.ReplyPrefix + impersonated + ".": false,
+	// Each needle is a pair: the direction nats-server names and the subject
+	// it names it for, both required on the same line. The subject half
+	// carries the `Subject "` the server prints, so a name that is a prefix
+	// of another principal's cannot satisfy the wrong one -- and it closes
+	// with the quote for publish, because the verify subject is whole, but
+	// with the dot that precedes the nuid ReplySubject appends per request
+	// for subscribe, which is also why `reply` above cannot be compared for
+	// equality: a second call would name a different subject.
+	//
+	// The direction half is what stops one refusal from satisfying both
+	// needles. Without it a publish violation on the reply subject -- which
+	// a client that subscribed fine and then misdirected its request would
+	// produce -- reads as proof that the subscribe was refused too.
+	// Matched as a separate substring rather than folded into one literal
+	// because the server moved the principal in and out of that position
+	// between v2.10 and v2.14; the direction word and the subject are stable,
+	// the text between them is not.
+	type needle struct{ direction, subject string }
+	want := map[needle]bool{
+		{"Publish Violation", `Subject "` + verify + `"`}:                                     false,
+		{"Subscription Violation", `Subject "` + capability.ReplyPrefix + impersonated + "."}: false,
 	}
 	var seen []string
 	deadline := time.After(5 * time.Second)
@@ -638,17 +649,17 @@ func assertTheBusRefusedTheForgedAsk(t *testing.T, vl *violationLog, impersonate
 			if !strings.Contains(line, "Violation") {
 				continue
 			}
-			for needle := range want {
-				if strings.Contains(line, needle) {
-					want[needle] = true
+			for n := range want {
+				if strings.Contains(line, n.direction) && strings.Contains(line, n.subject) {
+					want[n] = true
 				}
 			}
 		case <-deadline:
-			for needle, got := range want {
+			for n, got := range want {
 				if !got {
-					t.Errorf("the server logged no permissions violation matching %s: the forged ask was "+
+					t.Errorf("the server logged no %s naming %s: the forged ask was "+
 						"not refused by the bus, so the Check above failed for some other reason and "+
-						"proves nothing. Violations seen: %q", needle, seen)
+						"proves nothing. Violations seen: %q", n.direction, n.subject, seen)
 				}
 			}
 			return
