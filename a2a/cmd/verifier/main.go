@@ -50,6 +50,13 @@ const (
 
 	readyPort    = ":8080"
 	readyTimeout = 5 * time.Second
+
+	// drainTimeout bounds the wait for in-flight requests after SIGTERM. It
+	// sits under Kubernetes' default 30s termination grace period on
+	// purpose: past this the kubelet's SIGKILL is coming either way, and a
+	// bounded wait that logs is more useful than an unbounded one that gets
+	// killed mid-sentence. A verify round trip is a single KV read.
+	drainTimeout = 10 * time.Second
 )
 
 func main() { os.Exit(run()) }
@@ -93,8 +100,22 @@ func run() int {
 		Resolver: &capability.Resolver{Store: store},
 		Log:      log,
 	}
-	sub, err := svc.Subscribe(ctx, nc)
-	if err != nil {
+	// Handlers run under a context of their own, deliberately not the signal
+	// context. Every callback closes over whatever it is given, and the
+	// resolver's store reads take it: hand it the signal context and SIGTERM
+	// cancels it BEFORE the drain below, so each request still queued is
+	// answered by way of `context.Canceled` reaching Answer's fail-closed
+	// branch -- a refusal, sent to a broker that would read it as the
+	// capability being bad and reject a task that was fine. That is the exact
+	// outcome the drain exists to prevent, so the drain has to outlive the
+	// signal. handlerCancel runs after the drain has finished, not before.
+	handlerCtx, handlerCancel := context.WithCancel(context.Background())
+	defer handlerCancel()
+
+	// The handle is not kept: the shutdown below drains the whole connection
+	// rather than this one subscription, so there is nothing left to call on
+	// it.
+	if _, err := svc.Subscribe(handlerCtx, nc); err != nil {
 		log.Error("subscribe", "subject", capability.VerifySubscribe, "err", err)
 		return 1
 	}
@@ -107,9 +128,27 @@ func run() int {
 	// Drain rather than Unsubscribe: a request already in flight gets its
 	// answer, because the alternative is a broker reading the shutdown as a
 	// refusal and rejecting a task that was fine.
-	if err := sub.Drain(); err != nil {
+	//
+	// The connection drains, not just the subscription. sub.Drain() returns as
+	// soon as the drain is SCHEDULED, so on its own it races the deferred
+	// nc.Close() below and the answers it exists to deliver go out over a
+	// severed connection -- or do not go out at all. nc.Drain() walks the
+	// subscriptions, then flushes, then closes, and the closed handler is how
+	// a caller learns it finished. Waiting for that is the whole point.
+	drained := make(chan struct{})
+	nc.SetClosedHandler(func(*nats.Conn) { close(drained) })
+	if err := nc.Drain(); err != nil {
 		log.Warn("drain", "err", err)
 	}
+	select {
+	case <-drained:
+	case <-time.After(drainTimeout):
+		log.Warn("drain did not finish within the deadline; in-flight requests may be unanswered",
+			"timeout", drainTimeout)
+	}
+	// Only now: a handler still writing its reply needs its context live.
+	handlerCancel()
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), readyTimeout)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)

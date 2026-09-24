@@ -230,15 +230,42 @@ func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscript
 }
 
 // Serve subscribes and answers until ctx is done.
+//
+// The handlers get a context of their own rather than ctx, and the drain is
+// waited on rather than deferred. Both are the same correction, and
+// cmd/verifier/main.go carries the long version of why: ctx is a signal
+// context, so it is already cancelled by the time the drain runs, and handing
+// it to the callbacks turns every request still queued at shutdown into a
+// fail-closed refusal -- a broker rejecting a task that was fine. A deferred
+// sub.Drain() then makes it worse by returning as soon as the drain is
+// scheduled, so the answers race the caller's nc.Close().
 func (s *Service) Serve(ctx context.Context, nc *nats.Conn) error {
-	sub, err := s.Subscribe(ctx, nc)
+	handlerCtx, handlerCancel := context.WithCancel(context.Background())
+	defer handlerCancel()
+
+	sub, err := s.Subscribe(handlerCtx, nc)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = sub.Drain() }()
 	<-ctx.Done()
+	if err := sub.Drain(); err != nil {
+		return err
+	}
+	// Drain is scheduled, not done. The subscription goes invalid when it
+	// has finished, which is the only completion signal a subscription
+	// drain offers; cmd/verifier drains the whole connection instead and
+	// gets a closed handler for it.
+	deadline := time.Now().Add(drainWait)
+	for sub.IsValid() && time.Now().Before(deadline) {
+		time.Sleep(drainPoll)
+	}
 	return nil
 }
+
+const (
+	drainWait = 10 * time.Second
+	drainPoll = 5 * time.Millisecond
+)
 
 func (s *Service) handle(ctx context.Context, m *nats.Msg) {
 	caller, cerr := callerFromSubject(m.Subject)
