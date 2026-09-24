@@ -495,14 +495,17 @@ accepted limits, and they go to the downscoping design discussion together.
 KV scheme fixes that. Real tension with "structural, not behavioural."
 
 The bound that makes it survivable: a hop can only descend from a parent that named it, and every
-chain terminates at a root the gateway minted from the requester's own authority.
+chain terminates at a root the gateway minted for that one request.
 
 > **A broken hop cannot exceed what it was delegated for the request it is serving.** Worst case is
-> "narrowed less than intended", never "escalated past the human who asked."
+> "narrowed less than intended", never "widened past the root minted for this request."
 
-That is the sentence to have ready when someone probes the design, and it is worth knowing exactly
-what carries it: the two delegate rules above, a per-request principal both of them can name, and
-nothing else. The write half stops a hop descending from an origin it was never handed. The read
+That is the sentence to have ready when someone probes the design, and it is worth knowing both what
+carries it and what it does not say. It does not say "past the human who asked": the root is minted
+from the gateway's own install-wide tier and scope, the same pair for every requester, and nothing
+about who asked reaches the entry. §5's "the envelope has no requester field" below is the same fact
+stated from the other side. What carries what the bound does say: the two delegate rules above, a
+per-request principal both of them can name, and nothing else. The write half stops a hop descending from an origin it was never handed. The read
 half stops it presenting that origin directly. The principal is what makes "it" mean this request
 rather than this agent. It holds under imperfect implementation, which is the only kind there is,
 but it does not hold under a missing rule.
