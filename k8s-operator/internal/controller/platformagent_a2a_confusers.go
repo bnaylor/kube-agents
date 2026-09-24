@@ -125,6 +125,15 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 // whole subject space minus a few names -- the exact opposite of what writing
 // a deny means. Denying ">" is the stricter reading and the correct one: no
 // allow means nothing is allowed.
+//
+// The branch that added TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow wrote a
+// deny list without an allow and rendered nothing at all, which was the widest
+// of the readings rather than the narrowest. That hole is closed here by the
+// deny-of-">" above, but the test is kept: with no allow the principal's own
+// deny list is dropped on the floor, so a deny-without-allow is still an
+// authoring mistake, just no longer a security one. Refusing it at build time
+// says so where the author can see it. Every deny list in the identity table
+// is an operator-authored constant, so that test sees all of them.
 func renderA2APermission(indent, kind string, allow, deny []string) string {
 	if len(allow) == 0 {
 		return indent + kind + ` { deny = [">"] }` + "\n"
