@@ -38,12 +38,23 @@ func (g *gateStore) GetRevision(ctx context.Context, key string, rev uint64) ([]
 	case g.entered <- struct{}{}:
 	default:
 	}
+	// The context is checked on its own before the wait, and again after it.
+	// A single select over both channels is a coin flip whenever both are
+	// ready -- which is exactly the shape the cancelled-context control sets
+	// up -- and it made that control report "the fake is not honouring its
+	// context" about half the runs.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case <-g.release:
-		return g.inner.GetRevision(ctx, key, rev)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return g.inner.GetRevision(ctx, key, rev)
 }
 
 func drainTestServer(t *testing.T) string {
@@ -123,20 +134,25 @@ func TestAnInFlightRequestIsAnsweredAcrossADrain(t *testing.T) {
 		t.Fatal("the handler never reached the store; the test never set up the race it is about")
 	}
 
-	drained := make(chan struct{})
-	verifierConn.SetClosedHandler(func(*nats.Conn) { close(drained) })
-	if err := verifierConn.Drain(); err != nil {
-		t.Fatalf("drain: %v", err)
-	}
-	close(gate.release)
+	// The store read is released once the drain is under way, not before:
+	// released first, the handler could finish ahead of the drain and the
+	// test would pass without ever putting a request in the window it is
+	// about.
+	go func() {
+		for !verifierConn.IsDraining() && !verifierConn.IsClosed() {
+			time.Sleep(time.Millisecond)
+		}
+		close(gate.release)
+	}()
 
-	select {
-	case <-drained:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the connection never finished draining")
+	// The shipping shutdown, called rather than restated. An earlier version
+	// of this test open-coded the drain and the cancel here, which meant
+	// reordering them in cmd/verifier -- the defect this file exists for --
+	// left every assertion green.
+	DrainAndCancel(nil, verifierConn, handlerCancel, 10*time.Second)
+	if !verifierConn.IsClosed() {
+		t.Fatal("DrainAndCancel returned with the connection still open; it did not wait for the drain")
 	}
-	// Only now, which is the ordering the whole fix is.
-	handlerCancel()
 
 	m, err := replySub.NextMsg(5 * time.Second)
 	if err != nil {
