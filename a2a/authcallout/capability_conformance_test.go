@@ -264,7 +264,7 @@ func TestACapabilityWriterCannotWriteOutsideItsOwnNamespace(t *testing.T) {
 // mechanism still works end to end — the gateway mints, the verifier reads,
 // the session asks and is answered, and the answer is right.
 func TestTheShippedGrantsLetTheVerifierWorkAndNobodyElse(t *testing.T) {
-	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	h, vl := startHarnessWithServerLogMap(t, capMap(t), capTokens())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -350,6 +350,9 @@ func TestTheShippedGrantsLetTheVerifierWorkAndNobodyElse(t *testing.T) {
 		capability.NamespaceScope("kubeagents-system")); err == nil {
 		t.Fatal("podB asked the verifier a question in podA's name and was answered")
 	}
+	// And it was the bus that refused it, rather than the request going
+	// unanswered for any of the other reasons a Check can fail.
+	assertTheBusRefusedTheForgedAsk(t, vl, podA)
 }
 
 // startHarnessWithServerLogMap is startHarnessWithServerLog with the map and
@@ -456,7 +459,7 @@ func TestTheWebCredentialCannotReachTheVerifyPlane(t *testing.T) {
 // keeps the verifier's subject-derived caller identity from being a
 // self-assertion.
 func TestTheBridgeVerifiesOverItsShippedGrants(t *testing.T) {
-	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	h, vl := startHarnessWithServerLogMap(t, capMap(t), capTokens())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -520,9 +523,14 @@ func TestTheBridgeVerifiesOverItsShippedGrants(t *testing.T) {
 		t.Error("the bridge used a capability minted for a session pod")
 	}
 
-	// And it cannot ask in that pod's name. The server holds the grant to
-	// one subject, so this is a permissions violation rather than a
-	// verifier refusal -- the request never leaves the client.
+	// And it cannot ask in that pod's name. This is a permissions violation
+	// rather than a verifier refusal, and the difference is where the
+	// evidence lives: the request DOES leave the client -- PublishRequest
+	// queues the line and returns nil -- and is dropped at the server, which
+	// logs the violation and tells the caller nothing. So the Check below
+	// fails by timing out, which is also how it would fail if the verifier
+	// were simply not running, and the server log is the only place the two
+	// are distinguishable.
 	forged, err := capability.NewClient(bridge, podA)
 	if err != nil {
 		t.Fatalf("NewClient(bridge-as-podA): %v", err)
@@ -533,6 +541,7 @@ func TestTheBridgeVerifiesOverItsShippedGrants(t *testing.T) {
 		capability.NamespaceScope("kubeagents-system")); err == nil {
 		t.Fatal("the bridge asked the verifier a question in a session pod's name and was answered")
 	}
+	assertTheBusRefusedTheForgedAsk(t, vl, podA)
 
 	// A scope outside the pod's own namespace, refused: the executor is
 	// checked at where it runs, not merely at whether it holds anything.
@@ -571,5 +580,78 @@ func queueSubscribeRefused(t *testing.T, nc *nats.Conn, violations chan error, s
 		return true
 	case <-time.After(500 * time.Millisecond):
 		return false
+	}
+}
+
+// assertTheBusRefusedTheForgedAsk is the evidence half of "podB cannot ask in
+// podA's name", and it exists because the client-side half of that claim is
+// unfalsifiable on its own.
+//
+// Check returns a non-nil error for every reason there is -- refused by the
+// verifier, malformed answer, verifier down, verifier never started, harness
+// misconfigured, subject misspelled. Asserting `err != nil` after a 2s deadline
+// therefore passes whether the bus refused the impersonation or the test simply
+// asked a question nobody was listening for. The two are indistinguishable from
+// the caller, on purpose: NATS reports a permissions violation to the SERVER
+// log and to the connection's async error handler, never as an error from
+// SubscribeSync or PublishRequest, both of which return nil after queueing a
+// protocol line. The request is dropped at the server, so the caller's only
+// observation is silence, and silence is what a broken test looks like too.
+//
+// Two violations, not one, because Check touches two subjects and the grants
+// deny both: it subscribes the reply subject before it publishes the request.
+// Requiring both is what distinguishes a refusal from a race -- a client that
+// died before publishing would produce only the first.
+func assertTheBusRefusedTheForgedAsk(t *testing.T, vl *violationLog, impersonated string) {
+	t.Helper()
+
+	verify, err := capability.VerifySubject(impersonated)
+	if err != nil {
+		t.Fatalf("VerifySubject(%q): %v", impersonated, err)
+	}
+	// Each needle carries the `Subject "` nats-server prints, so a name that
+	// is a prefix of another principal's cannot satisfy the wrong one. The
+	// publish needle closes with the quote because the verify subject is
+	// whole; the subscribe needle closes with the dot that precedes the nuid
+	// ReplySubject appends per request, which is also why `reply` above cannot
+	// be compared for equality -- a second call would name a different
+	// subject.
+	want := map[string]bool{
+		`Subject "` + verify + `"`:                                false,
+		`Subject "` + capability.ReplyPrefix + impersonated + ".": false,
+	}
+	var seen []string
+	deadline := time.After(5 * time.Second)
+	for {
+		outstanding := 0
+		for _, got := range want {
+			if !got {
+				outstanding++
+			}
+		}
+		if outstanding == 0 {
+			return
+		}
+		select {
+		case line := <-vl.lines:
+			seen = append(seen, line)
+			if !strings.Contains(line, "Violation") {
+				continue
+			}
+			for needle := range want {
+				if strings.Contains(line, needle) {
+					want[needle] = true
+				}
+			}
+		case <-deadline:
+			for needle, got := range want {
+				if !got {
+					t.Errorf("the server logged no permissions violation matching %s: the forged ask was "+
+						"not refused by the bus, so the Check above failed for some other reason and "+
+						"proves nothing. Violations seen: %q", needle, seen)
+				}
+			}
+			return
+		}
 	}
 }
