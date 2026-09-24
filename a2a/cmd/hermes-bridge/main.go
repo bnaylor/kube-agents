@@ -64,13 +64,21 @@ const (
 	defaultKVBucket            = "runtime-state"
 
 	// saNamespaceFile is the kubelet's projection of the pod's own
-	// namespace. The bridge needs the namespace to build the scope it is
-	// checked at, and unlike every other A2A workload it cannot be handed
-	// POD_NAMESPACE by the operator: it is deployed through the CR's
-	// spec.deployment.sidecars (a2a/docs/hermes-bridge.md), which is a
-	// user-written container the operator copies verbatim. A file the
-	// kubelet always mounts is the one source that does not depend on
-	// whoever wrote that YAML remembering a variable.
+	// namespace, and it is capabilityScope's LAST rung rather than its
+	// reliable one. This comment used to argue the opposite -- that the
+	// bridge ships through spec.deployment.sidecars, a container the
+	// operator copies verbatim, so a file the kubelet always mounts beats
+	// any variable someone has to remember. Both halves were wrong. The
+	// operator does not copy the sidecar verbatim: a2aExecutorSidecarEnv
+	// renders POD_NAMESPACE onto it from the downward API. And the kubelet
+	// does not always mount this file: buildPodTemplateSpec sets
+	// AutomountServiceAccountToken false, so on a rendered install the
+	// read is ENOENT and the scope would resolve empty -- which is the
+	// failure the render exists to repair, not a fallback.
+	//
+	// Kept anyway, for a bridge run outside the operator's render (by hand,
+	// or in a test rig) where the token IS mounted. That is the only place
+	// it can succeed.
 	saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 )
 
