@@ -125,29 +125,11 @@ func run() int {
 	srv := serveReady(log, nc)
 
 	<-ctx.Done()
-	// Drain rather than Unsubscribe: a request already in flight gets its
-	// answer, because the alternative is a broker reading the shutdown as a
-	// refusal and rejecting a task that was fine.
-	//
-	// The connection drains, not just the subscription. sub.Drain() returns as
-	// soon as the drain is SCHEDULED, so on its own it races the deferred
-	// nc.Close() below and the answers it exists to deliver go out over a
-	// severed connection -- or do not go out at all. nc.Drain() walks the
-	// subscriptions, then flushes, then closes, and the closed handler is how
-	// a caller learns it finished. Waiting for that is the whole point.
-	drained := make(chan struct{})
-	nc.SetClosedHandler(func(*nats.Conn) { close(drained) })
-	if err := nc.Drain(); err != nil {
-		log.Warn("drain", "err", err)
-	}
-	select {
-	case <-drained:
-	case <-time.After(drainTimeout):
-		log.Warn("drain did not finish within the deadline; in-flight requests may be unanswered",
-			"timeout", drainTimeout)
-	}
-	// Only now: a handler still writing its reply needs its context live.
-	handlerCancel()
+	// Drain rather than Unsubscribe, wait for the drain rather than defer it,
+	// and cancel the handlers only after. capability.DrainAndCancel carries
+	// the three reasons; it is there rather than here so the ordering is
+	// pinned by a test against the code that runs.
+	capability.DrainAndCancel(log, nc, handlerCancel, drainTimeout)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), readyTimeout)
 	defer cancel()

@@ -211,10 +211,11 @@ func clip(s string) string {
 }
 
 // Subscribe starts answering and returns as soon as the subscription is
-// established on the server. Callers that want to block should use Serve;
-// this exists so a caller can know the verifier is listening before it lets
-// anything ask, because a request that races the subscription is answered by
-// the client's timeout, and the client reads a timeout as a denial.
+// established on the server. It exists in this shape so a caller can know the
+// verifier is listening before it lets anything ask: a request that races the
+// subscription is answered by the client's timeout, and the client reads a
+// timeout as a denial. Pair it with DrainAndCancel at shutdown; the context
+// handed here is the one that ordering is about.
 func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscription, error) {
 	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
 		s.handle(ctx, m)
@@ -229,43 +230,46 @@ func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscript
 	return sub, nil
 }
 
-// Serve subscribes and answers until ctx is done.
+// DrainAndCancel is the verifier's shutdown, and it lives here rather than
+// inline in cmd/verifier so the ordering is pinned by a test on the thing that
+// ships instead of by a test that restates it.
 //
-// The handlers get a context of their own rather than ctx, and the drain is
-// waited on rather than deferred. Both are the same correction, and
-// cmd/verifier/main.go carries the long version of why: ctx is a signal
-// context, so it is already cancelled by the time the drain runs, and handing
-// it to the callbacks turns every request still queued at shutdown into a
-// fail-closed refusal -- a broker rejecting a task that was fine. A deferred
-// sub.Drain() then makes it worse by returning as soon as the drain is
-// scheduled, so the answers race the caller's nc.Close().
-func (s *Service) Serve(ctx context.Context, nc *nats.Conn) error {
-	handlerCtx, handlerCancel := context.WithCancel(context.Background())
-	defer handlerCancel()
-
-	sub, err := s.Subscribe(handlerCtx, nc)
-	if err != nil {
-		return err
+// Two orderings, one of which is silently wrong. Every path into the resolver
+// takes a context; cancel the handlers' context before the drain and each
+// request still queued is answered through Answer's fail-closed branch --
+// `allowed: false`, which a broker reads as the capability being bad and uses
+// to reject a task nothing was wrong with. "This process is going away" and
+// "the store is unreachable" arrive as the same error, and the fail-closed
+// branch cannot tell them apart. So the drain has to outlive the signal, and
+// handlerCancel runs after it, never before.
+//
+// The whole connection drains, not one subscription: sub.Drain() returns as
+// soon as the drain is SCHEDULED, so it races the caller's nc.Close() and the
+// answers it exists to deliver go out over a severed connection or not at all.
+// nc.Drain() walks the subscriptions, flushes, then closes, and the closed
+// handler is how a caller learns it finished. Waiting for that is the point.
+//
+// A Drain() error is logged and the wait still runs. Returning there would
+// cancel the handlers immediately -- the exact defect above, in the one path
+// where the drain has already gone wrong and in-flight answers most need the
+// time.
+func DrainAndCancel(log *slog.Logger, nc *nats.Conn, handlerCancel context.CancelFunc, timeout time.Duration) {
+	drained := make(chan struct{})
+	nc.SetClosedHandler(func(*nats.Conn) { close(drained) })
+	if err := nc.Drain(); err != nil && log != nil {
+		log.Warn("drain", "err", err)
 	}
-	<-ctx.Done()
-	if err := sub.Drain(); err != nil {
-		return err
+	select {
+	case <-drained:
+	case <-time.After(timeout):
+		if log != nil {
+			log.Warn("drain did not finish within the deadline; in-flight requests may be unanswered",
+				"timeout", timeout)
+		}
 	}
-	// Drain is scheduled, not done. The subscription goes invalid when it
-	// has finished, which is the only completion signal a subscription
-	// drain offers; cmd/verifier drains the whole connection instead and
-	// gets a closed handler for it.
-	deadline := time.Now().Add(drainWait)
-	for sub.IsValid() && time.Now().Before(deadline) {
-		time.Sleep(drainPoll)
-	}
-	return nil
+	// Only now: a handler still writing its reply needs its context live.
+	handlerCancel()
 }
-
-const (
-	drainWait = 10 * time.Second
-	drainPoll = 5 * time.Millisecond
-)
 
 func (s *Service) handle(ctx context.Context, m *nats.Msg) {
 	caller, cerr := callerFromSubject(m.Subject)
