@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"net"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -155,10 +157,22 @@ func TestTheVerifierFenceAllowsOnlyDNSAndTheBus(t *testing.T) {
 		t.Fatalf("the verifier fence has %d egress rules, want exactly 2 (DNS, bus).\n"+
 			"A third destination is a new way for a compromised verifier to carry what it read out of the cluster.", len(np.Spec.Egress))
 	}
-	for _, rule := range np.Spec.Egress {
+	// Ports and peers, together. A rule is a port set AND a peer set, and
+	// neither half bounds the other: an empty To on a NetworkPolicyEgressRule
+	// is not "no destinations", it is every destination, so a rule checked on
+	// its ports alone is checked on half of what it grants. The count above
+	// does not close that either -- dropping To from the bus rule leaves two
+	// rules on the same two ports and opens TCP 4222 to every address the
+	// cluster can route, in-cluster and out.
+	//
+	// By position, because the two rules are not interchangeable. The peer set
+	// that is right for DNS (kube-system resolvers plus two host routes) is
+	// wrong for the bus, so a loop asserting "each rule has some peer" would
+	// pass on a bus rule pointed at kube-dns.
+	for i, rule := range np.Spec.Egress {
 		for _, p := range rule.Ports {
 			if p.Port == nil {
-				t.Error("an egress rule allows every port")
+				t.Errorf("egress rule %d allows every port", i)
 				continue
 			}
 			switch int32(p.Port.IntValue()) {
@@ -167,6 +181,58 @@ func TestTheVerifierFenceAllowsOnlyDNSAndTheBus(t *testing.T) {
 				t.Errorf("the verifier may egress to port %d; only DNS and the bus belong here", p.Port.IntValue())
 			}
 		}
+		if len(rule.To) == 0 {
+			t.Errorf("egress rule %d has no peer: its ports are open to every destination the cluster can route", i)
+		}
+	}
+
+	// Rule 1, DNS. Port 53 to an unbounded destination is a tunnel rather than
+	// name resolution, so every peer here has to be a named resolver or a host
+	// route -- a /32 or /128, never a range, and never widened by an except
+	// block. clusterDNSPeers is shared with the session fence, which is why
+	// this reads its output rather than restating it: what is asserted is the
+	// shape a peer list has to keep, not the list.
+	dns := np.Spec.Egress[0]
+	if len(dns.Ports) != 2 {
+		t.Errorf("DNS rule ports = %+v, want udp+tcp 53", dns.Ports)
+	}
+	if !reflect.DeepEqual(dns.To, clusterDNSPeers([]string{"10.0.0.10"})) {
+		t.Errorf("the DNS rule no longer carries the cluster resolver peers: %+v", dns.To)
+	}
+	for _, peer := range dns.To {
+		if peer.IPBlock == nil {
+			if peer.PodSelector == nil || peer.NamespaceSelector == nil {
+				t.Errorf("DNS peer %+v selects pods without bounding the namespace, or the other way round", peer)
+			}
+			continue
+		}
+		if _, network, err := net.ParseCIDR(peer.IPBlock.CIDR); err != nil {
+			t.Errorf("DNS peer %q is not a CIDR", peer.IPBlock.CIDR)
+		} else if ones, bits := network.Mask.Size(); ones != bits {
+			t.Errorf("DNS peer %q is a range, not a host: port 53 to a range is a tunnel", peer.IPBlock.CIDR)
+		}
+		if len(peer.IPBlock.Except) != 0 {
+			t.Errorf("DNS peer %q carries an except block, which only ever widens a host route", peer.IPBlock.CIDR)
+		}
+	}
+
+	// Rule 2, the bus. One peer, selected by label in this agent's own
+	// namespace -- not an IPBlock, because a pod IP does not survive a restart
+	// and a fence pinned to one stops matching without failing. The
+	// NamespaceSelector is load-bearing rather than decorative: a bare
+	// PodSelector would match `nats` pods in EVERY namespace, which on a
+	// multi-tenant cluster is egress to another tenant's bus.
+	bus := np.Spec.Egress[1]
+	if len(bus.Ports) != 1 || bus.Ports[0].Port.IntValue() != int(a2aNATSClientPort) ||
+		bus.Ports[0].Protocol == nil || *bus.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("bus rule is not exactly TCP %d: %+v", a2aNATSClientPort, bus.Ports)
+	}
+	wantBus := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, map[string]string{
+		labelPartOf:       a2aPartOf,
+		a2aComponentLabel: "nats",
+	})}
+	if !reflect.DeepEqual(bus.To, wantBus) {
+		t.Errorf("bus peer = %+v, want the nats pods in %s only", bus.To, agent.Namespace)
 	}
 }
 
