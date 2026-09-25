@@ -200,6 +200,13 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 								corev1.ResourceMemory: resource.MustParse("64Mi"),
 							},
 							Limits: corev1.ResourceList{
+								// A cpu limit as well as a memory one: a namespace
+								// whose ResourceQuota sets limits.cpu refuses a pod
+								// that omits it at admission, and a verifier that
+								// never comes up means every executor refuses every
+								// task. Matches the callout, which is the same shape
+								// of request-reply service.
+								corev1.ResourceCPU:    resource.MustParse("500m"),
 								corev1.ResourceMemory: resource.MustParse("256Mi"),
 							},
 						},
@@ -268,7 +275,7 @@ func buildA2AVerifierNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 // identity first, because the Deployment mounts a token for it and a pod that
 // names a missing ServiceAccount is rejected at admission.
 // Its fence is not applied here: it rides the shared NetworkPolicy loop in
-// reconcileA2ANext with the bus and session fences, so all three appear and
+// reconcileA2ANetworkFences with the bus and session fences, so all three appear and
 // disappear with the stack they fence, including through the skew freeze.
 func (r *PlatformAgentReconciler) reconcileA2AVerifier(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	owned := []client.Object{
