@@ -36,6 +36,42 @@ set -euo pipefail
 # env allowlist letting it through to the container.
 readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 
+# The kanban board's worker cap on the eval install. The image ships
+# kanban.max_in_progress: 2 (agents/chat/config.yaml), a floor for an install
+# that has not measured its own worker footprint, and the operator renders a
+# different cap only when the CR carries spec.harness.tuning.maxInProgress.
+# The eval fans its units out at EVAL_TASK_PARALLELISM (4 on a pull request,
+# 8 on the nightly since oss-test-infra#2707), and nearly every unit's
+# opening turn delegates one platform card, so on the image default most
+# lanes queue behind two slots: a queued card waits out the cards ahead of
+# it and then runs its own 10-45 minutes, past the 2700-3000s delegation
+# ceiling with no worker at fault, while the dispatcher logs the same "ready
+# queue non-empty ... 0 workers spawned" warning a wedged worker produces
+# (#1879, #1880). This bounds the queueing share of what remained after
+# their fixes (#2032); the same nightly also had workers wedged for a whole
+# delegation by the v2026.9.14 base's approval-regex hang on large terminal
+# commands, a separate holder of the same slots that the Hermes bump removes.
+#
+# Five, not the lane count. The cap bounds ACTIVE workers, and a coordinator
+# waiting on the children it fanned out gives its slot back but stays
+# resident (deploy/docker/patches/kanban_scheduling.py, Part 4), so the
+# process count is the cap plus the waiting coordinators. The gateway
+# container's 8Gi memory limit (resolveResources in
+# k8s-operator/internal/controller/manifest_helpers.go) was sized for five
+# concurrent workers over a 1.8GiB idle set, and a worker the cgroup OOM
+# killer takes strands its card with no restart and no event: the same shape
+# as the queue this removes, indistinguishable from it in the run record. So
+# the cap stops where the sizing stops: five covers the pull request's four
+# lanes with one slot for a fan-out child, and the nightly's eight lanes
+# still queue three deep until the working set at five is measured and the
+# eval install's memory limit is raised together with the cap (the CR patch
+# hack/kind-up.sh makes after helm is the shape; #2032 carries the
+# measurement). Set on this install only, so the production default stays
+# where the CRD reference argues it should. tests/test_ci_deploy_kanban_cap.py
+# pins the flag, the floor under the pull request's lanes, the ceiling the
+# memory limit was sized for, and the chart rendering the value onto the CR.
+readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
+
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
 # (`owner=helm` plus `name=<release>`), selecting every revision's record of
@@ -784,6 +820,9 @@ SANDBOX_KEY_DIR="$(umask 077 && mktemp -d)"
 ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}" \
   -f "${SANDBOX_KEY_DIR}/id_sandbox"
 
+# Named in the build log so a run's dispatcher behaviour can be read against
+# the cap it was given without opening the rendered CR.
+echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
 helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --namespace "${NAMESPACE}" --create-namespace \
   "${IMAGE_ARGS[@]}" \
@@ -802,6 +841,7 @@ helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
   --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
+  --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
   --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
   --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
   ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
