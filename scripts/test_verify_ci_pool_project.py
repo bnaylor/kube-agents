@@ -1482,7 +1482,7 @@ class TokenMinterTest(unittest.TestCase):
         )
 
     def _key_policy(self, members=None):
-        members = [f"serviceAccount:{self._GSA}"] if members is None else members
+        members = [f"serviceAccount:{self._GSA}", checker.PULL_SWEEP_MEMBER] if members is None else members
         return json.dumps({"bindings": [{"role": "roles/cloudkms.signerVerifier", "members": members}]})
 
     def _gsa_policy(self, member=None):
@@ -1520,7 +1520,7 @@ class TokenMinterTest(unittest.TestCase):
         # thing. Nothing was verified here, so the first half is absent.
         self.assertEqual(
             "the imported key versions, the key's purpose, algorithm and import-only setting, "
-            "the minter GSA's signing rights, the minter GSA's Workload Identity binding "
+            "the minter GSA's and the sweeper's signing rights, the minter GSA's Workload Identity binding "
             "not checked",
             result.message,
         )
@@ -1585,6 +1585,36 @@ class TokenMinterTest(unittest.TestCase):
         result = self._run(key_policy=_ok(self._key_policy(members=[])))
         self.assertFalse(result.passed)
         self.assertTrue(any("signerVerifier" in d for d in result.details), result.details)
+
+    def test_missing_pull_sweep_signer_fails_and_names_the_one_off_grant(self):
+        # A project registered before the sweep existed has the minter's grant
+        # and not the sweeper's. Re-running the provisioning script is the
+        # wrong repair on a registered project, so the detail carries the
+        # single gcloud command that adds the binding.
+        result = self._run(key_policy=_ok(self._key_policy(members=[f"serviceAccount:{self._GSA}"])))
+        self.assertFalse(result.passed)
+        sweep = [d for d in result.details if "pull-request sweep" in d]
+        self.assertEqual(len(sweep), 1, result.details)
+        self.assertIn("gcloud kms keys add-iam-policy-binding github-token-minter-key", sweep[0])
+        self.assertIn(f"--member={checker.PULL_SWEEP_MEMBER}", sweep[0])
+        # The headline names the one missing thing; "not provisioned / PEM
+        # missing" would send the operator to the key and the PEM instead.
+        self.assertEqual(result.message, "Minter provisioned; the pull-request sweeper lacks signer on the key (the detail has the one-off grant)")
+        self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
+        # With the minter's own grant missing too, the minter headline stands.
+        both = self._run(key_policy=_ok(self._key_policy(members=[])))
+        self.assertEqual(both.message, "Token minter not provisioned / PEM key missing or wrong")
+        # A denied read leaves details empty and the item unchecked: the
+        # headline must not call the minter provisioned over reads it skipped.
+        denied = _fail("ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission denied on resource")
+        unread = self._run(versions=denied, key=denied, key_policy=_ok(self._key_policy(members=[f"serviceAccount:{self._GSA}"])))
+        self.assertFalse(unread.passed)
+        self.assertNotIn("Minter provisioned", unread.message)
+        self.assertTrue(unread.message.startswith("The pull-request sweeper lacks signer on the key"), unread.message)
+        self.assertIn("the imported key versions, the key's purpose, algorithm and import-only setting not checked", unread.message)
+        # And it does not call the sweeper's rights verified in the same breath.
+        self.assertIn("the minter GSA's signing rights, the minter GSA's Workload Identity binding verified", unread.message)
+        self.assertNotIn("sweeper's signing rights", unread.message)
 
     def test_missing_minter_gsa_fails(self):
         result = self._run(gsa_policy=_fail("NOT_FOUND"))

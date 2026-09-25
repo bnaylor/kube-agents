@@ -224,6 +224,15 @@ PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gse
 # holding no role there at all (gke-labs/kube-agents#1491).
 NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 
+# The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
+# ci-kube-agents-pull-sweep on main) signs the agent's App through each
+# project's copy of the key, so it needs signer on that key and nothing on the
+# project. A project without the grant fails every ten-minute sweep from the
+# first, so the check names the one command that adds it -- the provisioning
+# script must not be re-run on a registered project (docs/ci-pool-projects.md
+# section 8).
+PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
 # as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
 # project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
@@ -1938,6 +1947,9 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     status is one of {"ok", "failed", "unverified"}, and the token is only ever
     returned, never logged: it is a live credential for every repository in the
     installation.
+
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    pins, whatever the App is granted.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -2304,6 +2316,7 @@ def check_token_minter(
     versions_checked = False
     key_checked = False
     signer_checked = False
+    sweeper_missing = False
     gsa_checked = False
 
     # Which version matters is the chart's business, not KMS's. The pool
@@ -2425,8 +2438,8 @@ def check_token_minter(
         if not _record_unreadable(
             err,
             f"Failed reading IAM policy for KMS key {key}: {err.strip()[:160]}",
-            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's signing rights were "
-            "not checked",
+            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's and the pull-request "
+            "sweeper's signing rights were not checked",
             details,
             warnings,
         ):
@@ -2441,6 +2454,15 @@ def check_token_minter(
             if f"serviceAccount:{minter_gsa}" not in signers:
                 passed = False
                 details.append(f"{minter_gsa} lacks roles/cloudkms.signerVerifier on {key}; it cannot sign a JWT")
+            if PULL_SWEEP_MEMBER not in signers:
+                passed = False
+                sweeper_missing = True
+                details.append(
+                    f"{PULL_SWEEP_MEMBER} lacks roles/cloudkms.signerVerifier on {key}; the pull-request "
+                    "sweep cannot sign here. Grant it without re-running the provisioning script: "
+                    f"gcloud kms keys add-iam-policy-binding {key} --keyring={keyring} --location={location} "
+                    f"--project={project_id} --member={PULL_SWEEP_MEMBER} --role=roles/cloudkms.signerVerifier"
+                )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing KMS key IAM policy: {exc}")
@@ -2535,12 +2557,33 @@ def check_token_minter(
         [
             ("the imported key versions", versions_checked),
             ("the key's purpose, algorithm and import-only setting", key_checked),
-            ("the minter GSA's signing rights", signer_checked),
+            ("the minter GSA's and the sweeper's signing rights", signer_checked),
             ("the minter GSA's Workload Identity binding", gsa_checked),
         ]
     )
     signing_version = f" v{probe_version}" if probe_version else ""
-    if not passed:
+    if not passed and sweeper_missing and len(details) == 1:
+        # The one failed item is the grant a project registered before the
+        # sweep existed never got (5.5). The headline says so, or an operator
+        # scanning it goes looking at the PEM -- and it calls the minter whole
+        # only when every read that would say so happened; a denied read
+        # leaves `details` empty and `partial` naming what went unchecked.
+        sweeper = "the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
+        if not partial:
+            message = f"Minter provisioned; {sweeper}"
+        else:
+            # The signer row is the minter's alone here: the sweeper's half of
+            # it is the failure, and cannot sit in the "verified" list.
+            rest = _partial_summary(
+                [
+                    ("the imported key versions", versions_checked),
+                    ("the key's purpose, algorithm and import-only setting", key_checked),
+                    ("the minter GSA's signing rights", signer_checked),
+                    ("the minter GSA's Workload Identity binding", gsa_checked),
+                ]
+            )
+            message = f"{sweeper[0].upper()}{sweeper[1:]}; {rest}"
+    elif not passed:
         message = "Token minter not provisioned / PEM key missing or wrong"
     elif partial:
         message = partial
