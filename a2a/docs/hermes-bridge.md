@@ -53,8 +53,10 @@ known-working concurrency story. Cap is 2, matching the platform profile's `conc
 
 Two properties of riding `spec.deployment.sidecars`. Neither is fixed, for the same
 reason in both cases: screening a user-supplied container means overriding user intent,
-and the operator does that only where it owns the meaning of the field - the two
-capability env names above, and the reserved volume names the webhook refuses.
+and the operator does that only where it owns the meaning of the field - the capability
+switch above, and the reserved volume names the webhook refuses. `POD_NAMESPACE` is the
+other name the render writes, but it goes in as a default a CR beats, so it overrides
+nothing.
 
 **Flipping to `mode: today` with the sidecar still set takes the agent down.** The
 operator copies `spec.deployment.sidecars` into the pod without consulting the mode, so

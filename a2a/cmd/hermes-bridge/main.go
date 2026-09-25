@@ -70,7 +70,9 @@ const (
 	// operator copies verbatim, so a file the kubelet always mounts beats
 	// any variable someone has to remember. Both halves were wrong. The
 	// operator does not copy the sidecar verbatim: a2aExecutorSidecarEnv
-	// renders POD_NAMESPACE onto it from the downward API. And the kubelet
+	// supplies POD_NAMESPACE from the downward API as a default under the
+	// sidecar's own env (a CR that sets it deliberately still wins, but a
+	// sidecar author who says nothing gets a value). And the kubelet
 	// does not always mount this file: buildPodTemplateSpec sets
 	// AutomountServiceAccountToken false, so on a rendered install the
 	// read is ENOENT and the scope would resolve empty -- which is the
@@ -171,9 +173,10 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 // takes one: an install whose gateway was given a narrower ceiling has to be
 // able to say so here too.
 //
-// POD_NAMESPACE is what a rendered install actually takes. The operator sets
-// it from the downward API on every sidecar it renders (a2aExecutorSidecarEnv,
-// k8s-operator/internal/controller/platformagent_a2a_callout.go), because the
+// POD_NAMESPACE is what a rendered install actually takes. The operator supplies
+// it from the downward API under every sidecar it renders (a2aExecutorSidecarEnv,
+// k8s-operator/internal/controller/platformagent_a2a_callout.go) -- as a default,
+// so a CR that sets the name deliberately still wins -- because the
 // third rung below cannot resolve in this pod: buildPodTemplateSpec sets
 // AutomountServiceAccountToken false, so the kubelet projects no serviceaccount
 // directory and the read returns ENOENT. That was not a gap in coverage, it was

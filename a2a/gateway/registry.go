@@ -77,7 +77,9 @@ type SessionRecord struct {
 	Tasks []TaskRef `json:"tasks,omitempty"`
 }
 
-// TaskRef names one historical task and the addressee it ran under.
+// TaskRef names one historical task and the authority it ran under: the
+// addressee, the correlation id that threads its envelopes, and the
+// capability it was minted with. A cancel is rebuilt from these.
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
