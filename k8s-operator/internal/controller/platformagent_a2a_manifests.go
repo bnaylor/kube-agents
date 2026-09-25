@@ -3001,7 +3001,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// what the script's gate compares a live stream
 				// against; the recreate width is what a fresh render
 				// creates, which floors at the cap TASKS shipped with,
-				// so a default install needs 46 and recreates at 64.
+				// so a default install needs 62 and recreates at 64.
 				// The third — what the live stream actually holds — is
 				// on the bus, and it is the one the maxSessions that
 				// fits is derived from, so that half of the remedy
