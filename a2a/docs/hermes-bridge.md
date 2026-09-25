@@ -34,12 +34,15 @@ volume, runs as the pod's KSA (model auth via Workload Identity for free), and g
 
 **Two names are the exception, and they are the operator's.** Under the A2A surface the
 render writes `POD_NAMESPACE` and `A2A_CAPABILITY_REQUIRED` onto every sidecar it emits
-(`a2aExecutorSidecarEnv`), passing them to `mergeEnvVars` as the override, so a CR value
-for either name is discarded on every reconcile. Both are inputs to the capability check below rather than
-deployment preferences - see "What scope the check runs at" for why the first one cannot
-be left to the CR author, and for what a default install did before the operator supplied
-it. This paragraph used to say the bridge needed no operator code at all; it needs exactly
-this much.
+(`a2aExecutorSidecarEnv`), but not with the same precedence.
+`A2A_CAPABILITY_REQUIRED` goes to `mergeEnvVars` as the override, so a CR value for it is
+discarded on every reconcile: the switch is the install's, not the sidecar author's.
+`POD_NAMESPACE` goes in underneath the container's own env, as a default, so a CR that
+sets it deliberately wins. Both are inputs to the capability check below rather than
+deployment preferences - see "What scope the check runs at" for why the render has to
+supply `POD_NAMESPACE` at all, and for what a default install did before it did. This
+paragraph used to say the bridge needed no operator code at all; it needs exactly this
+much.
 
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`

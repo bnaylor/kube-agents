@@ -861,9 +861,10 @@ file and never a `.git` it can write into.
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
   is not literal under `spec.mode: next`: the A2A render strips reserved-name
-  volume mounts and bus-credential mounts from a sidecar, and overwrites two
-  env names on it (`POD_NAMESPACE`, `A2A_CAPABILITY_REQUIRED`) because both
-  feed the capability check rather than the container's own configuration.
+  volume mounts and bus-credential mounts from a sidecar, and writes two env
+  names onto it because both feed the capability check rather than the
+  container's own configuration - `A2A_CAPABILITY_REQUIRED` as an override
+  that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
   Neither edit touches the container's filesystem posture, which is what this
   bullet is about.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
