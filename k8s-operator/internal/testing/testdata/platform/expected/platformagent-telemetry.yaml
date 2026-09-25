@@ -321,6 +321,8 @@ data:
       "projects": [],
       "folders": [],
       "organizations": [],
+      "sharedVpcHosts": [],
+      "metricsScopes": [],
       "exclude": {
         "projects": [],
         "clusters": []

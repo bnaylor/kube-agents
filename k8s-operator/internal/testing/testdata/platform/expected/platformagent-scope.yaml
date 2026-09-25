@@ -364,6 +364,13 @@ data:
       "organizations": [
         "111111111111"
       ],
+      "sharedVpcHosts": [
+        "vpc-host-dev",
+        "vpc-host-prod"
+      ],
+      "metricsScopes": [
+        "ops-metrics"
+      ],
       "exclude": {
         "projects": [
           "*-sandbox"
