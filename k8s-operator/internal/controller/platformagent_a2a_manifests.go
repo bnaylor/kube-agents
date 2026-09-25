@@ -389,9 +389,9 @@ const (
 	//	|       | its replacement and the old three have not yet reached their 5s   |
 	//	|       | inactive threshold                                                |
 	//	|    10 | a2aTasksWebReaders: the web rail's concurrent readers             |
-	//	|    16 | a2aTasksReplayConsumers: tasks/get replay ephemerals, derived     |
+	//	|    12 | a2aTasksReplayConsumers: tasks/get replay ephemerals, derived     |
 	//	|       | below                                                             |
-	//	|    32 | a2aTasksReservedConsumers                                         |
+	//	|    28 | a2aTasksReservedConsumers                                         |
 	//
 	// The replay term, and the mechanism it is sized from. lib.TasksGet
 	// opens an ordered consumer on TASKS and its cleanup stops the local
@@ -432,8 +432,6 @@ const (
 	//     it is not running.
 	//   - sweepTask and synthesizeTerminal at start, before it consumes, one
 	//     to four per in-flight key the prior incarnation left, sequentially.
-	//   - gke-labs#2010, open at this writing: TaskInReplay once per spawn,
-	//     from each of the bridge's Concurrency workers, concurrently.
 	//
 	// Two kinds of caller fall out of that list. A TRIGGER-PACED caller
 	// replays once per external event -- a turn, a terminal, a submission,
@@ -447,12 +445,12 @@ const (
 	// term does not size for them, and the cost of that is stated rather
 	// than hidden: a replay refused at the cap fails soft on every path but
 	// two -- the primer skips the task, the sweeps retry next pass or fail
-	// the bridge's start (which restarts it), the look-ahead spawns anyway --
-	// and the two that do not are both in the bridge's handler, which acks
-	// when it returns: handleMessage logs "events lookup failed; dropping
-	// submission", which loses the task, and cancelOrphan logs "cancel events
-	// lookup failed", which drops the cancel and leaves the orphan non-terminal
-	// for the retention window. A submission burst wide enough to reach the
+	// the bridge's start (which restarts it) -- and the two that do not are
+	// both in the bridge's handler, which acks when it returns:
+	// handleMessage logs "events lookup failed; dropping submission", which
+	// loses the task, and cancelOrphan logs "cancel events lookup failed",
+	// which drops the cancel and leaves the orphan non-terminal for the
+	// retention window. A submission burst wide enough to reach the
 	// cap is that handler's hazard, and pacing it is a bridge change, not a
 	// number here.
 	//
@@ -466,8 +464,6 @@ const (
 	//	| slots | source                                                            |
 	//	| ----: | ----------------------------------------------------------------- |
 	//	|     1 | a2aTasksReplayBridgeDispatch: the bridge's serialized handler     |
-	//	|     2 | a2aTasksReplayBridgeLookAhead: one per bridge worker, and the     |
-	//	|       | bridge runs a2aBridgeDefaultConcurrency of them (gke-labs#2010)   |
 	//	|     1 | a2aTasksReplayGatewaySweep: the sweep's one goroutine             |
 	//	|     4 | a2aTasksReplayAsks: an asker's two replays (a2aTasksReplayAsk)   |
 	//	|       | on each conversation whose task is running -- a chat turn's      |
@@ -475,9 +471,27 @@ const (
 	//	|       | and after its wait -- and in the shape this operator renders     |
 	//	|       | the running conversations are the bridge's                       |
 	//	|       | a2aBridgeDefaultConcurrency runs                                  |
-	//	|     8 | in flight                                                         |
+	//	|     6 | in flight                                                         |
 	//	|   x 2 | a2aTasksReplayTailFactor                                          |
-	//	|    16 | a2aTasksReplayConsumers                                           |
+	//	|    12 | a2aTasksReplayConsumers                                           |
+	//
+	// One row this table does not have, and what puts it back. gke-labs#2010,
+	// open and held at this writing, gives the bridge a pre-spawn look-ahead:
+	// lib.TaskInReplay, once per spawn, from each of the bridge's
+	// a2aBridgeDefaultConcurrency workers, concurrently. That is a
+	// trigger-paced source like the others -- 2 in flight, 4 after the tail
+	// factor -- and it was a row here, a2aTasksReplayBridgeLookAhead, before
+	// the symbol was in the tree. Sizing for a caller that cannot run is not
+	// caution, it is a refusal: those four slots took the first maxSessions
+	// the provision gate refuses on an existing 64-wide TASKS from 13 down to
+	// 11, for code no render reaches. The row comes back with the code:
+	// whoever lands #2010 restores a2aTasksReplayBridgeLookAhead =
+	// a2aBridgeDefaultConcurrency to the sum below, which takes in flight to
+	// 8, a2aTasksReplayConsumers to 16 and a2aTasksReservedConsumers to 32,
+	// and re-derives every number this block states from them.
+	// TestBridgeLookAheadIsNotInTheA2AModule reads the bridge's sources and
+	// fails on the day TaskInReplay appears in one, so the two halves cannot
+	// land in the wrong order unnoticed.
 	//
 	// The asks row is the one that rests on the shape of the install rather
 	// than on a lock, so the shape is stated. A conversation has one asker:
@@ -500,26 +514,26 @@ const (
 	// becomes per-session, and it moves into the multiplier beside
 	// a2aSessionConsumersPerSession.
 	//
-	// Two more things the three bridge rows rest on, both settable on the
+	// Two more things the two bridge rows rest on, both settable on the
 	// CR and neither read by this render. BRIDGE_CONCURRENCY: the sidecar is
 	// declared in spec.deployment.sidecars, so its env is the CR's, and an
 	// install that raises it (docs/designs/eval-next-transport.md commits the
-	// eval install to at least its task parallelism) scales the look-ahead
-	// and asks rows with it while this reserve stays put -- at 6, in flight
-	// is 1+6+1+12 = 20 and the term would be 40, which such an install
-	// carries today only because it spawns no session pods and so spends
-	// none of its maxSessions*3. Reading the sidecar's env into the budget is
-	// the follow-up, not a number here. And one agent replica: replicas
-	// share the bridge's durable and each brings its own workers, so a
-	// second replica doubles the dispatch and look-ahead rows.
+	// eval install to at least its task parallelism) scales the asks row with
+	// it while this reserve stays put -- at 6, in flight is 1+1+12 = 14 and
+	// the term would be 28, which such an install carries today only because
+	// it spawns no session pods and so spends none of its maxSessions*3.
+	// Reading the sidecar's env into the budget is the follow-up, not a
+	// number here. And one agent replica: replicas share the bridge's
+	// durable and each brings its own workers, so a second replica doubles
+	// the dispatch row.
 	//
-	// Where the floor hides all this. The budget is maxSessions*3 + 32 and a
+	// Where the floor hides all this. The budget is maxSessions*3 + 28 and a
 	// stream is created at max(64, budget), so a default install
-	// (maxSessions=10, budget 62) still renders 64. The first maxSessions
-	// whose budget clears the floor is 11 (65); it was 17 (67) when the
-	// reserve was 16. Above it the stream is 16 wider than it would have
-	// been, and so is the web user's unreapable-durable ceiling, which is the
-	// trade the block above already states.
+	// (maxSessions=10, budget 58) still renders 64. The first maxSessions
+	// whose budget clears the floor is 13 (67); it was 17 when the reserve
+	// was 16. Above it the stream is 12 wider than it would have been, and
+	// so is the web user's unreapable-durable ceiling, which is the trade
+	// the block above already states.
 	a2aTasksStandingDurables     = 2
 	a2aTasksAuditDurableHeadroom = 1
 	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
@@ -527,16 +541,15 @@ const (
 
 	// a2aBridgeDefaultConcurrency mirrors defaultConcurrency in
 	// a2a/cmd/hermes-bridge/main.go, the number of hermes subprocesses -- and
-	// so of look-ahead readers and of running conversations -- one bridge
-	// has when BRIDGE_CONCURRENCY is unset, which this operator leaves unset.
+	// so of running conversations -- one bridge has when BRIDGE_CONCURRENCY
+	// is unset, which this operator leaves unset.
 	// The two modules cannot import each other;
 	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
 	// if this one stops matching it.
 	a2aBridgeDefaultConcurrency = 2
 
-	a2aTasksReplayBridgeDispatch  = 1
-	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
-	a2aTasksReplayGatewaySweep    = 1
+	a2aTasksReplayBridgeDispatch = 1
+	a2aTasksReplayGatewaySweep   = 1
 	// a2aTasksReplayAsk is the replays one ask makes back to back: a chat
 	// turn's healActiveTask then answerStatusByReplay, or an inject-door
 	// read's probeConversation before and after its wait.
@@ -547,9 +560,9 @@ const (
 	// inactive threshold.
 	a2aTasksReplayTailFactor = 2
 	a2aTasksReplayConsumers  = a2aTasksReplayTailFactor *
-		(a2aTasksReplayBridgeDispatch + a2aTasksReplayBridgeLookAhead + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks)
+		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks)
 
-	a2aTasksReservedConsumers = 32
+	a2aTasksReservedConsumers = 28
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
 	// default install still gets. Never render below it.
@@ -3001,7 +3014,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// what the script's gate compares a live stream
 				// against; the recreate width is what a fresh render
 				// creates, which floors at the cap TASKS shipped with,
-				// so a default install needs 62 and recreates at 64.
+				// so a default install needs 58 and recreates at 64.
 				// The third — what the live stream actually holds — is
 				// on the bus, and it is the one the maxSessions that
 				// fits is derived from, so that half of the remedy
