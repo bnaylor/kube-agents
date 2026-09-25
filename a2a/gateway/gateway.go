@@ -1040,7 +1040,8 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
 		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
-	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID})
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee,
+		CorrelationID: correlationID, Capability: capRef})
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 	}
@@ -1190,12 +1191,13 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 // nothing to stop -- while the submission is still on the in subject, and the
 // bridge's durable consumer delivers from the start of the stream, so a
 // bridge that binds later within retention would run the stale prompt. The
-// cancel bounds that run. It rides the task's own chain (the history entry
-// keeps the correlation id and the addressee), is recorded on the history
+// cancel bounds that run. It rides the task's own chain and its own authority
+// (the history entry keeps the correlation id, the addressee and the
+// capability), is recorded on the history
 // entry like any published cancel, and detaches nothing, because nothing is
 // active. A task this conversation never held is refused: the gateway does
 // not publish cancels for tasks it did not start.
-func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskID string, authority []byte) {
+func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskID string, authority Authority) {
 	ref, held := rec.TaskRefFor(taskID)
 	if !held {
 		g.post(rec.Key, fmt.Sprintf("🤷 this conversation never held task `%s`; nothing sent", taskID))
@@ -1215,7 +1217,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 	}
 	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, rec.ContextID, ref.CorrelationID,
 		lib.WithTo(lib.Party{Session: ref.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(ref.Capability)))
 	if err != nil {
 		g.log.Error("cancel envelope build failed", "taskId", taskID, "err", err)
 		return
