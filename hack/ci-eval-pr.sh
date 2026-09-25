@@ -843,8 +843,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # Clusters are found by label rather than by name, so this does not need to
 # know the leased project's cluster prefix or region.
 #
-# Non-fatal by design: an unreachable seeded cluster -- or a leased project the
-# fleet was never applied to -- leaves its roles' files absent, and
+# Non-fatal by design, with one exception (the read-only credential, below,
+# which a project the fleet was never applied to also lacks): an unreachable
+# seeded cluster leaves its roles' files absent, and
 # `fleet_resource_property` turns that into status=error naming the role and
 # the project: failing the checks that needed that cluster rather than the job,
 # and never silently reading platform-agent-host instead.
@@ -863,9 +864,10 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # one namespace read per probe -- seconds, against a job measured in tens
 # of minutes.
 #
-# The `||` catches a REPOSITORY bug only: a missing or malformed
-# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
-# environmental failure -- no fleet in this project, a cluster that will not
+# The `||` catches two things. Exit 3 is the read-only credential unavailable
+# and ends the job (below). Any other non-zero is a REPOSITORY bug -- a missing
+# or malformed bench/tf/fleet/fixtures.json, an unusable output directory --
+# and warns. Every other environmental failure -- a cluster that will not
 # answer, a fixture that was never planted -- returns 0 with a warning of its
 # own and leaves the affected roles' files absent, which is the whole design.
 
@@ -880,22 +882,29 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # The other half is the token-creator grant -- `fleet_reader_token_creators`
 # in bench/tf/fleet/variables.tf, which defaults to both runners, the
 # presubmit's and the nightly's, and to the CI health bot, so an apply of that
-# stack grants each. In a project whose fleet was applied before that default
-# landed, `gcloud auth print-access-token
-# --impersonate-service-account` fails, fleet-kubeconfigs.sh warns per cluster,
-# and the role kubeconfigs keep the runner's own read-write credential. That is
-# a privilege gap on a fleet every open PR shares, not a functional one: the
-# files are still written, still point at the right seeded cluster, and every
-# check still grades the right object. `scripts/verify_ci_pool_project.py`
-# fails a project missing the binding. See bench/tf/fleet/README.md, "A
-# read-only credential for evaluations".
-export FLEET_READONLY_SA="${FLEET_READONLY_SA:-seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+# stack grants each. A project without the binding stops the run here: the
+# runner refuses to write kubeconfigs carrying this job's own read-write
+# credential onto a fleet every open PR shares. A precondition, not a repair:
+# the grant is `fleet_reader_token_creators`, and
+# `scripts/verify_ci_pool_project.py` fails a project missing it. See
+# bench/tf/fleet/README.md, "A read-only credential for evaluations".
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
+# use, and a Prow job refuses it: set there it would restore the fallback.
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+_fleet_refuse_opt_in_under_prow || exit 1
+FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS
-# shellcheck source=hack/fleet-kubeconfigs.sh
-source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+write_fleet_kubeconfigs || {
+  fleet_rc=$?
+  if [ "$fleet_rc" -eq "$_FLEET_EXIT_READONLY_UNAVAILABLE" ]; then
+    echo "FATAL: stopping at the fleet step: the seeded fleet cannot be read as its reader, and it is not graded with the runner's write credential." >&2
+    exit 1
+  fi
+  echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+}
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's

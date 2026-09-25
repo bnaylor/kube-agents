@@ -563,6 +563,35 @@ else
     "managed_repos but cannot mint a token, so GitHub-writing scenarios will fail."
 fi
 
+# ─── 2d. The seeded fleet's read-only credential ──────────────────────────────
+# The gate hack/ci-eval-pr.sh applies before it writes the fleet kubeconfigs,
+# run here first: everything from here on is the 20-30 minutes of build and
+# deploy ahead of it, and a project whose reader cannot be impersonated should
+# fail in seconds instead. Failing here usually also keeps the run inside the
+# dashboard's setup-death bound -- a zero-task FAILURE under five minutes of
+# whole job, scripts/eval_dashboard/classify.py -- so the health bot counts it
+# as infrastructure and points at the leased project; a run that waited longer
+# than that for its Boskos lease reads as a deploy break instead. A laptop
+# fails the same gate for a different reason -- roles/owner cannot impersonate
+# the reader -- and the gate's own message tells the two apart, naming the
+# pool repair to a job and FLEET_ALLOW_RUNNER_CREDENTIAL=1 (which leaves the
+# reader unset and passes on the developer's own credential) to a developer;
+# this caller adds no repair of its own. Like EVAL_GITOPS_REPO above, that
+# opt-in is for developers only: set in a Prow job's environment it would
+# quietly restore the write-credential fallback this gate replaces, so a
+# leased run refuses it.
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+preflight_fleet_reader() {
+  _fleet_refuse_opt_in_under_prow || exit 1
+  FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
+  _fleet_require_readonly_credential "${FLEET_READONLY_SA}" "${PROJECT_ID}" || {
+    echo "FATAL: stopping before the build: the seeded fleet cannot be read as its reader, and it is not graded with the runner's write credential." >&2
+    exit 1
+  }
+}
+preflight_fleet_reader
+
 # ─── 2c. Image Build Worker ───────────────────────────────────────────────────
 # Where the image builds run. Either a private worker pool or a sized machine
 # on the default pool -- never both, because a pool declares its own machine
