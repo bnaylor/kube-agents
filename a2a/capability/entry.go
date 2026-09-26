@@ -289,8 +289,21 @@ func Narrows(parent, child Entry) error {
 // string concatenations that agree until somebody edits one.
 //
 // An empty namespace yields "namespace/-". "-" is a legal scope segment and
-// is not a legal DNS-1123 namespace name, so nothing real is ever inside it:
-// a component defaulted this way can mint and check, and permits nothing.
+// is not a legal DNS-1123 namespace name, so no rendered namespace is ever
+// inside it and no rendered namespace ever contains it: against a real scope
+// the placeholder mismatches in both directions, which is what makes an
+// unrendered half of the pair fail closed.
+//
+// It is a mismatch marker and not a deny-all, and the difference matters.
+// Contains treats equality as containment, so a capability minted at
+// "namespace/-" does permit a request at "namespace/-" — the pairing two
+// components that defaulted *together* produce. On a rendered install neither
+// half defaults: Config.FromEnv reads POD_NAMESPACE with "kubeagents-system"
+// as its fallback, and the spawner writes the gateway's resolved scope onto
+// the session pod as A2A_AUTHORITY_SCOPE. A Config built without Namespace —
+// tests, and embedders that bypass FromEnv — is the case that reaches the
+// tautology, and what it waives is this axis alone; the delegate check still
+// binds. Pinned by TestTheNamespacePlaceholderIsAMismatchMarkerNotADenyAll.
 func NamespaceScope(namespace string) Scope {
 	if namespace == "" {
 		return Scope("namespace/-")

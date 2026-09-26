@@ -466,6 +466,35 @@ func TestAResourceOutsideTheScopeIsRefused(t *testing.T) {
 		"outside the capability's scope")
 }
 
+// The placeholder NamespaceScope("") returns is a mismatch marker, not a
+// deny-all, and the comment on it used to claim the second. Both facts are
+// pinned here because the false one reads like a fail-closed guarantee for
+// the unconfigured case, and the unconfigured case is fail-open between two
+// components that defaulted together.
+func TestTheNamespacePlaceholderIsAMismatchMarkerNotADenyAll(t *testing.T) {
+	const placeholder = Scope("namespace/-")
+	if got := NamespaceScope(""); got != placeholder {
+		t.Fatalf("precondition: NamespaceScope(%q) = %q, want %q", "", got, placeholder)
+	}
+
+	// Both directions of the mismatch, which is what an unrendered half of
+	// the pair actually runs into.
+	mustRefuse(t, Permits(Entry{Tier: TierDeveloperTeam, Scope: placeholder, Delegate: podA},
+		VerbTaskExecute, NamespaceScope("kubeagents-system")),
+		"outside the capability's scope")
+	mustRefuse(t, Permits(Entry{Tier: TierDeveloperTeam, Scope: NamespaceScope("kubeagents-system"), Delegate: podA},
+		VerbTaskExecute, placeholder),
+		"outside the capability's scope")
+
+	// And the tautology. Contains returns true on equality before it looks
+	// at segments, so a mint and a check that both defaulted agree — this
+	// is not a refusal and the doc comment must not say it is.
+	if err := Permits(Entry{Tier: TierDeveloperTeam, Scope: placeholder, Delegate: podA},
+		VerbTaskExecute, placeholder); err != nil {
+		t.Fatalf("the placeholder does not permit itself, so the comment correction is wrong: %v", err)
+	}
+}
+
 func TestAnUnknownVerbIsRefusedRatherThanAllowed(t *testing.T) {
 	e := Entry{Tier: TierPlatform, Scope: "project/P", Delegate: podA}
 	mustRefuse(t, Permits(e, Verb("cluster.delete-everything"), "project/P"),

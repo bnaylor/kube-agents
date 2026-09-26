@@ -315,9 +315,11 @@ func TestMintedSessionNamesAreOneSubjectTokenAndALegalPodName(t *testing.T) {
 // cfg.AuthorityScope and the executor checks against A2A_AUTHORITY_SCOPE, and
 // the verifier compares them — so an unrendered scope is not a missing nicety,
 // it is every task refused. It would also be refused *quietly*: the executor's
-// fallback is capability.NamespaceScope(""), which is `namespace/-`, a legal
-// scope that contains nothing, so the failure arrives as a scope refusal and
-// reads like a capability bug.
+// fallback is capability.NamespaceScope(""), which is `namespace/-`, and that
+// placeholder mismatches any real namespace the gateway minted under — the
+// refusal comes from the two scopes differing, not from the placeholder being
+// empty of everything, so the failure arrives as a scope refusal and reads
+// like a capability bug.
 func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
