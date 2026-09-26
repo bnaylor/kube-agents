@@ -399,6 +399,19 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// executor's own scope, and the verifier is the only thing that can say
 	// so. Refused is terminal rejected, before any model spend.
 	if reason := a.capabilityRefusal(ctx, nc, origin); reason != "" {
+		// A SIGTERM that lands inside the verify window is an eviction, not
+		// a refusal. Check wraps this same ctx and turns its cancellation
+		// into "the verifier could not be reached", so without this branch
+		// the kubelet taking the pod away is published as terminal
+		// `rejected` with a capability reason -- a task nothing was wrong
+		// with, blamed on its capability, and not retried. Same contract as
+		// the eviction branch in the run loop below.
+		if ctx.Err() != nil {
+			state := lib.StateFailed
+			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM "+
+				"while the capability was being verified", "")
+			return Result{State: state, Evicted: true}, err
+		}
 		state := lib.StateRejected
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
