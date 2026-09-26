@@ -3458,6 +3458,31 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
 
+	// The deny is pinned for the same reason the bridge's is, and more so:
+	// this is the principal that MINTS. It holds `$KV.cap.root.*`, so a
+	// widening of its JetStream grants is the likeliest way for read on the
+	// capability store to arrive by accident. gke-labs#1666 replaced the
+	// `$JS.API.>` this deny was written against with the enumerated list
+	// above, so it subtracts nothing today -- which is exactly the argument
+	// that gets a control deleted, and exactly why it is asserted here
+	// rather than left to the golden, which regenerates under `-update`.
+	for _, tc := range []struct {
+		section string
+		want    []string
+	}{
+		{"publish", capDenyPublish},
+		{"subscribe", capDenySubscribe},
+	} {
+		deny, ok := a2aGrantDenials(t, conf, "gateway", tc.section)
+		if !ok {
+			t.Errorf("gateway has no %s deny-list; the cap bucket is no longer subtracted from it", tc.section)
+			continue
+		}
+		if !reflect.DeepEqual(deny, tc.want) {
+			t.Errorf("gateway %s deny-list changed.\n got: %q\nwant: %q", tc.section, deny, tc.want)
+		}
+	}
+
 	// Verbs no gateway path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
