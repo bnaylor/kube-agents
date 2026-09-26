@@ -476,19 +476,6 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.tasks[env.TaskID] = run
 	b.mu.Unlock()
 
-	// Authorization before execution, and before the queue. The gateway
-	// minted a capability for this task at ingress; the verifier is the only
-	// thing that can say whether it permits this executor, at this
-	// executor's scope. Refused is terminal rejected, before hermes is
-	// invoked and before a model is called. It is registered above first so
-	// the refusal rides the same single-writer finalize every other terminal
-	// event does — idempotent, and it clears the in-flight registry the
-	// sweep reads. See capability.go.
-	if reason := b.capabilityRefusal(ctx, env); reason != "" {
-		b.finalize(run, lib.StateRejected, reason, nil)
-		return
-	}
-
 	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
 	select {
 	case b.queue <- run:
@@ -606,6 +593,25 @@ func (b *Bridge) worker(ctx context.Context) {
 		case run = <-b.queue:
 		}
 		if !run.pending() {
+			continue
+		}
+		// The authorization gate runs BEFORE the look-ahead, and the order
+		// is deliberate. The look-ahead is not free and it is not private:
+		// its fallback replay opens an ephemeral consumer and holds a
+		// replaySlot for the inactive threshold, and replaySlots is bounded
+		// at Concurrency and shared by every worker. Running it first would
+		// let an unauthorized submission spend a bus consumer and park a
+		// slot that authorized tasks queue behind -- work done on behalf of
+		// a requester who was never entitled to any, which is the property
+		// this branch exists to establish. The verifier round trip is a
+		// request-reply on a subject with no shared bounded resource behind
+		// it, so it is the cheaper of the two to spend on a task that turns
+		// out to be refused.
+		//
+		// It also decides the record: an unauthorized submission terminates
+		// `rejected` with the capability's reason rather than `canceled`,
+		// which is the honest terminal and the one an audit can act on.
+		if !b.capabilityPermits(ctx, run) {
 			continue
 		}
 		// The look-ahead runs with the task still pending, so a cancel the
@@ -776,6 +782,48 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 		}
 		b.holdReplaySlot(func() { <-b.replaySlots })
 	}, nil
+}
+
+// capabilityPermits is the authorization gate, and it runs HERE — on a
+// worker, after the queue — rather than in accept, which is where the check
+// first landed. Both placements are before `working` publishes, before hermes
+// is invoked and before a model is called, so nothing about what is refused
+// changes. What changes is who waits: accept runs on the bridge's one durable
+// consumer callback, which is serial and which also carries the KindCancel
+// envelopes for tasks that are already running. Check blocks for
+// capability.DefaultTimeout when nothing answers on the verify subject, so a
+// verifier outage made every cancel queue behind 5s per pending submission —
+// a user unable to stop a running hermes subprocess because of an outage in
+// the thing that authorizes new ones. The session executor has always checked
+// in its own process for the same reason (a2a/worker-adapter/adapter.go).
+//
+// The cost of the move: a submission now occupies a queue slot while it is
+// being verified, so a verifier outage long enough to queue taskQueueCapacity
+// of them ends in bridge-queue-overflow rather than capability-refused. At
+// Concurrency workers and one DefaultTimeout each that is thousands of
+// submissions inside one outage on a single-profile bridge, which is the
+// "fault, not load" the capacity already stands for.
+//
+// Returns false when it finalized the task; the caller must not run it.
+func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
+	reason := b.capabilityRefusal(ctx, run.origin)
+	if reason == "" {
+		return true
+	}
+	// "The verifier could not be reached" and "we stopped asking" are
+	// different facts, and Check cannot tell them apart: it turns any
+	// error out of NextMsgWithContext, context.Canceled included, into
+	// a refusal. So a submission whose check was in flight when the
+	// bridge was terminated would land as terminal `rejected` -- which
+	// no supervisor retries -- instead of the retryable shutdown every
+	// other pending task gets. The verifier guards the mirror image of
+	// this on its own side; see capability.DrainAndCancel.
+	if ctx.Err() != nil {
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		return false
+	}
+	b.finalize(run, lib.StateRejected, reason, nil)
+	return false
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {

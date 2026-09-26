@@ -32,8 +32,9 @@ import (
 // k8s-operator/internal/controller/platformagent_a2a_identities.go.
 
 // capabilityRefusal returns the reason this submission must be refused, or ""
-// to proceed. Called before the task is queued, so a refused task never
-// reaches a hermes subprocess and never spends a model call.
+// to proceed. Called by a worker before the task is started, so a refused
+// task never reaches a hermes subprocess and never spends a model call; see
+// Bridge.capabilityPermits for why it is not called on the consumer callback.
 func (b *Bridge) capabilityRefusal(ctx context.Context, env *lib.Envelope) string {
 	ref, present, err := capability.RefFromAuthority(env.Authority)
 	switch {

@@ -191,6 +191,14 @@ func startBridge(t *testing.T, url string, command []string) {
 	startBridgeN(t, url, command, 0)
 }
 
+// startBridgeCancelable hands the shutdown to the caller, for the tests whose
+// subject is what happens to a task in flight when the bridge goes away.
+// Cleanup still cancels, so cancelling twice is expected and harmless.
+func startBridgeCancelable(t *testing.T, url string, command []string) context.CancelFunc {
+	t.Helper()
+	return startBridgeCfg(t, url, command, 0, false, nil)
+}
+
 // startBridgeOptional runs a bridge with A2A_CAPABILITY_REQUIRED=false's
 // effect: the mixed-version rollout window, and the only configuration in
 // which an uncapabled submission runs.
