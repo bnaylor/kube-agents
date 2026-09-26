@@ -188,20 +188,28 @@ func startBridge(t *testing.T, url string, command []string) {
 	startBridgeN(t, url, command, 0)
 }
 
+// startBridgeCancelable hands the shutdown to the caller, for the tests whose
+// subject is what happens to a task in flight when the bridge goes away.
+// Cleanup still cancels, so cancelling twice is expected and harmless.
+func startBridgeCancelable(t *testing.T, url string, command []string) context.CancelFunc {
+	t.Helper()
+	return startBridgeCfg(t, url, command, 0, false)
+}
+
 // startBridgeOptional runs a bridge with A2A_CAPABILITY_REQUIRED=false's
 // effect: the mixed-version rollout window, and the only configuration in
 // which an uncapabled submission runs.
 func startBridgeOptional(t *testing.T, url string, command []string) {
 	t.Helper()
-	startBridgeCfg(t, url, command, 0, true)
+	_ = startBridgeCfg(t, url, command, 0, true)
 }
 
 func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 	t.Helper()
-	startBridgeCfg(t, url, command, concurrency, false)
+	_ = startBridgeCfg(t, url, command, concurrency, false)
 }
 
-func startBridgeCfg(t *testing.T, url string, command []string, concurrency int, optional bool) {
+func startBridgeCfg(t *testing.T, url string, command []string, concurrency int, optional bool) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	b, err := New(ctx, Config{
@@ -249,6 +257,7 @@ func startBridgeCfg(t *testing.T, url string, command []string, concurrency int,
 		_, err = js.Consumer(ctx, lib.TasksStream, "bridge-platform")
 		return err == nil
 	})
+	return cancel
 }
 
 func gatewayClient(t *testing.T, url string) *lib.Client {

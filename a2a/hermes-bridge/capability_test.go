@@ -1,9 +1,13 @@
 package hermesbridge
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -259,4 +263,156 @@ func TestAVerifierThatCannotBeReachedRefusesTheBridgesTask(t *testing.T) {
 	submitWithAuthority(t, c, taskID, "do the thing",
 		authorityFor(t, capability.Ref{Key: "root." + taskID, Revision: 1}))
 	refuseAndFold(t, url, c, taskID)
+}
+
+// The bridge going away is not the capability's fault.
+//
+// capability.Client.Check turns any error out of NextMsgWithContext into a
+// refusal, context.Canceled included, and accept passes it the bridge's own
+// Run context. So a submission whose check is still in flight when the bridge
+// is terminated used to land as terminal `rejected` with a capability reason:
+// a task nothing was wrong with, blamed on its authority, and - because
+// rejected is terminal and no supervisor retries it - not run again. Every
+// other pending task gets the retryable bridge-shutdown instead.
+//
+// This is the client-side twin of what capability.DrainAndCancel guards on the
+// verifier: "the store is unreachable" and "this process is going away" are
+// different facts, and the fail-closed branch cannot tell them apart on its
+// own. The verifier was taught the difference; the two callers were not.
+func TestTheBridgeShuttingDownMidVerifyIsNotACapabilityRefusal(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	// A verifier that is subscribed but never answers: the only shape that
+	// leaves a window to shut down inside. With nothing subscribed the bus
+	// answers no-responders at once and Check returns before a shutdown
+	// could overlap it -- that outage is
+	// TestAVerifierThatCannotBeReachedRefusesTheBridgesTask, and refusing
+	// there is correct.
+	silentVerifier(t, url)
+	c := gatewayClient(t, url)
+
+	// accept and one worker are driven directly rather than through Run,
+	// and that is the point of the test rather than a shortcut. Run's
+	// shutdownTasks finalizes the same registered run with bridge-shutdown,
+	// and finalize is first-wins, so end to end the two racing writers
+	// usually produce the right answer anyway and the bug hides. Here the
+	// worker is the only writer, which is the case this branch exists for.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, err := New(ctx, Config{
+		NATSURL:      url,
+		Command:      noCommand,
+		TaskDeadline: 20 * time.Second,
+		KillGrace:    500 * time.Millisecond,
+		Scope:        capability.NamespaceScope(""),
+	})
+	if err != nil {
+		t.Fatalf("bridge new: %v", err)
+	}
+	t.Cleanup(b.close)
+
+	const taskID = "task-bridge-cap-shutdown"
+	contextID := "ctx-" + taskID
+	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID,
+		messagePayload(t, taskID, contextID, "do the thing"),
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, capability.Ref{Key: "root." + taskID, Revision: 1})))
+	if err != nil {
+		t.Fatalf("submission envelope: %v", err)
+	}
+
+	// accept publishes submitted and queues; the worker then blocks in
+	// Check for its full 5s against the silent verifier, so cancelling
+	// shortly after lands inside that window with a wide margin.
+	b.accept(ctx, env)
+	b.wg.Add(1)
+	go b.worker(ctx)
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		cancel()
+	}()
+
+	task := waitTerminal(t, c, taskID)
+	if task.State != lib.StateFailed {
+		t.Errorf("state = %s, want failed; a shutdown is not a refusal", task.State)
+	}
+	text := terminalText(t, url, taskID)
+	if strings.Contains(text, "capability-refused") {
+		t.Errorf("the bridge blamed the capability for its own shutdown: %q", text)
+	}
+	if !strings.Contains(text, "bridge-shutdown") {
+		t.Errorf("the terminal event does not name the shutdown: %q", text)
+	}
+}
+
+// silentVerifier holds the verify subject without ever replying, so a Check
+// against it blocks until its own timeout or until the caller's context is
+// cancelled. It stands in for a verifier that is up, reachable and wedged.
+func silentVerifier(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-silent"))
+	if err != nil {
+		t.Fatalf("silent verifier connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	sub, err := nc.QueueSubscribe(capability.VerifySubscribe, capability.VerifyQueue,
+		func(*nats.Msg) {})
+	if err != nil {
+		t.Fatalf("silent verifier subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// A verifier outage must not make a cancel wait behind the submissions it is
+// refusing. The bridge has ONE durable consumer on `a2a.tasks.platform.*.in`
+// and it delivers serially, so whatever the submission path does on that
+// callback, a KindCancel envelope behind it does not get looked at until it
+// returns. Check blocks for capability.DefaultTimeout against a verifier that
+// does not answer; done inline that is 5s of head-of-line block per pending
+// submission, and a user trying to stop a task cannot, because of an outage
+// in the component that authorizes new ones. Hence capabilityPermits on the
+// worker.
+//
+// Three submissions and then a cancel, all published before the bridge is
+// reading, so stream order puts the cancel last -- the worst case, and the
+// only one worth pinning. The assertion is on the clock as well as the state:
+// with the check back on the consumer this is three full timeouts (~15s) and
+// the third task ends `rejected` rather than `canceled`.
+func TestAVerifierOutageDoesNotDelayACancel(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	silentVerifier(t, url)
+	c := gatewayClient(t, url)
+
+	const doomed = "task-cap-hol-3"
+	submit(t, c, "task-cap-hol-1", "do the thing")
+	submit(t, c, "task-cap-hol-2", "do the thing")
+	origin := submit(t, c, doomed, "do the thing")
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID,
+		origin.CorrelationID, lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", doomed), cancelEnv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrency 1: one worker means the two submissions ahead of it hold
+	// the verify slot for a full timeout each, so the queued third cannot
+	// be picked up and flipped to running underneath the cancel.
+	start := time.Now()
+	_ = startBridgeCfg(t, url, noCommand, 1, false)
+
+	task := waitTerminal(t, c, doomed)
+	elapsed := time.Since(start)
+	if task.State != lib.StateCanceled {
+		t.Errorf("state = %s, want canceled; the cancel was overtaken by the refusals ahead of it",
+			task.State)
+	}
+	// One timeout's worth of margin over the ~0s this should take, and still
+	// far inside the two timeouts the inline check would have cost.
+	if elapsed > capability.DefaultTimeout {
+		t.Errorf("the cancel took %s to reach a terminal; it queued behind the verifier outage", elapsed)
+	}
+	if text := terminalText(t, url, doomed); !strings.Contains(text, "canceled-before-start") {
+		t.Errorf("the terminal event is not the cancel's: %q", text)
+	}
 }
