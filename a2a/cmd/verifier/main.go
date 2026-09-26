@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -74,7 +75,13 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	nc, err := connect(ctx, log, url)
+	// Buffered by close() and fired at most once: the deferred Close below
+	// also runs the handler, and a clean shutdown must not look like a
+	// failure. See connect for why MaxReconnects(-1) does not make this
+	// unreachable.
+	busClosed := make(chan struct{})
+	var closeOnce sync.Once
+	nc, err := connect(ctx, log, url, func() { closeOnce.Do(func() { close(busClosed) }) })
 	if err != nil {
 		log.Error("bus connect", "err", err)
 		return 1
@@ -124,7 +131,24 @@ func run() int {
 
 	srv := serveReady(log, nc)
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-busClosed:
+		// Exit non-zero so the pod restarts. Returning to the drain below
+		// would be worse than useless: the connection is gone, the drain
+		// cannot flush, and the process would sit here answering the
+		// liveness probe forever. /healthz is unconditional by design --
+		// a transient disconnect must not kill a verifier that is about
+		// to reconnect -- so this is the only thing that restarts it, and
+		// without it the Deployment stays NotReady for good while every
+		// executor refuses every task.
+		log.Error("the bus connection ended and will not recover in this process; " +
+			"exiting so the pod restarts")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), readyTimeout)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		return 1
+	}
 	// Drain rather than Unsubscribe, wait for the drain rather than defer it,
 	// and cancel the handlers only after. capability.DrainAndCancel carries
 	// the three reasons; it is there rather than here so the ordering is
@@ -162,7 +186,15 @@ func serveReady(log *slog.Logger, nc *nats.Conn) *http.Server {
 	return srv
 }
 
-func connect(ctx context.Context, log *slog.Logger, url string) (*nats.Conn, error) {
+// onClosed fires if the connection ends for good. MaxReconnects(-1) does not
+// make that unreachable: nats.go aborts its own reconnect loop when the same
+// server answers with the same authorization error twice running
+// (processAuthError, nats.go v1.53.1, unless IgnoreAuthErrorAbort). This
+// component is callout-authenticated through a projected token, so a bus that
+// answers twice the same way -- a revoked identity, a callout that has lost
+// the verifier's user, a token file the kubelet has stopped refreshing --
+// lands exactly there. See run for what the verifier does about it.
+func connect(ctx context.Context, log *slog.Logger, url string, onClosed func()) (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Name("a2a-cap-verifier"),
 		// Retry forever rather than exiting. While this is disconnected no
@@ -176,6 +208,11 @@ func connect(ctx context.Context, log *slog.Logger, url string) (*nats.Conn, err
 		}),
 		nats.ReconnectHandler(func(c *nats.Conn) {
 			log.Info("reconnected to the bus", "url", c.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			log.Error("bus connection closed for good; this verifier can no longer answer, " +
+				"so no task anywhere in this install can start")
+			onClosed()
 		}),
 		nats.ErrorHandler(func(_ *nats.Conn, s *nats.Subscription, err error) {
 			// Permission violations are asynchronous and land here. On
