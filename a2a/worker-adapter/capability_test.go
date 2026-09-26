@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -279,5 +281,68 @@ func TestAVerifierThatCannotBeReachedRefusesTheTask(t *testing.T) {
 	}
 	if task := foldTask(t, c, session, taskID); task.State != lib.StateRejected || !task.Final {
 		t.Fatalf("the refusal is not terminal on the stream: %+v", task)
+	}
+}
+
+// silentVerifier subscribes to the verify subject and never answers. Without
+// it there is no window to cancel inside: core NATS answers a request with no
+// responder immediately, so "the verifier is absent" and "the verifier is
+// wedged" are different fixtures and only the second one holds the check open.
+func silentVerifier(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-silent"))
+	if err != nil {
+		t.Fatalf("silent verifier connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	sub, err := nc.QueueSubscribe(capability.VerifySubscribe, capability.VerifyQueue,
+		func(*nats.Msg) {})
+	if err != nil {
+		t.Fatalf("silent verifier subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// A SIGTERM inside the verify window is an eviction, not a refusal. The
+// executor's context is what the kubelet cancels, and it is also the context
+// Check waits on, so cancellation arrives at the call site wearing the same
+// clothes as an unreachable verifier: a non-empty refusal reason. Publishing
+// that as terminal `rejected` blames the task's capability for the cluster
+// taking its pod away, and rejected is final -- nothing retries it, and an
+// operator reading the fold sees an authorization failure that never
+// happened. The eviction branch in the run loop already draws this line; the
+// verify window was simply on the wrong side of it.
+func TestASIGTERMInsideTheVerifyWindowIsAnEvictionNotARefusal(t *testing.T) {
+	url := startServerNoVerifier(t)
+	silentVerifier(t, url)
+	c := testClient(t, url)
+	const session, taskID = "chat-ibex-cap15", "task-cap-evicted-midverify"
+	submit(t, c, session, taskID, "do the thing")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, adapterConfig(url, taskID, session, noHarness))
+
+	// Cancel on the state, not on a clock: `submitted` on the stream means
+	// the adapter is past every step before the check and into the window
+	// the silent verifier is holding open.
+	waitState(t, c, session, taskID, lib.StateSubmitted)
+	cancel()
+
+	out := waitOutcome(t, done, 30*time.Second)
+	if out.res.State != lib.StateFailed || !out.res.Evicted {
+		t.Fatalf("state %q evicted %v err %v; a shutdown mid-verify was not reported as an eviction",
+			out.res.State, out.res.Evicted, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	if task.State != lib.StateFailed || !task.Final {
+		t.Fatalf("the eviction is not terminal on the stream: %+v", task)
+	}
+	text := terminalText(t, url, session, taskID)
+	if !strings.Contains(text, "worker-evicted") {
+		t.Fatalf("the terminal event does not name the eviction: %q", text)
+	}
+	if strings.Contains(text, "capability-refused") {
+		t.Fatalf("the eviction was published as a capability refusal: %q", text)
 	}
 }
