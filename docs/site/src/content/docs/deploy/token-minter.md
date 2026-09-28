@@ -17,7 +17,7 @@ Overlay reference (the kustomize manifests behind that dev copy, and Minty's GSA
 2. **Verification.** Minty checks the request against local rules ([`configmap.yaml.template`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)). It extracts the `email` claim from the OIDC token and verifies against `assertion.email`.
 3. **KMS signing.** Minty asks GCP KMS to sign a JWT with the GitHub App's private key. The raw key material never touches Minty.
 4. **Token exchange.** Minty exchanges the signed JWT with GitHub for a 1-hour repository-scoped installation access token.
-5. **Delivery.** Minty returns the token to the agent, which uses it for `git push`, PR-open, and issue operations — the Platform Agent publishes audit findings as GitHub issues and reads `/remediate` comments on them, and `github-issue-resolver` triages the rest.
+5. **Delivery.** Minty returns the token to the credential broker, which spends it on the agent's behalf for `git push`, PR-open, and issue operations — the Platform Agent publishes audit findings as GitHub issues and reads `/remediate` comments on them, and `github-issue-resolver` triages the rest. The agent asks for the operation, never for the token.
 
 ## The GitOps repo must be owned by an organization
 
@@ -60,9 +60,9 @@ During initial installation, `install.sh` can create the Cloud KMS keyring/key a
 
 ```bash
 ./install.sh --non-interactive \
-  --project-id="YOUR_GCP_PROJECT_ID" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --gitops-org="YOUR_GITHUB_ORG" \
   --gitops-repo="YOUR_GITOPS_REPO" \
   --github-app-id="YOUR_GITHUB_APP_ID" \
@@ -85,9 +85,9 @@ For automated CI/CD pipelines, release automation, or production environments wh
    Once the key holds an `ENABLED` version in Cloud KMS, invoke `install.sh` without `--github-pem-path`:
    ```bash
    ./install.sh --non-interactive \
-     --project-id="YOUR_GCP_PROJECT_ID" \
-     --cluster-name="platform-agent-host" \
-     --region="us-central1" \
+     --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+     --gke-cluster-name="platform-agent-host" \
+     --gcp-region="us-central1" \
      --gitops-org="YOUR_GITHUB_ORG" \
      --gitops-repo="YOUR_GITOPS_REPO" \
      --github-app-id="YOUR_GITHUB_APP_ID"

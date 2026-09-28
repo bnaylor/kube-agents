@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
+import collections
 import contextlib
 import hashlib
 import hmac
@@ -15,9 +17,12 @@ import logging
 import os
 import queue
 import re
+import select
+import selectors
 import shlex
 import signal
 import shutil
+import socket
 import socketserver
 import ssl
 import subprocess
@@ -31,8 +36,9 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
+import api_policy
 import command_policy
 import providers
 import repo_ref
@@ -40,10 +46,14 @@ import scoped_sa_pool
 import vcs_broker
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
-# file is in its pod and not in this one; these three are the vocabulary both
-# sides share, and importing them keeps the context-name grammar in one place.
-# Nothing else in credential_proxy_client runs on import.
+# file is in its pod and not in this one; these are the vocabulary both sides
+# share, and importing them keeps the context-name grammar -- and where the
+# `--kubeconfig` scan stops -- in one place. Nothing else in
+# credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
+    API_RELAY_PREFIX,
+    END_OF_FLAGS,
+    KUBECONFIG_FLAG,
     ClusterTarget,
     parse_gke_context,
     read_current_context,
@@ -52,6 +62,118 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
+
+# The cluster this broker runs on, as the operator names it in the pod spec. A
+# request that names no cluster resolves to this rather than to whatever the
+# base kubeconfig currently points at.
+HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
+# control plane that is down, private or firewalled parks a broker worker for
+# five minutes; `_kubectl_runs_long` decides what counts as one-shot.
+DEFAULT_KUBECTL_TIMEOUT_SECONDS = 60
+DEFAULT_KUBECTL_REQUEST_TIMEOUT = "30s"
+ENV_KUBECTL_TIMEOUT_SECONDS = "CREDENTIAL_PROXY_KUBECTL_TIMEOUT_SECONDS"
+
+# kubectl invocations meant to outlast a one-shot read: no injected
+# `--request-timeout`, and the broker-wide deadline. `command_policy` refuses
+# most of these a layer earlier, but this decides a deadline rather than an
+# authorisation, so the list is the wider one. Exempting a verb that did not
+# need it only forgoes a bound; missing one breaks a command the shipped skills
+# tell the agent to run (`logs -f`, `rollout status`, `wait`).
+KUBECTL_LONG_RUNNING_VERBS = (
+    "attach",
+    "debug",
+    "delete",
+    "exec",
+    "port-forward",
+    "proxy",
+    "rollout",
+    "wait",
+)
+# `--follow` streams until the caller stops reading. Only meaningful on `logs`:
+# `-f` is `--filename` everywhere else, so it is matched against the verb rather
+# than against the whole argv.
+KUBECTL_FOLLOW_VERB = "logs"
+KUBECTL_FOLLOW_FLAGS = ("-f", "--follow")
+# `get`/`describe` with a watch flag stream too.
+KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
+# A caller who named their own bound has already answered the question; honour
+# it rather than overriding it with a shorter one.
+KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
+
+# Bounds on what a command's output costs this process while the command runs.
+# Output is read as it streams and only the first `--max-output-bytes` of each
+# stream is kept; the rest is drained and discarded, because the caller was
+# never going to receive it. `Popen.communicate()` would buffer all of it first
+# and truncate afterwards, so one `kubectl get pods -A -o yaml` on a large
+# cluster cost tens of MiB in this process per in-flight command, and a burst
+# of concurrent triage sessions took the broker past its memory limit.
+OUTPUT_READ_CHUNK_BYTES = 64 * 1024
+# The stdin pipe is written in pieces this size, interleaved with the reads, so
+# a request body larger than the pipe buffer cannot deadlock against a child
+# that is already writing. PIPE_BUF because a write no larger than it does not
+# block once `select` has reported the pipe writable; a bigger write to a
+# blocking pipe can, with this process then unable to read the child's output
+# while the child waits for its input to be read -- the same reason
+# `Popen.communicate()` uses this size.
+STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
+# After a command is killed, how long its pipes are given to close before what
+# it had already written is given up on.
+KILLED_COMMAND_DRAIN_SECONDS = 5
+# How often a command that has closed both its pipes but is still running is
+# looked at: nothing can wake that wait, so the deadline and the caller's
+# hang-up are checked in steps this long.
+PIPES_CLOSED_POLL_SECONDS = 0.5
+# How many requests that run commands may be in flight at once. A slot is held
+# from the moment a request is admitted until its response is on the wire,
+# because everything the request costs lives that long: one child process -- a
+# kubectl listing a large cluster runs to hundreds of MiB on its own -- and,
+# in this process, the two capped stream buffers, their decoded strings, and
+# the JSON body and its encoding. For text output that is about six times
+# `--max-output-bytes` at peak, measured at 24 MiB per request against a 4 MiB
+# cap; for output that is not UTF-8 it is more, because every such byte becomes
+# a replacement character (`_bounded_text` says how much more, and bounds it).
+# A long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
+# long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+# from a constant of its own beside the output cap and reserves the name, and
+# its cap test sizes the container's memory limit against the two, so the
+# value an install runs moves with that limit rather than through the CR; this
+# default is for a broker run outside the operator. `CommandExecutor.request_slot`
+# says which routes hold a slot and why the others take none.
+DEFAULT_MAX_CONCURRENT_COMMANDS = 8
+ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# How long a request waits for a slot before it is refused with 503. Long
+# enough to ride out a burst of one-shot reads, short enough that a queue held
+# up by long-running commands answers its callers rather than parking them.
+COMMAND_SLOT_WAIT_SECONDS = 60
+# A wait for a slot this long is worth a log line: it says the broker is
+# queueing, which is what an operator sizing the cap needs to see.
+COMMAND_SLOT_WAIT_LOG_MS = 1000
+# The slot wait is taken in pieces this long so that a caller that hangs up
+# while queued is noticed between attempts and dropped without starting its
+# command -- a fork made only to be killed would cost a live request the slot.
+COMMAND_SLOT_POLL_SECONDS = 0.5
+# How long the write of a response may take before its caller is given up on.
+# A response is written while its request's slot is still held, so a caller
+# that stops reading would otherwise keep the slot for as long as it liked; a
+# 16 MiB body crosses the Pod network in well under a second.
+RESPONSE_WRITE_TIMEOUT_SECONDS = 60
+# The same bound from the other end, for the one route that reads its body
+# after admission: a vcs body, bundle included, has this long to arrive once
+# the request holds a slot, or a caller that stalls mid-send would keep the
+# slot with nothing running in it.
+REQUEST_READ_TIMEOUT_SECONDS = 60
+# What a socket reports once its peer has closed for good. POLLHUP and not
+# EOF, because a peer that has only shut its writing half -- legal after an
+# HTTP request, and still waiting for the response -- reads as EOF too.
+CALLER_GONE_EVENTS = select.POLLHUP | select.POLLERR | select.POLLNVAL
+# A command that has to be ended -- its deadline passed, or its caller went
+# away -- gets SIGTERM and this long to exit before SIGKILL. git removes its
+# lock files on SIGTERM and cannot on SIGKILL, and a lock left behind in a
+# leased workspace fails every later git there until the pod restarts.
+KILL_GRACE_SECONDS = 2
+KILL_POLL_SECONDS = 0.05
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -67,6 +189,86 @@ AGENT_API_DRAIN_TIMEOUT_SECONDS = 10
 # match and the length guard both live there, at the same 256 this module
 # enforced before; the alias keeps the name this module's own tests use.
 MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
+
+# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
+# prefix itself is API_RELAY_PREFIX, imported above from the client module so
+# the two sides cannot spell it differently. `api_policy` decides what may be
+# relayed; these bound how. docs/designs/gcp-api-relay.md argues each value.
+#
+# Connect timeout: matches BROKER_CONNECT_TIMEOUT_SECONDS on the client side.
+# A SYN dropped by an egress policy hangs rather than fails, and this is what
+# turns that into an answer.
+API_RELAY_CONNECT_TIMEOUT_S = 10
+# Total deadline for one relayed read, connect included. A week of per-pod
+# series for a large cluster at the API's maximum page size is the slowest read
+# the table admits, and Monitoring has been observed to take tens of seconds to
+# assemble such a page; two minutes leaves room for that without letting a
+# stalled upstream park a handler thread for long.
+API_RELAY_DEADLINE_S = 120
+# Response cap. A full `timeSeries` page at the API's maximum `pageSize` is
+# under 4 MiB; a body over this is answered 502 and the caller's remedy is a
+# smaller `pageSize`, which every listed endpoint supports. Read in chunks up
+# to the cap rather than with `.read()`, so the cap bounds memory too.
+API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+API_RELAY_READ_CHUNK_BYTES = 64 * 1024
+# Query keys removed before forwarding. Each is a way to substitute a
+# credential for the broker's or to change the response class: an API key
+# would bill and authorise as someone else, and the two token keys would
+# replace the bearer header. Everything else in the query is forwarded
+# byte-for-byte; the filter grammar is Google's to validate.
+# `bearer_token` is the deprecated spelling of the same system parameter.
+API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token", "bearer_token"})
+# The two headers the upstream request carries beyond `Host`, and the only
+# two. Every header the caller sent is dropped.
+API_RELAY_ACCEPT = "application/json"
+API_RELAY_UPSTREAM_PORT = 443
+# The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
+# DNS name, no scheme, port, user info or percent-encoding -- before the
+# policy sees it. Anything else is a 400, not something to normalise: the
+# table matches exact text and what it sees must be what is forwarded.
+#
+# A percent-encoded slash decodes to a segment boundary the route regex never
+# saw. Refused rather than decoded, for the same reason.
+API_RELAY_ENCODED_SLASH = re.compile(r"%2f", re.IGNORECASE)
+# The query is forwarded byte-for-byte, so it has to be bytes the upstream
+# request line can carry. The set is what http.client itself will put on a
+# request line -- printable ASCII other than space and the characters that
+# would need escaping to survive it -- and not RFC 3986's gen-delims split:
+# `[` and `]` are gen-delims the RFC keeps out of a query, but http.client
+# sends them raw, Google's front end accepts them, `requests` leaves them
+# unquoted, and two of the Managed Prometheus routes take `match[]=` while
+# every range vector carries `[5m]`. Refusing them would refuse the routes.
+# What stays out: a raw UTF-8 byte, a control character, space, and `" < > \\
+# ^ ` { | }`, which http.client would either raise on or an upstream would
+# have to guess at; a percent-escape must be complete. A byte outside the set
+# would otherwise reach http.client, which raises rather than sends, and the
+# caller would see a closed connection instead of the 400 this turns it into.
+API_RELAY_QUERY_SHAPE = re.compile(
+    r"^(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?\[\]]|%[0-9A-Fa-f]{2})*\Z"
+)
+# The longest query forwarded. Google's front end answers an over-long URL
+# with a 414 and `Connection: close`; with no cap a caller could send it one
+# on demand. 8 KiB is that front end's usual request-URL ceiling, and a
+# `timeSeries` filter with an aggregation and several groupBy fields is well
+# under 2 KiB.
+API_RELAY_MAX_QUERY_BYTES = 8 * 1024
+# The `code` a 400 carries, per part of the request that was not in normal
+# form, so a caller can tell which of its own inputs to correct.
+API_RELAY_BAD_HOST = "API_RELAY_BAD_HOST"
+API_RELAY_BAD_PATH = "API_RELAY_BAD_PATH"
+API_RELAY_BAD_QUERY = "API_RELAY_BAD_QUERY"
+# Path segments that name a position rather than a resource; a path carrying
+# one is not in normal form.
+API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
+# Longer than the default 64 because an API path is caller text that has to be
+# readable in the audit line; the same 256 the exec route gives a `cwd`.
+API_RELAY_PATH_LOG_LENGTH = 256
+# The width a principal is logged at. The value comes from the TokenReview,
+# not from the request, and a ServiceAccount username truncated at the default
+# 64 loses exactly its discriminating part; the exec route's audit line uses
+# the same 512 as a literal.
+PRINCIPAL_LOG_LENGTH = 512
+MILLISECONDS_PER_SECOND = 1000
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -259,6 +461,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL,)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
+    # The constant, not a literal: required_roles() answers () on a miss and
+    # _role_permits then admits every role, so a prefix spelled twice is a
+    # rename away from opening the relay to the gateway.
+    (API_RELAY_PREFIX, (CALLER_ROLE_SHELL,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -534,6 +740,25 @@ class AuthenticationError(Exception):
     The message is for this process's log. It is deliberately never returned
     to the client, which gets an undifferentiated 401 — telling an unidentified
     caller *why* it failed tells it how to succeed.
+    """
+
+
+class CommandSlotUnavailable(RuntimeError):
+    """A request waited COMMAND_SLOT_WAIT_SECONDS without reaching a free slot.
+
+    Slots go in arrival order, so this is the request that has waited longest,
+    whether the slots never freed or freed only for the requests ahead of it.
+    Answered 503 rather than run anyway: a request past the cap is the one that
+    would take the container over its memory limit, and an OOM kill fails every
+    request in flight for every caller, not just this one.
+    """
+
+
+class CallerHungUp(Exception):
+    """The caller closed its connection while its request waited for a slot.
+
+    Nothing to run and nobody to answer: the route logs it and returns, and the
+    slot goes to a caller that is still there.
     """
 
 
@@ -870,6 +1095,65 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
     )
 
 
+def sanitize_header(value: str) -> str:
+    """Strip CR/LF so an upstream header cannot split the response (CWE-113).
+
+    Shared by the agent API proxy, which relays every upstream header, and the
+    Cloud API relay, which relays one: a Content-Type is upstream text either way.
+    """
+    return value.replace("\r", "").replace("\n", "")
+
+
+def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
+    """Read a request body so a refusal is not lost to a connection reset.
+
+    Closing a socket that still holds unread request bytes sends a TCP RST,
+    and the peer discards whatever it has not yet handed to the application
+    -- including the response written a moment earlier. A client that POSTed
+    a body with the wrong key therefore read ECONNRESET rather than the 401
+    the agent API proxy sent, which is indistinguishable from a dead listener
+    and cost real time during an RC investigation. The credential proxy's
+    Cloud API relay has the same exposure on a refused POST.
+
+    Reachable before authentication on the agent API proxy, so it is bounded
+    three ways: it declines a body over ``max_bytes`` or one it cannot frame,
+    it discards in AGENT_API_DRAIN_CHUNK_BYTES chunks rather than
+    materialising the body, and it gives up after
+    AGENT_API_DRAIN_TIMEOUT_SECONDS so a client that announces a body and
+    stalls cannot hold the handler thread.
+
+    Declining the oversized case has a cost worth stating: a body over
+    ``max_bytes`` still loses its refusal to the reset, which is the symptom
+    this function exists to remove. Draining it anyway would mean reading an
+    unbounded stream from an unauthenticated caller to make an error message
+    survive, which is the trade the size limit already refused.
+    """
+    if handler.headers.get("Transfer-Encoding"):
+        return
+    try:
+        content_length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        return
+    if content_length <= 0 or content_length > max_bytes:
+        return
+    previous_timeout = handler.connection.gettimeout()
+    try:
+        handler.connection.settimeout(AGENT_API_DRAIN_TIMEOUT_SECONDS)
+        remaining = content_length
+        while remaining > 0:
+            chunk = handler.rfile.read(min(remaining, AGENT_API_DRAIN_CHUNK_BYTES))
+            if not chunk:
+                # The peer closed mid-body; there is nothing left to drain.
+                break
+            remaining -= len(chunk)
+    except (ConnectionError, TimeoutError, OSError):
+        # The peer went away or stalled mid-body. There is nothing left to protect.
+        LOGGER.debug("request body drain failed", exc_info=True)
+    finally:
+        with contextlib.suppress(OSError):
+            handler.connection.settimeout(previous_timeout)
+
+
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
@@ -972,64 +1256,170 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             upstream.close()
 
     def _drain_request_body(self) -> None:
-        """Read the request body so a refusal is not lost to a connection reset.
-
-        Closing a socket that still holds unread request bytes sends a TCP RST,
-        and the peer discards whatever it has not yet handed to the application
-        -- including the response written a moment earlier. A client that POSTed
-        a body with the wrong key therefore read ECONNRESET rather than the 401
-        this handler sent, which is indistinguishable from a dead listener and
-        cost real time during an RC investigation.
-
-        This runs before authentication, so it is reachable by any caller the
-        listener accepts, and it is bounded three ways: it declines a body over
-        max_request_bytes or one this handler cannot frame, it discards in
-        AGENT_API_DRAIN_CHUNK_BYTES chunks rather than materialising the body,
-        and it gives up after AGENT_API_DRAIN_TIMEOUT_SECONDS so a client that
-        announces a body and stalls cannot hold the handler thread.
-
-        Declining the oversized case has a cost worth stating: a body over
-        max_request_bytes still loses its refusal to the reset, which is the
-        symptom this method exists to remove. Draining it anyway would mean
-        reading an unbounded stream from an unauthenticated caller to make an
-        error message survive, which is the trade the size limit already
-        refused.
-        """
-        if self.headers.get("Transfer-Encoding"):
-            return
-        try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            return
-        if content_length <= 0 or content_length > self.max_request_bytes:
-            return
-        previous_timeout = self.connection.gettimeout()
-        try:
-            self.connection.settimeout(AGENT_API_DRAIN_TIMEOUT_SECONDS)
-            remaining = content_length
-            while remaining > 0:
-                chunk = self.rfile.read(min(remaining, AGENT_API_DRAIN_CHUNK_BYTES))
-                if not chunk:
-                    # The peer closed mid-body; there is nothing left to drain.
-                    break
-                remaining -= len(chunk)
-        except (ConnectionError, TimeoutError, OSError):
-            # The peer went away or stalled mid-body. There is nothing left to protect.
-            LOGGER.debug("PlatformAgent API request body drain failed", exc_info=True)
-        finally:
-            with contextlib.suppress(OSError):
-                self.connection.settimeout(previous_timeout)
+        """Drain the body before a pre-authentication refusal; see drain_request_body."""
+        drain_request_body(self, self.max_request_bytes)
 
     @staticmethod
     def _sanitize_header(value: str) -> str:
-        """Strip CR/LF so upstream headers cannot split the response (CWE-113)."""
-        return value.replace("\r", "").replace("\n", "")
+        """See sanitize_header; kept as a method for the call sites below."""
+        return sanitize_header(value)
 
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler hands the raw request line through here, so
         # every argument is caller text and it is logged before any
         # authentication runs. See CredentialProxyHandler.log_message.
         LOGGER.info("agent-api " + message, *_sanitized_log_args(args))
+
+
+@dataclass(frozen=True)
+class ApiRelayResponse:
+    """What one relayed read produced, bounded by the response cap."""
+
+    status: int
+    content_type: str
+    body: bytes
+    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
+    # is then empty, because a truncated JSON page is worse than no page.
+    over_cap: bool = False
+
+
+class ApiRelayConnectTimeout(OSError):
+    """The upstream did not accept a connection within API_RELAY_CONNECT_TIMEOUT_S.
+
+    Its own class so the handler answers it as "unreachable" (502) rather than
+    as the read deadline (504): a dropped SYN and a slow page are different
+    faults with different remedies, and the log names the timeout that fired.
+    """
+
+
+class GoogleApiRelay:
+    """The broker's own credential and transport for the read-only Cloud API relay.
+
+    The credential is the one `GoogleChatRelay` and `scoped_sa_pool` already
+    obtain -- `google.auth.default()`, the ambient Workload Identity token --
+    fetched once on first use and refreshed by google-auth when it expires.
+    Nothing is imported at construction, so a broker with no cloud libraries
+    (the test suite, a sidecar with no identity) starts as before and the
+    route answers 503 rather than the process refusing to come up.
+
+    `AuthorizedSession` is deliberately not used. The upstream request is built
+    by hand in `fetch` so that exactly two headers leave this process and no
+    header the caller sent can ride along.
+
+    `connection` is the seam a test replaces with a plain HTTPConnection to a
+    fake upstream; everything above it -- the header set, the deadline, the
+    cap -- then runs for real.
+    """
+
+    SCOPES = (scoped_sa_pool.CLOUD_PLATFORM_SCOPE,)
+
+    def __init__(self) -> None:
+        self._credentials: Any = None
+        self._lock = threading.Lock()
+        # Built once: create_default_context loads the CA bundle, and a
+        # context is safe to share across connections.
+        self._tls_context = ssl.create_default_context()
+
+    def authorization_header(self) -> str:
+        """`Bearer <token>` for the broker's identity, refreshed if it has lapsed."""
+        with self._lock:
+            if self._credentials is None:
+                import google.auth
+
+                self._credentials, _ = google.auth.default(scopes=list(self.SCOPES))
+            if not self._credentials.valid:
+                from google.auth.transport.requests import Request
+
+                self._credentials.refresh(Request())
+            return f"Bearer {self._credentials.token}"
+
+    def connection(self, host: str) -> http.client.HTTPConnection:
+        """A fresh TLS connection to `host`, with the connect bounded."""
+        return http.client.HTTPSConnection(
+            host,
+            API_RELAY_UPSTREAM_PORT,
+            timeout=API_RELAY_CONNECT_TIMEOUT_S,
+            context=self._tls_context,
+        )
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the relay deadline passed")
+        return remaining
+
+    def fetch(self, host: str, target: str, authorization: str) -> ApiRelayResponse:
+        """One `GET https://{host}{target}` on the broker's credential.
+
+        `target` is the path and query as the handler assembled them, already
+        checked against the policy and stripped of the credential keys. Raises
+        `TimeoutError` when API_RELAY_DEADLINE_S passes at any point, and lets
+        `OSError` and `http.client.HTTPException` through for the handler to
+        answer 502; redirects are not followed, the 3xx comes back as a status.
+        """
+        deadline = time.monotonic() + API_RELAY_DEADLINE_S
+        connection = self.connection(host)
+        try:
+            try:
+                connection.connect()
+            except TimeoutError as exc:
+                # The connect timeout, not the deadline: a SYN nobody answered.
+                raise ApiRelayConnectTimeout(
+                    f"connect to {host} did not complete in {API_RELAY_CONNECT_TIMEOUT_S}s"
+                ) from exc
+            # http.client's timeout is per socket operation, not total. The
+            # deadline is applied by re-arming the socket before each read
+            # with whatever is left of it. The reference is taken once:
+            # getresponse() sets connection.sock to None for a close-delimited
+            # response (`Connection: close`, HTTP/1.0, no length) while the
+            # body stays readable through the response's own file handle, and
+            # that handle keeps this socket open until the response is closed.
+            sock = connection.sock
+            sock.settimeout(self._remaining(deadline))
+            # `skip_accept_encoding`: without it http.client adds a third
+            # header of its own. `Host` is added, because HTTP/1.1 requires it.
+            connection.putrequest("GET", target, skip_accept_encoding=True)
+            connection.putheader("Authorization", authorization)
+            connection.putheader("Accept", API_RELAY_ACCEPT)
+            connection.endheaders()
+            response = connection.getresponse()
+            chunks: list[bytes] = []
+            received = 0
+            while True:
+                if response.isclosed():
+                    # read1 closes the response's handle when the last
+                    # Content-Length byte arrives (or at EOF), and for a
+                    # close-delimited response that is the last reference to
+                    # the socket, so the fd is gone: nothing left to re-arm
+                    # or to read.
+                    break
+                sock.settimeout(self._remaining(deadline))
+                # read1, not read: read(n) loops recv until it has n bytes and
+                # each recv re-arms the socket timeout, so an upstream that
+                # trickles could outlive the deadline by a chunk per recv.
+                # read1 returns after one recv, and the deadline is checked
+                # again before the next.
+                chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > API_RELAY_MAX_RESPONSE_BYTES:
+                    return ApiRelayResponse(
+                        response.status, response.getheader("Content-Type", ""), b"", True
+                    )
+                chunks.append(chunk)
+            if response.length:
+                # A Content-Length-framed response that closed early: read1
+                # returns b"" on EOF without raising, so a page cut short would
+                # otherwise relay as a well-framed 200 with a truncated body.
+                # Only the chunked path raises this on its own.
+                raise http.client.IncompleteRead(b"".join(chunks), response.length)
+            return ApiRelayResponse(
+                response.status, response.getheader("Content-Type", ""), b"".join(chunks)
+            )
+        finally:
+            connection.close()
 
 
 class GoogleChatRelay:
@@ -1650,6 +2040,9 @@ class ExecutionResult:
     # ran in this one. Empty for every other command. See
     # `_execute_get_credentials`.
     kubeconfig: str = ""
+    # The caller's connection closed while the command ran, and the command was
+    # killed for it. There is nobody to answer; the handler logs and returns.
+    abandoned: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -1681,6 +2074,41 @@ def _is_get_credentials(argv: list[str]) -> bool:
     except ValueError:
         return False
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def _kubectl_runs_long(argv: list[str]) -> bool:
+    """Is this a kubectl that is meant to block, rather than a one-shot read?
+
+    Read off the verb -- resolved through command_policy so global flags with
+    detached values do not hide it -- plus the flags that make an otherwise-
+    bounded verb stream.
+    """
+    verb_tuple, _ = command_policy._kubectl_verb_and_flag(argv)
+    verb = verb_tuple[0] if verb_tuple else ""
+    if not verb:
+        for arg in argv[1:]:
+            if not arg.startswith("-"):
+                verb = arg
+                break
+    if verb in KUBECTL_LONG_RUNNING_VERBS:
+        return True
+    if verb == KUBECTL_FOLLOW_VERB and any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_FOLLOW_FLAGS
+    ):
+        return True
+    if any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_WATCH_FLAGS
+    ):
+        return True
+    return any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_TIMEOUT_FLAGS
+    )
 
 
 # Identity stamped on commits the proxy makes on the agent's behalf. `git commit`
@@ -2865,6 +3293,269 @@ def broker_executables() -> tuple[str, ...]:
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 
 
+@dataclass
+class _CapturedOutput:
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
+    timed_out: bool
+    abandoned: bool
+
+
+def _caller_has_gone(caller: Any) -> bool:
+    """Has the connection a command runs for closed for good?
+
+    Decided from the socket's hang-up state, never from EOF: a peer that has
+    only shut its writing half -- legal after an HTTP request, and still
+    waiting for the response -- reads as EOF too, and ending its command would
+    refuse a valid request. On the Unix socket every shipped topology fronts
+    with Envoy, a peer that closed reports POLLHUP and a half-closed one does
+    not. A TCP peer reports neither until a write fails, so a broker spoken to
+    over TCP runs its commands unwatched, the way internal callers do.
+
+    Non-blocking, so it can be asked at any time -- while the command runs,
+    once `select` has reported the socket, and between attempts to take a slot.
+    """
+    try:
+        descriptor = caller.fileno()
+    except (OSError, ValueError):
+        return True
+    if descriptor < 0:
+        return True
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN)
+    flags = dict(poller.poll(0)).get(descriptor, 0)
+    return bool(flags & CALLER_GONE_EVENTS)
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    """End a command and everything it started. Never raises.
+
+    SIGTERM first, so a program that cleans up on it -- git and its lock files
+    above all -- gets KILL_GRACE_SECONDS to do so, then SIGKILL to the whole
+    group `_execute` started if anything in it is still there. `poll` reports
+    the child alone, and a helper it started that ignores SIGTERM would
+    otherwise outlive the kill, holding the pipes and running on outside the
+    slot it was counted under. The grace is the group's, not the child's: the
+    loop waits for the group to empty, so a helper cleaning up after its
+    parent exited gets the same two seconds, and Linux keeps the group's id
+    allocated for as long as any member lives. A group seen empty gets no
+    SIGKILL at all -- with the child reaped its id is free for reuse, and the
+    next new session in this container is the likeliest taker.
+    """
+
+    def signal_group(signum: int) -> None:
+        try:
+            os.killpg(process.pid, signum)
+        except OSError:
+            # ESRCH: nothing left to signal. The child is in that group, so
+            # there is no per-process fallback that could reach anything.
+            pass
+
+    def group_is_empty() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    signal_group(signal.SIGTERM)
+    grace_ends = time.monotonic() + KILL_GRACE_SECONDS
+    while time.monotonic() < grace_ends:
+        # Reap the child if it has exited; a zombie would otherwise keep the
+        # group looking occupied for the whole grace.
+        process.poll()
+        if group_is_empty():
+            # Nothing left to kill, and once the child is reaped the group's
+            # id is free for reuse -- by another command's new session, most
+            # likely -- so an emptied group is left alone.
+            return
+        time.sleep(KILL_POLL_SECONDS)
+    signal_group(signal.SIGKILL)
+
+
+def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:
+    """Decode a captured stream so that its UTF-8 form stays within `limit`.
+
+    Decoding with replacement can only grow the text: every byte that is not
+    UTF-8 becomes U+FFFD, three bytes when encoded again and four in memory,
+    so a stream of such bytes at the cap -- a container that logs binary --
+    would cost this process, and then the response, several times the cap
+    the capture was bounded to. Text that decodes cleanly is returned whole;
+    anything else is measured once encoded and cut at the limit on a character
+    boundary, and the cut is reported as truncation.
+    """
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        pass
+    # Piece by piece, so the measuring never holds a second full copy: a
+    # whole-stream decode and re-encode of 8 MiB of such bytes cost 40 MiB of
+    # transients on top of the result.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pieces: list[str] = []
+    budget = limit
+    for offset in range(0, len(raw), OUTPUT_READ_CHUNK_BYTES):
+        end = offset + OUTPUT_READ_CHUNK_BYTES
+        piece = decoder.decode(raw[offset:end], final=end >= len(raw))
+        encoded = piece.encode("utf-8")
+        if len(encoded) > budget:
+            pieces.append(encoded[:budget].decode("utf-8", errors="ignore"))
+            return "".join(pieces), True
+        pieces.append(piece)
+        budget -= len(encoded)
+    return "".join(pieces), False
+
+
+def _capture_output(
+    process: subprocess.Popen,
+    stdin: bytes | None,
+    limit: int,
+    timeout: float,
+    caller: Any = None,
+) -> _CapturedOutput:
+    """Run a started command to completion holding at most `limit` bytes per stream.
+
+    What `Popen.communicate()` does, with three differences that are the point:
+    output past `limit` is read and dropped as it arrives instead of being kept
+    until the end, so the memory a command costs this process does not depend
+    on how much it prints; `caller`, when given, is the socket the command is
+    being run for, and its closing kills the command rather than leaving it to
+    run to its deadline for nobody; and a command that is killed -- for either
+    reason -- still has what it managed to write collected, briefly, so a
+    timed-out kubectl's partial output and stderr reach the caller.
+
+    Returns once the command has exited. `process.returncode` is set.
+    """
+    deadline = time.monotonic() + timeout
+    outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
+    truncated = False
+    pending = memoryview(stdin) if stdin else None
+    written = 0
+    selector = selectors.DefaultSelector()
+    for stream in outputs:
+        selector.register(stream, selectors.EVENT_READ)
+    if process.stdin is not None:
+        if pending is not None:
+            selector.register(process.stdin, selectors.EVENT_WRITE)
+        else:
+            process.stdin.close()
+    if caller is not None:
+        try:
+            selector.register(caller, selectors.EVENT_READ)
+        except (ValueError, OSError):
+            # Already closed, or not a file descriptor at all: run unwatched,
+            # as every internal caller does.
+            caller = None
+
+    def pump(until: float, watch_caller: bool) -> tuple[bool, bool]:
+        """Read until every pipe closes, `until` passes, or the caller leaves.
+
+        Returns (timed_out, abandoned).
+        """
+        nonlocal truncated, written
+        if not watch_caller and caller is not None:
+            with contextlib.suppress(KeyError, ValueError):
+                selector.unregister(caller)
+        # Until every pipe is done, stdin included: a child that closes its
+        # outputs and goes on reading its input still has to be fed, or it
+        # blocks on a pipe nobody writes to until the deadline kills it.
+        while any(not stream.closed for stream in outputs) or (
+            process.stdin is not None and not process.stdin.closed
+        ):
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return True, False
+            for key, _ in selector.select(remaining):
+                stream = key.fileobj
+                if stream is caller:
+                    if _caller_has_gone(caller):
+                        return False, True
+                    # Readable but not hung up: bytes that are not this
+                    # protocol's, or a peer that shut its writing half and is
+                    # waiting for the answer. Either way it is still there;
+                    # stop watching rather than spin, and let the command run.
+                    selector.unregister(caller)
+                    continue
+                if stream is process.stdin:
+                    try:
+                        written += os.write(
+                            stream.fileno(),
+                            pending[written : written + STDIN_WRITE_CHUNK_BYTES],
+                        )
+                    except BrokenPipeError:
+                        # The child stopped reading; what it did not take is
+                        # its business, exactly as it is for communicate().
+                        written = len(pending)
+                    if written >= len(pending):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
+                data = os.read(stream.fileno(), OUTPUT_READ_CHUNK_BYTES)
+                if not data:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                buffer = outputs[stream]
+                room = limit - len(buffer)
+                if room > 0:
+                    buffer += data[:room]
+                if len(data) > room:
+                    truncated = True
+        return False, False
+
+    try:
+        timed_out, abandoned = pump(deadline, watch_caller=True)
+        if timed_out or abandoned:
+            _kill_process_group(process)
+            # What the command wrote before it died is still in the pipes, and
+            # what is left to wait for after that is the reaping.
+            pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
+            try:
+                process.wait(timeout=KILLED_COMMAND_DRAIN_SECONDS)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                process.wait()
+        else:
+            # Every pipe closed but the command is still running -- it handed
+            # them to a child, or closed them itself. Nothing can wake a wait
+            # now, so it is taken in steps: the deadline still applies, and so
+            # does the caller's hang-up, and either gets the command the same
+            # end a command that kept writing gets.
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                elif caller is not None and _caller_has_gone(caller):
+                    abandoned = True
+                else:
+                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
+                    continue
+                _kill_process_group(process)
+                process.wait()
+    except BaseException:
+        # Whatever went wrong in here -- a read or write that raised, the
+        # thread being torn down -- the child does not get to outlive the
+        # capture: it would run on outside the cap, unwatched and unreaped.
+        _kill_process_group(process)
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in (process.stdin, *outputs):
+            if stream is not None and not stream.closed:
+                stream.close()
+    return _CapturedOutput(
+        stdout=bytes(outputs[process.stdout]),
+        stderr=bytes(outputs[process.stderr]),
+        truncated=truncated,
+        timed_out=timed_out,
+        abandoned=abandoned,
+    )
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = broker_executables()
 
@@ -2874,9 +3565,29 @@ class CommandExecutor:
         max_output_bytes: int,
         state_dir: str,
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
+        kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.kubectl_timeout_seconds = kubectl_timeout_seconds
         self.max_output_bytes = max_output_bytes
+        # See DEFAULT_MAX_CONCURRENT_COMMANDS; `parse_args` reads the operator's
+        # value from the environment, the way it does the other bounds.
+        if max_concurrent_commands < 1:
+            raise ValueError(f"{ENV_MAX_CONCURRENT_COMMANDS} must be at least 1")
+        self.max_concurrent_commands = max_concurrent_commands
+        # The slots are handed out in arrival order: a request holds a ticket
+        # in this queue while it waits, and only the ticket at the head may
+        # take a free slot. A semaphore would not do -- a waiter whose timed
+        # acquire lapses rejoins the wait at the back, so under sustained
+        # saturation the caller that had waited longest was as likely to be
+        # refused as one that had just arrived.
+        self._slot_condition = threading.Condition()
+        self._slots_in_use = 0
+        self._slot_queue: collections.deque[object] = collections.deque()
+        # The deadline the commands of the request on this thread share; set by
+        # `request_slot` for as long as the slot is held, read by `_execute`.
+        self._request_budget = threading.local()
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -3065,6 +3776,10 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # Read here rather than forwarded into `self.environment`: this decides
+        # which kubeconfig a request resolves to, and a subprocess has no
+        # business reading it or overriding it.
+        self.host_context = os.environ.get(HOST_CONTEXT_ENV, "").strip()
         # Applied per invocation in `_execute`, and only to git, rather than
         # written once to ~/.gitconfig: the identity then stays scoped to the
         # proxied commands that need it and leaves no ambient state in the
@@ -3095,6 +3810,99 @@ class CommandExecutor:
             LOGGER.info(
                 "scoped service account pool armed scopes=%d", len(self.scoped_pool.scopes)
             )
+
+    @property
+    def slots_in_use(self) -> int:
+        """How many requests hold a slot right now."""
+        with self._slot_condition:
+            return self._slots_in_use
+
+    @property
+    def queued_requests(self) -> int:
+        """How many requests are waiting for a slot right now."""
+        with self._slot_condition:
+            return len(self._slot_queue)
+
+    @contextlib.contextmanager
+    def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
+        """Hold one concurrency slot for the whole of a request.
+
+        Taken by the routes that run agent-selected commands -- `/v1/exec` and
+        `/v1/vcs/*` -- around the command and the response together, because
+        the memory a request costs lives until its response is written: the
+        child, the captured output, the decoded strings, the JSON body and its
+        encoding. Released when the command exited, the slot would let a caller
+        that reads slowly keep its body alive while the next command holds the
+        slot, and the number of bodies in memory would be the number of
+        callers rather than the cap. The other routes take no slot: the forge
+        refresh is a short call to the minter, the content workspace's git is
+        serialised by the store's own lock, and the Cloud API relay answers
+        from a bounded read of its own.
+
+        Slots go in arrival order. The wait is woken every
+        COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
+        checked each time: one that has hung up while queued raises
+        `CallerHungUp` before anything is started, rather than taking the slot
+        a live request is waiting for. A request still queued after
+        COMMAND_SLOT_WAIT_SECONDS raises `CommandSlotUnavailable`; with the
+        queue ordered, that is the request that has waited longest, not
+        whichever one a semaphore happened to pass over.
+
+        While the slot is held, every command run on this thread shares one
+        deadline, the broker-wide `timeout_seconds` counted from admission:
+        `_execute` caps each command to what is left of it. A vcs verb runs
+        several network git commands back to back and a first kubectl on an
+        uncached cluster fetches credentials first, and without the shared
+        deadline a request's silent worst case would be that many deadlines
+        end to end -- longer than the idle time Envoy allows the stream in
+        front of the broker, which is sized against this one.
+        """
+        queued_at = time.monotonic()
+        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        ticket = object()
+        with self._slot_condition:
+            self._slot_queue.append(ticket)
+            try:
+                while not (
+                    self._slot_queue[0] is ticket
+                    and self._slots_in_use < self.max_concurrent_commands
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Worded for the queue: slots may well have freed in
+                        # the meantime and gone to earlier arrivals, so "none
+                        # finished" would be false for a request that was
+                        # overtaken rather than starved.
+                        raise CommandSlotUnavailable(
+                            f"the credential proxy is at its limit of "
+                            f"{self.max_concurrent_commands} concurrent commands and this "
+                            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                            f"free slot; retry shortly"
+                        )
+                    self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
+                    if caller is not None and _caller_has_gone(caller):
+                        raise CallerHungUp("the caller disconnected while queued for a slot")
+                self._slots_in_use += 1
+            finally:
+                # Admitted or leaving, the ticket comes out and the next in
+                # line is woken to look again.
+                self._slot_queue.remove(ticket)
+                self._slot_condition.notify_all()
+        self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+        try:
+            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
+            if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
+                LOGGER.info(
+                    "request waited %dms for a slot (all %d slots were busy)",
+                    waited_ms,
+                    self.max_concurrent_commands,
+                )
+            yield
+        finally:
+            self._request_budget.deadline = None
+            with self._slot_condition:
+                self._slots_in_use -= 1
+                self._slot_condition.notify_all()
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -3147,7 +3955,18 @@ class CommandExecutor:
         cwd: str | None = None,
         kubeconfig_context: str | None = None,
         wants_kubeconfig: bool = False,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
+        """Run an agent-selected command.
+
+        `caller` is the connection the command is being run for. While the
+        command runs the connection is watched, and its closing ends the
+        command: a triage session torn down mid-command otherwise leaves its
+        kubectl running to the deadline, holding a slot and buffering output
+        for nobody. The route holds the request's slot around this call and
+        the response (`request_slot`), and watches the same connection while
+        queued. See `_caller_has_gone` for what counts as closing.
+        """
         if (
             not isinstance(argv, list)
             or not argv
@@ -3166,7 +3985,9 @@ class CommandExecutor:
         # kubeconfig, so it is handled separately: it writes, everything else
         # reads.
         if _is_get_credentials(argv):
-            return self._execute_get_credentials(command, stdin, cwd, wants_kubeconfig)
+            return self._execute_get_credentials(
+                command, stdin, cwd, wants_kubeconfig, caller=caller
+            )
 
         # Two ways in, and both have to be covered or the other is a bypass.
         # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
@@ -3182,6 +4003,18 @@ class CommandExecutor:
         # the pool existed -- regenerated on the ambient identity, never
         # selected on.
         scoped = executable == "kubectl"
+        # Bound the one-shot read; a command meant to block keeps kubectl's own
+        # default. Decided here rather than in `_execute` because the argv
+        # arrives there carrying the flag this branch just injected, and reading
+        # it back would conclude the caller had asked for it.
+        kubectl_deadline: int | None = None
+        if executable == "kubectl" and not _kubectl_runs_long(command):
+            kubectl_deadline = self.kubectl_timeout_seconds
+            command = [
+                command[0],
+                f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+                *command[1:],
+            ]
         command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
         if flag_kubeconfig is not None:
             # The flag beats the environment, because that is the precedence
@@ -3231,12 +4064,21 @@ class CommandExecutor:
             stdin=stdin,
             cwd=cwd,
             kubeconfig_path=kubeconfig_path,
+            timeout_seconds=kubectl_deadline,
+            caller=caller,
         )
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
     ) -> ExecutionResult:
-        """Run a trusted, operator-defined helper that is not agent selectable."""
+        """Run a trusted, operator-defined helper that is not agent selectable.
+
+        Slots are a request's, not a command's (`request_slot`), so a helper
+        takes none of its own: it runs inside whichever request needed it -- a
+        vcs verb refreshing its credential -- or, from the refresh route and
+        the cron behind it, inside none. It is a short call to the minter
+        either way, not a listing.
+        """
         return self._execute(argv, cwd=cwd)
 
     def execute_workspace_git(
@@ -3682,20 +4524,28 @@ class CommandExecutor:
         return scoped
 
     def _ambient_target(self) -> ClusterTarget | None:
-        """The cluster the sidecar's own kubeconfig points at, if any.
+        """The cluster a request that names none resolves to.
 
-        This is the file `bootstrap` asked gcloud to write, so reading it is not
-        the same act as reading one the agent handed over — nothing here is
-        caller-controlled. It matters because `KUBECONFIG` is set in the base
-        environment: a `kubectl` request that names no kubeconfig at all still
-        reaches a cluster, and if the pool did not cover that path it would be
-        the one door left open onto the ambient credential.
+        `KUBECONFIG` is set in the base environment, so a `kubectl` naming no
+        kubeconfig at all still reaches a cluster, and if the pool did not cover
+        this path it would be the one door left open onto the ambient
+        credential.
+
+        The operator names the host cluster in the environment and that wins: it
+        is fixed for the life of the pod, while the kubeconfig's
+        `current-context` is whatever last wrote the file. The file is the
+        fallback, for a broker started outside the operator -- reading it is
+        safe because `bootstrap` wrote it, not the agent.
         """
+        if self.host_context:
+            target = parse_gke_context(self.host_context)
+            if target is not None:
+                return target
         try:
             text = Path(self.environment["KUBECONFIG"]).read_text(
                 encoding="utf-8", errors="replace"
             )
-        except OSError:
+        except (KeyError, OSError):
             return None
         context = read_current_context(text)
         return parse_gke_context(context) if context else None
@@ -3734,22 +4584,31 @@ class CommandExecutor:
         already put its cluster through pool selection, and selecting a *second*
         cluster for the same request is not a second control, it is a bug. The
         last flag wins, the way kubectl reads them.
+
+        Stops at `--`, where the shim's scan stops too. After it the words are
+        the command `kubectl exec` or `kubectl debug` runs in the pod, kubectl
+        does not read them as its own flags, and the shim forwarded any
+        `--kubeconfig` there as the path it was. Resolving that path here would
+        refuse the request as a non-GKE context name; the two sides have to
+        agree on where kubectl's flags end.
         """
         rewritten = list(command)
         resolved_path: Path | None = None
         index = 1
         while index < len(rewritten):
             argument = rewritten[index]
-            if argument == "--kubeconfig" and index + 1 < len(rewritten):
+            if argument == END_OF_FLAGS:
+                break
+            if argument == KUBECONFIG_FLAG and index + 1 < len(rewritten):
                 resolved_path = self._resolve_kubeconfig(rewritten[index + 1], scoped=scoped)
                 rewritten[index + 1] = str(resolved_path)
                 index += 2
                 continue
-            if argument.startswith("--kubeconfig="):
+            if argument.startswith(f"{KUBECONFIG_FLAG}="):
                 resolved_path = self._resolve_kubeconfig(
                     argument.split("=", 1)[1], scoped=scoped
                 )
-                rewritten[index] = f"--kubeconfig={resolved_path}"
+                rewritten[index] = f"{KUBECONFIG_FLAG}={resolved_path}"
             index += 1
         return rewritten, resolved_path
 
@@ -3781,7 +4640,12 @@ class CommandExecutor:
             return []
 
         def run(argv: list[str]) -> tuple[int, str]:
-            result = self._execute([gcloud, *argv[1:]])
+            # The short deadline: this is a control-plane lookup made on the
+            # way to a kubectl, not a command the caller chose, and it runs
+            # silently under the kubeconfig lock. See _ensure_managed_kubeconfig.
+            result = self._execute(
+                [gcloud, *argv[1:]], timeout_seconds=self.kubectl_timeout_seconds
+            )
             return result.exit_code, result.stdout
 
         return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
@@ -3817,6 +4681,12 @@ class CommandExecutor:
                         *self._dns_endpoint_args(gcloud, target),
                     ],
                     kubeconfig_path=scratch,
+                    # The short deadline, as for the describe above. A
+                    # credential fetch takes seconds when the API answers, and
+                    # when it does not, five minutes of silence here -- ahead of
+                    # the kubectl's own deadline, inside the same request --
+                    # would outlast the idle timeout Envoy allows the stream.
+                    timeout_seconds=self.kubectl_timeout_seconds,
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
@@ -3834,6 +4704,7 @@ class CommandExecutor:
         stdin: str | None,
         cwd: str | None,
         wants_kubeconfig: bool,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
         """Run the one command that is allowed to author a kubeconfig.
 
@@ -3849,14 +4720,15 @@ class CommandExecutor:
         Returned rather than written: the destination is a path in the agent's
         pod, which this process cannot see and must not be handed a route into.
         """
-        if not wants_kubeconfig:
-            # No destination asked for, so gcloud updates the broker's own
-            # config as it always has. Nothing agent-authored is involved.
-            return self._execute(command, stdin=stdin, cwd=cwd)
-
+        # Always execute into an isolated scratch file: left to itself gcloud
+        # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
+        # config, moving the `current-context` that every later context-less
+        # kubectl resolves against.
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
-            result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
+            result = self._execute(
+                command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch, caller=caller
+            )
             if result.exit_code == 0 and scratch.is_file():
                 generated = scratch.read_text(encoding="utf-8")
                 context = read_current_context(generated)
@@ -3868,7 +4740,8 @@ class CommandExecutor:
                     # redundant fetch. Taking the lock here would serialise every
                     # scaffold behind every cold read for no benefit.
                     os.replace(scratch, self._managed_kubeconfig(target))
-                result = replace(result, kubeconfig=generated)
+                if wants_kubeconfig:
+                    result = replace(result, kubeconfig=generated)
             return result
         finally:
             scratch.unlink(missing_ok=True)
@@ -3881,6 +4754,8 @@ class CommandExecutor:
         kubeconfig_path: Path | None = None,
         containment_root: Path | None = None,
         extra_config: tuple[tuple[str, str], ...] = (),
+        timeout_seconds: int | None = None,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -3893,9 +4768,19 @@ class CommandExecutor:
         caller. `execute_workspace_git` passes the broker-owned content
         workspace root instead — the two roots are proven disjoint at startup,
         so widening the check here cannot widen the other path.
+
+        `timeout_seconds` overrides the broker-wide deadline for this one
+        command; `execute` passes the shorter kubectl bound through it.
+
+        `caller` is the connection the command answers, if it answers one; see
+        `_capture_output`. Internal callers leave it unset.
+
+        No concurrency slot is taken here. A slot is a request's, held by the
+        route from admission until the response is written (`request_slot`),
+        so every command a request runs -- the kubeconfig cache-fill made under
+        `_kubeconfig_lock` included -- is covered by the one its request holds,
+        and no lock is ever held while waiting for a slot.
         """
-        started = time.monotonic()
-        timed_out = False
         root = containment_root or self.workspace_dir
         command_cwd = root
         if cwd:
@@ -3933,6 +4818,17 @@ class CommandExecutor:
             )
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
+        effective_timeout: float = (
+            timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        )
+        request_deadline = getattr(self._request_budget, "deadline", None)
+        if request_deadline is not None:
+            # The commands of one request share its deadline (`request_slot`);
+            # a command that starts with nothing left gets nothing, and comes
+            # back timed out rather than running past what the request was
+            # allowed.
+            effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
+        started = time.monotonic()
         process = subprocess.Popen(
             argv,
             cwd=command_cwd,
@@ -3942,29 +4838,37 @@ class CommandExecutor:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        try:
-            stdout_bytes, stderr_bytes = process.communicate(
-                input=stdin.encode("utf-8") if stdin is not None else None,
-                timeout=self.timeout_seconds,
+        captured = _capture_output(
+            process,
+            stdin=stdin.encode("utf-8") if stdin is not None else None,
+            limit=self.max_output_bytes,
+            timeout=effective_timeout,
+            caller=caller,
+        )
+        stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
+        stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
+        if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
+            target_str = (
+                f"target kubeconfig {kubeconfig_path}"
+                if kubeconfig_path
+                else "ambient cluster target"
             )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            stdout_bytes, stderr_bytes = process.communicate()
+            # Appended after the bound, so a stream already at the cap does
+            # not push the one line that explains the exit code off the end.
+            stderr_text += (
+                f"\n[credential-proxy] kubectl command timed out after {effective_timeout:.0f}s "
+                f"({target_str})\n"
+            )
 
-        stdout_bytes, stdout_truncated = self._truncate(stdout_bytes)
-        stderr_bytes, stderr_truncated = self._truncate(stderr_bytes)
         duration_ms = int((time.monotonic() - started) * 1000)
         return ExecutionResult(
-            exit_code=124 if timed_out else process.returncode,
-            stdout=stdout_bytes.decode("utf-8", errors="replace"),
-            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+            exit_code=124 if captured.timed_out else process.returncode,
+            stdout=stdout_text,
+            stderr=stderr_text,
             duration_ms=duration_ms,
-            truncated=stdout_truncated or stderr_truncated,
-            timed_out=timed_out,
+            truncated=captured.truncated or stdout_cut or stderr_cut,
+            timed_out=captured.timed_out,
+            abandoned=captured.abandoned,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -4159,6 +5063,62 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     )
 
 
+def api_relay_target_problem(host: str, path: str, query: str) -> tuple[str, str] | None:
+    """Why the request is not in normal form, as ``(code, reason)``, or None.
+
+    Refuses rather than normalises. The policy table in `api_policy` matches
+    exact text, and the property the relay rests on is that what the table
+    saw is what the broker forwards; a normaliser between the two is a second
+    parser that can disagree with the first. So a `..` segment, an empty
+    segment, a percent-encoded slash, a scheme or a port in the host position,
+    or a query byte the upstream request line cannot carry are each a 400 that names the
+    reason and, in ``code``, which part of the request to correct.
+    """
+    if not host:
+        return API_RELAY_BAD_HOST, "the request names no upstream host"
+    if not api_policy.HOST_SHAPE.match(host):
+        return API_RELAY_BAD_HOST, (
+            "the host segment must be a lower-case DNS name with no scheme, port, "
+            "user info or encoding"
+        )
+    if not path:
+        return API_RELAY_BAD_PATH, "the request names no API path"
+    if API_RELAY_ENCODED_SLASH.search(path):
+        return API_RELAY_BAD_PATH, "a percent-encoded slash in the path is not in normal form"
+    for segment in path.split("/"):
+        if segment in API_RELAY_DOT_SEGMENTS:
+            return API_RELAY_BAD_PATH, "an empty, `.` or `..` path segment is not in normal form"
+    if len(query) > API_RELAY_MAX_QUERY_BYTES:
+        return API_RELAY_BAD_QUERY, (
+            f"the query is longer than {API_RELAY_MAX_QUERY_BYTES} bytes; use pageSize and "
+            f"pageToken rather than a longer filter"
+        )
+    if not API_RELAY_QUERY_SHAPE.match(query):
+        return API_RELAY_BAD_QUERY, (
+            "the query may contain only URL query characters (RFC 3986's set plus [ and ]) "
+            "and complete percent-escapes"
+        )
+    return None
+
+
+def strip_credential_query_keys(query: str) -> str:
+    """The query with API_RELAY_STRIPPED_QUERY_KEYS removed and nothing else touched.
+
+    Split on `&` and rejoined rather than parsed and re-encoded, so every pair
+    that stays is forwarded byte-for-byte: the filter grammar is Google's to
+    validate, and a re-encoding here would be a second opinion about it.
+    """
+    kept = []
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        key = urllib.parse.unquote_plus(pair.partition("=")[0])
+        if key in API_RELAY_STRIPPED_QUERY_KEYS:
+            continue
+        kept.append(pair)
+    return "&".join(kept)
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
@@ -4173,6 +5133,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    # The read-only Cloud API relay's credential and transport. Armed by
+    # serve() unconditionally, like the exec route: the shell role always
+    # exists. None only in a test that has not set it, where the route
+    # answers 503.
+    api_relay: GoogleApiRelay | None = None
     base_branch: str = ""
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
@@ -4305,6 +5270,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path != "/healthz" and self._authenticated() is None:
             return
+        if self.path.startswith(API_RELAY_PREFIX):
+            self._handle_api_relay()
+            return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
                 self._json(
@@ -4349,6 +5317,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
         if principal is None:
+            return
+        if self.path.startswith(API_RELAY_PREFIX):
+            # Reaches the relay so that the refusal is the policy's
+            # `gcp.api.method`, named in the audit line, rather than a 404
+            # that reads as "no such route". The body is never read.
+            self._handle_api_relay()
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
@@ -4539,13 +5513,62 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute(
-                exec_argv,
-                stdin=stdin,
-                cwd=cwd,
-                kubeconfig_context=kubeconfig_context,
-                wants_kubeconfig=wants_kubeconfig,
+            # One slot for the command and its response together; see
+            # CommandExecutor.request_slot for why the response is inside it.
+            with self._request_slot():
+                result = self.executor.execute(
+                    exec_argv,
+                    stdin=stdin,
+                    cwd=cwd,
+                    kubeconfig_context=kubeconfig_context,
+                    wants_kubeconfig=wants_kubeconfig,
+                    # The connection this command answers. Its closing
+                    # mid-command kills the command; see CommandExecutor.execute.
+                    caller=self.connection,
+                )
+                if result.abandoned:
+                    # The connection is gone, so there is no response to write;
+                    # the log line is the record that the command was ended.
+                    LOGGER.info(
+                        "command abandoned request_id=%s duration_ms=%d: the caller "
+                        "disconnected and the command was killed",
+                        request_id,
+                        result.duration_ms,
+                    )
+                    return
+                LOGGER.info(
+                    "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
+                    request_id,
+                    result.exit_code,
+                    result.duration_ms,
+                    result.truncated,
+                )
+                response = {
+                    "status": "completed",
+                    "exitCode": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "durationMs": result.duration_ms,
+                    "truncated": result.truncated,
+                    "timedOut": result.timed_out,
+                }
+                # Only `get-credentials` fills this, and only when the caller
+                # asked for the file. It is gcloud's own output, not anything
+                # the agent wrote.
+                if result.kubeconfig:
+                    response["kubeconfig"] = result.kubeconfig
+                self._json(HTTPStatus.OK, response)
+        except CallerHungUp:
+            LOGGER.info(
+                "command abandoned request_id=%s: the caller disconnected while queued "
+                "for a slot; the command was not started",
+                request_id,
             )
+            return
+        except CommandSlotUnavailable as exc:
+            LOGGER.warning("command queued too long request_id=%s", request_id)
+            self._busy(exc)
+            return
         except scoped_sa_pool.PoolRefusal as exc:
             # A refusal, not a fault and not a caller error: the request was
             # well formed and the deployment holds no credential narrow enough
@@ -4596,27 +5619,229 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "credential proxy command execution failed"},
             )
             return
+
+    def _handle_api_relay(self) -> None:
+        """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
+
+        The second shape the broker speaks, beside the argv of `/v1/exec`. The
+        caller is already authenticated and its role checked against
+        ROUTE_ROLES by `_authenticated`; what happens here, in order, is the
+        normal-form check on the caller's text, the `api_policy` decision, the
+        upstream request with exactly the broker's two headers, and the
+        passthrough of the upstream's status, `Content-Type` and body. Two
+        audit lines per request, on the exec route's pattern: one before the
+        decision and exactly one verdict -- rejected, blocked, forwarded, or
+        one of the upstream failures. `host` and `path` are caller text and go through
+        `_sanitize_for_logging` as `argv[0]` does. docs/designs/gcp-api-relay.md
+        is the design and its security review names which line stops what.
+        """
+        principal = self.principal
+        request_id = str(uuid.uuid4())
+        if self.command != api_policy.API_READ_METHOD:
+            # A POST is refused below without its body being read, and closing
+            # on unread bytes sends a reset that can swallow the 403. Same
+            # bounded drain the agent API proxy uses for its pre-auth 401.
+            drain_request_body(self, self.max_request_bytes)
+        parts = urllib.parse.urlsplit(self.path)
+        host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
         LOGGER.info(
-            "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
+            "api request_id=%s principal=%s host=%s path=%s",
             request_id,
-            result.exit_code,
-            result.duration_ms,
-            result.truncated,
+            # Same width as the exec line, for the same reason: this value is
+            # the TokenReview's, and a truncated identity names the wrong
+            # ServiceAccount.
+            _sanitize_for_logging(
+                principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
+            ),
+            _sanitize_for_logging(host),
+            _sanitize_for_logging(path, max_length=API_RELAY_PATH_LOG_LENGTH),
         )
-        response = {
-            "status": "completed",
-            "exitCode": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "durationMs": result.duration_ms,
-            "truncated": result.truncated,
-            "timedOut": result.timed_out,
-        }
-        # Only `get-credentials` fills this, and only when the caller asked for
-        # the file. It is gcloud's own output, not anything the agent wrote.
-        if result.kubeconfig:
-            response["kubeconfig"] = result.kubeconfig
-        self._json(HTTPStatus.OK, response)
+        problem = api_relay_target_problem(host, path, parts.query)
+        if problem is not None:
+            code, reason = problem
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason
+            )
+            self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
+            return
+        # From here on `host` has passed api_policy.HOST_SHAPE, so the lines
+        # below log it as-is; `path` is never logged again.
+        decision = api_policy.evaluate(self.command, host, path, parts.query)
+        if not decision.allowed:
+            LOGGER.warning("api blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return
+        if self.api_relay is None:
+            LOGGER.warning("api disabled request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
+            )
+            return
+        try:
+            authorization = self.api_relay.authorization_header()
+        except Exception as exc:
+            # The type and not the message: google-auth's messages can name
+            # the credential file it looked for.
+            LOGGER.warning(
+                "api credential unavailable request_id=%s type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the credential proxy could not obtain its own credential",
+                    "code": "RELAY_CREDENTIAL_UNAVAILABLE",
+                },
+            )
+            return
+        query = strip_credential_query_keys(parts.query)
+        target = f"/{path}?{query}" if query else f"/{path}"
+        started = time.monotonic()
+        try:
+            upstream = self.api_relay.fetch(host, target, authorization)
+        except ApiRelayConnectTimeout:
+            LOGGER.warning(
+                "api upstream connect timeout request_id=%s host=%s connect_timeout_s=%d",
+                request_id,
+                host,
+                API_RELAY_CONNECT_TIMEOUT_S,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return
+        except TimeoutError:
+            LOGGER.warning(
+                "api upstream timeout request_id=%s host=%s deadline_s=%d",
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            self._json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {
+                    "error": "the upstream did not answer within the relay deadline",
+                    "code": "UPSTREAM_TIMEOUT",
+                },
+            )
+            return
+        except (UnicodeError, http.client.InvalidURL) as exc:
+            # Belt to the query check's braces: what putrequest raises for a
+            # target it will not send -- a non-ASCII byte, a control character
+            # -- is the caller's text, and a 400 that names it beats a
+            # traceback and a closed connection. UnicodeError and not
+            # ValueError: ssl.SSLCertVerificationError is a ValueError too, and
+            # a TLS fault is the upstream's, answered 502 below.
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s",
+                request_id,
+                API_RELAY_BAD_QUERY,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "the request could not be placed on an upstream request line",
+                    "code": API_RELAY_BAD_QUERY,
+                },
+            )
+            return
+        except http.client.IncompleteRead as exc:
+            # The upstream closed before delivering what it announced. Its own
+            # code, so an operator can tell a page cut short from a host that
+            # never answered; nothing of the partial body is relayed.
+            LOGGER.warning(
+                "api upstream truncated request_id=%s host=%s received=%d expected=%d",
+                request_id,
+                host,
+                len(exc.partial),
+                len(exc.partial) + (exc.expected or 0),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "the upstream closed before sending the whole response",
+                    "code": "UPSTREAM_TRUNCATED",
+                },
+            )
+            return
+        except (OSError, http.client.HTTPException) as exc:
+            LOGGER.warning(
+                "api upstream unreachable request_id=%s host=%s type=%s",
+                request_id,
+                host,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return
+        duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
+        if upstream.over_cap:
+            LOGGER.warning(
+                "api response too large request_id=%s host=%s status=%d cap_bytes=%d",
+                request_id,
+                host,
+                upstream.status,
+                API_RELAY_MAX_RESPONSE_BYTES,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": (
+                        f"the upstream response exceeded {API_RELAY_MAX_RESPONSE_BYTES} "
+                        f"bytes; request a smaller pageSize"
+                    ),
+                    "code": "UPSTREAM_RESPONSE_TOO_LARGE",
+                },
+            )
+            return
+        if HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
+            # Not followed, and not handed to the caller as a redirect either:
+            # a Location the sandbox followed itself would be a request the
+            # policy never saw.
+            LOGGER.warning(
+                "api redirect refused request_id=%s host=%s status=%d",
+                request_id,
+                host,
+                upstream.status,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": (
+                        "the upstream answered with a redirect, which the relay does not follow"
+                    ),
+                    "code": "UPSTREAM_REDIRECTED",
+                },
+            )
+            return
+        LOGGER.info(
+            "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d",
+            request_id,
+            host,
+            upstream.status,
+            len(upstream.body),
+            duration_ms,
+        )
+        self.send_response(upstream.status)
+        if upstream.content_type:
+            self.send_header("Content-Type", sanitize_header(upstream.content_type))
+        self.send_header("Content-Length", str(len(upstream.body)))
+        self.end_headers()
+        self.wfile.write(upstream.body)
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.
@@ -4875,34 +6100,63 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if route is None:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
+        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
-            payload = self._read_json_body(
-                max_bytes=max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
+            # One slot for the whole request: the body, which may carry a
+            # bundle of tens of MiB and is not read until the request is
+            # admitted, the verb's git commands, and the response. See
+            # CommandExecutor.request_slot for why the response is inside it;
+            # the body is inside it for the same reason, from the other end.
+            with self._request_slot():
+                # Read under one deadline for the whole body: the slot is held
+                # from here on, and a caller that stalls or trickles mid-send
+                # would otherwise keep it with nothing running in it. A stalled
+                # peer is not a hang-up -- its socket reports no POLLHUP -- so
+                # the watch that ends an abandoned wait does not cover this.
+                # (A handler the route tests build by hand has no connection;
+                # see _request_slot.)
+                try:
+                    if getattr(self, "connection", None) is None:
+                        payload = self._read_json_body(max_bytes=body_limit)
+                    else:
+                        payload = self._read_json_body_within(
+                            body_limit, REQUEST_READ_TIMEOUT_SECONDS
+                        )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except OSError as exc:
+                    LOGGER.warning(
+                        "request body not received verb=%s type=%s", verb, type(exc).__name__
+                    )
+                    return
+                # The managed-repository control, on the same footing as
+                # `require_managed_workspace` on the content routes: the broker
+                # holds the forge credential, so "is this a repository we write
+                # to" can only be answered here. Nothing downstream answers it
+                # -- a forge is handed a repository and spends the token on it
+                # -- so this is the whole of the check for these routes.
+                #
+                # Resolved rather than compared as given, because the managed
+                # list holds slugs and a caller may name a repository by URL.
+                # Resolving here also rejects a host this install serves no
+                # credential for before the write verb is entered, which is the
+                # same order `/v1/forge/refresh` uses.
+                if verb in vcs_broker.WRITE_VERBS:
+                    try:
+                        _, repository = self.vcs.registry.resolve(payload.get("repository"))
+                    except providers.WorkspaceError as exc:
+                        self._json(HTTPStatus(exc.status), _redacted_fields(exc))
+                        return
+                    if not self._repository_is_permitted(repository):
+                        return
+                result = route(payload)
+                self._json(HTTPStatus.OK, result)
+        except CallerHungUp:
+            LOGGER.info(
+                "vcs %s abandoned: the caller disconnected while queued for a slot", verb
             )
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-        # The managed-repository control, on the same footing as
-        # `require_managed_workspace` on the content routes: the broker holds
-        # the forge credential, so "is this a repository we write to" can only
-        # be answered here. Nothing downstream answers it -- a forge is handed a
-        # repository and spends the token on it -- so this is the whole of the
-        # check for these routes.
-        #
-        # Resolved rather than compared as given, because the managed list holds
-        # slugs and a caller may name a repository by URL. Resolving here also
-        # rejects a host this install serves no credential for before the write
-        # verb is entered, which is the same order `/v1/forge/refresh` uses.
-        if verb in vcs_broker.WRITE_VERBS:
-            try:
-                _, repository = self.vcs.registry.resolve(payload.get("repository"))
-            except providers.WorkspaceError as exc:
-                self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                return
-            if not self._repository_is_permitted(repository):
-                return
-        try:
-            result = route(payload)
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
             # `refresh_forge_credential` raises it: the credential strategy asks
@@ -4936,13 +6190,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
             )
             return
+        except CommandSlotUnavailable as exc:
+            # Raised before the body was read, so nothing is left half-done --
+            # and the body is drained before the answer, or a caller still
+            # sending a large one would see the connection reset in place of
+            # the 503.
+            LOGGER.warning("command queued too long verb=%s", verb)
+            drain_request_body(self, body_limit)
+            self._busy(exc)
+            return
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
             return
-        self._json(HTTPStatus.OK, result)
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -4951,6 +6213,37 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("request exceeds configured size limit")
         payload = json.loads(self.rfile.read(content_length))
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return payload
+
+    def _read_json_body_within(self, max_bytes: int, seconds: float) -> dict[str, Any]:
+        """`_read_json_body` for a body read while a slot is held.
+
+        The whole body has `seconds` to arrive, not each piece of it. A socket
+        timeout bounds one `recv`, so a body that trickles a byte at a time
+        inside that window would never time out; here one deadline is fixed
+        up front and the timeout re-armed with what is left of it before every
+        read, and `read1` takes at most one `recv` per call, so no single call
+        can outlast the deadline either. Raises `TimeoutError` when it passes.
+        """
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0 or content_length > max_bytes:
+            raise ValueError("request exceeds configured size limit")
+        deadline = time.monotonic() + seconds
+        chunks: list[bytes] = []
+        remaining = content_length
+        while remaining:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("the request body did not arrive in time")
+            self.connection.settimeout(left)
+            chunk = self.rfile.read1(min(remaining, OUTPUT_READ_CHUNK_BYTES))
+            if not chunk:
+                raise ConnectionError("the connection closed before the request body was complete")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = json.loads(b"".join(chunks))
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
         return payload
@@ -5100,12 +6393,60 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # Not ASCII-escaped: a replacement character standing in for a byte
+        # that was not UTF-8 is three bytes on the wire this way and six as
+        # `�`, and `_bounded_text` sized the text for the former. JSON is
+        # UTF-8 and every caller reads it as such.
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8", errors="replace"
+        )
+        # Written under a deadline: a request's slot is held until its response
+        # is on the wire, and a caller that stops reading must not keep it. A
+        # write that fails is logged rather than raised -- the caller is the
+        # one party that cannot be told.
+        self.connection.settimeout(RESPONSE_WRITE_TIMEOUT_SECONDS)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as exc:
+            LOGGER.warning(
+                "response not delivered status=%d bytes=%d type=%s",
+                int(status),
+                len(body),
+                type(exc).__name__,
+            )
+
+    def _request_slot(self) -> contextlib.AbstractContextManager:
+        """This request's concurrency slot, watched on this connection.
+
+        `serve` always installs a `CommandExecutor`, which has one, and every
+        handler the server builds has a connection. The stand-ins the route
+        tests put in their place predate the slot, as they predate
+        `resolve_git_command` above: an executor without one gets no slot
+        rather than a fault, and a handler without a connection an unwatched
+        wait.
+        """
+        executor = getattr(self, "executor", None)
+        if hasattr(executor, "request_slot"):
+            return executor.request_slot(caller=getattr(self, "connection", None))
+        return contextlib.nullcontext()
+
+    def _busy(self, exc: CommandSlotUnavailable) -> None:
+        """Answer a broker at its concurrency cap, on whichever route asked.
+
+        Not a refusal of what was asked and not a fault: the command past the
+        cap is the one that would take the container over its memory limit.
+        `error` is the key the shim prints, so the agent reads why rather than
+        a bare exit 1, and `code` lets a caller tell "busy, retry" from a
+        failure.
+        """
+        self._json(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
+        )
 
 
 def start_agent_api_proxy() -> ThreadingHTTPServer:
@@ -5219,6 +6560,12 @@ def serve(args: argparse.Namespace) -> None:
         timeout_seconds=args.timeout_seconds,
         max_output_bytes=args.max_output_bytes,
         state_dir=args.state_dir,
+        kubectl_timeout_seconds=getattr(
+            args, "kubectl_timeout_seconds", DEFAULT_KUBECTL_TIMEOUT_SECONDS
+        ),
+        max_concurrent_commands=getattr(
+            args, "max_concurrent_commands", DEFAULT_MAX_CONCURRENT_COMMANDS
+        ),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
@@ -5236,6 +6583,8 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
+    CredentialProxyHandler.api_relay = GoogleApiRelay()
+    LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
@@ -5331,6 +6680,17 @@ def parse_args() -> argparse.Namespace:
         default=int(os.getenv("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "300")),
     )
     parser.add_argument(
+        "--kubectl-timeout-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                ENV_KUBECTL_TIMEOUT_SECONDS,
+                str(DEFAULT_KUBECTL_TIMEOUT_SECONDS),
+            )
+        ),
+        help="Timeout in seconds for kubectl execution",
+    )
+    parser.add_argument(
         "--max-request-bytes",
         type=int,
         default=int(os.getenv("CREDENTIAL_PROXY_MAX_REQUEST_BYTES", "1048576")),
@@ -5339,6 +6699,14 @@ def parse_args() -> argparse.Namespace:
         "--max-output-bytes",
         type=int,
         default=int(os.getenv("CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", "4194304")),
+    )
+    parser.add_argument(
+        "--max-concurrent-commands",
+        type=int,
+        default=int(
+            os.getenv(ENV_MAX_CONCURRENT_COMMANDS, str(DEFAULT_MAX_CONCURRENT_COMMANDS))
+        ),
+        help="How many requests that run commands may be in flight at once",
     )
     parser.add_argument(
         "--state-dir",

@@ -14,17 +14,18 @@
 
 """Leaf verifiers this repository adds to devops-bench's own.
 
-Three of them answer the half of a task's exact checks that cluster state
+Four of them answer the half of a task's exact checks that cluster state
 cannot: did the *report* name the thing we planted, did the agent *call* the
-tools it claims to have used, and — for the fleet audits, whose SOPs
-deliberately keep the chat reply to one line — does the *ledger issue the run
-published* carry the finding. All three read the per-run stash in
-:mod:`kube_agents_bench.transcript`, and all three fail closed: an empty
+tools it claims to have used, does the *ledger issue the run published* carry
+the finding — for the fleet audits, whose SOPs deliberately keep the chat reply
+to one line — and is the *pull request* the reply links one this run opened
+rather than an earlier one. All four read the per-run stash in
+:mod:`kube_agents_bench.transcript`, and all four fail closed: an empty
 stash is ``status="error"`` — the check could not be evaluated — never a pass
 or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
-The fourth, ``fleet_resource_property``, does read cluster state, and exists
+The fifth, ``fleet_resource_property``, does read cluster state, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -43,7 +44,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -69,6 +70,7 @@ from kube_agents_bench.fleet import (
 __all__ = [
     "FleetResourcePropertyVerifier",
     "LedgerIssueContainsVerifier",
+    "PullRequestOpenedVerifier",
     "ReportContainsVerifier",
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
@@ -79,6 +81,11 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
+_NO_WORKER_CALLS_REASON = (
+    "no delegated worker's tool calls are in the trajectory: either no card was "
+    "delegated or the worker-trajectory capture did not run, so a check scoped to "
+    "the workers cannot observe its subject"
+)
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -87,7 +94,9 @@ _NO_TRANSCRIPT_REASON = (
 # (gke-labs/kube-agents#982) on a report the OutcomeValidity judge scored
 # 1.00, and enumerating markdown shapes in every task.yaml would only encode
 # one run's formatting.
-_MARKDOWN_NOISE = str.maketrans("", "", "*_`")
+# Markdown emphasis is dropped; the typographic apostrophe folds to ASCII
+# so a pattern spells each contraction ("don't") exactly once.
+_MARKDOWN_NOISE = str.maketrans({"*": None, "_": None, "`": None, "’": "'"})
 
 
 def _normalize(text: str) -> str:
@@ -110,6 +119,16 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
+def _normalize_lines(text: str) -> str:
+    """``_normalize`` applied per line, newlines kept.
+
+    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
+    end on; the whitespace collapse above would otherwise fuse a negated
+    bullet into its unnegated neighbour before the regex runs.
+    """
+    return "\n".join(_normalize(line) for line in text.splitlines())
+
+
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
     """Exact phrase checks against the agent's answer.
@@ -117,6 +136,14 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
+    ``forbidden_patterns`` is the one regex exception, for the shape a
+    substring cannot express: a banned word whose negated uses are
+    legitimate ("no guarantee"). Each is ``re.search``ed against a
+    line-preserving variant of the same normalization — newlines survive,
+    so a Markdown bullet or heading with no terminal punctuation is its own
+    segment and a pattern may anchor on ``\\n``; the flat collapse would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -144,7 +171,15 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -156,20 +191,26 @@ class ReportContainsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
-        text = _normalize(
-            snap.final_message if self.scope == "final" else snap.output
-        )
+        raw = snap.final_message if self.scope == "final" else snap.output
+        text = _normalize(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
+        pattern_hits = [
+            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
+        ]
         any_of_miss = bool(self.any_of_phrases) and not any(
             _normalize(p) in text for p in self.any_of_phrases
         )
-        if missing or present or any_of_miss:
+        if missing or present or pattern_hits or any_of_miss:
             parts = []
             if missing:
                 parts.append(f"required phrases absent from the report: {missing}")
             if present:
                 parts.append(f"forbidden phrases present in the report: {present}")
+            if pattern_hits:
+                parts.append(
+                    f"forbidden patterns matched in the report: {pattern_hits}"
+                )
             if any_of_miss:
                 parts.append(
                     f"none of the alternative phrasings present: {self.any_of_phrases}"
@@ -188,6 +229,10 @@ class ReportContainsVerifier(BaseVerifier):
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
         ]
+        if self.forbidden_patterns:
+            satisfied.append(
+                f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
+            )
         if self.any_of_phrases:
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
@@ -199,30 +244,70 @@ class ReportContainsVerifier(BaseVerifier):
         )
 
 
+# Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
+# the tools it actually invoked under args["calls"][*]["name"].
+_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
+    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
+    if entry.get("name") != _TOOL_CALL_WRAPPER:
+        return set()
+    args = entry.get("args")
+    calls = args.get("calls") if isinstance(args, dict) else None
+    if not isinstance(calls, list):
+        return set()
+    return {str(c.get("name")) for c in calls if isinstance(c, dict) and c.get("name")}
+
+
 @VERIFIERS.register("tool_called")
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
 
-    THE TRAJECTORY IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
-    design, ``result.trajectory`` holds only the delegating turn's calls:
-    poll-turn calls are the harness's own bookkeeping and are kept out
-    (``_fold_status_turn``), and a delegated worker's calls never reach it
-    at all. This verifier can therefore assert what the ROUTER did
-    (``kanban_create`` is the router's own call) and nothing about what a
-    worker did on a cluster — a mutation safeguard built on it would be
-    blind to the very calls it fears. Use a cluster-state check
-    (``resource_property``) for those.
+    ``scope`` says whose calls count. The trajectory holds two kinds of
+    entry: the delegating turn's own calls (poll-turn calls are the
+    harness's bookkeeping and are kept out, ``_fold_status_turn``), and the
+    delegated workers' calls, which the harness appends after settlement
+    tagged with the ``agent`` that made them (``worker_trajectory``).
+
+    - ``router`` (the default, and what every check written before the
+      workers' calls were recorded means): the delegating turn's calls only,
+      so ``kanban_create`` counts and the worker's ``kanban_complete`` does
+      not. A cluster-mutation safeguard in this scope is blind to the calls
+      it fears; use a cluster-state check (``resource_property``) for those.
+    - ``workers``: the tagged entries only -- what the platform worker and
+      any Cluster Agent called on the run's cards. This is the scope that
+      sees which MCP tool a worker reached for.
+    - ``all``: both.
+
+    ``workers`` and ``all`` fail closed on a trajectory that carries no
+    tagged entry: a worker that ran made at least one call (its
+    ``kanban_complete``), so no tagged entry means the capture did not run,
+    or the router never delegated, and either way the check cannot observe
+    its subject -- ``status="error"``, never a pass, the same rule
+    ``worker_commands`` applies to an absent capture.
 
     Passes when at least ``minimum_calls`` matching calls were made. Wrapped
     in a ``none`` compound, it is the safeguard shape "this tool was never
-    called", within the router-only limits above. Names match the harness's
-    canonical trajectory entries (``ToolCall.to_dict()["name"]``), e.g.
-    ``kanban_create``.
+    called", within the chosen scope. Names match the harness's canonical
+    trajectory entries (``ToolCall.to_dict()["name"]``), e.g.
+    ``kanban_create``; a worker's entries carry the name the profile's
+    session store recorded for the tool.
+
+    A worker reaches an MCP tool through Hermes' ``tool_call`` wrapper: the
+    entry is named ``tool_call`` and the tool actually invoked sits in its
+    arguments, ``{"calls": [{"name": "mcp__developer_knowledge__search_documents",
+    "arguments": {...}}]}`` (measured on build 2102459327938826240, #1765).
+    A name in ``tool_names`` therefore also matches a ``tool_call`` entry
+    whose ``calls`` list names it, else a worker's MCP calls would be
+    invisible to this check by name. One wrapper entry counts once however
+    many of its calls match; ``require_success`` reads the wrapper's status.
     """
 
     type: Literal["tool_called"]
     tool_names: list[str] = Field(min_length=1)
     minimum_calls: int = Field(default=1, ge=1)
+    scope: Literal["router", "workers", "all"] = "router"
     # Objectives set this: a call the harness marked status="error" produced
     # no effect (kanban_create that failed filed no card), so counting it
     # would pass a check whose subject never happened. Safeguards leave it
@@ -240,12 +325,23 @@ class ToolCalledVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
+        entries = [entry for entry in snap.trajectory if isinstance(entry, dict)]
+        if self.scope != "router" and not any(entry.get("agent") for entry in entries):
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_CALLS_REASON,
+            )
+        if self.scope == "router":
+            entries = [entry for entry in entries if not entry.get("agent")]
+        elif self.scope == "workers":
+            entries = [entry for entry in entries if entry.get("agent")]
         wanted = set(self.tool_names)
         calls = [
             entry
-            for entry in snap.trajectory
-            if isinstance(entry, dict)
-            and entry.get("name") in wanted
+            for entry in entries
+            if (entry.get("name") in wanted or _wrapped_tool_names(entry) & wanted)
             and not (self.require_success and entry.get("status") == "error")
         ]
         count = len(calls)
@@ -254,7 +350,7 @@ class ToolCalledVerifier(BaseVerifier):
             success=ok,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{count} call(s) to {sorted(wanted)} in the trajectory"
+                f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
                 f" (minimum {self.minimum_calls})"
             ),
             raw={"matching_calls": count},
@@ -288,10 +384,30 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
+# The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
+# on a ledger it retires before a repetition (RESET_MARKER there;
+# scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
+# ledger a report still cites is read for it, so the harness's own close is
+# named as such rather than blamed on the run.
+LEDGER_RESET_MARKER = "<!-- kube-agents-eval-ledger-reset -->"
+# How far back from a ledger's closed_at that comment is asked for, and the
+# page it is asked for on. The reset posts the comment and closes seconds
+# later; an hour is generous and keeps the read to one page.
+_RESET_COMMENT_LOOKBACK = timedelta(hours=1)
+_GITHUB_PAGE_SIZE = 100
+_GITHUB_SINCE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 # github.com only, and issues only: `/pull/<n>` is a remediation pull request,
 # which every audit report also links and which is not the ledger.
 _ISSUE_URL_RE = re.compile(
     r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)/issues/(\d+)",
+    re.IGNORECASE,
+)
+
+# The other half of the pair above: pull requests only. A remediation case is
+# graded on the PR it opened, and the ledger issue beside it is not that.
+_PULL_URL_RE = re.compile(
+    r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)/pull/(\d+)",
     re.IGNORECASE,
 )
 
@@ -316,16 +432,73 @@ _LEDGER_FOOTER_RE = re.compile(
 _DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
+# Mirrors the output of its `all_findings_block`, which the script writes but
+# never parses, so no test on that side checks this regex against it
+# (`test_the_complete_block_regex_reads_what_audit_report_writes` does): every finding id
+# in the document plus the collector-held ids, written only when the body cut
+# findings for space. The delta block above then lists the rendered ones
+# alone, and a finding filed but cut would read as never filed.
+_ALL_FINDINGS_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
+)
 
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
 # candidates to shotgun the API with.
 _MAX_LEDGER_CANDIDATES = 8
 
+# A report that retired the ledger rather than filing on it, in the words the
+# harness and the audit's closing line use for that: `render_clean_comment`'s
+# "found **0 findings**" and "is now clean", and the roll-up a parent writes
+# when it paraphrases the worker ("The open ledger issue has been closed").
+# Consulted only when the report names no issue URL at all, where the two
+# ways of arriving there -- a worker that never returned and a worker that
+# closed the ledger as clean and dropped the pointer -- used to share one
+# sentence (#1683). Clause-bounded so "closed" and "ledger" have to be about
+# each other.
+_CLEAN_CLOSE_RE = re.compile(
+    r"ledger[^\n.]{0,80}?\bclosed\b|\bclosed\b[^\n.]{0,80}?\bledger\b"
+    r"|\b0 findings\b|\bfound nothing\b|\bno findings\b|\bis now clean\b",
+    re.IGNORECASE,
+)
+
+# Matches when the worker queued the audit for a future cron schedule or reported
+# that the on-demand trigger was unavailable (#1876), instead of running the audit.
+_QUEUED_INSTEAD_OF_RUN_RE = re.compile(
+    r"\b(?:queued\s+(?:to\s+run|for\s+its\s+next|for\s+the\s+next|the\s+stream)|"
+    r"on-demand\s+trigger\s+is\s+unavailable|"
+    r"stream\s+will\s+run\s+on\s+its\s+\d{2}:\d{2}\s+schedule|"
+    r"will\s+run\s+on\s+its\s+next\s+cron\s+schedule)\b",
+    re.IGNORECASE,
+)
+
 _NO_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell this run's ledger from a previous "
     "run's and refuses to grade it"
+)
+
+# Bound on pull request URLs resolved from one report, for the reason
+# _MAX_LEDGER_CANDIDATES exists: a remediation reply links the PR it opened,
+# and a report naming a dozen is one to read by hand.
+_MAX_PR_CANDIDATES = 8
+
+# Page size for the pull request's commit listing. The head is on the last
+# page, so the page number is computed from the total the pulls endpoint
+# reports; GitHub caps the listing at 250, and a pull request longer than that
+# simply yields no head commit rather than the wrong one.
+_PR_COMMITS_PAGE_SIZE = 100
+
+_NO_PR_RUN_CLOCK_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check cannot tell a pull request this run opened from "
+    "one left behind by a previous run, and refuses to grade it"
+)
+
+_NO_PR_URL_REASON = (
+    "the run's report names no github.com pull request URL, so no fix was "
+    "proposed (or the agent did not report the PR it opened); a remediation "
+    "reply must carry the pull request URL in full"
 )
 
 _NO_TOKEN_REASON = (
@@ -354,8 +527,9 @@ _MAX_NAMED_COMMANDS = 5
 class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
 
-    The one check that sees the ROUTE a worker took rather than the answer it
-    gave. ``tool_called`` cannot: a worker's calls never reach the trajectory.
+    Sees the ROUTE a worker took rather than the answer it gave, through the
+    terminal commands it typed; ``tool_called`` under ``scope: workers`` is
+    the companion for the MCP tool calls it made (see its docstring).
     The harness reads each delegated card's worker log before purging it and
     stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
     this verifier matches Python regular expressions against those strings,
@@ -435,6 +609,88 @@ class WorkerCommandsVerifier(BaseVerifier):
         )
 
 
+_NO_WORKER_AGENTS_REASON = (
+    "no delegated worker's tool calls were captured for this run: either no card "
+    "was delegated, the run ended before the cards settled, or the worker "
+    "trajectory could not be read -- so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("worker_agents")
+class WorkerAgentsVerifier(BaseVerifier):
+    """Checks which profiles the delegated workers ran as.
+
+    The harness appends each delegated worker's tool calls to the trajectory
+    tagged with ``agent``, the profile that made the call
+    (:mod:`kube_agents_bench.worker_trajectory`). ``tool_called`` skips those
+    entries and ``worker_commands`` sees commands but not who ran them, so
+    neither can tell a card a Cluster Agent worked from one the Platform Agent
+    kept. This reads the tags and nothing else.
+
+    ``required_agents``: Python regular expressions, each of which must
+    ``re.fullmatch`` the ``agent`` tag of at least one worker entry.
+
+    Fails closed like its siblings: a run with no tagged entries is
+    ``status="error"``, not a fail -- the harness saw no worker at all. So is
+    a required profile missing from a capture that recorded gaps
+    (``worker_capture_gaps``): a store it could not open or a fan-out it
+    clipped may hold exactly the calls that would have matched, and grading
+    that as the agent taking the wrong route would be a guess.
+    """
+
+    type: Literal["worker_agents"]
+    required_agents: list[str] = Field(min_length=1)
+
+    @field_validator("required_agents")
+    @classmethod
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        agents = sorted({str(e["agent"]) for e in snap.trajectory if e.get("agent")})
+        if not agents:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_AGENTS_REASON,
+            )
+        missing = [p for p in self.required_agents if not any(re.fullmatch(p, a) for a in agents)]
+        if missing and snap.worker_capture_gaps:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"no captured worker ran as a profile matching {missing} (workers seen: {agents}), "
+                    f"but the capture was incomplete, so this check could not be evaluated: "
+                    f"{'; '.join(snap.worker_capture_gaps)}"
+                ),
+            )
+        if missing:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"no delegated worker ran as a profile matching {missing}; workers ran as {agents}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
+        )
+
+
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     """One GET against the GitHub REST API. The whole faked surface in tests.
 
@@ -481,7 +737,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     """The ledger footer's ``(audit id, generated-at)``, or None when absent.
 
     The LAST match, not the first. ``render_issue_body`` assembles the body as
-    ``fixed + findings + withheld + evidence + footer``, so every byte the
+    ``fixed + findings + held + declared + withheld + evidence + footer``, so every byte the
     agent authored — finding titles and impacts through ``clip_text``, which
     redacts credentials and clips length but neither strips backticks nor
     flattens newlines, and evidence excerpts into a raw fenced block — sits
@@ -493,7 +749,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     hidden ``audit-findings`` delta block is rendered after it — but nothing
     the agent writes can ever appear below it, so the final match is the one
     ``audit_report.py`` wrote. Same reason ``_finding_ids`` reads
-    ``matches[-1]``.
+    the last match.
     """
     match = None
     for match in _LEDGER_FOOTER_RE.finditer(body):
@@ -512,18 +768,44 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     return match.group("audit").strip(), stamp
 
 
-def _finding_ids(body: str) -> list[str] | None:
-    """This run's finding ids from the hidden delta block, or None when absent."""
-    matches = _DELTA_RE.findall(body)
-    if not matches:
+def _parse_github_time(value: Any) -> datetime | None:
+    """A GitHub API timestamp (``2026-09-17T03:12:16Z``) as an aware datetime, or None."""
+    if not isinstance(value, str) or not value.strip():
         return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     try:
-        ids = json.loads(matches[-1])
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def _finding_ids(body: str) -> tuple[list[str], str] | None:
+    """This run's finding ids and the block they came from, or None when the ledger carries no block.
+
+    The complete-list block when the body has one, since only a truncated body
+    writes it and there the delta block holds the rendered subset; the delta
+    block otherwise, which then names every finding. Both by their last match,
+    for the reason ``_parse_footer`` gives, and the complete list only BELOW
+    the last delta block, where ``_render_footer`` puts it: an untruncated
+    body has no real one, so a copy an agent wrote into a finding above the
+    footer would otherwise outrank the delta block that does.
+    """
+    deltas = list(_DELTA_RE.finditer(body))
+    if not deltas:
+        return None
+    last = deltas[-1]
+    complete = [m for m in _ALL_FINDINGS_RE.finditer(body) if m.start() > last.end()]
+    source = "audit-findings-all" if complete else "audit-findings"
+    try:
+        ids = json.loads((complete or deltas)[-1].group(1))
     except (ValueError, TypeError):
         return None
     if not isinstance(ids, list):
         return None
-    return [i for i in ids if isinstance(i, str)]
+    return [i for i in ids if isinstance(i, str)], source
 
 
 @VERIFIERS.register("ledger_issue_contains")
@@ -543,8 +825,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     prints ``"issue": null`` until a ledger exists (only ``finish`` ever calls
     ``gh issue create``), the audit's ``.lease`` marker on disk records the
     repo and the audit id but no issue number, and the audit runs in a
-    delegated worker whose tool calls never reach ``snap.trajectory``. What
-    does cross back is ``finish``'s ``issue_url``, which the SOP requires
+    delegated worker whose calls reach ``snap.trajectory`` only as clipped,
+    tagged entries that no verifier reads for content. What does cross back
+    is ``finish``'s ``issue_url``, which the SOP requires
     every non-silent report to carry in full — and an on-demand run, which is
     what an eval task is, is never silent. The URL is treated as a POINTER and
     never as evidence: everything asserted below comes from what GitHub
@@ -591,12 +874,44 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     recommendations, and the scope table.
 
     ``finding_ids`` — only the ids in the hidden ``<!-- audit-findings: … -->``
-    delta block, which ``audit_report.py`` derives as
+    delta block (or, on a body truncated for size, the
+    ``<!-- audit-findings-all: … -->`` block listing every filed and
+    collector-held finding),
+    which ``audit_report.py`` derives as
     ``<check>.<cluster>.<namespace>.<object>``. Use it whenever the phrase is a
     CLUSTER name: the body's scope table names every audited cluster on every
     run, so ``required_phrases: ["seeded-c"]`` against ``body`` would pass on a
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
+
+    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger without
+    rewriting its body, so a ledger the audit retired during this run still
+    carries the previous run's stamp and would read, above, as "a previous
+    run's ledger, so this run published nothing" — the one thing that run had
+    not done. When the issue is ``closed`` and its ``closed_at`` falls inside
+    this run, the reason says the ledger was closed as clean while this case
+    expected a finding on it. The same distinction is drawn when the report
+    names no URL at all but says in words that the ledger was closed or that
+    nothing was found (``_CLEAN_CLOSE_RE``): rep 2 of the 2026-09-16 nightly
+    did exactly that and shared its reason with a delegation that never
+    returned (#1683). Neither is a new pass or fail; both are the same fail
+    with a reason a reader can act on.
+
+    THE HARNESS'S OWN CLOSE IS NAMED AS SUCH. ``hack/ci-eval-pr.sh`` retires
+    the stream's open ledger before every repetition
+    (``hack/ci_reset_audit_ledgers.py``), seconds before devops-bench starts
+    the run, so that ``closed_at`` falls inside the same window a false clean
+    would. A worker that cites the retired ledger instead of the fresh one it
+    should have opened did not close it: when a closed ledger carries a
+    ``LEDGER_RESET_MARKER`` comment posted within ``max_clock_skew_sec`` of
+    its ``closed_at``, the reason says the harness reset it before this run
+    started. Bound to the close on purpose: the reset comments first and
+    closes second, so a reset whose close failed leaves the marker on an OPEN
+    ledger, and a worker's genuine false clean on it later must not inherit
+    the harness's name from a comment that is minutes or hours older than the
+    close. Still a fail, since the run published nothing to the ledger it
+    named; only the sentence changes, whichever side of ``started_at`` the
+    close fell on.
     """
 
     type: Literal["ledger_issue_contains"]
@@ -625,6 +940,44 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _closed_by_the_reset(
+        self, api_url: str, closed_at: datetime, token: str, budget: float
+    ) -> bool | None:
+        """Whether the harness's reset marker was posted alongside this close.
+
+        ``True`` or ``False`` when the comments were read; ``None`` when they
+        could not be (a transport fault or a non-200), which the caller
+        reports instead of treating it as either answer. Only comments from
+        the hour before the close are asked for, and only a marker comment
+        created within ``max_clock_skew_sec`` of ``closed_at`` counts: the
+        reset posts its comment and closes seconds later, so a marker that is
+        older than that belongs to a reset whose close failed, not to this
+        close.
+        """
+        closed_at = closed_at.astimezone(timezone.utc)
+        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
+        try:
+            status_code, payload = _http_get_json(
+                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}",
+                token,
+                budget,
+            )
+        except OSError:
+            return None
+        if status_code != 200 or not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if not isinstance(comment, dict):
+                continue
+            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
+                continue
+            created_at = _parse_github_time(comment.get("created_at"))
+            if created_at is None:
+                continue
+            if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
+                return True
+        return False
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -661,6 +1014,26 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
+            if queued:
+                return done(
+                    False,
+                    "the run's report names no github.com issue URL because the worker queued "
+                    f"the audit for later instead of running it ({queued.group(0).strip()!r}): "
+                    "when asked to run an audit following its SOP, the worker must execute "
+                    "the audit now via audit_report.py start/finish rather than deferring to cron (#1876)",
+                )
+            clean = _CLEAN_CLOSE_RE.search(snap.final_message)
+            if clean:
+                return done(
+                    False,
+                    "the run's report names no github.com issue URL, but says the "
+                    f"ledger was retired as clean ({clean.group(0).strip()!r}): the "
+                    "audit closed the stream's ledger over a fleet this case planted "
+                    "a finding on, and dropped the pointer to it -- a false clean, "
+                    "not a report that never arrived; every non-silent fleet-audit "
+                    "report must carry issue_url in full",
+                )
             return done(
                 False,
                 "the run's report names no github.com issue URL, so no ledger "
@@ -735,8 +1108,14 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             matches.append(
                 {
                     "slug": f"{owner}/{repo}#{number}",
+                    "api_url": url,
                     "body": body,
                     "generated_at": footer[1],
+                    # Read here, decided below: a closed issue is only telling
+                    # once the stamp has said the body is not this run's.
+                    "state": str(payload.get("state") or "").lower(),
+                    "state_reason": str(payload.get("state_reason") or ""),
+                    "closed_at": _parse_github_time(payload.get("closed_at")),
                 }
             )
 
@@ -759,6 +1138,57 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         age = (started - generated_at).total_seconds()
         if age > self.max_clock_skew_sec:
+            closed_at: datetime | None = ledger["closed_at"]
+            if ledger["state"] == "closed" and closed_at is not None:
+                state_reason = ledger["state_reason"] or "completed"
+                raw = {
+                    "generated_at": generated_at.isoformat(),
+                    "closed_at": closed_at.isoformat(),
+                    "state_reason": ledger["state_reason"],
+                }
+                # One more read, only for a closed ledger: was the close the
+                # harness's own reset? None means the comments could not be
+                # read, which is said rather than taken for either answer.
+                reset = self._closed_by_the_reset(ledger["api_url"], closed_at, token, budget)
+                raw["reset_by_harness"] = reset
+                if reset:
+                    # The per-unit reset runs before the harness's clock starts,
+                    # so "before" is the expected reading; a reset close after
+                    # it would be another lane's, and is said as what it is.
+                    when = (
+                        f"before this run started ({started.isoformat()})"
+                        if closed_at <= started
+                        else f"{(closed_at - started).total_seconds():.0f}s after this run "
+                        f"started ({started.isoformat()})"
+                    )
+                    return done(
+                        False,
+                        f"{ledger['slug']} was closed as {state_reason} at "
+                        f"{closed_at.isoformat()} by the eval harness's ledger reset, "
+                        f"{when}: the report cites the ledger the reset retired so a "
+                        "repetition would open a fresh one, and its body still carries "
+                        f"the previous run's stamp ({generated_at.isoformat()}), so this "
+                        "run published nothing to it -- a stale pointer to the harness's "
+                        "close, not a false clean",
+                        raw=raw,
+                    )
+                if (started - closed_at).total_seconds() <= self.max_clock_skew_sec:
+                    unread = (
+                        ""
+                        if reset is False
+                        else " (its comments could not be read, so the harness's own "
+                        "ledger reset is not ruled out)"
+                    )
+                    return done(
+                        False,
+                        f"{ledger['slug']} was closed as {state_reason} at "
+                        f"{closed_at.isoformat()}, during this run, with its body still "
+                        f"carrying the previous run's stamp ({generated_at.isoformat()}): "
+                        "the audit reported the stream clean and retired the ledger "
+                        "while this case expected a finding on it -- a false clean, not "
+                        f"an absent report{unread}",
+                        raw=raw,
+                    )
             return done(
                 False,
                 f"{ledger['slug']} was generated at {generated_at.isoformat()}, "
@@ -768,16 +1198,22 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             )
 
         if self.scope == "finding_ids":
-            ids = _finding_ids(ledger["body"])
-            if ids is None:
+            parsed = _finding_ids(ledger["body"])
+            if parsed is None:
                 return done(
                     False,
                     f"{ledger['slug']} carries no readable "
-                    "<!-- audit-findings: [...] --> delta block, so the findings "
+                    "<!-- audit-findings: [...] --> delta block (or a malformed "
+                    "audit-findings-all block below it), so the findings "
                     "this run filed cannot be read off it",
                 )
+            ids, source = parsed
             text = "\n".join(ids).lower()
-            surface = f"the {len(ids)} finding id(s) on {ledger['slug']}"
+            # Which block: a truncated body with no complete list below its
+            # delta block (over the script's cap, or a drifted format) grades
+            # the rendered subset, and the reason should say so rather than
+            # read as a finding the agent never filed.
+            surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
@@ -820,6 +1256,375 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
             "contains " + ", ".join(satisfied),
             raw=raw,
+        )
+
+
+@VERIFIERS.register("pull_request_opened")
+class PullRequestOpenedVerifier(BaseVerifier):
+    """A remediation pull request THIS run opened, resolved through GitHub.
+
+    WHY THIS EXISTS. The remediation cases used to grade on a
+    ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
+    that the reply hold a URL-shaped string. Nothing is fetched, so an invented
+    link passes; and the pool sweep runs between leases rather than between
+    reps, so a pull request an earlier rep of the same job opened is still there
+    and still linkable. Repeats of a case were being graded against a pile of their
+    own earlier output (#1755).
+
+    WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
+    resolves it; the number is a pull request and not an issue; it lives under
+    ``owner`` when one is set; it is not closed unmerged; it was written --
+    created or updated -- at or after this run started, less
+    ``max_clock_skew_sec``; it changes at least one file; and its head commit
+    is no older than the same start. Updating counts because the skill reuses a
+    branch and edits the pull request already open on it, which is the
+    documented behaviour rather than a defect -- so the stamp alone proves only
+    that somebody wrote to the pull request, and the head commit is what
+    separates a run that pushed a fix from one that left a comment. That is
+    also what makes reps inside a job gradable: rep 2 pushing onto rep 1's
+    branch moves the head commit, rep 2 quoting rep 1's URL does not. One
+    surviving candidate is enough — a reply may link the ticket it came from
+    beside the fix — and a candidate GitHub cannot answer for ends the check
+    only when no other candidate passes.
+
+    WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
+    API, the response carries ``created_at``, and it is the endpoint the read
+    credential is known to reach (``issues: read`` — see
+    :class:`LedgerIssueContainsVerifier`). ``/pulls/{n}`` is tried only when
+    that answers 401/403/404, which separates a number that is not there from a
+    credential that cannot see pull requests. Denied by both is
+    ``status="error"`` naming the permission to add, never a fail: an
+    unreadable API is the absence of an observation. 404 on both is either the
+    number or a repository this credential cannot see; nothing in the API
+    separates them, so both are graded as absence. ``_head_push`` then reads
+    ``/pulls/{n}`` outright, which needs ``pull_requests: read`` --
+    ``hack/ci-eval-pr.sh`` mints it.
+    """
+
+    type: Literal["pull_request_opened"]
+    # The organisation the pull request must sit under, "" for any. The eval
+    # GitOps repositories are `gke-agentic/<project>-infra`, so the org half is
+    # a fair exact match across every pool project and breaks loudly if the org
+    # moves.
+    owner: str = ""
+    # Tolerance between GitHub's creation stamp and the harness's run-start
+    # clock, which are two different machines. Small on purpose: every second
+    # of it is a second of a previous rep's pull request reading as this one's.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _resolve(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[dict | None, str | None]:
+        """``(payload, None)`` when resolved, ``(None, reason)`` when unevaluable.
+
+        ``(None, None)`` is the third answer: no such pull request, which is a
+        rejected candidate rather than a broken check. Only a credential the
+        API refuses is a broken check -- that is a fault of ours, it is the
+        same for every repetition, and no grade drawn from it would mean
+        anything. Everything else the agent chose, so it is graded.
+        """
+        base = f"https://api.github.com/repos/{owner}/{repo}"
+        first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
+        status_code = first
+        if first in (401, 403, 404):
+            status_code, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+        if 401 in (first, status_code):
+            # 401 is the credential itself, not its scopes: an installation
+            # token lasts an hour, and telling the reader to widen a permission
+            # sends them to the App's settings for a fault that is in the mint.
+            return None, (
+                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
+                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                "expires an hour after it is minted — so this check could not be "
+                "evaluated"
+            )
+        if status_code == 200 and isinstance(payload, dict):
+            return payload, None
+        if first == 403 and status_code == 403:
+            return None, (
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
+                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                "read neither its issues nor its pull requests — add "
+                "`pull_requests: read` to the installation — so this check could "
+                "not be evaluated"
+            )
+        if status_code in (403, 404):
+            # Absence, and graded as such. A 403 from one endpoint proves the
+            # repository is reachable, so the other endpoint's 404 is the
+            # number's own. 404 from both is either the number or a repository
+            # this credential cannot see -- and an onboarding gap belongs to
+            # `scripts/verify_ci_pool_project.py`, which checks installation
+            # membership, not to a grading check that would have to red every
+            # open pull request to report it.
+            return None, None
+        return None, (
+            f"unexpected GitHub response {status_code} for "
+            f"{owner}/{repo}#{number}; this check could not be evaluated"
+        )
+
+    def _head_push(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        resolved: dict,
+        token: str,
+        budget: float,
+    ) -> tuple[int | None, datetime | None, str | None]:
+        """``(changed files, head commit date, unevaluable reason)``.
+
+        Both reads want ``pull_requests: read``. ``/pulls/{n}`` carries the
+        file count and the commit total, and is skipped when ``_resolve``
+        already fell through to it; dating the head commit needs the commits
+        listing, whose last page holds it. ``/commits/{sha}`` would be one call
+        and wants ``contents: read``, which grading does not carry.
+
+        A page GitHub has not got (404, or one the head is not on) dates
+        nothing, comes back ``None``, and the caller does not reject on it: an
+        observation the API would not give is not evidence that a run pushed
+        nothing. A page it would not serve -- 401, 403, a 5xx -- is the
+        credential's or GitHub's fault, and is an unevaluable reason exactly
+        as on ``/pulls/{n}``; folding it into ``None`` would pass a leftover
+        the run only wrote to.
+        """
+        base = f"https://api.github.com/repos/{owner}/{repo}"
+        payload = resolved
+        if "changed_files" not in payload:
+            status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            # The same three readings `_resolve` gives this endpoint: 401 is
+            # the token, 403 is the permission, anything else is GitHub's.
+            if status == 401:
+                return (
+                    None,
+                    None,
+                    f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
+                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    "an installation token expires an hour after it is minted — so "
+                    "this check could not be evaluated",
+                )
+            if status == 403:
+                return (
+                    None,
+                    None,
+                    f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
+                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    "`pull_requests: read` to grade what a run pushed, so this "
+                    "check could not be evaluated",
+                )
+            if status != 200 or not isinstance(payload, dict):
+                return (
+                    None,
+                    None,
+                    f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
+                    "on the pulls endpoint; this check could not be evaluated",
+                )
+        changed = payload.get("changed_files")
+        changed = changed if isinstance(changed, int) else None
+        total = payload.get("commits")
+        head_sha = (payload.get("head") or {}).get("sha") or ""
+        if not isinstance(total, int) or total < 1:
+            return changed, None, None
+        page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
+        status, commits = _http_get_json(
+            f"{base}/pulls/{number}/commits"
+            f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+            token,
+            budget,
+        )
+        if status == 404:
+            return changed, None, None
+        if status == 401:
+            return (
+                None,
+                None,
+                f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
+                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                "an installation token expires an hour after it is minted — so "
+                "this check could not be evaluated",
+            )
+        if status == 403:
+            return (
+                None,
+                None,
+                f"GitHub denied {owner}/{repo}#{number} on the commits page; "
+                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                "`pull_requests: read` to grade what a run pushed, so this "
+                "check could not be evaluated",
+            )
+        if status != 200 or not isinstance(commits, list):
+            return (
+                None,
+                None,
+                f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
+                "on the commits page; this check could not be evaluated",
+            )
+        for entry in reversed(commits):
+            if not isinstance(entry, dict) or entry.get("sha") != head_sha:
+                continue
+            committer = (entry.get("commit") or {}).get("committer") or {}
+            return changed, _parse_github_time(committer.get("date")), None
+        return changed, None, None
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(
+            success: bool,
+            reason: str,
+            *,
+            status: str | None = None,
+            raw: dict | None = None,
+        ) -> VerificationResult:
+            return VerificationResult(
+                success=success,
+                status=status,
+                elapsed_time=time.monotonic() - start,
+                reason=reason,
+                raw=raw,
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done(False, _NO_TRANSCRIPT_REASON, status="error")
+        if not snap.started_at:
+            return done(False, _NO_PR_RUN_CLOCK_REASON, status="error")
+        token = next(
+            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
+        )
+        if not token:
+            return done(False, _NO_TOKEN_REASON, status="error")
+
+        seen: list[tuple[str, str, int]] = []
+        for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
+            key = (owner, repo, int(number))
+            if key not in seen:
+                seen.append(key)
+        if not seen:
+            return done(False, _NO_PR_URL_REASON)
+        if len(seen) > _MAX_PR_CANDIDATES:
+            return done(
+                False,
+                f"the run's report names {len(seen)} distinct pull request URLs; a "
+                f"remediation proposes one fix, so more than {_MAX_PR_CANDIDATES} is "
+                "not a set of candidates worth resolving",
+            )
+
+        started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        budget = single_call_timeout(timeout_sec)
+        rejected: list[str] = []
+        # A candidate the API cannot answer for only ends the check if nothing
+        # else resolves. An agent that mistypes a repository slug beside the
+        # real URL would otherwise error, and an error is rung 2, which reds the
+        # eval job for every open pull request.
+        unresolved: list[str] = []
+        for owner, repo, number in seen:
+            slug = f"{owner}/{repo}#{number}"
+            if self.owner and owner.lower() != self.owner.lower():
+                rejected.append(f"{slug}: not under {self.owner}")
+                continue
+            try:
+                payload, unevaluable = self._resolve(owner, repo, number, token, budget)
+            except OSError as exc:
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
+            if payload is None:
+                if unevaluable is None:
+                    rejected.append(f"{slug}: no such pull request (404)")
+                else:
+                    unresolved.append(unevaluable)
+                continue
+            # `pull_request` is how the issues endpoint marks one; `head` is
+            # what the pulls endpoint returns instead. Neither means the URL
+            # said /pull/ over a number that is a plain issue.
+            if not payload.get("pull_request") and "head" not in payload:
+                rejected.append(f"{slug}: that number is an issue, not a pull request")
+                continue
+            merged_at = payload.get("merged_at") or (
+                payload.get("pull_request") or {}
+            ).get("merged_at")
+            if str(payload.get("state") or "").lower() == "closed" and not merged_at:
+                # Closing moves `updated_at`, so without this a run that closed
+                # a leftover -- or its own pull request -- would read as one
+                # that wrote a fix. The objective is that the fix went out.
+                rejected.append(f"{slug}: closed without being merged")
+                continue
+            created = _parse_github_time(payload.get("created_at"))
+            if created is None:
+                rejected.append(f"{slug}: GitHub returned no readable created_at")
+                continue
+            # Creation is not the only way a run owns a pull request: the
+            # submit-suggestion skill derives the branch from the change, so a
+            # later rep pushes onto the branch the first one used, `gh pr
+            # create` answers "already exists", and the skill edits that pull
+            # request and returns its URL. That work lands in `updated_at`
+            # alone. The stamp moves on any write by anyone, so passing here is
+            # necessary and not sufficient -- the head commit check below is
+            # what says the run pushed something. A rep that resubmits
+            # byte-identical content writes nothing at all (the skill raises
+            # before the push), so a correct rep lands here too, which is why
+            # the reason names both readings.
+            updated = _parse_github_time(payload.get("updated_at"))
+            touched = updated if updated and updated > created else created
+            age = (started - touched).total_seconds()
+            if age > self.max_clock_skew_sec:
+                rejected.append(
+                    f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
+                    f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                    "an earlier run opened, which this run either quoted or "
+                    "resubmitted unchanged"
+                )
+                continue
+            # What the stamp above cannot say: whether the run pushed a fix or
+            # only wrote to a pull request. `updated_at` moves on a comment and
+            # on a label. The head commit moves on neither.
+            try:
+                changed, pushed, unevaluable = self._head_push(
+                    owner, repo, number, payload, token, budget
+                )
+            except OSError as exc:
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
+            if unevaluable:
+                unresolved.append(unevaluable)
+                continue
+            if changed == 0:
+                rejected.append(
+                    f"{slug}: changes no files, so it carries no proposed fix"
+                )
+                continue
+            if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+                rejected.append(
+                    f"{slug}: its head commit dates from {pushed.isoformat()}, "
+                    f"before this run started ({started.isoformat()}) — this run "
+                    "wrote to a pull request an earlier one pushed the fix to"
+                )
+                continue
+            return done(
+                True,
+                f"{slug} was {'opened' if touched == created else 'updated'} at "
+                f"{touched.isoformat()}, during this run, and carries "
+                f"{changed if changed is not None else 'an unreported number of'} "
+                "changed file(s)",
+                raw={
+                    "pull_request": slug,
+                    "created_at": created.isoformat(),
+                    "updated_at": updated.isoformat() if updated else None,
+                    "changed_files": changed,
+                    "head_committed_at": pushed.isoformat() if pushed else None,
+                },
+            )
+
+        if unresolved:
+            return done(
+                False,
+                "no pull request URL in the report resolved: " + "; ".join(unresolved)
+                + (f"; also rejected: {'; '.join(rejected)}" if rejected else ""),
+                status="error",
+            )
+        return done(
+            False,
+            "none of the pull request URLs the report names is one this run opened: "
+            + "; ".join(rejected),
         )
 
 
@@ -911,7 +1716,7 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
     subject is a legitimately absent object such as a pathless ``absent``, the
     namespace containing it. Anything else is an environment that was never
     ready, which is an error and not the agent's doing. The first draft of this
-    gate confirmed only the NAMESPACE, which four of the seven roles do not
+    gate confirmed only the NAMESPACE, which four of the eight roles do not
     have: on a live-but-empty cluster ``compliance-rbac-overgrant`` reported a
     catastrophic ``fail`` against an agent that had touched nothing.
 

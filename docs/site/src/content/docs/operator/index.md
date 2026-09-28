@@ -31,16 +31,16 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 The controller reconciles a `PlatformAgent` into:
 
-- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key and runs the `k8s-event-watcher`. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
+- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key, runs the `k8s-event-watcher`, and runs the `drift-detector` where an install has enabled it. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `StatefulSet` (named `<name>-shell`) and its `Service`, the shell sandbox: `sshd` on `2222`, the durable `/opt/data`, and the wrappers that stand in for `gcloud`, `kubectl`, `gh` and `git`. This is the pod that runs model-authored commands, and its ServiceAccount carries no Workload Identity annotation.
 - A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, and a `NetworkPolicy` narrowing who may reach it — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `Service` fronting the gateway `Deployment` (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
 - A `PodDisruptionBudget` selecting the Deployment's pods, `maxUnavailable: 1` at every replica count. That declares the agent evictable rather than blocking node drains, and it stays correct when the agent is scaled — a budget keyed to the replica count would deadlock drains the first time someone scaled back to one.
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
-- `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
+- `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, the [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) declaration as `scope.json` mounted at `/etc/kube-agents/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (GitOps repo, with the GitHub Token Minter endpoint injected as an env var).
-- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the auth callout, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the auth callout and, once a chat backend is configured, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -85,9 +85,18 @@ Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/)
 
 ## Admission webhooks
 
-The manager serves a mutating (defaulting) and a validating webhook for `PlatformAgent`, both
-registered with `failurePolicy: Fail`. They are part of Kustomize installs only — Helm chart installs
-run with `ENABLE_WEBHOOKS=false` (see the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md)).
+The manager serves a mutating (defaulting) and a validating webhook for `PlatformAgent`. The
+Kustomize install registers them with `failurePolicy: Fail`. The Helm chart leaves them off by
+default (`operator.webhooks.enabled=false`, because the chart cannot install the cert-manager they
+need) and registers them at `operator.webhooks.failurePolicy`, which defaults to `Ignore`. The
+Terraform full-install composition turns them on, since `enable_webhooks` defaults to `true`
+there. So on a supported install the webhooks are registered — but under `Ignore` an unreachable
+one admits the object with validation skipped rather than failing the apply, and on a fresh
+full-install that is the first `PlatformAgent` rather than an edge case: Helm applies the webhook
+configurations ahead of the cert-manager `Certificate` and the CR in the same release, which is
+why the default is `Ignore` at all. Setting it to `Fail` is supported and documented (see the
+[chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md)).
+Controls that must hold regardless are enforced in the render as well as at admission.
 
 **The webhook server listens on port `10250`, not Kubebuilder's usual `9443`.** GKE creates one
 firewall rule from the control plane to the nodes, and it permits only `tcp:443` and `tcp:10250`. The
@@ -160,8 +169,11 @@ kubectl delete mutatingwebhookconfiguration kubeagents-mutating-webhook-configur
 kubectl -n kubeagents-system set env deploy/kubeagents-controller-manager ENABLE_WEBHOOKS=false
 ```
 
-That leaves the cluster with the same validation coverage a chart install has. Re-apply with
-`make deploy IMG=$IMG` once the cause is fixed.
+That leaves the cluster with the validation coverage a chart install with
+`operator.webhooks.enabled=false` has. The CRD's own schema and CEL rules still run -- those
+belong to the API server, not to the webhook -- as does whatever the render enforces on its own.
+What goes away is everything the operator's admission checks add on top, the bus-credential
+refusals among them. Re-apply with `make deploy IMG=$IMG` once the cause is fixed.
 
 ## An image ahead of its ClusterRole
 

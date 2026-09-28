@@ -78,7 +78,7 @@ func observedGenerationReconciler(agent *agentv1alpha1.PlatformAgent, counter *s
 func settleReady(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
 	ctx := context.Background()
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent))
+	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{})
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestDegradedStatusRecordsTheGenerationItWasComputedFrom(t *testing.T) {
 	agent := observedGenerationAgent(5)
 	r := observedGenerationReconciler(agent, &statusWriteCounter{})
 
-	if err := r.updateStatusDegraded(context.Background(), agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured in this cluster"); err != nil {
+	if err := r.updateStatusDegraded(context.Background(), agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured in this cluster", workloadNotRendered); err != nil {
 		t.Fatalf("updateStatusDegraded failed: %v", err)
 	}
 	if agent.Status.Phase != "Degraded" {

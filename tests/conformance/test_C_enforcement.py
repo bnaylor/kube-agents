@@ -578,23 +578,14 @@ class C1IsolationIsStructural(unittest.TestCase):
         """KNOWN VIOLATION. The sandbox reaches the metadata server anyway.
 
         This is the invariant `spec.security.egressPolicy: Allowlist` exists to
-        establish, and on this tree it does not hold -- on both delivery paths,
-        which is worth stating because checking only one is how this was
-        nearly missed:
-
-        - Operator-rendered: platformagent-gateway-netpol allows
-          169.254.169.254/32 on TCP 80 -- the metadata server's own
-          ports -- and 169.254.169.252/32 on 988, selecting the same
-          `app: platformagent-gateway` pods that
-          platformagent-sandbox-metadata-deny selects.
-        - Kustomize-mode: deploy/kustomize/platform/networkpolicy-core-egress.yaml
-          ships platform-agent-core-egress with the same two metadata rules. It
-          selects on `app.kubernetes.io/name: platform-agent` rather than the
-          `app:` label, a different expression over the same Pods, which the
-          agent carries both of.
+        establish, and on this tree it does not hold: the operator-rendered
+        platformagent-gateway-netpol allows 169.254.169.254/32 on TCP 80 -- the
+        metadata server's own ports -- and 169.254.169.252/32 on 988, selecting
+        the same `app: platformagent-gateway` pods that
+        platformagent-sandbox-metadata-deny selects.
 
         Two policies over one Pod union their allow-sets, so opting into the
-        allowlist does not subtract what either of them adds.
+        allowlist does not subtract what the gateway policy adds.
 
         The failure is real and the feature does not currently do what its name
         says. Recorded here rather than repaired because #676 was deliberate:
@@ -900,10 +891,15 @@ class C1IsolationIsStructural(unittest.TestCase):
         it presents whatever file it read. What demands the audience is the
         callout, whose TokenReview names it explicitly (`NewTokenValidator`), so
         a kubelet minting anything else produces a refused connect rather than a
-        silent downgrade. The two literals are held apart by the same module
-        boundary as the path above, so they are checked together.
+        silent downgrade. The operator spells it in `api/v1alpha1`, a package
+        over from the projection, because the validating webhook reads the
+        same value to refuse a user volume that projects it; the controller
+        constant the render uses is a reference to that one. The two literals
+        are held apart by the same module boundary as the path above, so they
+        are checked together.
         """
         operator = h.text("operator_a2a_callout")
+        api = h.text("operator_bus_api")
         library = h.text("a2a_bus_credentials")
 
         def one(pattern: str, text: str, what: str) -> str:
@@ -929,8 +925,26 @@ class C1IsolationIsStructural(unittest.TestCase):
             "container is refused" % (mount, filename, reader),
         )
 
+        # The operator's half of the audience is declared in the API package
+        # rather than beside the projection, because the validating webhook
+        # reads it too. So it is extracted from there -- and the controller's
+        # constant is held to being a reference to it rather than a second
+        # spelling, which is what keeps the literal read here the one the
+        # kubelet actually mints under. Comparing the controller constant to
+        # the API constant instead would be the same value twice.
         rendered_audience = one(
-            r'a2aBusTokenAudience\s*=\s*"([^"]+)"', operator, "a2aBusTokenAudience"
+            r'A2ABusTokenAudience\s*=\s*"([^"]+)"', api, "A2ABusTokenAudience"
+        )
+        controller_audience = one(
+            r"a2aBusTokenAudience\s*=\s*(\S+)", operator, "the controller's audience"
+        )
+        self.assertEqual(
+            controller_audience,
+            "agentv1alpha1.A2ABusTokenAudience",
+            "the controller spells the bus token audience %s rather than "
+            "taking it from the API package, so the literal this test "
+            "compared is not the one the projection mints under"
+            % controller_audience,
         )
         demanded_audience = one(
             r'BusTokenAudience\s*=\s*"([^"]+)"', library, "lib.BusTokenAudience"
@@ -1476,6 +1490,10 @@ class C3UntrustedByDefault(unittest.TestCase):
         self.assertLessEqual(len(sanitize("A" * 4096)), 64)
 
 
+# A Dockerfile `RUN` wrapped over several lines is one command; join it
+# before reading, or a flag on the second line is invisible.
+_CONTINUATION_RE = re.compile(r"\\\s*\n\s*")
+
 class C4ProvenanceOfExecutableContent(unittest.TestCase):
     """C4: skills, plugins, actions and images are pinned, signed and owned."""
 
@@ -1536,6 +1554,39 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         """
         self.assertRegex(h.text("tags_env"), r"HERMES_AGENT_TAG=\S+@sha256:[0-9a-f]{64}")
         self.assertIn("${HERMES_AGENT_TAG}", h.text("dockerfile"))
+
+    def test_C4_every_hermes_plugin_install_is_pinned_to_a_commit(self) -> None:
+        """A plugin installed from a third-party default branch is unpinned
+        upstream content executed inside the agent process.
+
+        `hermes plugins install <spec>` with no `--ref` resolves against
+        whatever that repository's default branch holds at build time, so the
+        image changes without a commit here and the build can break on a
+        morning nobody touched it. Asserted so that dropping the ref back to a
+        floating branch is a red test rather than a diff nobody reads.
+
+        Deliberately tolerant about spelling: the ref may sit before or after
+        the plugin spec, may be `--ref X` or `--ref=X`, and may be a variable
+        so long as an `ARG` in the same file binds it to a full SHA. What it
+        will not accept is a branch, a tag, or nothing -- the three things
+        that leave the build reading a moving target.
+        """
+        dockerfile = _CONTINUATION_RE.sub(" ", h.text("dockerfile"))
+        args = dict(re.findall(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)", dockerfile, re.M))
+        installs = re.findall(r"hermes\s+plugins\s+install\s+(.*?)(?:&&|;|$)", dockerfile, re.M)
+        self.assertTrue(installs, "no `hermes plugins install` found; this test is vacuous")
+        for command in installs:
+            ref = re.search(r"--ref[=\s]+(\S+)", command)
+            self.assertIsNotNone(ref, f"`hermes plugins install{command}` carries no --ref")
+            value = ref.group(1).strip("\"'")
+            var = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", value)
+            if var:
+                value = args.get(var.group(1), "").strip("\"'")
+            self.assertRegex(
+                value,
+                r"(?i)^[0-9a-f]{40}$",
+                f"`hermes plugins install{command}` is not pinned to a full commit SHA",
+            )
 
     def test_C4_precondition_the_chart_still_names_images(self) -> None:
         self.assertIn("repository:", h.text("chart_values"))

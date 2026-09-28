@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations. It utilizes a Platform Agent to transition from reactive manual management to proactive, intent-driven operations.
+This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations.
 
 ## Repository Layout
 
@@ -245,14 +245,13 @@ Agents with a user in the loop follow this file.
   comment** (`uses: actions/checkout@3d3c42e… # v7.0.1`), and **guard automatically-triggered
   credentialed workflows against forks** with `if: github.repository == 'gke-labs/kube-agents'` on
   every job. A mutable tag lets a retagged release change what CI runs; an unguarded job fails on
-  every fork sync and mails the fork owner. No check in this repository blocks either one, and
-  both have exemptions — local reusable workflows need no pin, a `workflow_call`- or
-  `workflow_dispatch`-only workflow needs no guard, and `docs-deploy.yml` is unguarded on purpose
-  so a fork can publish its own Pages site. Open
+  every fork sync and mails the fork owner. No check in this repository blocks either one; the
+  exemptions are in the rule file. Open
   [`.agents/rules/github_actions.md`](.agents/rules/github_actions.md) whenever you touch a
   `uses:` line or a workflow trigger.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
+  A bug fix must name what stops it recurring.
 - **AI Agent Attribution & Commit Authorship:**
   - Do not add AI agents as git commit co-authors or include `Co-Authored-By:` trailers in commit messages.
   - Note AI assistance in the PR description (e.g. `Generated with the help of <Agent/Model>.`).
@@ -317,10 +316,10 @@ Agents with a user in the loop follow this file.
   Kubernetes resource; `install.sh` / `uninstall.sh` / `upgrade.sh` are front doors
   that generate `terraform.tfvars` and drive it. Do not add a second expression of an
   install step — a kubectl-applied manifest a chart template already renders, a gcloud
-  call the composition already makes. The two places manifests still exist twice on
-  purpose (`k8s-operator/config/crd` + `config/rbac` mirrored into the chart by
-  `make chart-check`, and the kustomize integration manifests kept in step with the
-  chart templates for the dev path) each have a check or a comment saying so.
+  call the composition already makes. Operator-owned YAML mirrored or derived into
+  the chart (`config/crd`, `config/rbac`, the admission policy, the generated
+  `files/footprint.yaml`, and the webhook template it compares) is held in step by
+  `make chart-check`; the dev path's kustomize manifests are the other copy.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
@@ -441,8 +440,7 @@ Pushing fixes is also what makes the pull request body stale. Fixes that answer 
 live test you re-ran to confirm them, belong in **Self-Review** and **Live validation** — folded
 into what is already there, per "Keep these sections current, not chronological" above. Do it once
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
-review brings fresh findings, and folding them in twice is the same wasted round. Nothing else in
-this workflow reopens the body.
+review brings fresh findings, and folding them in twice is the same wasted round.
 
 **Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
 merge and keeps the change counted as its author's outstanding work; what belongs here is the

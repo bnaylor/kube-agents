@@ -142,7 +142,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	})
 
 	// Beat 2 shape: "what is it doing" answered by replay under the gateway
-	// user's grants (ordered consumer + stream msg-get on TASKS).
+	// user's grants (ordered consumer + direct get on TASKS).
 	adapter.inbox <- InboundMessage{
 		Conversation: "discord:live/thread-livetest", Kind: "group",
 		AuthorID: "1001", MessageID: "live-2", Text: "what is it doing",
@@ -635,7 +635,7 @@ func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
 		ActiveTask:   &ActiveTask{TaskID: seedTask, CorrelationID: "corr-s9sup", Detached: true},
 		Tasks:        []TaskRef{{ID: seedTask, Addressee: "chat-s9sup-seed", Canceled: true}},
 	}
-	podName, err := sp.Spawn(ctx, rec, seedTask, "")
+	podName, err := sp.Spawn(ctx, rec, seedTask, "", 1)
 	if err != nil {
 		t.Fatalf("seed pod spawn on the install: %v", err)
 	}

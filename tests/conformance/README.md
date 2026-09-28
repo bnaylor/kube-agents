@@ -83,16 +83,27 @@ reads with an anchor string that `test_harness_selfcheck.py` verifies. Rename
 a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
-One set of inputs is not registered: the group-B workflow tests glob
+Two sets of inputs are not registered. The group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
-is added. The non-empty-glob guard lives with C4's SHA-pin sweep; the group-B
-allowlists are guarded differently — a holder appearing or vanishing moves a
-set the test compares exactly. C4 is the invariant; its stricter form, which
-also requires the version comment beside each SHA and a digest on a `docker://`
-ref, and the fork-guard check on every auto-triggered credentialed workflow,
-run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
+is added. Four of the five consumers of that glob answer for the empty set
+themselves: the group-B allowlists go red when an expected name goes missing,
+and B4's `workflow_run` gate and its `pull_request_target` checkout test each
+assert their own filtered subset non-empty. The fifth asserts an absence, and
+an absence is true of the empty set, so `_workflows()` in
+`test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
+copy of the glob and guards it the same way. C4 is the invariant; its
+stricter form, which also requires the version comment beside each SHA and a
+digest on a `docker://` ref, and the fork-guard check on every auto-triggered
+credentialed workflow, run under `make test-python` in
+`tests/test_workflow_pins_and_fork_guards.py`.
+
+The other is the site's content tree, which D2 walks for the read-only
+switch. `_harness.site_pages()` raises when the tree is missing or holds no
+page, the security reference under it is registered so the self-check names
+the tree when it moves, and the test requires the pages to name the broker's
+other variables before it reads their silence on this one.
 
 ## Invariant → test → bucket → historical attack
 
@@ -100,8 +111,7 @@ run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
 **KV** marks a known violation: the test exists, asserts the invariant, and
 currently fails.
 
-> **The cited documents are not in this repository.**
-> `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
+> **The cited documents are not in this repository.** > `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
 > `overnight-b/findings.md` and `round_2/` live in a separate working
 > repository that is not published, so those citations do not resolve for a
 > reader here. The table below is the vendored summary: it states each
@@ -118,6 +128,9 @@ currently fails.
 | A2  | two users with different RBAC get different outcomes                       | 2        | `Scenario1`, `Scenario2`                                                            | shared-identity execution: every allowlisted chat user wields the agent's full authority                                                                                                                                                                 |
 | A2  | the agent ceiling binds a cluster-admin requester                          | 2        | `Scenario3`                                                                         | —                                                                                                                                                                                                                                                        |
 | A2  | staleness bound N                                                          | **3**    | —                                                                                   | N is unset. Three unstated Ns (A2, C2, D6), all needing owners.                                                                                                                                                                                          |
+| A3  | the eval inject door renders only under the operator's flag                | 1        | `test_A3_the_inject_door_renders_only_under_the_operator_flag`                      | a door mapping a body-supplied principal, rendered on an install that never asked for it                                                                                                                                                                 |
+| A3  | the eval door's flag is not a field a customer can set                     | 1        | `test_A3_the_inject_flag_is_not_a_field_a_customer_can_set`                         | "render the eval door" reachable from a `PlatformAgent`, which the operator would be obliged to honour                                                                                                                                                   |
+| A3  | the eval door cannot assert a cloud principal                              | 1        | `test_A3_the_inject_door_cannot_assert_a_cloud_principal`                           | a map entry pointing the eval door at a real identity: an identity-minting door the day publisher identity arms                                                                                                                                          |
 | A3  | caller-supplied `--as` refused, all five flags, both separators            | 1        | `test_A3_rejects_caller_supplied_as`                                                | impersonation asserted by the caller                                                                                                                                                                                                                     |
 | A3  | `--kuberc` refused                                                         | 1        | `test_A3_rejects_kuberc`                                                            | **slice 2a**: a YAML file injecting `as: system:admin` with nothing in argv                                                                                                                                                                              |
 | A3  | `--flags-file` refused                                                     | 1        | `test_A3_rejects_gcloud_flags_file`                                                 | the same attack in gcloud's spelling, found first                                                                                                                                                                                                        |
@@ -142,7 +155,7 @@ currently fails.
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
 | B1  | the agent cannot force-push                                                | 1 **KV** | `test_B1_the_agent_cannot_merge_or_approve`                                         | `git push --force origin main` matches no denylist rule; the git verb and lease machinery constrain where git writes, not this flag — a watched branch is still rewritable                                                                               |
 | B2  | no workflow approves or merges a pull request                              | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                             | a model verdict causing a merge                                                                                                                                                                                                                          |
-| B2  | `pull-requests: write` has exactly one holder                              | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
+| B2  | `pull-requests: write` has exactly six holders                             | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
 | B2  | a certified predicate in a human-only path                                 | **3**    | —                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
 | B3  | substrate paths enumerated as code                                         | 1 **KV** | `test_B3_the_substrate_paths_are_enumerated_as_code`                                | `failurePolicy: Fail` → `Ignore`, commit message "unblock apply during upgrade window"                                                                                                                                                                   |
 | B3  | the agent cannot reach admission or RBAC through kubectl                   | 1        | `test_B3_the_agent_cannot_reach_the_admission_policy_through_kubectl`               | — (the API half; the artifact half is the KV above)                                                                                                                                                                                                      |
@@ -169,7 +182,7 @@ currently fails.
 | C1  | the gateway redactor matches the leaked credential shapes                  | 1        | `test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes`                 | #603: a 200-character `ya29.` token, a projected-token JWT, an `AIza` key, a PEM block and a Secret `data:` block, each measured in the clear in a durable artifact; the gateway hook runs this module at egress                                         |
 | C1  | the gateway redactor leaves ordinary manifest content alone                | 1        | `test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone`               | the over-eager redactor that eats every IAM principal and gets switched off — the service-account exemption's anchored lookahead is the control                                                                                                          |
 | C1  | the agent container's bus identity env is spelled the same in both modules | 1        | `test_C1_the_agent_containers_bus_identity_env_is_spelled_the_same_in_both_modules` | a rename of `A2A_BUS_USER` on the operator side alone: the writer and the reader are in different Go modules with no shared constant, so nothing but this catches it until a client exits `no bus identity` at runtime                                   |
-| C1  | the agent principal carries no static bus password                         | 1        | `test_C1_the_agent_principal_carries_no_static_bus_password`                        | the retired `worker` credential coming back by either route — a `credsKey` added to the callout-resolved `agent` principal, or the static `bridge` principal re-keyed on a ServiceAccount so the callout hands the sidecar and the agent the same grants |
+| C1  | the agent principal carries no static bus password                         | 1        | `test_C1_the_agent_principal_carries_no_static_bus_password`                        | the retired `worker` credential coming back through the render — a `credsKey` on the callout-resolved `agent` principal, or `bridge` re-keyed on a ServiceAccount. Not a CR that declares its own volume: Go tests pin the reservations that refuse one. |
 | C1  | the bus token path and audience agree across the module boundary           | 1        | `test_C1_the_bus_token_path_and_audience_agree_across_the_module_boundary`          | the projected token's mount path moved on the operator side alone: the client `os.Stat`s the old path, misses, falls back to a password this change stopped rendering, and offers the empty string — the bus lost, both Go suites green                  |
 | C1  | the reserved bus token-file env is spelled the same in both modules        | 1        | `test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules`       | a rename of `A2A_BUS_TOKEN_FILE` on either side alone, or the plugin-env drop spelling the reserved name by hand rather than through the constant. The odd one out of the three cross-module pairs, and the one a comment claimed this suite held.       |
 | C1  | the metadata server is unreachable from the sandbox                        | 2        | `Scenario5`                                                                         | the controller deleting the metadata-deny NetworkPolicy; the credential-free sandbox minting the GSA token                                                                                                                                               |
@@ -187,6 +200,7 @@ currently fails.
 | C3  | untrusted content cannot derive an approval tier                           | **3**    | —                                                                                   | needs the provenance labelling D3 also needs. The fleet-drift attack (an attacker shifting a derived baseline until production reads as drift) is the case to write first.                                                                               |
 | C4  | every third-party action is pinned to a commit                             | 1        | `test_C4_every_third_party_action_is_pinned_to_a_commit`                            | a retagged release silently changing what CI runs                                                                                                                                                                                                        |
 | C4  | the agent base image is pinned by digest                                   | 1        | `test_C4_the_agent_base_image_is_pinned_by_digest`                                  | — (the one reference this repo gets right)                                                                                                                                                                                                               |
+| C4  | every hermes plugin install is pinned to a commit                          | 1        | `test_C4_every_hermes_plugin_install_is_pinned_to_a_commit`                         | an upstream default branch shipping a plugin manifest the pinned installer cannot read, breaking every image build                                                                                                                                       |
 | C4  | upstream skills are pinned and verified                                    | 1 **KV** | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
 | C4  | every shipped image is pinned by digest                                    | 1 **KV** | `test_C4_every_shipped_image_is_pinned_by_digest`                                   | `DefaultPlatformAgentVersion = "latest"`                                                                                                                                                                                                                 |
 | C5  | no minted role grants a write verb                                         | 1        | `test_C5_no_minted_role_grants_a_write_verb`                                        | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                                                                |
@@ -211,7 +225,7 @@ currently fails.
 | D4  | the customer API key is secret-backed                                      | 1        | `test_D4_the_customer_api_key_is_secret_backed`                                     | —                                                                                                                                                                                                                                                        |
 | D4  | every projected token is audience-bound                                    | 1 **KV** | `test_D4_every_projected_token_is_audience_bound`                                   | **slice 2b 1.10**: `event-watcher-ksa-token` mounted with the default audience, including into the broker Pod                                                                                                                                            |
 | D4  | no fixed shared secret ships in a manifest                                 | 1 **KV** | `test_D4_no_fixed_shared_secret_ships_in_a_manifest`                                | `API_SERVER_KEY="cluster-internal-trusted"`, and the Python default is the same literal                                                                                                                                                                  |
-| D5  | availability and cost are security properties                              | **3**    | `D5AvailabilityAndCostAreSecurityProperties` (docstring)                            | no budgets, so no exhaustion event to assert the refusal of                                                                                                                                                                                              |
+| D5  | availability and cost are security properties                              | **3**    | `D5AvailabilityAndCostAreSecurityProperties` (docstring)                            | no per-tenant or per-principal budget, so no exhaustion event to assert the refusal of. Two bus budgets exist now; the docstring records why neither satisfies this — one degrades, one is capacity                                                      |
 | D5  | model fallback may not lower the enforcement tier                          | 1        | `test_D5_the_enforcement_tier_cannot_be_lowered_by_routing`                         | choosing which model evaluates your injection payload by exhausting the good one's budget                                                                                                                                                                |
 | D6  | kill switch                                                                | **3**    | `D6KillSwitch` (docstring)                                                          | no halt path; N unset; the nearest candidate needs a Deployment edit, which is the agent plane's own control path                                                                                                                                        |
 | D6  | the read-only switch is not mistaken for a kill switch                     | 1        | `test_D6_the_read_only_switch_is_not_mistaken_for_a_kill_switch`                    | D6 being marked satisfied by a control that points the opposite way                                                                                                                                                                                      |
@@ -256,12 +270,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-102 mutations: 79 KILLED, 21 NOISY, two `must_survive` controls (one on the
+114 mutations: 88 KILLED, 24 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-17 against
-this branch merged with `main`; re-run the harness rather than trusting
+handling), zero genuine survivors, zero stale — measured 2026-09-25 against
+this branch on `main` at `525b37e7`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 100 of the 102: a
+Note that the summary line the harness prints accounts for 112 of the 114: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
@@ -300,7 +314,9 @@ suite once at the end: a run that ends red says so and exits non-zero.
 ## Adding a test
 
 1. Register every artifact you read in `_harness.SOURCES`, with an anchor
-   substring whose loss makes your assertion meaningless.
+   substring whose loss makes your assertion meaningless. A _set_ of files
+   is the one exception, and it owes what the two above pay: a helper that
+   raises on empty, and a registered member the test requires to be in it.
 2. Name the test after the invariant: `test_A3_rejects_caller_supplied_as`.
    `test_harness_selfcheck.py` reads that prefix to check coverage.
 3. Assert the _refusal_, never the presence of the control. Twice in this

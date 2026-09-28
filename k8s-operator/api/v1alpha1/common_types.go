@@ -28,6 +28,68 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	// A2ABusTokenAudience is the audience every A2A bus token is bound to. The
+	// operator projects a ServiceAccount token for it into the platform-agent
+	// container under `mode: next`, and the auth callout accepts no other
+	// audience. It lives here rather than in the controller because the
+	// validating webhook needs the same value: a user-authored volume that
+	// projects a token for this audience under any name is the bus credential
+	// by another route, and BusCredentialRoutes below is what both halves of
+	// that reservation key on.
+	A2ABusTokenAudience = "a2a-bus"
+
+	// The suffixes that build the names of the bus objects the operator
+	// renders off the PlatformAgent's own name. Here for the same reason as
+	// the audience: the webhook has to recognise the Secrets that carry bus
+	// credentials by name, and a second spelling of a suffix in the webhook
+	// package would drift from the one the render uses.
+	a2aNATSNameSuffix    = "-a2a-nats"
+	a2aCredsSecretSuffix = "-creds"
+	a2aNATSConfigSuffix  = "-config"
+	a2aCalloutNameSuffix = "-a2a-callout"
+	a2aCalloutKeysSuffix = "-keys"
+)
+
+// A2ANATSName is the name of the NATS objects the operator renders for a
+// PlatformAgent under `mode: next`, and the stem of A2ACredsSecretName.
+func A2ANATSName(agentName string) string { return agentName + a2aNATSNameSuffix }
+
+// A2ACredsSecretName is the Secret holding the bus's static passwords
+// (`bridge-password` among them) for a PlatformAgent of that name.
+func A2ACredsSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aCredsSecretSuffix
+}
+
+// A2ANATSConfigSecretName is the Secret holding the rendered nats.conf, which
+// carries every static password inline.
+func A2ANATSConfigSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSConfigSuffix
+}
+
+// A2ACalloutName is the name of the auth callout's objects, and the stem of
+// A2ACalloutKeysSecretName.
+func A2ACalloutName(agentName string) string { return agentName + a2aCalloutNameSuffix }
+
+// A2ACalloutKeysSecretName is the Secret holding the callout's keypairs,
+// among them the issuer seed that signs every identity the bus accepts.
+func A2ACalloutKeysSecretName(agentName string) string {
+	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
+}
+
+// A2ACredentialSecretNames is every Secret the operator renders with a bus
+// credential in it, for a PlatformAgent of that name. It is the set
+// BusCredentialRoutes refuses a user volume for; a Secret added to the bus
+// render that carries a credential belongs here, or the reservation has the
+// hole it was written to close, one Secret over.
+func A2ACredentialSecretNames(agentName string) []string {
+	return []string{
+		A2ACredsSecretName(agentName),
+		A2ANATSConfigSecretName(agentName),
+		A2ACalloutKeysSecretName(agentName),
+	}
+}
+
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
 // overridden by user Deployment specs or injected into the credential proxy.
 //
@@ -108,14 +170,20 @@ var SensitiveEnvVars = map[string]struct{}{
 // volume under the name plus a "-vol" suffix, so it cannot collide with a
 // reserved name or carry a token projection.
 //
-// What this reservation does NOT cover is the volume SOURCE. It is a check on
-// names, so a differently-named projected volume whose
-// serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
-// same credential and is admitted. The only source-type check on
-// sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
-// Established by execution rather than by reading the render: a sidecarVolumes
-// entry named innocuous-cache projecting that audience renders intact and the
-// sidecar authenticates as `agent`.
+// This map is the NAME half. It shipped alone first, and a check on names
+// alone left the volume SOURCE unexamined: a differently-named projected
+// volume whose serviceAccountToken.audience is `a2a-bus`, mounted into a
+// sidecar, minted the same credential and was admitted (established by
+// execution: a sidecarVolumes entry named innocuous-cache projecting that
+// audience rendered intact and the sidecar authenticated as `agent`), and a
+// volume mounting the credentials Secret needed no token at all. The SOURCE
+// half is BusCredentialRoutes below, keyed on the audience and on the Secrets
+// the operator renders with bus credentials in them.
+//
+// A hostPath entry on those same two lists is refused by a source check too,
+// and the render drops it and every mount naming it whether or not the
+// webhook ran (gke-labs#1675). That one is not part of this pair: it guards
+// the node filesystem, not the bus credential.
 //
 // Which fixes the terms this should be read on. KSA tokens are pod-scoped and
 // the callout cannot see which container presented one, so neither a name nor
@@ -129,8 +197,9 @@ var SensitiveEnvVars = map[string]struct{}{
 // rather than an escape, guarded because nothing else would notice. That rests
 // on who may write the CR, which makes it re-decidable rather than settled: a
 // delegable role, or the CR moving into a repo the agent can open pull
-// requests against, changes the answer. gke-labs#1667 closes the audience
-// route and the creds-Secret route that is cheaper than it.
+// requests against, changes the answer. BusCredentialRoutes below is the
+// source half of this reservation: the audience route, and the creds-Secret
+// route that is cheaper than it.
 //
 // One member so far. `a2a-bus-token` is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
@@ -142,6 +211,103 @@ var SensitiveEnvVars = map[string]struct{}{
 // a2aStripBusTokenVolumeMounts.
 var ReservedVolumeNames = map[string]struct{}{
 	"a2a-bus-token": {},
+}
+
+// BusCredentialRouteKind says which of the two sources a user-authored volume
+// used to reach the bus credential without naming the reserved volume.
+type BusCredentialRouteKind string
+
+const (
+	// BusCredentialRouteAudience is a projected serviceAccountToken source whose
+	// audience is A2ABusTokenAudience: a valid bus token for the pod's
+	// ServiceAccount, under whatever volume name the CR chose.
+	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
+	// BusCredentialRouteSecret is a volume that mounts one of the Secrets the
+	// operator renders with a bus credential in it (A2ACredentialSecretNames),
+	// either as a `secret` volume or as a projected `secret` source.
+	BusCredentialRouteSecret BusCredentialRouteKind = "secret"
+)
+
+// BusCredentialRoute is one way a user-authored volume would hand the A2A bus
+// credential to whichever container mounts it. Source is the index into
+// projected.sources the route was found at, or BusCredentialRouteVolumeSource
+// when it is the volume's own `secret` field. Secret is the Secret's name for
+// a Secret route, empty otherwise. Not an API type, so no deepcopy.
+// +kubebuilder:object:generate=false
+type BusCredentialRoute struct {
+	Kind   BusCredentialRouteKind
+	Source int
+	Secret string
+}
+
+// BusCredentialRouteVolumeSource is the Source of a route found on the volume
+// itself rather than on one of a projected volume's sources.
+const BusCredentialRouteVolumeSource = -1
+
+// BusCredentialRoutes lists the ways a user-authored volume would deliver the
+// A2A bus credential, regardless of the volume's name. Empty for a volume that
+// would not. ReservedVolumeNames above is the name half of the same
+// reservation; this is the source half, and the webhook refuses what it finds
+// while the render strips it (see a2aStripBusCredentialSources in the
+// controller).
+//
+// Two routes. A projected serviceAccountToken for A2ABusTokenAudience is the
+// token the platform-agent container presents, minted for the pod's
+// ServiceAccount, so the name on the volume changes nothing about what the
+// callout sees. The Secrets in A2ACredentialSecretNames need no token minting
+// at all and are the cheaper route; a check on the audience alone would narrow
+// the expensive route and advertise the cheap one. There are three of them
+// because the same credentials sit in three places: the creds Secret holds
+// the static passwords (`bridge-password` among them), the nats-config Secret
+// holds nats.conf with every one of those passwords inline, and the
+// callout-keys Secret holds the issuer seed that signs every identity the bus
+// accepts, which is worth more than any password in the other two.
+//
+// Volume shapes only. A `secret` volume and a projected `secret` source are
+// the two volume shapes that put a Secret's data in the container; the other
+// volume sources that name a Secret (csi.nodePublishSecretRef, the storage
+// drivers' secretRef fields) hand it to a node plugin rather than to the
+// container. What this does NOT cover is env: `env[].valueFrom.secretKeyRef`
+// and `envFrom[].secretRef` on a sidecar deliver the same bytes and are not
+// checked here. That is deliberate rather than an oversight. The bridge
+// sidecar's documented configuration (a2a/docs/hermes-bridge.md) is a
+// secretKeyRef to `bridge-password` on the creds Secret, so a refusal on env
+// would refuse the supported bridge; which keys a sidecar may read by env is
+// a policy this reservation does not set. The issue this closes scoped the
+// Secret half to volumes (its precedent, agentForbiddenVolumeNames, is
+// volume-keyed too); the env half is a decision still owed.
+//
+// What this is, so the guard is not read as more than it is: KSA tokens are
+// pod-scoped and the callout cannot tell which container presented one, so
+// neither this nor the name reservation is a boundary against a hostile
+// sidecar. It is a guard against a misconfiguration by the CR's author, who is
+// the platform operator (ReservedVolumeNames says why that is the actor), and
+// it is worth having on those terms because nothing else would notice.
+func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute {
+	credentialSecrets := A2ACredentialSecretNames(agentName)
+	isCredential := func(name string) bool {
+		for _, s := range credentialSecrets {
+			if name == s {
+				return true
+			}
+		}
+		return false
+	}
+	var routes []BusCredentialRoute
+	if v.Secret != nil && isCredential(v.Secret.SecretName) {
+		routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: v.Secret.SecretName})
+	}
+	if v.Projected != nil {
+		for i, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
+				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+			}
+			if src.Secret != nil && isCredential(src.Secret.Name) {
+				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
+			}
+		}
+	}
+	return routes
 }
 
 type HermesSpec struct {
@@ -216,6 +382,13 @@ type HarnessSpec struct {
 	// is the emergency stop for an event storm.
 	// +optional
 	EventWatcher *EventWatcherSpec `json:"eventWatcher,omitempty"`
+
+	// DriftDetector configures out-of-band change detection — the drift-detector
+	// that reads GKE admin-activity audit records from a Pub/Sub subscription and
+	// turns the ones a person made outside git into triage cards. Off unless asked
+	// for, unlike EventWatcher above.
+	// +optional
+	DriftDetector *DriftDetectorSpec `json:"driftDetector,omitempty"`
 
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
@@ -349,6 +522,58 @@ type EventWatcherSpec struct {
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
+// DriftDetectorSpec configures the drift-detector, which runs as a peer service
+// inside the gateway pod's agent-api-auth sidecar alongside the API authenticator
+// and the k8s-event-watcher. Not alongside Envoy or the credential runtime: those
+// moved to the credential pod, and CREDENTIAL_PROXY_ROLE=api-proxy is what tells
+// the shared entrypoint not to start them here.
+//
+// It pulls GKE admin-activity audit records from a Pub/Sub subscription, drops
+// the ones no human made, joins each survivor against the live object to see
+// whether the change still stands, and posts what is left to the pod-local
+// Session KV server as a gitops-drift inject.
+//
+// It answers a different question from the watcher beside it. An event says
+// Kubernetes is unhappy; a drift record says a person changed a live object outside
+// git, and asks the reader which of the two states should win.
+type DriftDetectorSpec struct {
+	// Enabled controls whether the detector is started. Absent means not started,
+	// the opposite of EventWatcher, and the reason is a dependency rather than
+	// caution: the detector reads a Pub/Sub subscription that exists only where the
+	// drift-pubsub Terraform module was applied. An install without one that started
+	// the detector anyway would get a process that never exits and never reports a
+	// change — the subscription is not checked at startup, and a pull that fails
+	// because it does not exist is retried for the life of the pod. The pod stays
+	// Ready, so an install left on by accident is indistinguishable from a fleet
+	// nobody has touched.
+	//
+	// Setting it is necessary and not sufficient. The detector also needs
+	// spec.harness.projectId, .location and .clusterName, because it verifies the
+	// cluster name it is given against the cluster its credentials actually reach and
+	// stops on a disagreement — so a half-named harness would give a restart loop.
+	// The operator treats that combination as the detector staying off.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Subscription is the Pub/Sub subscription carrying the audit records. Empty
+	// takes the detector's own default, which is the name the drift-pubsub module
+	// creates; set it only for a subscription made by hand or renamed.
+	// +optional
+	Subscription string `json:"subscription,omitempty"`
+
+	// GitopsManagers names the managedFields managers that are the GitOps controller
+	// — `argocd-controller`, `flux`. Comma-separated and matched exactly.
+	//
+	// Empty is supported and degrades rather than fails. Ownership is still read and
+	// reported, but no record is ever marked as possibly reconciled, so every card
+	// asks its reader to check the live object without the hint that a controller may
+	// already have reverted the change. Naming a manager that does not write to these
+	// objects has the same effect as leaving it empty.
+	// +optional
+	GitopsManagers string `json:"gitopsManagers,omitempty"`
+}
+
 // TuningSpec carries execution limits per agent persona.
 //
 // Keys are personas, not profile names, because the profiles they map to are not all
@@ -419,7 +644,7 @@ type TuningSpec struct {
 	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
 	// preemption.
 	//
-	// The number lands in two places that deliberately differ. The gateway's
+	// The number lands in three places that deliberately differ. The gateway's
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
 	// delegation is refused with a chat reply naming the numbers, never queued,
 	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
@@ -431,7 +656,32 @@ type TuningSpec struct {
 	// bounds everything else in the namespace: an install whose namespace
 	// carries many non-session pods can see unrelated pod creation refused at
 	// admission before sessions reach this cap, and the headroom is an
-	// operator constant, not a CR field.
+	// operator constant, not a CR field. The third is the bus: the TASKS
+	// stream's max_consumers is provisioned from this number, because each
+	// session pod creates three named consumers there and a stream that
+	// cannot hold the configured concurrency refuses a legitimate session's
+	// consumer create at load. That one is capacity, not a control - it is
+	// sized to fit this cap rather than to enforce it - and because
+	// provisioning never edits an existing stream, an install whose TASKS
+	// stream is too small for the configured cap makes the provision Job
+	// fail rather than letting the shortfall surface later as a legitimate
+	// session's consumer create being refused and reported as a task
+	// failure. What that refusal names is the two ways out, and neither is
+	// a stream edit, because max_consumers is the one limit nats-server
+	// will not change on a stream that already exists: lower this number
+	// until it fits the stream, or delete TASKS and let provisioning
+	// recreate it at the width this number asks for, paying the task
+	// history the stream was holding. The two do not finish the same way.
+	// Lowering this number re-renders the provision Job, so it re-runs by
+	// itself. Recreating the stream also needs the provision Job re-run,
+	// and then the A2A gateway restarted - deleting a stream deletes the
+	// durable consumers on it, the gateway's event relay and any Hermes
+	// bridge sidecar do not re-create theirs, and a gateway in that state
+	// still accepts delegations and spawns session pods while relaying no
+	// events. The refusal names the order. An operator upgrade reaches that
+	// refusal as readily as an edit here does: a stream created before the
+	// derivation existed holds whatever it was created with, whatever this
+	// field says.
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
@@ -572,30 +822,57 @@ type DeploymentSpec struct {
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// InitContainers specifies standard Kubernetes initContainers to run before the agent starts.
+	// A volumeMounts entry naming a reserved volume is refused at admission, and
+	// dropped from the render on an install running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
 
 	// Sidecars specifies standard Kubernetes sidecar/application containers to run alongside the agent.
+	// A volumeMounts entry naming a reserved volume is refused at admission, and
+	// dropped from the render on an install running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	Sidecars []corev1.Container `json:"sidecars,omitempty"`
 
 	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+	// An entry is refused at admission if it takes a reserved volume name, or if
+	// its source is one of the routes to the agent's A2A bus credentials: a
+	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
+	// to one of the Secrets the operator renders bus credentials into
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// as either a secret volume or a projected secret source. The refusal is on
+	// the name and the shape of the source, not on what a given Secret happens to
+	// hold at the time. Reading those Secrets through env is not refused here. On
+	// an install running the A2A surface the same entries are dropped from the
+	// render as well, which is the half that holds when admission does not run:
+	// a default chart install does not register the webhooks at all
+	// (operator.webhooks.enabled=false), and one that does registers them at
+	// failurePolicy Ignore by default.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
 
 	// ExtraVolumes specifies custom volumes to mount for the main container.
+	// The same reserved names and reserved sources as SidecarVolumes are refused
+	// at admission -- a ServiceAccount token projection for the "a2a-bus"
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
+	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
 
 	// ExtraVolumeMounts specifies custom volume mounts for the main container.
+	// Appended to platform-agent and platform-agent-dashboard both, so an entry
+	// naming a reserved volume is refused at admission, and dropped from the
+	// render on an install running the A2A surface. The render drops one more
+	// shape admission does not: an entry naming a user volume that was itself
+	// dropped for the credential its source carries.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
@@ -786,11 +1063,9 @@ type SecuritySpec struct {
 	// for egress by <name>-gateway-netpol, which the operator renders on every
 	// reconcile whether this field is set or not — unless
 	// spec.networkPolicy.enabled is false, which withholds the gateway policy.
-	// On a Helm install that makes this the Pod's only policy: the one shape
-	// where this field enforces for real on an enforcing CNI, denying
-	// everything off its list. A Kustomize install still carries the static
-	// platform-agent-core-egress set over the same Pod, so the union resumes
-	// there. Everywhere else, turning this on leaves the
+	// That makes this the Pod's only policy: the one shape where this field
+	// enforces for real on an enforcing CNI, denying everything off its list.
+	// Everywhere else, turning this on leaves the
 	// Pod's permitted egress a strict superset of what it was. In the default
 	// shape the only destination it adds is the credential broker on TCP 8765
 	// — plus, when the agent is not exporting telemetry, the managed collector
@@ -813,12 +1088,6 @@ type SecuritySpec struct {
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
 	//     what this control is meant to be.
-	//
-	// A Kustomize install additionally applies platform-agent-core-egress
-	// (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which selects
-	// the agent Pod by app.kubernetes.io/name and permits the same metadata
-	// path. A Helm install does not carry it, and it changes nothing either
-	// way: the gateway policy alone is enough to make the point above.
 	//
 	// The overlap is deliberate rather than an oversight. Workload Identity
 	// needs the metadata path, and <name>-gateway-netpol still permits it to
@@ -875,7 +1144,9 @@ type SecuritySpec struct {
 	//     git wrappers, which go through the broker;
 	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
 	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
+	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
+	//     pinned empty in the managed .env (a project other than the pod's belongs in
+	//     spec.scope.projects, the management project still has to resolve).
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this

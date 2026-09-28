@@ -20,6 +20,23 @@
 admissionPolicy:
   enabled: true
 
+# Preflight ResourceQuota validation at chart render time (#749).
+# When enabled and running against a live cluster (`helm install` or `helm upgrade`),
+# the chart queries namespace ResourceQuotas via `lookup`. If any un-scoped quota lacks
+# sufficient headroom for the combined footprint of the chart workloads and the
+# operator-rendered pods (gateway, shell sandbox, credential proxy), the render fails
+# fast with a diagnosis and patch command instead of stalling later during pod creation.
+#
+# With no cluster to query (`helm template` in CI) or no ResourceQuota in the namespace,
+# `lookup` returns nothing and the check passes.
+#
+# It needs `get`/`list` on `resourcequotas` in the release namespace, though. Helm's
+# `lookup` swallows a NotFound and nothing else, so a 403 aborts the render rather than
+# passing quietly; an identity without that permission installs with
+# `--set quotaPreflight.enabled=false`.
+quotaPreflight:
+  enabled: true
+
 global:
   # Registry prefix for the images built from this repo (operator, agent,
   # credential proxy). Empty leaves them on the public defaults below.
@@ -210,10 +227,10 @@ telemetry:
 
 litellm:
   # The agent's baked default model endpoint is
-  # http://litellm.kubeagents-system.svc.cluster.local/v1 (see
+  # http://inference-gateway.kubeagents-system.svc.cluster.local/v1 (see
   # deploy/shared/defaults/config.yaml), so a working install needs this
-  # gateway. Disable only if you run your own LiteLLM (or point the agent
-  # elsewhere). Mirrors k8s-operator/config/integrations/litellm/base.
+  # gateway. Disable only if you run your own inference gateway (or point the
+  # agent elsewhere). Mirrors k8s-operator/config/integrations/litellm/base.
   # NOTE: the namespace in that endpoint is baked — installing the release
   # into any namespace other than kubeagents-system leaves the agent unable
   # to reach the gateway rendered here.
@@ -231,6 +248,16 @@ litellm:
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
+  # Output-token budget the gateway asks the provider for on a request that
+  # names none, rendered as max_tokens under every model_list alias. 0 leaves
+  # the key out, so the rendered config and its rollout checksum are what they
+  # were. Set it for a backend with one combined prompt-plus-output budget
+  # (vLLM, SGLang, TGI, llama.cpp), which refuses a request whose max_tokens
+  # alone fills the served window. A request that carries its own max_tokens
+  # keeps it: what that means for the agent's own traffic is on the site's
+  # inference-gateway page, "Setting the output-token budget". Chart-only;
+  # the kustomize dev base carries no such key.
+  maxTokens: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity, so the chart always creates this KSA — no operator reconciles it.
@@ -256,7 +283,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.100.0
+    tag: v1.100.1
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -414,12 +441,20 @@ hindsight:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # Recall is CPU-bound on the in-process cross-encoder reranker; see the
-    # template before raising these — more CPU has been measured to buy
-    # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
+    # The request covers steady state: at rest the API sits near 9m of CPU,
+    # and the request is what the scheduler places, what Autopilot bills and
+    # what a ResourceQuota counts, so it stays small. The limit is the ceiling
+    # recall may burst to on the in-process cross-encoder reranker; CPU above
+    # the request is best-effort, so on a node shared with other CPU-heavy
+    # tenants the request is the number to raise. An Autopilot cluster without
+    # Pod bursting resets the limit to the request, so raise the request there
+    # too if recall is slow. Raising the limit buys nothing: more CPU has been
+    # measured to change no recall latency on e2-standard-4, and a request of
+    # 4 CPUs never schedules there (docs/designs/memory.md, "What a recall
+    # costs"; k8s-operator/config/integrations/hindsight/api.yaml is canonical).
     resources:
       requests:
-        cpu: "2"
+        cpu: 250m
         memory: 1Gi
       limits:
         cpu: "4"
@@ -578,6 +613,23 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Out-of-band change detection. The drift-detector reads GKE
+    # admin-activity audit records from a Pub/Sub subscription and reports the
+    # ones a person made outside git, so it needs that subscription to exist:
+    # apply terraform/modules/drift-pubsub against this project before
+    # enabling it. Left off, the whole block is omitted and the detector is
+    # shipped in the image without being started.
+    driftDetector:
+      enabled: null # CRD default: false
+      # The subscription carrying the audit records. Empty takes the
+      # detector's own default, which is the name the drift-pubsub module
+      # creates; set it only for one made by hand or renamed.
+      subscription: ""
+      # Comma-separated managedFields managers that are the GitOps controller
+      # — "argocd-controller", "flux". Empty still reports who changed what,
+      # but never marks a change as one a controller may already have
+      # reverted.
+      gitopsManagers: ""
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every
@@ -655,7 +707,7 @@ platformAgent:
       # run on the standard container runtime.
       #
       # The Terraform composition always passes this explicitly (from
-      # agent_runtime_class, which install.sh derives from --gvisor), so this
+      # agent_runtime_class, which install.sh derives from --enable-gvisor), so this
       # default is what a direct `helm install` gets -- and what a `helm
       # upgrade` of a release that never set the key adopts, since Helm merges
       # the new chart's defaults. That upgrade path fails quietly where the
@@ -778,6 +830,42 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+  # The GCP projects, beyond the one the agent runs in, whose GKE clusters the
+  # hourly Cluster Agent reconcile enumerates, and what it leaves unmanaged:
+  # rendered as spec.scope on the PlatformAgent (the CRD reference on the site
+  # documents the field). The agent's service account needs the read roles in
+  # each project named; the Terraform composition binds them from the same
+  # value it passes here, and a chart installed on its own needs them granted
+  # by hand.
+  #
+  # A map renders the block as it is, empty lists included: an empty scope is a
+  # present block with empty lists, which the reconcile reads as the
+  # declaration that drops projects (their Cluster Agent profiles retire over
+  # its next two clean runs), so the composition always passes a map and a
+  # project leaves the scope by being removed from projects. null, the default,
+  # is not an empty scope: it is the chart being told nothing and renders no
+  # block. While no earlier revision rendered the block, that leaves a scope the
+  # CR already carries alone, because Helm sends only the difference between
+  # its rendered manifests; once a revision has rendered it, a render without
+  # it removes spec.scope from the CR, which the reconcile reads as no
+  # declaration (the management project alone, nothing retired), so null clears
+  # a scope without retiring its projects and emptying projects is how projects
+  # are dropped. The block is never dropped for being empty.
+  # Once a release has rendered the block the value is the declaration: the
+  # installer refuses the next full upgrade over a spec.scope edited by hand
+  # until install.env records it or the CR is put back, and a retag, or a
+  # hand-driven composition apply whose rendered scope is unchanged, leaves the
+  # edit in place.
+  #
+  #   scope:
+  #     projects: [payments-prod, payments-staging]
+  #     exclude:
+  #       projects: ["*-sandbox"]     # project IDs or shell-style globs
+  #       clusters:                   # one cluster, by the full triple
+  #         - projectId: payments-staging
+  #           location: us-central1
+  #           clusterName: scratch-cluster
+  scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

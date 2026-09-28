@@ -1,6 +1,7 @@
 import argparse
 import base64
 import contextlib
+import http.client
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 import credential_proxy
+import credential_proxy_client
 import gke_endpoint
 import providers
 import vcs_broker
@@ -254,8 +257,17 @@ class AgentAPIProxyTest(unittest.TestCase):
                 ("127.0.0.1", self.proxy.server_port),
                 timeout=_STALLED_CLIENT_READ_TIMEOUT_SECONDS,
             ) as client:
-                client.sendall(request)
+                # The clock starts before the request leaves, not after. The
+                # server's drain window opens once it has read the partial body,
+                # and that can happen before sendall returns to this thread: the
+                # bytes reach the kernel inside sendall, and the server thread can
+                # wake, parse, and block in its timed read first. A clock started
+                # here precedes the bytes leaving this socket, so elapsed brackets
+                # whatever window the server enforced. Started after sendall it
+                # could sit inside that window, and a loaded runner read 0.2495
+                # against the 0.25 deadline (#1740).
                 started = time.monotonic()
+                client.sendall(request)
                 status = self._read_status_line(client)
                 elapsed = time.monotonic() - started
         self.assertIn(b"401", status)
@@ -2054,6 +2066,348 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual(["git", "status", "--porcelain"], executed_argvs[0])
 
 
+class ExecRouteCapacityTest(unittest.TestCase):
+    """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(
+            json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8"
+        )
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, payload, path="/v1/exec"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def assert_slot_released(self, executor):
+        """The slot goes once the response is written, and the client can read
+        that response a moment before the handler thread leaves the `with`;
+        wait for the release rather than race it."""
+        deadline = time.monotonic() + 5
+        while executor.slots_in_use and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(0, executor.slots_in_use)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def no_slot_free(caller=None):
+        """What `request_slot` does when every slot stays busy for the wait."""
+        raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands and this request waited 60s without reaching a free slot")
+        yield  # pragma: no cover -- makes this a generator, as a context manager needs
+
+    def test_a_vcs_verb_at_the_cap_answers_the_same_503(self):
+        # The slot is the request's, taken by the route before the verb runs,
+        # so a broker at its cap has to read as busy there too, not as a fault.
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"probe": lambda payload: {"ok": True}},
+            ),
+            mock.patch.object(CredentialProxyHandler.executor, "request_slot", self.no_slot_free),
+        ):
+            status, body = self.post({}, path="/v1/vcs/probe")
+
+        self.assertEqual(503, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
+
+    def test_the_vcs_route_holds_its_slot_until_the_response_is_written(self):
+        # The route that runs the largest children the broker forks -- git
+        # clone and fetch -- is bounded the same way the exec route is: the
+        # slot is held through the verb and through the write of its answer.
+        seen = []
+        executor = CredentialProxyHandler.executor
+        original = CredentialProxyHandler._json
+
+        def verb(payload):
+            seen.append(("verb", executor.slots_in_use))
+            return {"ok": True}
+
+        def recording(handler, status, payload):
+            seen.append(("write", executor.slots_in_use))
+            return original(handler, status, payload)
+
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker, "route_table", return_value={"probe": verb}
+            ),
+            mock.patch.object(CredentialProxyHandler, "_json", recording),
+        ):
+            status, body = self.post({}, path="/v1/vcs/probe")
+
+        self.assertEqual(200, status)
+        self.assertEqual({"ok": True}, body)
+        self.assertEqual([("verb", 1), ("write", 1)], seen)
+        self.assert_slot_released(executor)
+
+    def raw_request(self, target, body, content_length=None):
+        """Send one HTTP request on a raw socket and return the socket unread.
+
+        For the callers the route tests cannot make with urllib: one that never
+        reads its response, one that never finishes sending its body.
+        """
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port))
+        self.addCleanup(sock.close)
+        length = len(body) if content_length is None else content_length
+        sock.sendall(
+            f"POST {target} HTTP/1.0\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {length}\r\n\r\n".encode("ascii")
+            + body
+        )
+        return sock
+
+    def test_a_caller_that_stops_reading_is_given_up_on_and_its_slot_freed(self):
+        # The slot is held through the write, so a caller that never reads a
+        # body larger than the socket buffers would otherwise keep it forever.
+        executor = CredentialProxyHandler.executor
+        stub = Path(executor.executables["kubectl"])
+        stub.write_text("#!/bin/bash\nhead -c 16777216 /dev/zero | tr '\\0' a\n", encoding="utf-8")
+        with (
+            mock.patch.object(executor, "max_output_bytes", 16 << 20),
+            mock.patch.object(credential_proxy, "RESPONSE_WRITE_TIMEOUT_SECONDS", 1),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.raw_request("/v1/exec", json.dumps({"argv": ["kubectl", "get", "pods"]}).encode())
+            deadline = time.monotonic() + 10
+            while not any("response not delivered" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the write to a caller that never reads was not given up on")
+                time.sleep(0.1)
+
+        self.assert_slot_released(executor)
+
+    def test_a_caller_that_stalls_mid_body_on_the_vcs_route_frees_its_slot(self):
+        # The vcs body is read inside the slot, so a caller that announces a
+        # body and stops sending would keep a slot with nothing running in it;
+        # a stalled peer is no hang-up, so a deadline is what ends it.
+        executor = CredentialProxyHandler.executor
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"probe": lambda payload: {"ok": True}},
+            ),
+            mock.patch.object(credential_proxy, "REQUEST_READ_TIMEOUT_SECONDS", 1),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.raw_request("/v1/vcs/probe", b'{"partial": ', content_length=1000)
+            deadline = time.monotonic() + 10
+            while not any("request body not received" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the stalled body was not given up on")
+                time.sleep(0.1)
+
+        self.assert_slot_released(executor)
+
+    def test_a_body_that_trickles_in_is_given_up_on_at_the_deadline(self):
+        # A socket timeout bounds one recv, so a byte every so often would
+        # keep a full stall from ever showing; the whole body has to arrive
+        # within one deadline, however it is paced.
+        executor = CredentialProxyHandler.executor
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def trickle(sock):
+            # A byte well inside the per-recv window, for as long as the test
+            # runs; the deadline, not the gaps, has to end the read.
+            while not stop.is_set():
+                try:
+                    sock.sendall(b" ")
+                except OSError:
+                    return
+                stop.wait(0.3)
+
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"probe": lambda payload: {"ok": True}},
+            ),
+            mock.patch.object(credential_proxy, "REQUEST_READ_TIMEOUT_SECONDS", 1),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            sock = self.raw_request("/v1/vcs/probe", b"{", content_length=1000)
+            threading.Thread(target=trickle, args=(sock,), daemon=True).start()
+            started = time.monotonic()
+            deadline = time.monotonic() + 10
+            while not any("request body not received" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the trickling body was never given up on")
+                time.sleep(0.1)
+            elapsed = time.monotonic() - started
+        stop.set()
+
+        # Given up on at about the deadline, not after the whole body's worth of gaps.
+        self.assertLess(elapsed, 4)
+        self.assert_slot_released(executor)
+
+    def test_a_caller_that_hangs_up_while_queued_is_logged_by_the_route(self):
+        # The executor-level test proves the refusal; this one proves the exec
+        # route turns it into its log line and starts nothing. Over a Unix
+        # socket, as in production: on the TCP listener the other tests use, a
+        # closed peer reports no POLLHUP, and the route runs unwatched there
+        # by design.
+        executor = CredentialProxyHandler.executor
+        single = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "single"),
+            scoped_pool=None,
+            max_concurrent_commands=1,
+        )
+        single.executables["kubectl"] = executor.executables["kubectl"]
+        socket_path = Path(self.temp_dir.name) / "broker.sock"
+        unix_server = credential_proxy.ThreadingUnixHTTPServer(
+            str(socket_path), CredentialProxyHandler
+        )
+        threading.Thread(target=unix_server.serve_forever, daemon=True).start()
+        self.addCleanup(unix_server.server_close)
+        self.addCleanup(unix_server.shutdown)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with single.request_slot():
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        with (
+            mock.patch.object(CredentialProxyHandler, "executor", single),
+            self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs,
+        ):
+            body = json.dumps({"argv": ["kubectl", "get", "pods"]}).encode()
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(str(socket_path))
+            sock.sendall(
+                b"POST /v1/exec HTTP/1.0\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            )
+            time.sleep(0.3)
+            sock.close()
+            deadline = time.monotonic() + 10
+            while not any("while queued for a slot" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the route never logged the queued hang-up")
+                time.sleep(0.1)
+        release.set()
+        holder.join()
+
+        self.assertEqual(0, single.queued_requests)
+        self.assertEqual(0, single.slots_in_use)
+
+    def test_a_broker_at_its_cap_answers_503_with_a_reason_the_shim_prints(self):
+        # `error` is the key the shim prints for a non-policy failure, so the
+        # agent reads why rather than a bare exit 1 -- and `code` lets a caller
+        # tell "busy, retry" from a fault.
+        with mock.patch.object(
+            CredentialProxyHandler.executor, "request_slot", self.no_slot_free
+        ):
+            status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(503, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
+
+    def test_the_exec_route_holds_its_slot_until_the_response_is_written(self):
+        # The slot covers the response as well as the command: released when
+        # the command exits, a slow reader keeps its body alive while the next
+        # command holds the slot, and the bodies in memory number the callers
+        # rather than the cap.
+        seen = []
+        original = CredentialProxyHandler._json
+
+        def recording(handler, status, payload):
+            seen.append(CredentialProxyHandler.executor.slots_in_use)
+            return original(handler, status, payload)
+
+        with mock.patch.object(CredentialProxyHandler, "_json", recording):
+            status, _ = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(200, status)
+        self.assertEqual([1], seen)
+        self.assert_slot_released(CredentialProxyHandler.executor)
+
+    def test_a_replacement_character_is_three_bytes_on_the_wire(self):
+        # ASCII-escaped JSON writes `\ufffd`, six bytes for one byte that was
+        # not UTF-8; the bound on the decoded text was sized for the three
+        # bytes of the character itself.
+        stub = Path(CredentialProxyHandler.executor.executables["kubectl"])
+        stub.write_text("#!/bin/bash\nprintf '\\377'\n", encoding="utf-8")
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        connection.request(
+            "POST",
+            "/v1/exec",
+            body=json.dumps({"argv": ["kubectl", "get", "pods"]}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+
+        self.assertEqual(200, response.status)
+        self.assertIn("\ufffd".encode("utf-8"), body)
+        self.assertNotIn(b"\\ufffd", body)
+        self.assertEqual("\ufffd", json.loads(body)["stdout"])
+
+    def test_the_exec_route_hands_its_connection_to_the_executor(self):
+        # The watch that ends an abandoned command needs the socket the request
+        # arrived on; the route is where it is known.
+        seen = []
+        original = CredentialProxyHandler.executor.execute
+
+        def recording(argv, **kwargs):
+            seen.append(kwargs.get("caller"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", recording):
+            status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(200, status)
+        self.assertEqual("pods\n", body["stdout"])
+        self.assertEqual(1, len(seen))
+        self.assertIsInstance(seen[0], socket.socket)
+
+
 class CommandExecutorTest(unittest.TestCase):
     CONTEXT = "gke_demo-project_us-central1_cluster-a"
 
@@ -2069,12 +2423,20 @@ class CommandExecutorTest(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def executor(self, timeout_seconds=5, max_output_bytes=1024):
+    def executor(
+        self,
+        timeout_seconds=5,
+        max_output_bytes=1024,
+        kubectl_timeout_seconds=credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        max_concurrent_commands=credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
+    ):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
             state_dir=self.temp_dir.name,
             scoped_pool=None,
+            kubectl_timeout_seconds=kubectl_timeout_seconds,
+            max_concurrent_commands=max_concurrent_commands,
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
@@ -2145,6 +2507,40 @@ class CommandExecutorTest(unittest.TestCase):
         stub.chmod(0o755)
         executor.executables["git"] = str(stub)
         return executor
+
+    def fake_kubectl(self, executor, body="exit 0"):
+        """Swap in a kubectl that does whatever the test needs it to do.
+
+        Named `kubectl` in a directory of its own for the same reason `fake_git`
+        is: a suffixed filename would not be the executable the proxy resolves.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-kubectl-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def dispatched(self, executor, argv):
+        """The argv and per-command deadline `execute` settles on for `argv`.
+
+        Both halves of the timeout decision are made in `execute` and are
+        invisible from the outside, so the assertions need the call it makes
+        rather than the result it returns.
+        """
+        seen = []
+        original = executor._execute
+
+        def record(inner_argv, **kwargs):
+            seen.append((list(inner_argv), kwargs.get("timeout_seconds")))
+            return original(inner_argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(list(argv))
+
+        self.assertEqual(1, len(seen))
+        return seen[0]
 
     def dumped_environment(self, result):
         """Parse an `env` dump, insisting it arrived whole.
@@ -2258,6 +2654,44 @@ class CommandExecutorTest(unittest.TestCase):
                 ["kubectl", "--kubeconfig=/etc/kubeconfig.yaml", "get", "pods"]
             )
 
+    def test_a_kubeconfig_after_the_separator_is_the_remote_commands(self):
+        # `kubectl exec pod -- tool --kubeconfig f`: kubectl stops reading its
+        # own flags at `--`, and so does the shim, which forwards `f` as the
+        # path it is. Resolving it here refused the whole request as a
+        # non-GKE context name.
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        for remote in ("--kubeconfig", "/remote/path.yaml"), ("--kubeconfig=/remote/path.yaml",):
+            with self.subTest(remote=remote):
+                argv = ["kubectl", "exec", "pod/x", "--", "tool", *remote]
+                rewritten, path = executor._reroute_kubeconfig_flags(argv)
+                self.assertEqual(argv, rewritten)
+                self.assertIsNone(path)
+
+                pinned = ["kubectl", f"--kubeconfig={self.CONTEXT}", *argv[1:]]
+                rewritten, path = executor._reroute_kubeconfig_flags(pinned)
+                self.assertEqual(
+                    ["kubectl", f"--kubeconfig={managed}", *argv[1:]], rewritten
+                )
+                self.assertEqual(managed, path)
+
+    def test_the_broker_accepts_every_argv_the_shim_rewrites(self):
+        # The contract, end to end: what `resolve_kubeconfig_flags` leaves in
+        # argv is what this side resolves. A shim test alone stubs the broker
+        # with a 200 and cannot see the two disagree about where flags end.
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        local = self.caller_kubeconfig(executor)
+        argv = [
+            "kubectl", "--kubeconfig", str(local), "exec", "pod/x",
+            "--", "tool", "--kubeconfig", "/remote/path.yaml",
+        ]
+        shimmed = credential_proxy_client.resolve_kubeconfig_flags(argv)
+        rewritten, path = executor._reroute_kubeconfig_flags(shimmed)
+        self.assertEqual(managed, path)
+        self.assertEqual(str(managed), rewritten[2])
+        self.assertEqual(argv[3:], rewritten[3:])
+
     def test_kubeconfig_surrounding_whitespace_is_ignored(self):
         # Profile .env files routinely carry a trailing newline, and the shim
         # forwards what it read; a name that only differs by whitespace must
@@ -2356,6 +2790,34 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(seen))
         self.assertFalse(executor._within_workspace(seen[0]))
 
+    def test_get_credentials_uses_scratch_even_when_no_kubeconfig_is_wanted(self):
+        # This path used to skip the scratch file and let gcloud write whatever
+        # `KUBECONFIG` named -- the broker's own base config. Asserted on the
+        # base file rather than on the routing: that write is what must not
+        # happen.
+        executor = self.fake_gcloud(self.executor())
+        base = Path(executor.environment["KUBECONFIG"])
+        base.parent.mkdir(parents=True, exist_ok=True)
+        before = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+        base.write_text(before, encoding="utf-8")
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(kwargs.get("kubeconfig_path"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+
+        self.assertEqual(1, len(seen))
+        self.assertIsNotNone(seen[0])
+        self.assertNotEqual(base, seen[0])
+        self.assertEqual(before, base.read_text(encoding="utf-8"))
+
     # ---- Choosing the control-plane endpoint --------------------------------
 
     def test_cache_miss_passes_dns_endpoint_when_the_cluster_needs_it(self):
@@ -2416,18 +2878,719 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(124, result.exit_code)
 
     def test_timeout_handles_process_group_exit_race(self):
-        process = mock.Mock(pid=123, returncode=0)
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(["command"], 1),
-            (b"", b""),
-        ]
-        with (
-            mock.patch("credential_proxy.subprocess.Popen", return_value=process),
-            mock.patch("credential_proxy.os.killpg", side_effect=ProcessLookupError),
-        ):
-            result = self.executor(timeout_seconds=1).execute_internal(["command"])
+        # The group can be gone by the time the deadline fires -- the command
+        # exits between the timeout and the kill -- and a kill that finds
+        # nothing must not turn a timeout into an exception. The sleep here
+        # outlives the deadline by a fifth of a second and ends on its own;
+        # every signal to its group is made to answer as though it had already.
+        with mock.patch("credential_proxy.os.killpg", side_effect=ProcessLookupError):
+            result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "1.2"])
         self.assertTrue(result.timed_out)
         self.assertEqual(124, result.exit_code)
+
+    # ---- What a command's output costs this process --------------------------
+    #
+    # Output is read as it streams and only `max_output_bytes` of each stream is
+    # kept. Before this, `communicate()` held every byte a command printed until
+    # it exited, so the broker's memory tracked the size of what commands
+    # printed times how many ran at once -- the OOM loop in #2018.
+
+    def test_output_past_the_cap_is_dropped_as_it_streams(self):
+        # 3 MiB printed, 4 KiB kept: the command still runs to completion (a
+        # child blocked on a full pipe would time out instead) and the caller
+        # gets exactly the cap, marked truncated.
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=4096),
+            body="head -c 3145728 /dev/zero | tr '\\0' a",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.truncated)
+        self.assertEqual(4096, len(result.stdout))
+        self.assertEqual("a" * 4096, result.stdout)
+
+    def test_each_stream_is_capped_on_its_own(self):
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=4096),
+            body="printf ok; head -c 100000 /dev/zero | tr '\\0' e >&2",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertEqual("ok", result.stdout)
+        self.assertEqual("e" * 4096, result.stderr)
+        self.assertTrue(result.truncated)
+
+    def test_output_within_the_cap_is_complete_and_not_marked_truncated(self):
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=1 << 20),
+            body="head -c 200000 /dev/zero | tr '\\0' b; printf err >&2; exit 3",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertEqual(3, result.exit_code)
+        self.assertFalse(result.truncated)
+        self.assertEqual(200000, len(result.stdout))
+        self.assertEqual("err", result.stderr)
+
+    def test_output_that_is_not_utf8_is_bounded_once_decoded(self):
+        # Every byte that is not UTF-8 decodes to a three-byte replacement
+        # character, so a stream of them at the cap would leave the process,
+        # and then the response, three times the cap. The bound is on the
+        # decoded text's UTF-8 size, not only on the bytes captured.
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=64 << 10),
+            body="head -c 200000 /dev/zero | tr '\\0' '\\377'",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.truncated)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 64 << 10)
+        self.assertEqual({"�"}, set(result.stdout))
+
+    def test_valid_utf8_output_is_returned_as_written(self):
+        executor = self.fake_kubectl(self.executor(), body="printf 'h\\303\\251llo'")
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertFalse(result.truncated)
+        self.assertEqual("héllo", result.stdout)
+
+    def test_a_large_stdin_is_delivered_in_full(self):
+        # Larger than a pipe buffer, so the write has to interleave with the
+        # reads: a command that echoes its input back would otherwise deadlock
+        # against a writer that waits for it to be read.
+        executor = self.fake_kubectl(self.executor(max_output_bytes=1 << 24), body="cat")
+        payload = "x" * (1 << 20)
+
+        result = executor.execute(["kubectl", "get", "pods"], stdin=payload)
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(payload, result.stdout)
+
+    def test_stdin_is_fed_after_the_outputs_close(self):
+        # A child that closes stdout and stderr first and then reads its input
+        # is still owed the input: the read loop has to keep going for stdin
+        # alone, or the child blocks on a half-written pipe until the deadline.
+        # `wc` reads all of stdin and reports the count into a file, since its
+        # stdout is gone.
+        count_file = Path(self.temp_dir.name) / "count"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=2),
+            body=f'exec >&- 2>&-; wc -c > "{count_file}"',
+        )
+        payload = "y" * (1 << 20)
+
+        result = executor.execute(["kubectl", "get", "pods"], stdin=payload)
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(str(len(payload)), count_file.read_text().strip())
+
+    def test_a_timed_out_command_still_returns_what_it_wrote(self):
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="printf partial; sleep 10",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.exit_code)
+        self.assertEqual("partial", result.stdout)
+        self.assertIn("kubectl command timed out after 1s", result.stderr)
+
+    def test_output_past_the_cap_never_lands_in_this_process(self):
+        # The claim the streaming read exists for, checked against the process
+        # rather than against the result: 16 MiB printed against a 64 KiB cap
+        # must not cost 16 MiB here. Reading the whole output first and
+        # truncating afterwards passes every other test in this group and
+        # fails this one.
+        import tracemalloc
+
+        printed = 16 << 20
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=64 << 10),
+            body=f"head -c {printed} /dev/zero | tr '\\0' a",
+        )
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            result = executor.execute(["kubectl", "get", "pods"])
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertTrue(result.truncated)
+        self.assertLess(
+            peak, printed // 4, f"{peak} bytes peaked in this process for {printed} printed"
+        )
+
+    def test_an_ended_command_gets_sigterm_before_sigkill(self):
+        # git removes its lock files on SIGTERM and cannot on SIGKILL, so the
+        # end a command gets -- at its deadline or when its caller leaves -- is
+        # TERM, a grace period, then KILL. The stub proves the order by writing
+        # a marker from its TERM handler.
+        marker = Path(self.temp_dir.name) / "terminated"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body=f"trap 'touch \"{marker}\"; exit 143' TERM; sleep 10 & wait $!",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertTrue(
+            marker.exists(), "the command was not given SIGTERM before it was killed"
+        )
+
+    def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(self):
+        # `trap '' TERM` is inherited by the sleep, so nothing in the group
+        # exits on the first signal; the second one is what ends it, after the
+        # grace and well before the sleep would have.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="trap '' TERM; sleep 10 & wait $!",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        grace_ms = credential_proxy.KILL_GRACE_SECONDS * 1000
+        self.assertGreaterEqual(result.duration_ms, 1000 + grace_ms - 100)
+        self.assertLess(result.duration_ms, 9000)
+
+    def test_a_descendant_that_ignores_sigterm_is_killed_with_the_group(self):
+        # The leader (bash) dies on SIGTERM; the shell it started ignores it,
+        # and so does that shell's sleep. The second signal has to reach the
+        # group whether or not the leader is still there, or the survivors
+        # keep the pipes and run on outside the slot they were counted under.
+        pid_file = Path(self.temp_dir.name) / "stubborn.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body=f'sh -c \'trap "" TERM; echo $$ > "{pid_file}"; sleep 30\' & wait',
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "a descendant that ignored SIGTERM outlived the command",
+        )
+
+    def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
+        # With both pipes closed the read loop has nothing to watch, so the
+        # wait that follows has to look at the caller itself, or a hang-up in
+        # that window leaves the command running to the deadline for nobody.
+        pid_file = Path(self.temp_dir.name) / "detached.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30),
+            body=f'exec >&- 2>&-; sleep 30 & echo $! > "{pid_file}"; wait',
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.7)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        result = executor.execute(
+            ["kubectl", "wait", "--for=condition=Ready", "pod/api"], caller=ours
+        )
+
+        self.assertTrue(result.abandoned)
+        self.assertFalse(result.timed_out)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "the sleep the command started outlived the hang-up",
+        )
+
+    def test_a_command_that_closes_its_pipes_and_runs_on_still_meets_the_deadline(self):
+        # With both pipes closed there is nothing left to read, so the
+        # deadline is enforced by the wait that follows -- at the deadline,
+        # not at the end of the drain grace a killed command gets.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="exec >&- 2>&-; sleep 10",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.exit_code)
+        self.assertLess(result.duration_ms, 4000)
+
+    # ---- The caller's connection ---------------------------------------------
+
+    @staticmethod
+    def process_is_live(pid):
+        """Is `pid` still running? A zombie or a missing entry both mean no."""
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("State:"):
+                        return line.split()[1] not in {"Z", "X"}
+        except OSError:
+            return False
+        return False
+
+    def test_an_abandoned_caller_ends_the_command_and_everything_it_started(self):
+        # A triage session torn down mid-command used to leave its kubectl
+        # running to the deadline, holding a slot and buffering output for
+        # nobody. `wait` is a long-running verb, so the deadline here is the
+        # broker-wide 30s; the result has to come back well before that.
+        pid_file = Path(self.temp_dir.name) / "sleeper.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30),
+            body=f'sleep 30 & echo $! > "{pid_file}"; wait',
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.5)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        result = executor.execute(
+            ["kubectl", "wait", "--for=condition=Ready", "pod/api"], caller=ours
+        )
+
+        self.assertTrue(result.abandoned)
+        self.assertFalse(result.timed_out)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "the sleep the command started outlived the command",
+        )
+
+    def test_a_caller_that_stays_connected_does_not_end_the_command(self):
+        executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("done\n", result.stdout)
+
+    def test_a_half_closed_caller_is_not_taken_for_a_hang_up(self):
+        # A peer that shut its writing half after the request is still there,
+        # waiting for the response; it reads as EOF, and EOF alone must not
+        # end its command. Only a peer that closed for good reports POLLHUP.
+        executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        theirs.shutdown(socket.SHUT_WR)
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("done\n", result.stdout)
+
+    def test_a_caller_that_hangs_up_while_queued_is_dropped_before_anything_starts(self):
+        # With every slot busy, a caller that leaves during the wait must not
+        # take the slot a live request is waiting for only to fork and kill.
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=3)
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.3)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises(credential_proxy.CallerHungUp):
+            with executor.request_slot(caller=ours):
+                self.fail("a slot was granted to a caller that had gone")
+
+        # Back before the slot would have freed.
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_unexpected_bytes_from_the_caller_are_not_taken_for_a_hang_up(self):
+        # After the request body nothing more is expected, but a peer that
+        # sends something is still there: the command runs on, unwatched.
+        executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        theirs.sendall(b"not part of this protocol")
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertEqual("done\n", result.stdout)
+
+    def test_the_deadline_still_applies_while_a_caller_is_watched(self):
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1), body="sleep 10"
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.abandoned)
+        self.assertEqual(124, result.exit_code)
+
+    def test_a_closed_caller_socket_runs_the_command_unwatched(self):
+        # Registering a dead descriptor must not fail the command; internal
+        # callers pass nothing and this is the same path.
+        executor = self.fake_kubectl(self.executor(), body="echo done")
+        ours, theirs = socket.socketpair()
+        theirs.close()
+        ours.close()
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("done\n", result.stdout)
+
+    # ---- How many commands run at once ---------------------------------------
+
+    def test_the_concurrency_cap_is_read_from_the_environment(self):
+        # Through the argument parser, like the other bounds, so the operator's
+        # env entry reaches the executor the way the output cap does.
+        with mock.patch.dict(
+            os.environ, {credential_proxy.ENV_MAX_CONCURRENT_COMMANDS: "3"}
+        ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+            self.assertEqual(3, credential_proxy.parse_args().max_concurrent_commands)
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+            sys, "argv", ["credential_proxy.py"]
+        ):
+            os.environ.pop(credential_proxy.ENV_MAX_CONCURRENT_COMMANDS, None)
+            self.assertEqual(
+                credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
+                credential_proxy.parse_args().max_concurrent_commands,
+            )
+        with self.assertRaises(ValueError):
+            self.executor(max_concurrent_commands=0)
+
+    def test_slots_are_granted_in_arrival_order(self):
+        # Under sustained saturation the request that has waited longest must
+        # be the next served, and the one refused after the wait must be the
+        # one that waited it: a semaphore's lapsing timed acquire rejoins at
+        # the back and does neither. The holder keeps its slot until told to
+        # let go, so the four are queued before any can be admitted, however
+        # slowly the runner starts threads.
+        executor = self.executor(max_concurrent_commands=1)
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.assertTrue(held.wait(5), "the slot holder never got its slot")
+        admitted = []
+        lock = threading.Lock()
+
+        def wait_in_line(label):
+            with executor.request_slot():
+                with lock:
+                    admitted.append(label)
+
+        threads = []
+        for index, label in enumerate(("first", "second", "third", "fourth")):
+            thread = threading.Thread(target=wait_in_line, args=(label,))
+            thread.start()
+            threads.append(thread)
+            # Each joins the queue before the next is started, so arrival
+            # order is known rather than raced.
+            deadline = time.monotonic() + 5
+            while executor.queued_requests < index + 1:
+                if time.monotonic() > deadline:
+                    self.fail(f"{label} never joined the queue")
+                time.sleep(0.01)
+        release.set()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(["first", "second", "third", "fourth"], admitted)
+
+    def hold_a_slot(self, executor, seconds):
+        """Hold a request slot for `seconds` on another thread; return once held.
+
+        The holder sets an event once it has the slot, so the caller waits on
+        the fact rather than on a sleep that a loaded runner can outrun.
+        """
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                time.sleep(seconds)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.assertTrue(held.wait(5), "the slot holder never got its slot")
+        return thread
+
+    def test_a_request_past_the_cap_waits_for_a_slot(self):
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=1)
+
+        started = time.monotonic()
+        with executor.request_slot():
+            waited = time.monotonic() - started
+
+        # It was admitted after the holder finished, not beside it.
+        self.assertGreaterEqual(waited, 0.5)
+
+    def test_a_request_that_waits_too_long_for_a_slot_is_refused(self):
+        executor = self.executor(max_concurrent_commands=1)
+        holder = self.hold_a_slot(executor, seconds=2)
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with executor.request_slot():
+                    self.fail("a slot was granted while the holder still had it")
+
+        self.assertIn("limit of 1 concurrent commands", str(raised.exception))
+        self.assertIn("without reaching a free slot", str(raised.exception))
+        # The refusal released nothing it did not hold: the slot is still the
+        # holder's, and comes back when it ends.
+        holder.join()
+        with executor.request_slot():
+            pass
+
+    def test_a_wait_for_a_slot_is_logged(self):
+        # The log line is what an operator sizing the cap reads; the command's
+        # own duration does not include the wait, since `_execute` starts its
+        # clock after admission.
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=2)
+
+        queued_at = time.monotonic()
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_LOG_MS", 100):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                with executor.request_slot():
+                    waited_ms = (time.monotonic() - queued_at) * 1000
+                    result = executor.execute_internal(["/bin/echo", "after the wait"])
+
+        self.assertTrue(
+            any("request waited" in line and "for a slot" in line for line in logs.output)
+        )
+        # Measured against the wait rather than a fixed bound: a loaded runner
+        # can take half a second to fork an echo, but never the two seconds the
+        # command would report if its clock had started in the queue.
+        self.assertGreater(waited_ms, 1000)
+        self.assertLess(result.duration_ms, waited_ms / 2)
+
+    def test_an_emptied_group_gets_no_sigkill(self):
+        # Once the group is seen empty its id is free for reuse, so the second
+        # signal goes only to a group the grace ran out on.
+        sent = []
+        real_killpg = os.killpg
+
+        def recording(pgid, signum):
+            sent.append(signum)
+            return real_killpg(pgid, signum)
+
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1), body="sleep 10"
+        )
+        with mock.patch("credential_proxy.os.killpg", recording):
+            result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertIn(credential_proxy.signal.SIGTERM, sent)
+        self.assertNotIn(credential_proxy.signal.SIGKILL, sent)
+
+    def test_the_kubeconfig_cache_fill_runs_on_the_short_deadline(self):
+        # Two silent gcloud calls ahead of the kubectl, inside one request:
+        # on the broker-wide deadline they alone could outlast the idle time
+        # Envoy allows the stream.
+        executor = self.fake_gcloud(self.executor(kubectl_timeout_seconds=7))
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(kwargs.get("timeout_seconds"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor._ensure_managed_kubeconfig(target)
+
+        self.assertTrue(seen, "no gcloud ran for the cache fill")
+        self.assertEqual({7}, set(seen))
+
+    def test_a_request_s_commands_share_one_deadline(self):
+        # Several commands in one request -- a vcs publish's git, a first
+        # kubectl's credential fetch -- must not each get the whole broker
+        # deadline, or the request's silent worst case is that many deadlines
+        # end to end. The first command here spends most of a 2 s budget; the
+        # second gets only what is left.
+        executor = self.executor(timeout_seconds=2)
+
+        started = time.monotonic()
+        with executor.request_slot():
+            first = executor.execute_internal(["/bin/sleep", "1.2"])
+            second = executor.execute_internal(["/bin/sleep", "5"])
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(first.timed_out)
+        self.assertTrue(second.timed_out)
+        self.assertEqual(124, second.exit_code)
+        self.assertLess(elapsed, 5)
+        # Outside a request, a command gets the deadline it asked for.
+        self.assertFalse(executor.execute_internal(["/bin/sleep", "0.1"]).timed_out)
+
+    def test_commands_take_no_slot_of_their_own(self):
+        # A slot is a request's, held by the route around the command and the
+        # response; a command never queues on its own. So the kubeconfig
+        # cache-fill under `_kubeconfig_lock`, a trusted helper and the
+        # workspace's git all run inside whatever slot their request holds,
+        # and none of them can hold a lock while waiting for one.
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=2)
+
+        started = time.monotonic()
+        result = executor.execute_internal(["/bin/echo", "now"])
+
+        self.assertEqual("now\n", result.stdout)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    # ---- Bounding a kubectl that cannot reach its control plane -------------
+
+    def test_kubectl_read_is_given_a_request_timeout_and_the_short_deadline(self):
+        # kubectl's own client default is 300s, so an unreachable control plane
+        # holds a broker worker for five minutes without these two bounds.
+        executor = self.fake_kubectl(self.executor())
+
+        argv, deadline = self.dispatched(executor, ["kubectl", "get", "pods"])
+
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}", argv
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
+
+    def test_kubectl_keeps_the_request_timeout_its_caller_chose(self):
+        # A caller who named a bound has answered the question; overriding it
+        # with a shorter one would make the flag a lie.
+        executor = self.fake_kubectl(self.executor())
+
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "get", "pods", "--request-timeout=5m"]
+        )
+
+        self.assertEqual(
+            1, len([arg for arg in argv if arg.startswith("--request-timeout")])
+        )
+        self.assertIn("--request-timeout=5m", argv)
+        self.assertIsNone(deadline)
+
+    def test_kubectl_commands_that_are_meant_to_block_keep_the_broker_deadline(self):
+        # `logs`, `wait` and `rollout status` are permitted by command_policy
+        # and instructed by a shipped skill, so bounding them at 30s/60s does
+        # not turn a hang into a fast failure, it turns a working command into
+        # a broken one. The rest are refused a layer earlier today and are here
+        # so the deadline stays right if that ever changes.
+        executor = self.fake_kubectl(self.executor())
+        blocking = (
+            ["kubectl", "logs", "-f", "pod/api"],
+            ["kubectl", "logs", "--follow", "pod/api"],
+            ["kubectl", "get", "pods", "-w"],
+            ["kubectl", "get", "pods", "--watch"],
+            ["kubectl", "rollout", "status", "deployment/api"],
+            ["kubectl", "wait", "--for=condition=Ready", "pod/api"],
+            ["kubectl", "delete", "namespace", "scratch"],
+            ["kubectl", "exec", "pod/api", "--", "true"],
+            ["kubectl", "port-forward", "pod/api", "8080:80"],
+            ["kubectl", "--namespace=demo", "wait", "--for=delete", "pod/api"],
+            ["kubectl", "-n", "kube-system", "logs", "-f", "pod/api"],
+            ["kubectl", "logs", "--follow=true", "pod/api"],
+            ["kubectl", "get", "pods", "--watch=true"],
+            ["kubectl", "get", "pods", "--watch-only=true"],
+            ["kubectl", "-n", "demo", "rollout", "status", "deployment/api"],
+            ["kubectl", "--namespace", "demo", "wait", "--for=condition=Ready", "pod/x"],
+            ["kubectl", "--context", "foo", "wait", "--for=delete", "pod/api"],
+        )
+
+        for command in blocking:
+            with self.subTest(command=" ".join(command)):
+                argv, deadline = self.dispatched(executor, command)
+                self.assertNotIn(
+                    f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+                    argv,
+                )
+                self.assertIsNone(deadline)
+
+    def test_kubectl_detached_global_flag_does_not_exempt_ordinary_reads(self):
+        executor = self.fake_kubectl(self.executor())
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "-n", "kube-system", "get", "pods"]
+        )
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+            argv,
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
+
+    def test_kubectl_filename_flag_is_not_mistaken_for_logs_follow(self):
+        # `-f` is `--filename` on every verb except `logs`. Reading it as "this
+        # streams" would exempt most of the write path from the bound.
+        executor = self.fake_kubectl(self.executor())
+
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "apply", "-f", "manifest.yaml"]
+        )
+
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}", argv
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
+
+    def test_hanging_kubectl_read_is_killed_at_the_short_deadline(self):
+        # The end-to-end shape of the fix: the broker-wide deadline is long, the
+        # kubectl one is short, and a read that cannot answer takes the short one.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="sleep 10",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.exit_code)
+        self.assertIn("kubectl command timed out after 1s", result.stderr)
+
+    def test_blocking_kubectl_outlives_the_short_deadline(self):
+        # The other side of the same knob: with the short deadline set to 1s, a
+        # command that is meant to block still gets the broker-wide budget.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="sleep 2",
+        )
+
+        result = executor.execute(["kubectl", "wait", "--for=condition=Ready", "pod/api"])
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(0, result.exit_code)
 
     def test_command_environment_excludes_sidecar_tokens(self):
         import os
@@ -3805,7 +4968,13 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
                 return None
 
             def execute(
-                self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+                self,
+                argv,
+                stdin=None,
+                cwd=None,
+                kubeconfig_context=None,
+                wants_kubeconfig=False,
+                caller=None,
             ):
                 owner.executed.append(argv)
                 return credential_proxy.ExecutionResult(
@@ -4510,8 +5679,8 @@ class VcsRouteTest(unittest.TestCase):
         self.assertTrue(vcs_broker.WRITE_VERBS <= routes)
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
-            {"capabilities", "clone", "proposal-list", "proposal-view",
-             "issue-list", "issue-view"},
+            {"capabilities", "clone", "identity", "proposal-list", "proposal-view",
+             "proposal-commits", "issue-list", "issue-view"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -4988,7 +6157,13 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
             return "no lease" if argv and argv[0] == "git" else None
 
         def execute(
-            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            self,
+            argv,
+            stdin=None,
+            cwd=None,
+            kubeconfig_context=None,
+            wants_kubeconfig=False,
+            caller=None,
         ):
             return credential_proxy.ExecutionResult(
                 exit_code=0, stdout="", stderr="",
@@ -5107,7 +6282,13 @@ class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
             return None
 
         def execute(
-            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            self,
+            argv,
+            stdin=None,
+            cwd=None,
+            kubeconfig_context=None,
+            wants_kubeconfig=False,
+            caller=None,
         ):
             self.executed.append(argv)
             return credential_proxy.ExecutionResult(
@@ -6001,7 +7182,13 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             return None
 
         def execute(
-            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            self,
+            argv,
+            stdin=None,
+            cwd=None,
+            kubeconfig_context=None,
+            wants_kubeconfig=False,
+            caller=None,
         ):
             self.executed.append(argv)
             return credential_proxy.ExecutionResult(
@@ -6380,6 +7567,55 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         result = executor.execute(["kubectl", "get", "pods"])
         self.assertEqual(0, result.exit_code, result.stderr)
         self.assertIn("token: TOKEN-1", result.stdout)
+
+    def host_context_executor(self, pool, context):
+        """An executor built with the operator's host-cluster pin in place.
+
+        Read in `__init__`, so the environment has to be patched around
+        construction rather than assigned afterwards.
+        """
+        with mock.patch.dict(os.environ, {"KUBE_CONTEXT_NAME": context}):
+            return self.executor(pool)
+
+    def test_the_host_context_beats_a_base_kubeconfig_that_has_drifted(self):
+        """The pin is what makes the default survive a rewrite of that file.
+
+        The base kubeconfig names a cluster the pool does not cover, which is
+        what `get-credentials` for another cluster used to leave behind. Reading
+        the file refuses; reading the environment runs. Asserted through the
+        mint, because a refusal and a mint for the wrong cluster both come back
+        as "it did not work" otherwise.
+        """
+        executor = self.host_context_executor(
+            self.pool(), f"gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}"
+        )
+        self.ambient_kubeconfig(executor, self.UNMAPPED)
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_without_a_host_context_the_base_kubeconfig_still_answers(self):
+        """A broker started outside the operator keeps the old behaviour."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KUBE_CONTEXT_NAME", None)
+            executor = self.executor(self.pool())
+        self.ambient_kubeconfig(executor, self.MAPPED)
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_a_host_context_that_is_not_a_gke_name_falls_back(self):
+        """`minikube` is a legitimate context and names no GKE cluster.
+
+        Trusting it blindly would strand the ambient path on a value
+        `parse_gke_context` cannot use, refusing every request that names no
+        cluster.
+        """
+        executor = self.host_context_executor(self.pool(), "minikube")
+        self.ambient_kubeconfig(executor, self.MAPPED)
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.EMAIL], self.minted)
 
     def test_the_kubeconfig_flag_goes_through_selection_too(self):
         """`--kubeconfig` outranks the environment in kubectl.
@@ -7247,6 +8483,849 @@ class ReadCredentialSelectionTest(unittest.TestCase):
         self.assertEqual("core.hooksPath", without[0][0])
         self.assertEqual(list(credential_proxy.GIT_FORCED_CONFIG), without[1:])
         self.assertNotIn("http.https://github.com/.extraheader", dict(without))
+
+class ApiRelayOverTheSocketTest(unittest.TestCase):
+    """The read-only Cloud API relay, driven over a real socket.
+
+    A fake upstream stands in for monitoring.googleapis.com and records what
+    reached it, so every property the design's security review claims is
+    checked at the edge: which headers leave the broker, which query keys do
+    not, which callers are turned away, and what the audit trail says about
+    each. `GoogleApiRelay.fetch` runs for real; only the connection is pointed
+    at the fake and the token is fixed.
+    """
+
+    CALLER = "system:serviceaccount:kubeagents-system:kubeagents-platform-agent-shell"
+    ALLOWED = "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries"
+
+    def setUp(self):
+        owner = self
+        self.upstream_requests = []
+        self.reply = {"status": 200, "content_type": "application/json; charset=UTF-8",
+                      "body": b'{"timeSeries":[]}', "headers": {}, "delay": 0.0,
+                      # (pieces, seconds between them): send the body a piece at
+                      # a time, flushing each, for the deadline tests.
+                      "trickle": None,
+                      # Announce the full Content-Length, send this many bytes,
+                      # then close the connection.
+                      "truncate_to": None,
+                      # Write this exact byte string as the whole response and
+                      # close, for responses BaseHTTPRequestHandler cannot frame.
+                      "raw": None}
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802
+                owner.upstream_requests.append((self.path, dict(self.headers)))
+                reply = owner.reply
+                time.sleep(reply["delay"])
+                try:
+                    if reply["raw"] is not None:
+                        self.wfile.write(reply["raw"])
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
+                    self.send_response(reply["status"])
+                    if reply["content_type"]:
+                        self.send_header("Content-Type", reply["content_type"])
+                    for name, value in reply["headers"].items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", str(len(reply["body"])))
+                    self.end_headers()
+                    if reply["truncate_to"] is not None:
+                        self.wfile.write(reply["body"][: reply["truncate_to"]])
+                        self.wfile.flush()
+                        self.close_connection = True
+                    elif reply["trickle"] is None:
+                        self.wfile.write(reply["body"])
+                    else:
+                        pieces, gap = reply["trickle"]
+                        for piece in pieces:
+                            self.wfile.write(piece)
+                            self.wfile.flush()
+                            time.sleep(gap)
+                except OSError:
+                    # The broker gave up on us (the deadline test); nothing to report.
+                    pass
+
+            def log_message(self, _message, *_args):
+                return
+
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
+        self.addCleanup(self.upstream.server_close)
+        self.addCleanup(self.upstream.shutdown)
+
+        class FakeRelay(credential_proxy.GoogleApiRelay):
+            """The real fetch over a plain connection to the fake upstream."""
+
+            def __init__(self, port):
+                super().__init__()
+                self.port = port
+                self.hosts = []
+
+            def authorization_header(self):
+                return "Bearer broker-token"
+
+            def connection(self, host):
+                self.hosts.append(host)
+                return http.client.HTTPConnection(
+                    "127.0.0.1", self.port, timeout=credential_proxy.API_RELAY_CONNECT_TIMEOUT_S
+                )
+
+        self.relay = FakeRelay(self.upstream.server_address[1])
+
+        for attribute in ("api_relay", "authenticator", "policy", "executor",
+                          "max_request_bytes", "enforce_read_only"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.api_relay = self.relay
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        # Above _BODY_LARGER_THAN_SOCKET_BUFFERS, so the refused-POST drain test
+        # exercises a body the drain actually reads rather than declines.
+        CredentialProxyHandler.max_request_bytes = 16 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                "kubeagents-credential-proxy": credential_proxy.CALLER_ROLE_SHELL,
+                "kubeagents-credential-proxy-chat": credential_proxy.CALLER_ROLE_CHAT,
+            },
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+        roles = {
+            "shell-token": credential_proxy.CALLER_ROLE_SHELL,
+            "chat-token": credential_proxy.CALLER_ROLE_CHAT,
+        }
+        caller = self.CALLER
+
+        def fake_review(token):
+            if token not in roles:
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=caller, uid="sa-uid", role=roles[token])
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _request(self, path, token="shell-token", method="GET", headers=None, body=None):
+        # http.client rather than urllib: the request target goes on the wire
+        # exactly as written, which is what the normal-form tests need.
+        sent = dict(headers or {})
+        if token is not None:
+            sent["Authorization"] = f"Bearer {token}"
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        try:
+            connection.request(method, path, body=body, headers=sent)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def _raw(self, target: bytes, token=b"shell-token"):
+        """Send a request line as bytes; for targets http.client itself refuses to send."""
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"GET " + target + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer " + token + b"\r\n\r\n"
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            return response.status, dict(response.getheaders()), response.read()
+
+    def _json_request(self, *args, **kwargs):
+        status, headers, body = self._request(*args, **kwargs)
+        return status, headers, json.loads(body)
+
+    # -- the happy path --------------------------------------------------
+
+    def test_a_permitted_read_reaches_the_upstream_with_exactly_two_headers(self):
+        query = (
+            "filter=metric.type%3D%22kubernetes.io%2Fcontainer%2Fcpu%2Fcore_usage_time%22"
+            "&interval.startTime=2026-09-08T00%3A00%3A00Z&key=AIzaFAKE&access_token=x"
+            "&oauth_token=y&bearer_token=z&pageSize=1000"
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, body = self._request(
+                f"{self.ALLOWED}?{query}",
+                headers={"X-Goog-User-Project": "someone-else", "Accept": "text/plain",
+                         "Cookie": "session=1"},
+            )
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"timeSeries":[]}', body)
+        self.assertEqual("application/json; charset=UTF-8", headers["Content-Type"])
+
+        self.assertEqual(["monitoring.googleapis.com"], self.relay.hosts)
+        self.assertEqual(1, len(self.upstream_requests))
+        path, upstream_headers = self.upstream_requests[0]
+        # The three credential keys are gone; every other pair is byte-for-byte.
+        self.assertEqual(
+            "/v3/projects/kagents-dev/timeSeries"
+            "?filter=metric.type%3D%22kubernetes.io%2Fcontainer%2Fcpu%2Fcore_usage_time%22"
+            "&interval.startTime=2026-09-08T00%3A00%3A00Z&pageSize=1000",
+            path,
+        )
+        self.assertEqual(
+            {"Host", "Authorization", "Accept"},
+            set(upstream_headers),
+            "the upstream request carries the broker's two headers and Host, nothing else",
+        )
+        self.assertEqual("Bearer broker-token", upstream_headers["Authorization"])
+        self.assertEqual("application/json", upstream_headers["Accept"])
+
+        lines = [record.getMessage() for record in logs.records]
+        opened = [line for line in lines if line.startswith("api request_id=")]
+        self.assertEqual(1, len(opened))
+        self.assertIn(f"principal={self.CALLER}", opened[0])
+        self.assertIn(" host=monitoring.googleapis.com path=v3/projects/kagents-dev/timeSeries", opened[0])
+        forwarded = [line for line in lines if line.startswith("api forwarded request_id=")]
+        self.assertEqual(1, len(forwarded))
+        self.assertIn(" host=monitoring.googleapis.com status=200 bytes=17 duration_ms=", forwarded[0])
+        request_id = opened[0].split()[1]
+        self.assertIn(request_id, forwarded[0], "the two lines share one request id")
+
+    def test_the_upstream_status_and_body_come_back_unchanged(self):
+        for status, content_type, body in (
+            (403, "application/json; charset=UTF-8", b'{"error":{"code":403,"status":"PERMISSION_DENIED"}}'),
+            (429, "application/json", b'{"error":{"code":429}}'),
+            (404, "text/html", b"<html>gone</html>"),
+        ):
+            with self.subTest(status=status):
+                self.reply.update(status=status, content_type=content_type, body=body)
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    got_status, headers, got_body = self._request(self.ALLOWED)
+                self.assertEqual(status, got_status)
+                self.assertEqual(content_type, headers["Content-Type"])
+                self.assertEqual(body, got_body)
+                self.assertTrue(
+                    any(f"api forwarded request_id=" in r.getMessage() and f"status={status}" in r.getMessage()
+                        for r in logs.records)
+                )
+
+    def test_a_close_delimited_upstream_response_is_relayed_in_full(self):
+        # getresponse() sets connection.sock to None when the upstream says
+        # Connection: close; the body is still readable through the response's
+        # own handle. Re-arming the deadline on connection.sock raised
+        # AttributeError on the first read, which no clause caught: a
+        # traceback, no response, and a request line with no verdict.
+        body = b'{"timeSeries":[' + b"x" * 200_000 + b"]}"
+        self.reply.update(body=body, headers={"Connection": "close"})
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(body, got)
+        self.assertEqual("application/json; charset=UTF-8", headers["Content-Type"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api forwarded request_id="), lines[1])
+        self.assertIn(f" status=200 bytes={len(body)} ", lines[1])
+
+    def test_an_http10_upstream_without_content_length_is_read_to_eof(self):
+        body = b'{"metricDescriptors":[' + b"y" * 70_000 + b"]}"
+        self.reply.update(raw=b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n" + body)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(body, got)
+        self.assertEqual("application/json", headers["Content-Type"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api forwarded request_id="), lines[1])
+
+    def test_a_front_end_414_with_connection_close_passes_through(self):
+        self.reply.update(status=414, content_type="text/html; charset=UTF-8",
+                          body=b"<html>414 Request-URI Too Large</html>",
+                          headers={"Connection": "close"})
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(414, status)
+        self.assertEqual(b"<html>414 Request-URI Too Large</html>", got)
+        self.assertEqual("text/html; charset=UTF-8", headers["Content-Type"])
+        self.assertTrue(any("api forwarded request_id=" in r.getMessage() and "status=414" in r.getMessage()
+                            for r in logs.records))
+
+    def test_a_query_over_the_length_cap_never_leaves_the_broker(self):
+        cap = credential_proxy.API_RELAY_MAX_QUERY_BYTES
+        over = "filter=" + "a" * (cap - len("filter=") + 1)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(f"{self.ALLOWED}?{over}")
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertIn(str(cap), payload["error"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertTrue(any("api rejected request_id=" in r.getMessage() and "code=API_RELAY_BAD_QUERY" in r.getMessage()
+                            for r in logs.records))
+        # Exactly at the cap is forwarded.
+        at_cap = "filter=" + "a" * (cap - len("filter="))
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._request(f"{self.ALLOWED}?{at_cap}")
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        self.assertEqual(f"/v3/projects/kagents-dev/timeSeries?{at_cap}", self.upstream_requests[0][0])
+
+    def test_an_upstream_response_with_no_content_type_still_passes(self):
+        self.reply.update(content_type="", body=b"raw")
+        status, headers, body = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(b"raw", body)
+        self.assertNotIn("Content-Type", headers)
+
+    # -- who may call ----------------------------------------------------
+
+    def test_the_route_demands_the_shell_role(self):
+        # Through the constant as well as the literal path: required_roles()
+        # answers () on a miss and the role check then admits everyone, so
+        # the table entry has to be spelled from the same constant the
+        # dispatch uses.
+        for path in (self.ALLOWED, credential_proxy.API_RELAY_PREFIX + "x"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    (credential_proxy.CALLER_ROLE_SHELL,),
+                    credential_proxy.required_roles(path),
+                )
+        self.assertEqual("/v1/gcp/", credential_proxy.API_RELAY_PREFIX)
+
+    def test_the_chat_gateway_is_refused_before_anything_is_read(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED, token="chat-token")
+        self.assertEqual(403, status)
+        self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertFalse(any("api request_id=" in r.getMessage() for r in logs.records),
+                         "a caller the role table turns away never opens an api line")
+
+    def test_an_unauthenticated_caller_is_401(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(self.ALLOWED, token=None)
+        self.assertEqual(401, status)
+        self.assertEqual([], self.upstream_requests)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, _ = self._json_request(self.ALLOWED, token="forged")
+        self.assertEqual(401, status)
+        self.assertEqual([], self.upstream_requests)
+
+    # -- normal form -----------------------------------------------------
+
+    def test_a_path_not_in_normal_form_is_400_and_names_the_reason(self):
+        PATH, HOST, QUERY = "API_RELAY_BAD_PATH", "API_RELAY_BAD_HOST", "API_RELAY_BAD_QUERY"
+        cases = (
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/../other/timeSeries", PATH, "`..`"),
+            ("/v1/gcp/monitoring.googleapis.com/v3//projects/kagents-dev/timeSeries", PATH, "empty"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/./projects/kagents-dev/timeSeries", PATH, "`.`"),
+            ("/v1/gcp/monitoring.googleapis.com/v3%2Fprojects/kagents-dev/timeSeries", PATH, "percent-encoded slash"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries%2f", PATH, "percent-encoded slash"),
+            ("/v1/gcp/https://monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "scheme"),
+            ("/v1/gcp/monitoring.googleapis.com:443/v3/projects/kagents-dev/timeSeries", HOST, "port"),
+            ("/v1/gcp/user@monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "user info"),
+            ("/v1/gcp/Monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "lower-case"),
+            ("/v1/gcp/monitoring%2egoogleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "encoding"),
+            ("/v1/gcp//v3/projects/kagents-dev/timeSeries", HOST, "no upstream host"),
+            ("/v1/gcp/", HOST, "no upstream host"),
+            ("/v1/gcp/monitoring.googleapis.com", PATH, "no API path"),
+            ("/v1/gcp/monitoring.googleapis.com/", PATH, "no API path"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?filter=%zz", QUERY, "percent-escapes"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?filter=a%2", QUERY, "percent-escapes"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a={b}", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=\\b", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=b|c", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=%22b%22&c=\"d\"", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=<b>", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=b^c", QUERY, "query characters"),
+        )
+        for path, code, reason in cases:
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._json_request(path)
+                self.assertEqual(400, status)
+                self.assertEqual(code, payload["code"])
+                self.assertIn(reason, payload["error"])
+                self.assertEqual([], self.upstream_requests)
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api request_id=") for line in lines))
+                rejected = [line for line in lines if line.startswith("api rejected request_id=")]
+                self.assertEqual(1, len(rejected))
+                self.assertIn(f" code={code} reason=", rejected[0])
+
+    def test_brackets_in_the_query_are_forwarded_byte_for_byte(self):
+        # `[` and `]` are RFC 3986 gen-delims, but http.client sends them raw
+        # and Google accepts them; the Managed Prometheus routes need them
+        # (`match[]=`, and `[5m]` in every range vector), and `requests` and
+        # `curl -g` leave them unquoted. An earlier shape refused them, which
+        # refused the routes.
+        prometheus = "/v1/gcp/monitoring.googleapis.com/v1/projects/kagents-dev/location/global/prometheus/api/v1"
+        for path, upstream_target in (
+            (f"{prometheus}/series?match[]=up&match[]=node_cpu_seconds_total",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/series?match[]=up&match[]=node_cpu_seconds_total"),
+            (f"{prometheus}/query?query=rate(container_cpu_usage_seconds_total[5m])",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/query?query=rate(container_cpu_usage_seconds_total[5m])"),
+            (f"{prometheus}/query?query=up[5m]",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/query?query=up[5m]"),
+            (f"{self.ALLOWED}?a=[b]", "/v3/projects/kagents-dev/timeSeries?a=[b]"),
+        ):
+            with self.subTest(path=path):
+                self.upstream_requests.clear()
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path)
+                self.assertEqual(200, status)
+                self.assertEqual([upstream_target], [p for p, _ in self.upstream_requests])
+                self.assertTrue(any(r.getMessage().startswith("api forwarded request_id=") for r in logs.records))
+
+    def test_a_query_byte_http_client_cannot_send_is_400_not_a_dropped_connection(self):
+        # http.client's own client side refuses these targets, so they go on
+        # the wire raw. Before the query check, a raw UTF-8 byte reached
+        # putrequest as UnicodeEncodeError -- a ValueError neither except
+        # clause caught -- and the caller read zero bytes while the log held a
+        # request line with no verdict; a DEL reached it as InvalidURL and was
+        # misreported as an unreachable upstream.
+        allowed = self.ALLOWED.encode()
+        for suffix in (b"?filter=caf\xc3\xa9", b"?filter=\xff", b"?filter=a\x7fb", b"?filter=a\x01b"):
+            with self.subTest(suffix=suffix):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, headers, body = self._raw(allowed + suffix)
+                self.assertEqual(400, status)
+                payload = json.loads(body)
+                self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts)
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api rejected request_id=") and "code=API_RELAY_BAD_QUERY" in line
+                                    for line in lines))
+
+    def test_a_value_error_from_the_upstream_request_line_is_still_a_400(self):
+        # The second line of defence: if a target ever reaches fetch that
+        # http.client will not send, the answer is the same 400, not a
+        # traceback on the server and a reset on the client.
+        def raising_fetch(host, target, authorization):
+            raise UnicodeEncodeError("ascii", "\xe9", 0, 1, "ordinal not in range(128)")
+
+        self.relay.fetch = raising_fetch
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertTrue(any("api rejected request_id=" in r.getMessage() and "reason=UnicodeEncodeError" in r.getMessage()
+                            for r in logs.records))
+
+        def raising_invalid_url(host, target, authorization):
+            raise http.client.InvalidURL("URL can't contain control characters")
+
+        self.relay.fetch = raising_invalid_url
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+
+    # -- the policy, over the wire ---------------------------------------
+
+    def test_a_policy_refusal_is_403_in_the_exec_shape_with_its_audit_line(self):
+        cases = (
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/alertPolicies", "gcp.api.path"),
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries/x", "gcp.api.path"),
+            ("GET", "/v1/gcp/iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/x:generateAccessToken",
+             "gcp.api.host-refused"),
+            ("GET", "/v1/gcp/metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+             "gcp.api.host-refused"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.host"),
+            ("GET", "/v1/gcp/evil.example.com/anything", "gcp.api.host"),
+            ("POST", self.ALLOWED, "gcp.api.method"),
+            ("POST", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries:query", "gcp.api.method"),
+        )
+        for method, path, rule in cases:
+            with self.subTest(method=method, path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._json_request(path, method=method)
+                self.assertEqual(403, status)
+                self.assertEqual(
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": rule},
+                    {key: payload[key] for key in ("status", "code", "rule")},
+                )
+                self.assertTrue(payload["message"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts, "a refused request never opens a connection")
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api request_id=") for line in lines))
+                blocked = [line for line in lines if line.startswith("api blocked request_id=")]
+                self.assertEqual(1, len(blocked))
+                self.assertTrue(blocked[0].endswith(f" rule={rule}"), blocked[0])
+
+    def test_a_refused_post_with_a_large_body_still_receives_its_403(self):
+        # A body larger than the socket buffers is still being written when
+        # the handler answers; closing on it sends a reset that swallows the
+        # response unless the body is drained first.
+        body = b"x" * _BODY_LARGER_THAN_SOCKET_BUFFERS
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(
+                self.ALLOWED, method="POST", body=body,
+                headers={"Content-Type": "application/json"},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.method", payload["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    # -- the upstream misbehaving ----------------------------------------
+
+    def test_a_body_one_byte_over_the_cap_is_502(self):
+        cap = 4096
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            self.reply.update(body=b"x" * (cap + 1))
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, _, payload = self._json_request(self.ALLOWED)
+            self.assertEqual(502, status)
+            self.assertEqual("UPSTREAM_RESPONSE_TOO_LARGE", payload["code"])
+            self.assertIn("pageSize", payload["error"])
+            self.assertTrue(any("api response too large request_id=" in r.getMessage() for r in logs.records))
+
+            self.reply.update(body=b"x" * cap)
+            status, _, body = self._request(self.ALLOWED)
+            self.assertEqual(200, status)
+            self.assertEqual(cap, len(body), "a body exactly at the cap passes")
+
+    def test_a_redirect_is_not_followed(self):
+        self.reply.update(status=302, content_type="text/html", body=b"",
+                          headers={"Location": "https://evil.example/collect"})
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, headers, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_REDIRECTED", payload["code"])
+        self.assertNotIn("Location", headers)
+        self.assertEqual(1, len(self.upstream_requests), "one request, no follow")
+        self.assertEqual(["monitoring.googleapis.com"], self.relay.hosts)
+        self.assertTrue(any("api redirect refused request_id=" in r.getMessage() and "status=302" in r.getMessage()
+                            for r in logs.records))
+
+    def test_an_upstream_that_outlives_the_deadline_is_504(self):
+        self.reply.update(delay=2.0)
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.3):
+            started = time.monotonic()
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(504, status)
+        self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
+        self.assertLess(time.monotonic() - started, 1.5, "the deadline, not the upstream, ended the wait")
+        self.assertTrue(any("api upstream timeout request_id=" in r.getMessage() for r in logs.records))
+
+    def test_a_connect_that_hangs_is_502_naming_the_connect_timeout(self):
+        # A dropped SYN raises TimeoutError from connect() after the connect
+        # timeout. That is "unreachable", not the read deadline, and the log
+        # names the timeout that fired.
+        class HangingConnection(http.client.HTTPConnection):
+            def connect(self):
+                raise TimeoutError("timed out")
+
+        self.relay.connection = lambda host: HangingConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        connect_lines = [r.getMessage() for r in logs.records
+                         if r.getMessage().startswith("api upstream connect timeout request_id=")]
+        self.assertEqual(1, len(connect_lines))
+        self.assertIn(f"connect_timeout_s={credential_proxy.API_RELAY_CONNECT_TIMEOUT_S}", connect_lines[0])
+        self.assertFalse(any("deadline_s=" in r.getMessage() for r in logs.records))
+
+    def test_a_trickling_upstream_is_cut_at_the_deadline_not_at_the_end_of_the_body(self):
+        # Ten pieces, 0.2 s apart: two seconds of body. With read(n) each
+        # recv re-armed the socket timeout, so the whole body arrived and the
+        # deadline never fired; with read1 the deadline is checked per recv.
+        pieces = [b"x" * 1024] * 10
+        self.reply.update(body=b"".join(pieces), trickle=(pieces, 0.2))
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.5):
+            started = time.monotonic()
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, _, payload = self._json_request(self.ALLOWED)
+            elapsed = time.monotonic() - started
+        self.assertEqual(504, status)
+        self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
+        self.assertLess(elapsed, 1.2, f"answered after {elapsed:.2f}s; the deadline was 0.5s")
+
+    def test_a_tls_verification_failure_is_502_not_a_400(self):
+        # ssl.SSLCertVerificationError is a ValueError as well as an SSLError,
+        # so a belt clause written for ValueError answered a broken CA bundle
+        # or a TLS-intercepting egress as a bad query. It is the upstream's
+        # fault and is answered as one.
+        class UnverifiableConnection(http.client.HTTPConnection):
+            def connect(self):
+                raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+        self.relay.connection = lambda host: UnverifiableConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        verdicts = [r.getMessage() for r in logs.records if r.getMessage().startswith("api upstream unreachable")]
+        self.assertEqual(1, len(verdicts))
+        self.assertIn("type=SSLCertVerificationError", verdicts[0])
+        self.assertFalse(any("API_RELAY_BAD_QUERY" in r.getMessage() for r in logs.records))
+
+    def test_a_target_putrequest_will_not_send_is_still_a_400_at_the_connection(self):
+        # The belt path, pinned at the level it protects: putrequest refusing
+        # the target, after a successful connect.
+        class RefusingConnection(http.client.HTTPConnection):
+            def putrequest(self, method, url, **kwargs):
+                raise UnicodeEncodeError("ascii", "\xe9", 0, 1, "ordinal not in range(128)")
+
+        self.relay.connection = lambda host: RefusingConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertTrue(any("reason=UnicodeEncodeError" in r.getMessage() for r in logs.records))
+
+    def test_an_upstream_that_closes_short_of_its_content_length_is_502(self):
+        # read1 returns b"" on an early EOF without raising for a
+        # Content-Length-framed body; without the owed-bytes check a page cut
+        # short relayed as a well-framed 200.
+        body = b'{"timeSeries":[' + b"x" * 4096 + b"]}"
+        self.reply.update(body=body, truncate_to=1000)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_TRUNCATED", payload["code"])
+        self.assertNotIn("timeSeries", json.dumps(payload), "none of the partial body is relayed")
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api upstream truncated request_id="), lines[1])
+        self.assertIn(f" received=1000 expected={len(body)}", lines[1])
+        self.assertFalse(any(line.startswith("api forwarded") for line in lines))
+
+    def test_an_unreachable_upstream_is_502(self):
+        # Point the relay at a port nothing listens on.
+        spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        self.relay.port = spare.server_address[1]
+        spare.server_close()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        self.assertTrue(any("api upstream unreachable request_id=" in r.getMessage() for r in logs.records))
+
+    # -- the broker's own side -------------------------------------------
+
+    def test_no_relay_armed_is_503_after_the_policy_has_answered(self):
+        CredentialProxyHandler.api_relay = None
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(503, status)
+        self.assertEqual("API_RELAY_DISABLED", payload["code"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[0].startswith("api request_id="))
+        self.assertTrue(lines[1].startswith("api disabled request_id="), lines[1])
+        self.assertTrue(lines[1].endswith(" rule=gcp.api.monitoring.timeseries-list"))
+        # The policy still answers first: a refusal reads as a refusal, not an outage.
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request("/v1/gcp/logging.googleapis.com/v2/entries")
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.host", payload["rule"])
+
+    def test_a_relayed_content_type_cannot_split_the_response(self):
+        # The one upstream header the relay re-emits is upstream text, so it
+        # gets the same CR/LF strip the agent API proxy gives every header.
+        def injecting_fetch(host, target, authorization):
+            return credential_proxy.ApiRelayResponse(
+                200, "application/json\r\nX-Injected: 1\r\nSet-Cookie: a=b", b"{}"
+            )
+
+        self.relay.fetch = injecting_fetch
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, headers, body = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(b"{}", body)
+        self.assertNotIn("X-Injected", headers)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual("application/jsonX-Injected: 1Set-Cookie: a=b", headers["Content-Type"])
+
+    def test_the_tls_context_is_built_once_per_relay(self):
+        relay = credential_proxy.GoogleApiRelay()
+        first = relay.connection("monitoring.googleapis.com")
+        second = relay.connection("monitoring.googleapis.com")
+        self.assertIs(first._context, second._context)
+
+    def test_a_credential_the_broker_cannot_obtain_is_503_and_names_only_the_type(self):
+        def failing():
+            raise RuntimeError("could not read /var/run/secrets/tokens/gcp-ksa/token")
+
+        self.relay.authorization_header = failing
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(503, status)
+        self.assertEqual("RELAY_CREDENTIAL_UNAVAILABLE", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        joined = "\n".join(r.getMessage() for r in logs.records)
+        self.assertIn("api credential unavailable request_id=", joined)
+        self.assertIn("type=RuntimeError", joined)
+        self.assertNotIn("/var/run/secrets", joined)
+
+
+class ApiRelayAuditLineCannotBeForgedTest(unittest.TestCase):
+    """Caller text in the api lines goes through the same sanitizer as argv[0].
+
+    Driven on a handler object rather than over the socket: `urlsplit` strips
+    `\\n` and `\\r` from a request target, but not the vertical tab or the
+    Unicode line separator, and `str.splitlines` treats both as record
+    boundaries. Whatever the transport lets through, the record stays one line.
+    """
+
+    FORGERY = (
+        "\x0b2026-01-01 00:00:00,000 INFO credential-proxy api request_id=y "
+        "principal=system:serviceaccount:kubeagents-system:other host=x path=y "
+    )
+
+    def _handler(self, path, command="GET"):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.command = command
+        handler.path = path
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:agent-shell",
+            uid="u",
+            role=credential_proxy.CALLER_ROLE_SHELL,
+        )
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        return handler
+
+    def _assert_one_line_each(self, logs):
+        for record in logs.records:
+            message = record.getMessage()
+            self.assertEqual([message], message.splitlines(), message)
+
+    def test_a_forged_host_stays_on_one_line(self):
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com{self.FORGERY}/v3/projects/p/timeSeries")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        self.assertEqual(HTTPStatus.BAD_REQUEST, handler.replies[0][0])
+        self._assert_one_line_each(logs)
+
+    def test_a_forged_path_stays_on_one_line(self):
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com/v3/projects/p/timeSeries{self.FORGERY}")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        # The segment carrying the forgery is not in normal form; either way,
+        # the line that already logged it is intact.
+        self.assertIn(handler.replies[0][0], (HTTPStatus.BAD_REQUEST, HTTPStatus.FORBIDDEN))
+        self._assert_one_line_each(logs)
+
+    def test_the_path_is_logged_wider_than_the_default_but_still_capped(self):
+        long_path = "v3/projects/kagents-dev/" + "a" * 600
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com/{long_path}")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        opened = next(r.getMessage() for r in logs.records if r.getMessage().startswith("api request_id="))
+        logged = opened.split(" path=", 1)[1]
+        self.assertEqual(credential_proxy.API_RELAY_PATH_LOG_LENGTH, len(logged))
+
+
+class GoogleApiRelayCredentialTest(unittest.TestCase):
+    """The relay's token is google-auth's, obtained once and refreshed by it."""
+
+    def _google(self, credentials, defaults):
+        google = types.ModuleType("google")
+        auth = types.ModuleType("google.auth")
+        transport = types.ModuleType("google.auth.transport")
+        requests_transport = types.ModuleType("google.auth.transport.requests")
+
+        def default(scopes=None):
+            defaults.append(scopes)
+            return credentials, "kagents-dev"
+
+        auth.default = default
+        requests_transport.Request = lambda: "request"
+        google.auth = auth
+        auth.transport = transport
+        transport.requests = requests_transport
+        return {
+            "google": google,
+            "google.auth": auth,
+            "google.auth.transport": transport,
+            "google.auth.transport.requests": requests_transport,
+        }
+
+    def test_default_once_refresh_only_when_lapsed(self):
+        class FakeCredentials:
+            def __init__(self):
+                self.valid = False
+                self.token = None
+                self.refreshed_with = []
+
+            def refresh(self, request):
+                self.refreshed_with.append(request)
+                self.token = f"tok{len(self.refreshed_with)}"
+                self.valid = True
+
+        credentials = FakeCredentials()
+        defaults = []
+        with mock.patch.dict(sys.modules, self._google(credentials, defaults)):
+            relay = credential_proxy.GoogleApiRelay()
+            self.assertEqual("Bearer tok1", relay.authorization_header())
+            self.assertEqual("Bearer tok1", relay.authorization_header(), "a valid token is reused")
+            credentials.valid = False
+            self.assertEqual("Bearer tok2", relay.authorization_header(), "a lapsed one is refreshed")
+        self.assertEqual(1, len(defaults), "google.auth.default is called once")
+        self.assertEqual([credential_proxy.scoped_sa_pool.CLOUD_PLATFORM_SCOPE], defaults[0])
+        self.assertEqual(["request", "request"], credentials.refreshed_with)
+
+    def test_construction_imports_nothing(self):
+        # A broker without the cloud libraries still starts; the route answers
+        # 503 on first use instead.
+        with mock.patch.dict(sys.modules, {"google": None, "google.auth": None}):
+            relay = credential_proxy.GoogleApiRelay()
+            with self.assertRaises(ImportError):
+                relay.authorization_header()
+
+    def test_the_upstream_connection_is_tls_on_443_with_a_bounded_connect(self):
+        connection = credential_proxy.GoogleApiRelay().connection("monitoring.googleapis.com")
+        self.assertIsInstance(connection, http.client.HTTPSConnection)
+        self.assertEqual("monitoring.googleapis.com", connection.host)
+        self.assertEqual(credential_proxy.API_RELAY_UPSTREAM_PORT, connection.port)
+        self.assertEqual(credential_proxy.API_RELAY_CONNECT_TIMEOUT_S, connection.timeout)
+
+
+class ApiRelayQueryStrippingTest(unittest.TestCase):
+    """The credential keys go; every other pair is forwarded as written."""
+
+    def test_the_four_keys_are_removed_wherever_they_sit(self):
+        strip = credential_proxy.strip_credential_query_keys
+        self.assertEqual("", strip("key=a"))
+        self.assertEqual("filter=x", strip("key=a&filter=x"))
+        self.assertEqual("filter=x", strip("filter=x&access_token=b"))
+        self.assertEqual("filter=x&pageSize=5", strip("filter=x&oauth_token=c&pageSize=5"))
+        self.assertEqual("filter=x", strip("bearer_token=d&filter=x"))
+        self.assertEqual("filter=x", strip("key&filter=x&access_token"))
+        self.assertEqual("filter=x", strip("k%65y=a&filter=x"), "the key is compared decoded")
+
+    def test_everything_else_is_byte_for_byte(self):
+        query = "filter=metric.type%3D%22a%2Fb%22+AND+x&interval.endTime=2026-09-15T00%3A00%3A00Z&&pageSize=1000"
+        self.assertEqual(query.replace("&&", "&"), credential_proxy.strip_credential_query_keys(query))
+
+    def test_a_key_that_merely_contains_a_stripped_one_stays(self):
+        self.assertEqual(
+            "keyed=1&my_access_token=2&oauth_token_x=3",
+            credential_proxy.strip_credential_query_keys("keyed=1&my_access_token=2&oauth_token_x=3"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

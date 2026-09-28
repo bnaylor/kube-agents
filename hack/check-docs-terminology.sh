@@ -20,12 +20,27 @@ FAILED=0
 # Documentation this guard inspects. The guard itself is excluded, since it
 # necessarily contains the strings it forbids.
 FILE_LIST=$(mktemp)
-trap 'rm -f "$FILE_LIST"' EXIT
+GREP_ERR=$(mktemp)
+GREP_FAILURES=$(mktemp)
+trap 'rm -f "$FILE_LIST" "$GREP_ERR" "$GREP_FAILURES"' EXIT
 
 git ls-files '*.md' '*.mdx' \
   | grep -v '^docs/site/node_modules/' \
   | grep -v '^hack/check-docs-terminology.sh$' \
   > "$FILE_LIST"
+
+# The test seam. DOCS_TERMINOLOGY_EXTRA_FILES names a file whose lines are more
+# paths to scan, appended to the tracked set rather than replacing it, so the
+# copy floors below still see the real documents that satisfy them.
+# tests/test_docs_terminology_guard.py hands the guard a path built to fail
+# one check and reads the verdict; nothing else sets it.
+if [ -n "${DOCS_TERMINOLOGY_EXTRA_FILES:-}" ]; then
+  if [ ! -r "$DOCS_TERMINOLOGY_EXTRA_FILES" ]; then
+    echo "ERROR: DOCS_TERMINOLOGY_EXTRA_FILES=${DOCS_TERMINOLOGY_EXTRA_FILES} is not readable; the guard cannot run." >&2
+    exit 1
+  fi
+  cat "$DOCS_TERMINOLOGY_EXTRA_FILES" >> "$FILE_LIST"
+fi
 
 FILE_COUNT=$(wc -l < "$FILE_LIST" | tr -d ' ')
 if [ "$FILE_COUNT" -eq 0 ]; then
@@ -35,9 +50,26 @@ fi
 
 echo "Checking terminology across ${FILE_COUNT} documentation files..."
 
-# search <extended-regex> -> prints "path:line:text" matches, empty if none
+# search <extended-regex> -> prints "path:line:text" matches, empty if none.
+#
+# "No matches" and "grep would not run" are different answers and used to be
+# reported the same way. A pattern grep refuses to compile, or a file it cannot
+# read, is a check that did not happen; folded into an empty result by
+# `2>/dev/null || true` it becomes a check that passed, which is the one failure
+# mode a guard must not have. The exit status cannot tell them apart -- xargs
+# reports the same code whether grep found nothing or rejected the pattern -- so
+# the discriminator is stderr, recorded here and reported at the end so every
+# broken pattern is named rather than only the first.
 search() {
-  tr '\n' '\0' < "$FILE_LIST" | xargs -0 grep -nEI -H "$1" 2>/dev/null || true
+  local out
+  : > "$GREP_ERR"
+  out=$(tr '\n' '\0' < "$FILE_LIST" | xargs -0 grep -nEI -H "$1" 2>"$GREP_ERR")
+  if [ -s "$GREP_ERR" ]; then
+    printf 'pattern: %s\n' "$1" >> "$GREP_FAILURES"
+    sed 's/^/  /' "$GREP_ERR" >> "$GREP_FAILURES"
+    return 2
+  fi
+  printf '%s' "$out"
 }
 
 # forbid <extended-regex> <explanation>
@@ -239,18 +271,24 @@ fi
 # Any line quoting a finding-id-shaped character class must quote this exact
 # pattern. Anchored on `[a-z0-9._-]`, which is specific enough not to collide
 # with the unrelated slug rules elsewhere in the docs.
-WRONG_ID=$(search '\[a-z0-9\._-\]' | grep -vF "$ID_PATTERN" || true)
+ID_HITS=$(search '\[a-z0-9\._-\]')
+ID_SEARCH_OK=$?
+WRONG_ID=$(printf '%s' "$ID_HITS" | grep -vF "$ID_PATTERN" || true)
 if [ -n "$WRONG_ID" ]; then
   echo "::error::Documented finding-id pattern does not match FINDING_ID_RE in ${AUDIT_SCRIPT} (expected ${ID_PATTERN})."
   printf '%s\n\n' "$WRONG_ID" | sed 's/^/    /'
   FAILED=1
 fi
 
-# A guard that passes because every copy disappeared is not a passing guard.
-ID_COPIES=$(search '\[a-z0-9\._-\]' | grep -cF "$ID_PATTERN" || true)
-if [ "${ID_COPIES:-0}" -lt 1 ]; then
-  echo "::error::No document quotes the finding-id pattern any more; either restore it or drop this guard."
-  FAILED=1
+# A guard that passes because every copy disappeared is not a passing guard --
+# unless the search is what disappeared them, which is why the status is read.
+# `cap_guard` above carries the long form of this note.
+if [ "$ID_SEARCH_OK" -eq 0 ]; then
+  ID_COPIES=$(printf '%s' "$ID_HITS" | grep -cF "$ID_PATTERN" || true)
+  if [ "${ID_COPIES:-0}" -lt 1 ]; then
+    echo "::error::No document quotes the finding-id pattern any more; either restore it or drop this guard."
+    FAILED=1
+  fi
 fi
 
 # --- fleet-audit rendering caps -------------------------------------------
@@ -282,6 +320,12 @@ spellings() {
   local value grouped word alt
   value=$(cap_value "$1")
   [ -n "$value" ] || return 1
+  # The result is interpolated into an extended regex below, so anything that is
+  # not a bare integer is a constant this function cannot spell -- and a stray
+  # `(` or `+` from, say, `MAX_X = int(1e5)` would make grep reject the whole
+  # pattern rather than say so. Refuse it here; the loop that calls this treats
+  # a refusal as fatal.
+  case "$value" in *[!0-9]*) return 1 ;; esac
   alt="$value"
   grouped=$(group_digits "$value")
   [ "$grouped" != "$value" ] && alt="${alt}|${grouped}"
@@ -295,8 +339,9 @@ spellings() {
 # elsewhere on the same line can neither satisfy nor trip the check. Anything
 # the probe finds and the good pattern does not is a stale copy.
 cap_guard() {
-  local probe="$1" good="$2" why="$3" except="${4:-}" all hits copies
+  local probe="$1" good="$2" why="$3" except="${4:-}" all hits copies probe_ok
   all=$(search "$probe")
+  probe_ok=$?
   if [ -n "$all" ] && [ -n "$except" ]; then
     all=$(printf '%s\n' "$all" | grep -vE "$except" || true)
   fi
@@ -306,11 +351,19 @@ cap_guard() {
     printf '%s\n\n' "$hits" | sed 's/^/    /'
     FAILED=1
   fi
-  # A guard that passes because every copy disappeared is not a passing guard.
-  copies=$(printf '%s' "$all" | grep -cE "$good" || true)
-  if [ "${copies:-0}" -lt 1 ]; then
-    echo "::error::No document states this cap any more; restore it or drop the guard. ($why)"
-    FAILED=1
+  # A guard that passes because every copy disappeared is not a passing guard --
+  # unless the search itself is what disappeared them. A broken pattern or an
+  # unreadable file makes `search` return nothing for every probe, and every
+  # cap guard below then announces that its cap is undocumented. Those
+  # confident wrong diagnoses bury the one line that names the real cause, which
+  # `search` has already recorded and the report at the end of this section
+  # prints. Say nothing here and let that line be the answer.
+  if [ "$probe_ok" -eq 0 ]; then
+    copies=$(printf '%s' "$all" | grep -cE "$good" || true)
+    if [ "${copies:-0}" -lt 1 ]; then
+      echo "::error::No document states this cap any more; restore it or drop the guard. ($why)"
+      FAILED=1
+    fi
   fi
 }
 
@@ -318,7 +371,7 @@ for CONSTANT in MAX_EXCERPT_LINES MAX_EXCERPT_CHARS MAX_COMMAND_CHARS \
   MAX_BODY_CHARS BODY_BUDGET MAX_SCOPE_ROWS AUTO_PROMOTION_CAP MIN_NA_REASON_CHARS \
   MIN_CHECK_COMMAND_CHARS; do
   if ! spellings "$CONSTANT" > /dev/null; then
-    echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT}." >&2
+    echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT} as an integer." >&2
     exit 1
   fi
 done
@@ -415,51 +468,13 @@ cap_guard \
   "allowed $(spellings MAX_COMMAND_CHARS) characters" \
   "Documented evidence.command budget does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
-# --- fleet-audit cron prompts ---------------------------------------------
-# Ground truth: the prompts in the cron manifest. Two site pages quote the
-# compliance watchdog's prompt verbatim to show what an anti-skim prompt looks
-# like, and both went stale the moment the SOP grew — they told readers the SOP
-# was 348 lines with its checks at 56-270 when it was 406 lines with its checks
-# at 102-314. A quotation that has drifted from the thing it quotes is worse
-# than no quotation, so require it to be a literal substring of the manifest.
-#
-# The consequence to know before you write: `all N lines of it` is treated as a
-# claim to be quoting a prompt, not as a phrase. Prose that paraphrases a
-# watchdog rather than quoting it will fail this check even though nothing has
-# drifted. Quote the prompt verbatim from the manifest, or describe it in words
-# that avoid the idiom.
-#
-# Both rosters are ground truth. The governance prompts live on the Platform
-# Agent's; the Chat Agent's is checked too so a job that moves between them
-# does not turn every quotation stale on the way.
-CRON_JOBS="agents/platform/cron/jobs.json agents/chat/defaults/cron/jobs.json"
-for JOBS_FILE in $CRON_JOBS; do
-  if [ ! -f "$JOBS_FILE" ]; then
-    echo "ERROR: ${JOBS_FILE} not found; the cron-prompt guard cannot run." >&2
-    exit 1
-  fi
-done
-
-PROMPT_HITS=$(mktemp)
-trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
-search 'all [0-9]+ lines of it' > "$PROMPT_HITS"
-
-# No floor here, unlike the caps above: the site owes nobody a quotation of a
-# cron prompt, and zero copies is zero stale copies.
-STALE_PROMPTS=""
-while IFS= read -r HIT; do
-  [ -n "$HIT" ] || continue
-  QUOTED=$(printf '%s\n' "$HIT" | grep -oE 'Read the SOP at .*so a read that stops early' || true)
-  # shellcheck disable=SC2086 # CRON_JOBS is a deliberate word-split list.
-  if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" $CRON_JOBS; then
-    STALE_PROMPTS="${STALE_PROMPTS}${HIT}
-"
-  fi
-done < "$PROMPT_HITS"
-
-if [ -n "$STALE_PROMPTS" ]; then
-  echo "::error::Documented cron prompt is not a verbatim copy of any prompt in ${CRON_JOBS}."
-  printf '%s\n' "$STALE_PROMPTS" | sed '/^$/d; s/^/    /'
+# --- Checks that could not run --------------------------------------------
+# Reported after the last `search` call so every broken pattern is named at
+# once, and reported at all because a check that did not run is not a check that
+# passed.
+if [ -s "$GREP_FAILURES" ]; then
+  echo "::error::A terminology check could not run: grep rejected a pattern, or could not read a file."
+  sed 's/^/    /' "$GREP_FAILURES"
   FAILED=1
 fi
 

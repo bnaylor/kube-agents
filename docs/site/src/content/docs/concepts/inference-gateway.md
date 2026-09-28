@@ -27,7 +27,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 - [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) — Gemini-only default. Uses `GEMINI_API_KEY`.
 - [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription) — proxies to a personal ChatGPT subscription via OAuth device flow. Useful for demos where you don't want a per-token cost.
 
-To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
+To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `inference-gateway`.
 
 ### Setting the default model
 
@@ -62,6 +62,24 @@ make -C k8s-operator deploy-litellm
 ```
 
 Either way the agent picks up the new model on its next request without any change to its own config.
+
+### Setting the output-token budget
+
+`MODEL_MAX_TOKENS` is the number of output tokens the gateway asks the provider for on a request that names none. Set it in `install.env` or with `--model-max-tokens=N`; it reaches the chart as `litellm.maxTokens` and the Terraform example as `model_max_tokens`, and the chart renders it as `max_tokens` under every `model_list` alias. With `MODEL_PROVIDER=gemini` and `MODEL_MAX_TOKENS=8192` the first alias reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      max_tokens: 8192
+```
+
+The chart is the only path that renders it: the kustomize dev copy above (`make -C k8s-operator deploy-litellm`) carries no `max_tokens`. On an installed system, set the key in `install.env` and re-run `upgrade.sh`, or use `install.sh --menu` and **Save & Apply**, which regenerates from `install.env`; there is no menu entry for it.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. The hosted providers above need no value: the agent's requests carry their own `max_tokens`, and a provider with its own output limit answers a value above it with an error rather than a truncated reply. A self-hosted backend such as vLLM, SGLang, TGI or llama.cpp admits a request only if the prompt and `max_tokens` together fit its served window, so a request that asks for more output than the window holds is refused before the model runs. Set the value below that window, leaving the prompt the room it needs.
+
+The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.9.14`) does not send `max_tokens` on agent turns, so this value is the one the agent's requests get, the same as a direct call to the gateway's `/v1/chat/completions` that omits the field. Images built on `v2026.8.19` and earlier sent their own `max_tokens` on every request; on those the client's value won for agent turns and only a request that omitted the field took the configured one.
 
 ### Prompt caching
 
@@ -117,7 +135,7 @@ A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value,
 
 **Pseudonymisation is not reversible, and that limits what the agent can do with a pseudonymised value.** The model never sees `10.0.0.5`; it sees `[ip:3fa9c2d1e0b4]`, and a `kubectl` command or a chat answer it writes from that token names an address that does not exist, so the tool call fails or the answer is useless. Pseudonymise identifiers the agent only needs to reason _about_; keep the ones it must act on in `allowCidrs`, use `off`, or accept that those tasks degrade. Masking has the same limit without the correlation.
 
-What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. It does not touch what the agent writes to disk: kanban worker transcripts, conversation logs, the terminal-output cache and the state databases still carry tool output verbatim. And it does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
+What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. It does not touch what the agent writes to disk: conversation logs and the state databases still carry tool output verbatim, and what the image itself redacts on the agent's volume is listed under [Security and IAM](/kube-agents/reference/security-and-iam/#what-leaves-for-the-model-provider). And it does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
 ### Vertex AI and Model Garden
 
@@ -178,7 +196,7 @@ Deploy it with `make -C k8s-operator deploy-inference-replay` — it is a develo
 
 ## What the agent doesn't care about
 
-The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
+The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `inference-gateway` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `inference-gateway` Service is repointed at the replay proxy and the original gateway pods are re-exposed through a new `inference-gateway-upstream` Service that the proxy forwards cache misses to. That means:
 
 - Swapping Gemini for Anthropic is a LiteLLM `ConfigMap` change.
 - So is [prompt caching](#prompt-caching) — the breakpoints are injected gateway-side, because only the gateway knows which model they are for.
@@ -188,5 +206,5 @@ The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the 
 ## Where to go next
 
 - [Reference → Examples](/kube-agents/reference/examples/) — the inference example bundles walked through.
-- [Deploy → Kustomize](/kube-agents/deploy/kustomize/) — what the LiteLLM Deployment looks like on disk.
+- [Deploy → Network policies and Service](/kube-agents/deploy/kustomize/#kustomize-for-operator-integrations) — where the LiteLLM Deployment's dev copy lives on disk.
 - [Concepts → Observability](/kube-agents/concepts/observability/) — LLM telemetry export.

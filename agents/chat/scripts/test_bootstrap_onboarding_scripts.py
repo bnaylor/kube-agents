@@ -580,5 +580,108 @@ class ScanGateTest(unittest.TestCase):
         self.assertIsNone(parse("kanban create: board unavailable"))
 
 
+class ScopeGapParagraphTest(unittest.TestCase):
+    """The sweep is told which projects in scope the reconcile could not list."""
+
+    def _with_snapshot(self, snapshot):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data_dir = Path(tmp.name)
+        if snapshot is not None:
+            (data_dir / bootstrap_scan_gate.SCOPE_SNAPSHOT_NAME).write_text(snapshot, encoding="utf-8")
+        return data_dir
+
+    def test_no_snapshot_names_nothing(self):
+        self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(None)), "")
+
+    def test_an_unreadable_snapshot_names_nothing(self):
+        self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot("{nope")), "")
+
+    def test_the_task_body_speaks_of_one_project_unless_the_snapshot_names_more(self):
+        # An install with no scope renders the prompt it rendered before scopes existed.
+        data_dir = self._with_snapshot(None)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("Audit every cluster the project has", body)
+        self.assertIn("If you cannot list the project's clusters at all", body)
+        self.assertIn("holds the `RECONCILE_EXCLUDE` opt-out and the create/prune rules", body)
+        self.assertNotIn("projects in scope", body)
+        self.assertNotIn("the scope and its exclusions", body)
+        data_dir = self._with_snapshot('{"projects": [{"id": "mgmt", "outcome": "ok"}, {"id": "other", "outcome": "ok"}]}')
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("Audit every cluster the projects in scope have", body)
+        self.assertIn("If you cannot list a project's clusters at all", body)
+        self.assertIn("holds the scope and its exclusions and the create/prune rules", body)
+
+    def test_the_paragraph_names_the_container_and_counts_members_past_a_limit(self):
+        import json as _json
+        rows = [{"id": "mgmt", "outcome": "ok"}] + [{"id": f"p-{i:03d}", "outcome": "over-cap", "via": ["folders/9"]} for i in range(25)]
+        snap = _json.dumps({"projects": rows, "containers": [{"id": "folders/9", "outcome": "over-cap", "projects": 25}]})
+        paragraph = bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(snap))
+        # Over-cap is a successful lookup past the cap, named as such, never as unresolved.
+        self.assertNotIn("could not resolve", paragraph)
+        self.assertIn("It resolved `folders/9` (25 project(s)) past its listing cap", paragraph)
+        self.assertIn("name the container as over the cap", paragraph)
+        self.assertEqual(paragraph.count("`p-"), bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT)
+        self.assertIn(f"and {25 - bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT} more", paragraph)
+        self.assertLess(len(paragraph), 2500)
+
+    def test_a_declared_container_makes_the_prompt_multi_project_even_with_one_row(self):
+        snap = '{"projects": [{"id": "mgmt", "outcome": "ok"}], "containers": [{"id": "folders/9", "outcome": "unreachable", "projects": 0}]}'
+        data_dir = self._with_snapshot(snap)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("Audit every cluster the projects in scope have", body)
+        self.assertIn("could not resolve `folders/9`", body)
+
+    def test_an_unresolved_container_with_no_members_is_still_named(self):
+        # First run under a declaration whose folder could not be resolved: no member rows,
+        # but a whole folder is missing from the roster and the sweep must hear it.
+        snap = '{"projects": [{"id": "mgmt", "outcome": "ok"}, {"id": "p2", "outcome": "ok"}], "containers": [{"id": "folders/9", "outcome": "unreachable", "projects": 0}]}'
+        paragraph = bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(snap))
+        self.assertIn("could not resolve `folders/9` (unreachable, 0 project(s) carried)", paragraph)
+        self.assertIn("Every project it did resolve was listed.", paragraph)
+        # And a single-project install with a resolved container and nothing unlisted stays silent.
+        snap = '{"projects": [{"id": "mgmt", "outcome": "ok"}], "containers": [{"id": "folders/9", "outcome": "ok", "projects": 0}]}'
+        self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(snap)), "")
+
+    def test_a_single_project_install_gets_no_paragraph_whatever_its_outcome(self):
+        # The give-up path on a scope-less install: one project, not ok. The prompt stays main's.
+        data_dir = self._with_snapshot('{"projects": [{"id": "mgmt", "outcome": "unreachable"}]}')
+        self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(data_dir), "")
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertNotIn("projects in scope", body)
+        self.assertIn("Audit every cluster the project has", body)
+
+    def test_a_snapshot_whose_projects_is_not_a_list_names_nothing(self):
+        for body in ('{"projects": null}', '{"projects": 3}', '{"projects": "x"}', '[1]'):
+            self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(body)), "", body)
+
+    def test_all_ok_names_nothing(self):
+        snap = '{"projects": [{"id": "a", "outcome": "ok"}, {"id": "b", "outcome": "ok"}]}'
+        self.assertEqual(bootstrap_scan_gate._unlisted_projects(self._with_snapshot(snap)), [])
+
+    def test_unlisted_projects_are_named_with_their_outcome_in_sorted_order(self):
+        snap = ('{"projects": [{"id": "zeta", "outcome": "denied"}, {"id": "ok-one", "outcome": "ok"},'
+                ' {"id": "alpha", "outcome": "unreachable"}]}')
+        data_dir = self._with_snapshot(snap)
+        self.assertEqual(bootstrap_scan_gate._unlisted_projects(data_dir),
+                         [("alpha", "unreachable"), ("zeta", "denied")])
+        paragraph = bootstrap_scan_gate._scope_gap_paragraph(data_dir)
+        self.assertIn("`alpha` (unreachable), `zeta` (denied)", paragraph)
+        self.assertIn("not fully covered", paragraph)
+
+    def test_the_task_body_carries_the_paragraph_when_a_project_is_unlisted(self):
+        snap = '{"projects": [{"id": "mgmt", "outcome": "ok"}, {"id": "locked", "outcome": "denied"}]}'
+        data_dir = self._with_snapshot(snap)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("`locked` (denied)", body)
+        # It sits between the roster caveat and Step 2, where the fan-out reads it.
+        self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
+
+
 if __name__ == "__main__":
     unittest.main()

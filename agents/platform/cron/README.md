@@ -46,6 +46,76 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `stall-watch` hands a stall to a Cluster Agent card
+
+`stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
+minutes it lists the project's clusters and, for every namespace of every
+running or reconciling cluster that has a Cluster Agent profile and is not a
+system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
+of controller kinds, keeping a ledger of the rows it has seen. On a new stall
+episode it files one kanban card per cluster and namespace, assigned to that
+cluster's Cluster Agent profile, telling it to run `gke-stall-detection` on the
+namespace and record the finding. That is the same card, diagnosis and chat
+thread a user's own question produces, which is the point: one detector and one
+experience whether the cron or a person noticed first. The watch follows the
+reconciler's roster: a cluster with no profile, one `RECONCILE_EXCLUDE` pruned
+or one not yet scaffolded, is neither read nor filed for, because the exclusion
+is the operator keeping a model turn off that cluster and a card would hand its
+rows to another profile; a cluster that leaves the roster has its rows cleared
+and its open card completed with a comment saying so. At most three cards open
+per tick (`MAX_CARDS_PER_TICK`, the default of the pull-request poller's
+`PR_AGENT_MAX_PER_TICK`), since each is a Cluster Agent turn and the number of
+namespaces with a new stall is chosen by whoever can create namespaces; the rest
+keep their rows and wait, oldest first sighting first, so a tenant filling three
+fresh namespaces every tick cannot keep an older stall from its card, and chat
+gets one line saying how many wait. A card the board refused leaves its
+namespace waiting the same way. A new object in
+a namespace whose card is still open is a comment on that card; when every
+object in the namespace has cleared, the card gets a closing comment and is
+completed. A `repeating-warnings` or `dangling-reference` row clears only after
+two consecutive scans without it, so a warning that recurs hourly or a referent
+listing that failed once does not close and reopen a card.
+
+The card's progress reaches chat because the script writes the card's
+`kanban_notify_subs` row itself: a cron child has no session identity for
+`kanban_create` to copy, and a card without a row is invisible to the gateway
+notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries three one-liners, "stall noticed in
+`<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened", "stall cleared
+...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
+follow on later ticks", each naming at most eight objects, plus the sweep-failed
+and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
+cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a listing gcloud called incomplete, a sweep that hit its
+25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
+an exhausted sweep resumes where it stopped.
+
+Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
+through `sandbox_exec`, because the agent container carries no kubectl (with the
+sandbox switched off the calls run locally and fail with `No such file or
+directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
+state). The script itself travels on the command's stdin, read from the agent
+image's copy in `/opt/defaults/scripts` and run with `python3 -I -`: what the
+`hermes` login executes is never a file under the sandbox's agent-owned
+`/opt/data`, and isolated mode keeps that directory, which is the command's
+working directory, off the module path, so a `json.py` the model dropped there is
+not the code that runs. The per-cluster kubeconfigs stay in
+`/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
+prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
+cluster to what `kubectl api-resources` says it serves, and is not
+operator-configurable on this release: `STALL_WATCH_KINDS` replaces it for a run
+started by hand in the pod (`all` hands `stall_report.py` its every-kind
+default), but the operator's env allowlist does not carry it, so a value on the
+CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
+this job split the work by signal: a Warning whose reason is on the watcher's
+list is the watcher's within seconds; a condition, a reference or an event the
+list never names is this job's within the half hour. It declares `risk: high`
+because every card it files starts a Cluster Agent turn over every namespace of
+every cluster on the Cluster Agent roster, the management cluster included
+unless `RECONCILE_EXCLUDE` names it. The card body and chat lines carry object
+names, heuristics and durations only, never a row's detail, since condition
+reasons, spec paths and event messages are text a tenant writes; the Cluster
+Agent reads that text again when it runs the skill, and its read-only skill and
+preflight bound what it does with it.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
@@ -174,7 +244,7 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
@@ -195,6 +265,12 @@ under "Detecting a broken leg".
 `test_every_watchdog_declares_all_delivery` in
 `../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
 the exemption by name, pinned to a `no_agent` entry whose script exists.
+
+A misspelled `deliver` part next to one that resolves is dropped by the scheduler
+with the run still recording `ok`. `check_cron_delivery` in
+`scripts/check_prompt_assets.py` (`make prompt-check`) refuses a value outside the
+`CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
+the typo fails the pull request instead.
 
 ## `deliver: "chat"` — reporting through the Chat Agent
 
@@ -299,7 +375,10 @@ to an install:
 
 - Run `make docs-generate` after editing either roster. The site's cron
   reference table is generated from both, and a cron expression missing from
-  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
+  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`. The
+  `compliance-audit` entry is also rendered in full as the job-schema example
+  on the watchdogs, skills and cron-jobs pages, so an edit to it changes those
+  three pages too.
 - For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
   the agent image without a release; `./upgrade.sh --upgrade-mode=harness
 --image-tag=<ref>` is the path for an installed cluster.
@@ -336,12 +415,35 @@ on purpose, not shipped new, and is never reinstalled.
 Three rules on the site page came from measured failures, recorded here so the
 rule outlives the memory of why:
 
-- **On-demand runs are marked due, never re-enacted in the requesting session.**
+- **On-demand runs are marked due, not re-enacted in the requesting session; one delegated stream is the exception.**
   On 2026-08-03 a session asked to run several audits at once crammed them into
   one turn budget and produced five hand-typed empty findings documents and a
   fleet-wide all-clear, having issued no `kubectl` at all. That is why the
   Platform Agent marks the job due for the next tick instead of running the SOP
-  itself.
+  itself. The one run that does happen in a session (#1876, #1887): a card that
+  delegates exactly one stream per its SOP is run by that worker through
+  `audit_report.py start … finish` (`skills/fleet-audit/SKILL.md`, "Running a
+  stream on demand"); several streams still queue.
+  Such a run holds no per-job lock, so `start` keeps its own guard: an
+  in-flight note per stream on the sandbox pod's own volume, at
+  `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
+  the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
+  this README otherwise calls "the volume"), holding the stream id and a start
+  time, honoured for two hours and removed by a `finish` that published or
+  died (exit 0 or 1); `finish --dry-run` and a `finish` that exited 2 keep it,
+  so a note beside a rejected document is a live run, not a stale one. The note spans one
+  `start`-`finish` pair, so a multi-repository loop reclaims it at each
+  repository. A run that died without `finish` costs the
+  stream at most the ticks inside those two hours. For the operator only:
+  when you know from outside the run that it is over (its card is closed, its
+  pod is gone), deleting that note releases the stream at once. The `.lock`
+  file beside the note is created once, mode 0644 whatever the creating
+  shell's umask, and never removed; a `START REFUSED` that says the guard
+  could not be taken names the error, and a lock that uid 1000 cannot open
+  is the first thing to check. The CLI has no
+  override flag on purpose; the one it had was taken by refused workers over
+  their own live runs (#1876), and a worker's shell is the same shell you
+  would use, so the release lives here and not where a worker reads.
 - **Overlap is held per job, not per profile.** Holding the profile lock across
   execution — the upstream default — meant a fleet audit blocked every dispatch
   for its whole run; three `github-issue-resolver` firings were measured 418s,

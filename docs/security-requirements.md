@@ -75,13 +75,13 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee. The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee, with one operator-enforced carve-out inside it: an administrator-supplied volume whose source would deliver the A2A bus credential to a second container, or a volume or mount named `a2a-bus-token`, is refused at admission, and on an install running the A2A surface stripped from the render as well (the same Secrets read through `env` are not, which is the supported route for the bridge sidecar). The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below.
 - Credentialed commands execute in the credential broker Pod, not in the agent sandbox.
 - The credential broker receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
+- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support. The one non-CLI interface is the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by a code allowlist (`agents/platform/scripts/api_policy.py`) and open to the shell role only; see [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md).
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the
@@ -121,18 +121,15 @@ about the allowlist's own contents.
 **It blocks nothing at all today.** Adding a NetworkPolicy is monotone: policies selecting one Pod
 are unioned, the API has no deny rule, and the agent Pod is already selected for egress by
 `<agent>-gateway-netpol`, which the operator renders whenever `spec.networkPolicy.enabled` is left at
-its default (set it to `false` and the gateway policy is withheld instead — on a Helm install the
-allowlist is then the Pod's only policy and really does default-deny on an enforcing CNI; a Kustomize
-install still carries the static `platform-agent-core-egress` set over the same Pod). So enabling
+its default (set it to `false` and the gateway policy is withheld instead; the allowlist is then the
+Pod's only policy and really does default-deny on an enforcing CNI). So enabling
 `egressPolicy: Allowlist` leaves the Pod's permitted egress a strict superset of what it was — wider
 by the credential broker on TCP 8765, and wider also by the managed collector namespace on 4317/4318
 when the agent is not exporting telemetry, since the gateway policy drops its own OTel rule in that
 case. It cannot take a destination away. The gateway policy permits `169.254.169.254/32` on TCP 80 and on port
 53, plus the discovered metadata-daemon port (`988` by default) to both link-local metadata
 addresses, so the metadata path stays open, and it permits TCP 443 to `0.0.0.0/0` minus the private
-ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half stays open too. A Kustomize
-install adds `platform-agent-core-egress`, which permits the same metadata path; it changes nothing
-either way.
+ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half stays open too.
 
 The field is therefore a rendered, auditable statement of the destinations the agent is supposed to need, plus the refusal rules and the reconcile behaviour that a real control will need — not a control. Narrowing `<agent>-gateway-netpol`, which still permits the metadata path, is what turns it into one. Two conditions the operator will not be able to enforce even then: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and any other policy an administrator adds re-opens whatever it permits. The capability cost — the agent's DuckDuckGo web search, the `browser` toolset, the `gke` and `developer_knowledge` MCP servers, and direct `github.com` access from the sandbox — falls due at that point and not before; none of it is lost today, because the gateway policy still permits every one of those destinations.
 

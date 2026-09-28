@@ -94,6 +94,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # provider's default model; set the matching *_api_key above).
 # model_provider     = "gemini"
 # model_default_name = ""
+# Output tokens the gateway asks for on a request that names none; 0 renders
+# nothing. For a self-hosted backend whose prompt and output share one window.
+# model_max_tokens   = 0
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults
@@ -117,6 +120,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # credentials Secret and the CR's slack section turns on. Creating the Slack
 # app (Socket Mode + bot scopes) stays manual — see the README.
 # enable_slack            = true
+# Comma-separate several to serve more than one Slack workspace.
 # slack_bot_token         = "xoxb-..."
 # slack_app_token         = "xapp-..."
 # slack_allowed_users     = ["U01234567"]
@@ -132,6 +136,24 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # permission_set either way. There is no admin bundle -- widening access
 # means naming the roles, so that the grant is explicit and reviewed.
 # permission_set = "read-only"
+
+# Multi-project scope: the projects beyond project_id whose GKE clusters get a
+# Cluster Agent, and what to leave unmanaged. The IAM module binds the read
+# roles in each listed project and the chart renders the same object into the
+# PlatformAgent CR. Omit the block, or leave the lists empty, for the
+# management project alone. A PlatformAgent that already declares spec.scope
+# by hand: copy it here before the first apply, which renders the block for
+# the first time and replaces the live lists with these. Folders and
+# organisations are not inputs yet.
+# scope = {
+#   projects = ["payments-prod", "payments-staging"]
+#   exclude = {
+#     projects = ["*-sandbox"]
+#     clusters = [
+#       { project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" },
+#     ]
+#   }
+# }
 
 # Optional scheduled backups of the release namespace. Off by default in both
 # install paths: Backup for GKE bills per backed-up pod and per GB of snapshot
@@ -153,7 +175,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # shared cluster, install cert-manager separately and set this to false.
 # enable_cert_manager  = true
 # enable_webhooks      = true
-# cert_manager_version = "v1.21.1"
+# cert_manager_version = "v1.21.2"
 
 # Anything the variables above do not reach. Deep-merged over the values this
 # composition computes, so one leaf can be set without restating its block.

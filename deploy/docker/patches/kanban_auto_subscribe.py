@@ -4,6 +4,21 @@ Installed into the image at ``/opt/hermes/tools/kanban_auto_subscribe.py`` and
 wired into ``tools/kanban_tools.py`` (the ``kanban_create`` handler) by
 ``deploy/docker/patches/apply_kanban_auto_subscribe.py``.
 
+Status at v2026.9.14: largely superseded upstream
+-------------------------------------------------
+Since upstream commit 3b7ff435fd (2026-09-07, "preserve durable origins for
+worker-created tasks") ``create_task`` takes ``creator_task_id=<HERMES_KANBAN_TASK>``
+and, inside the creation transaction, ``kanban_db_graph.inherit_creator_origin``
+-> ``_inherit_notify_subs`` copies the creator card's subscription rows to the
+child. That is the second bullet under "The gap, measured" closed at the
+source, and ``verify_kanban_auto_subscribe.py`` passes every incident check
+against the unpatched base. The module is kept for the two things upstream
+still does not cover -- the idempotent re-create of a card born outside any
+worker (``create_task`` returns the existing id before it opens ``write_txn``,
+so nothing inherits; see "The cursor starts caught up") and the wiring check
+the applier and verifier provide. Retiring the Dockerfile step is a follow-up;
+the narrative below is the record of why the patch existed.
+
 The gap, measured
 -----------------
 The gateway notifier only sees cards with a ``kanban_notify_subs`` row. Two
@@ -17,8 +32,8 @@ the 2026-08-07 live run (12:58):
   four cards the coordinator created *as a dispatcher-spawned worker* (three
   sleep tasks and the synthesizer ``t_f54bd6b5``) had no session context and
   got nothing.
-* Upstream ``create_task`` does inherit subscriptions — but only from the
-  explicit ``parents=[...]`` graph edges (``_inherit_notify_subs``). A
+* Upstream ``create_task`` at v2026.8.19 did inherit subscriptions — but only
+  from the explicit ``parents=[...]`` graph edges (``_inherit_notify_subs``). A
   worker's own card is deliberately not a graph parent of the work it fans
   out (``parents=[<itself>]`` is the self-parenting deadlock the
   ``kanban_scheduling`` patch exists to untangle), so the chain from
@@ -26,9 +41,8 @@ the 2026-08-07 live run (12:58):
 
 Result: the synthesizer's answer sat undelivered for 91.3s until the user
 asked after it — ``gateway.log`` shows zero Slack sends between 12:59:02 and
-13:02:15. The manual remedy,
-``agents/platform/scripts/kanban_notify_propagate.py``, relies on the worker
-remembering to run it; it didn't.
+13:02:15. The manual remedy, a propagate script the worker had to remember
+to run, did not get run; it has since been deleted.
 
 The fix
 -------
@@ -41,19 +55,19 @@ So the user's thread follows the work wherever a worker fans it out, one hop
 at a time: coordinator → sleep tasks → synthesizer, each inheriting from the
 card that created it.
 
-Same contract as the manual script it automates: the copied column set is
-``platform, chat_id, thread_id, user_id, notifier_profile`` (also exactly
-what upstream ``_inherit_notify_subs`` copies), ``INSERT OR IGNORE`` on the
-subscription primary key makes it idempotent — the script remains in place
-as a manual/back-fill tool and double-writes are harmless — and
+The copied column set is ``platform, chat_id, thread_id, user_id,
+notifier_profile`` (exactly what upstream ``_inherit_notify_subs`` copies),
+``INSERT OR IGNORE`` on the subscription primary key makes it idempotent —
+so a card upstream already subscribed takes no double write — and
 ``created_at`` is re-stamped.
 
 The cursor starts caught up
 ---------------------------
 ``last_event_id`` is seeded at the child's current ``MAX(task_events.id)``
 rather than at 0, because a subscriber wants the events that happen after it
-subscribes and nothing before. Both upstream seeding paths in
-``hermes_cli/kanban_db.py`` already do this and each records the bug that
+subscribes and nothing before. Both upstream seeding paths (``add_notify_sub``
+in ``hermes_cli/kanban_db_notify.py``, ``_inherit_notify_subs`` in
+``hermes_cli/kanban_db.py``) already do this and each records the bug that
 taught them to: ``add_notify_sub`` snaps to the head because a cursor of 0
 on an already-active task made the notifier replay every historical terminal
 event on its next tick, a boot-time burst of 100+ messages (issue #29905),
@@ -89,8 +103,7 @@ logger = logging.getLogger(__name__)
 
 #: The subscription columns copied parent -> child. ``task_id`` is rewritten,
 #: ``created_at`` re-stamped, ``last_event_id`` seeded at the child's own
-#: head. Matches both the manual propagate script and upstream
-#: ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
+#: head. Matches upstream ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
 #: instead of a silently wrong copy.
 COPY_COLUMNS = ("platform", "chat_id", "thread_id", "user_id", "notifier_profile")
 

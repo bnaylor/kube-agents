@@ -45,9 +45,9 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. Without the pair nothing breaks on an install that leaves
-  `harness.experimental.shellSandbox` off, which is the default; with it on, the
-  agent has no key to dial the sandbox with. See
+  itself. The sandbox is always on — `harness.experimental.shellSandbox.enabled`
+  is not a toggle, the operator refuses `false`, and this chart fails at template
+  time — so without the pair the agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
 
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
@@ -211,13 +211,16 @@ one from the mirror through its own chart's values.
 ### LiteLLM gateway
 
 The agent's baked default model endpoint is
-`http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
+`http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
 uses Workload Identity (below); `litellm.modelDefaultName`
-overrides the per-provider default model. Set `litellm.enabled=false`
+overrides the per-provider default model; `litellm.maxTokens` (default `0`,
+meaning none) puts a `max_tokens` under every alias for a request that names
+none, which a self-hosted backend with one combined prompt-plus-output budget
+needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -247,8 +250,10 @@ default, and the rendered config is unchanged while it is; the feature is
 chart-only, so with it on the gateway diverges from the kustomize dev base,
 which carries no redaction. The site's
 [inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)
-owns what is redacted, what is not (responses, on-disk transcripts, chat
-egress) and why a pseudonymised identifier is one the agent cannot act on.
+owns what is redacted, what is not (responses, chat egress) and why a
+pseudonymised identifier is one the agent cannot act on; the site's
+[security and IAM page](../../docs/site/src/content/docs/reference/security-and-iam.md)
+owns what the image redacts in the files on the agent's volume.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
@@ -277,6 +282,25 @@ resolves to that GSA:
 `model_provider = "vertex_ai"` — the second `kube-agents-iam` module
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
+
+#### Upgrade notes: inference-gateway Service rename
+
+The agent-facing K8s Service was renamed from `litellm` to `inference-gateway` (and `litellm-gateway` to `inference-gateway-upstream` for the upstream gateway). The operator now renders `base_url: http://inference-gateway.<namespace>.svc.cluster.local/v1` into the managed agent config on every reconcile; the managed scope is overlaid on load, so agents cannot retain the old name via a local override.
+
+**Default installs (`litellm.enabled=true`):** Helm deletes the old `litellm` Service and creates `inference-gateway` in the same upgrade. The operator re-renders the agent ConfigMap once the new pod rolls out. There is a brief window between Helm's delete of `litellm` and the completion of the operator reconcile and agent rolling-restart during which agent pods still resolve `litellm` (now gone) and model calls fail. To eliminate this window, annotate the live `litellm` Service before upgrading so Helm retains it alongside the new `inference-gateway`:
+
+```bash
+kubectl annotate svc litellm helm.sh/resource-policy=keep -n <namespace>
+helm upgrade ...
+```
+
+Old agent pods continue routing through `Service/litellm` until the operator updates the ConfigMap and the rolling restart completes. Once all pods have migrated to `inference-gateway`, remove the retained Service:
+
+```bash
+kubectl delete svc litellm -n <namespace>
+```
+
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 
@@ -444,10 +468,10 @@ canonical walkthroughs.
 
 ### Agent runtime knobs
 
-`platformAgent.harness.hermes`, `platformAgent.harness.memory`, and
-`platformAgent.deployment.availability` expose the remaining PlatformAgent CR
-fields, so a chart install can reach every field of the CR without editing it
-by hand. Each one defaults
+`platformAgent.harness.hermes`, `platformAgent.harness.memory`,
+`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+expose the remaining PlatformAgent CR fields, so a chart install can reach every
+field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
@@ -490,7 +514,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Four knobs need context beyond the chart:
+Five knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -502,7 +526,7 @@ Four knobs need context beyond the chart:
   value to `""` to run on the standard container runtime instead. Installs
   driven by the Terraform composition never see this default — it always renders
   `runtimeClassName` explicitly, from its own `agent_runtime_class` variable,
-  which `install.sh` writes from `--gvisor`. That variable still defaults to
+  which `install.sh` writes from `--enable-gvisor`. That variable still defaults to
   `""`, so a bare `terraform apply` against the composition leaves the agent
   unsandboxed where a bare `helm install` sandboxes it.
 - `harness.experimental.shellSandbox.runtimeClassName` is the same choice for the
@@ -516,12 +540,20 @@ Four knobs need context beyond the chart:
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
   them: the three `gcloud` commands are in
   [`designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md#setting-up-the-pool).
-  Set it with `harness.experimental.shellSandbox.enabled` — the chart fails the
-  render if you set one without the other, since federation only takes effect
-  when the credential proxy runs beside the sandbox.
+  Set `audience` and `serviceAccountEmail` together — the chart fails the
+  render on one without the other, because the operator reads a half-filled
+  block as absent and leaves the credential proxy on the metadata server
+  without saying so. Federation takes effect wherever that proxy runs beside
+  the sandbox, which is every install: `shellSandbox.enabled: false` is refused.
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
+- `harness.driftDetector.enabled` needs
+  [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
+  applied against the project first. The chart does not check, and neither does
+  the detector: enabled without a subscription to read, it comes up and retries
+  a pull that cannot succeed for the life of the pod, never exits, and leaves
+  the pod Ready. That is why it defaults to off.
 
 ### Plugins & Runtime Tuning
 
@@ -545,6 +577,18 @@ before any GKE call. The
 `scoped_service_accounts` output when `scoped_clusters` is set. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
+
+### Projects in scope
+
+`platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
+beyond the one the agent runs in, whose GKE clusters get a Cluster Agent, and the projects and
+clusters it leaves unmanaged (the
+[CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included, because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
+`terraform/examples/full-install` composition always passes a map, so on that path a project
+leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
+The agent's service account needs the read roles in each project named; the composition binds
+them from the same value, and a chart installed on its own needs them granted by hand.
 
 ### ServiceAccount ownership
 
@@ -576,6 +620,94 @@ so that case is inside the supported range and has to work.
 Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
 that already has them: the objects are cluster singletons with fixed names, so
 Helm refuses the second install on ownership rather than duplicating them.
+
+### Quota preflight
+
+`quotaPreflight.enabled` (default `true`) checks the namespace's `ResourceQuota`
+objects before anything is applied, and fails the render with a diagnosis and a
+ready-to-run `kubectl patch` rather than letting the install stall later on pod
+creation. `--set quotaPreflight.enabled=false` skips it.
+
+What it sums: the chart's own workloads from `values.yaml` — the operator, LiteLLM and
+the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, which
+have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
+`platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
+sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
+pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
+credential proxy and the PersistentVolumeClaims are not, because they do not scale with
+it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+(`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
+though note that if a namespace ResourceQuota restricts that compute resource (such as
+`limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
+declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
+`null`, a claim sized from it would be counted as zero, so an empty one fails the check
+by name.
+
+How it decides. For each quota it compares `hard` against what the release needs, on
+install and upgrade alike; on install it also compares `hard - used`. It reads
+CPU, memory and ephemeral-storage (requests and limits), `pods` (`count/pods`),
+`persistentvolumeclaims` (`count/persistentvolumeclaims`) and `requests.storage`; other
+keys, including `services`, `secrets` and other `count/<resource>` entries, are not
+modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
+a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
+identify, so comparing the whole release against it would be wrong either way. Every quota
+that falls short is reported in one failure, so a namespace with two of them takes one
+patch rather than two rounds.
+
+Two carve-outs in that comparison, both to stop it refusing an install that would have
+worked:
+
+- **`hard - used` is not applied on upgrade**, because the release's own pods are already
+  counted in `used` and subtracting them again refuses every upgrade of a release that
+  exactly fits. The cost is that a neighbouring workload's usage is in `used` too and
+  cannot be told apart from the release's own, so in a shared namespace an upgrade is
+  checked against `hard` alone.
+- **`hard - used` is not applied to claims** — `persistentvolumeclaims` and
+  `requests.storage` — on install either. The shell sandbox's StatefulSet sets
+  `persistentVolumeClaimRetentionPolicy` to `Retain`, so its claims outlive
+  `helm uninstall` and show up in `used` on the next install, to be reused by name rather
+  than created again. `hard` still has to fit the release, which is what catches a quota
+  genuinely too small for it.
+
+The patch it prints raises `hard` to what the release needs plus one rollout surge Pod —
+adding `used` on install for compute and pod quotas, where `used` is somebody else's, and
+not on upgrade or for claim-shaped keys, where `used` already holds the release's own
+running pods or retained PVCs. Claim counts and `requests.storage` get no surge allowance,
+because a surge Pod mounts the existing claim rather than creating one. The surge Pod it
+sizes for is the largest one in the release that a rollout actually creates: rollouts are
+per-workload, so room for one at a time is enough. The shell sandbox's StatefulSet and the
+pre-delete cleanup Job never surge, and neither does the agent pod at the default
+`platformAgent.deployment.availability.replicas` of one, where the operator rolls the
+gateway Deployment with `strategy: Recreate` — it counts only from two replicas up, where
+the strategy becomes `RollingUpdate`.
+
+**Where it is silent, and where it is not.** The check needs a cluster to query, so it
+does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a
+clean render in either case is not evidence that a quota fits.
+
+It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
+to it. A LimitRange with a per-container `max`, or a `default` that rewrites what the pods
+request, rejects or resizes them at admission no matter how much quota is free — the same
+stall, from an object this check never looks at. Check it separately with
+`kubectl describe limitrange -n <release-namespace>`.
+
+Conversely, a ResourceQuota that restricts compute resources (`requests.cpu`, `limits.cpu`,
+`requests.memory`, `limits.memory`, `requests.ephemeral-storage`, `limits.ephemeral-storage`)
+requires every container in the namespace to declare that request or limit unless a
+`LimitRange` provides a default. All chart-rendered workloads (operator, LiteLLM, minter,
+Hindsight, cleanup Job) and several operator containers (such as the shell sandbox, dashboard,
+and agent container) set no ephemeral storage, and pruning a workload's limits leaves it
+without them; the preflight checks total headroom against what is declared, not whether every
+individual container declares every resource the quota constrains. A namespace quota constraining
+ephemeral storage therefore additionally requires a `LimitRange` defaulting it, or the API
+server will reject pod creation.
+
+It does need `get`/`list` on `resourcequotas` in the release namespace. Helm's `lookup`
+returns nothing for a NotFound and raises a template error for everything else, so an
+identity without that permission gets `error calling lookup: resourcequotas is
+forbidden` and no install rather than a quiet pass. Grant the permission, or install with
+`--set quotaPreflight.enabled=false`.
 
 ## Uninstalling
 
@@ -687,5 +819,15 @@ helm uninstall kube-agents -n kubeagents-system
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+- `files/footprint.yaml` is generated too, but from a different source: it is summed from
+  the operator's **golden manifest**
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`),
+  not from `k8s-operator/config/` and not from a live render. Changing the operator's
+  resources therefore takes two steps in order — re-bless the goldens
+  (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.
+  Running `chart-sync` first regenerates the old numbers from the stale golden. The
+  package matters: the goldens are written by `internal/testing/golden_test.go`, and
+  `./internal/controller/...` has an unrelated `-update` flag of its own, so pointing the
+  command there exits 0 without touching them.
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.

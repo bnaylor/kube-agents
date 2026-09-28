@@ -19,6 +19,16 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
+# What the image reports as its own version. Hermes interpolates it into the
+# `User-Agent` of every remote-MCP call, so an image built without it is
+# indistinguishable on the wire from any other. Both cloudbuild files, the
+# CI deploy and `dev_rebuild_agent.sh` already pass it; these targets are the
+# only image entry point that did not, and they publish to $(REPO) like the
+# rest. `dev` matches the Dockerfile's own ARG default, so a plain
+# `make docker-build` is unchanged.
+KUBE_AGENTS_VERSION ?= dev
+VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
+
 .PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
@@ -48,10 +58,10 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build t
 # otherwise resolve to the build host — an arm64 machine would silently produce
 # an image that crashloops on the cluster (#560).
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
-	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 # Context is the repository root, not deploy/sandbox: the image ships the same
 # credential-proxy client and PATH script the agent image does, and copying
@@ -158,11 +168,14 @@ RUFF_SELECT := E9,F63,F7,F82
 lint-python: ## Run ruff's error rules over every Python file (the set tests/test_lint_python.py enforces).
 	@python3 -m ruff check --isolated --select $(RUFF_SELECT) .
 
-# Unit tests for every Python helper outside k8s-operator/, which has its own
-# target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl
-# rather than importing SDKs -- but the agent scripts do import a few third
-# party packages, listed in requirements-test.txt and installed by
-# `make test-python-deps`. CI installs the same file.
+# Unit tests for every Python helper in the tree, the operator's leader-election
+# wrapper (k8s-operator/internal/controller) included. `make -C k8s-operator
+# test-python` runs that one too, so operator work stays self-contained; it is
+# one small file, so the second run under `make verify` costs nothing. Mostly
+# stdlib-only -- the skill helpers shell out to gh/kubectl rather than importing
+# SDKs -- but the agent scripts do import a few third party packages, listed in
+# requirements-test.txt and installed by `make test-python-deps`. CI installs
+# the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
 # without editing this file. Several globs rather than one because the tests do
@@ -202,6 +215,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
 	$(wildcard tests/test_*.py) \
@@ -336,9 +350,9 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
 	@echo "==> verify OK"
 
-test-python: ## Run the Python unit tests outside k8s-operator/.
+test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
+		echo "Error: the PYTHON_TEST_DIRS globs matched no test_*.py files."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
@@ -602,10 +616,10 @@ docs-check-audience: ## Fail when a published site page carries a maintainer ide
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config; the webhook template is hand-maintained and only checked.
+chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator golden; the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config and its hand-written webhook template matches config/webhook (CI runs this; needs helm and PyYAML).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator golden (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).

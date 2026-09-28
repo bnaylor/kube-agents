@@ -53,8 +53,12 @@ still needs the judge even though only the deterministic checks decide.
 
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
-`BENCH_FLEET_KUBECONFIG_DIR` first. Without the fleet the case fails every time with the fleet
-phrases absent, which is broken, not red.
+`BENCH_FLEET_KUBECONFIG_DIR` first. The runner refuses to write kubeconfigs on your own
+credential unless told to: either set `FLEET_ALLOW_RUNNER_CREDENTIAL=1` (a fleet only you
+use), or apply the fleet stack with `user:<you>` added to `fleet_reader_token_creators` and
+set `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` — the default
+grants token-creator to the CI identities only, and `roles/owner` does not include it. Without the fleet the case
+fails every time with the fleet phrases absent, which is broken, not red.
 
 It must fail, and fail for the reason your change addresses. Keep the failing entry from
 `verification_report[]` in the run's `results.json` (its `status` and `reason`) and the line of the
@@ -76,14 +80,16 @@ request, with `owner:` set and a `docs/designs/domains.yaml` slug (or a reviewed
 `KNOWN_NO_DOMAIN` entry). The nightly is where a new case lands
 ([`docs/designs/bench-case-format.md`](../../docs/designs/bench-case-format.md),
 "Registration"): it runs every night from the night it merges and builds its record; a
-presubmit seat (`hack/eval/presubmit-cases.txt`, an `eval-crew` approval) is a later pull
-request that cites that record, never the one that makes the case pass. A case whose
-fixture does not exist at all is a `FIXTURE_NOT_READY` entry in
+presubmit seat is a later pull request that cites that record — one edit that moves the
+line to `hack/eval/presubmit-cases.txt` and adds the name to `hack/eval/blocking-roster.txt`
+(an `eval-crew` approval; since 2026-09-22 the presubmit runs the blocking roster only, and
+`scripts/test_eval_rosters.py` pins the two files as equal) — never the one that makes the
+case pass. A case whose fixture does not exist at all is a `FIXTURE_NOT_READY` entry in
 `scripts/validate_bench_cases.py` with its issue instead. A case already registered stays
-where it is. Admission to the blocking roster (`hack/eval/blocking-roster.txt`) is earned on
-the case's record afterwards ([`docs/eval-gate-roster.md`](../../docs/eval-gate-roster.md),
+where it is. That seat is the admission, earned on the case's record
+([`docs/eval-gate-roster.md`](../../docs/eval-gate-roster.md),
 [`bench/baselines/README.md`](../../bench/baselines/README.md)); never add a new case to
-it in the pull request that makes it pass.
+the roster in the pull request that makes it pass.
 
 ## When the fix is not yours
 

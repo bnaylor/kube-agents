@@ -49,8 +49,8 @@ only — anything that renames, removes or re-types a field bumps
   ],
   "coverage": {
     "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["incident-triage"]
+    "domains_covered": 9,
+    "uncovered": ["fleet-audits", "remediation"]
   }
 }
 ```
@@ -102,20 +102,28 @@ the same layout and is collected from the moment it starts running.
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
 - `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
   the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
-  `RED`. `null` when the log has no such line — the job ended before its
+  `RED`. A run the suite could not evaluate (an admitted case lost every
+  repetition to infrastructure; the job exits `2` and the line carries
+  `NOT EVALUATED` between the anchors) records as `RED` here, because the
+  collector reads the `Failed` word and not the words after it; the
+  verdict's own `outcome` is in the run's `eval-verdict.json`, which nothing
+  on the dashboard reads yet. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
-  the field existed has no key: unknown, which is not `null`.
+  the field existed has no key: unknown, which is not `null` — `health.py`
+  never counts it as a deadline kill.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
   `hack/ci-eval-pr.sh`'s step-0 revalidation ended before the eval loop; then
   it falls back to `finished − started` (which also counts provisioning).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
-  verdict outside the vocabulary below — only the currently-unreachable
-  `[EXPECTED_FAIL]`, which no `task.yaml` sets — does not parse and yields
-  no entry):
+  verdict outside the vocabulary below — `[EXPECTED_FAIL]`, which no
+  `task.yaml` sets, and `[NOT_GRADED_ON_TRANSPORT]`, the inject lane's word
+  for a case whose every objective check is not applicable on that
+  transport — does not parse and yields no entry, so such a case is missing
+  from `tasks[]` rather than misfiled; the next-mode key is #2008's):
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
     `[UNSTABLE]` (a multi-repetition case that passed some but not all
     graded repetitions is not a clean pass; `reps` carries the split),
@@ -135,7 +143,16 @@ the same layout and is collected from the moment it starts running.
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
-      tokens this collector has never seen) → `fail`.
+      tokens this collector has never seen) → `fail`. An `infra` rep whose
+      `reason` leads with `KUBE_AGENTS_DELEGATION_CEILING` is a
+      **delegation-ceiling** rep: the harness's wait for the delegated worker
+      ran out with the card still running and nothing delivered. The readers
+      (`classify.py`, `health.py`) count it apart from the storm reps — it is
+      not lost to 429s — and outside every pass-rate denominator; `classify.py`
+      classes a case whose ungraded reps are all of this kind
+      `delegation-ceiling`. The run page, the PR view and the PR comment's
+      result cell count it in a case's total and name it apart; the Cases
+      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -254,7 +271,8 @@ side.
   entry in `hack/eval/presubmit-cases.txt` **or** `hack/eval/nightly-cases.txt`
   — the nightly matrix is the presubmit's superset (`EVAL_TIER=nightly`
   appends the second file). `active` implies `nightly_active`; the Cases page's "nightly
-  only" status is `nightly_active and not active`.
+  only" status is `nightly_active and not active` with no demotion date on record for the
+  case (a dated one reads `demoted`).
 - `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
 - `pass_rate` — `passes / (passes + fails)`. **`infra` results are excluded
@@ -341,14 +359,30 @@ Additive, optional, and safe to omit — consumers must default them.
   `artifacts_url` are then `null` — but `commit` is not, when Prow recorded
   a `revision`: it falls back to that ref's first 7 characters, which for a
   tag-push postsubmit is the same commit the banner would have named.
-  `artifacts_url` is additionally `null` for a run outside Prow.
-- `verdict` — the eval's, which is **not** the job's: the lane is advisory,
-  so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
-  config's doing — it runs the driver under `|| true` — not the driver's, so
-  a future config that drops the `|| true` would make the two agree without
-  anything here changing. `NOT RUN` is
-  the deploy-failed path — nothing was measured, so it is not a judgement
-  on the candidate.
+  `artifacts_url` is additionally `null` for a run outside Prow. `rc_tag` is
+  whatever tag the job fired on, so the store holds two families: records
+  from before the gate landed carry a `staging_` tag, the deploy tag the job
+  then triggered on, and records after it carry the `evalcand_` tag the
+  nightly now pushes ahead of the deploy. Nothing reads the prefix.
+- `verdict` — the eval's, which is still not the job's, though they now
+  mostly agree: the job runs the driver bare, so a `RED` candidate leaves a
+  `FAILURE` in `result`. They part on `NOT RUN`, which is written on three
+  paths and on none of them is a judgement on the candidate: the deploy
+  failed, so nothing was measured; the eval ran and could not be evaluated
+  (`ci-eval-pr.sh` exited `2` and `eval-verdict.json` says
+  `outcome: not_evaluated` — an admitted case lost every repetition to
+  infrastructure, or every case the run had was not graded on its
+  transport), so the candidate was not measured on it; or the eval
+  exited non-zero without writing `eval-verdict.md` at all, so it stopped
+  before grading anything. On each of them the driver exits non-zero and
+  the build is `FAILURE`. That gap is the reason `verdict` is recorded
+  separately at all, and the reason the promotion reads this word rather
+  than `result`: `RED` holds the candidate back for good, `NOT RUN` lets a
+  later nightly nominate the same commit again. The promotion reads it out
+  of the build's own `artifacts/rc-eval-summary.md` rather than from here —
+  this store is the dashboard's, and nothing decides from it — so a `null`
+  here is a run whose banner was missing, which is the same run the
+  promotion would have found no summary for.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store
@@ -374,11 +408,19 @@ what the renderer does with them.
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
   are excluded from every pass-fraction denominator, exactly like `infra`
-  task results. When `reps` is absent the task's single `result` stands in
-  for one rep.
+  task results; an `infra` rep whose `reason` leads with
+  `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
+  (`storm_reps`, `health.json`'s `infra_reps`) and reported under
+  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
-  its verdict and is reported as truncated. Absent means unknown.
+  its verdict and is reported as truncated. `health.py` reads a presubmit
+  `FAILURE` with `null` that ran to the job's deadline — and is neither a
+  lost pod nor a conflicted merge — as a deadline kill
+  (rule 3d), `classify.py` classes the run `deadline-kill`, and
+  `gate_comment.py` gives it the one-line deadline comment. Absent means
+  unknown: never a kill.
 - `runs[].log_url` — nightly runs only: Spyglass's page for the build
   directory the collector listed
   (`https://oss.gprow.dev/view/gs/<bucket>/logs/<job>/<build>`), so the
@@ -605,9 +647,15 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
-`setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
+`setup_death`, `storm_reps`, `ceiling_reps`, `do`, the run-level `cls`
+(`setup` for a setup death or a lost pod, `deadline-kill`, `only-this-pr`
+for a conflicted merge, else `null` — a run whose classes are per case),
+`eval_verdict` (present only when the `data.json` record carries the key,
+so the Brief's recovery count out of a deadline-kill outage can tell a
+recorded `null` from a pre-field record), `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
-nightly_failed_recent}`) and `health_at` (the verdict in force when it
+nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
+`health_at` (the verdict in force when it
 finished, from history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -620,9 +668,13 @@ when none did — evidence about `main`, shown beside the case, never a tag.
 `cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
 demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
-(active, off the roster), `demoted` (held out, with `demoted_on` read from the hold-out
-entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`),
-`nightly_only`, or `retired` (in neither matrix on this checkout); an
+(active, off the roster — since 2026-09-22 the presubmit runs the roster only, so this is
+reachable only on a checkout whose presubmit file lists a case the roster does not),
+`demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
+entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
+2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
+(in the nightly file only, no demotion date on record), or `retired` (in neither matrix on
+this checkout); an
 unreadable roster reads every active case as `blocking`, over-reporting
 rather than hiding. `rates` is `{presubmit: [[pass, fail], [pass, fail]],
 nightly: [...]}` over graded reps for each of `rate_windows_days` (7 and
@@ -768,9 +820,9 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -778,7 +830,15 @@ and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
 a run-page banner of its own, and otherwise show the generic degraded
-headline. `issue` (`{number, url}`) may carry `condition`, the one it was
+headline. For `delegation_ceiling` (15+ repetitions across 3+ PRs in 2 hours
+ended at the harness's delegation wait with the worker still running, #1874)
+the `incident` also carries `reps`, and the pages give it the storm's 2-hour
+lead, a Brief headline and a run-page banner of its own. `deadline_kill` (3+ runs on 2+ PRs in 2 hours that concluded `FAILURE`
+with `eval_verdict` `null` after running to the job's 360-minute deadline,
+#1894) is an OUTAGE with the storm's incident keys plus `first_kill` — the
+outage's first kill, kept across ticks while `window_start` slides with the
+rule's 2-hour window, for the surfaces that date the whole episode; the pages
+give it a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
 filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
 role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
@@ -790,6 +850,48 @@ baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
 it is set.
+
+`pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
+pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
+window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
+threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+longest run has been waiting for a project right now, `0` for an empty queue
+and `null` when Deck was not read; `over_threshold` is the count already past
+the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
+live backlog — and `null` when Deck was unread or no limit was given. A verdict
+lasts a week, so every present-tense reader asks it: the alert is withheld on
+`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
+Brief go past tense on either. `waiting_since` dates the backlog from its
+oldest queued run, and is `null` when there is none; the Brief's present-tense
+sentence prefers it to `since`, which can be days older.
+`breach_seen` says whether the open episode has ever measured a breach, and
+`since` is the episode's start except that a `BREACH` does not inherit one from
+a stretch that only ever said the queue could not be read. `metrics` carries
+both across a tick that read no artifact, as `pool_since` and
+`pool_breach_seen`. The two
+figures are never the seven-day window's — the periodic breaches on a day's row
+or on runs queued past p95 right now, and the window sits back inside its own
+limit after one bad day. Exactly one of `window_hours` and `day` says which
+stretch they cover: the periodic's recent window when it had the runs to judge
+it and went over a limit, the worst breached day otherwise. A verdict lasts a
+week, so the recent window comes first — a Thursday incident evidenced by
+Monday reads as a contradiction — but a compliant stretch is the same
+contradiction, only newer. Both are `null` when only the live queue breached;
+`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+periodic stopped publishing, and the last reading is not evidence about now.
+Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
+`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
+headline and on the last-24-hours view.
+`metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
+`null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
+the artifact was there at all. Nothing else answers that: `pool` is `null` for a
+healthy pool and for a failed fetch alike, and `queue_wait_p50_s` is `null` on a
+day with no runs. The poster needs the difference — going blind must not read as
+the episode ending. `metrics.pool_since` is the open episode's start, held
+across the ticks that read no artifact and so write no `pool`, and `null` once
+a tick reads one and writes none, which is the episode ending.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
@@ -857,12 +959,33 @@ prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
 and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
 opens the parse on the first one, so the decoy stays in the fixture.
 
+`testdata_nightly/` holds the nightly of 2026-09-21 (`ci-kube-agents-eval-nightly`,
+the periodic, so no `pull` key and `revision: main`), the second night the
+480m deadline ended with every unit finished and nothing graded (#1491).
+`started.json` / `finished.json` are verbatim and every driver line is real —
+the lease, the fan-out start, the launch and `finished` markers, the
+entrypoint's timeout and grace-period lines, the profile table. The four
+grading blocks are **spliced in**: the real night printed none, because the
+grading ran after the fan-out's `wait` and the deadline arrived first. They
+are real `bench-gate case` output from the night before
+(build 2101461441721667584) for four cases that also ran this night, placed at
+each case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
+since it grades per case, three of them after the SIGTERM, inside the grace
+period; the `recorded` lines are restamped to this build. The
+`Eval ended before its verdict` line is the EXIT trap's cut-off report:
+
+| build               | why it is here                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 2102186223282950144 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
+
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by
 suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
 them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
 `pr`, `started`, `finished`, `result`, `duration_s`, `tier` when the run
-carries one, and per task `name`, `result`, `reps[].result` and the first
+carries one, the how-it-ended fields — `has_build_log`, the `pod_*` trio,
+`merge_conflict`, `eval_verdict` — when the source has them, and per task
+`name`, `result`, `reps[].result` and the first
 96 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
@@ -884,7 +1007,11 @@ asserts it reads as `lost_pods` and not as setup deaths.
 [2026-09-07 18:00Z, 2026-09-14 18:20Z) — the seven days the slow-gate rule's
 baseline needs, ending on the afternoon every run was green and three hours
 long (#1586); the test asserts the `slow` note from 18:00Z that day and none
-over the 09-12/13 weekend.
+over the 09-12/13 weekend. `testdata_health/deadline-kills-2026-09-22.json.gz`
+is the same cut for [2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of
+them killed at the deadline with `eval_verdict: null` (#1880, #1894); the
+test asserts the `deadline_kill` OUTAGE from the third kill and a lull
+reading as recovering.
 
 `testdata_store/` holds four **real** objects from the evidence store's
 first recording night (2026-09-17, build 2100374258805903360, commit

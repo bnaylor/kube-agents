@@ -203,7 +203,12 @@ profile's dispatch. Notes on the mechanics:
 - `concurrency` is enforced here: submissions beyond a profile's cap are redelivered
   with backoff until a slot frees. Nothing is dropped; the stream holds the backlog.
 - A new profile's first dispatch waits on its `BusCredentialsReady` status condition -
-  the deployment spec owns why (auth-callout propagation). Submissions queue on the
+  the deployment spec owns why (auth-callout propagation). The rule that gate reads is
+  the one the gateway's creation gate ships: one callout replica ready on the current
+  spec, taken from the callout Deployment's status, not the all-replicas condition on the
+  `PlatformAgent` - a per-profile gate built on that reading reinstates, per profile, the
+  indefinite hold on a quota-capped cluster that the deployment spec's 9/17 amendment
+  removes for the gateway. Submissions queue on the
   stream meanwhile. Note the name is already taken by a coarser condition: until this
   CRD exists it lives on the `PlatformAgent` and means "the callout is ready and serving
   a map" rather than "this profile's user is served". The deployment spec records both
@@ -231,8 +236,13 @@ posture: non-root, scratch on an emptyDir, no secrets. Two deltas from the demo:
   still nil for the default profile (a KSA with no RoleBindings has a name and nothing
   else). Automount stays off; the projected volume is explicit.
 
-Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`. Everything else - prompt, correlation,
-context - is in the task message the adapter fetches from the stream by subject.
+Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`, and `A2A_ORIGIN_SEQ`. Everything else -
+prompt, correlation, context - is in the task message, which the adapter fetches by the
+stream sequence `A2A_ORIGIN_SEQ` names rather than by scanning the subject. The spawner
+knows that sequence because it publishes the submission before it spawns the pod, and the
+ack carries it. The variable can also read `unknown`, from a spawner that could not tell;
+absence means an older spawner. Both send the adapter back to the subject scan, which is
+correct only while the submission is still the head of the subject.
 
 **The adapter.** Inside the pod, a thin adapter sits between the bus and the harness.
 It fetches the task message, opens its own ephemeral consumer on the task's `…in`
@@ -534,7 +544,7 @@ this spec only guarantees the bus carries what that rebuild needs.
 | `max_in_progress` board cap (`common_types.go:278-311`)                                                                                                                                                                                        | `spec.concurrency`, per profile                                                                            | Covered                          |
 | Structured result posted verbatim, summary clipping (`kanban_result_required.py`)                                                                                                                                                              | `result` artifact + terminal status; rendering moves                                                       | Gateway                          |
 | Heartbeat notes as a rolling, edited chat line at zero LLM cost (`kanban_progress_lines.py`)                                                                                                                                                   | `progress` artifact carries the notes; the rolling-message rendering must be rebuilt                       | Gateway                          |
-| Auto-subscribe of the originating thread, inheritance to child cards, at-least-once delivery cursor, wake policy - completed does not wake the creator (`kanban_notify_propagate.py`, `kanban_auto_subscribe.py`, `kanban_notify_delivery.py`) | `correlationId` + durable replay are the substrate; subscription and wake policy are gateway session state | Gateway                          |
+| Auto-subscribe of the originating thread, inheritance to child cards, at-least-once delivery cursor, wake policy - completed does not wake the creator (the upstream `create_task()`, `kanban_auto_subscribe.py`, `kanban_notify_delivery.py`) | `correlationId` + durable replay are the substrate; subscription and wake policy are gateway session state | Gateway                          |
 | Report-by-thread `incidents` store, so "apply Option A" replies have context (`kanban_notifier.py`)                                                                                                                                            | No bus home; gateway session state                                                                         | Gateway - flagged to that design |
 | `needs_input` escalation to a human                                                                                                                                                                                                            | `input-required` state, first-class                                                                        | Covered                          |
 | Mid-run steering: `kanban_comment` injected into a running worker (`kanban_comment_status.py`)                                                                                                                                                 | Follow-up message on `…in`, adapter injects via harness stdin                                              | Covered (adapter work)           |

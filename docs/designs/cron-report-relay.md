@@ -484,7 +484,7 @@ use, is upstream's sender and carries no such guard.
 ## How the switch is wired: `chat` is a platform
 
 Nothing in Hermes is patched. Upstream already routes `deliver=<name>` through
-the platform registry, and `cron/scheduler.py::_plugin_cron_env_var` says so in
+the platform registry, and `cron/scheduler_delivery.py::_plugin_cron_env_var` says so in
 its own words — a plugin that sets `cron_deliver_env_var` gets "cron delivery
 support without editing this module". So the relay ships as a bundled platform
 plugin, [`deploy/docker/plugins/chat/`](../../deploy/docker/plugins/chat/),
@@ -660,8 +660,9 @@ privilege the pod does not already hold.
   one read, which is how an issue a person closed by hand is noticed and
   replaced rather than edited while closed), and closed with a comment once
   every leg has recovered. The call is
-  `forge.run_gh` through the sandbox and the credential proxy, the same route
-  `github-repo-watcher` takes; the minted token already holds `issues: write`.
+  `forge.call` — a version-control verb, over the sandbox hop into the
+  credential broker — the same route `github-repo-watcher` takes; the minted
+  token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
   own ledger. With no repository to use, the job falls back to the log line
   alone. Two installs that manage one repository would share one issue; the
