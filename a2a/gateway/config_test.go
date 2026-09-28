@@ -344,60 +344,76 @@ func TestFromEnvBackendSelection(t *testing.T) {
 }
 
 // TestFromEnvBackendCombinations walks every combination of the three
-// backends' credentials, because with three backends the pairs are exactly
-// what a hand-enumerated switch leaves a hole in — the two-backend switch
-// this merged from only knew about one pair, and a fourth backend must not
-// be addable with a combination nobody checked. Exactly one backend armed is
-// the only accepted shape; zero, any pair, all three, and any half Slack
-// pair all refuse.
+// backends' credentials and the inject door, because with three backends the
+// pairs are exactly what a hand-enumerated switch leaves a hole in — the
+// two-backend switch this merged from only knew about one pair, and a fourth
+// backend must not be addable with a combination nobody checked. Exactly one
+// real backend armed is the only accepted shape; zero, any pair, all three,
+// and any half Slack pair all refuse. The door is the other axis: it is not
+// a backend, so it must sit beside any ONE of the three without displacing
+// it, count as an ingress on its own, and change none of the refusals.
 func TestFromEnvBackendCombinations(t *testing.T) {
 	const (
 		discord = "x"
 		bot     = "xoxb-1"
 		app     = "xapp-1"
 		relay   = "http://relay.ns.svc:8081"
+		door    = ":8099"
 	)
 	for _, d := range []string{"", discord} {
 		for _, b := range []string{"", bot} {
 			for _, a := range []string{"", app} {
 				for _, g := range []string{"", relay} {
-					name := fmt.Sprintf("discord=%t/bot=%t/app=%t/gchat=%t", d != "", b != "", a != "", g != "")
-					t.Run(name, func(t *testing.T) {
-						setBaseEnv(t)
-						t.Setenv("DISCORD_TOKEN", d)
-						t.Setenv("SLACK_BOT_TOKEN", b)
-						t.Setenv("SLACK_APP_TOKEN", a)
-						t.Setenv("A2A_GCHAT_RELAY_URL", g)
-
-						// A half Slack pair is a typo, never a choice.
-						halfPair := (b != "") != (a != "")
-						armed := 0
-						want := ""
-						if g != "" {
-							armed, want = armed+1, "gchat"
-						}
-						if b != "" {
-							armed, want = armed+1, "slack"
-						}
-						if d != "" {
-							armed, want = armed+1, "discord"
-						}
-
-						cfg, err := FromEnv()
-						if halfPair || armed != 1 {
-							if err == nil {
-								t.Fatalf("FromEnv() accepted %s (armed=%d, halfPair=%t); backend = %q",
-									name, armed, halfPair, cfg.Backend())
+					for _, i := range []string{"", door} {
+						name := fmt.Sprintf("discord=%t/bot=%t/app=%t/gchat=%t/door=%t", d != "", b != "", a != "", g != "", i != "")
+						t.Run(name, func(t *testing.T) {
+							setBaseEnv(t)
+							t.Setenv("DISCORD_TOKEN", d)
+							t.Setenv("SLACK_BOT_TOKEN", b)
+							t.Setenv("SLACK_APP_TOKEN", a)
+							t.Setenv("A2A_GCHAT_RELAY_URL", g)
+							t.Setenv("A2A_INJECT_LISTEN", i)
+							if i != "" {
+								t.Setenv("A2A_INJECT_TOKEN", "s3cret")
 							}
-							return
-						}
-						if err != nil {
-							t.Fatalf("FromEnv() refused the one armed backend: %v", err)
-						}
-						if got := cfg.Backend(); got != want {
-							t.Fatalf("Backend() = %q, want %q", got, want)
-						}
-					})
+
+							// A half Slack pair is a typo, never a choice.
+							halfPair := (b != "") != (a != "")
+							armed := 0
+							want := ""
+							if g != "" {
+								armed, want = armed+1, "gchat"
+							}
+							if b != "" {
+								armed, want = armed+1, "slack"
+							}
+							if d != "" {
+								armed, want = armed+1, "discord"
+							}
+							// The door alone is an ingress (decided 2026-09-17,
+							// see FromEnv); with nothing else armed Backend()
+							// is "" rather than a real backend's name.
+							doorOnly := armed == 0 && i != ""
+
+							cfg, err := FromEnv()
+							if halfPair || (armed != 1 && !doorOnly) {
+								if err == nil {
+									t.Fatalf("FromEnv() accepted %s (armed=%d, halfPair=%t); backend = %q",
+										name, armed, halfPair, cfg.Backend())
+								}
+								return
+							}
+							if err != nil {
+								t.Fatalf("FromEnv() refused %s: %v", name, err)
+							}
+							if got := cfg.Backend(); got != want {
+								t.Fatalf("Backend() = %q, want %q: the door must not displace or stand in for a real backend", got, want)
+							}
+							if cfg.InjectArmed() != (i != "") {
+								t.Fatalf("InjectArmed() = %t with A2A_INJECT_LISTEN=%q", cfg.InjectArmed(), i)
+							}
+						})
+					}
 				}
 			}
 		}
@@ -577,6 +593,9 @@ func TestFromEnvTheDoorSitsBesideARealBackend(t *testing.T) {
 		{"beside the chat relay", map[string]string{
 			"DISCORD_TOKEN": "", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
 		}, gchatBackend},
+		{"beside the slack pair", map[string]string{
+			"DISCORD_TOKEN": "", "SLACK_BOT_TOKEN": "xoxb-1", "SLACK_APP_TOKEN": "xapp-1",
+		}, slackBackend},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setBaseEnv(t)
