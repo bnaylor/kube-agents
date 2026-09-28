@@ -160,9 +160,22 @@ func TestTheBridgeRefusesASubmissionWithNoCapabilityByDefault(t *testing.T) {
 	refuseAndFold(t, url, c, taskID)
 }
 
-// The zero value of the knob is the enforcing one, asserted on the Config the
-// binary actually builds rather than on the tests' own.
-func TestTheBridgesDefaultIsToRequireACapability(t *testing.T) {
+// The knob's POLARITY, which is the only thing a zero-value assertion can
+// decide and is worth deciding: the field is named for the relaxed state, so
+// Go's zero value is the enforcing one and an embedder that constructs a
+// Config and forgets this field gets enforcement. Renaming it to
+// CapabilityRequired would invert that silently, and this reds.
+//
+// It is NOT the env contract, and the comment here used to say it was
+// ("asserted on the Config the binary actually builds"). It is not: this
+// reads a struct literal's zero value, which is false by language
+// definition, so it passes against every implementation including the
+// `!= "true"` one that turns an unset variable fail-open. The env mapping is
+// pinned where the binary performs it, over configFromEnv, by
+// TestTheBridgeBinaryRequiresACapabilityUnlessExactlyFalse in
+// a2a/cmd/hermes-bridge; the comparison itself by
+// TestOnlyTheExactStringFalseRelaxesTheCapabilityRequirement in a2a/capability.
+func TestTheBridgesDefaultKnobPolarityIsEnforcing(t *testing.T) {
 	if (Config{}).CapabilityOptional {
 		t.Fatal("the zero value must be the enforcing one: an unconfigured sidecar must refuse, not execute")
 	}

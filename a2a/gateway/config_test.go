@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -788,5 +789,43 @@ func TestDefaultAddresseeIsPlatform(t *testing.T) {
 	}
 	if cfg.DefaultAddressee != "platform" {
 		t.Fatalf("DefaultAddressee = %q, want platform", cfg.DefaultAddressee)
+	}
+}
+
+// The gateway half of the capability switch, asserted through FromEnv rather
+// than through a Config literal. The mint side and the check side are
+// rendered from one variable so they cannot drift, which only holds if each
+// end reads it the same way; this is the gateway end of that claim.
+func TestFromEnvCapabilityOptionalOnlyOnExactlyFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "a default install sets nothing", set: false, want: false},
+		{name: "empty is not consent", value: "", set: true, want: false},
+		{name: "the rollout window", value: "false", set: true, want: true},
+		{name: "explicitly required", value: "true", set: true, want: false},
+		{name: "a typo enforces", value: "False", set: true, want: false},
+		{name: "so does a lie", value: "0", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("A2A_CAPABILITY_REQUIRED", tc.value)
+			if !tc.set {
+				if err := os.Unsetenv("A2A_CAPABILITY_REQUIRED"); err != nil {
+					t.Fatalf("could not unset: %v", err)
+				}
+			}
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			if cfg.CapabilityOptional != tc.want {
+				t.Errorf("CapabilityOptional = %v, want %v with A2A_CAPABILITY_REQUIRED=%q (set=%v)",
+					cfg.CapabilityOptional, tc.want, tc.value, tc.set)
+			}
+		})
 	}
 }

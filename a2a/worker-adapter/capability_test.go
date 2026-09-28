@@ -149,6 +149,13 @@ func TestASubmissionWithNoCapabilityIsRefusedByDefault(t *testing.T) {
 	const session, taskID = "chat-ibex-cap6", "task-cap-null"
 	submitWithAuthority(t, c, session, taskID, "do the thing", json.RawMessage(`{"grants":null}`))
 
+	// adapterConfig never sets this field, so the check below is the knob's
+	// polarity -- the zero value is the enforcing one -- and not the env
+	// contract, which is pinned over the binary's own mapping by
+	// TestTheWorkerBinaryRequiresACapabilityUnlessExactlyFalse in
+	// a2a/cmd/worker-adapter. What makes the assertion worth keeping here is
+	// that the refusal below is only meaningful if the config it ran under
+	// was the enforcing one.
 	cfg := adapterConfig(url, taskID, session, noHarness)
 	if cfg.CapabilityOptional {
 		t.Fatal("the zero value must be the enforcing one")

@@ -138,41 +138,9 @@ func managedScopeDir() string {
 // logged where it is found and then returned; a missing NATS_URL returns
 // errUsage before anything is dialed.
 func realMain(ctx context.Context, log *slog.Logger) error {
-	url := os.Getenv("NATS_URL")
-	if url == "" {
-		log.Error("NATS_URL is required")
-		return errUsage
-	}
-	cfg := hermesbridge.Config{
-		NATSURL:      url,
-		Profile:      envOr("BRIDGE_PROFILE", defaultProfile),
-		Concurrency:  envInt(log, "BRIDGE_CONCURRENCY", defaultConcurrency),
-		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
-		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
-		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
-		// The activity door (a2a/hermes-bridge/activity.go): on by default;
-		// each child is handed whatever address the door bound.
-		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
-		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
-		ManagedScopeDir:  managedScopeDir(),
-		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
-		Logger:           log,
-		// Unset means required: a submission with no capability is
-		// refused. "false" is the mixed-version window only — a gateway
-		// that predates the mint. It does not switch enforcement off; a
-		// capability that is present is always checked.
-		CapabilityOptional: os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
-	}
-	cfg.Scope = capabilityScope(log)
-	if bin := os.Getenv("HERMES_BIN"); bin != "" {
-		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
-	}
-	if user := os.Getenv("NATS_USER"); user != "" {
-		cfg.NATSOptions = append(cfg.NATSOptions, nats.UserInfo(user, os.Getenv("NATS_PASSWORD")))
-		// Push delivery answers on inbox subjects, and this user may only
-		// subscribe under its own prefix - the CLI default _INBOX.<nuid>
-		// would be refused and every JS API call would time out.
-		cfg.NATSOptions = append(cfg.NATSOptions, nats.CustomInboxPrefix("_INBOX."+user))
+	cfg, err := configFromEnv(log)
+	if err != nil {
+		return err
 	}
 
 	b, err := hermesbridge.New(ctx, cfg)
@@ -214,6 +182,53 @@ func activityListen(v string) string {
 		return ""
 	}
 	return v
+}
+
+// configFromEnv is the whole environment contract in one place, split out of
+// realMain so a test can reach it: realMain's next move is to dial, so every
+// assertion about what the environment maps to had to be made against a
+// Config the test built itself, which is an assertion about the test. The
+// capability switch is the one that matters — see CapabilityOptional below.
+func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
+	url := os.Getenv("NATS_URL")
+	if url == "" {
+		log.Error("NATS_URL is required")
+		return hermesbridge.Config{}, errUsage
+	}
+	cfg := hermesbridge.Config{
+		NATSURL:      url,
+		Profile:      envOr("BRIDGE_PROFILE", defaultProfile),
+		Concurrency:  envInt(log, "BRIDGE_CONCURRENCY", defaultConcurrency),
+		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
+		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
+		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
+		// The activity door (a2a/hermes-bridge/activity.go): on by default;
+		// each child is handed whatever address the door bound.
+		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
+		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
+		ManagedScopeDir:  managedScopeDir(),
+		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
+		Logger:           log,
+		// Unset means required: a submission with no capability is
+		// refused. "false" is the mixed-version window only — a gateway
+		// that predates the mint. It does not switch enforcement off; a
+		// capability that is present is always checked. The comparison
+		// itself is in capability.OptionalFromEnv, under a table test,
+		// because writing it out here is how `!= "true"` gets in.
+		CapabilityOptional: capability.OptionalFromEnv(),
+	}
+	cfg.Scope = capabilityScope(log)
+	if bin := os.Getenv("HERMES_BIN"); bin != "" {
+		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
+	}
+	if user := os.Getenv("NATS_USER"); user != "" {
+		cfg.NATSOptions = append(cfg.NATSOptions, nats.UserInfo(user, os.Getenv("NATS_PASSWORD")))
+		// Push delivery answers on inbox subjects, and this user may only
+		// subscribe under its own prefix - the CLI default _INBOX.<nuid>
+		// would be refused and every JS API call would time out.
+		cfg.NATSOptions = append(cfg.NATSOptions, nats.CustomInboxPrefix("_INBOX."+user))
+	}
+	return cfg, nil
 }
 
 // capabilityScope resolves the scope this executor is checked at. It must be

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -154,5 +155,45 @@ func TestProgressIntervalRefusesAnOverRangeValue(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Errorf("the largest count that fits was logged about:\n%s", buf.String())
+	}
+}
+
+// The capability switch, asserted against the Config this binary actually
+// builds. The test this replaces asserted `(Config{}).CapabilityOptional ==
+// false` -- the zero value of a Go bool, true by language definition for any
+// implementation, including the `!= "true"` one that would turn a default
+// install fail-open. configFromEnv exists so this can be an assertion about
+// the binary instead of about the test's own struct literal.
+func TestTheBridgeBinaryRequiresACapabilityUnlessExactlyFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "a default install sets nothing", set: false, want: false},
+		{name: "empty is not consent", value: "", set: true, want: false},
+		{name: "the rollout window", value: "false", set: true, want: true},
+		{name: "explicitly required", value: "true", set: true, want: false},
+		{name: "a typo enforces", value: "False", set: true, want: false},
+		{name: "so does a lie", value: "0", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NATS_URL", unreachableNATSURL)
+			t.Setenv("A2A_CAPABILITY_REQUIRED", tc.value)
+			if !tc.set {
+				if err := os.Unsetenv("A2A_CAPABILITY_REQUIRED"); err != nil {
+					t.Fatalf("could not unset: %v", err)
+				}
+			}
+			cfg, err := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatalf("configFromEnv: %v", err)
+			}
+			if cfg.CapabilityOptional != tc.want {
+				t.Errorf("CapabilityOptional = %v, want %v with A2A_CAPABILITY_REQUIRED=%q (set=%v)",
+					cfg.CapabilityOptional, tc.want, tc.value, tc.set)
+			}
+		})
 	}
 }

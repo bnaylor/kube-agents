@@ -383,7 +383,7 @@ func FromEnv() (*Config, error) {
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
 		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
-		CapabilityOptional:    os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
+		CapabilityOptional:    capability.OptionalFromEnv(),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)

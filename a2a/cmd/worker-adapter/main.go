@@ -76,38 +76,9 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	taskID := os.Getenv("TASK_ID")
-	profile := os.Getenv("PROFILE")
-	natsURL := os.Getenv("NATS_URL")
-	if taskID == "" || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract)")
+	cfg, ok := configFromEnv(log)
+	if !ok {
 		return 1
-	}
-
-	originSeq, originSeqStated := originSeq(log)
-	cfg := workeradapter.Config{
-		NATSURL:      natsURL,
-		NATSUser:     os.Getenv("NATS_USER"),
-		NATSPassword: os.Getenv("NATS_PASSWORD"),
-		BusTokenFile: busTokenFile(),
-		PodName:      os.Getenv(lib.EnvPodName),
-		TaskID:       taskID,
-		Profile:      profile,
-		Session:      os.Getenv("A2A_SESSION"),
-		Namespace:    os.Getenv("POD_NAMESPACE"),
-		Scope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
-		// Unset means required: a submission with no capability is
-		// refused. "false" is the mixed-version window only — a gateway
-		// that predates the mint. It does not switch enforcement off; a
-		// capability that is present is always checked.
-		CapabilityOptional: os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
-		OriginSeq:          originSeq,
-		OriginSeqStated:    originSeqStated,
-		HarnessCommand:     harnessCommand(),
-		HarnessEnv:         harnessEnv(),
-		TaskDeadline:       envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
-		KillGrace:          envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
-		Logger:             log,
 	}
 
 	// The harness works out of the pod's scratch emptyDir; falling back to
@@ -127,7 +98,7 @@ func run() int {
 
 	res, err := workeradapter.Run(ctx, cfg)
 	if err != nil {
-		log.Error("adapter run failed", "task", taskID, "state", string(res.State), "err", err)
+		log.Error("adapter run failed", "task", cfg.TaskID, "state", string(res.State), "err", err)
 	}
 	switch {
 	case res.Evicted:
@@ -144,6 +115,51 @@ func run() int {
 	default:
 		return 1
 	}
+}
+
+// configFromEnv is the whole environment contract in one place, split out of
+// run so a test can reach it: run's next move is to chdir and dial, so every
+// assertion about what the environment maps to had to be made against a
+// Config the test built itself, which is an assertion about the test. The
+// capability switch is the one that matters — see CapabilityOptional below.
+// The bool is false when the required trio is missing, which run reports as
+// exit 1.
+func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
+	taskID := os.Getenv("TASK_ID")
+	profile := os.Getenv("PROFILE")
+	natsURL := os.Getenv("NATS_URL")
+	if taskID == "" || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract)")
+		return workeradapter.Config{}, false
+	}
+
+	originSeq, originSeqStated := originSeq(log)
+	return workeradapter.Config{
+		NATSURL:      natsURL,
+		NATSUser:     os.Getenv("NATS_USER"),
+		NATSPassword: os.Getenv("NATS_PASSWORD"),
+		BusTokenFile: busTokenFile(),
+		PodName:      os.Getenv(lib.EnvPodName),
+		TaskID:       taskID,
+		Profile:      profile,
+		Session:      os.Getenv("A2A_SESSION"),
+		Namespace:    os.Getenv("POD_NAMESPACE"),
+		Scope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		// Unset means required: a submission with no capability is
+		// refused. "false" is the mixed-version window only — a gateway
+		// that predates the mint. It does not switch enforcement off; a
+		// capability that is present is always checked. The comparison
+		// itself is in capability.OptionalFromEnv, under a table test,
+		// because writing it out here is how `!= "true"` gets in.
+		CapabilityOptional: capability.OptionalFromEnv(),
+		OriginSeq:          originSeq,
+		OriginSeqStated:    originSeqStated,
+		HarnessCommand:     harnessCommand(),
+		HarnessEnv:         harnessEnv(),
+		TaskDeadline:       envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
+		KillGrace:          envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
+		Logger:             log,
+	}, true
 }
 
 // harnessCommand builds the harness argv: the native binary driven over the
