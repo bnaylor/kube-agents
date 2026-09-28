@@ -274,6 +274,12 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			sidecar("hermes-bridge", lit("2"))}}, 2, 28},
 		{"a valueFrom cannot be read here and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", fromRef)}}, 2, 28},
+		// envFrom is not walked, so a sidecar with envFrom and no entry in
+		// env declares nothing here and neither flag is set; the provision
+		// script's NOTE, not the count, is where that shape is reported
+		// (a2aBridgeEnvFromUnread).
+		{"envFrom is not read, so nothing is declared", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			{Name: "hermes-bridge", Image: "bridge:dev", EnvFrom: []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}}}}}}}, 2, 28},
 		{"a non-integer is the default, as envInt makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", lit("six"))}}, 2, 28},
 		{"an empty value is the default, as envInt makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{

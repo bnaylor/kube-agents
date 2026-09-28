@@ -289,10 +289,10 @@ func TestProvisionRefusalNamesTheReserveItSizedFor(t *testing.T) {
 	readStubCalls(t, callLog)
 }
 
-// runProvisionRefusal executes the provision script for agent against a stub
-// bus whose TASKS holds liveConsumers, expecting the exit-2 refusal, and
-// returns what the script wrote to stderr.
-func runProvisionRefusal(t *testing.T, agent *agentv1alpha1.PlatformAgent, liveConsumers int) string {
+// runProvision executes the provision script for agent against a stub bus
+// whose TASKS holds liveConsumers, and returns the exit code and what the
+// script wrote to stderr.
+func runProvision(t *testing.T, agent *agentv1alpha1.PlatformAgent, liveConsumers int) (int, string) {
 	t.Helper()
 	bash, err := exec.LookPath("bash")
 	if err != nil {
@@ -309,13 +309,113 @@ func runProvisionRefusal(t *testing.T, agent *agentv1alpha1.PlatformAgent, liveC
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	cmd.Stdout = &strings.Builder{}
-	runErr := cmd.Run()
-	ee, ok := runErr.(*exec.ExitError)
-	if !ok || ee.ExitCode() != 2 {
-		t.Fatalf("exit %v, want 2\nstderr:\n%s", runErr, stderr.String())
+	code := 0
+	if runErr := cmd.Run(); runErr != nil {
+		ee, ok := runErr.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("running the provision script: %v\nstderr:\n%s", runErr, stderr.String())
+		}
+		code = ee.ExitCode()
 	}
 	readStubCalls(t, callLog)
-	return stderr.String()
+	return code, stderr.String()
+}
+
+// runProvisionRefusal is runProvision expecting the exit-2 refusal.
+func runProvisionRefusal(t *testing.T, agent *agentv1alpha1.PlatformAgent, liveConsumers int) string {
+	t.Helper()
+	code, stderr := runProvision(t, agent, liveConsumers)
+	if code != 2 {
+		t.Fatalf("exit %d, want 2\nstderr:\n%s", code, stderr)
+	}
+	return stderr
+}
+
+// The run that passes says what the budget could not read. A CR whose only
+// BRIDGE_CONCURRENCY is a valueFrom resolves to the default, budgets 58,
+// passes a 64-wide stream, and ran its real worker count on a stream sized
+// for two with nothing in any log to say so: gke-labs#2043's under-sizing,
+// reached with no refusal. A key delivered through envFrom is the same
+// silence from further off -- a2aBridgeConcurrencyValue walks env, so the
+// sidecar looked like no bridge at all. Both print a NOTE on every run, exit
+// 0 included; neither moves a number, and a literal, in env alone or beside
+// an envFrom the kubelet lets it override, prints nothing. Executed, since
+// the run in question is the one that exits 0.
+func TestProvisionSaysWhenABridgeCountWasNotRead(t *testing.T) {
+	fromRef := corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
+		ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"},
+	}}
+	envFrom := []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}}}}
+	sidecar := func(env []corev1.EnvVar, from []corev1.EnvFromSource) *agentv1alpha1.DeploymentSpec {
+		return &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: env, EnvFrom: from}}}
+	}
+	const (
+		readNote    = "NOTE: a spec.deployment.sidecars entry sets BRIDGE_CONCURRENCY to a value this render could not read as a count -"
+		envFromNote = "NOTE: a spec.deployment.sidecars entry carries envFrom and sets no BRIDGE_CONCURRENCY in env. A BRIDGE_CONCURRENCY"
+	)
+	for _, tc := range []struct {
+		name              string
+		deployment        *agentv1alpha1.DeploymentSpec
+		wantEnvFromUnread bool
+		want              []string
+		unwanted          []string
+	}{
+		{"a valueFrom alone is the default, and the run says so", sidecar([]corev1.EnvVar{fromRef}, nil), false,
+			[]string{
+				readNote,
+				// The reference shape with a literal $(NAME), which the
+				// script's double quotes would otherwise substitute.
+				"a valueFrom, a $(NAME) reference to one or to a name no earlier literal in the same entry set, or a value",
+				"that is not a count - and it counted as the bridge's default of 2.",
+				"so the 2 bridge workers this budget is sized for may be fewer than it runs, and TASKS may be",
+				"or a $(NAME) reference to an earlier literal in the same entry.",
+			},
+			[]string{envFromNote}},
+		{"an envFrom with no entry in env may carry the key, and the run says so", sidecar(nil, envFrom), true,
+			[]string{
+				envFromNote,
+				"delivered through envFrom is not read: this render cannot see the keys a ConfigMap or Secret carries, so",
+				"the entry counted as no bridge and added nothing to the 2 bridge workers this budget is sized for.",
+				"read it, set it in env as a literal, which the kubelet lets override envFrom.",
+			},
+			[]string{readNote}},
+		{"a literal in env beside envFrom is the count, and the run says nothing", sidecar([]corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}}, envFrom), false,
+			nil, []string{"NOTE: a spec.deployment.sidecars"}},
+		{"a literal alone says nothing", sidecar([]corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}}, nil), false,
+			nil, []string{"NOTE: a spec.deployment.sidecars"}},
+		{"no sidecar says nothing", nil, false,
+			nil, []string{"NOTE: a spec.deployment.sidecars"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent.Spec.Deployment = tc.deployment
+			if got := a2aBridgeEnvFromUnread(agent); got != tc.wantEnvFromUnread {
+				t.Errorf("a2aBridgeEnvFromUnread = %v, want %v", got, tc.wantEnvFromUnread)
+			}
+			// The numbers do not move: the default install's budget, which
+			// a 64-wide stream holds, so the run below exits 0.
+			if got := a2aTasksConsumerBudget(agent); got != 58 {
+				t.Fatalf("budget = %d, want 58", got)
+			}
+			code, stderr := runProvision(t, agent, 64)
+			if code != 0 {
+				t.Fatalf("exit %d, want 0\nstderr:\n%s", code, stderr)
+			}
+			if strings.Contains(stderr, "TASKS holds max_consumers") {
+				t.Errorf("a 64-wide stream refused a budget of 58:\n%s", stderr)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("stderr does not say %q\ngot:\n%s", want, stderr)
+				}
+			}
+			for _, unwanted := range tc.unwanted {
+				if strings.Contains(stderr, unwanted) {
+					t.Errorf("stderr says %q\ngot:\n%s", unwanted, stderr)
+				}
+			}
+		})
+	}
 }
 
 // The refusal the install in gke-labs#2043 hears: a bus provisioned at 64
@@ -515,20 +615,21 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		deployment *agentv1alpha1.DeploymentSpec
+		sessions   int // 0 is the default maxSessions
 		want       []string
 		unwanted   []string
 	}{
-		{"the default install names maxSessions and two ways out", nil,
+		{"the default install names maxSessions and two ways out", nil, 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 needs (58).",
 				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 64,",
 				"and therefore the maxSessions that fits. The two do not finish the same way. Lowering maxSessions finishes by itself:",
 			},
 			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY", "The three"}},
-		{"the bridge's own default written on the CR reads the same", bridge("2"),
+		{"the bridge's own default written on the CR reads the same", bridge("2"), 0,
 			[]string{"spec.harness.tuning.maxSessions=10 needs (58).", "so the two ways out are"},
 			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY"}},
-		{"the presubmit's four names both inputs and three ways out", bridge("4"),
+		{"the presubmit's four names both inputs and three ways out", bridge("4"), 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 4 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (66; the reserve is 36 at 4 workers and 28 at the bridge's default of 2).",
 				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower BRIDGE_CONCURRENCY, or none for the bridge's default of 2) until it does, or to delete the TASKS stream and let provisioning recreate it at 66,",
@@ -538,7 +639,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns, and the agent workload test-agent-gateway with it",
 			},
 			[]string{"the two ways out", "The two do not finish", "needs (66)", "more than 1024"}},
-		{"a capped count says so", bridge("9223372036854775807"),
+		{"a capped count says so", bridge("9223372036854775807"), 0,
 			[]string{
 				"the 1024 bridge workers the CR declares",
 				"need together (4146;",
@@ -551,7 +652,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		// and a reference, so the message says what the render read and
 		// states the per-entry rule.
 		{"a literal beside a valueFrom is a read, not a declaration, and says the rule", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}},
+			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}}, 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 8 bridge workers " + readClause + " need together (82; the reserve is 52 at 8 workers and 28 at the bridge's default of 2).",
 				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers",
@@ -559,7 +660,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 			},
 			[]string{"the CR declares", "the two ways out", "more than 1024"}},
 		{"two literals are what the CR declares, with no rule to state", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("bridge-a", lit("4")), sidecar("bridge-b", lit("6"))}},
+			sidecar("bridge-a", lit("4")), sidecar("bridge-b", lit("6"))}}, 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 10 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (90; the reserve is 60 at 10 workers and 28 at the bridge's default of 2).",
 				"recreate it at 90,",
@@ -569,24 +670,40 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		// the message has no worker sentence to attribute: it reads as the
 		// default install does, rule and all absent.
 		{"a lone reference to a valueFrom is the default, and the message has no worker sentence", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}},
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, 0,
 			[]string{"spec.harness.tuning.maxSessions=10 needs (58).", "so the two ways out are"},
 			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY", "the render reads", "cannot read", "The three"}},
 		// Capped over a read: the sentence that names the cap follows the
 		// attribution, since 1023 and a reference is not a CR declaring
 		// more than 1024.
 		{"a capped count over a read says the count, not the CR, is past the cap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("bridge-a", lit("1023")), sidecar("bridge-b", fromRef)}},
+			sidecar("bridge-a", lit("1023")), sidecar("bridge-b", fromRef)}}, 0,
 			[]string{
 				"the 1024 bridge workers " + readClause + " need together (4146;",
 				"That count is more than 1024; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct.",
 				"recreate it at 4146,",
 			},
 			[]string{"the CR declares"}},
+		// One worker moved the reserve to 24, so the count is an input
+		// the message names -- "maxSessions=20 needs (84)" would quote a
+		// number maxSessions alone does not produce -- but there is no
+		// lower count to declare, so the lever is not offered and the
+		// ways out stay two.
+		{"one worker is named as an input, with no lower count to offer", bridge("1"), 20,
+			[]string{
+				"spec.harness.tuning.maxSessions=20 and the 1 bridge worker the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (84; the reserve is 24 at 1 worker and 28 at the bridge's default of 2, with no lower count left to declare).",
+				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 84,",
+				"and therefore the maxSessions that fits. The two do not finish the same way.",
+			},
+			[]string{"needs (84)", "fewer workers", "The three", "the worker count, that fits", "1 bridge workers", "at 1 workers"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 			agent.Spec.Deployment = tc.deployment
+			if tc.sessions != 0 {
+				sessions := tc.sessions
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+			}
 			msg := a2aProvisionRefusalStatus(agent)
 			for _, want := range tc.want {
 				if !strings.Contains(msg, want) {

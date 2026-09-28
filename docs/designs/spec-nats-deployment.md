@@ -421,11 +421,17 @@ Layout:
   one, and 2 when no sidecar sets it, and at
   most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
   the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
-  bridge's worker count and the provision Job's refusal quotes the one it used, says when it
-  capped it, says when an entry it could not read as a count took the default in its place -
-  the count is then what the render read, not what the CR declares - and, where the count is
-  above the default, offers fewer workers as the third way
-  out beside a lower `maxSessions` and a deleted stream.
+  bridge's worker count, and each surface says what it read. The provision script's refusal
+  quotes the count it used, the per-entry rule it read it by, and whether it capped it; the
+  `Ready` condition's message on that refusal says, when an entry it could not read as a
+  count took the default in its place, that the count is what the render read, not what the
+  CR declares, and states the rule; and the script prints a `NOTE:` on every run, refused or
+  not, when an entry took the default or a sidecar carries `envFrom` with no entry in `env`
+  (a `BRIDGE_CONCURRENCY` delivered through `envFrom` is not read), since the budget may then
+  be short for the real count with no refusal to say so. Where the count is above the
+  default, both refusal surfaces offer fewer workers as the third way out beside a lower
+  `maxSessions` and a deleted stream; the message attributes the need to the count wherever
+  it moved the reserve, one worker included.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
