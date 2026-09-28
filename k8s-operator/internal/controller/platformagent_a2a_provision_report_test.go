@@ -31,6 +31,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,10 +43,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -228,14 +231,38 @@ func TestTheProvisionScriptSurvivesAFailedTerminationLogWrite(t *testing.T) {
 	}
 }
 
+// assigningUIDsOnCreate gives every object the reconciler creates a UID, the
+// way the API server does and the fake client (controller-runtime v0.25) does
+// not. The report reader selects the Job's pods by controller-uid as well as
+// job-name; with the fake's empty UID on the Job and an empty label on the
+// pods, that half of the selector matched everything and pinned nothing.
+func assigningUIDsOnCreate(funcs interceptor.Funcs) interceptor.Funcs {
+	inner := funcs.Create
+	funcs.Create = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if obj.GetUID() == "" {
+			obj.SetUID(uuid.NewUUID())
+		}
+		if inner != nil {
+			return inner(ctx, cl, obj, opts...)
+		}
+		return cl.Create(ctx, obj, opts...)
+	}
+	return funcs
+}
+
 // provisionJobOf reads the provision Job back as stored, so pods built for
 // it carry the labels the Job controller would give them: the name and the
-// Job's UID, which is what the reader selects on.
+// Job's UID, which is what the reader selects on. A Job with no UID would
+// make the controller-uid half of that selector vacuous, so it is refused
+// here rather than matched by accident.
 func provisionJobOf(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 	t.Helper()
 	job := &batchv1.Job{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}, job); err != nil {
 		t.Fatalf("get provision Job: %v", err)
+	}
+	if job.UID == "" {
+		t.Fatal("precondition: the provision Job has no UID, so the reader's controller-uid selector would match any pod under the name; build the client with assigningUIDsOnCreate")
 	}
 	return job
 }
@@ -281,6 +308,16 @@ func provisionPodRetried(job *batchv1.Job) *corev1.Pod {
 			}},
 		},
 	}
+}
+
+// provisionPodOfAnotherJob is a succeeded pod under the Job's name that a
+// different Job owns: the previous Job of the same digested name, deleted by
+// hand and re-created, whose pods the garbage collector has not reached.
+// It carries message, and the reader must not read it.
+func provisionPodOfAnotherJob(job *batchv1.Job, message string) *corev1.Pod {
+	pod := provisionPodReporting(job, "previous-run", message)
+	pod.Labels[batchv1.ControllerUidLabel] = "some-other-uid"
+	return pod
 }
 
 // drainEvents returns every Event the fake recorder has buffered, without
@@ -483,6 +520,46 @@ func TestTheReportWaitsForThePodAndReportsOnce(t *testing.T) {
 	}
 }
 
+// TestAPodOfAnotherJobUnderTheSameNameIsNotRead pins the controller-uid half
+// of the reader's selector. A Job deleted by hand and re-created under the
+// same digested name shares the namespace with the previous Job's pods until
+// the garbage collector reaches them; one of those, succeeded and carrying a
+// gap report, is not this Job's run. With no pod of its own in the cache the
+// Job takes the waiting path while its completion is fresh (no Event, no
+// stamp) and the vanished-pod path once it is older than the grace (no
+// Event, stamped unreadable); the other Job's report reaches the
+// PlatformAgent's Events on neither.
+func TestAPodOfAnotherJobUnderTheSameNameIsNotRead(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	job := provisionJobOf(t, ctx, cl, agent)
+	if err := cl.Create(ctx, provisionPodOfAnotherJob(job, gapReport())); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileTwice(t, ctx, r, req)
+	if events := drainEvents(rec); len(events) != 0 {
+		t.Fatalf("another Job's pod was read as this Job's run: %d Event(s): %q", len(events), events)
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != "" {
+		t.Fatalf("Job stamp = %q on a fresh completion with none of its own pods in the cache; want no stamp, the pass waits", got)
+	}
+
+	ageTheProvisionJob(t, ctx, cl, agent, 2*a2aProvisionReportGrace)
+	reconcileTwice(t, ctx, r, req)
+	if events := drainEvents(rec); len(events) != 0 {
+		t.Fatalf("another Job's pod was read once the Job's own pod counted as gone: %d Event(s): %q", len(events), events)
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeUnreadable {
+		t.Errorf("Job stamp = %q, want %q: the Job's own pod is gone and the other Job's is not a substitute", got, a2aProvisionReportOutcomeUnreadable)
+	}
+}
+
 // TestAReconcilerWithoutARecorderStillStampsTheJob: tests and the golden
 // harness build the reconciler with no recorder. The pass must not panic,
 // and the stamp still lands so the pod is not re-read forever.
@@ -520,7 +597,7 @@ func ageTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client, age
 func a2aGateTestReconcilerCountingProvisionPodLists(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request, *int) {
 	t.Helper()
 	lists := 0
-	funcs := fakeServerSideApplyInterceptors()
+	funcs := assigningUIDsOnCreate(fakeServerSideApplyInterceptors())
 	funcs.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 		if _, isPods := list.(*corev1.PodList); isPods {
 			lo := &client.ListOptions{}
@@ -617,17 +694,23 @@ func TestAFreshCompletionWithNoPodStillWaits(t *testing.T) {
 }
 
 // TestAFindingWithoutALiveCapIsMalformed: the reader does not fill in a
-// field the pod left out. A tasks_subject_cap finding with no live cap, or
-// with a live cap the script would never write under that key, is not a
-// report: the Job is stamped unreadable, and no Event is recorded, because
-// the only Event the reader could build from it would carry numbers the pod
-// did not send.
+// field the pod left out, and does not quote one the script could not have
+// written. A tasks_subject_cap finding with no live cap, or with a live cap
+// other than the two spellings of no limit the script writes under that key
+// (0 and -1), is not a report: the Job is stamped unreadable, and no Event
+// is recorded, because the only Event the reader could build from it would
+// carry numbers the pod did not send. A message that is JSON null is no
+// report either: the script's clean report is {}, and null decodes to no
+// object at all rather than to an object with nothing in it.
 func TestAFindingWithoutALiveCapIsMalformed(t *testing.T) {
 	for _, tc := range []struct{ name, message string }{
 		{"no fields at all", `{"tasks_subject_cap":{}}`},
 		{"null in the finding's place", `{"tasks_subject_cap":null}`},
+		{"null in the report's place", `null`},
 		{"want but no live", fmt.Sprintf(`{"tasks_subject_cap":{"want":%d}}`, a2aTasksMaxMsgsPerSubject)},
 		{"a positive live cap is a bound, not the gap", fmt.Sprintf(`{"tasks_subject_cap":{"live":8,"want":%d}}`, a2aTasksMaxMsgsPerSubject)},
+		{"a negative live cap other than -1 is nothing nats reports", fmt.Sprintf(`{"tasks_subject_cap":{"live":-7,"want":%d}}`, a2aTasksMaxMsgsPerSubject)},
+		{"the most negative live cap the field can hold", fmt.Sprintf(`{"tasks_subject_cap":{"live":%d}}`, int64(math.MinInt64))},
 		{"a live cap that is not a number", `{"tasks_subject_cap":{"live":"0"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

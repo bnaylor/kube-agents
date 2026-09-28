@@ -186,7 +186,7 @@ func a2aGateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent, ext
 		WithScheme(scheme).
 		WithObjects(append([]client.Object{agent, sandboxKeysSecret(agent), discordBotSecret(agent)}, extra...)...).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		WithInterceptorFuncs(assigningUIDsOnCreate(fakeServerSideApplyInterceptors())).
 		Build()
 	return &PlatformAgentReconciler{Client: cl, Scheme: scheme}, cl,
 		ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}

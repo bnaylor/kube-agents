@@ -430,7 +430,7 @@ const (
 	// this binary's a2aTasksMaxMsgsPerSubject, not a number read off the
 	// pod: a report that could steer the remedy could steer it to 0, which
 	// to nats is no limit at all. Format arguments: Job name, live cap,
-	// rendered cap, rendered cap. tasksSubjectCapWantDiffers is appended
+	// rendered cap, rendered cap. tasksSubjectCapRenderedDiffers is appended
 	// when the pod's report named some other rendered cap, so the difference
 	// is said rather than trusted or hidden; format argument: the pod's
 	// number.
@@ -438,7 +438,7 @@ const (
 	tasksSubjectCapEventMessage  = "provision Job %s found the TASKS stream with max_msgs_per_subject=%d (no per-subject limit); " +
 		"this render creates it at %d and provisioning does not edit an existing stream, so one task's events can still evict another session's history. " +
 		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
-	tasksSubjectCapWantDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
+	tasksSubjectCapRenderedDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
@@ -2491,7 +2491,7 @@ type tasksSubjectCapFinding struct {
 func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 	message := fmt.Sprintf(tasksSubjectCapEventMessage, jobName, f.live, a2aTasksMaxMsgsPerSubject, a2aTasksMaxMsgsPerSubject)
 	if f.hasWant && f.want != int64(a2aTasksMaxMsgsPerSubject) {
-		message += fmt.Sprintf(tasksSubjectCapWantDiffers, f.want)
+		message += fmt.Sprintf(tasksSubjectCapRenderedDiffers, f.want)
 	}
 	return message
 }
@@ -2502,10 +2502,14 @@ func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 // is an error rather than an empty report: the script writes {} when it
 // found nothing, so nothing at all means the script never got to write, and
 // the caller should say so rather than call the install clean. A finding
-// with no live cap, or a live cap the script would not have written under
-// this key (anything positive is a bound, not the gap), is an error too,
-// with the message quoted: the reader does not fill in a field the pod left
-// out, because the field it would fill in steers the remedy.
+// with no live cap, or a live cap other than the two the script writes under
+// this key (0 and -1, the two spellings of no limit; anything positive is a
+// bound, not the gap, and any other negative is nothing nats reports), is an
+// error too, with the message quoted: the reader does not fill in a field
+// the pod left out, because the field it would fill in steers the remedy,
+// and it does not quote a number the script has no way to have written. A
+// bare JSON null is an error and not a clean report: it decodes to no
+// object at all, and the script's clean report is {}.
 func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
 	if strings.TrimSpace(message) == "" {
 		return nil, fmt.Errorf("empty termination message; the provision script wrote no report")
@@ -2516,14 +2520,19 @@ func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
 	}
 	fields, present := report[a2aProvisionReportTasksSubjectCapKey]
 	if !present {
+		if report == nil {
+			// json.Unmarshal reads a bare null into a nil map, which a key
+			// lookup cannot tell from {} on its own.
+			return nil, fmt.Errorf("the provision pod's termination message is JSON null, not a report the script writes")
+		}
 		return nil, nil
 	}
 	live, ok := fields[a2aProvisionReportLiveKey]
 	if !ok {
 		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with no %q field; not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey)
 	}
-	if live > 0 {
-		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with %s=%d, a bound rather than the gap the key names; not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey, live)
+	if live != 0 && live != -1 {
+		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with %s=%d, not the gap the key names (0 or -1); not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey, live)
 	}
 	want, hasWant := fields[a2aProvisionReportWantKey]
 	return &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}, nil
