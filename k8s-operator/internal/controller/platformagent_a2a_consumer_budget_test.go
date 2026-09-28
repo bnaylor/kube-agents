@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/nats-io/nats.go/jetstream"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -113,6 +114,146 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The budget reads the bridge sidecar's BRIDGE_CONCURRENCY. Before it did,
+// an install that declared a bridge at 6 rendered the same 64-wide TASKS as
+// one at 2 and was told the same 28-consumer reserve, while its bridge ran
+// three times the conversations the asks row was sized for (gke-labs#2043).
+// This uses only the budget, the render and the script -- the three things
+// an install sees -- so it runs against a tree without the resolver and
+// fails there on the numbers.
+func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
+	bridge := func(env ...corev1.EnvVar) *agentv1alpha1.DeploymentSpec {
+		return &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: env}}}
+	}
+	lit := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", Value: v} }
+	for _, tc := range []struct {
+		name       string
+		deployment *agentv1alpha1.DeploymentSpec
+		wantBudget int
+		wantRender int
+		wantScript []string
+	}{
+		{"no sidecar is the default install", nil, 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		{"a sidecar that is not a bridge changes nothing", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "fluent-bit", Image: "fb:dev"}}}, 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		{"the bridge's own default written on the CR changes nothing", bridge(lit("2")), 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		{"the presubmit's four clears the floor", bridge(lit("4")), 66, 66,
+			[]string{"required_consumers=66", "--max-consumers=66", "plus 36 reserved", "sized for 4 bridge workers"}},
+		{"the nightly's six", bridge(lit("6")), 74, 74,
+			[]string{"required_consumers=74", "--max-consumers=74", "plus 44 reserved", "sized for 6 bridge workers"}},
+		{"a valueFrom is the default", bridge(corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}), 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		// The valueFrom path pinned by a number a literal-only render cannot
+		// produce: a readable 6 beside an unreadable one is 8, not 6 and not 2.
+		{"a bridge that can be read beside one that cannot counts the default for it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			{Name: "bridge-a", Image: "bridge:dev", Env: []corev1.EnvVar{lit("6")}},
+			{Name: "bridge-b", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}}}}}, 82, 82,
+			[]string{"required_consumers=82", "--max-consumers=82", "plus 52 reserved", "sized for 8 bridge workers"}},
+		{"a non-integer is the default, as the bridge would run it", bridge(lit("six")), 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		{"zero is the default, as the bridge would run it", bridge(lit("0")), 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		{"two bridges bring their own workers", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			{Name: "bridge-a", Image: "bridge:dev", Env: []corev1.EnvVar{lit("4")}},
+			{Name: "bridge-b", Image: "bridge:dev", Env: []corev1.EnvVar{lit("6")}}}}, 90, 90,
+			[]string{"required_consumers=90", "--max-consumers=90", "plus 60 reserved", "sized for 10 bridge workers"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent.Spec.Deployment = tc.deployment
+			if got := a2aTasksConsumerBudget(agent); got != tc.wantBudget {
+				t.Errorf("budget = %d, want %d", got, tc.wantBudget)
+			}
+			if got := a2aTasksMaxConsumers(agent); got != tc.wantRender {
+				t.Errorf("rendered max_consumers = %d, want %d", got, tc.wantRender)
+			}
+			script := a2aProvisionScript(agent)
+			add, ok := streamAddInvocation(script, "TASKS")
+			if !ok {
+				t.Fatal("no `stream add TASKS` in the provision script")
+			}
+			for _, want := range tc.wantScript {
+				if !strings.Contains(script, want) {
+					t.Errorf("the provision script does not contain %q (stream add: %s)", want, add)
+				}
+			}
+		})
+	}
+
+	// The concurrency-dependent term is the only one that moved: the four
+	// fixed rows and the per-session multiplier are the same on every
+	// install, so the difference between two installs is exactly the tail
+	// factor times the asks per worker times the workers.
+	at := func(c string) int {
+		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+		agent.Spec.Deployment = bridge(lit(c))
+		return a2aTasksConsumerBudget(agent)
+	}
+	if d := at("6") - at("2"); d != 16 {
+		t.Errorf("six workers cost %d more than two; the asks row is two replays per worker with a tail of two, so the difference is 2*2*4 = 16", d)
+	}
+}
+
+// The refusal an install with a declared bridge hears is computed from the
+// reserve that install carries. Executed, not read: the `fits` arithmetic
+// and the two messages that quote the reserve come out of the shell, and a
+// script that quoted the default table while checking the derived budget
+// would tell an operator to lower maxSessions to a number that still refuses.
+func TestProvisionRefusalNamesTheReserveItSizedFor(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatalf("bash is required to execute the provision script: %v", err)
+	}
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	sessions := 100
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "6"}},
+	}}}
+
+	dir := t.TempDir()
+	script := stageProvisionScript(t, dir, a2aProvisionScript(agent))
+	callLog := stubNats(t, dir, `{"name":"TASKS","max_consumers":64,"max_msgs_per_subject":4096}`)
+	cmd := exec.Command(bash, script)
+	cmd.Env = append(os.Environ(),
+		"PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"BUS_USER=test-agent-a2a-provision",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	cmd.Stdout = &strings.Builder{}
+	runErr := cmd.Run()
+	ee, ok := runErr.(*exec.ExitError)
+	if !ok || ee.ExitCode() != 2 {
+		t.Fatalf("exit %v, want 2\nstderr:\n%s", runErr, stderr.String())
+	}
+	for _, want := range []string{
+		// 100*3 + (16 + 2*(1+1+12)) = 344, not the 328 the default table gives.
+		"needs 344",
+		"plus 44 reserved for the standing durables, the web rail and tasks/get replays.",
+		"sized for 6 bridge workers",
+		// (64 - 44) / 3 = 6; the default table would have said 12, and a CR
+		// lowered to 12 would be refused again at 36 + 44 = 80.
+		"lower spec.harness.tuning.maxSessions to at most 6 -",
+		"with 44 of them reserved",
+		"recreates TASKS at 344",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr does not name %q\ngot:\n%s", want, stderr.String())
+		}
+	}
+	for _, unwanted := range []string{"plus 28 reserved", "to at most 12", "one session still needs"} {
+		if strings.Contains(stderr.String(), unwanted) {
+			t.Errorf("stderr names %q, the default table's number, on a CR that declared six workers:\n%s", unwanted, stderr.String())
+		}
+	}
+	readStubCalls(t, callLog)
 }
 
 // The rendered flags, so a refactor that drops one is caught without running

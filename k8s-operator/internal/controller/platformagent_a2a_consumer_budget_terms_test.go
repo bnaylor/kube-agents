@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -71,6 +72,18 @@ func TestReservedConsumersIsTheSumOfItsTerms(t *testing.T) {
 		a2aTasksReplayBridgeLookAhead
 	if inFlight != 8 {
 		t.Errorf("replays in flight = %d, the table above a2aTasksReservedConsumers says 8; re-derive the row that moved and the table with it", inFlight)
+	}
+	// The sum is written twice: once as the constants above, which are the
+	// default-install table, and once as a function of the bridge's worker
+	// count, which is what the budget reads for a CR. A row added to one and
+	// not the other -- #2010's look-ahead is the one on the horizon -- fails
+	// here rather than sizing the default install and a declared install
+	// from different tables.
+	if got := a2aTasksReplayConsumersFor(a2aBridgeDefaultConcurrency); got != a2aTasksReplayConsumers {
+		t.Errorf("a2aTasksReplayConsumersFor(%d) = %d, the constant a2aTasksReplayConsumers is %d; the two spellings of the replay sum have a row the other lacks", a2aBridgeDefaultConcurrency, got, a2aTasksReplayConsumers)
+	}
+	if got := a2aTasksReservedConsumersFor(a2aBridgeDefaultConcurrency); got != a2aTasksReservedConsumers {
+		t.Errorf("a2aTasksReservedConsumersFor(%d) = %d, the literal a2aTasksReservedConsumers is %d; the table evaluated at the default is no longer the number", a2aBridgeDefaultConcurrency, got, a2aTasksReservedConsumers)
 	}
 	for name, v := range reserveTerms {
 		if v <= 0 {
@@ -179,6 +192,69 @@ func TestProvisionRefusalMovesWithTheReserve(t *testing.T) {
 	}
 	if a2aTasksConsumerBudget(agent) != sessions*a2aSessionConsumersPerSession+a2aTasksReservedConsumers {
 		t.Errorf("a2aTasksConsumerBudget = %d, want %d*%d + %d", a2aTasksConsumerBudget(agent), sessions, a2aSessionConsumersPerSession, a2aTasksReservedConsumers)
+	}
+}
+
+// a2aBridgeConcurrency reads BRIDGE_CONCURRENCY off spec.deployment.sidecars
+// the way the bridge reads it off its environment, and the comment above the
+// reserve states the rule; this holds the function to each clause of it. The
+// per-worker arithmetic the rule feeds -- 36 at 4, 44 at 6 -- is pinned
+// beside the cases, so a change to a2aTasksReplayAsk or the tail factor that
+// silently moved the reserve a declared install carries fails here.
+func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
+	lit := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", Value: v} }
+	fromRef := corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
+		ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"},
+	}}
+	sidecar := func(name string, env ...corev1.EnvVar) corev1.Container {
+		return corev1.Container{Name: name, Image: name + ":dev", Env: env}
+	}
+	for _, tc := range []struct {
+		name        string
+		deployment  *agentv1alpha1.DeploymentSpec
+		want        int
+		wantReserve int
+	}{
+		{"no deployment block is the default", nil, 2, 28},
+		{"no sidecars is the default", &agentv1alpha1.DeploymentSpec{}, 2, 28},
+		{"a sidecar that does not set it is not a bridge", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("fluent-bit", corev1.EnvVar{Name: "FLB_LOG_LEVEL", Value: "info"})}}, 2, 28},
+		{"a literal is the count", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("6"))}}, 6, 44},
+		{"the presubmit's four", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("4"))}}, 4, 36},
+		{"the default written out is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("2"))}}, 2, 28},
+		{"a valueFrom cannot be read here and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", fromRef)}}, 2, 28},
+		{"a non-integer is the default, as envInt makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("six"))}}, 2, 28},
+		{"an empty value is the default, as envInt makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit(""))}}, 2, 28},
+		{"zero is the default, as Config.defaults makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("0"))}}, 2, 28},
+		{"a negative is the default, as Config.defaults makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("-3"))}}, 2, 28},
+		{"two bridges sum", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("4")), sidecar("fluent-bit"), sidecar("bridge-b", lit("6"))}}, 10, 60},
+		{"a bridge that can be read and one that cannot", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}}, 8, 52},
+		{"the last entry of the name wins within one container", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("3"), corev1.EnvVar{Name: "NATS_URL", Value: "nats://bus:4222"}, lit("5"))}}, 5, 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent.Spec.Deployment = tc.deployment
+			if got := a2aBridgeConcurrency(agent); got != tc.want {
+				t.Errorf("a2aBridgeConcurrency = %d, want %d", got, tc.want)
+			}
+			if got := a2aTasksReserve(agent); got != tc.wantReserve {
+				t.Errorf("a2aTasksReserve = %d, want %d (16 fixed + 2*(1+1+2*%d))", got, tc.wantReserve, tc.want)
+			}
+		})
+	}
+	if a2aBridgeConcurrency(nil) != a2aBridgeDefaultConcurrency {
+		t.Errorf("a2aBridgeConcurrency(nil) = %d, want the default", a2aBridgeConcurrency(nil))
 	}
 }
 

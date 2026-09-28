@@ -386,7 +386,12 @@ that starts before NATS resolves crash-loops the agent's pod), with that image, 
 the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
 and `BRIDGE_CONCURRENCY` set to `EVAL_TASK_PARALLELISM`, sized against the bridge's fixed queue
 as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
-as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The
+as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
+sizes the `TASKS` consumer reserve from that `BRIDGE_CONCURRENCY` too, and provisioning
+never edits a stream that exists, so a bus provisioned before the sidecar is declared holds
+a `TASKS` narrower than the CR then asks for and the second provision Job refuses it,
+parking the CR `Degraded` over a working bus; the deploy does not read the CR's phase after
+the sidecar patch, and sizing the first provision for the sidecar is owed. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
 script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside

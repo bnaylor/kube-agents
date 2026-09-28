@@ -405,14 +405,20 @@ Layout:
   on `TASKS` that bound is no longer the flat 64 but a number derived from
   `spec.harness.tuning.maxSessions`, since a session pod creates three consumers there
   and a stream that cannot hold the configured concurrency refuses a legitimate session.
-  The number is `maxSessions` times three plus a fixed reserve for what is nobody's
+  The number is `maxSessions` times three plus a reserve for what is nobody's
   session, itemized term by named term beside `a2aTasksReservedConsumers` in the
   operator: the two standing durables, headroom for the audit durable, one incarnation's
   overlap, the web rail's readers, and - amended 9/25 - the `tasks/get` replay
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for.
+  between calls are named there as what the term does not size for. Amended 9/28: the
+  replay term scales with the bridge's worker count, which the render reads as
+  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
+  sets it, each read as the bridge reads it, the literal or the bridge's default of 2 for
+  a `valueFrom`, an unparsable value or one below one, and 2 when no sidecar sets it - so
+  the reserve moves with the bridge's worker count and the provision Job's refusal quotes
+  the one it used.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
