@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -74,6 +75,19 @@ const slackRosterPage = 200
 // on the next reply.
 const slackRepliesTimeout = 2 * time.Second
 
+// slackAPITimeout bounds every Web API call the adapter makes through the
+// context-free slack-go methods (PostMessage, UpdateMessage, the roster and
+// DM reads). slack-go's default client has no timeout at all, and the
+// gateway holds a conversation's session lock for as long as a Post or Edit
+// takes, so a black-holed connection to slack.com would otherwise wedge that
+// conversation's worker for the kernel's whole TCP retransmit budget. The
+// siblings are bounded the same way: gchat's relay client carries
+// gchatRelayTimeout, discordgo's carries 20s.
+const slackAPITimeout = 30 * time.Second
+
+// slackHTTPClient is the bounded client NewSlackAdapter hands slack-go.
+func slackHTTPClient() *http.Client { return &http.Client{Timeout: slackAPITimeout} }
+
 const (
 	// slackBackend names the backend in authority blocks and config.
 	slackBackend = "slack"
@@ -95,7 +109,7 @@ const (
 // slackAPI is the slice of the Slack Web API the adapter uses; *slack.Client
 // satisfies it, tests fake it.
 type slackAPI interface {
-	AuthTest() (*slack.AuthTestResponse, error)
+	AuthTestContext(ctx context.Context) (*slack.AuthTestResponse, error)
 	PostMessage(channelID string, options ...slack.MsgOption) (string, string, error)
 	UpdateMessage(channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
 	GetUsersInConversation(params *slack.GetUsersInConversationParameters) ([]string, string, error)
@@ -189,14 +203,25 @@ func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter
 	if !strings.HasPrefix(botToken, slackBotTokenPrefix) || !strings.HasPrefix(appToken, slackAppTokenPrefix) {
 		return nil, fmt.Errorf("slack tokens look wrong: bot tokens start %s, app tokens %s", slackBotTokenPrefix, slackAppTokenPrefix)
 	}
-	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+	return newSlackAdapter(botToken, appToken, log), nil
+}
+
+// newSlackAdapter is NewSlackAdapter past the token check. The extra options
+// are applied after the adapter's own, so a test can point the client at a
+// stub server; production passes none.
+func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack.Option) *SlackAdapter {
+	opts := append([]slack.Option{
+		slack.OptionAppLevelToken(appToken),
+		slack.OptionHTTPClient(slackHTTPClient()),
+	}, extra...)
+	api := slack.New(botToken, opts...)
 	return &SlackAdapter{
 		api:            api,
 		sm:             socketmode.New(api),
 		log:            log,
 		sessionThreads: map[string]bool{},
 		seen:           map[string]bool{},
-	}, nil
+	}
 }
 
 // Run resolves the bot's own identity, consumes Socket Mode events, and
@@ -234,7 +259,11 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// live — must signal it rather than leak it for the process's lifetime.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	auth, err := s.api.AuthTest()
+	// Under ctx, like everything else Run blocks on: this is the one call
+	// made before the pump exists, and a stalled auth.test with no context
+	// would hold Run — and so realMain — past SIGTERM with nothing logged,
+	// until the kubelet's grace period killed the pod.
+	auth, err := s.api.AuthTestContext(ctx)
 	if err != nil {
 		return fmt.Errorf("slack auth.test: %w", err)
 	}

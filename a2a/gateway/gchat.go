@@ -541,9 +541,11 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 		// durable publish would be at-least-once, but the dedupe map is
 		// in-memory, so a redelivery after a slow publish and a restart
 		// becomes a DUPLICATE task — a worse failure than a lost ask,
-		// which a user retries by typing again. It also matches every
-		// other backend's ingress semantics: Discord and Slack websockets
-		// redeliver nothing at all.
+		// which a user retries by typing again. It also matches the other
+		// backends' ingress semantics closely enough: the Discord websocket
+		// redelivers nothing, and Slack's Socket Mode, which does redeliver
+		// unacked envelopes, carries its own in-adapter dedupe ring for
+		// exactly that (slackSeenCap in slack.go).
 		a.settle(env.Receipt)
 		if decodeErr != nil {
 			a.log.Warn("gchat event payload did not parse; acked away",

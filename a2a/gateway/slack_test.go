@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -33,7 +34,7 @@ type fakeSlackAPI struct {
 	repliesCalls int
 }
 
-func (f *fakeSlackAPI) AuthTest() (*slack.AuthTestResponse, error) {
+func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
 	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage"}, nil
 }
 
@@ -83,6 +84,114 @@ func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params
 func newTestSlackAdapter(api *fakeSlackAPI) *SlackAdapter {
 	return &SlackAdapter{api: api, log: slog.Default(), botUserID: "UBOT",
 		sessionThreads: map[string]bool{}, seen: map[string]bool{}}
+}
+
+// stalledSlackStub is a Slack Web API stub that parks every request until
+// unblock is called, then answers invalid_auth (one of the four errors
+// socketmode does not retry). unblock is idempotent and is also registered
+// as a cleanup AHEAD of srv.Close, so a t.Fatal anywhere in the test releases
+// the parked request before Close waits on it. Without that ordering a
+// failing test hung in Close for the package timeout — ten minutes and a
+// "blocked in Close after 5 seconds" line — instead of printing its Fatalf.
+func stalledSlackStub(t *testing.T) (srv *httptest.Server, unblock func()) {
+	t.Helper()
+	release := make(chan struct{})
+	var once sync.Once
+	unblock = func() { once.Do(func() { close(release) }) }
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+	return srv, unblock
+}
+
+// TestSlackWebAPIClientIsBounded: the client NewSlackAdapter hands slack-go
+// carries a timeout. slack-go's default has none, and every context-free
+// call the adapter makes runs under the conversation's session lock.
+func TestSlackWebAPIClientIsBounded(t *testing.T) {
+	c := slackHTTPClient()
+	if c.Timeout <= 0 || c.Timeout > time.Minute {
+		t.Fatalf("slack Web API client timeout = %v, want a bound within a minute", c.Timeout)
+	}
+}
+
+// TestSlackRunAuthTestHonoursCancel: auth.test is the one Web API call Run
+// makes before the pump exists. Against a server that never answers, a
+// cancelled ctx must still bring Run back — that is SIGTERM during a
+// stalled boot, which previously waited on the kubelet to kill the pod.
+func TestSlackRunAuthTestHonoursCancel(t *testing.T) {
+	srv, _ := stalledSlackStub(t)
+	a := newSlackAdapter("xoxb-stub", "xapp-stub", slog.Default(), slack.OptionAPIURL(srv.URL+"/"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(ctx, func(InboundMessage) {}) }()
+
+	select {
+	case err := <-returned:
+		t.Fatalf("Run returned before cancel against a stalled auth.test: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v after cancel, want a context.Canceled-wrapped auth.test error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel: auth.test is not under ctx")
+	}
+}
+
+// TestSlackEmptyPrincipalMapWarnsAtBoot: the boot-time warning for an empty
+// map fires for every backend whose identity join IS the map — Slack as
+// much as Discord — and not for gchat, which never reads it. Nothing renders
+// the Slack map yet, so a Slack gateway with a missing map file is the
+// ordinary case until #2099, and it must not pass boot silently and then
+// drop every sender.
+func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	for _, tc := range []struct {
+		backend string
+		warns   bool
+	}{
+		{slackBackend, true},
+		{discordBackend, true},
+		{gchatBackend, false},
+	} {
+		t.Run(tc.backend, func(t *testing.T) {
+			client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-"+tc.backend), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+			if err != nil {
+				t.Fatalf("gateway client: %v", err)
+			}
+			t.Cleanup(client.Close)
+			logs := &recordingHandler{}
+			cfg := &Config{
+				NATSURL:          url,
+				PrincipalMapPath: filepath.Join(t.TempDir(), "no-such-map"),
+				DefaultAddressee: "platform",
+				IdleTTL:          30 * time.Minute,
+				AttributionSalt:  []byte("test-salt"),
+			}
+			if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: tc.backend, Logger: slog.New(logs)}); err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			lvl, found := logs.level("principal map is empty")
+			if found != tc.warns {
+				t.Fatalf("backend %q: empty-map warning found=%t, want %t", tc.backend, found, tc.warns)
+			}
+			if found && lvl != slog.LevelWarn {
+				t.Fatalf("backend %q: empty-map notice at %v, want WARN", tc.backend, lvl)
+			}
+		})
+	}
 }
 
 // recordingHandler captures log records so a test can assert on the LEVEL a
@@ -597,13 +706,7 @@ func TestToMrkdwnNeutralisesControlSequences(t *testing.T) {
 // own — under -race, only Run's wg.Wait can order that write before this
 // read.
 func TestSlackRunAwaitsPumpGoroutine(t *testing.T) {
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
-	}))
-	defer srv.Close()
+	srv, unblock := stalledSlackStub(t)
 
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	// A real socketmode client, pointed at the stub: its Events channel is
@@ -644,7 +747,7 @@ func TestSlackRunAwaitsPumpGoroutine(t *testing.T) {
 
 	// RunContext can now fail, which sends Run into its deferred cancel and
 	// wait while the handler is still parked.
-	close(release)
+	unblock()
 	select {
 	case err := <-returned:
 		t.Fatalf("Run returned with the pump still in the handler: %v", err)
@@ -680,13 +783,7 @@ func TestSlackRunAwaitsPumpGoroutine(t *testing.T) {
 // since Events is FIFO and the pump is single-threaded, seeing the second turn
 // means the first was already decided.
 func TestSlackPumpDropsATurnItCouldNotAck(t *testing.T) {
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
-	}))
-	defer srv.Close()
+	srv, unblock := stalledSlackStub(t)
 
 	logs := &recordingHandler{}
 	a := newTestSlackAdapter(&fakeSlackAPI{})
@@ -724,7 +821,7 @@ func TestSlackPumpDropsATurnItCouldNotAck(t *testing.T) {
 	}
 
 	cancel()
-	close(release)
+	unblock()
 	select {
 	case <-returned:
 	case <-time.After(10 * time.Second):

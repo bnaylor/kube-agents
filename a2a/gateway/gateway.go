@@ -200,10 +200,13 @@ func New(o Options) (*Gateway, error) {
 			"so nothing but the eval door can reach this install (inject-only)")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
-	// map — an empty map is only a lockout on the backends that use one, and
-	// a gateway whose only ingress is the side door uses the door's map
-	// below instead of this one.
-	if backend == discordBackend && pm.Len() == 0 {
+	// map — an empty map is only a lockout on the backends that use one
+	// (Discord's test table and Slack's user_id join alike), and a gateway
+	// whose only ingress is the side door uses the door's map below instead
+	// of this one. Slack is the case that matters operationally: nothing
+	// renders its map yet (#2099), so a Slack gateway whose map path is
+	// missing would otherwise pass boot silently and drop every sender.
+	if (backend == discordBackend || backend == slackBackend) && pm.Len() == 0 {
 		log.Warn("principal map is empty; every inbound message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
 	}
