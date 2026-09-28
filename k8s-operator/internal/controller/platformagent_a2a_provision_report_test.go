@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,6 +45,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -164,17 +166,16 @@ func TestTheProvisionScriptReportsTheSubjectCapGapOnItsTerminationMessage(t *tes
 			}
 			// And the two ends agree: what the script wrote is what the
 			// reconcile parses.
-			report, err := parseA2AProvisionReport(string(got))
+			finding, err := parseA2AProvisionReport(string(got))
 			if err != nil {
 				t.Fatalf("the reconcile cannot read what the script wrote: %v", err)
 			}
-			finding := report[a2aProvisionReportTasksSubjectCapKey]
 			if tc.liveCap == 0 || tc.liveCap == -1 {
-				if finding == nil || finding[a2aProvisionReportLiveKey] != int64(tc.liveCap) || finding[a2aProvisionReportWantKey] != int64(want) {
-					t.Errorf("parsed finding = %v, want live %d want %d", finding, tc.liveCap, want)
+				if finding == nil || finding.live != int64(tc.liveCap) || !finding.hasWant || finding.want != int64(want) {
+					t.Errorf("parsed finding = %+v, want live %d want %d", finding, tc.liveCap, want)
 				}
 			} else if finding != nil {
-				t.Errorf("a bounded stream parsed as a finding: %v", finding)
+				t.Errorf("a bounded stream parsed as a finding: %+v", finding)
 			}
 		})
 	}
@@ -196,6 +197,34 @@ func TestTheProvisionScriptDoesNotFailWithoutATerminationLog(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "no per-subject limit") {
 		t.Errorf("the NOTE still has to reach the pod log when there is no termination log:\n%s", stderr)
+	}
+}
+
+// TestTheProvisionScriptSurvivesAFailedTerminationLogWrite: the kubelet's
+// file is there and writable by the -w test, and the write itself fails (a
+// full or faulting disk; here, a directory in the file's place, which every
+// platform refuses to write a stream into). Under set -e a bare failed write
+// would exit 1 on a bus the script just finished provisioning, and exit 1
+// matches no podFailurePolicy rule, so the Job would burn its backoff into
+// BackoffLimitExceeded and the CR would read Degraded on a complete bus. The
+// script has to say so on stderr and exit 0; the reconcile then sees no
+// message and stamps the Job unreadable rather than clean.
+func TestTheProvisionScriptSurvivesAFailedTerminationLogWrite(t *testing.T) {
+	agent := a2aTestAgent()
+	dir := t.TempDir()
+	script, reportPath := stageProvisionScriptReportingTo(t, dir, agent)
+	if err := os.Mkdir(reportPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exit, stderr := runProvisionScript(t, dir, script, liveTASKS(agent, 0))
+	if exit != 0 {
+		t.Fatalf("exit %d, want 0: a failed report write is not a failed provision\nstderr:\n%s", exit, stderr)
+	}
+	if !strings.Contains(stderr, "could not write the provision report to the termination log") {
+		t.Errorf("the failed write goes unmentioned on stderr:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "no per-subject limit") {
+		t.Errorf("the NOTE still has to reach the pod log when the termination log cannot be written:\n%s", stderr)
 	}
 }
 
@@ -468,5 +497,204 @@ func TestAReconcilerWithoutARecorderStillStampsTheJob(t *testing.T) {
 	reconcileTwice(t, ctx, r, req)
 	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
 		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+	}
+}
+
+// ageTheProvisionJob moves the provision Job's completion back by age, so a
+// pass reads it as an old completion rather than one the cache may still be
+// catching up with.
+func ageTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent, age time.Duration) {
+	t.Helper()
+	job := provisionJobOf(t, ctx, cl, agent)
+	completed := metav1.NewTime(time.Now().Add(-age))
+	job.Status.CompletionTime = &completed
+	if err := cl.Status().Update(ctx, job); err != nil {
+		t.Fatalf("age provision Job: %v", err)
+	}
+}
+
+// a2aGateTestReconcilerCountingProvisionPodLists is a2aGateTestReconciler
+// with one more interceptor: it counts every List of Pods selected by the
+// Job-name label, which is the read reportA2AProvisionFindings makes and
+// nothing else in Reconcile does.
+func a2aGateTestReconcilerCountingProvisionPodLists(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request, *int) {
+	t.Helper()
+	lists := 0
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if _, isPods := list.(*corev1.PodList); isPods {
+			lo := &client.ListOptions{}
+			lo.ApplyOptions(opts)
+			if lo.LabelSelector != nil && strings.Contains(lo.LabelSelector.String(), batchv1.JobNameLabel) {
+				lists++
+			}
+		}
+		return cl.List(ctx, list, opts...)
+	}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent), discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	return &PlatformAgentReconciler{Client: cl, Scheme: scheme}, cl,
+		ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}, &lists
+}
+
+// TestAJobWhoseSucceededPodIsGoneIsStampedUnreadableOnce: the Job completed
+// and its succeeded pod is no longer there to read (the pod garbage
+// collector after a node scale-down, a Succeeded-pod cleanup, a hand
+// delete). That is not "the cache has not caught up": the Job counted the
+// success and the completion is well past the grace. The run's report is
+// lost, and the pass says so once, stamping the Job unreadable, rather than
+// re-listing the pods and re-logging on every pass for the rest of the
+// Job's 24h TTL. No Event is invented for it.
+func TestAJobWhoseSucceededPodIsGoneIsStampedUnreadableOnce(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req, lists := a2aGateTestReconcilerCountingProvisionPodLists(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	ageTheProvisionJob(t, ctx, cl, agent, 2*a2aProvisionReportGrace)
+	*lists = 0
+
+	reconcileTwice(t, ctx, r, req)
+	if events := drainEvents(rec); len(events) != 0 {
+		t.Fatalf("an Event with no pod to read: %q", events)
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeUnreadable {
+		t.Fatalf("Job stamp = %q, want %q: a Job whose pod is gone has to be stamped, or it is re-read for its whole TTL", got, a2aProvisionReportOutcomeUnreadable)
+	}
+	if *lists != 1 {
+		t.Fatalf("the Job's pods were listed %d times across the passes that saw it complete, want exactly 1", *lists)
+	}
+	// Three more passes over the same stamped Job: no list, no stamp, no Event.
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+3, err)
+		}
+	}
+	if *lists != 1 {
+		t.Fatalf("a stamped Job's pods were listed again (%d lists in all); the stamp is not holding", *lists)
+	}
+	if events := drainEvents(rec); len(events) != 0 {
+		t.Fatalf("a later pass recorded %d Event(s): %q", len(events), events)
+	}
+}
+
+// TestAFreshCompletionWithNoPodStillWaits is the other side of the grace:
+// the Job completed just now, its counted pod is not in the cache yet, and
+// the pass leaves it unstamped for the next one. TestTheReportWaitsForThe-
+// PodAndReportsOnce covers the report that then arrives; this pins that the
+// wait is decided by the completion's age and not by the count alone, so
+// the vanished-pod branch cannot swallow a report the cache was about to
+// deliver.
+func TestAFreshCompletionWithNoPodStillWaits(t *testing.T) {
+	job := &batchv1.Job{}
+	job.Status.Succeeded = 1
+	now := time.Now()
+	fresh := metav1.NewTime(now.Add(-a2aProvisionReportGrace / 2))
+	job.Status.CompletionTime = &fresh
+	if a2aProvisionPodVanished(job, now) {
+		t.Fatal("a completion half a grace old read as a vanished pod")
+	}
+	old := metav1.NewTime(now.Add(-a2aProvisionReportGrace))
+	job.Status.CompletionTime = &old
+	if !a2aProvisionPodVanished(job, now) {
+		t.Fatal("a completion a whole grace old still read as the cache catching up")
+	}
+	job.Status.CompletionTime = nil
+	if !a2aProvisionPodVanished(job, now) {
+		t.Fatal("a counted success with no completion time has nothing to bound the wait on and must read as gone")
+	}
+	job.Status.Succeeded = 0
+	if a2aProvisionPodVanished(job, now) {
+		t.Fatal("a Job that counted no success has no pod to have lost")
+	}
+}
+
+// TestAFindingWithoutALiveCapIsMalformed: the reader does not fill in a
+// field the pod left out. A tasks_subject_cap finding with no live cap, or
+// with a live cap the script would never write under that key, is not a
+// report: the Job is stamped unreadable, and no Event is recorded, because
+// the only Event the reader could build from it would carry numbers the pod
+// did not send.
+func TestAFindingWithoutALiveCapIsMalformed(t *testing.T) {
+	for _, tc := range []struct{ name, message string }{
+		{"no fields at all", `{"tasks_subject_cap":{}}`},
+		{"null in the finding's place", `{"tasks_subject_cap":null}`},
+		{"want but no live", fmt.Sprintf(`{"tasks_subject_cap":{"want":%d}}`, a2aTasksMaxMsgsPerSubject)},
+		{"a positive live cap is a bound, not the gap", fmt.Sprintf(`{"tasks_subject_cap":{"live":8,"want":%d}}`, a2aTasksMaxMsgsPerSubject)},
+		{"a live cap that is not a number", `{"tasks_subject_cap":{"live":"0"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			r, cl, req := a2aGateTestReconciler(t, agent)
+			rec := record.NewFakeRecorder(8)
+			r.Recorder = rec
+			ctx := context.Background()
+			provisionedInstall(t, ctx, cl, r, agent, tc.message)
+			reconcileTwice(t, ctx, r, req)
+			if events := drainEvents(rec); len(events) != 0 {
+				t.Fatalf("a malformed finding recorded %d Event(s): %q", len(events), events)
+			}
+			if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeUnreadable {
+				t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeUnreadable)
+			}
+		})
+	}
+}
+
+// TestTheRemedyCarriesThisRendersCapNotThePods: the nats stream edit in the
+// Event names this binary's a2aTasksMaxMsgsPerSubject whatever the pod's
+// report said the rendered cap was. A finding with no want at all still
+// gets the right remedy (and never --max-msgs-per-subject=0, which to nats
+// is no limit); a finding whose want differs gets the right remedy and a
+// remark naming the pod's number, so the difference is said, not trusted.
+func TestTheRemedyCarriesThisRendersCapNotThePods(t *testing.T) {
+	rendered := fmt.Sprintf("nats stream edit TASKS --max-msgs-per-subject=%d", a2aTasksMaxMsgsPerSubject)
+	for _, tc := range []struct {
+		name, message string
+		wantRemark    string
+	}{
+		{name: "no want at all", message: `{"tasks_subject_cap":{"live":0}}`},
+		{name: "the unlimited sentinel with no want", message: `{"tasks_subject_cap":{"live":-1}}`},
+		{name: "a want of zero", message: `{"tasks_subject_cap":{"live":0,"want":0}}`, wantRemark: "named 0 as the rendered cap"},
+		{name: "some other want", message: `{"tasks_subject_cap":{"live":0,"want":7}}`, wantRemark: "named 7 as the rendered cap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			r, cl, req := a2aGateTestReconciler(t, agent)
+			rec := record.NewFakeRecorder(8)
+			r.Recorder = rec
+			ctx := context.Background()
+			provisionedInstall(t, ctx, cl, r, agent, tc.message)
+			reconcileTwice(t, ctx, r, req)
+			events := drainEvents(rec)
+			if len(events) != 1 {
+				t.Fatalf("got %d Events, want 1: %q", len(events), events)
+			}
+			if strings.Contains(events[0], "--max-msgs-per-subject=0") {
+				t.Fatalf("the Event tells the operator to remove the limit:\n%s", events[0])
+			}
+			if !strings.Contains(events[0], rendered) {
+				t.Errorf("the Event's remedy is not this render's %q:\n%s", rendered, events[0])
+			}
+			if !strings.Contains(events[0], fmt.Sprintf("creates it at %d", a2aTasksMaxMsgsPerSubject)) {
+				t.Errorf("the Event's rendered cap is not this render's:\n%s", events[0])
+			}
+			if tc.wantRemark == "" && strings.Contains(events[0], "as the rendered cap") {
+				t.Errorf("a finding with no want drew a remark about the pod's want:\n%s", events[0])
+			}
+			if tc.wantRemark != "" && !strings.Contains(events[0], tc.wantRemark) {
+				t.Errorf("the Event does not say the pod's want differed (%q):\n%s", tc.wantRemark, events[0])
+			}
+			if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
+				t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+			}
+		})
 	}
 }
