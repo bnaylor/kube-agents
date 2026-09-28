@@ -422,7 +422,9 @@ Layout:
   most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
   the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
   bridge's worker count and the provision Job's refusal quotes the one it used, says when it
-  capped it, and, where the count is above the default, offers fewer workers as the third way
+  capped it, says when an entry it could not read as a count took the default in its place -
+  the count is then what the render read, not what the CR declares - and, where the count is
+  above the default, offers fewer workers as the third way
   out beside a lower `maxSessions` and a deleted stream.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small

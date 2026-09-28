@@ -343,9 +343,19 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			}
 			// The capped flag is what the two refusal surfaces read: set on
 			// exactly the rows the cap decided, whether one literal or the sum.
-			_, capped := a2aBridgeWorkers(agent)
+			_, capped, defaulted := a2aBridgeWorkers(agent)
 			if wantCapped := strings.Contains(tc.name, "past the cap") || strings.Contains(tc.name, "above the cap") || strings.Contains(tc.name, "MaxInt64") || strings.Contains(tc.name, "each at the cap"); capped != wantCapped {
 				t.Errorf("a2aBridgeWorkers capped = %v, want %v", capped, wantCapped)
+			}
+			// The defaulted flag is what the status message reads: set on
+			// exactly the rows where an entry sets the key and took the
+			// default in place of a count it could not read, not on the rows
+			// where the default is the count because nothing sets the key
+			// or the CR wrote the default out.
+			wantDefaulted := strings.Contains(tc.name, "cannot") ||
+				(strings.Contains(tc.name, "is the default") && !strings.HasPrefix(tc.name, "no ") && !strings.Contains(tc.name, "does not set") && !strings.Contains(tc.name, "written out"))
+			if defaulted != wantDefaulted {
+				t.Errorf("a2aBridgeWorkers defaulted = %v, want %v", defaulted, wantDefaulted)
 			}
 		})
 	}

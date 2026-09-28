@@ -501,6 +501,17 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		return &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev",
 			Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: v}}}}}
 	}
+	sidecar := func(name string, env ...corev1.EnvVar) corev1.Container {
+		return corev1.Container{Name: name, Image: name + ":dev", Env: env}
+	}
+	lit := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", Value: v} }
+	fromRef := corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
+		ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"},
+	}}
+	// The clause the message adds only where an entry took the default in
+	// place of a count the render could not read; the script's parenthetical
+	// states the same rule on every render.
+	const readClause = "the render reads from spec.deployment.sidecars (BRIDGE_CONCURRENCY; an entry it cannot read as a count, a valueFrom or a reference to one among them, counts as the bridge's default of 2)"
 	for _, tc := range []struct {
 		name       string
 		deployment *agentv1alpha1.DeploymentSpec
@@ -534,7 +545,44 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 				"The CR declares more than 1024; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct.",
 				"recreate it at 4146,",
 			},
-			[]string{"the two ways out"}},
+			[]string{"the two ways out", readClause, "That count is"}},
+		// The count is attributed to the CR only when the CR declares it. A
+		// literal beside a valueFrom is 6 + the default; the CR declares 6
+		// and a reference, so the message says what the render read and
+		// states the per-entry rule.
+		{"a literal beside a valueFrom is a read, not a declaration, and says the rule", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}},
+			[]string{
+				"spec.harness.tuning.maxSessions=10 and the 8 bridge workers " + readClause + " need together (82; the reserve is 52 at 8 workers and 28 at the bridge's default of 2).",
+				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers",
+				"recreate it at 82,",
+			},
+			[]string{"the CR declares", "the two ways out", "more than 1024"}},
+		{"two literals are what the CR declares, with no rule to state", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("4")), sidecar("bridge-b", lit("6"))}},
+			[]string{
+				"spec.harness.tuning.maxSessions=10 and the 10 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (90; the reserve is 60 at 10 workers and 28 at the bridge's default of 2).",
+				"recreate it at 90,",
+			},
+			[]string{readClause, "the render reads", "cannot read", "That count is"}},
+		// A lone reference to a valueFrom is the default, and at the default
+		// the message has no worker sentence to attribute: it reads as the
+		// default install does, rule and all absent.
+		{"a lone reference to a valueFrom is the default, and the message has no worker sentence", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}},
+			[]string{"spec.harness.tuning.maxSessions=10 needs (58).", "so the two ways out are"},
+			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY", "the render reads", "cannot read", "The three"}},
+		// Capped over a read: the sentence that names the cap follows the
+		// attribution, since 1023 and a reference is not a CR declaring
+		// more than 1024.
+		{"a capped count over a read says the count, not the CR, is past the cap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("1023")), sidecar("bridge-b", fromRef)}},
+			[]string{
+				"the 1024 bridge workers " + readClause + " need together (4146;",
+				"That count is more than 1024; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct.",
+				"recreate it at 4146,",
+			},
+			[]string{"the CR declares"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}

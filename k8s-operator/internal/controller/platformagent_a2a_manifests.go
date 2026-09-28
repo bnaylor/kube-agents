@@ -1956,7 +1956,7 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	maxSessionsN := resolveA2AMaxSessions(agent)
 	maxSessions := strconv.Itoa(maxSessionsN)
 	perSession := strconv.Itoa(a2aSessionConsumersPerSession)
-	bridgeWorkersN, bridgeWorkersCapped := a2aBridgeWorkers(agent)
+	bridgeWorkersN, bridgeWorkersCapped, _ := a2aBridgeWorkers(agent)
 	bridgeWorkers := strconv.Itoa(bridgeWorkersN)
 	bridgeDefault := strconv.Itoa(a2aBridgeDefaultConcurrency)
 	bridgeMax := strconv.Itoa(a2aBridgeConcurrencyMax)
@@ -2521,16 +2521,22 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 // valueFrom or a reference to one, a bridge that leaves the key unset,
 // replicas).
 func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
-	n, _ := a2aBridgeWorkers(agent)
+	n, _, _ := a2aBridgeWorkers(agent)
 	return n
 }
 
-// a2aBridgeWorkers is a2aBridgeConcurrency and whether the count was capped:
-// a literal above a2aBridgeConcurrencyMax, or a sum over sidecars above it,
-// counts as the cap, and the two refusal surfaces say so when it did.
-func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped bool) {
+// a2aBridgeWorkers is a2aBridgeConcurrency and two facts about how the count
+// was read, for the two refusal surfaces to say: capped when a literal above
+// a2aBridgeConcurrencyMax, or a sum over sidecars above it, counted as the
+// cap; defaulted when an entry that sets the key was not one this render
+// could read as a count -- a valueFrom, a reference to one, a value the
+// bridge would not take -- and counted as a2aBridgeDefaultConcurrency in its
+// place, so the count is not what the CR literally declares. Neither flag is
+// set when no sidecar sets the key: the default is then the count, not a
+// stand-in for one.
+func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped, defaulted bool) {
 	if agent == nil || agent.Spec.Deployment == nil {
-		return a2aBridgeDefaultConcurrency, false
+		return a2aBridgeDefaultConcurrency, false, false
 	}
 	total, declared := 0, false
 	for _, c := range agent.Spec.Deployment.Sidecars {
@@ -2539,17 +2545,18 @@ func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped boo
 			continue
 		}
 		declared = true
-		n, over := a2aBridgeConcurrencyOf(value)
+		n, over, fell := a2aBridgeConcurrencyOf(value)
 		total += n
 		capped = capped || over
+		defaulted = defaulted || fell
 	}
 	if !declared {
-		return a2aBridgeDefaultConcurrency, false
+		return a2aBridgeDefaultConcurrency, false, false
 	}
 	if total > a2aBridgeConcurrencyMax {
-		return a2aBridgeConcurrencyMax, true
+		return a2aBridgeConcurrencyMax, true, defaulted
 	}
-	return total, capped
+	return total, capped, defaulted
 }
 
 // a2aBridgeConcurrencyValue is the string the bridge's envInt reads for
@@ -2644,16 +2651,17 @@ func expandEnvReferences(input string, known map[string]string) string {
 // to a valueFrom, whose value is read in the pod -- the default again below
 // one, and a2aBridgeConcurrencyMax above it, reported as capped. A valueFrom
 // itself has no literal to parse and arrives here empty, so it takes the
-// default too.
-func a2aBridgeConcurrencyOf(value string) (count int, capped bool) {
+// default too. Every path to the default reports defaulted, so the status
+// message can say the count is a read and not the CR's declaration.
+func a2aBridgeConcurrencyOf(value string) (count int, capped, defaulted bool) {
 	n, err := strconv.Atoi(value)
 	if err != nil || n <= 0 {
-		return a2aBridgeDefaultConcurrency, false
+		return a2aBridgeDefaultConcurrency, false, true
 	}
 	if n > a2aBridgeConcurrencyMax {
-		return a2aBridgeConcurrencyMax, true
+		return a2aBridgeConcurrencyMax, true, false
 	}
-	return n, false
+	return n, false, false
 }
 
 // a2aTasksReplayConsumersFor is a2aTasksReplayConsumers as a function of the
@@ -2705,22 +2713,34 @@ func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
 // that declares more workers than the bridge's default is told both numbers
 // and offered the lever on the second one -- fewer workers, which re-renders
 // the Job the way a maxSessions edit does -- and told when the count was
-// capped. At the default there is no worker count to lower, and the message
-// reads as it did, with the two ways out. The third number the remedy wants,
-// what the live stream holds, is on the bus and in the pod log.
+// capped. The count is attributed to the CR only when it is the CR's: where
+// an entry took the default because this render could not read it as a count
+// (a valueFrom, a reference to one, a value the bridge would not take), the
+// CR declares something other than the number, so the message says the count
+// is what the render read and states the per-entry rule the script's
+// parenthetical states, in one clause. At the default there is no worker
+// count to lower, and the message reads as it did, with the two ways out.
+// The third number the remedy wants, what the live stream holds, is on the
+// bus and in the pod log.
 func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 	maxSessions := resolveA2AMaxSessions(agent)
-	workers, capped := a2aBridgeWorkers(agent)
+	workers, capped, defaulted := a2aBridgeWorkers(agent)
 	need := fmt.Sprintf("spec.harness.tuning.maxSessions=%d needs (%d)", maxSessions, a2aTasksConsumerBudget(agent))
 	ways := "the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream"
 	fits := "the maxSessions that fits"
 	finish := "The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
 	if workers > a2aBridgeDefaultConcurrency {
-		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge workers the CR declares (%s on spec.deployment.sidecars) need together (%d; the reserve is %d at %d workers and %d at the bridge's default of %d)",
-			maxSessions, workers, a2aBridgeConcurrencyEnvVar, a2aTasksConsumerBudget(agent),
+		source := fmt.Sprintf("the CR declares (%s on spec.deployment.sidecars)", a2aBridgeConcurrencyEnvVar)
+		countIs := "The CR declares"
+		if defaulted {
+			source = fmt.Sprintf("the render reads from spec.deployment.sidecars (%s; an entry it cannot read as a count, a valueFrom or a reference to one among them, counts as the bridge's default of %d)", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
+			countIs = "That count is"
+		}
+		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge workers %s need together (%d; the reserve is %d at %d workers and %d at the bridge's default of %d)",
+			maxSessions, workers, source, a2aTasksConsumerBudget(agent),
 			a2aTasksReserve(agent), workers, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency)
 		if capped {
-			need += fmt.Sprintf(". The CR declares more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", a2aBridgeConcurrencyMax)
+			need += fmt.Sprintf(". %s more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", countIs, a2aBridgeConcurrencyMax)
 		}
 		ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower %s, or none for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
 		fits = "the maxSessions, or the worker count, that fits"
