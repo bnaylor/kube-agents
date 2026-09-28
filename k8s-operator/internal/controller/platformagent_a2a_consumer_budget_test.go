@@ -158,6 +158,17 @@ func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 			{Name: "bridge-b", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
 				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}}}}}, 82, 82,
 			[]string{"required_consumers=82", "--max-consumers=82", "plus 52 reserved", "sized for 8 bridge workers"}},
+		// The kubelet expands $(NAME) against the sidecar's earlier entries
+		// before the bridge reads it: a reference to a literal 6 runs six
+		// workers, and a render that counted the reference as unreadable
+		// would budget 58, create TASKS at 64 and pass the gate.
+		{"a reference to an earlier literal counts what the kubelet expands it to", bridge(corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, lit("$(EVAL_PARALLELISM)")), 74, 74,
+			[]string{"required_consumers=74", "--max-consumers=74", "plus 44 reserved", "sized for 6 bridge workers"}},
+		{"a reference to a later entry is left as written and is the default", bridge(lit("$(EVAL_PARALLELISM)"), corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}), 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
+		{"a reference to a valueFrom is the default", bridge(corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}, lit("$(EVAL_PARALLELISM)")), 58, 64,
+			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
 		{"a non-integer is the default, as the bridge would run it", bridge(lit("six")), 58, 64,
 			[]string{"required_consumers=58", "--max-consumers=64", "plus 28 reserved", "sized for 2 bridge workers"}},
 		{"zero is the default, as the bridge would run it", bridge(lit("0")), 58, 64,
@@ -246,6 +257,11 @@ func TestProvisionRefusalNamesTheReserveItSizedFor(t *testing.T) {
 		"lower spec.harness.tuning.maxSessions to at most 6 -",
 		"with 44 of them reserved",
 		"recreates TASKS at 344",
+		// The parenthetical names the reference shape with a literal $(NAME):
+		// inside the script's double quotes that is a command substitution
+		// unless escaped, and an unescaped one would print an empty string.
+		"a $(NAME) reference to an earlier literal in the same entry is expanded",
+		"a valueFrom or a reference to one; 2 when none sets it",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("stderr does not name %q\ngot:\n%s", want, stderr.String())

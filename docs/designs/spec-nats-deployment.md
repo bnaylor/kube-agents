@@ -415,8 +415,10 @@ Layout:
   between calls are named there as what the term does not size for. Amended 9/28: the
   replay term scales with the bridge's worker count, which the render reads as
   `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
-  sets it, each read as the bridge reads it, the literal or the bridge's default of 2 for
-  a `valueFrom`, an unparsable value or one below one, and 2 when no sidecar sets it, and at
+  sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
+  earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
+  default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below
+  one, and 2 when no sidecar sets it, and at
   most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
   the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
   bridge's worker count and the provision Job's refusal quotes the one it used, says when it

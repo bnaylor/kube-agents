@@ -288,6 +288,34 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}}, 8, 52},
 		{"the last entry of the name wins within one container", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", lit("3"), corev1.EnvVar{Name: "NATS_URL", Value: "nats://bus:4222"}, lit("5"))}}, 5, 40},
+		// The kubelet expands $(NAME) in env[].value against the entries
+		// declared before it, in declaration order, before envInt ever sees
+		// the string, so the count is what the reference resolves to in the
+		// pod. The rows follow expansion.Expand's rules: an unresolvable
+		// reference is left as written, $$ is one $, and the chain resolves
+		// because each earlier entry was expanded when it was declared.
+		{"a reference to an earlier literal is that literal, as the kubelet expands it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, lit("$(EVAL_PARALLELISM)"))}}, 6, 44},
+		{"a reference through an earlier reference resolves in declaration order, as the kubelet does", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_TASK_PARALLELISM", Value: "6"}, corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "$(EVAL_TASK_PARALLELISM)"}, lit("$(EVAL_PARALLELISM)"))}}, 6, 44},
+		{"a self-reference is the earlier entry of the same name", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("4"), lit("$(BRIDGE_CONCURRENCY)"))}}, 4, 36},
+		{"expansion is textual, so two references side by side are their digits", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "TENS", Value: "1"}, corev1.EnvVar{Name: "ONES", Value: "2"}, lit("$(TENS)$(ONES)"))}}, 12, 68},
+		{"a reference to a later entry is left as written and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("$(EVAL_PARALLELISM)"), corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"})}}, 2, 28},
+		{"a reference to a valueFrom cannot be read here and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, 2, 28},
+		{"a reference to a literal a later valueFrom shadows is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, 2, 28},
+		{"a reference to a name no entry declares is left as written and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("$(KUBERNETES_SERVICE_PORT)"))}}, 2, 28},
+		{"$$ is one literal $, so $$(NAME) is not a reference and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, lit("$$(EVAL_PARALLELISM)"))}}, 2, 28},
+		{"an unclosed $( is literal characters and is the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, lit("$(EVAL_PARALLELISM"))}}, 2, 28},
+		{"a reference that resolves above the cap is the cap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "1000000000"}, lit("$(EVAL_PARALLELISM)"))}}, 1024, 4116},
 		// The cap, which the bridge does not have. 20 + 4*1024 = 4116.
 		{"the cap itself is a count", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", lit("1024"))}}, 1024, 4116},

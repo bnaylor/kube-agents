@@ -602,7 +602,11 @@ const (
 	//     contract (a2a/cmd/hermes-bridge/main.go), so it is the one thing a
 	//     bridge that changed its count must have written. A container that
 	//     is not a bridge and sets it is over-counted, which widens.
-	//   - The value is read the way envInt and Config.defaults read it: an
+	//   - The value is read the way envInt and Config.defaults read it once
+	//     the kubelet has handed it over: a $(NAME) reference in the literal
+	//     is expanded against the entries declared before it in the same
+	//     container, in declaration order, as the kubelet expands it before
+	//     the process starts (a2aBridgeConcurrencyValue), and then an
 	//     integer above zero is the count, up to a2aBridgeConcurrencyMax,
 	//     past which it is the cap and the refusal says so; an empty,
 	//     non-integer or non-positive value is a2aBridgeDefaultConcurrency,
@@ -610,7 +614,8 @@ const (
 	//     wide for an int, which envInt cannot parse either. A valueFrom
 	//     cannot be read at render
 	//     time -- the Secret or ConfigMap it names is read in the pod, not
-	//     here -- and counts as the default too, stated in the refusal so an
+	//     here -- and counts as the default too, as does a reference to
+	//     one, stated in the refusal so an
 	//     operator who set it that way knows the budget did not see it. No
 	//     condition is raised for it: the number is a floor the bridge may
 	//     exceed, not a refusal, and the provision script's message is
@@ -1968,7 +1973,8 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// The parenthetical under the reserve: where the worker count came from,
 	// and that it was capped when it was.
 	bridgeNote := `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers: each spec.deployment.sidecars entry" >&2
-  echo "  that sets ` + a2aBridgeConcurrencyEnvVar + ` counts its literal, or ` + bridgeDefault + ` for a value this render cannot read; ` + bridgeDefault + ` when none sets it)." >&2
+  echo "  that sets ` + a2aBridgeConcurrencyEnvVar + ` counts its literal - a \$(NAME) reference to an earlier literal in the same entry is expanded" >&2
+  echo "  as the kubelet expands it - or ` + bridgeDefault + ` for a value this render cannot read, a valueFrom or a reference to one; ` + bridgeDefault + ` when none sets it)." >&2
 `
 	if bridgeWorkersCapped {
 		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: this CR" >&2
@@ -2512,7 +2518,8 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 // the way the bridge reads it, capped at a2aBridgeConcurrencyMax, and
 // a2aBridgeDefaultConcurrency when none does. The comment above
 // a2aTasksReservedConsumers states the rule and what it cannot see (a
-// valueFrom, a bridge that leaves the key unset, replicas).
+// valueFrom or a reference to one, a bridge that leaves the key unset,
+// replicas).
 func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 	n, _ := a2aBridgeWorkers(agent)
 	return n
@@ -2527,17 +2534,12 @@ func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped boo
 	}
 	total, declared := 0, false
 	for _, c := range agent.Spec.Deployment.Sidecars {
-		var last *corev1.EnvVar
-		for i := range c.Env {
-			if c.Env[i].Name == a2aBridgeConcurrencyEnvVar {
-				last = &c.Env[i]
-			}
-		}
-		if last == nil {
+		value, set := a2aBridgeConcurrencyValue(c)
+		if !set {
 			continue
 		}
 		declared = true
-		n, over := a2aBridgeConcurrencyOf(*last)
+		n, over := a2aBridgeConcurrencyOf(value)
 		total += n
 		capped = capped || over
 	}
@@ -2550,18 +2552,101 @@ func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped boo
 	return total, capped
 }
 
-// a2aBridgeConcurrencyOf is envInt (a2a/cmd/hermes-bridge/main.go) and
-// Config.defaults (a2a/hermes-bridge/bridge.go) applied to one env entry,
-// then the cap the bridge does not have: strconv.Atoi on the literal, the
-// default on an empty or unparsable value -- which includes a literal too
-// wide for an int, the one shape past the cap envInt itself refuses -- the
-// default again below one, and a2aBridgeConcurrencyMax above it, reported
-// as capped. A valueFrom has no literal to parse and takes the default.
-func a2aBridgeConcurrencyOf(e corev1.EnvVar) (count int, capped bool) {
-	if e.ValueFrom != nil {
-		return a2aBridgeDefaultConcurrency, false
+// a2aBridgeConcurrencyValue is the string the bridge's envInt reads for
+// BRIDGE_CONCURRENCY in this container, as far as a render can know it, and
+// whether the container sets the key at all. The kubelet does not hand a
+// container its env[].value verbatim: before the process starts it expands
+// each entry's $(NAME) references against the entries declared before it in
+// the same container, in declaration order, so a later entry sees an earlier
+// one's expanded value (corev1.EnvVar.Value's contract, applied by
+// makeEnvironmentVariables in the kubelet). A sidecar declared as
+// EVAL_PARALLELISM=6, BRIDGE_CONCURRENCY=$(EVAL_PARALLELISM) runs six
+// workers; a render that read the literal counted two, budgeted for two and
+// passed the gate on a stream sized for two, with no refusal to say so. So
+// the walk here is the kubelet's: every literal entry is expanded against
+// what came before it and remembered under its name; a valueFrom entry is
+// remembered as unknowable, since its value is read in the pod, so a
+// reference to it -- or to a name an earlier literal set and a later
+// valueFrom shadowed -- is left as written, fails Atoi and takes the default;
+// the last entry of the name is the one that counts, as in the pod. What the
+// kubelet can see and this cannot -- an envFrom key, a service variable -- is
+// likewise left as written and takes the default. Nothing else this render
+// emits changes: the expansion is computed to read this one value, and the
+// sidecar is still copied verbatim.
+func a2aBridgeConcurrencyValue(c corev1.Container) (value string, set bool) {
+	known := map[string]string{}
+	for _, e := range c.Env {
+		if e.ValueFrom != nil {
+			delete(known, e.Name)
+			if e.Name == a2aBridgeConcurrencyEnvVar {
+				value, set = "", true
+			}
+			continue
+		}
+		v := expandEnvReferences(e.Value, known)
+		known[e.Name] = v
+		if e.Name == a2aBridgeConcurrencyEnvVar {
+			value, set = v, true
+		}
 	}
-	n, err := strconv.Atoi(e.Value)
+	return value, set
+}
+
+// expandEnvReferences follows the kubelet's expansion.Expand
+// (k8s.io/kubernetes/third_party/forked/golang/expansion, which this module
+// does not depend on) with its MappingFuncFor over known: $(NAME) becomes
+// known[NAME] when the name is there and is left as written when it is not,
+// $$ becomes $, and a $ followed by anything else -- including an unclosed
+// $( -- is the literal characters. Nothing is chased after substitution:
+// a value known holds was itself expanded when its entry was walked, which
+// is how a reference through a reference resolves in declaration order.
+func expandEnvReferences(input string, known map[string]string) string {
+	var out strings.Builder
+	for i := 0; i < len(input); i++ {
+		if input[i] != '$' || i+1 >= len(input) {
+			out.WriteByte(input[i])
+			continue
+		}
+		switch input[i+1] {
+		case '$':
+			out.WriteByte('$')
+			i++
+		case '(':
+			end := strings.IndexByte(input[i+2:], ')')
+			if end < 0 {
+				out.WriteString("$(")
+				i++
+				continue
+			}
+			name := input[i+2 : i+2+end]
+			if v, ok := known[name]; ok {
+				out.WriteString(v)
+			} else {
+				out.WriteString("$(" + name + ")")
+			}
+			i += 2 + end
+		default:
+			out.WriteByte('$')
+		}
+	}
+	return out.String()
+}
+
+// a2aBridgeConcurrencyOf is envInt (a2a/cmd/hermes-bridge/main.go) and
+// Config.defaults (a2a/hermes-bridge/bridge.go) applied to the value
+// a2aBridgeConcurrencyValue read off one sidecar -- the literal with its
+// $(NAME) references expanded as the kubelet expands them, so a reference to
+// an earlier literal counts what the bridge runs with -- then the cap the
+// bridge does not have: strconv.Atoi on the string, the default on an empty
+// or unparsable one -- which includes a literal too wide for an int, the one
+// shape past the cap envInt itself refuses, and a reference this render could
+// not resolve, left as written: one the kubelet cannot resolve either, or one
+// to a valueFrom, whose value is read in the pod -- the default again below
+// one, and a2aBridgeConcurrencyMax above it, reported as capped. A valueFrom
+// itself has no literal to parse and arrives here empty, so it takes the
+// default too.
+func a2aBridgeConcurrencyOf(value string) (count int, capped bool) {
+	n, err := strconv.Atoi(value)
 	if err != nil || n <= 0 {
 		return a2aBridgeDefaultConcurrency, false
 	}
