@@ -2325,8 +2325,11 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   # podFailurePolicy matches on 2 and fails the Job from the first pod
   # (buildA2AProvisionJob), so a refusal nothing about a re-run can change
   # does not spend the backoffLimit before it is heard. This refusal is in
-  # that class: both numbers are fixed until an operator lowers maxSessions
-  # or recreates the stream, and provisioning does neither. Note that
+  # that class: the budget's two inputs, maxSessions and the bridge's worker
+  # count, and the stream's max_consumers are all fixed until an operator
+  # lowers maxSessions, declares the bridge sidecar with fewer workers where
+  # it declared more than the default, or recreates the stream, and
+  # provisioning does none of those. Note that
   # set -euo pipefail exits with the failing command's own status, which is
   # not 2, so an unexpected failure stays on the retry budget.
   exit 2
@@ -2786,11 +2789,17 @@ func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
 // declared count moved the reserve, below the default as well as above it:
 // one worker is a reserve of 24, not 28, and a message that named
 // maxSessions alone over that number would be quoting an input it did not
-// name. The lever goes out only above the default, since one worker has no
-// lower count beneath it, and the message says so in the clause instead. At
-// the default there is no worker sentence, and the message reads as it did,
-// with the two ways out. The third number the remedy wants, what the live
-// stream holds, is on the bus and in the pod log.
+// name. The read clause goes out whenever an entry took the default, the
+// count it summed to included: a CR whose only entry is a valueFrom resolves
+// to the default and is told that the count is what the render read, since
+// the sidecar may be running more than the budget was sized for, and the
+// reserve is stated once, as the default's, rather than against itself. The
+// lever goes out only above the default, since one worker has no lower
+// count beneath it, and the message says so in the clause instead. At the
+// default the CR declared -- a literal 2, or no entry -- there is no worker
+// sentence, and the message reads as it did, with the two ways out. The
+// third number the remedy wants, what the live stream holds, is on the bus
+// and in the pod log.
 func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 	maxSessions := resolveA2AMaxSessions(agent)
 	workers, capped, defaulted := a2aBridgeWorkers(agent)
@@ -2798,7 +2807,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 	ways := "the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream"
 	fits := "the maxSessions that fits"
 	finish := "The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
-	if workers != a2aBridgeDefaultConcurrency {
+	if workers != a2aBridgeDefaultConcurrency || defaulted {
 		source := fmt.Sprintf("the CR declares (%s on spec.deployment.sidecars)", a2aBridgeConcurrencyEnvVar)
 		countIs := "The CR declares"
 		if defaulted {
@@ -2809,9 +2818,12 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		if workers == 1 {
 			noun, noLower = "worker", ", with no lower count left to declare"
 		}
-		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; the reserve is %d at %d %s and %d at the bridge's default of %d%s)",
-			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent),
-			a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency, noLower)
+		reserve := fmt.Sprintf("the reserve is %d at %d %s and %d at the bridge's default of %d%s", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency, noLower)
+		if workers == a2aBridgeDefaultConcurrency {
+			reserve = fmt.Sprintf("the reserve is %d at %d %s, the bridge's default", a2aTasksReserve(agent), workers, noun)
+		}
+		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; %s)",
+			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
 		if capped {
 			need += fmt.Sprintf(". %s more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", countIs, a2aBridgeConcurrencyMax)
 		}

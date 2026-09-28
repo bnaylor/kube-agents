@@ -123,9 +123,11 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 // an install that declared a bridge at 6 rendered the same 64-wide TASKS as
 // one at 2 and was told the same 28-consumer reserve, while its bridge ran
 // three times the conversations the asks row was sized for (gke-labs#2043).
-// This uses only the budget, the render and the script -- the three things
-// an install sees -- so it runs against a tree without the resolver and
-// fails there on the numbers.
+// This asserts only through the budget, the render and the script -- the
+// three things an install sees. A tree without the resolver produces 58, 64
+// and a 28-consumer reserve on every shape below; the rows that declare a
+// count expect other numbers, which is what pins that the resolver reads
+// it, and the rows that do not pin that it reads nothing else.
 func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 	bridge := func(env ...corev1.EnvVar) *agentv1alpha1.DeploymentSpec {
 		return &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: env}}}
@@ -666,13 +668,20 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 				"recreate it at 90,",
 			},
 			[]string{readClause, "the render reads", "cannot read", "That count is"}},
-		// A lone reference to a valueFrom is the default, and at the default
-		// the message has no worker sentence to attribute: it reads as the
-		// default install does, rule and all absent.
-		{"a lone reference to a valueFrom is the default, and the message has no worker sentence", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+		// A lone reference to a valueFrom is the default, and the message
+		// still says the count is what the render read and states the rule:
+		// the sidecar may run more workers than the budget was sized for,
+		// which is what the clause is for. The reserve is stated once, as
+		// the default's, and the ways out stay two, there being no lower
+		// count to offer at the default.
+		{"a lone reference to a valueFrom is the default, and the message still states the read rule", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, 0,
-			[]string{"spec.harness.tuning.maxSessions=10 needs (58).", "so the two ways out are"},
-			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY", "the render reads", "cannot read", "The three"}},
+			[]string{
+				"spec.harness.tuning.maxSessions=10 and the 2 bridge workers " + readClause + " need together (58; the reserve is 28 at 2 workers, the bridge's default).",
+				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 64,",
+				"and therefore the maxSessions that fits. The two do not finish the same way.",
+			},
+			[]string{"needs (58)", "the CR declares", "fewer workers", "The three", "and 28 at the bridge's default of 2", "That count is"}},
 		// Capped over a read: the sentence that names the cap follows the
 		// attribution, since 1023 and a reference is not a CR declaring
 		// more than 1024.
