@@ -384,6 +384,45 @@ const (
 	busProvisionedConditionType = "BusProvisioned"
 	busProvisionedReason        = "ProvisionJobComplete"
 
+	// The provision script's closing block reads the live TASKS stream back
+	// and reports what a create-only run could not apply. Its stderr NOTE is
+	// for whoever reads the pod log; the same finding also goes out as one
+	// line of JSON on the container's termination message, at the kubelet's
+	// default path, which reportA2AProvisionFindings reads back off the
+	// Job's succeeded pod and records as an Event on the PlatformAgent. That
+	// is how the finding outlives the 24h TTL that takes the log. The JSON is
+	// an object keyed by finding; an empty object is the script saying it
+	// looked and found nothing, which is not the same as no message at all.
+	// The script gets the keys from these constants, so the two ends cannot
+	// drift.
+	a2aProvisionTerminationLogPath       = "/dev/termination-log"
+	a2aProvisionReportTasksSubjectCapKey = "tasks_subject_cap"
+	a2aProvisionReportLiveKey            = "live"
+	a2aProvisionReportWantKey            = "want"
+	// a2aProvisionContainerName is the Job pod's one container, named because
+	// the report reader looks its termination state up by name.
+	a2aProvisionContainerName = "provision"
+	// a2aProvisionReportAnnotation is stamped on the provision Job once its
+	// report has been read, so the Event fires once per Job run and not on
+	// every pass that sees the same completed Job; the value says what was
+	// done with the report. The Job is the right holder: its TTL removes it
+	// and create-if-absent runs the script again under the same name, and
+	// that fresh run gets a fresh stamp, so an unfixed gap is reported once
+	// per run rather than once per install.
+	a2aProvisionReportAnnotation        = "kubeagents.x-k8s.io/a2a-provision-report"
+	a2aProvisionReportOutcomeReported   = "reported"
+	a2aProvisionReportOutcomeClean      = "clean"
+	a2aProvisionReportOutcomeUnreadable = "unreadable"
+	// reasonTasksSubjectCapMissing is the Warning Event's reason when the live
+	// TASKS stream carries no per-subject cap; tasksSubjectCapEventMessage is
+	// its message: the Job that found it, the live and rendered caps, and the
+	// one edit that closes it with what the edit costs. Format arguments: Job
+	// name, live cap, rendered cap, rendered cap.
+	reasonTasksSubjectCapMissing = "TasksSubjectCapMissing"
+	tasksSubjectCapEventMessage  = "provision Job %s found the TASKS stream with max_msgs_per_subject=%d (no per-subject limit); " +
+		"this render creates it at %d and provisioning does not edit an existing stream, so one task's events can still evict another session's history. " +
+		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
+
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
 	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
@@ -2045,7 +2084,15 @@ fi
 # finite cap is bounded already, and telling the operator who chose it that
 # their stream "predates the limit" is telling them something false about their
 # own install.
+#
+# report is the same finding for the operator, as one line of JSON written
+# to the container's termination message below: the pod log goes with the
+# Job's TTL, and the reconcile reads this off the pod and records it as an
+# Event on the PlatformAgent (reportA2AProvisionFindings). An empty object
+# says the check ran and found nothing.
+report='{}'
 if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
+  report="{\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}}"
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
   echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
   echo "  an operator applies it one task's events can still evict another session's history." >&2
@@ -2060,6 +2107,13 @@ elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `
   echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+fi
+# Written only where the kubelet has mounted the file: outside a pod there is
+# nothing to write to, and a copy of a report is not a reason to fail a fully
+# provisioned bus. A pod that somehow has no file leaves no message, and the
+# reconcile logs that rather than reading it as clean.
+if [ -w "` + a2aProvisionTerminationLogPath + `" ]; then
+  printf '%s' "${report}" > "` + a2aProvisionTerminationLogPath + `"
 fi
 
 required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
@@ -2242,7 +2296,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
 					Containers: []corev1.Container{{
-						Name:            "provision",
+						Name:            a2aProvisionContainerName,
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
@@ -2318,6 +2372,109 @@ func a2aProvisionJobName(agent *agentv1alpha1.PlatformAgent, spec batchv1.JobSpe
 	rendered, _ := json.Marshal(spec)
 	sum := sha256.Sum256(rendered)
 	return agent.Name + a2aProvisionJobNameInfix + hex.EncodeToString(sum[:])[:a2aProvisionJobNameHashLength]
+}
+
+// reportA2AProvisionFindings turns what the provision script found about the
+// live bus into an Event on the PlatformAgent, once per Job run. The script
+// leaves its findings as one line of JSON on its container's termination
+// message (the closing block of a2aProvisionScript); this reads it off the
+// Job's succeeded pod on the first pass that sees the Job complete, records
+// an Event for each finding it knows, and stamps the Job so no later pass
+// over the same completed Job repeats it. A Job the TTL removes and
+// create-if-absent runs again is a new run with no stamp, which is how an
+// unfixed gap is reported roughly daily rather than once and never again.
+//
+// An Event and not a condition, on the line drawn at the Recorder field: the
+// gap is a fact about the live stream that a Job discovered, not a state this
+// reconcile converges on or could re-derive without running the Job.
+//
+// Best effort throughout, because nothing here changes what the render did
+// or what the phase says. A report the operator cannot deliver is logged; the
+// Job is left unstamped where a retry can still deliver it (a pod the cache
+// has not caught up with) and stamped where it cannot (a message the script
+// did not write). The pods come from the cache, which already watches them
+// for the agent pod's status, so a retry costs no API call; the Job itself
+// came through a2aReader, so the stamp is read back live on the next pass.
+func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job) {
+	if job.Annotations[a2aProvisionReportAnnotation] != "" {
+		return
+	}
+	log := logf.FromContext(ctx).WithValues("job", job.Name)
+	// By the Job's UID as well as its name, the selector the Job controller
+	// itself uses: a Job deleted by hand and re-created under the same
+	// digested name can share the namespace with the previous Job's pods
+	// until the garbage collector reaches them, and a report read off one
+	// of those would be the previous run's.
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
+		batchv1.JobNameLabel:       job.Name,
+		batchv1.ControllerUidLabel: string(job.UID),
+	}); err != nil {
+		log.Error(err, "could not list the A2A provision Job's pods; its report waits for the next pass")
+		return
+	}
+	message, found := a2aProvisionTerminationMessage(pods.Items)
+	if !found {
+		log.Info("the A2A provision Job is complete but none of its pods reads succeeded yet; its report waits for the next pass")
+		return
+	}
+	outcome := a2aProvisionReportOutcomeClean
+	report, err := parseA2AProvisionReport(message)
+	switch {
+	case err != nil:
+		log.Error(err, "the A2A provision pod's termination message is not a report; nothing from this Job run reaches the PlatformAgent's Events")
+		outcome = a2aProvisionReportOutcomeUnreadable
+	case report[a2aProvisionReportTasksSubjectCapKey] != nil:
+		finding := report[a2aProvisionReportTasksSubjectCapKey]
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonTasksSubjectCapMissing,
+			fmt.Sprintf(tasksSubjectCapEventMessage, job.Name,
+				finding[a2aProvisionReportLiveKey], finding[a2aProvisionReportWantKey], finding[a2aProvisionReportWantKey]))
+		outcome = a2aProvisionReportOutcomeReported
+	}
+	patch := client.MergeFrom(job.DeepCopy())
+	if job.Annotations == nil {
+		job.Annotations = map[string]string{}
+	}
+	job.Annotations[a2aProvisionReportAnnotation] = outcome
+	if err := r.Patch(ctx, job, patch); err != nil {
+		log.Error(err, "could not stamp the A2A provision Job as reported; the next pass reports it again")
+	}
+}
+
+// a2aProvisionReport is the shape of the script's termination message: an
+// object keyed by finding, each finding an object of integer fields. The
+// script writes {} when it found nothing.
+type a2aProvisionReport map[string]map[string]int64
+
+// parseA2AProvisionReport reads the termination message. An empty message is
+// an error rather than an empty report: the script writes {} when it found
+// nothing, so nothing at all means the script never got to write, and the
+// caller should say so rather than call the install clean.
+func parseA2AProvisionReport(message string) (a2aProvisionReport, error) {
+	if strings.TrimSpace(message) == "" {
+		return nil, fmt.Errorf("empty termination message; the provision script wrote no report")
+	}
+	report := a2aProvisionReport{}
+	if err := json.Unmarshal([]byte(message), &report); err != nil {
+		return nil, fmt.Errorf("parsing the provision pod's termination message %q: %w", message, err)
+	}
+	return report, nil
+}
+
+// a2aProvisionTerminationMessage finds the message the script left on the pod
+// that completed the Job: the one whose provision container terminated with
+// exit 0. A Job's earlier pods (a retry after NATS was not yet answering) are
+// not the run that completed it, and are skipped.
+func a2aProvisionTerminationMessage(pods []corev1.Pod) (string, bool) {
+	for i := range pods {
+		for _, cs := range pods[i].Status.ContainerStatuses {
+			if cs.Name != a2aProvisionContainerName || cs.State.Terminated == nil || cs.State.Terminated.ExitCode != 0 {
+				continue
+			}
+			return cs.State.Terminated.Message, true
+		}
+	}
+	return "", false
 }
 
 // defaultA2AMaxSessions is spec.harness.tuning.maxSessions when unset; the
@@ -3109,6 +3266,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			switch cond.Type {
 			case batchv1.JobComplete:
 				state.done = true
+				r.reportA2AProvisionFindings(ctx, agent, existing)
 			case batchv1.JobFailed:
 				state.failed = true
 				// This is the only place a provision refusal reaches

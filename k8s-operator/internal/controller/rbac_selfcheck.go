@@ -134,7 +134,11 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
-	{Group: "", Resources: []string{"namespaces", "nodes", "events", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
+	{Group: "", Resources: []string{"namespaces", "nodes", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
+	// events: read with the rest, plus create and patch for the Recorder's
+	// Events on the PlatformAgent. On an install whose ClusterRole predates
+	// the recorder this is the shortfall the self-check names.
+	{Group: "", Resources: []string{"events"}, Verbs: []string{"get", "list", "watch", "create", "patch"}},
 	// resourcequotas: the mode-next session-pod bound is rendered and removed
 	// by the operator, so this one is write rather than read.
 	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},
