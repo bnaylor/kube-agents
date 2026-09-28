@@ -29,6 +29,7 @@ import (
 const (
 	a2aManifestsSource  = "platformagent_a2a_manifests.go"
 	a2aBridgeMainSource = "../../../a2a/cmd/hermes-bridge/main.go"
+	a2aBridgeSource     = "../../../a2a/hermes-bridge/bridge.go"
 )
 
 // reserveTableRow matches one row of the two tables above the reserve whose
@@ -171,6 +172,52 @@ func TestBridgeConcurrencyMatchesTheA2AModule(t *testing.T) {
 	}
 }
 
+// a2aBridgeConcurrencyMax is the bridge's taskQueueCapacity, the queue behind
+// its workers and the ceiling hack/ci-deploy.sh puts on the concurrency it
+// writes; the bridge itself caps nothing (envInt takes any int, Config.defaults
+// rewrites only a count below one), so this is the one number of the bridge's
+// own that bounds its worker count. Read from the source, for the reason the
+// SessionConsumerRoles test gives, and every step fails rather than defaults.
+func TestBridgeConcurrencyMaxMatchesTheBridgeQueue(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, a2aBridgeSource, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v (if the bridge package moved, this test's path must move with it; it is what keeps a2aBridgeConcurrencyMax honest)", a2aBridgeSource, err)
+	}
+	var lit *ast.BasicLit
+	ast.Inspect(f, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, name := range spec.Names {
+			if name.Name != "taskQueueCapacity" || i >= len(spec.Values) {
+				continue
+			}
+			if l, ok := spec.Values[i].(*ast.BasicLit); ok && l.Kind == token.INT {
+				lit = l
+			}
+		}
+		return true
+	})
+	if lit == nil {
+		t.Fatalf("no `taskQueueCapacity = <int>` in %s; it is what a2aBridgeConcurrencyMax mirrors", a2aBridgeSource)
+	}
+	got, err := strconv.Atoi(lit.Value)
+	if err != nil {
+		t.Fatalf("taskQueueCapacity in %s is %q, not an integer", a2aBridgeSource, lit.Value)
+	}
+	if got != a2aBridgeConcurrencyMax {
+		t.Errorf("the bridge's taskQueueCapacity is %d, a2aBridgeConcurrencyMax says %d: the budget caps the worker count at a number that is no longer the bridge's queue", got, a2aBridgeConcurrencyMax)
+	}
+	// The reason the cap exists, held as arithmetic: at both API ceilings the
+	// budget is a small number, and the reserve at the cap is above the
+	// default's, so nothing downstream of a2aBridgeConcurrency can wrap.
+	if atCap := a2aTasksReservedConsumersFor(a2aBridgeConcurrencyMax); atCap <= a2aTasksReservedConsumers || atCap > 10000 {
+		t.Errorf("reserve at the cap = %d; it should sit above the default's %d and well under any int", atCap, a2aTasksReservedConsumers)
+	}
+}
+
 // The provision script's refusal is the reserve's other reader: it quotes the
 // number, computes the maxSessions that still fits from it, and names what
 // the reserve is for. All three move with the constant, or the operator is
@@ -241,6 +288,21 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}}, 8, 52},
 		{"the last entry of the name wins within one container", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", lit("3"), corev1.EnvVar{Name: "NATS_URL", Value: "nats://bus:4222"}, lit("5"))}}, 5, 40},
+		// The cap, which the bridge does not have. 20 + 4*1024 = 4116.
+		{"the cap itself is a count", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("1024"))}}, 1024, 4116},
+		{"a literal above the cap is the cap, not the default", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("1000000000"))}}, 1024, 4116},
+		{"MaxInt64 is the cap and the reserve does not wrap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("9223372036854775807"))}}, 1024, 4116},
+		{"two sidecars whose literals sum past the cap are the cap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("1000")), sidecar("bridge-b", lit("1000"))}}, 1024, 4116},
+		{"two sidecars each at the cap are the cap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("bridge-a", lit("9223372036854775807")), sidecar("bridge-b", lit("9223372036854775807"))}}, 1024, 4116},
+		// Past int64 envInt cannot parse it and the bridge runs the default,
+		// so the default is the count that mirrors the bridge, not the cap.
+		{"a literal too wide for an int is the default, as envInt makes it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("hermes-bridge", lit("99999999999999999999"))}}, 2, 28},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -250,6 +312,12 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			}
 			if got := a2aTasksReserve(agent); got != tc.wantReserve {
 				t.Errorf("a2aTasksReserve = %d, want %d (16 fixed + 2*(1+1+2*%d))", got, tc.wantReserve, tc.want)
+			}
+			// The capped flag is what the two refusal surfaces read: set on
+			// exactly the rows the cap decided, whether one literal or the sum.
+			_, capped := a2aBridgeWorkers(agent)
+			if wantCapped := strings.Contains(tc.name, "past the cap") || strings.Contains(tc.name, "above the cap") || strings.Contains(tc.name, "MaxInt64") || strings.Contains(tc.name, "each at the cap"); capped != wantCapped {
+				t.Errorf("a2aBridgeWorkers capped = %v, want %v", capped, wantCapped)
 			}
 		})
 	}

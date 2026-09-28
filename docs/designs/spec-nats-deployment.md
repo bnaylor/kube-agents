@@ -416,9 +416,12 @@ Layout:
   replay term scales with the bridge's worker count, which the render reads as
   `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
   sets it, each read as the bridge reads it, the literal or the bridge's default of 2 for
-  a `valueFrom`, an unparsable value or one below one, and 2 when no sidecar sets it - so
-  the reserve moves with the bridge's worker count and the provision Job's refusal quotes
-  the one it used.
+  a `valueFrom`, an unparsable value or one below one, and 2 when no sidecar sets it, and at
+  most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
+  the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
+  bridge's worker count and the provision Job's refusal quotes the one it used, says when it
+  capped it, and, where the count is above the default, offers fewer workers as the third way
+  out beside a lower `maxSessions` and a deleted stream.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
