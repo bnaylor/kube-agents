@@ -1243,7 +1243,8 @@ func slackCancelledPumpRun(apiURL, envelopeID, ts string, logs *recordingHandler
 const slackCancelledPumpRuns = 50
 
 // TestSlackPumpStartsNoTurnOnACancelledContext is the shutdown-race guard —
-// what 9239f5df set out to do and did only about half the time.
+// what the first shutdown fix in this branch set out to do and did only about
+// half the time.
 //
 // The trap: AckCtx returning nil never meant Slack has the ack. It means the
 // response was QUEUED. SendCtx races ctx.Done against a send into the 20-deep
