@@ -264,30 +264,47 @@ type ProbeSink interface {
 }
 
 // SessionLookup answers whether the gateway has started a task in a
-// conversation -- not merely whether a session record exists, since one is
-// minted for any verified turn, including a "stop" with nothing running. It
-// is a PURE READ of the session registry, like ConversationProbe: no lock,
-// no heal, no post, no write, one KV read.
+// conversation and the session is not idle past the idle TTL. A running
+// task counts regardless of age: the conversation is a session for as long
+// as the task runs. Otherwise it is one only while its record shows
+// activity within the TTL.
+//
+// A record alone is not the answer, in either direction. One is minted for
+// any verified turn, including a "stop" with nothing running, so its
+// existence does not say a task started; and the reap keeps the record --
+// it deletes the idle session's pod and leaves the record, past tasks
+// included, and nothing deletes records at all -- so its existence does not
+// say the session is live either. The lookup reads the two facts the record
+// does carry, the active task and the last activity, and answers from
+// those.
+//
+// It is a PURE READ of the session registry, like ConversationProbe: no
+// lock, no heal, no post, no write, one KV read.
 //
 // It exists because an adapter can be asked whether a conversation is one
-// the gateway is in before it has been told so on this process. The Slack
-// adapter's session-thread cache is process memory: a thread the gateway
-// adopted mid-conversation -- a verified sender's mentioned ask in someone
-// else's thread, whose root never mentions the bot -- is forgotten on a
-// restart or a cache eviction, and its unmentioned follow-ups ("stop") would
-// be dropped against a root read that cannot know better. The registry is
-// the source of truth for which conversations the gateway is in, so a cold
-// cache asks it first.
+// the gateway is in before it has been told so on this process, or after it
+// has stopped being one. The Slack adapter's session-thread cache is process
+// memory: a thread the gateway adopted mid-conversation -- a verified
+// sender's mentioned ask in someone else's thread -- is forgotten on a
+// restart or a cache eviction, and its unmentioned follow-ups ("stop") have
+// no other source to be recognised from. The registry is the source of
+// truth for which conversations the gateway is in, so a cold cache asks it
+// first, and a positive entry that has aged past the TTL asks it again.
+//
+// The TTL is handed over beside the lookup (SessionLookupSink) so that the
+// adapter can expire its own positive cache on the same bound the lookup
+// answers by, rather than holding a true for the life of the entry.
 //
 // Called on the adapter's own event goroutine under the adapter's own
 // bound, never from a gateway worker.
 type SessionLookup func(ctx context.Context, conversation string) (bool, error)
 
 // SessionLookupSink is the optional extension an Adapter implements to
-// receive the gateway's SessionLookup. Wired in New the way ProbeSink is; an
-// adapter that does not implement it is never offered one.
+// receive the gateway's SessionLookup and the idle TTL it is bounded by.
+// Wired in New the way ProbeSink is; an adapter that does not implement it
+// is never offered either.
 type SessionLookupSink interface {
-	SetSessionLookup(SessionLookup)
+	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
 }
 
 // ConversationState is one read's answer: the record as it stands, plus the

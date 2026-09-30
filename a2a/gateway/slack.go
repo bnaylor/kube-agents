@@ -141,9 +141,13 @@ type SlackAdapter struct {
 	// set through SetSessionLookup when the gateway is built; nil in an
 	// embedder that offers none, and then a cache miss is a false: there is
 	// nothing to ask. It is the source of truth for which threads the
-	// gateway has started a task in; sessionThreads is a cache in front of
-	// it.
-	sessions SessionLookup
+	// gateway has started a task in and not gone idle since; sessionThreads
+	// is a cache in front of it. sessionTTL is the gateway's idle TTL,
+	// handed over beside the lookup, and it is the bound a cached true
+	// expires on (isSessionThread); zero means a true never expires, which
+	// is the embedder that offers no lookup either.
+	sessions   SessionLookup
+	sessionTTL time.Duration
 	// sessionThreads caches whether a thread is a SESSION thread — one the
 	// gateway has started a task in, which is the rule that lets such a
 	// thread carry every message without making every thread in a joined
@@ -153,11 +157,19 @@ type SlackAdapter struct {
 	// verified sender's ask has started a task there — and a miss consults
 	// the registry for the same fact and caches its answer. Nothing is
 	// derived from the root message: a channel mention from an unmapped
-	// sender roots nothing, and a thread whose record the idle TTL has
-	// reaped needs a fresh mention. threadsOrder gives it the same eviction
-	// ring as seen.
-	sessionThreads map[string]bool
-	threadsOrder   []string
+	// sender roots nothing. A session thread stays one while its session is
+	// active or has been active within the idle TTL, and no longer: a
+	// cached true is stamped in sessionMarkedAt when it is written, expires
+	// on sessionTTL, and is re-asked of the registry, which answers on the
+	// same bound. The session record is not the bound — it outlives the
+	// reap, which deletes the pod and keeps the record — so a thread whose
+	// session has gone idle needs a fresh mention whether or not its record
+	// is still there. threadsOrder gives the cache the same eviction ring
+	// as seen; sessionMarkedAt holds a stamp for every true and nothing for
+	// a false.
+	sessionThreads  map[string]bool
+	sessionMarkedAt map[string]time.Time
+	threadsOrder    []string
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
 	seen      map[string]bool
 	seenOrder []string
@@ -214,14 +226,18 @@ var (
 	_ SessionLookupSink = (*SlackAdapter)(nil)
 )
 
-// SetSessionLookup receives the gateway's session registry as a read
-// (SessionLookupSink). isSessionThread consults it on a cache miss, so a
-// thread the gateway started a task in survives a restart of this process
-// and an eviction from the cache.
-func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup) {
+// SetSessionLookup receives the gateway's session registry as a read, and
+// the idle TTL the read is bounded by (SessionLookupSink). isSessionThread
+// consults the lookup on a cache miss, so a thread the gateway started a
+// task in survives a restart of this process and an eviction from the
+// cache, and again when a cached true has aged past the TTL, so a thread
+// whose session has gone idle stops carrying every message on the same
+// bound the registry answers by.
+func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions = lookup
+	s.sessionTTL = idleTTL
 }
 
 // TaskStarted is the TaskObserver half the Slack adapter wants: a task
@@ -243,7 +259,11 @@ func (s *SlackAdapter) TaskStarted(conversation, _ string) {
 
 // TaskTerminal, TaskAccepted and CancelPublished are not the Slack adapter's
 // business: a human reads the thread. A thread stays a session thread past
-// its task's end, as the session record does, so nothing is unmarked here.
+// its task's end for as long as the session has been active within the idle
+// TTL -- the cache expires its true on that bound and re-asks the registry,
+// which answers by the record's last activity, not by the record's
+// existence, since the record outlives the reap -- so nothing is unmarked
+// here, and nothing needs to be.
 func (s *SlackAdapter) TaskTerminal(string, string, lib.TaskState, TerminalSource, string) {}
 func (s *SlackAdapter) TaskAccepted(string, string)                                        {}
 func (s *SlackAdapter) CancelPublished(string, string)                                     {}
@@ -269,11 +289,12 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 	opts = append(opts, slack.OptionHTTPClient(slackHTTPClient()))
 	api := slack.New(botToken, opts...)
 	return &SlackAdapter{
-		api:            api,
-		sm:             socketmode.New(api),
-		log:            log,
-		sessionThreads: map[string]bool{},
-		seen:           map[string]bool{},
+		api:             api,
+		sm:              socketmode.New(api),
+		log:             log,
+		sessionThreads:  map[string]bool{},
+		sessionMarkedAt: map[string]time.Time{},
+		seen:            map[string]bool{},
 	}
 }
 
@@ -608,16 +629,32 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 // session thread. So a channel ask's own thread becomes a session thread
 // when the gateway starts the task there — TaskStarted, the same as any
 // other thread — and a channel mention from a sender the principal map
-// refuses roots nothing. It also means a thread whose record the idle TTL
-// has reaped needs a fresh mention: the registry has forgotten it, and
-// there is no other source to remember it from.
+// refuses roots nothing.
+//
+// Nor is a session thread one forever. It stays one while its session is
+// active or has been active within the idle TTL, and past that it needs a
+// fresh mention. A cached true carries the time it was written
+// (sessionMarkedAt), and once that is sessionTTL old the entry is treated
+// as expired: the registry is asked again, and its answer -- true when a
+// task is running there or the session has had a turn inside the TTL,
+// false otherwise -- overwrites the entry whichever way it goes. That is
+// the one path a true is downgraded on, and it is deliberate: the
+// registry's false here is not a stale read racing a TaskStarted, it is the
+// gateway's word that the session went idle. The registry answers on the
+// same bound (SessionLookup), so the cache and the source agree; the
+// session record itself is not the bound, since it outlives the reap, and
+// nothing here reads it as one. A positive answer restamps the entry, so a
+// thread the registry still holds is asked about once per TTL, not once
+// per reply. A lookup that fails on an expired entry leaves it as it was,
+// reports false and does not cache, like a failed miss.
 //
 // A false cached here is not permanent, and must not be. TaskStarted for the
 // same thread calls markSessionThread(key, true), which overwrites it, so a
 // thread that becomes a session mid-conversation stops dropping its
 // unmentioned messages from that task on. Without the overwrite the negative
 // entry would outlive — and silence — the very session it was cached before.
-// The reverse overwrite is refused (markSessionThread never downgrades).
+// The reverse overwrite is refused for a true that has not expired
+// (markSessionThread never downgrades).
 //
 // One stated limit: an unmentioned reply that reaches the pump after the
 // ask that starts the task was enqueued but before its worker's TaskStarted
@@ -629,9 +666,15 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS string) bool {
 	key := channel + "/" + threadTS
 	s.mu.Lock()
+	expired := false
 	if v, ok := s.sessionThreads[key]; ok {
-		s.mu.Unlock()
-		return v
+		if !v || !s.markExpiredLocked(key) {
+			s.mu.Unlock()
+			return v
+		}
+		// A true past the TTL: not an answer any more. Fall through to the
+		// registry, and let its answer replace the entry either way.
+		expired = true
 	}
 	lookup := s.sessions
 	s.mu.Unlock()
@@ -658,23 +701,56 @@ func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS st
 		}
 		return false
 	}
-	s.markSessionThread(key, held)
+	s.setMark(key, held, expired)
 	return held
 }
 
-// markSessionThread records the answer for a thread. Overwriting an
-// existing entry deliberately does NOT re-append to threadsOrder: the
-// eviction ring holds one position per key, and a flip from false to true
-// must not move a key's place in it or let it hold two.
+// markExpiredLocked reports whether the cached true for key has aged past
+// sessionTTL. Caller holds s.mu. A zero TTL never expires anything, and a
+// true with no stamp (there is none: every true is stamped where it is
+// written) is read as fresh rather than as infinitely old, so a bookkeeping
+// slip fails towards the never-downgrade rule and not towards dropping a
+// live thread's replies.
+func (s *SlackAdapter) markExpiredLocked(key string) bool {
+	if s.sessionTTL <= 0 {
+		return false
+	}
+	at, ok := s.sessionMarkedAt[key]
+	return ok && time.Since(at) >= s.sessionTTL
+}
+
+// markSessionThread records the answer for a thread. It is the public rule:
+// it never downgrades. A true comes from the gateway's TaskStarted or from
+// the registry; the only false that can arrive after one through this path
+// is a registry read that was already in flight when the true landed
+// (isSessionThread releases the lock across the read, and TaskStarted runs
+// on a gateway worker, not the pump), and letting that stale read win would
+// silence a live session thread for the life of the entry.
 //
-// It never downgrades. A true comes from the gateway's TaskStarted or from
-// the registry; the only false that can arrive after one is a registry read
-// that was already in flight when the true landed (isSessionThread releases
-// the lock across the read, and TaskStarted runs on a gateway worker, not
-// the pump), and letting that stale read win would silence a live session
-// thread for the life of the entry. A session that has since ended keeps
-// its thread marked, as its record does until the idle TTL reaps it.
+// A true does expire, though. It stays while the session is active or has
+// been active within the idle TTL: marking true stamps the entry, and once
+// the stamp is sessionTTL old isSessionThread re-asks the registry and
+// overwrites the entry with its answer through setMark's force path, which
+// is the one place a true gives way to a false. The session record is not
+// what bounds that -- it outlives the reap -- and a session that has since
+// ended keeps its thread marked only until then.
 func (s *SlackAdapter) markSessionThread(key string, isSession bool) {
+	s.setMark(key, isSession, false)
+}
+
+// setMark writes an entry. Overwriting an existing entry deliberately does
+// NOT re-append to threadsOrder: the eviction ring holds one position per
+// key, and a flip from false to true must not move a key's place in it or
+// let it hold two. A true is stamped in sessionMarkedAt, an existing true
+// re-stamped; a false clears the stamp, since only a true expires.
+//
+// force is isSessionThread's expired-entry path: a false may replace a true
+// there, but only one that is STILL expired at the write. A TaskStarted that
+// landed while the registry read was in flight re-stamped the entry, and the
+// read's false is then the stale read the never-downgrade rule exists for,
+// not the registry's word on the entry it was asked about; the fresh true
+// stands. The public rule for every other caller is markSessionThread's.
+func (s *SlackAdapter) setMark(key string, isSession, force bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing, exists := s.sessionThreads[key]
@@ -683,12 +759,20 @@ func (s *SlackAdapter) markSessionThread(key string, isSession bool) {
 		s.threadsOrder = append(s.threadsOrder, key)
 		if len(s.threadsOrder) > slackThreadsCap {
 			delete(s.sessionThreads, s.threadsOrder[0])
+			delete(s.sessionMarkedAt, s.threadsOrder[0])
 			s.threadsOrder = s.threadsOrder[1:]
 		}
 	case existing && !isSession:
-		return
+		if !force || !s.markExpiredLocked(key) {
+			return
+		}
 	}
 	s.sessionThreads[key] = isSession
+	if isSession {
+		s.sessionMarkedAt[key] = time.Now()
+	} else {
+		delete(s.sessionMarkedAt, key)
+	}
 }
 
 // inbound normalizes one message event, or reports it not-a-turn. The

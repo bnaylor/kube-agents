@@ -219,13 +219,14 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	s.door.SetProbe(probe)
 }
 
-// SetSessionLookup hands the gateway's session lookup to the primary, which
-// is the half that wants it (the Slack adapter's session-thread rule; the
-// door keys every conversation itself and has no such question). Implemented
-// unconditionally for the same reason as SetProbe, and a primary that is not
-// a SessionLookupSink is offered nothing, as it would be alone.
-func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup) {
+// SetSessionLookup hands the gateway's session lookup, and the idle TTL it
+// is bounded by, to the primary, which is the half that wants them (the
+// Slack adapter's session-thread rule; the door keys every conversation
+// itself and has no such question). Implemented unconditionally for the same
+// reason as SetProbe, and a primary that is not a SessionLookupSink is
+// offered nothing, as it would be alone.
+func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	if sink, ok := s.primary.(SessionLookupSink); ok {
-		sink.SetSessionLookup(lookup)
+		sink.SetSessionLookup(lookup, idleTTL)
 	}
 }

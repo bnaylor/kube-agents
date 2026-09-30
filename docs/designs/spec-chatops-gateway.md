@@ -920,8 +920,12 @@ registry, which it asks whether a task has started in that thread (a record alon
 not enough, since one is minted for any verified turn, a "stop" with nothing running
 included). Nothing is derived from the root message. A mention on its own starts
 nothing and makes nothing a session thread, whoever typed it, so a channel mention from
-a sender the principal map refuses roots nothing; and once the idle TTL reaps a session
-record, its thread needs a fresh mention. Two subtypes count as turns besides plain
+a sender the principal map refuses roots nothing. A session thread stays one while a
+task runs there or the session has had activity within the idle TTL; past that, the
+thread needs a fresh mention. The bound is activity, not the record: the session record
+outlives the reap (which deletes the idle pod and keeps the record), so the registry
+answers from the active task and the last activity, and the adapter expires its own
+cached answer on the same TTL and asks again. Two subtypes count as turns besides plain
 messages: `thread_broadcast` (a
 thread reply with "also send to channel" checked - dropping it would eat a steer
 silently) and `file_share` (an ask with an attachment). Everything else drops in the

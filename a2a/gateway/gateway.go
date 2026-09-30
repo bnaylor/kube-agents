@@ -286,9 +286,11 @@ func New(o Options) (*Gateway, error) {
 	// The session registry as a read, for an adapter that has to decide on
 	// its own goroutine whether a conversation is one the gateway is in (the
 	// Slack adapter's session-thread rule, and the side door composite in
-	// front of it). See SessionLookup.
+	// front of it), with the idle TTL the read is bounded by so the adapter
+	// can expire its own positive cache on the same bound. See
+	// SessionLookup.
 	if sink, ok := o.Adapter.(SessionLookupSink); ok {
-		sink.SetSessionLookup(g.hasSession)
+		sink.SetSessionLookup(g.hasSession, o.Config.IdleTTL)
 	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
@@ -876,23 +878,39 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 }
 
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
-// whether a task has ever started in the conversation, read from the
-// registry and reported with nothing changed. A pure read, as SessionLookup
-// requires -- no lock, no heal, no post, no publish, no write.
+// whether the gateway has started a task in the conversation and the
+// session is not idle past the idle TTL, read from the registry and
+// reported with nothing changed. A pure read, as SessionLookup requires --
+// no lock, no heal, no post, no publish, no write.
 //
-// A record alone is not the answer. mintSession Creates one for ANY verified
+// A record alone is not the answer. mintSession creates one for ANY verified
 // turn before the text is dispatched, so a mapped user's "@bot stop" with
 // nothing running, or an ask refused at the session cap, leaves a record
 // behind and starts nothing; answering true on that would adopt the thread
 // the way TaskStarted never did, and the two sources would disagree. A
 // started task is what startTask writes -- ActiveTask while it runs, and a
 // TaskRef in Tasks for the record's life -- so that is what this reads.
+//
+// Nor is a record with a past task the answer forever. A running task keeps
+// the conversation a session however long it runs (reapOnce never touches a
+// pod under one, and a thread whose task is still working must carry the
+// "stop"). Otherwise the conversation is a session only while it has had
+// activity within the idle TTL: LastActivity is written by routeTurn on
+// every turn and persisted, and the TTL is the same g.cfg.IdleTTL reapOnce
+// reads. The record itself is not the bound -- reapOnce deletes the pod and
+// keeps the record, Tasks and all, and nothing else deletes it -- so a read
+// keyed on the record's existence would answer true for any thread a task
+// ever started in, for good. Activity is the bound; the record merely
+// carries it.
 func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, error) {
 	rec, err := g.reg.Get(ctx, conversation)
 	if err != nil || rec == nil {
 		return false, err
 	}
-	return rec.ActiveTask != nil || len(rec.Tasks) > 0, nil
+	if rec.ActiveTask != nil {
+		return true, nil
+	}
+	return len(rec.Tasks) > 0 && time.Since(rec.LastActivity) < g.cfg.IdleTTL, nil
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements

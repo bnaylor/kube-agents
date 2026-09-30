@@ -27,7 +27,7 @@ import (
 // Compile-time contract. The inject backend is the one adapter that has to
 // answer ABOUT a task, and the chat backends deliberately do not -- a human
 // reads the chat, so the rendered text is their whole interface. The negative
-// assertions are in TestOnlyTheInjectBackendObservesTasks below, which a
+// assertions are in TestWhichAdaptersObserveTasks below, which a
 // compile-time var cannot express.
 var (
 	_ Adapter         = (*InjectAdapter)(nil)
@@ -878,12 +878,12 @@ func TestInjectPostsTheWholeOfALongAnswer(t *testing.T) {
 	}
 }
 
-// TestOnlyTheInjectBackendObservesTasks: TaskObserver is an optional
+// TestWhichAdaptersObserveTasks: TaskObserver is an optional
 // extension. Discord and gchat stay outside it, and Slack is inside it for
 // one documented reason (TaskStarted marks session threads). If any other
 // chat adapter picks it up by accident, the gateway starts calling into it on
 // every task with no test covering what it does there.
-func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
+func TestWhichAdaptersObserveTasks(t *testing.T) {
 	discord := &DiscordAdapter{}
 	if _, ok := any(discord).(TaskObserver); ok {
 		t.Error("the Discord adapter implements TaskObserver; the gateway now calls into it untested")
