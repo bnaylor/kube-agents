@@ -260,6 +260,31 @@ type ProbeSink interface {
 	SetProbe(ConversationProbe)
 }
 
+// SessionLookup answers whether the gateway holds a session record for a
+// conversation key. It is a PURE READ of the session registry, like
+// ConversationProbe: no lock, no heal, no post, no write, one KV read.
+//
+// It exists because an adapter can be asked whether a conversation is one
+// the gateway is in before it has been told so on this process. The Slack
+// adapter's session-thread cache is process memory: a thread the gateway
+// adopted mid-conversation -- a verified sender's mentioned ask in someone
+// else's thread, whose root never mentions the bot -- is forgotten on a
+// restart or a cache eviction, and its unmentioned follow-ups ("stop") would
+// be dropped against a root read that cannot know better. The registry is
+// the source of truth for which conversations the gateway is in, so a cold
+// cache asks it first.
+//
+// Called on the adapter's own event goroutine under the adapter's own
+// bound, never from a gateway worker.
+type SessionLookup func(ctx context.Context, conversation string) (bool, error)
+
+// SessionLookupSink is the optional extension an Adapter implements to
+// receive the gateway's SessionLookup. Wired in New the way ProbeSink is; an
+// adapter that does not implement it is never offered one.
+type SessionLookupSink interface {
+	SetSessionLookup(SessionLookup)
+}
+
 // ConversationState is one read's answer: the record as it stands, plus the
 // two gateway-wide facts a caller needs beside it.
 type ConversationState struct {

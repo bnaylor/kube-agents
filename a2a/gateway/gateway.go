@@ -283,6 +283,13 @@ func New(o Options) (*Gateway, error) {
 	if sink, ok := o.Adapter.(ProbeSink); ok {
 		sink.SetProbe(g.probeConversation)
 	}
+	// The session registry as a read, for an adapter that has to decide on
+	// its own goroutine whether a conversation is one the gateway is in (the
+	// Slack adapter's session-thread rule, and the side door composite in
+	// front of it). See SessionLookup.
+	if sink, ok := o.Adapter.(SessionLookupSink); ok {
+		sink.SetSessionLookup(g.hasSession)
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
@@ -868,10 +875,27 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 	return state, nil
 }
 
+// hasSession is the SessionLookup the gateway offers a SessionLookupSink:
+// whether the registry holds a record for the key, read and reported with
+// nothing changed. A pure read, as SessionLookup requires -- no lock, no
+// heal, no post, no publish, no write. A record exists from the first turn
+// the gateway ran for the conversation (mintSession, under the session lock),
+// so "true" means a verified sender's message reached routing there.
+func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, error) {
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil {
+		return false, err
+	}
+	return rec != nil, nil
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
-// TaskObserver about a task's two ends. Both are no-ops for every chat
-// backend, which does not implement the interface: a human reads the chat, so
-// the rendered text is the whole of what a chat backend needs.
+// TaskObserver about a task's two ends. Both are no-ops for an adapter that
+// does not implement the interface -- Discord and gchat, for which a human
+// reads the chat and the rendered text is the whole interface. The Slack
+// adapter implements it for TaskStarted alone: a task starting in a thread is
+// what makes that thread a session thread, and the adapter learns it here
+// rather than inferring it from a mention it has not yet seen verified.
 func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskStarted(conversation, taskID)

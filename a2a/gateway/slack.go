@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -133,15 +134,23 @@ type SlackAdapter struct {
 	botUserID string
 
 	mu sync.Mutex
+	// sessions is the gateway's session registry as a read (SessionLookup),
+	// set through SetSessionLookup when the gateway is built; nil in an
+	// embedder that offers none, and then the root read below is the whole
+	// derivation. It is the source of truth for which threads the gateway
+	// is in; sessionThreads is a cache in front of it.
+	sessions SessionLookup
 	// sessionThreads caches whether a thread is a SESSION thread — one the
-	// bot has been addressed in, whether by its root message or by a later
-	// reply — which is the rule that lets such a thread carry every message
-	// without making every thread in a joined channel a session. Not "the
-	// root mentions the bot", which is only how the answer is DERIVED for a
-	// thread the adapter has not already seen a mention in: a session can be
-	// minted on a reply that mentions the bot inside a thread someone else
-	// rooted, and that thread has to carry the follow-ups too. threadsOrder
-	// gives it the same eviction ring as seen.
+	// gateway holds a session in, which is the rule that lets such a thread
+	// carry every message without making every thread in a joined channel a
+	// session. It is filled from three places: a channel ask records its own
+	// thread (its root IS the ask); TaskStarted records the thread a task
+	// started in, which is how a thread someone else rooted becomes one once
+	// a verified sender's mentioned ask has started a task there; and a
+	// miss consults the registry and then the root message. Not "the root
+	// mentions the bot", which is only the last-resort derivation for a
+	// thread neither the gateway nor this process knows. threadsOrder gives
+	// it the same eviction ring as seen.
 	sessionThreads map[string]bool
 	threadsOrder   []string
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
@@ -194,7 +203,44 @@ func toMrkdwn(text string) string {
 	return slackLinkRE.ReplaceAllString(text, "<$2|$1>")
 }
 
-var _ Adapter = (*SlackAdapter)(nil)
+var (
+	_ Adapter           = (*SlackAdapter)(nil)
+	_ TaskObserver      = (*SlackAdapter)(nil)
+	_ SessionLookupSink = (*SlackAdapter)(nil)
+)
+
+// SetSessionLookup receives the gateway's session registry as a read
+// (SessionLookupSink). isSessionThread consults it on a cache miss before it
+// reads the thread root, so a thread the gateway adopted mid-conversation
+// survives a restart of this process and an eviction from the cache.
+func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions = lookup
+}
+
+// TaskStarted is the TaskObserver half the Slack adapter wants: a task
+// starting in a thread is what makes that thread a session thread. It is the
+// gateway's word, after it verified the sender and minted the session, and
+// it replaces the adapter's own guess from a mention -- which recorded a
+// thread on ANY mention, a bare "<@bot>" from an unmapped sender included,
+// before the gateway had decided anything. A DM is the whole session and
+// needs no record. Called on the conversation's inbox worker under the
+// session lock (TaskObserver): record and return.
+func (s *SlackAdapter) TaskStarted(conversation, _ string) {
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok || threadTS == "" {
+		return
+	}
+	s.markSessionThread(channel+"/"+threadTS, true)
+}
+
+// TaskTerminal, TaskAccepted and CancelPublished are not the Slack adapter's
+// business: a human reads the thread. A thread stays a session thread past
+// its task's end, as the session record does, so nothing is unmarked here.
+func (s *SlackAdapter) TaskTerminal(string, string, lib.TaskState, TerminalSource, string) {}
+func (s *SlackAdapter) TaskAccepted(string, string)                                        {}
+func (s *SlackAdapter) CancelPublished(string, string)                                     {}
 
 // NewSlackAdapter builds the Socket Mode client pair. The bot token drives
 // the Web API and the app token the outbound websocket — the two refs the
@@ -539,20 +585,27 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 }
 
 // isSessionThread reports whether a thread carries every message: from the
-// cache when a mention has already been seen in it (inbound records that)
-// or when an earlier read answered, and otherwise from one
-// conversations.replies read of the root message. That read happens on the
-// event pump's goroutine, so it is bounded by slackRepliesTimeout as well
-// as by ctx. An API failure — the timeout included — reports false without
-// caching: dropping is safe (the user can @mention), and the next reply
-// retries.
+// cache when a channel ask rooted it or a task started in it (inbound and
+// TaskStarted record those) or when an earlier miss answered; otherwise from
+// the gateway's session registry, which is the source of truth for the
+// threads the gateway is in; and otherwise from one conversations.replies
+// read of the root message. Both reads happen on the event pump's goroutine,
+// so they share one slackRepliesTimeout bound as well as ctx. A failure of
+// either — the timeout included — reports false without caching: dropping is
+// safe (the user can @mention), and the next reply retries.
 //
-// A false cached here is not permanent, and must not be. A later mention in
-// the same thread calls markSessionThread(key, true), which overwrites it,
-// so a thread that becomes a session mid-conversation stops dropping its
-// unmentioned messages from that mention on. Without the overwrite the
-// negative entry would outlive — and silence — the very session it was
-// cached before.
+// The registry comes first because it knows what the root cannot: a thread
+// the gateway adopted on a mentioned ask inside someone else's thread has a
+// root with no mention in it, and after a restart or an eviction the cache
+// has forgotten the TaskStarted that recorded it. A registry error falls
+// through to the root read rather than dropping: the root still answers for
+// every thread the bot rooted.
+//
+// A false cached here is not permanent, and must not be. TaskStarted for the
+// same thread calls markSessionThread(key, true), which overwrites it, so a
+// thread that becomes a session mid-conversation stops dropping its
+// unmentioned messages from that task on. Without the overwrite the negative
+// entry would outlive — and silence — the very session it was cached before.
 func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS string) bool {
 	key := channel + "/" + threadTS
 	s.mu.Lock()
@@ -560,9 +613,24 @@ func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS st
 		s.mu.Unlock()
 		return v
 	}
+	lookup := s.sessions
 	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, slackRepliesTimeout)
 	defer cancel()
+	if lookup != nil {
+		held, err := lookup(ctx, slackConversationID("channel", channel, threadTS))
+		switch {
+		case err == nil && held:
+			s.markSessionThread(key, true)
+			return true
+		case errors.Is(err, context.Canceled):
+			// Shutdown mid-read, as for the root read below; and this one
+			// is not the end of the answer, so it says so.
+			s.log.Debug("session lookup abandoned on shutdown; falling back to the thread root", "channel", channel, "thread", threadTS, "err", err)
+		case err != nil:
+			s.log.Warn("session lookup failed; falling back to the thread root", "channel", channel, "thread", threadTS, "err", err)
+		}
+	}
 	msgs, _, _, err := s.api.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
 		ChannelID: channel, Timestamp: threadTS, Limit: 1, Inclusive: true,
 	})
@@ -607,10 +675,10 @@ func (s *SlackAdapter) markSessionThread(key string, isSession bool) {
 // affordance rule, deterministic: DMs carry every message; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
-// it mentions the bot or the thread is already a session thread — and a
-// mention in a thread MAKES it one, whoever rooted it. Everything else —
-// bots, our own posts, edits and other subtypes, redeliveries — is not a
-// turn.
+// it mentions the bot or the thread is already a session thread — one the
+// gateway holds a session in, which a mention alone does not make it: the
+// gateway starting a task there does (TaskStarted). Everything else — bots,
+// our own posts, edits and other subtypes, redeliveries — is not a turn.
 func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
@@ -655,21 +723,25 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// thread the session will live in.
 		threadTS = m.TimeStamp
 	}
-	if mentioned {
-		// Addressing the bot in a thread makes that thread a session thread,
-		// and this is the one place that is recorded — for the channel ask
-		// above, whose own ts is the root, and equally for a mention inside
-		// a thread someone else started. The second case is why this is not
-		// inside the !isReply branch: the gateway mints a session on the
-		// key below either way and starts a task there, and a session whose
-		// thread does not carry every message is one the user cannot steer
-		// or "stop" without re-@mentioning for each message. Discord, which
-		// this is parity with, has no root condition at all.
+	if mentioned && !isReply {
+		// A channel ask roots its own thread, and the root IS the ask, so
+		// the answer the root read would derive is known here for free:
+		// record it, and the first reply under it delivers from cache
+		// rather than spending slackRepliesTimeout re-reading a message
+		// this process just saw. A bare "<@bot>" in the channel is the
+		// same: the root mentions the bot, whatever else it says.
 		//
-		// It also un-poisons the cache: an earlier unmentioned reply in this
-		// thread will have read the root, found no mention and cached false,
-		// and markSessionThread overwrites that rather than leaving the
-		// thread dropped for the life of the entry.
+		// A mention inside a thread someone else rooted is deliberately NOT
+		// recorded here, though it did use to be. The adapter has verified
+		// nothing at this point -- not the sender, not that the text is an
+		// ask -- and recording on the mention alone made any bare "<@bot>"
+		// from anyone, mapped or not, turn a foreign thread into one whose
+		// every message reached the gateway. The gateway's word is what
+		// makes a thread a session thread: it starts a task there for a
+		// verified sender's ask and says so through TaskStarted, which
+		// records the thread (and un-poisons a false an earlier unmentioned
+		// reply cached from the root). The registry consult in
+		// isSessionThread covers the same thread after a restart.
 		s.markSessionThread(m.Channel+"/"+threadTS, true)
 	}
 	if text == "" {
@@ -678,17 +750,17 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// Checked before the session-thread lookup below, not after it. An
 		// attachment-only (file_share with no caption) or whitespace-only
 		// reply in an uncached thread is discarded either way, and
-		// isSessionThread can spend slackRepliesTimeout on a
-		// conversations.replies read with the event pump — and so the next
-		// envelope's ack — blocked behind it. Nothing is lost by skipping
-		// that read: sessionThreads is a pure lookup cache with no reader
-		// outside isSessionThread itself, and for a thread with no mention
-		// in it the answer is derived from the root message's text, so the
-		// next reply in the thread fills it with the same answer. The
-		// markSessionThread above is deliberately still reached — a bare
-		// "@bot" addresses the bot in that thread whether the user typed it
-		// as a channel message or as a reply, later messages there are the
-		// ask, and recording it costs no API call.
+		// isSessionThread can spend slackRepliesTimeout on a registry read
+		// and a conversations.replies read with the event pump — and so the
+		// next envelope's ack — blocked behind it. Nothing is lost by
+		// skipping that: sessionThreads is a pure lookup cache with no
+		// reader outside isSessionThread itself, and the next reply in the
+		// thread derives the same answer from the same sources. The
+		// markSessionThread above is still reached for the channel case —
+		// a bare "@bot" as a channel message roots a thread whose later
+		// replies are the ask, and recording it costs no API call. A bare
+		// mention as a reply records nothing: it starts no task, so it
+		// makes nothing a session thread.
 		return InboundMessage{}, false
 	}
 	if isReply && !mentioned && !s.isSessionThread(ctx, m.Channel, threadTS) {

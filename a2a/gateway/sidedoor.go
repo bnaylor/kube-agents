@@ -152,32 +152,47 @@ func (s *sideDoorAdapter) OpenDirect(userID string) (string, error) {
 	return s.primary.OpenDirect(userID)
 }
 
-// TaskStarted and TaskTerminal reach the door alone, and only for its own
-// conversations. The composite implements TaskObserver unconditionally so
-// that the gateway's type assertion finds it whatever the primary is; a chat
-// backend is told nothing either way, which is what it would have been told
-// if it were the only adapter.
+// The TaskObserver calls route on the conversation's key like the posts: the
+// door's own conversations reach the door, and every other conversation
+// reaches the primary when it implements TaskObserver -- the Slack adapter
+// does, for TaskStarted -- and nobody otherwise. The composite implements the
+// interface unconditionally so that the gateway's type assertion finds it
+// whatever the primary is; a chat backend that does not implement it is told
+// nothing, which is what it would have been told if it were the only adapter.
+func (s *sideDoorAdapter) primaryObserver() (TaskObserver, bool) {
+	observer, ok := s.primary.(TaskObserver)
+	return observer, ok
+}
+
 func (s *sideDoorAdapter) TaskStarted(conversation, taskID string) {
 	if forDoor(conversation) {
 		s.door.TaskStarted(conversation, taskID)
+	} else if observer, ok := s.primaryObserver(); ok {
+		observer.TaskStarted(conversation, taskID)
 	}
 }
 
 func (s *sideDoorAdapter) TaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if forDoor(conversation) {
 		s.door.TaskTerminal(conversation, taskID, state, source, reason)
+	} else if observer, ok := s.primaryObserver(); ok {
+		observer.TaskTerminal(conversation, taskID, state, source, reason)
 	}
 }
 
 func (s *sideDoorAdapter) TaskAccepted(conversation, taskID string) {
 	if forDoor(conversation) {
 		s.door.TaskAccepted(conversation, taskID)
+	} else if observer, ok := s.primaryObserver(); ok {
+		observer.TaskAccepted(conversation, taskID)
 	}
 }
 
 func (s *sideDoorAdapter) CancelPublished(conversation, taskID string) {
 	if forDoor(conversation) {
 		s.door.CancelPublished(conversation, taskID)
+	} else if observer, ok := s.primaryObserver(); ok {
+		observer.CancelPublished(conversation, taskID)
 	}
 }
 
@@ -202,4 +217,15 @@ func (s *sideDoorAdapter) TurnFinished(conversation string) {
 // gateway's type assertion has to find it whatever the primary is.
 func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	s.door.SetProbe(probe)
+}
+
+// SetSessionLookup hands the gateway's session lookup to the primary, which
+// is the half that wants it (the Slack adapter's session-thread rule; the
+// door keys every conversation itself and has no such question). Implemented
+// unconditionally for the same reason as SetProbe, and a primary that is not
+// a SessionLookupSink is offered nothing, as it would be alone.
+func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup) {
+	if sink, ok := s.primary.(SessionLookupSink); ok {
+		sink.SetSessionLookup(lookup)
+	}
 }
