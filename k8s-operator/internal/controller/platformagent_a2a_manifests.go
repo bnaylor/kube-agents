@@ -182,7 +182,20 @@ const (
 	// limit is what a limits.cpu quota was still missing, and a refused
 	// callout is a provision Job the operator never creates (the gate on
 	// its creation in reconcileA2A) and a CR that reads Provisioning for it.
-	a2aCalloutCPULimit    = "500m"
+	a2aCalloutCPULimit = "500m"
+
+	// The verifier is the same shape of request-reply service as the
+	// callout and is sized to match it. Its limits matter for the same
+	// reason the callout's do, one step further along: a namespace whose
+	// ResourceQuota sets limits.cpu refuses a pod that omits it at
+	// admission, and a verifier that never comes up means every executor
+	// refuses every submission -- terminally, since the executors do not
+	// retry a refusal.
+	a2aVerifierCPURequest    = "50m"
+	a2aVerifierMemoryRequest = "64Mi"
+	a2aVerifierCPULimit      = "500m"
+	a2aVerifierMemoryLimit   = "256Mi"
+
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
 	// The first-party next-stack images the operator renders — this one, the
 	// worker below, the auth callout (platformagent_a2a_callout.go) and the

@@ -5907,10 +5907,15 @@ func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
 // ---- resources and ordering on the next-stack pods (#1700, #1702) ---------
 
 // TestA2ANextStackPodsCarryRequestsAndLimits: every container the operator
-// renders for the next stack (NATS, gateway, provision Job, callout) carries
-// CPU and memory requests and limits, so a namespace whose ResourceQuota
-// requires limits admits the stack, and Autopilot does not size the pods for
-// it. The session pods the gateway spawns are the gateway's (a2a/gateway).
+// renders for the next stack (NATS, gateway, provision Job, callout,
+// verifier) carries CPU and memory requests and limits, so a namespace whose
+// ResourceQuota requires limits admits the stack, and Autopilot does not size
+// the pods for it. The session pods the gateway spawns are the gateway's
+// (a2a/gateway).
+//
+// The enumeration is the test: a render added to the stack and not added here
+// is uncovered, and the failure it would have caught is not a degradation but
+// a pod the namespace refuses at admission.
 func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	agent := a2aTestAgent()
 	type container struct {
@@ -5935,8 +5940,14 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
-	if len(containers) < 4 {
-		t.Fatalf("expected at least four containers across the four renders, got %d", len(containers))
+	// The verifier too, and it is the one with the sharpest consequence: an
+	// executor that cannot reach a verifier refuses the submission, and the
+	// refusal is terminal on the task.
+	for _, c := range buildA2AVerifierDeployment(agent).Spec.Template.Spec.Containers {
+		containers = append(containers, container{"verifier Deployment", c})
+	}
+	if len(containers) < 5 {
+		t.Fatalf("expected at least five containers across the five renders, got %d", len(containers))
 	}
 	for _, entry := range containers {
 		for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
@@ -5961,6 +5972,10 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	gw := dep.Spec.Template.Spec.Containers[0].Resources
 	if got := gw.Requests[corev1.ResourceCPU]; got.String() != a2aGatewayCPURequest {
 		t.Errorf("gateway cpu request = %s, want %s", got.String(), a2aGatewayCPURequest)
+	}
+	ver := buildA2AVerifierDeployment(agent).Spec.Template.Spec.Containers[0].Resources
+	if got := ver.Limits[corev1.ResourceCPU]; got.String() != a2aVerifierCPULimit {
+		t.Errorf("verifier cpu limit = %s, want %s", got.String(), a2aVerifierCPULimit)
 	}
 }
 

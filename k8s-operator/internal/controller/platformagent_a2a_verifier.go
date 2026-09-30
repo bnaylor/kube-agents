@@ -24,7 +24,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -194,22 +193,12 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 							PeriodSeconds:    10,
 							FailureThreshold: 6,
 						},
-						Resources: corev1.ResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse("50m"),
-								corev1.ResourceMemory: resource.MustParse("64Mi"),
-							},
-							Limits: corev1.ResourceList{
-								// A cpu limit as well as a memory one: a namespace
-								// whose ResourceQuota sets limits.cpu refuses a pod
-								// that omits it at admission, and a verifier that
-								// never comes up means every executor refuses every
-								// task. Matches the callout, which is the same shape
-								// of request-reply service.
-								corev1.ResourceCPU:    resource.MustParse("500m"),
-								corev1.ResourceMemory: resource.MustParse("256Mi"),
-							},
-						},
+						// Named constants through the shared builder, which is
+						// where the rest of the next stack's sizes live; the
+						// reasoning for a cpu limit as well as a memory one is
+						// with them.
+						Resources: a2aResources(a2aVerifierCPURequest, a2aVerifierMemoryRequest,
+							a2aVerifierCPULimit, a2aVerifierMemoryLimit),
 						SecurityContext: hardenedSecurityContext(),
 					}},
 					Volumes: []corev1.Volume{a2aBusTokenVolumeSource()},
