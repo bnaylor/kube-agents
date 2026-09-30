@@ -108,13 +108,54 @@ func stalledSlackStub(t *testing.T) (srv *httptest.Server, unblock func()) {
 	return srv, unblock
 }
 
-// TestSlackWebAPIClientIsBounded: the client NewSlackAdapter hands slack-go
-// carries a timeout. slack-go's default has none, and every context-free
-// call the adapter makes runs under the conversation's session lock.
+// TestSlackWebAPIClientIsBounded: a Post through the real constructor against
+// a server that never answers returns by slackAPITimeout instead of parking.
+// Driven through newSlackAdapter, not slackHTTPClient, because the claim is
+// about the client the constructor hands slack-go: deleting the
+// OptionHTTPClient line, or letting an option in extra displace it, leaves
+// the helper intact and the adapter unbounded. The production bound is also
+// pinned, since the test shortens it.
 func TestSlackWebAPIClientIsBounded(t *testing.T) {
-	c := slackHTTPClient()
-	if c.Timeout <= 0 || c.Timeout > time.Minute {
-		t.Fatalf("slack Web API client timeout = %v, want a bound within a minute", c.Timeout)
+	if slackAPITimeout <= 0 || slackAPITimeout > time.Minute {
+		t.Fatalf("slackAPITimeout = %v, want a bound within a minute", slackAPITimeout)
+	}
+	orig := slackAPITimeout
+	slackAPITimeout = 300 * time.Millisecond
+	t.Cleanup(func() { slackAPITimeout = orig })
+
+	srv, _ := stalledSlackStub(t)
+	a := newSlackAdapter("xoxb-stub", "xapp-stub", slog.Default(), slack.OptionAPIURL(srv.URL+"/"))
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Post("slack:C1/1.0", "hello")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Post against a server that never answers returned nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Post parked past the bound: the constructor did not hand slack-go the bounded client")
+	}
+}
+
+// TestSlackDMMentionIsStripped: the bot's handle is addressing in a DM too,
+// where Slack's composer offers it by autocomplete. "<@UBOT> stop" must reach
+// the gateway as "stop" so the cancel affordance matches, and a bare mention
+// in a DM is not a turn, as it is not in a channel.
+func TestSlackDMMentionIsStripped(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	got, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "<@UBOT> stop", "1.0", ""))
+	if !ok || got.Text != "stop" || got.Conversation != "slack:dm/D1" {
+		t.Fatalf("DM with a mention: delivered=%v text=%q conv=%q, want text \"stop\"", ok, got.Text, got.Conversation)
+	}
+	if _, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "<@UBOT>", "2.0", "")); ok {
+		t.Fatal("a bare mention in a DM has nothing to run")
+	}
+	got, ok = a.inbound(context.Background(), slackMsg("im", "D1", "U1", "plain ask", "3.0", ""))
+	if !ok || got.Text != "plain ask" {
+		t.Fatalf("DM without a mention: delivered=%v text=%q", ok, got.Text)
 	}
 }
 

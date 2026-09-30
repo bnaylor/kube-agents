@@ -196,7 +196,7 @@ func New(o Options) (*Gateway, error) {
 		// like this, but a `mode: next` install whose relay URL failed to
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
-		log.Warn("the gateway is running on the inject door alone: no Discord token and no Chat relay are armed, " +
+		log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
 			"so nothing but the eval door can reach this install (inject-only)")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the

@@ -84,7 +84,11 @@ const slackRepliesTimeout = 2 * time.Second
 // conversation's worker for the kernel's whole TCP retransmit budget. The
 // siblings are bounded the same way: gchat's relay client carries
 // gchatRelayTimeout, discordgo's carries 20s.
-const slackAPITimeout = 30 * time.Second
+//
+// A var, not a const, so a test can shorten it and drive a real Post through
+// newSlackAdapter against a server that never answers; the bound is only
+// worth pinning at the client the constructor actually hands slack-go.
+var slackAPITimeout = 30 * time.Second
 
 // slackHTTPClient is the bounded client NewSlackAdapter hands slack-go.
 func slackHTTPClient() *http.Client { return &http.Client{Timeout: slackAPITimeout} }
@@ -256,10 +260,11 @@ func NewSlackAdapter(botToken, appToken string, log *slog.Logger) (*SlackAdapter
 // are applied after the adapter's own, so a test can point the client at a
 // stub server; production passes none.
 func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack.Option) *SlackAdapter {
-	opts := append([]slack.Option{
-		slack.OptionAppLevelToken(appToken),
-		slack.OptionHTTPClient(slackHTTPClient()),
-	}, extra...)
+	// The bounded client goes LAST so nothing in extra can displace it:
+	// slack-go applies options in order, and a later OptionHTTPClient would
+	// silently put the unbounded default back under every Post and Edit.
+	opts := append([]slack.Option{slack.OptionAppLevelToken(appToken)}, extra...)
+	opts = append(opts, slack.OptionHTTPClient(slackHTTPClient()))
 	api := slack.New(botToken, opts...)
 	return &SlackAdapter{
 		api:            api,
@@ -688,8 +693,18 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		return InboundMessage{}, false
 	}
 	text := strings.TrimSpace(m.Text)
+	// The mention is addressing, not ask, in a DM as much as in a channel:
+	// Slack's composer autocompletes the bot's handle in a DM too, and an
+	// unstripped "<@UBOT> stop" normalizes to "ubot stop", which is not a
+	// stop. Stripped before the DM branch so the affordance matchers see
+	// what the user meant on both paths.
+	mentioned := slackMentionsBot(text, s.botUserID)
+	if mentioned {
+		text = stripSlackMention(text, s.botUserID)
+	}
 	if m.ChannelType == "im" {
 		if text == "" {
+			// A bare mention has nothing to run, in a DM as in a channel.
 			return InboundMessage{}, false
 		}
 		return InboundMessage{
@@ -708,10 +723,6 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			// decodes can newly fall under isStatusQuery's wideMatchLenCap.
 			Text: slackUnescaper.Replace(text),
 		}, true
-	}
-	mentioned := slackMentionsBot(text, s.botUserID)
-	if mentioned {
-		text = stripSlackMention(text, s.botUserID)
 	}
 	isReply := m.ThreadTimeStamp != "" && m.ThreadTimeStamp != m.TimeStamp
 	threadTS := m.ThreadTimeStamp
