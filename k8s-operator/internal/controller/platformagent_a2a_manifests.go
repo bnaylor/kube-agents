@@ -563,7 +563,13 @@ const (
 	// TASKS from 13 down to 11 for nothing, and it came back with the call.
 	// TestBridgeLookAheadIsInTheA2AModule reads the bridge's sources and
 	// fails on the day the call leaves them, naming the arithmetic that has
-	// to move back with it.
+	// to move back with it. The row is one slot per worker
+	// (a2aTasksReplayLookAhead), so like the asks row it is written twice:
+	// a2aTasksReplayBridgeLookAhead at the default in the sum below, and
+	// a2aTasksReplayLookAhead per worker inside a2aTasksReplayConsumersFor,
+	// the spelling the budget reads for a CR.
+	// TestReservedConsumersIsTheSumOfItsTerms holds the two equal at the
+	// default.
 	//
 	// The asks row is the one that rests on the shape of the install rather
 	// than on a lock, so the shape is stated. A conversation has one asker:
@@ -586,12 +592,14 @@ const (
 	// becomes per-session, and it moves into the multiplier beside
 	// a2aSessionConsumersPerSession.
 	//
-	// Two more things the two bridge rows rest on, both settable on the
+	// Two more things the three bridge rows rest on, both settable on the
 	// CR. BRIDGE_CONCURRENCY is read. The sidecar is declared in
 	// spec.deployment.sidecars, so its env is the CR's, and an install that
 	// raises it (docs/designs/eval-next-transport.md commits the eval install
 	// to at least its task parallelism) has that many running conversations
-	// to be asked about: the asks row is a2aTasksReplayAsk per worker, and
+	// to be asked about, and that many workers looking ahead: the asks row
+	// is a2aTasksReplayAsk per worker, the look-ahead row
+	// a2aTasksReplayLookAhead per worker, and
 	// a2aBridgeConcurrency reads the worker count off the CR the way the
 	// bridge reads it off its environment. The rule, and what it cannot see:
 	//
@@ -638,17 +646,19 @@ const (
 	// spec.deployment.replicas is not read here.
 	//
 	// Where the floor hides all this. The budget is maxSessions*3 + the
-	// reserve, 28 at the default concurrency, and a stream is created at
-	// max(64, budget), so a default install (maxSessions=10, budget 58)
+	// reserve, 32 at the default concurrency, and a stream is created at
+	// max(64, budget), so a default install (maxSessions=10, budget 62)
 	// still renders 64. The first maxSessions whose budget clears the floor
-	// is 13 (67); it was 17 when the reserve was 16. Above it the stream is
-	// 12 wider than it would have been, and so is the web user's
-	// unreapable-durable ceiling, which is the trade the block above already
-	// states.
+	// is 11 (65); it was 13 when the reserve was 28 and 17 when it was 16.
+	// Above it the stream is 16 wider than it would have been, and so is the
+	// web user's unreapable-durable ceiling, which is the trade the block
+	// above already states.
 	//
-	// A declared bridge concurrency moves the reserve by 2*a2aTasksReplayAsk
-	// per worker: 36 at 4, 44 at 6, and either clears the floor at the
-	// default maxSessions (66, 74). The gate at the end of the provision
+	// A declared bridge concurrency moves the reserve by
+	// a2aTasksReplayTailFactor*(a2aTasksReplayAsk+a2aTasksReplayLookAhead),
+	// 6 per worker -- the asks and the look-ahead, each with its tail: 44
+	// at 4, 56 at 6, and either clears the floor at the default maxSessions
+	// (74, 86). The gate at the end of the provision
 	// script compares the budget to the live stream, so an install that
 	// provisioned TASKS at 64 and then declared the sidecar is refused the
 	// way a raised maxSessions is, with the same two ways out and a third
@@ -693,7 +703,7 @@ const (
 	// ceiling hack/ci-deploy.sh already puts on the EVAL_TASK_PARALLELISM it
 	// writes into this env (1..1024): a bridge with more workers than its
 	// queue holds accepted tasks is a typo, not a sizing. At both ceilings
-	// the budget is 10000*3 + 20 + 4*1024 = 34116, nowhere near a wrap. A
+	// the budget is 10000*3 + 20 + 6*1024 = 36164, nowhere near a wrap. A
 	// literal past the cap counts as the cap, not as the default -- the
 	// default would silently under-budget a large install, the cap sizes it
 	// for every worker its queue can feed -- and the sum over sidecars is
@@ -710,10 +720,14 @@ const (
 	// read's probeConversation before and after its wait.
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
-	// a2aTasksReplayBridgeLookAhead is the bridge's pre-spawn look-ahead:
-	// lib.TaskInReplay at most once per dequeue from each worker, and at most
-	// Concurrency of them in hand at once, which the bridge paces.
-	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
+	// a2aTasksReplayLookAhead is the pre-spawn look-ahead replays one bridge
+	// worker holds: lib.TaskInReplay at most once per dequeue, and at most
+	// Concurrency of them in hand across the bridge at once, which the bridge
+	// paces. a2aTasksReplayBridgeLookAhead is that at the bridge's default,
+	// the look-ahead row above; a2aTasksReplayConsumersFor carries it per
+	// worker.
+	a2aTasksReplayLookAhead       = 1
+	a2aTasksReplayBridgeLookAhead = a2aTasksReplayLookAhead * a2aBridgeDefaultConcurrency
 	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
 	// the replay running and the one before it, still inside its five-second
 	// inactive threshold.
@@ -1971,9 +1985,10 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// The reserve without its per-worker term and the term itself, so the
 	// script can compute the worker count that fits beside this CR's
 	// maxSessions from the live stream the way it computes the maxSessions
-	// that fits: reserve(w) = fixedReserve + perWorker*w.
+	// that fits: reserve(w) = fixedReserve + perWorker*w, where a worker is
+	// its asks and its look-ahead, each with a tail.
 	fixedReserve := strconv.Itoa(a2aTasksReservedConsumersFor(0))
-	perWorker := strconv.Itoa(a2aTasksReplayTailFactor * a2aTasksReplayAsk)
+	perWorker := strconv.Itoa(a2aTasksReplayTailFactor * (a2aTasksReplayAsk + a2aTasksReplayLookAhead))
 	oneWorker := strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
 	oneAndOne := strconv.Itoa(a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
 	bridgeAboveDefault := bridgeWorkersN > a2aBridgeDefaultConcurrency
@@ -2732,13 +2747,17 @@ func a2aBridgeConcurrencyOf(value string) (count int, capped, defaulted bool) {
 }
 
 // a2aTasksReplayConsumersFor is a2aTasksReplayConsumers as a function of the
-// bridge's worker count: the asks row is a2aTasksReplayAsk per worker and the
-// other two rows do not move. gke-labs#2010's look-ahead row goes inside the
-// parentheses as one slot per worker (+ bridgeConcurrency), beside its
-// constant twin in the a2aTasksReplayConsumers sum.
+// bridge's worker count: the asks row is a2aTasksReplayAsk per worker, the
+// look-ahead row a2aTasksReplayLookAhead per worker, and the other two rows
+// do not move. Each per-worker term sits beside its constant twin in the
+// a2aTasksReplayConsumers sum -- a2aTasksReplayAsks and
+// a2aTasksReplayBridgeLookAhead, both at a2aBridgeDefaultConcurrency -- and
+// TestReservedConsumersIsTheSumOfItsTerms holds the two spellings equal
+// there.
 func a2aTasksReplayConsumersFor(bridgeConcurrency int) int {
 	return a2aTasksReplayTailFactor *
-		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsk*bridgeConcurrency)
+		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep +
+			a2aTasksReplayAsk*bridgeConcurrency + a2aTasksReplayLookAhead*bridgeConcurrency)
 }
 
 // a2aTasksReservedConsumersFor is the reserve's table evaluated at a bridge
@@ -2787,7 +2806,7 @@ func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
 // is what the render read and states the per-entry rule the script's
 // parenthetical states, in one clause. The attribution goes out whenever the
 // declared count moved the reserve, below the default as well as above it:
-// one worker is a reserve of 24, not 28, and a message that named
+// one worker is a reserve of 26, not 32, and a message that named
 // maxSessions alone over that number would be quoting an input it did not
 // name. The read clause goes out whenever an entry took the default, the
 // count it summed to included: a CR whose only entry is a valueFrom resolves
