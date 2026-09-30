@@ -388,10 +388,15 @@ and `BRIDGE_CONCURRENCY` set to `EVAL_TASK_PARALLELISM`, sized against the bridg
 as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
 as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
 sizes the `TASKS` consumer reserve from that `BRIDGE_CONCURRENCY` too, and provisioning
-never edits a stream that exists, so a bus provisioned before the sidecar is declared holds
-a `TASKS` narrower than the CR then asks for and the second provision Job refuses it,
-parking the CR `Degraded` over a working bus; the deploy does not read the CR's phase after
-the sidecar patch, and sizing the first provision for the sidecar is owed. The
+never edits a stream that exists, so a bus provisioned before the sidecar is declared would
+hold a `TASKS` narrower than the CR then asks for, and the second provision Job would refuse
+it. The deploy therefore sizes the first provision for the sidecar (decided 2026-09-30 on
+gke-labs/kube-agents#2077): its mode patch also sets `spec.harness.tuning.maxSessions` to the
+largest value whose budget at the lane's worker count fits the 64-consumer floor the first
+run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the reserve and the
+value clamps to 1), computed from four constants the script copies from the operator and
+pins against it. The deploy does not yet read the CR's phase after the sidecar patch, so a
+budget that outgrew the sizing would still park the CR `Degraded` over a working bus. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
 script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
@@ -558,7 +563,8 @@ it, and the wait goes.
 
 `EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
 today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, merge-patches the CR, and waits for the generation to move before
+Deployment's generation, merge-patches the CR (the mode, and the `maxSessions` sized for the
+sidecar to come), and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator

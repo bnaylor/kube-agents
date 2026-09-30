@@ -30,6 +30,18 @@ order the block's comment states (NATS, callout, provisioning Job, agent, the
 inject door, the sidecar's roll, the bridge's log line), and two workloads are
 deliberately absent from it: the A2A gateway, reported and not gated, and the
 shell StatefulSet, which does not change under next.
+
+The two provision runs (gke-labs/kube-agents#2077). The operator sizes the
+TASKS stream's consumer budget from the CR's maxSessions and from the bridge
+workers its sidecars declare, creates the stream at the larger of that budget
+and a floor of 64, never edits a stream that exists, and refuses a later
+render whose budget the live stream cannot hold. Step 6b declares the sidecar
+only after the bus is up, so the first provision creates TASKS for a CR with
+no sidecar and the sidecar patch re-renders the Job against it. The first
+patch therefore carries a maxSessions sized so the second budget fits the
+floor, computed from four constants copied from the operator's and pinned
+against them (the Go side's TestCiDeploySizesMaxSessionsToTheTasksFloor pins
+the same four against the functions that derive them).
 """
 
 import json
@@ -203,6 +215,12 @@ def lifted_block(start: str, stop: str, what: str) -> str:
                     return "\n".join(lines[index : end + 1])
             break
     raise AssertionError(f"{what} not found in {_CI_DEPLOY}")
+
+
+def max_sessions_derivation() -> str:
+    """Section 2b's sizing of MODE_NEXT_MAX_SESSIONS: the arithmetic and the
+    clamp under it."""
+    return lifted_block("MODE_NEXT_MAX_SESSIONS=$((", "  fi", "the maxSessions derivation")
 
 
 def prow_guard() -> str:
@@ -701,6 +719,113 @@ class FlagSetIsNextTest(unittest.TestCase):
         # And the render reads the Deployment after the mode roll, so the
         # environment it copies is the next-mode one.
         self.assertLess(block.index('gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"'), block.index("SIDECAR_PATCH="))
+
+
+class TasksBudgetSizingTest(unittest.TestCase):
+    """(b): the first patch carries a maxSessions sized so the sidecar patch's
+    budget fits the TASKS the first provision creates at the floor."""
+
+    def test_the_budget_terms_are_the_operators(self) -> None:
+        """The four numbers are copied from the operator, which keeps them as
+        Go constants and a function over them; each is read back from the
+        source it came from. The Go side pins the same four against the
+        functions (TestCiDeploySizesMaxSessionsToTheTasksFloor)."""
+        consts = constants()
+        manifests = text(_A2A_MANIFESTS)
+        self.assertEqual(int(consts["A2A_TASKS_FLOOR"]), go_int_constant(_A2A_MANIFESTS, "a2aTasksMaxConsumersFloor"))
+        per_session = go_int_constant(_A2A_MANIFESTS, "a2aSessionConsumersPerSession")
+        self.assertEqual(int(consts["A2A_SESSION_CONSUMERS"]), per_session)
+        # The reserve table at zero workers, and its slope. The overlap row
+        # is an alias of the per-session count, not a literal.
+        self.assertRegex(manifests, re.compile(r"^\s*a2aTasksIncarnationOverlap\s*=\s*a2aSessionConsumersPerSession$", re.MULTILINE))
+        tail = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayTailFactor")
+        fixed = (
+            go_int_constant(_A2A_MANIFESTS, "a2aTasksStandingDurables")
+            + go_int_constant(_A2A_MANIFESTS, "a2aTasksAuditDurableHeadroom")
+            + per_session
+            + go_int_constant(_A2A_MANIFESTS, "a2aTasksWebReaders")
+            + tail * (go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayBridgeDispatch") + go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayGatewaySweep"))
+        )
+        per_worker = tail * (go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayAsk") + go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayLookAhead"))
+        self.assertEqual(int(consts["A2A_RESERVE_FIXED"]), fixed)
+        self.assertEqual(int(consts["A2A_RESERVE_PER_WORKER"]), per_worker)
+        # And the function the operator evaluates is that table, in the
+        # order the script's comment states it.
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksReservedConsumersFor\(bridgeConcurrency int\) int \{\s*"
+            r"return a2aTasksStandingDurables \+ a2aTasksAuditDurableHeadroom \+ a2aTasksIncarnationOverlap \+\s*"
+            r"a2aTasksWebReaders \+ a2aTasksReplayConsumersFor\(bridgeConcurrency\)",
+        )
+
+    def test_max_sessions_is_the_largest_that_fits_the_floor_and_at_least_one(self) -> None:
+        """Section 2b's arithmetic, run for the lane's worker counts. The
+        tech lead's numbers: 6 at the presubmit's 4 workers, 2 at 6; at 8 the
+        floor cannot hold the reserve and the clamp gives 1, and the second
+        provision Job refuses."""
+        consts = constants()
+        floor, per_session = int(consts["A2A_TASKS_FLOOR"]), int(consts["A2A_SESSION_CONSUMERS"])
+        fixed, per_worker = int(consts["A2A_RESERVE_FIXED"]), int(consts["A2A_RESERVE_PER_WORKER"])
+        expected = {1: 12, 2: 10, 4: 6, 6: 2, 7: 1, 8: 1, int(consts["BRIDGE_QUEUE_CAPACITY"]): 1}
+        for workers, want in expected.items():
+            with self.subTest(workers=workers):
+                result = run_bash(
+                    "\n".join(
+                        [
+                            constants_block(),
+                            f"MODE_NEXT_BRIDGE_CONCURRENCY={workers}",
+                            max_sessions_derivation(),
+                            'echo "N=${MODE_NEXT_MAX_SESSIONS}"',
+                        ]
+                    )
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                got = int(re.search(r"N=(\d+)", result.stdout).group(1))
+                self.assertEqual(got, want)
+                budget = got * per_session + fixed + per_worker * workers
+                if budget <= floor:
+                    self.assertGreater(budget + per_session, floor, "not the largest maxSessions that fits")
+                else:
+                    self.assertEqual(got, 1, "past the floor only the clamp is left")
+        # The default lane fits; the reason the sizing exists.
+        default = int(consts["EVAL_TASK_PARALLELISM_DEFAULT"])
+        self.assertLessEqual(expected[default] * per_session + fixed + per_worker * default, floor)
+
+    def test_the_first_patch_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
+        consts = constants()
+        patch = json.loads(consts["MODE_NEXT_PATCH_FORMAT"] % 6)
+        self.assertEqual(patch, {"spec": {"mode": "next", "harness": {"tuning": {"maxSessions": 6}}}})
+        # The path is the CRD's: PlatformAgentSpec.Harness -> HarnessSpec.Tuning
+        # -> TuningSpec.MaxSessions, as the API package tags them.
+        api = text(_API_TYPES)
+        self.assertIn('Tuning *TuningSpec `json:"tuning,omitempty"`', api)
+        self.assertIn('MaxSessions *int `json:"maxSessions,omitempty"`', api)
+        self.assertIn('Harness *HarnessSpec `json:"harness,omitempty"`', text(_API_TYPES.parent / "platformagent_types.go"))
+        # Sized in section 2b, from the concurrency the guard there admitted,
+        # before anything is built.
+        script = text(_CI_DEPLOY)
+        guard = script.index('MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"')
+        derivation = script.index("MODE_NEXT_MAX_SESSIONS=$((")
+        self.assertLess(guard, derivation)
+        self.assertLess(derivation, script.index("# ─── 4. Build Container Images"))
+        self.assertIn("A2A_RESERVE_PER_WORKER * MODE_NEXT_BRIDGE_CONCURRENCY", script[derivation : derivation + 200])
+        # And in step 6b the log line, the patch's rendering, the patch and
+        # the first Job wait, in that order.
+        block = lifted(*_MODE_SECTION)
+        markers = [
+            'echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge\'s budget',
+            'printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"',
+            'kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"',
+            'case " ${JOB_CONDITIONS} " in',
+        ]
+        position = 0
+        for marker in markers:
+            with self.subTest(marker=marker):
+                found = block.find(marker, position)
+                self.assertGreater(found, -1, f"{marker!r} is missing after offset {position}")
+                position = found + len(marker)
+        # No other patch precedes it: the first render sees the cap.
+        self.assertEqual(block.index("kubectl patch platformagent"), block.index(markers[2]))
 
 
 class SidecarPatchTest(unittest.TestCase):

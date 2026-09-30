@@ -112,11 +112,12 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides, and
 #     arms the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
-#   - step 6b patches the CR, waits for the agent Deployment to roll, gates on
-#     the NATS StatefulSet, the callout Deployment, the provisioning Job and
-#     the agent Deployment, in that order, waits for the inject door's Service
-#     and token Secret, declares the bridge sidecar on the CR, and waits for
-#     the bridge to log that it is consuming `platform` tasks.
+#   - step 6b patches the CR (the mode, and the maxSessions section 2b sized
+#     for the sidecar to come), waits for the agent Deployment to roll, gates
+#     on the NATS StatefulSet, the callout Deployment, the provisioning Job
+#     and the agent Deployment, in that order, waits for the inject door's
+#     Service and token Secret, declares the bridge sidecar on the CR, and
+#     waits for the bridge to log that it is consuming `platform` tasks.
 # hack/ci-eval-pr.sh then runs the matrix through the door (AGENT_TRANSPORT=
 # inject) under the same flag. The chart deliberately renders no spec.mode
 # (docs/designs/spec-mode-switch.md), so the flip is a merge patch on the CR
@@ -144,7 +145,13 @@ readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agen
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
-readonly MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
+# The first patch: the mode, and the maxSessions section 2b sizes for the
+# sidecar patch to come, in one merge so the first render -- and so the first
+# provision Job -- sees both. A printf format; %d is MODE_NEXT_MAX_SESSIONS.
+# The field path is the CRD's (HarnessSpec.Tuning.MaxSessions in
+# k8s-operator/api/v1alpha1), which TestCiDeploySizesMaxSessionsToTheTasksFloor
+# holds by decoding this patch into the type.
+readonly MODE_NEXT_PATCH_FORMAT='{"spec":{"mode":"next","harness":{"tuning":{"maxSessions":%d}}}}'
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
@@ -196,6 +203,26 @@ readonly A2A_BUS_TOKEN_VOLUME="a2a-bus-token"
 # never approaches it, so the bound below catches a typo, not a sizing.
 readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
+# The TASKS consumer budget's terms, as the operator sizes it
+# (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
+# stream is created at max(budget, A2A_TASKS_FLOOR), where the budget is
+# maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
+# A2A_RESERVE_PER_WORKER * (the bridge workers the CR declares); provisioning
+# never edits a stream that exists, and a later render whose budget exceeds
+# the live stream is refused. Step 6b patches the mode and the sidecar
+# separately (a bridge cannot start before the bus), so the first provision
+# creates TASKS for a CR with no sidecar and the second is measured against
+# it: section 2b sizes spec.harness.tuning.maxSessions from these four so the
+# second budget fits the first stream. Copied, not derived, because the
+# operator's are Go constants (a2aTasksMaxConsumersFloor,
+# a2aSessionConsumersPerSession, and the reserve table
+# a2aTasksReservedConsumersFor evaluates: 20 fixed plus 6 per worker with
+# #2010's look-ahead row); TestCiDeploySizesMaxSessionsToTheTasksFloor there
+# and tests/test_ci_deploy_mode_next.py here fail when either side moves.
+readonly A2A_TASKS_FLOOR=64
+readonly A2A_SESSION_CONSUMERS=3
+readonly A2A_RESERVE_FIXED=20
+readonly A2A_RESERVE_PER_WORKER=6
 # The line the bridge logs once its durable consumer is bound
 # (a2a/hermes-bridge/bridge.go, Run): a JSON record with these two fields.
 # Until it appears the bus has an executor for nobody, and every case on the
@@ -546,6 +573,18 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -lt 1 ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then
     echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (an integer 1..${BRIDGE_QUEUE_CAPACITY})." >&2
     exit 1
+  fi
+  # The maxSessions the first provision is given, so that the sidecar patch
+  # in step 6b re-renders a budget the first run's TASKS already holds: the
+  # largest value with maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED
+  # + A2A_RESERVE_PER_WORKER * workers <= A2A_TASKS_FLOOR, and at least 1
+  # (the API's minimum; the eval spawns no session pods, so the number is
+  # capacity nobody draws on). At the presubmit's 4 workers that is 6, at 6
+  # it is 2. At 8 or more the floor cannot hold even the reserve: the clamp
+  # gives 1 and the second provision Job refuses.
+  MODE_NEXT_MAX_SESSIONS=$(((A2A_TASKS_FLOOR - A2A_RESERVE_FIXED - A2A_RESERVE_PER_WORKER * MODE_NEXT_BRIDGE_CONCURRENCY) / A2A_SESSION_CONSUMERS))
+  if [ "${MODE_NEXT_MAX_SESSIONS}" -lt 1 ]; then
+    MODE_NEXT_MAX_SESSIONS=1
   fi
 fi
 
@@ -946,7 +985,11 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # bridge that starts before NATS resolves crash-loops in the agent's pod and
 # holds the pod NotReady (a2a/docs/hermes-bridge.md, "What this deployment
 # method costs"). That declaration rolls the agent Deployment once more, and
-# the step ends on the bridge's own word that it is consuming `platform`
+# re-renders the provisioning Job, because the sidecar's BRIDGE_CONCURRENCY
+# is an input to the TASKS consumer budget; the first patch carries the
+# maxSessions section 2b sized so that second run's budget fits the stream
+# the first run created (the constants block says the arithmetic). Then the
+# step ends on the bridge's own word that it is consuming `platform`
 # tasks; until then the bus has an executor for nobody and every case on the
 # inject transport ends as infrastructure. The teardown's `helm uninstall`
 # removes the CR whole, so the flip-back-with-sidecar failure the bridge doc
@@ -1068,6 +1111,15 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next (EVAL_MODE_NEXT=1) ==="
+  # The mode and the session cap in one patch, so the first render -- and the
+  # first provisioning Job -- sees both. Section 2b sized the cap so the TASKS
+  # that Job creates at the floor holds the budget the sidecar patch below
+  # re-renders; the arithmetic is in the log for a reader of the artifact who
+  # finds a non-default maxSessions on the eval CR.
+  echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge's budget (${MODE_NEXT_MAX_SESSIONS}*${A2A_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY} <= ${A2A_TASKS_FLOOR})"
+  # The format is a named constant, which is the point of it (SC2059 wants a literal).
+  # shellcheck disable=SC2059
+  printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
   GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"
   wait_agent_generation_past "${GEN_BEFORE}" "the mode patch"

@@ -10,6 +10,8 @@ package controller
 // of the a2a module to the original.
 
 import (
+	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -30,6 +32,7 @@ const (
 	a2aManifestsSource  = "platformagent_a2a_manifests.go"
 	a2aBridgeMainSource = "../../../a2a/cmd/hermes-bridge/main.go"
 	a2aBridgeSource     = "../../../a2a/hermes-bridge/bridge.go"
+	ciDeploySource      = "../../../hack/ci-deploy.sh"
 )
 
 // reserveTableRow matches one row of the two tables above the reserve whose
@@ -499,5 +502,114 @@ func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
 	if len(lookAheadCalls) == 0 {
 		t.Errorf("no bridge source calls a *%s read: the bridge no longer replays per spawn, so a2aTasksReplayBridgeLookAhead reserves slots for code no render reaches. Remove it from the a2aTasksReplayConsumers sum, which takes replays in flight to 6, a2aTasksReplayConsumers to 12 and a2aTasksReservedConsumers to 28, and re-derive the two tables above the constants and the numbers the tests here pin.",
 			a2aBridgeLookAheadCall)
+	}
+}
+
+// hack/ci-deploy.sh sizes the eval CR's maxSessions so that the sidecar
+// patch, which re-renders the provision Job with the bridge's worker count,
+// asks for a budget the TASKS the first provision created at the floor
+// already holds (gke-labs/kube-agents#2077). It computes that from four
+// numbers copied from this package -- the floor, the per-session count, and
+// the reserve table's intercept and slope -- because a shell script cannot
+// evaluate Go constants. This holds the four to the constants and the
+// function they stand for, holds the arithmetic they feed to what it
+// promises (at the presubmit's 4 workers and at 6, a first render at the
+// floor and a second budget within it; at 8 the floor cannot hold the
+// reserve, and the lane relies on its Degraded gate), and decodes the patch
+// the script renders into the CR type, so the field path it names is one
+// the API has. Read from the source, for the reason the SessionConsumerRoles
+// test gives, and every step fails rather than defaults.
+func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
+	script, err := os.ReadFile(ciDeploySource)
+	if err != nil {
+		t.Fatalf("read %s: %v (if the script moved, this test's path must move with it; it is what keeps its budget constants honest)", ciDeploySource, err)
+	}
+	read := func(name string) int {
+		m := regexp.MustCompile(`(?m)^readonly ` + name + `=(\d+)$`).FindSubmatch(script)
+		if m == nil {
+			t.Fatalf("no `readonly %s=<int>` in %s; section 2b's maxSessions sizing reads it", name, ciDeploySource)
+		}
+		n, err := strconv.Atoi(string(m[1]))
+		if err != nil {
+			t.Fatalf("%s in %s is %q, not an integer", name, ciDeploySource, m[1])
+		}
+		return n
+	}
+	floor, perSession := read("A2A_TASKS_FLOOR"), read("A2A_SESSION_CONSUMERS")
+	fixed, perWorker := read("A2A_RESERVE_FIXED"), read("A2A_RESERVE_PER_WORKER")
+	if floor != a2aTasksMaxConsumersFloor {
+		t.Errorf("A2A_TASKS_FLOOR is %d, a2aTasksMaxConsumersFloor is %d: the script sizes maxSessions against a stream width the first provision no longer creates", floor, a2aTasksMaxConsumersFloor)
+	}
+	if perSession != a2aSessionConsumersPerSession {
+		t.Errorf("A2A_SESSION_CONSUMERS is %d, a2aSessionConsumersPerSession is %d", perSession, a2aSessionConsumersPerSession)
+	}
+	if want := a2aTasksReservedConsumersFor(0); fixed != want {
+		t.Errorf("A2A_RESERVE_FIXED is %d, the reserve at zero workers is %d", fixed, want)
+	}
+	if want := a2aTasksReservedConsumersFor(1) - a2aTasksReservedConsumersFor(0); perWorker != want {
+		t.Errorf("A2A_RESERVE_PER_WORKER is %d, the reserve's slope is %d", perWorker, want)
+	}
+	// The script's two-term line is the table only while the table is linear
+	// in the worker count.
+	for _, w := range []int{1, 2, 4, 6, 8, a2aBridgeConcurrencyMax} {
+		if got, want := a2aTasksReservedConsumersFor(w), fixed+perWorker*w; got != want {
+			t.Errorf("reserve at %d workers = %d; the script's %d + %d*w says %d", w, got, fixed, perWorker, want)
+		}
+	}
+	// Section 2b's arithmetic: bash's integer division truncates toward zero,
+	// and the clamp holds the API's minimum.
+	size := func(workers int) int {
+		n := (floor - fixed - perWorker*workers) / perSession
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
+	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_PATCH_FORMAT='(.*)'$`).FindSubmatch(script)
+	if format == nil {
+		t.Fatalf("no `readonly MODE_NEXT_PATCH_FORMAT='...'` in %s; it is the patch that carries the mode and the cap", ciDeploySource)
+	}
+	for _, tc := range []struct {
+		workers, want int
+		fits          bool
+	}{
+		{4, 6, true},
+		{6, 2, true},
+		{8, 1, false},
+	} {
+		n := size(tc.workers)
+		if n != tc.want {
+			t.Errorf("at %d workers the script sizes maxSessions=%d, want %d", tc.workers, n, tc.want)
+		}
+		// The first patch, decoded into the CR type with unknown fields
+		// refused: the path is spec.harness.tuning.maxSessions, and the mode
+		// rides in the same merge so the first render sees both.
+		agent := &agentv1alpha1.PlatformAgent{}
+		dec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(agent); err != nil {
+			t.Fatalf("MODE_NEXT_PATCH_FORMAT does not decode into a PlatformAgent: %v", err)
+		}
+		if agent.Spec.Mode == nil || *agent.Spec.Mode != "next" {
+			t.Errorf("the first patch does not set spec.mode: next (got %v)", agent.Spec.Mode)
+		}
+		if got := resolveA2AMaxSessions(agent); got != n {
+			t.Errorf("the first patch's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)
+		}
+		// The first render, with no sidecar declared: TASKS is created at the
+		// floor, never wider.
+		if got := a2aTasksMaxConsumers(agent); got != a2aTasksMaxConsumersFloor {
+			t.Errorf("at %d workers the first render creates TASKS at %d consumers, not the floor %d", tc.workers, got, a2aTasksMaxConsumersFloor)
+		}
+		// The second, with the sidecar the script declares at the lane's
+		// worker count, measured against that stream.
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+			Name: "hermes-bridge", Image: "bridge:dev",
+			Env: []corev1.EnvVar{{Name: a2aBridgeConcurrencyEnvVar, Value: strconv.Itoa(tc.workers)}},
+		}}}
+		budget := a2aTasksConsumerBudget(agent)
+		if fits := budget <= a2aTasksMaxConsumersFloor; fits != tc.fits {
+			t.Errorf("at %d workers with maxSessions=%d the second budget is %d against a %d-wide TASKS; fits=%v, want %v", tc.workers, n, budget, a2aTasksMaxConsumersFloor, fits, tc.fits)
+		}
 	}
 }
