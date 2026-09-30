@@ -68,30 +68,65 @@ func (f *fakeSlackAPI) OpenConversation(params *slack.OpenConversationParameters
 
 func newTestSlackAdapter(api *fakeSlackAPI) *SlackAdapter {
 	return &SlackAdapter{api: api, log: slog.Default(), botUserID: "UBOT",
-		sessionThreads: map[string]bool{}, sessionMarkedAt: map[string]time.Time{}, seen: map[string]bool{}}
+		sessionThreads: map[string]bool{}, sessionExpiresAt: map[string]time.Time{}, seen: map[string]bool{},
+		now: time.Now}
+}
+
+// fakeClock pins a SlackAdapter's clock to a value the test moves by hand,
+// so an expiry is a fact the test arranged and not a sleep raced against
+// the runner. TTLs are then comfortable and no statement has to run inside
+// one.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock(a *SlackAdapter) *fakeClock {
+	c := &fakeClock{t: time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)}
+	a.now = c.now
+	return c
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+	return c.t
 }
 
 // countingLookup is a SessionLookup a test wires as a.sessions. It answers
-// from held (absent means false, nil) or fail (an error for that key), and
-// records every conversation it was asked about. The registry read is the
-// one synchronous round trip isSessionThread makes on the event pump's own
-// goroutine, so tests assert on how often it happens, not only on its
-// answer. Mutexed because the gateway tests drive it beside real workers.
+// from held (absent means false, nil) or fail (an error for that key), with
+// until as the bound on every true (the zero value is a true that never
+// expires, for tests that are not about expiry), and records every
+// conversation it was asked about. The registry read is the one synchronous
+// round trip isSessionThread makes on the event pump's own goroutine, so
+// tests assert on how often it happens, not only on its answer. Mutexed
+// because the gateway tests drive it beside real workers.
 type countingLookup struct {
 	mu    sync.Mutex
 	held  map[string]bool
+	until time.Time
 	fail  map[string]error
 	asked []string
 }
 
-func (l *countingLookup) lookup(_ context.Context, conversation string) (bool, error) {
+func (l *countingLookup) lookup(_ context.Context, conversation string) (bool, time.Time, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.asked = append(l.asked, conversation)
 	if err := l.fail[conversation]; err != nil {
-		return false, err
+		return false, time.Time{}, err
 	}
-	return l.held[conversation], nil
+	if !l.held[conversation] {
+		return false, time.Time{}, nil
+	}
+	return true, l.until, nil
 }
 
 func (l *countingLookup) calls() int {
@@ -103,7 +138,7 @@ func (l *countingLookup) calls() int {
 // noSessions is a SessionLookup that holds nothing: the registry of a
 // gateway that has started no task anywhere, which is what a cache miss
 // asks in the adapter-only tests.
-func noSessions(context.Context, string) (bool, error) { return false, nil }
+func noSessions(context.Context, string) (bool, time.Time, error) { return false, time.Time{}, nil }
 
 // stalledSlackStub is a Slack Web API stub that parks every request until
 // unblock is called, then answers invalid_auth (one of the four errors
@@ -325,7 +360,7 @@ func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
 	if rec.ActiveTask != nil || len(rec.Tasks) != 0 {
 		t.Fatalf("a stop with nothing running started a task: %+v", rec)
 	}
-	if held, err := a.sessions(ctx, "slack:C1/200.1"); err != nil || held {
+	if held, _, err := a.sessions(ctx, "slack:C1/200.1"); err != nil || held {
 		t.Fatalf("the lookup adopted a thread no task ever started in: held=%v err=%v", held, err)
 	}
 	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "anyway, lunch?", "5.0", "200.1")); ok {
@@ -334,7 +369,7 @@ func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
 
 	// The ask that does start a task adopts the thread, cache wiped or not.
 	g.handleInbound(InboundMessage{Conversation: "slack:C1/200.1", Kind: "group", AuthorID: "U1", MessageID: "6.0", Text: "drain node 3"})
-	if held, err := a.sessions(ctx, "slack:C1/200.1"); err != nil || !held {
+	if held, _, err := a.sessions(ctx, "slack:C1/200.1"); err != nil || !held {
 		t.Fatalf("a started task must make the lookup answer true: held=%v err=%v", held, err)
 	}
 	a.mu.Lock()
@@ -379,7 +414,7 @@ func TestSideDoorForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
 	if !ok {
 		t.Fatal("the composite must implement SessionLookupSink")
 	}
-	sink.SetSessionLookup(func(context.Context, string) (bool, error) { return true, nil }, 7*time.Minute)
+	sink.SetSessionLookup(func(context.Context, string) (bool, time.Time, error) { return true, time.Time{}, nil }, 7*time.Minute)
 	a.mu.Lock()
 	forwarded := a.sessions != nil
 	ttl := a.sessionTTL
@@ -401,19 +436,24 @@ func TestSideDoorForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
 func TestSlackSessionMarkExpiresOnTheIdleTTL(t *testing.T) {
 	ctx := context.Background()
 	a := newTestSlackAdapter(&fakeSlackAPI{})
+	clock := newFakeClock(a)
 	reg := &countingLookup{}
 	a.sessions = reg.lookup
-	a.sessionTTL = 50 * time.Millisecond
+	const ttl = 10 * time.Minute
+	a.sessionTTL = ttl
 	const key = "C1/9.0"
-	cached := func() (v, ok, stamped bool) {
+	cached := func() (v, ok bool, exp time.Time, stamped bool) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		v, ok = a.sessionThreads[key]
-		_, stamped = a.sessionMarkedAt[key]
-		return v, ok, stamped
+		exp, stamped = a.sessionExpiresAt[key]
+		return v, ok, exp, stamped
 	}
 
 	a.TaskStarted("slack:"+key, "task-1")
+	if _, _, exp, stamped := cached(); !stamped || !exp.Equal(clock.now().Add(ttl)) {
+		t.Fatalf("TaskStarted must write a true that expires a TTL from now: stamped=%v exp=%v", stamped, exp)
+	}
 	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "and the other one", "10.0", "9.0")); !ok {
 		t.Fatal("an unmentioned reply inside the TTL must deliver")
 	}
@@ -421,15 +461,15 @@ func TestSlackSessionMarkExpiresOnTheIdleTTL(t *testing.T) {
 		t.Fatalf("a fresh true consulted the registry %d times, want 0", n)
 	}
 
-	time.Sleep(60 * time.Millisecond)
+	clock.advance(ttl)
 	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "still there?", "11.0", "9.0")); ok {
 		t.Fatal("an unmentioned reply past the TTL, with the registry answering false, must not be a turn")
 	}
 	if n := reg.calls(); n != 1 {
 		t.Fatalf("the expired true consulted the registry %d times, want 1", n)
 	}
-	if v, ok, stamped := cached(); !ok || v || stamped {
-		t.Fatalf("after the registry's false the cache must hold false and no stamp: v=%v ok=%v stamped=%v", v, ok, stamped)
+	if v, ok, _, stamped := cached(); !ok || v || stamped {
+		t.Fatalf("after the registry's false the cache must hold false and no expiry: v=%v ok=%v stamped=%v", v, ok, stamped)
 	}
 
 	// A new task in the thread: marked again, and the mark answers alone.
@@ -442,29 +482,45 @@ func TestSlackSessionMarkExpiresOnTheIdleTTL(t *testing.T) {
 	}
 
 	// The registry still holds the session when the mark expires: the reply
-	// delivers, the entry is restamped, and the next reply inside the TTL
-	// does not ask again.
+	// delivers, the entry takes the bound the registry handed back, and the
+	// next reply inside that bound does not ask again. The bound is the
+	// registry's own, not now+TTL: the registry answers by LastActivity+TTL,
+	// and the message that made the adapter ask may have moved no activity
+	// (an unmapped sender's, refused by the gateway), so an entry stamped
+	// from the adapter's clock would outlive the registry's answer by up to
+	// a TTL. Here the registry says "true, for another 3 minutes".
+	expired := clock.advance(ttl)
+	until := expired.Add(3 * time.Minute)
 	reg.mu.Lock()
 	reg.held = map[string]bool{"slack:" + key: true}
+	reg.until = until
 	reg.mu.Unlock()
-	time.Sleep(60 * time.Millisecond)
 	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "one more", "13.0", "9.0")); !ok {
 		t.Fatal("past the TTL with the registry answering true, the reply must deliver")
 	}
 	if n := reg.calls(); n != 2 {
 		t.Fatalf("the second expiry consulted the registry %d times in all, want 2", n)
 	}
-	a.mu.Lock()
-	age := time.Since(a.sessionMarkedAt[key])
-	a.mu.Unlock()
-	if age >= a.sessionTTL {
-		t.Fatalf("a positive registry answer must restamp the entry; stamp is %v old", age)
+	if v, ok, exp, stamped := cached(); !ok || !v || !stamped || !exp.Equal(until) {
+		t.Fatalf("a positive registry answer must expire the entry at the registry's until, not now+TTL: v=%v ok=%v exp=%v want %v", v, ok, exp, until)
 	}
+	clock.advance(2 * time.Minute)
 	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "and another", "14.0", "9.0")); !ok {
-		t.Fatal("a reply inside the refreshed TTL must deliver")
+		t.Fatal("a reply inside the registry's bound must deliver")
 	}
 	if n := reg.calls(); n != 2 {
-		t.Fatalf("a restamped true consulted the registry again (%d calls, want still 2)", n)
+		t.Fatalf("a true inside the registry's bound consulted the registry again (%d calls, want still 2)", n)
+	}
+	// At the registry's bound -- 3 minutes on, well inside a TTL from the
+	// adapter's own stamp -- the entry is expired and the registry is asked
+	// again. This is the assertion that separates "expires at until" from
+	// "expires at now+TTL".
+	clock.advance(time.Minute)
+	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "still?", "15.0", "9.0")); !ok {
+		t.Fatal("at the registry's bound with the registry still answering true, the reply must deliver")
+	}
+	if n := reg.calls(); n != 3 {
+		t.Fatalf("the entry must expire at the registry's until: registry consulted %d times in all, want 3", n)
 	}
 }
 
@@ -474,23 +530,25 @@ func TestSlackSessionMarkExpiresOnTheIdleTTL(t *testing.T) {
 // read the never-downgrade rule is for, and it must not win.
 func TestSlackExpiredMarkForceYieldsToAFreshTrue(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
-	a.sessionTTL = 50 * time.Millisecond
+	clock := newFakeClock(a)
+	const ttl = 10 * time.Minute
+	a.sessionTTL = ttl
 	a.markSessionThread("C1/1.0", true)
-	time.Sleep(60 * time.Millisecond)
+	clock.advance(ttl)
 	a.mu.Lock()
 	expired := a.markExpiredLocked("C1/1.0")
 	a.mu.Unlock()
 	if !expired {
 		t.Fatal("the mark should have expired")
 	}
-	a.markSessionThread("C1/1.0", true) // the TaskStarted that raced the read
-	a.setMark("C1/1.0", false, true)    // the read's answer, arriving late
+	a.markSessionThread("C1/1.0", true)           // the TaskStarted that raced the read
+	a.setMark("C1/1.0", false, true, time.Time{}) // the read's answer, arriving late
 	if !a.sessionThreads["C1/1.0"] {
 		t.Fatal("a forced false overwrote a true that was restamped during the read")
 	}
 	// And with nothing racing, the forced false lands.
-	time.Sleep(60 * time.Millisecond)
-	a.setMark("C1/1.0", false, true)
+	clock.advance(ttl)
+	a.setMark("C1/1.0", false, true, time.Time{})
 	if v := a.sessionThreads["C1/1.0"]; v {
 		t.Fatal("a forced false on an entry still expired must land")
 	}
@@ -1002,6 +1060,35 @@ func TestToMrkdwnEscapesAmpersandsInsideLinkURLs(t *testing.T) {
 	}
 }
 
+// TestToMrkdwnRefusesPipesInsideLinkURLs: Slack splits the <url|text> the
+// link rewrite emits at its FIRST pipe. A markdown link whose URL carries a
+// pipe would therefore render as a link to the text before the pipe, under
+// display text the URL chose -- [Trace](https://evil.example/x|https://good.example)
+// as <https://evil.example/x|https://good.example|Trace> shows "good" and
+// goes to "evil". The URL class excludes the pipe, so such a link is left
+// as the escaped plain markdown it arrived as and no <...|...> is produced;
+// an ordinary link beside it still converts.
+func TestToMrkdwnRefusesPipesInsideLinkURLs(t *testing.T) {
+	cases := map[string]string{
+		"[Trace](https://evil.example/x|https://good.example)": "[Trace](https://evil.example/x|https://good.example)",
+		"[a](https://x.example/p|q)":                           "[a](https://x.example/p|q)",
+		// The crafted link beside an honest one: only the honest one converts.
+		"[ok](https://x.example/p) and [Trace](https://evil.example/x|https://good.example)": "<https://x.example/p|ok> and [Trace](https://evil.example/x|https://good.example)",
+		// The same URL, with the pipe percent-encoded as a URL must carry it,
+		// is an ordinary link.
+		"[Trace](https://x.example/p%7Cq)": "<https://x.example/p%7Cq|Trace>",
+	}
+	for in, want := range cases {
+		got := toMrkdwn(in)
+		if got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+		if strings.Contains(in, "|") && strings.Contains(got, "|https://good.example|") {
+			t.Errorf("toMrkdwn(%q) = %q produced a link whose display text the URL chose", in, got)
+		}
+	}
+}
+
 // TestToMrkdwnNeutralisesControlSequences is the property the escaping exists
 // for and the one no link-handling change may cost us. Relayed text is
 // executor output — model output — so a prompt-injected result containing
@@ -1397,11 +1484,11 @@ func TestSlackAckCtxFailsOnACancelledContext(t *testing.T) {
 func TestSlackSessionLookupLogLevels(t *testing.T) {
 	// The registry's answer is whatever the context says, the way a real
 	// KV read surfaces ctx.Err() on a cancelled or expired context.
-	ctxErr := func(ctx context.Context, _ string) (bool, error) {
+	ctxErr := func(ctx context.Context, _ string) (bool, time.Time, error) {
 		if err := ctx.Err(); err != nil {
-			return false, fmt.Errorf("kv get: %w", err)
+			return false, time.Time{}, fmt.Errorf("kv get: %w", err)
 		}
-		return false, errors.New("kv unavailable")
+		return false, time.Time{}, errors.New("kv unavailable")
 	}
 	uncached := func(t *testing.T, a *SlackAdapter, key string) {
 		t.Helper()
@@ -1652,20 +1739,20 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	var asked []string
 	registryDown := true
-	a.sessions = func(_ context.Context, conversation string) (bool, error) {
+	a.sessions = func(_ context.Context, conversation string) (bool, time.Time, error) {
 		asked = append(asked, conversation)
 		switch conversation {
 		case "slack:C1/200.1":
-			return true, nil
+			return true, time.Time{}, nil
 		case "slack:C1/230.1":
 			// A session thread behind a registry that fails once and then
 			// recovers.
 			if registryDown {
-				return false, errors.New("kv unavailable")
+				return false, time.Time{}, errors.New("kv unavailable")
 			}
-			return true, nil
+			return true, time.Time{}, nil
 		}
-		return false, nil
+		return false, time.Time{}, nil
 	}
 
 	// The registry holds the thread: delivered, and cached.
@@ -1779,7 +1866,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 	// registry is consulted; the answers are still the real registry's.
 	registry := a.sessions
 	var consulted int
-	a.sessions = func(ctx context.Context, conversation string) (bool, error) {
+	a.sessions = func(ctx context.Context, conversation string) (bool, time.Time, error) {
 		consulted++
 		return registry(ctx, conversation)
 	}
@@ -1815,7 +1902,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 	if cached {
 		t.Fatalf("an unverified sender's ask marked its thread as %v; it must mark nothing", v)
 	}
-	if held, err := a.sessions(ctx, "slack:C1/300.1"); err != nil || held {
+	if held, _, err := a.sessions(ctx, "slack:C1/300.1"); err != nil || held {
 		t.Fatalf("the registry holds a session for the unverified sender's thread: held=%v err=%v", held, err)
 	}
 }
@@ -1893,12 +1980,21 @@ func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
 	if err := g.reg.Put(ctx, rec); err != nil {
 		t.Fatalf("releasing the task: %v", err)
 	}
+	// Released but inside the TTL: still a session thread, and the bound
+	// the registry hands back is its own, LastActivity + TTL.
+	held, until, err := a.sessions(ctx, conv)
+	if err != nil || !held {
+		t.Fatalf("a released task inside the idle TTL must still be a session thread: held=%v err=%v", held, err)
+	}
+	if want := rec.LastActivity.Add(ttl); !until.Equal(want) {
+		t.Fatalf("the idle-bounded positive must expire at LastActivity+TTL: until=%v want %v", until, want)
+	}
 	time.Sleep(ttl + 100*time.Millisecond)
 	rec, err = g.reg.Get(ctx, conv)
 	if err != nil || rec == nil || len(rec.Tasks) == 0 {
 		t.Fatalf("the record must survive with its task history for this test to mean anything: rec=%+v err=%v", rec, err)
 	}
-	if held, err := a.sessions(ctx, conv); err != nil || held {
+	if held, _, err := a.sessions(ctx, conv); err != nil || held {
 		t.Fatalf("an idle session with a record and a past task must not be a session thread: held=%v err=%v", held, err)
 	}
 	if got, ok := a.inbound(ctx, slackMsg("channel", "C1", "U1", "stop", "6.0", "200.1")); ok {
@@ -1918,10 +2014,91 @@ func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
 	// The running-task half: nothing terminates this task, and the TTL
 	// passing does not end the session while it runs.
 	time.Sleep(ttl + 100*time.Millisecond)
-	if held, err := a.sessions(ctx, conv); err != nil || !held {
+	if held, _, err := a.sessions(ctx, conv); err != nil || !held {
 		t.Fatalf("a running task must keep the thread a session thread past the TTL: held=%v err=%v", held, err)
 	}
 	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U1", "still going?", "9.0", "200.1")); !ok {
 		t.Fatal("with a task running, an unmentioned reply past the TTL must deliver from the registry")
+	}
+}
+
+// TestSlackGatewayDetachedTaskIsNotARunningTask: a task the user stopped
+// whose terminal never arrived is left on the record with Detached set
+// (cancelTask), and the reap treats it as not running. The lookup must
+// share that predicate: a detached task with stale activity does not keep
+// its thread a session thread forever, while the same task not detached
+// does, however stale the activity. Driven through the real gateway and
+// its registry, with the record written back the way the idle test
+// releases a task.
+func TestSlackGatewayDetachedTaskIsNotARunningTask(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U1 test:jayanti\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-slack-detached"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	const ttl = 30 * time.Minute
+	cfg := &Config{
+		NATSURL:          url,
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          ttl,
+		AttributionSalt:  []byte("test-salt"),
+	}
+	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const conv = "slack:C1/200.1"
+	marked := func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.sessionThreads["C1/200.1"]
+	}
+	g.handleInbound(InboundMessage{Conversation: conv, Kind: "group", AuthorID: "U1", MessageID: "4.0", Text: "drain node 3"})
+	waitFor(t, "the gateway to start a task in C1/200.1 and the adapter to mark it", marked)
+	rec, err := g.reg.Get(ctx, conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("expected an active task on the record: rec=%+v err=%v", rec, err)
+	}
+
+	// The stop went out, no terminal came back, and the activity is stale.
+	rec.ActiveTask.Detached = true
+	rec.LastActivity = time.Now().Add(-2 * ttl)
+	if err := g.reg.Put(ctx, rec); err != nil {
+		t.Fatalf("detaching the task: %v", err)
+	}
+	if held, _, err := a.sessions(ctx, conv); err != nil || held {
+		t.Fatalf("a detached task with stale activity must not keep the thread a session thread: held=%v err=%v", held, err)
+	}
+	// A restart: the cache is gone, the registry is the only source.
+	a.mu.Lock()
+	a.sessionThreads = map[string]bool{}
+	a.sessionExpiresAt = map[string]time.Time{}
+	a.threadsOrder = nil
+	a.mu.Unlock()
+	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "anyone?", "5.0", "200.1")); ok {
+		t.Fatal("an unmentioned reply in a thread whose only task is detached and idle must not be a turn")
+	}
+
+	// The same record, task not detached: running, and the thread stays
+	// a session thread whatever the activity says.
+	rec.ActiveTask.Detached = false
+	if err := g.reg.Put(ctx, rec); err != nil {
+		t.Fatalf("re-attaching the task: %v", err)
+	}
+	if held, _, err := a.sessions(ctx, conv); err != nil || !held {
+		t.Fatalf("a running task must keep the thread a session thread past any TTL: held=%v err=%v", held, err)
 	}
 }

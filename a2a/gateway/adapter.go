@@ -264,10 +264,11 @@ type ProbeSink interface {
 }
 
 // SessionLookup answers whether the gateway has started a task in a
-// conversation and the session is not idle past the idle TTL. A running
-// task counts regardless of age: the conversation is a session for as long
-// as the task runs. Otherwise it is one only while its record shows
-// activity within the TTL.
+// conversation and the session is not idle past the idle TTL, and, with a
+// true, the moment that answer stops being trustworthy. A running task
+// counts regardless of age: the conversation is a session for as long as
+// the task runs. Otherwise it is one only while its record shows activity
+// within the TTL.
 //
 // A record alone is not the answer, in either direction. One is minted for
 // any verified turn, including a "stop" with nothing running, so its
@@ -276,7 +277,8 @@ type ProbeSink interface {
 // included, and nothing deletes records at all -- so its existence does not
 // say the session is live either. The lookup reads the two facts the record
 // does carry, the active task and the last activity, and answers from
-// those.
+// those. Running means what it means to the reap: an active task that is
+// not detached.
 //
 // It is a PURE READ of the session registry, like ConversationProbe: no
 // lock, no heal, no post, no write, one KV read.
@@ -289,15 +291,25 @@ type ProbeSink interface {
 // restart or a cache eviction, and its unmentioned follow-ups ("stop") have
 // no other source to be recognised from. The registry is the source of
 // truth for which conversations the gateway is in, so a cold cache asks it
-// first, and a positive entry that has aged past the TTL asks it again.
+// first, and a positive entry that has expired asks it again.
 //
-// The TTL is handed over beside the lookup (SessionLookupSink) so that the
-// adapter can expire its own positive cache on the same bound the lookup
-// answers by, rather than holding a true for the life of the entry.
+// until is the registry's own bound on a true, handed back so the adapter's
+// cache expires when the answer does and not later: for an idle-bounded
+// session it is the last activity plus the TTL, the instant the registry
+// would begin answering false; for a running task, which has no bound, it
+// is a TTL from now, when the adapter asks again and is answered again. A
+// cache that stamped its own clock instead would hold a true for up to a
+// TTL past the registry's word whenever the message that made it ask moved
+// no activity -- one the gateway refused, an unmapped sender's. With a
+// false, until is the zero time and means nothing.
+//
+// The TTL is still handed over beside the lookup (SessionLookupSink): a
+// true the adapter writes on its own word (TaskStarted) has no registry
+// answer to take a bound from, and expires a TTL after the start.
 //
 // Called on the adapter's own event goroutine under the adapter's own
 // bound, never from a gateway worker.
-type SessionLookup func(ctx context.Context, conversation string) (bool, error)
+type SessionLookup func(ctx context.Context, conversation string) (held bool, until time.Time, err error)
 
 // SessionLookupSink is the optional extension an Adapter implements to
 // receive the gateway's SessionLookup and the idle TTL it is bounded by.

@@ -25,10 +25,12 @@ import (
 // here drives the executor side through the lib, as the bridge does.
 
 // Compile-time contract. The inject backend is the one adapter that has to
-// answer ABOUT a task, and the chat backends deliberately do not -- a human
-// reads the chat, so the rendered text is their whole interface. The negative
-// assertions are in TestWhichAdaptersObserveTasks below, which a
-// compile-time var cannot express.
+// answer ABOUT a task. Discord and gchat deliberately do not -- a human reads
+// the chat, so the rendered text is their whole interface -- and Slack
+// implements TaskObserver for TaskStarted only, to learn which threads a task
+// started in; it answers about nothing. The negative assertions are in
+// TestWhichAdaptersObserveTasks below, which a compile-time var cannot
+// express.
 var (
 	_ Adapter         = (*InjectAdapter)(nil)
 	_ TaskObserver    = (*InjectAdapter)(nil)

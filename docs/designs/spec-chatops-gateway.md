@@ -924,9 +924,10 @@ a sender the principal map refuses roots nothing. A session thread stays one whi
 task runs there or the session has had activity within the idle TTL; past that, the
 thread needs a fresh mention. The bound is activity, not the record: the session record
 outlives the reap (which deletes the idle pod and keeps the record), so the registry
-answers from the active task and the last activity, and the adapter expires its own
-cached answer on the same TTL and asks again. Two subtypes count as turns besides plain
-messages: `thread_broadcast` (a
+answers from the active task and the last activity, hands back the bound its answer
+holds to, and the adapter expires its cached answer on that bound - the registry's own,
+not a TTL of its own counting - and asks again. Two subtypes count as turns besides
+plain messages: `thread_broadcast` (a
 thread reply with "also send to channel" checked - dropping it would eat a steer
 silently) and `file_share` (an ask with an attachment). Everything else drops in the
 adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs

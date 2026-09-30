@@ -880,8 +880,9 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
 // whether the gateway has started a task in the conversation and the
 // session is not idle past the idle TTL, read from the registry and
-// reported with nothing changed. A pure read, as SessionLookup requires --
-// no lock, no heal, no post, no publish, no write.
+// reported with nothing changed, plus the moment that answer stops being
+// trustworthy. A pure read, as SessionLookup requires -- no lock, no heal,
+// no post, no publish, no write.
 //
 // A record alone is not the answer. mintSession creates one for ANY verified
 // turn before the text is dispatched, so a mapped user's "@bot stop" with
@@ -894,23 +895,42 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 // Nor is a record with a past task the answer forever. A running task keeps
 // the conversation a session however long it runs (reapOnce never touches a
 // pod under one, and a thread whose task is still working must carry the
-// "stop"). Otherwise the conversation is a session only while it has had
-// activity within the idle TTL: LastActivity is written by routeTurn on
-// every turn and persisted, and the TTL is the same g.cfg.IdleTTL reapOnce
-// reads. The record itself is not the bound -- reapOnce deletes the pod and
-// keeps the record, Tasks and all, and nothing else deletes it -- so a read
-// keyed on the record's existence would answer true for any thread a task
-// ever started in, for good. Activity is the bound; the record merely
-// carries it.
-func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, error) {
+// "stop"). Running is the reap's own predicate -- an ActiveTask that is not
+// Detached -- so this read and the reap share one definition of it: a task
+// the user has stopped, whose terminal never arrived (cancelTask sets
+// Detached and leaves ActiveTask in place), is not running here any more
+// than it exempts the pod there. Otherwise the conversation is a session
+// only while it has had activity within the idle TTL: LastActivity is
+// written by routeTurn on every turn and persisted, and the TTL is the same
+// g.cfg.IdleTTL reapOnce reads. The record itself is not the bound --
+// reapOnce deletes the pod and keeps the record, Tasks and all, and nothing
+// else deletes it -- so a read keyed on the record's existence would answer
+// true for any thread a task ever started in, for good. Activity is the
+// bound; the record merely carries it.
+//
+// The until returned with a true is the registry's own bound, not the
+// adapter's: for the idle case it is LastActivity + IdleTTL, the instant the
+// registry itself would start answering false, so a cache that expires on
+// it cannot outlive the answer it was given (a message the gateway refuses,
+// an unmapped sender's, moves nothing, and a cache stamped from its own
+// clock would hold a true the registry had already withdrawn). For a
+// running task there is no bound to hand over, so it is now + IdleTTL: the
+// adapter asks again then, and a task still running is answered again.
+func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, time.Time, error) {
 	rec, err := g.reg.Get(ctx, conversation)
 	if err != nil || rec == nil {
-		return false, err
+		return false, time.Time{}, err
 	}
-	if rec.ActiveTask != nil {
-		return true, nil
+	now := time.Now()
+	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
+		return true, now.Add(g.cfg.IdleTTL), nil
 	}
-	return len(rec.Tasks) > 0 && time.Since(rec.LastActivity) < g.cfg.IdleTTL, nil
+	if len(rec.Tasks) > 0 {
+		if until := rec.LastActivity.Add(g.cfg.IdleTTL); now.Before(until) {
+			return true, until, nil
+		}
+	}
+	return false, time.Time{}, nil
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
