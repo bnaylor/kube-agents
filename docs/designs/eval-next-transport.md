@@ -395,8 +395,9 @@ gke-labs/kube-agents#2077): its mode patch also sets `spec.harness.tuning.maxSes
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first
 run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the reserve and the
 value clamps to 1), computed from four constants the script copies from the operator and
-pins against it. The deploy does not yet read the CR's phase after the sidecar patch, so a
-budget that outgrew the sizing would still park the CR `Degraded` over a working bus. The
+pins against it, and after the sidecar patch it waits for the re-run provision Job and reads
+the CR's phase, so a refusal reds the lane rather than parking the CR `Degraded` over a
+working bus. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
 script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
@@ -574,7 +575,11 @@ the door and the executor. The deploy arms the gateway's inject door on the oper
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
 image overrides) and waits for the door's Service and token Secret; it then declares the bridge
 sidecar on the CR through `spec.deployment.sidecars` (the executor paragraph in stage 1 says
-what the sidecar carries), waits for the agent Deployment to roll once more, and ends on the
+what the sidecar carries), waits for the agent Deployment to roll once more and for the
+provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
+budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
+that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
+being read past), and ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
