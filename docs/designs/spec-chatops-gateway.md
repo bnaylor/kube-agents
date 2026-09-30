@@ -922,7 +922,8 @@ included). Nothing is derived from the root message. A mention on its own starts
 nothing and makes nothing a session thread, whoever typed it, so a channel mention from
 a sender the principal map refuses roots nothing. A session thread stays one while a
 task runs there or the session has had activity within the idle TTL; past that, the
-thread needs a fresh mention. The bound is activity, not the record: the session record
+thread needs a fresh mention. A task's end counts as activity, so the window opens at the
+answer, not at the ask that started a long task. The bound is activity, not the record: the session record
 outlives the reap (which deletes the idle pod and keeps the record), so the registry
 answers from the active task and the last activity, hands back the bound its answer
 holds to, and the adapter expires its cached answer on that bound - the registry's own,

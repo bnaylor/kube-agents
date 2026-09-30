@@ -283,13 +283,37 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // TaskTerminal, TaskAccepted and CancelPublished are not the Slack adapter's
 // business: a human reads the thread. A thread stays a session thread past
 // its task's end for as long as the session has been active within the idle
-// TTL -- the cache expires its true on the registry's own bound and
-// re-asks the registry, which answers by the record's last activity, not
-// by the record's existence, since the record outlives the reap -- so
-// nothing is unmarked here, and nothing needs to be.
-func (s *SlackAdapter) TaskTerminal(string, string, lib.TaskState, TerminalSource, string) {}
-func (s *SlackAdapter) TaskAccepted(string, string)                                        {}
-func (s *SlackAdapter) CancelPublished(string, string)                                     {}
+// TTL, and the relay stamps the task's end as activity, so that window
+// starts at the answer. What TaskTerminal does here is expire the cached
+// positive: while the task ran the entry's bound was a re-ask cadence
+// (hasSession hands back now+TTL for a running task, since it cannot know
+// when the task will end), and the moment it ends the next unmentioned
+// reply must re-ask and take the registry's real bound, LastActivity+TTL,
+// rather than ride the stale cadence past it. Nothing is unmarked; the
+// re-ask decides. Called on the relay queue under the session lock: record
+// and return.
+func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok || threadTS == "" {
+		return
+	}
+	s.expireMark(channel + "/" + threadTS)
+}
+
+// expireMark makes a cached positive due for a re-ask on the next reply. It
+// changes no answer by itself: an entry that is not a positive is left
+// alone, and a positive keeps answering true until the re-ask says
+// otherwise.
+func (s *SlackAdapter) expireMark(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionThreads[key] {
+		s.sessionExpiresAt[key] = s.now()
+	}
+}
+
+func (s *SlackAdapter) TaskAccepted(string, string)    {}
+func (s *SlackAdapter) CancelPublished(string, string) {}
 
 // NewSlackAdapter builds the Socket Mode client pair. The bot token drives
 // the Web API and the app token the outbound websocket — the two refs the

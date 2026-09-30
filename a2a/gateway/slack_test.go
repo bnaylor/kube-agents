@@ -554,6 +554,51 @@ func TestSlackExpiredMarkForceYieldsToAFreshTrue(t *testing.T) {
 	}
 }
 
+// TestSlackTaskTerminalExpiresTheMarkSoTheNextReplyReasks: while a task runs
+// the cached positive carries a re-ask cadence, not a real bound. When the
+// task ends the entry is made due, so the next unmentioned reply asks the
+// registry and takes its LastActivity-based bound instead of riding the
+// cadence past it. A DM key expires nothing.
+func TestSlackTaskTerminalExpiresTheMarkSoTheNextReplyReasks(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	clock := newFakeClock(a)
+	reg := &countingLookup{held: map[string]bool{}}
+	a.sessions, a.sessionTTL = reg.lookup, 10*time.Minute
+
+	a.TaskStarted("slack:C1/9.0", "task-1")
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "status?", "9.1", "9.0")); !ok || reg.calls() != 0 {
+		t.Fatalf("during the task a reply must deliver from cache: delivered=%v lookups=%d", ok, reg.calls())
+	}
+
+	clock.advance(2 * time.Minute)
+	a.TaskTerminal("slack:C1/9.0", "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	reg.held["slack:C1/9.0"] = true
+	reg.until = clock.now().Add(10 * time.Minute)
+	got, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "now prod too", "9.2", "9.0"))
+	if !ok || got.Conversation != "slack:C1/9.0" || reg.calls() != 1 {
+		t.Fatalf("after the terminal the reply must re-ask and deliver: delivered=%v conv=%q lookups=%d", ok, got.Conversation, reg.calls())
+	}
+	a.mu.Lock()
+	exp := a.sessionExpiresAt["C1/9.0"]
+	a.mu.Unlock()
+	if !exp.Equal(reg.until) {
+		t.Fatalf("after the re-ask the entry must carry the registry's bound: exp=%v want %v", exp, reg.until)
+	}
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "thanks", "9.3", "9.0")); !ok || reg.calls() != 1 {
+		t.Fatalf("within the new bound the reply is served from cache: delivered=%v lookups=%d", ok, reg.calls())
+	}
+
+	// A DM is not tracked, and a thread with no positive has nothing to expire.
+	a.TaskTerminal("slack:dm/D1", "task-dm", lib.StateCompleted, TerminalFromExecutor, "")
+	a.TaskTerminal("slack:C1/77.0", "task-x", lib.StateCompleted, TerminalFromExecutor, "")
+	a.mu.Lock()
+	_, tracked := a.sessionExpiresAt["C1/77.0"]
+	a.mu.Unlock()
+	if tracked {
+		t.Fatal("TaskTerminal on an untracked thread must record nothing")
+	}
+}
+
 // recordingHandler captures log records so a test can assert on the LEVEL a
 // message came out at, not only on its text — the shutdown-path filters are
 // entirely about level, and a test that only matched the words would pass

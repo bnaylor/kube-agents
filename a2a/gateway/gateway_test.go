@@ -1306,3 +1306,47 @@ func TestAddresseeForStragglerTask(t *testing.T) {
 		t.Fatalf("unknown task falls back to the record's addressee, got %q", got)
 	}
 }
+
+// TestTaskEndCountsAsActivity: the idle TTL that bounds a session (the reap,
+// and the Slack adapter's session-thread rule through hasSession) counts
+// from the task's end, not from the ask that started it. Otherwise a long
+// task's thread went quiet the instant its answer posted, and the follow-up
+// right after the result — the most ordinary message a session carries —
+// was dropped. The relay stamps LastActivity when it clears the task.
+func TestTaskEndCountsAsActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-activity"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "a-1", Text: "take your time"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+
+	before, err := r.g.reg.Get(ctx, conv)
+	if err != nil || before == nil || before.ActiveTask == nil {
+		t.Fatalf("no active task on the record after the ask: %+v err=%v", before, err)
+	}
+	asked := before.LastActivity
+	time.Sleep(50 * time.Millisecond) // so the terminal's stamp is measurably later
+
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "done, eventually"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the terminal to release the task", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastActivity.After(asked) {
+		t.Fatalf("the task's end did not count as activity: LastActivity %v is not after the ask's %v", after.LastActivity, asked)
+	}
+	held, until, err := r.g.hasSession(ctx, conv)
+	if err != nil || !held || !until.Equal(after.LastActivity.Add(r.g.cfg.IdleTTL)) {
+		t.Fatalf("after the terminal the session must be held until LastActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
+	}
+}
