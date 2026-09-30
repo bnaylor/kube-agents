@@ -260,12 +260,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// thread rule through hasSession) counts from here, not from the ask
 		// that started the task: a long task's thread must not go quiet the
 		// instant its answer posts, and the user's follow-up right after the
-		// result is the most ordinary message a session carries. Two
-		// terminals are NOT activity: the supervisor's, which is the reap's
-		// own word about a session it has just judged idle (stamping it
-		// would re-open the window the reap closed), and a detached task's,
-		// which the user already stopped.
-		if source == TerminalFromExecutor && !active.Detached {
+		// result is the most ordinary message a session carries. The
+		// executor's confirmation of a stop is an answer too: a detached
+		// task's terminal from the executor counts. The supervisor's does
+		// not: that is the reap's own word about a session it has just
+		// judged idle, and stamping it would re-open the window the reap
+		// closed.
+		if source == TerminalFromExecutor {
 			now := time.Now().UTC()
 			rec.LastActivity = now
 			rec.LastTaskActivity = now

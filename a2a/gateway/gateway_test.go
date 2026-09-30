@@ -1458,3 +1458,100 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 		t.Fatalf("a no-task turn re-admitted the thread: held=%v err=%v", held, err)
 	}
 }
+
+// TestExecutorCanceledOnAStoppedTaskCountsAsActivity: the executor's
+// confirmation of a stop is the answer the user was waiting on, so it moves
+// the task's clock like any executor terminal; only the supervisor's (the
+// reap's own) does not.
+func TestExecutorCanceledOnAStoppedTaskCountsAsActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-exec-canceled"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "x-1", Text: "long one"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("no active task after the ask: %+v err=%v", rec, err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask.Detached = true
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the executor's canceled to clear the task", func() bool {
+		got, err := r.g.reg.Get(ctx, conv)
+		return err == nil && got != nil && got.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastTaskActivity.After(stale) {
+		t.Fatalf("the executor's canceled on a stopped task did not count as activity: %v", after.LastTaskActivity)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
+		t.Fatalf("after the executor confirmed the stop the thread must still be a session thread: held=%v err=%v", held, err)
+	}
+}
+
+// TestHealedExecutorTerminalCountsAsActivity: the heal is the executor's
+// terminal reaching the record by the other route (the relay missed it), and
+// it must move the task's clock the way relayTerminal does, or a healed
+// thread goes quiet the moment its lost answer is posted. Driven with a
+// "stop" after the heal, which starts nothing, so nothing else restamps.
+func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-heal-activity"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ha-1", Text: "summarize the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "normal retire", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	// The stale record a lost render leaves behind: the task still active
+	// on it, both clocks past the TTL.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID, Ask: "summarize the fleet", SubmittedAt: stale}
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ha-2", Text: "stop"}
+	waitFor(t, "the heal to post the lost terminal", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, origin.TaskID) && strings.Contains(p, string(lib.StateCompleted)) {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "the heal's release to be written", func() bool {
+		got, err := r.g.reg.Get(ctx, conv)
+		return err == nil && got != nil && got.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastTaskActivity.After(stale) {
+		t.Fatalf("the healed executor terminal did not count as activity: %v", after.LastTaskActivity)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
+		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)
+	}
+}

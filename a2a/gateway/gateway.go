@@ -757,6 +757,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	addressee := rec.AddresseeFor(active.TaskID)
 	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
 	healed := false
+	var healedSource TerminalSource
 	switch {
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
@@ -780,7 +781,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			source = TerminalFromSupervisor
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
-		healed = true
+		healed, healedSource = true, source
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
 		g.log.Info("healing an active task with no first event inside the grace",
@@ -795,10 +796,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// the install's. Nothing is published: as handleInbound's comment
 		// says, age is not evidence.
 		g.observeTaskTerminal(rec.Key, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
-		healed = true
+		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
 		rec.ActiveTask = nil
+		// The same rule as relayTerminal's, for the same terminal reaching
+		// the record by the other route: an executor's end of the task is
+		// activity, and the idle window opens at the answer. Without this a
+		// healed thread went quiet the moment its lost answer was posted.
+		if healedSource == TerminalFromExecutor {
+			now := time.Now().UTC()
+			rec.LastActivity = now
+			rec.LastTaskActivity = now
+		}
 		// Write the release now, not at the end of the turn: a turn that
 		// returns early — a cap refusal, on exactly the Delegate that
 		// follows a wedge — would otherwise announce a release it never
@@ -900,7 +910,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 // the user has stopped, whose terminal never arrived (cancelTask sets
 // Detached and leaves ActiveTask in place), is not running here any more
 // than it exempts the pod there. Otherwise the conversation is a session
-// only while it has had activity within the idle TTL: LastActivity is
+// only while it has had activity within the idle TTL: LastTaskActivity is
 // written by routeTurn on every turn and persisted, and the TTL is the same
 // g.cfg.IdleTTL reapOnce reads. The record itself is not the bound --
 // reapOnce deletes the pod and keeps the record, Tasks and all, and nothing
@@ -909,7 +919,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 // bound; the record merely carries it.
 //
 // The until returned with a true is the registry's own bound, not the
-// adapter's: for the idle case it is LastActivity + IdleTTL, the instant the
+// adapter's: for the idle case it is LastTaskActivity + IdleTTL, the instant the
 // registry itself would start answering false, so a cache that expires on
 // it cannot outlive the answer it was given (a message the gateway refuses,
 // an unmapped sender's, moves nothing, and a cache stamped from its own
