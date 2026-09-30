@@ -20,19 +20,14 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-// fakeSlackAPI fakes the six Web API calls the adapter makes; tests assert
-// on what was posted/updated and canned replies drive the root check.
+// fakeSlackAPI fakes the five Web API calls the adapter makes; tests assert
+// on what was posted/updated.
 type fakeSlackAPI struct {
-	replies  map[string][]slack.Message // channel+"/"+threadTS -> msgs, root first
 	posted   []struct{ channel, thread, text string }
 	updated  []struct{ channel, ts, text string }
 	members  []string
 	cursor   string
 	openedIM string
-	// repliesCalls counts conversations.replies reads. That call is the one
-	// synchronous Web API round trip made on the event pump's own goroutine,
-	// so tests assert on how often it happens, not only on its answer.
-	repliesCalls int
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
@@ -71,21 +66,44 @@ func (f *fakeSlackAPI) OpenConversation(params *slack.OpenConversationParameters
 	return ch, false, false, nil
 }
 
-// GetConversationRepliesContext honours ctx the way the real client does —
-// a cancelled or expired context comes back as ctx.Err() and no messages —
-// so tests can drive the shutdown and timeout paths of isSessionThread.
-func (f *fakeSlackAPI) GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
-	f.repliesCalls++
-	if err := ctx.Err(); err != nil {
-		return nil, false, "", err
-	}
-	return f.replies[params.ChannelID+"/"+params.Timestamp], false, "", nil
-}
-
 func newTestSlackAdapter(api *fakeSlackAPI) *SlackAdapter {
 	return &SlackAdapter{api: api, log: slog.Default(), botUserID: "UBOT",
 		sessionThreads: map[string]bool{}, seen: map[string]bool{}}
 }
+
+// countingLookup is a SessionLookup a test wires as a.sessions. It answers
+// from held (absent means false, nil) or fail (an error for that key), and
+// records every conversation it was asked about. The registry read is the
+// one synchronous round trip isSessionThread makes on the event pump's own
+// goroutine, so tests assert on how often it happens, not only on its
+// answer. Mutexed because the gateway tests drive it beside real workers.
+type countingLookup struct {
+	mu    sync.Mutex
+	held  map[string]bool
+	fail  map[string]error
+	asked []string
+}
+
+func (l *countingLookup) lookup(_ context.Context, conversation string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.asked = append(l.asked, conversation)
+	if err := l.fail[conversation]; err != nil {
+		return false, err
+	}
+	return l.held[conversation], nil
+}
+
+func (l *countingLookup) calls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.asked)
+}
+
+// noSessions is a SessionLookup that holds nothing: the registry of a
+// gateway that has started no task anywhere, which is what a cache miss
+// asks in the adapter-only tests.
+func noSessions(context.Context, string) (bool, error) { return false, nil }
 
 // stalledSlackStub is a Slack Web API stub that parks every request until
 // unblock is called, then answers invalid_auth (one of the four errors
@@ -239,9 +257,9 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 }
 
 // TestSlackMarkNeverDowngrades: a true in sessionThreads is the gateway's
-// word (TaskStarted), the registry's, or the ask that rooted the thread, and
-// the only false that can follow it is a root read that was in flight when
-// it landed. That read must not win.
+// word (TaskStarted) or the registry's, and the only false that can follow
+// it is a registry read that was in flight when it landed. That read must
+// not win.
 func TestSlackMarkNeverDowngrades(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.markSessionThread("C1/1.0", true)
@@ -285,10 +303,7 @@ func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
 	}
 	t.Cleanup(client.Close)
 
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
 	cfg := &Config{
 		NATSURL:          url,
 		PrincipalMapPath: mapFile,
@@ -491,29 +506,29 @@ func TestSlackOpenDirect(t *testing.T) {
 }
 
 // TestSlackInboundAffordanceRule pins which messages become turns: DMs
-// always; channel messages only when they mention the bot (the ask roots
-// the session thread); thread replies when they mention the bot or the
-// thread is already a session thread (session threads carry every message —
-// the parity with Discord's bot-created threads).
+// always; channel messages only when they mention the bot (the ask's own ts
+// is the thread the session will live in); thread replies when they mention
+// the bot or the thread is already a session thread (session threads carry
+// every message — the parity with Discord's bot-created threads).
 //
 // The cases run in order against one adapter, because the rule is stateful:
-// a task starting in a thread (TaskStarted, which the case that adopts 200.1
-// calls where the gateway would) makes it a session thread for the cases
-// after it. 200.1 is the thread the bot is pulled into mid-conversation and
-// 300.1 the one it is never addressed in, and they are separate threads for
-// exactly that reason.
+// a task starting in a thread (TaskStarted, which the before hooks call
+// where the gateway would) makes it a session thread for the cases after
+// it, and nothing else does — a channel ask's own thread is no exception.
+// 100.1 is the thread a channel ask rooted, 200.1 the one the bot is pulled
+// into mid-conversation, and 300.1 the one it is never addressed in. The
+// first two are one rule; the third is a separate thread for exactly that
+// reason. The registry answers false throughout, so a cache miss drops.
 func TestSlackInboundAffordanceRule(t *testing.T) {
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/100.1": {{Msg: slack.Msg{Text: "<@UBOT> check the nodes", User: "U1"}}},
-		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-		"C1/300.1": {{Msg: slack.Msg{Text: "anyone seen the changelog?", User: "U2"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
 
-	// adopted is the gateway's side of the mid-thread case below: the
-	// mentioned ask on slack:C1/200.1 was verified and started a task, and
-	// TaskStarted is how the adapter learns that thread is now a session
-	// thread. Run before the case that needs it.
+	// rooted and adopted are the gateway's side of the two threads below:
+	// the channel ask that rooted 100.1 and the mentioned ask in someone
+	// else's 200.1 were each verified and started a task, and TaskStarted
+	// is how the adapter learns that thread is now a session thread. Each
+	// runs before the first case that needs it.
+	rooted := func() { a.TaskStarted("slack:C1/100.1", "task-0") }
 	adopted := func() { a.TaskStarted("slack:C1/200.1", "task-1") }
 	cases := []struct {
 		name   string
@@ -534,7 +549,11 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		// carries every message — the follow-up the user expects to be able
 		// to steer or stop with.
 		{"unmentioned follow-up in an adopted thread delivers", adopted, slackMsg("channel", "C1", "U1", "stop", "4.5", "200.1"), true, "slack:C1/200.1", "group", "stop"},
-		{"reply in bot-rooted thread delivers unmentioned", nil, slackMsg("channel", "C1", "U3", "steer it", "5.0", "100.1"), true, "slack:C1/100.1", "group", "steer it"},
+		// The channel ask that rooted 100.1 is not in this table because it
+		// would change nothing: a channel mention is a turn, and marks no
+		// thread. The gateway starting the task there does (rooted).
+		{"reply in a thread a channel ask rooted drops until a task starts", nil, slackMsg("channel", "C1", "U3", "too early", "4.8", "100.1"), false, "", "", ""},
+		{"reply in bot-rooted thread delivers unmentioned once a task started", rooted, slackMsg("channel", "C1", "U3", "steer it", "5.0", "100.1"), true, "slack:C1/100.1", "group", "steer it"},
 		{"reply in plain thread drops", nil, slackMsg("channel", "C1", "U3", "chatter", "6.0", "300.1"), false, "", "", ""},
 		{"bare mention drops", nil, slackMsg("channel", "C1", "U1", "<@UBOT>", "7.0", ""), false, "", "", ""},
 		// Slack transmits &, < and > entity-encoded; the ask must reach the
@@ -657,15 +676,15 @@ func TestToMrkdwn(t *testing.T) {
 // channel" checked and file_share is an ask with an attachment — both are
 // genuine turns and must not vanish silently. Edits stay dropped.
 func TestSlackTurnSubtypes(t *testing.T) {
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/100.1": {{Msg: slack.Msg{Text: "<@UBOT> check the nodes", User: "U1"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
+	// The gateway started a task in 100.1, so it is a session thread.
+	a.TaskStarted("slack:C1/100.1", "task-1")
 
 	broadcast := slackMsg("channel", "C1", "U2", "also try the east cluster", "8.0", "100.1")
 	broadcast.SubType = "thread_broadcast"
 	if _, ok := a.inbound(context.Background(), broadcast); !ok {
-		t.Error("thread_broadcast reply in a bot-rooted thread must deliver")
+		t.Error("thread_broadcast reply in a session thread must deliver")
 	}
 
 	file := slackMsg("im", "D1", "U1", "here is the manifest", "9.0", "")
@@ -734,27 +753,25 @@ func TestSlackAskEchoIsNotDoubleEscaped(t *testing.T) {
 	}
 }
 
-// TestSlackEmptyTurnSkipsRootLookup: an attachment-only or whitespace-only
-// reply is dropped either way, so it must not pay for the thread-root read
-// first. That read runs on the event pump's goroutine under
-// slackRepliesTimeout, and the next envelope's ack waits behind it — a
+// TestSlackEmptyTurnSkipsSessionLookup: an attachment-only or whitespace-only
+// reply is dropped either way, so it must not pay for the session registry
+// read first. That read runs on the event pump's goroutine under
+// slackSessionLookupTimeout, and the next envelope's ack waits behind it — a
 // two-second stall spent to discard the message. The control case — a reply
-// with text, in a thread of its OWN — proves the guard still reads when the
+// with text, in a thread of its OWN — proves the guard still asks when the
 // answer matters.
 //
 // The control's thread is separate on purpose. Sharing 300.1 with the empty
 // cases made the final count assertion worthless: with the guard removed the
 // attachment case does the read and caches the answer, the whitespace and
-// control cases then both hit that cache, and repliesCalls lands on exactly
-// the 1 the test wanted. It passed on a cache hit while claiming to prove a
+// control cases then both hit that cache, and the count lands on exactly the
+// 1 the test wanted. It passed on a cache hit while claiming to prove a
 // read. In its own uncached thread the control has to spend the call, so the
 // same "want 1" now reads 2 the moment the guard goes.
-func TestSlackEmptyTurnSkipsRootLookup(t *testing.T) {
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/300.1": {{Msg: slack.Msg{Text: "<@UBOT> watch the rollout", User: "U1"}}},
-		"C1/310.1": {{Msg: slack.Msg{Text: "<@UBOT> and this one too", User: "U1"}}},
-	}}
-	a := newTestSlackAdapter(api)
+func TestSlackEmptyTurnSkipsSessionLookup(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{held: map[string]bool{"slack:C1/300.1": true, "slack:C1/310.1": true}}
+	a.sessions = reg.lookup
 
 	// A file_share reply with no caption, in a thread nothing has cached.
 	attachment := slackMsg("channel", "C1", "U2", "", "301.0", "300.1")
@@ -762,46 +779,76 @@ func TestSlackEmptyTurnSkipsRootLookup(t *testing.T) {
 	if _, ok := a.inbound(context.Background(), attachment); ok {
 		t.Error("an empty reply is not a turn")
 	}
-	if api.repliesCalls != 0 {
-		t.Errorf("empty reply made %d conversations.replies calls, want 0", api.repliesCalls)
+	if n := reg.calls(); n != 0 {
+		t.Errorf("empty reply made %d session lookups, want 0", n)
 	}
 
 	whitespace := slackMsg("channel", "C1", "U2", "   \n\t ", "302.0", "300.1")
 	if _, ok := a.inbound(context.Background(), whitespace); ok {
 		t.Error("a whitespace-only reply is not a turn")
 	}
-	if api.repliesCalls != 0 {
-		t.Errorf("whitespace reply made %d conversations.replies calls, want 0", api.repliesCalls)
+	if n := reg.calls(); n != 0 {
+		t.Errorf("whitespace reply made %d session lookups, want 0", n)
 	}
 
 	// Control: a different thread, uncached by anything above, with text.
-	// The read must happen, and the reply must deliver.
+	// The lookup must happen, and the reply must deliver.
 	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "steer it", "313.0", "310.1")); !ok {
-		t.Error("an unmentioned reply in a bot-rooted thread must deliver")
+		t.Error("an unmentioned reply in a thread the registry holds must deliver")
 	}
-	if api.repliesCalls != 1 {
-		t.Errorf("made %d conversations.replies calls, want 1 — only the control should read", api.repliesCalls)
+	if n := reg.calls(); n != 1 {
+		t.Errorf("made %d session lookups, want 1 — only the control should ask", n)
 	}
 }
 
-// TestSlackBareMentionStillRootsTheThread pins the side effect the empty-text
-// check above must not skip past. A bare "@bot" is not a turn, but it does
-// root a thread, and recording that costs no API call — so the first real
-// reply under it delivers from cache rather than spending
-// slackRepliesTimeout re-reading a root we already saw.
-func TestSlackBareMentionStillRootsTheThread(t *testing.T) {
-	api := &fakeSlackAPI{}
-	a := newTestSlackAdapter(api)
-	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT>", "400.0", "")); ok {
+// TestSlackChannelMentionRootsNothingUntilATaskStarts pins the rule that a
+// channel-level mention is a turn and nothing more. It used to mark its own
+// thread a session thread on the spot — the root IS the ask, so the answer
+// looked free — but the adapter has verified nothing at that point, not the
+// sender and not that the text is an ask, and a sender the principal map
+// refuses would still have turned the thread into one whose every message
+// reached the gateway. Now the thread becomes a session thread when the
+// gateway starts the task there and says so (TaskStarted), the same as a
+// thread someone else rooted; until then an unmentioned reply asks the
+// registry, which holds nothing, and drops.
+func TestSlackChannelMentionRootsNothingUntilATaskStarts(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{}
+	a.sessions = reg.lookup
+
+	got, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT> drain node 3", "400.0", ""))
+	if !ok || got.Conversation != "slack:C1/400.0" || got.Text != "drain node 3" {
+		t.Fatalf("a channel mention is a turn keyed on its own ts: delivered=%v got=%+v", ok, got)
+	}
+	if v, cached := a.sessionThreads["C1/400.0"]; cached {
+		t.Fatalf("the channel mention marked its own thread as %v; it must mark nothing", v)
+	}
+	// A bare "<@bot>" in the channel is not a turn, and marks nothing either.
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT>", "410.0", "")); ok {
 		t.Fatal("a bare mention has nothing to run")
 	}
-	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "here is the ask", "401.0", "400.0")); !ok {
-		t.Error("a reply under a bare mention must deliver: the root mentioned the bot")
+	if v, cached := a.sessionThreads["C1/410.0"]; cached {
+		t.Fatalf("a bare channel mention marked its own thread as %v; it must mark nothing", v)
 	}
-	// api.replies is empty, so a lookup would have answered false and
-	// dropped the reply. Delivering proves it came from the cache fill.
-	if api.repliesCalls != 0 {
-		t.Errorf("root was re-read %d times; the bare mention should have cached it", api.repliesCalls)
+
+	// An unmentioned reply under the ask, before any task started there:
+	// the registry is asked, holds nothing, and the reply drops.
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "here is more", "401.0", "400.0")); ok {
+		t.Fatal("an unmentioned reply under a channel mention delivered before any task started")
+	}
+	if n := reg.calls(); n != 1 {
+		t.Fatalf("the reply made %d session lookups, want 1 — the registry is the only source", n)
+	}
+
+	// The gateway verified the sender and started the task: now the thread
+	// is a session thread, and the same shape of reply delivers from cache.
+	a.TaskStarted("slack:C1/400.0", "task-1")
+	got, ok = a.inbound(context.Background(), slackMsg("channel", "C1", "U2", "and this", "402.0", "400.0"))
+	if !ok || got.Conversation != "slack:C1/400.0" {
+		t.Fatalf("an unmentioned reply after TaskStarted: delivered=%v conv=%q", ok, got.Conversation)
+	}
+	if n := reg.calls(); n != 1 {
+		t.Errorf("the reply after TaskStarted made %d session lookups in total, want the 1 from before — TaskStarted filled the cache", n)
 	}
 }
 
@@ -1229,26 +1276,45 @@ func TestSlackAckCtxFailsOnACancelledContext(t *testing.T) {
 	}
 }
 
-// TestSlackRootLookupLogLevels: the thread-root read fires on every
-// unmentioned thread reply, so its failure log is the noisiest thing in the
-// adapter and a WARN on every pod termination is a false positive for anything
-// alerting on logs. Cancelled is demoted. DeadlineExceeded is NOT — at this
-// site that is slackRepliesTimeout genuinely expiring on a slow
-// conversations.replies, which cost a user their reply and is the real
-// operational signal a blanket "any context error" filter would swallow.
-func TestSlackRootLookupLogLevels(t *testing.T) {
+// TestSlackSessionLookupLogLevels: the session registry read fires on every
+// unmentioned reply in an uncached thread, so its failure log is the noisiest
+// thing in the adapter and a WARN on every pod termination is a false
+// positive for anything alerting on logs. Cancelled is demoted.
+// DeadlineExceeded is NOT — at this site that is slackSessionLookupTimeout
+// genuinely expiring on a slow registry read, which cost a user their reply
+// and is the real operational signal a blanket "any context error" filter
+// would swallow. And no failure caches: an error is an unknown, not an
+// answer, and a false left behind would silence a running task's thread.
+func TestSlackSessionLookupLogLevels(t *testing.T) {
+	// The registry's answer is whatever the context says, the way a real
+	// KV read surfaces ctx.Err() on a cancelled or expired context.
+	ctxErr := func(ctx context.Context, _ string) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("kv get: %w", err)
+		}
+		return false, errors.New("kv unavailable")
+	}
+	uncached := func(t *testing.T, a *SlackAdapter, key string) {
+		t.Helper()
+		if v, cached := a.sessionThreads[key]; cached {
+			t.Errorf("a failed lookup cached %v for %s; an error must not be cached", v, key)
+		}
+	}
+
 	// Shutdown: the parent context is already cancelled.
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	shutdown := &recordingHandler{}
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.log = slog.New(shutdown)
+	a.sessions = ctxErr
 	if a.isSessionThread(cancelled, "C1", "700.1") {
 		t.Error("a failed lookup must report false")
 	}
-	if lvl, ok := shutdown.level("thread root lookup"); !ok || lvl != slog.LevelDebug {
+	if lvl, ok := shutdown.level("session lookup"); !ok || lvl != slog.LevelDebug {
 		t.Errorf("cancelled lookup logged at %v (found=%v), want DEBUG", lvl, ok)
 	}
+	uncached(t, a, "C1/700.1")
 
 	// The timeout, modelled with a parent whose deadline has already passed
 	// so the derived context reports DeadlineExceeded rather than Canceled.
@@ -1257,22 +1323,38 @@ func TestSlackRootLookupLogLevels(t *testing.T) {
 	timedOut := &recordingHandler{}
 	b := newTestSlackAdapter(&fakeSlackAPI{})
 	b.log = slog.New(timedOut)
+	b.sessions = ctxErr
 	if b.isSessionThread(expired, "C1", "700.2") {
 		t.Error("a timed-out lookup must report false")
 	}
-	if lvl, ok := timedOut.level("thread root lookup"); !ok || lvl != slog.LevelWarn {
-		t.Errorf("timed-out lookup logged at %v (found=%v), want WARN — slackRepliesTimeout expiring is a dropped reply", lvl, ok)
+	if lvl, ok := timedOut.level("session lookup"); !ok || lvl != slog.LevelWarn {
+		t.Errorf("timed-out lookup logged at %v (found=%v), want WARN — slackSessionLookupTimeout expiring is a dropped reply", lvl, ok)
 	}
+	uncached(t, b, "C1/700.2")
 
-	// And a plain empty answer, with no context involved at all, still warns.
-	empty := &recordingHandler{}
+	// And a plain registry error, with no context involved at all, warns.
+	failed := &recordingHandler{}
 	c := newTestSlackAdapter(&fakeSlackAPI{})
-	c.log = slog.New(empty)
+	c.log = slog.New(failed)
+	c.sessions = ctxErr
 	if c.isSessionThread(context.Background(), "C1", "700.3") {
-		t.Error("an unknown thread root must report false")
+		t.Error("a failed lookup must report false")
 	}
-	if lvl, ok := empty.level("thread root lookup"); !ok || lvl != slog.LevelWarn {
-		t.Errorf("empty root lookup logged at %v (found=%v), want WARN", lvl, ok)
+	if lvl, ok := failed.level("session lookup"); !ok || lvl != slog.LevelWarn {
+		t.Errorf("failed lookup logged at %v (found=%v), want WARN", lvl, ok)
+	}
+	uncached(t, c, "C1/700.3")
+
+	// No lookup wired at all: a miss is a false, and nothing is logged —
+	// there was nothing to ask, so nothing failed.
+	silent := &recordingHandler{}
+	d := newTestSlackAdapter(&fakeSlackAPI{})
+	d.log = slog.New(silent)
+	if d.isSessionThread(context.Background(), "C1", "700.4") {
+		t.Error("with no lookup wired a miss must report false")
+	}
+	if lvl, ok := silent.level("session lookup"); ok {
+		t.Errorf("with no lookup wired, a miss logged at %v; want nothing", lvl)
 	}
 }
 
@@ -1322,10 +1404,10 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 // someone else's thread, which delivers a turn keyed on that thread, the
 // gateway starts a task there and says so (TaskStarted), and the user then
 // follows up unmentioned — a steer, or "stop". That follow-up has to reach
-// the gateway, because a session is already running there. Before the
-// adapter recorded the thread, the follow-up hit the root check, the root
-// read found a message with no mention, and the message was discarded
-// without even a drop notice: nothing reached handleInbound.
+// the gateway, because a session is already running there. Without the
+// record, the follow-up is a cache miss, the registry is asked, and the
+// message is discarded without even a drop notice if the answer is no:
+// nothing reaches handleInbound.
 //
 // The record is the gateway's TaskStarted, not the mention: the adapter
 // used to record on the mention alone, before anyone had verified the
@@ -1359,10 +1441,8 @@ func TestSlackMidThreadMentionAdoptsThread(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			api := &fakeSlackAPI{replies: map[string][]slack.Message{
-				"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-			}}
-			a := newTestSlackAdapter(api)
+			a := newTestSlackAdapter(&fakeSlackAPI{})
+			a.sessions = noSessions
 
 			got, ok := a.inbound(context.Background(), c.msg("<@UBOT> drain node 3", "4.0", "200.1"))
 			if !ok || got.Conversation != "slack:C1/200.1" {
@@ -1388,13 +1468,12 @@ func TestSlackMidThreadMentionAdoptsThread(t *testing.T) {
 // or decided anything — so anyone who could type "<@bot>" in a thread turned
 // its every later message into a delivery. Now the thread becomes a session
 // thread when the gateway starts a task in it and says so (TaskStarted);
-// until then an unmentioned reply is answered from the root, which does not
-// mention the bot, and drops.
+// until then an unmentioned reply is answered from the registry, which holds
+// no task there, and drops.
 func TestSlackBareMentionInForeignThreadAdoptsNothing(t *testing.T) {
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{}
+	a.sessions = reg.lookup
 
 	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT>", "4.0", "200.1")); ok {
 		t.Fatal("a bare mention has nothing to run and must not deliver")
@@ -1405,8 +1484,8 @@ func TestSlackBareMentionInForeignThreadAdoptsNothing(t *testing.T) {
 	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "drain node 3", "5.0", "200.1")); ok {
 		t.Fatal("an unmentioned reply after a bare mention delivered: the mention adopted the thread")
 	}
-	if api.repliesCalls != 1 {
-		t.Errorf("the unmentioned reply made %d conversations.replies reads, want exactly 1 — the root is the answer", api.repliesCalls)
+	if n := reg.calls(); n != 1 {
+		t.Errorf("the unmentioned reply made %d session lookups, want exactly 1 — the registry is the answer", n)
 	}
 	// A mentioned ask is a turn whoever rooted the thread; that has not
 	// changed. What has: the thread is a session thread once the gateway
@@ -1421,16 +1500,15 @@ func TestSlackBareMentionInForeignThreadAdoptsNothing(t *testing.T) {
 	}
 }
 
-// TestSlackMentionUnpoisonsCachedFalse: the root check caches its answer, so
-// an unmentioned reply that arrives BEFORE the bot is pulled into the thread
-// leaves a false behind. The gateway starting a task there (TaskStarted) has
-// to overwrite it, or the thread is dropped for the life of the cache entry
-// — including the "stop" for the session that task started.
+// TestSlackMentionUnpoisonsCachedFalse: the registry lookup caches its
+// answer, so an unmentioned reply that arrives BEFORE the bot is pulled into
+// the thread leaves a false behind. The gateway starting a task there
+// (TaskStarted) has to overwrite it, or the thread is dropped for the life
+// of the cache entry — including the "stop" for the session that task
+// started.
 func TestSlackMentionUnpoisonsCachedFalse(t *testing.T) {
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
 
 	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U3", "chatter", "3.0", "200.1")); ok {
 		t.Fatal("chatter in a thread the bot is not in must drop")
@@ -1455,19 +1533,14 @@ func TestSlackMentionUnpoisonsCachedFalse(t *testing.T) {
 }
 
 // TestSlackSessionLookupAnswersAColdCache: the session registry is the
-// source of truth for which threads the gateway is in, and a cache miss asks
-// it before it reads the thread root. That is what makes a thread the
-// gateway adopted mid-conversation — root by someone else, no mention in it
-// — survive a restart of the adapter's process: the root read alone would
-// answer false, and every follow-up would drop.
+// source of truth for which threads the gateway has started a task in, and a
+// cache miss asks it. That is what makes a session thread — the channel
+// ask's own or one the gateway adopted mid-conversation — survive a restart
+// of the adapter's process: with nothing else to derive an answer from,
+// every follow-up would drop. A true and a false are both answers and both
+// cache; an error is neither, and must not.
 func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-		"C1/210.1": {{Msg: slack.Msg{Text: "coffee?", User: "U2"}}},
-		"C1/220.1": {{Msg: slack.Msg{Text: "<@UBOT> watch the rollout", User: "U1"}}},
-		"C1/230.1": {{Msg: slack.Msg{Text: "tea?", User: "U2"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
 	var asked []string
 	registryDown := true
 	a.sessions = func(_ context.Context, conversation string) (bool, error) {
@@ -1475,11 +1548,9 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 		switch conversation {
 		case "slack:C1/200.1":
 			return true, nil
-		case "slack:C1/220.1":
-			return false, errors.New("kv unavailable")
 		case "slack:C1/230.1":
-			// An adopted thread (root by someone else) behind a registry
-			// that fails once and then recovers.
+			// A session thread behind a registry that fails once and then
+			// recovers.
 			if registryDown {
 				return false, errors.New("kv unavailable")
 			}
@@ -1488,56 +1559,52 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 		return false, nil
 	}
 
-	// The registry holds the thread: delivered, and the root was never read.
+	// The registry holds the thread: delivered, and cached.
 	got, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "5.0", "200.1"))
 	if !ok || got.Conversation != "slack:C1/200.1" {
 		t.Fatalf("a reply in a thread the registry holds: delivered=%v conv=%q", ok, got.Conversation)
 	}
-	if api.repliesCalls != 0 {
-		t.Errorf("the registry answered, yet %d conversations.replies reads were made; want 0", api.repliesCalls)
-	}
 	if !a.sessionThreads["C1/200.1"] {
-		t.Error("the registry's answer was not cached")
+		t.Error("the registry's true was not cached")
+	}
+	if len(asked) != 1 {
+		t.Errorf("the registry was consulted for %v; want once", asked)
 	}
 
-	// The registry does not hold the thread, and the root does not mention
-	// the bot: dropped, after exactly the one root read.
+	// The registry does not hold the thread: dropped, and the false cached,
+	// so the next reply in the same thread does not ask again.
 	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "chatter", "6.0", "210.1")); ok {
-		t.Fatal("a reply in a thread neither the registry nor the root claims delivered")
+		t.Fatal("a reply in a thread the registry does not hold delivered")
 	}
-	if api.repliesCalls != 1 {
-		t.Errorf("a registry false must fall through to the root: %d replies reads, want 1", api.repliesCalls)
+	if v, cached := a.sessionThreads["C1/210.1"]; !cached || v {
+		t.Errorf("the registry's false was not cached: cached=%v value=%v", cached, v)
 	}
-
-	// The registry fails: not a drop. The root read still answers for a
-	// thread the bot rooted.
-	got, ok = a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "and the canary", "7.0", "220.1"))
-	if !ok || got.Conversation != "slack:C1/220.1" {
-		t.Fatalf("a reply in a bot-rooted thread with the registry failing: delivered=%v conv=%q", ok, got.Conversation)
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "more chatter", "7.0", "210.1")); ok {
+		t.Fatal("a second reply in the same thread delivered")
 	}
-	if api.repliesCalls != 2 {
-		t.Errorf("a registry error must fall through to the root: %d replies reads, want 2", api.repliesCalls)
-	}
-	if len(asked) != 3 {
-		t.Errorf("the registry was consulted for %v; want once per cold thread so far", asked)
+	if len(asked) != 2 {
+		t.Errorf("the registry was consulted for %v; want the cached false to have answered the second reply", asked)
 	}
 
-	// The registry fails on an ADOPTED thread, whose root cannot vouch for
-	// it: this reply drops, but the false must not be cached, or the thread
-	// is silent for the rest of its task once the registry is back.
+	// The registry fails on a session thread: this reply drops, but the
+	// false must not be cached, or the thread is silent for the rest of its
+	// task once the registry is back.
 	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "8.0", "230.1")); ok {
-		t.Fatal("with the registry down and no mention in the root, the reply has nothing to deliver on")
+		t.Fatal("with the registry down, the reply has nothing to deliver on")
 	}
-	if _, cached := a.sessionThreads["C1/230.1"]; cached {
-		t.Fatal("a false derived while the registry was unreachable was cached")
+	if v, cached := a.sessionThreads["C1/230.1"]; cached {
+		t.Fatalf("a %v derived while the registry was unreachable was cached", v)
 	}
 	registryDown = false
 	got, ok = a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "9.0", "230.1"))
 	if !ok || got.Conversation != "slack:C1/230.1" {
 		t.Fatalf("the next reply, with the registry back: delivered=%v conv=%q", ok, got.Conversation)
 	}
-	if len(asked) != 5 {
-		t.Errorf("the registry was consulted for %v; want the adopted thread asked twice", asked)
+	if !a.sessionThreads["C1/230.1"] {
+		t.Error("the recovered registry's true was not cached")
+	}
+	if len(asked) != 4 {
+		t.Errorf("the registry was consulted for %v; want the failing thread asked twice", asked)
 	}
 }
 
@@ -1584,10 +1651,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 	}
 	t.Cleanup(client.Close)
 
-	api := &fakeSlackAPI{replies: map[string][]slack.Message{
-		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
-	}}
-	a := newTestSlackAdapter(api)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
 	cfg := &Config{
 		NATSURL:          url,
 		PrincipalMapPath: mapFile,
@@ -1601,6 +1665,14 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 	}
 	if a.sessions == nil {
 		t.Fatal("New did not offer the Slack adapter the session lookup")
+	}
+	// Wrap the lookup New wired so the test can count how often the
+	// registry is consulted; the answers are still the real registry's.
+	registry := a.sessions
+	var consulted int
+	a.sessions = func(ctx context.Context, conversation string) (bool, error) {
+		consulted++
+		return registry(ctx, conversation)
 	}
 
 	// The mentioned ask, as inbound would hand it over, driven through the
@@ -1622,8 +1694,8 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 	if !ok || got.Conversation != "slack:C1/200.1" {
 		t.Fatalf("an unmentioned follow-up after a restart: delivered=%v conv=%q — the registry did not answer", ok, got.Conversation)
 	}
-	if api.repliesCalls != 0 {
-		t.Errorf("the root was read %d times; the registry should have answered first", api.repliesCalls)
+	if consulted != 1 {
+		t.Errorf("the registry was consulted %d times for the follow-up, want 1 — the cache was empty and it is the only source", consulted)
 	}
 
 	// An unmapped sender's ask starts nothing, so it marks nothing.

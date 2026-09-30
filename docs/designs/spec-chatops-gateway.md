@@ -909,20 +909,20 @@ no thread-creation failure mode to handle. Session semantics are unchanged: the 
 DM is one conversation, a channel is not a session, a thread in it is.
 
 **Which messages become turns.** DMs carry every message. A channel message must
-mention the bot, and the ask roots the session thread. A thread reply is a turn when it
-mentions the bot or the thread is already a session thread - one the gateway holds a
-session in. That is what lets a session thread carry every message (the Discord parity)
-without making every thread in a joined channel a session. A thread becomes a session
-thread when the gateway starts a task in it - a verified sender's mentioned ask, which
-in someone else's thread mints a session keyed on that thread - and the adapter learns
-that from the gateway's `TaskStarted`, not from the mention itself: a bare mention
-inside someone else's thread starts nothing and makes nothing a session thread, whoever
-typed it. After a restart or a cache eviction the adapter asks the gateway's session
-registry whether a task has started in that thread (a record alone is not enough, since
-one is minted for any verified turn, a "stop" with nothing running included) before it
-falls back to reading the thread root. A rule that only ever looked at the root message
-dropped an adopted thread's follow-ups silently while the task ran on, because a steer
-or a "stop" arrives unmentioned. Two subtypes count as turns besides plain messages: `thread_broadcast` (a
+mention the bot, and the ask's own ts is the thread the session will live in. A thread
+reply is a turn when it mentions the bot or the thread is a session thread - one the
+gateway has started a task in. That is what lets a session thread carry every message
+(the Discord parity) without making every thread in a joined channel a session. A
+thread becomes a session thread only when the gateway starts a task in it - a verified
+sender's mentioned ask, in the channel or in someone else's thread - and the adapter
+learns that from the gateway's `TaskStarted` and, on a cache miss, from the session
+registry, which it asks whether a task has started in that thread (a record alone is
+not enough, since one is minted for any verified turn, a "stop" with nothing running
+included). Nothing is derived from the root message. A mention on its own starts
+nothing and makes nothing a session thread, whoever typed it, so a channel mention from
+a sender the principal map refuses roots nothing; and once the idle TTL reaps a session
+record, its thread needs a fresh mention. Two subtypes count as turns besides plain
+messages: `thread_broadcast` (a
 thread reply with "also send to channel" checked - dropping it would eat a steer
 silently) and `file_share` (an ask with an attachment). Everything else drops in the
 adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs
