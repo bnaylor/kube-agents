@@ -112,9 +112,10 @@ func stalledSlackStub(t *testing.T) (srv *httptest.Server, unblock func()) {
 // a server that never answers returns by slackAPITimeout instead of parking.
 // Driven through newSlackAdapter, not slackHTTPClient, because the claim is
 // about the client the constructor hands slack-go: deleting the
-// OptionHTTPClient line, or letting an option in extra displace it, leaves
-// the helper intact and the adapter unbounded. The production bound is also
-// pinned, since the test shortens it.
+// OptionHTTPClient line leaves the helper intact and the adapter unbounded.
+// The extra options carry an unbounded OptionHTTPClient on purpose, so the
+// test also holds the constructor to applying its own client last. The
+// production bound is pinned as well, since the test shortens it.
 func TestSlackWebAPIClientIsBounded(t *testing.T) {
 	if slackAPITimeout <= 0 || slackAPITimeout > time.Minute {
 		t.Fatalf("slackAPITimeout = %v, want a bound within a minute", slackAPITimeout)
@@ -124,7 +125,8 @@ func TestSlackWebAPIClientIsBounded(t *testing.T) {
 	t.Cleanup(func() { slackAPITimeout = orig })
 
 	srv, _ := stalledSlackStub(t)
-	a := newSlackAdapter("xoxb-stub", "xapp-stub", slog.Default(), slack.OptionAPIURL(srv.URL+"/"))
+	a := newSlackAdapter("xoxb-stub", "xapp-stub", slog.Default(),
+		slack.OptionAPIURL(srv.URL+"/"), slack.OptionHTTPClient(&http.Client{}))
 	done := make(chan error, 1)
 	go func() {
 		_, err := a.Post("slack:C1/1.0", "hello")
@@ -329,6 +331,48 @@ func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
 	}
 }
 
+// TestSideDoorForwardsObserverAndLookupToASlackPrimary: with the inject door
+// armed beside Slack (a dev or eval install), the gateway's TaskStarted and
+// SetSessionLookup reach the composite, and the composite has to pass them
+// on to the Slack primary or no thread is ever marked and the registry never
+// reaches the adapter. The door's own conversations stay the door's.
+func TestSideDoorForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	door, err := NewInjectAdapter("127.0.0.1:0", "side-door-test-token", time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	composite := WithSideDoor(a, door, nil)
+
+	observer, ok := composite.(TaskObserver)
+	if !ok {
+		t.Fatal("the composite must implement TaskObserver")
+	}
+	observer.TaskStarted("slack:C1/9.0", "task-chat")
+	if !a.sessionThreads["C1/9.0"] {
+		t.Fatal("TaskStarted for a chat conversation did not reach the Slack primary")
+	}
+	observer.TaskStarted(injectKeyPrefix+"case-1", "task-door")
+	if n := len(a.sessionThreads); n != 1 {
+		t.Fatalf("the door's TaskStarted reached the Slack primary; sessionThreads = %v", a.sessionThreads)
+	}
+	observer.TaskAccepted("slack:C1/9.0", "task-chat")
+	observer.CancelPublished("slack:C1/9.0", "task-chat")
+	observer.TaskTerminal("slack:C1/9.0", "task-chat", lib.StateCompleted, TerminalFromExecutor, "")
+
+	sink, ok := composite.(SessionLookupSink)
+	if !ok {
+		t.Fatal("the composite must implement SessionLookupSink")
+	}
+	sink.SetSessionLookup(func(context.Context, string) (bool, error) { return true, nil })
+	a.mu.Lock()
+	forwarded := a.sessions != nil
+	a.mu.Unlock()
+	if !forwarded {
+		t.Fatal("SetSessionLookup did not reach the Slack primary")
+	}
+}
+
 // recordingHandler captures log records so a test can assert on the LEVEL a
 // message came out at, not only on its text — the shutdown-path filters are
 // entirely about level, and a test that only matched the words would pass
@@ -453,7 +497,8 @@ func TestSlackOpenDirect(t *testing.T) {
 // the parity with Discord's bot-created threads).
 //
 // The cases run in order against one adapter, because the rule is stateful:
-// a mention in a thread makes that thread a session thread for the cases
+// a task starting in a thread (TaskStarted, which the case that adopts 200.1
+// calls where the gateway would) makes it a session thread for the cases
 // after it. 200.1 is the thread the bot is pulled into mid-conversation and
 // 300.1 the one it is never addressed in, and they are separate threads for
 // exactly that reason.
@@ -1101,9 +1146,18 @@ func TestSlackPumpStartsNoTurnOnACancelledContext(t *testing.T) {
 func TestSlackPumpDoesNotAckOnACancelledContext(t *testing.T) {
 	srv := slackInvalidAuthServer(t)
 	logs := &recordingHandler{}
+	took := 0
 	for i := 0; i < slackCancelledPumpRuns; i++ {
-		slackCancelledPumpRun(srv.URL+"/", fmt.Sprintf("Env-noack-%d", i),
-			fmt.Sprintf("810.%03d", i), logs, func(InboundMessage) {})
+		if slackCancelledPumpRun(srv.URL+"/", fmt.Sprintf("Env-noack-%d", i),
+			fmt.Sprintf("810.%03d", i), logs, func(InboundMessage) {}) {
+			took++
+		}
+	}
+	// Absence-only assertions pass when nothing ran; this is the one test
+	// that pins the receive-site re-check on its own, so it needs the same
+	// guard as its sibling.
+	if took == 0 {
+		t.Errorf("not one of the %d runs took the envelope off Events, so the receive-site ctx check never executed", slackCancelledPumpRuns)
 	}
 	if lvl, ok := logs.level("ack abandoned"); ok {
 		t.Errorf("a cancelled pump attempted an ack and had it refused (logged at %v); the receive is not re-checking ctx", lvl)
@@ -1411,9 +1465,11 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
 		"C1/210.1": {{Msg: slack.Msg{Text: "coffee?", User: "U2"}}},
 		"C1/220.1": {{Msg: slack.Msg{Text: "<@UBOT> watch the rollout", User: "U1"}}},
+		"C1/230.1": {{Msg: slack.Msg{Text: "tea?", User: "U2"}}},
 	}}
 	a := newTestSlackAdapter(api)
 	var asked []string
+	registryDown := true
 	a.sessions = func(_ context.Context, conversation string) (bool, error) {
 		asked = append(asked, conversation)
 		switch conversation {
@@ -1421,6 +1477,13 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 			return true, nil
 		case "slack:C1/220.1":
 			return false, errors.New("kv unavailable")
+		case "slack:C1/230.1":
+			// An adopted thread (root by someone else) behind a registry
+			// that fails once and then recovers.
+			if registryDown {
+				return false, errors.New("kv unavailable")
+			}
+			return true, nil
 		}
 		return false, nil
 	}
@@ -1456,7 +1519,25 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 		t.Errorf("a registry error must fall through to the root: %d replies reads, want 2", api.repliesCalls)
 	}
 	if len(asked) != 3 {
-		t.Errorf("the registry was consulted for %v; want once per cold thread", asked)
+		t.Errorf("the registry was consulted for %v; want once per cold thread so far", asked)
+	}
+
+	// The registry fails on an ADOPTED thread, whose root cannot vouch for
+	// it: this reply drops, but the false must not be cached, or the thread
+	// is silent for the rest of its task once the registry is back.
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "8.0", "230.1")); ok {
+		t.Fatal("with the registry down and no mention in the root, the reply has nothing to deliver on")
+	}
+	if _, cached := a.sessionThreads["C1/230.1"]; cached {
+		t.Fatal("a false derived while the registry was unreachable was cached")
+	}
+	registryDown = false
+	got, ok = a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "stop", "9.0", "230.1"))
+	if !ok || got.Conversation != "slack:C1/230.1" {
+		t.Fatalf("the next reply, with the registry back: delivered=%v conv=%q", ok, got.Conversation)
+	}
+	if len(asked) != 5 {
+		t.Errorf("the registry was consulted for %v; want the adopted thread asked twice", asked)
 	}
 }
 
@@ -1530,13 +1611,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		defer a.mu.Unlock()
 		return a.sessionThreads["C1/200.1"]
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !marked() && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !marked() {
-		t.Fatalf("the gateway started a task in C1/200.1 and the adapter never marked it: %v", a.sessionThreads)
-	}
+	waitFor(t, "the gateway to start a task in C1/200.1 and the adapter to mark it", marked)
 
 	// A restart: the cache is gone, the registry is not.
 	a.mu.Lock()

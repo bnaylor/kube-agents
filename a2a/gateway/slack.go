@@ -604,7 +604,11 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 // root with no mention in it, and after a restart or an eviction the cache
 // has forgotten the TaskStarted that recorded it. A registry error falls
 // through to the root read rather than dropping: the root still answers for
-// every thread the bot rooted.
+// every thread the bot rooted. But a false derived while the registry was
+// unreachable is an unknown, not an answer, and is not cached — the adopted
+// thread is exactly the one the root cannot vouch for, and caching that
+// false would silence it for the rest of its task. The next reply asks the
+// registry again.
 //
 // A false cached here is not permanent, and must not be. TaskStarted for the
 // same thread calls markSessionThread(key, true), which overwrites it, so a
@@ -631,6 +635,7 @@ func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS st
 	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, slackRepliesTimeout)
 	defer cancel()
+	registryUnsure := false
 	if lookup != nil {
 		held, err := lookup(ctx, slackConversationID("channel", channel, threadTS))
 		switch {
@@ -640,8 +645,10 @@ func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS st
 		case errors.Is(err, context.Canceled):
 			// Shutdown mid-read, as for the root read below; and this one
 			// is not the end of the answer, so it says so.
+			registryUnsure = true
 			s.log.Debug("session lookup abandoned on shutdown; falling back to the thread root", "channel", channel, "thread", threadTS, "err", err)
 		case err != nil:
+			registryUnsure = true
 			s.log.Warn("session lookup failed; falling back to the thread root", "channel", channel, "thread", threadTS, "err", err)
 		}
 	}
@@ -664,7 +671,12 @@ func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS st
 		return false
 	}
 	root := slackMentionsBot(msgs[0].Text, s.botUserID)
-	s.markSessionThread(key, root)
+	// A true from the root is an answer whatever the registry said. A false
+	// is only an answer when the registry was heard from (or there is none):
+	// see the doc comment.
+	if root || !registryUnsure {
+		s.markSessionThread(key, root)
+	}
 	return root
 }
 

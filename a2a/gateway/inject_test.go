@@ -879,9 +879,10 @@ func TestInjectPostsTheWholeOfALongAnswer(t *testing.T) {
 }
 
 // TestOnlyTheInjectBackendObservesTasks: TaskObserver is an optional
-// extension, and the chat backends must stay outside it. If a chat adapter
-// ever implements it by accident, the gateway starts calling into it on every
-// task with no test covering what it does there.
+// extension. Discord and gchat stay outside it, and Slack is inside it for
+// one documented reason (TaskStarted marks session threads). If any other
+// chat adapter picks it up by accident, the gateway starts calling into it on
+// every task with no test covering what it does there.
 func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 	discord := &DiscordAdapter{}
 	if _, ok := any(discord).(TaskObserver); ok {
