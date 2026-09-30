@@ -662,9 +662,11 @@ arrives while the first turn is still in flight. The id is unique per invocation
 never mistaken for a retry, and each status turn of the harness's delegation wait carries its own,
 `<run>/<case>/<rep>/status-<n>`, so the dedupe does not fold it into the opening task.
 
-The gateway tells the adapter a task's ends through an optional `TaskObserver` interface the
-chat backends do not implement: a human reads the chat, so rendered text is their whole
-interface, while a program must not have to parse `✅ **completed**` to know a task is over. The
+The gateway tells the adapter a task's ends through an optional `TaskObserver` interface that
+Discord and Google Chat do not implement: a human reads the chat, so rendered text is their
+whole interface, while a program must not have to parse `✅ **completed**` to know a task is
+over. (The Slack adapter implements it for one reason of its own, given in its section: a task
+starting or ending in a thread is what its session-thread cache keys on.) The
 start and the accept are separate calls because the id and the submission are different facts,
 as the refusal above turns on. The terminal says who declared it, which is the difference between
 an executor that failed, a task that never reached the bus, the supervisor's word about an
