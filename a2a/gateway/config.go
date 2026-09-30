@@ -151,8 +151,9 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the last user message (decided
-	// 8/24: 30 minutes, config-backed).
+	// IdleTTL is the reap threshold since the session's last activity: a
+	// verified turn, or an executor ending a live task (decided 8/24: 30
+	// minutes, config-backed; the task's end counts since 2026-09-30).
 	IdleTTL time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The

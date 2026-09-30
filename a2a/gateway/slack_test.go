@@ -599,6 +599,19 @@ func TestSlackTaskTerminalExpiresTheMarkSoTheNextReplyReasks(t *testing.T) {
 	}
 }
 
+// TestSlackTaskTerminalWithoutALookupExpiresNothing: an embedder that offers
+// no lookup gets a true that never expires (there is nothing to re-ask), and
+// TaskTerminal must honour that rather than make the entry due and turn the
+// next reply into a drop.
+func TestSlackTaskTerminalWithoutALookupExpiresNothing(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.TaskStarted("slack:C1/9.0", "task-1")
+	a.TaskTerminal("slack:C1/9.0", "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "and then?", "9.1", "9.0")); !ok {
+		t.Fatal("with no lookup wired, a session thread must keep carrying replies after its task ends")
+	}
+}
+
 // recordingHandler captures log records so a test can assert on the LEVEL a
 // message came out at, not only on its text — the shutdown-path filters are
 // entirely about level, and a test that only matched the words would pass
@@ -2015,8 +2028,8 @@ func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
 	}
 
 	// The task ends. The relay clears ActiveTask on the terminal; here the
-	// record is written the same way, LastActivity untouched so that it
-	// goes stale on its own. The record and its task history stay.
+	// record is written the same way, the activity clocks untouched so that
+	// they go stale on their own. The record and its task history stay.
 	rec, err := g.reg.Get(ctx, conv)
 	if err != nil || rec == nil || rec.ActiveTask == nil {
 		t.Fatalf("expected an active task on the record: rec=%+v err=%v", rec, err)
@@ -2026,13 +2039,13 @@ func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
 		t.Fatalf("releasing the task: %v", err)
 	}
 	// Released but inside the TTL: still a session thread, and the bound
-	// the registry hands back is its own, LastActivity + TTL.
+	// the registry hands back is its own, the last task's activity + TTL.
 	held, until, err := a.sessions(ctx, conv)
 	if err != nil || !held {
 		t.Fatalf("a released task inside the idle TTL must still be a session thread: held=%v err=%v", held, err)
 	}
-	if want := rec.LastActivity.Add(ttl); !until.Equal(want) {
-		t.Fatalf("the idle-bounded positive must expire at LastActivity+TTL: until=%v want %v", until, want)
+	if want := rec.LastTaskActivity.Add(ttl); !until.Equal(want) {
+		t.Fatalf("the idle-bounded positive must expire at LastTaskActivity+TTL: until=%v want %v", until, want)
 	}
 	time.Sleep(ttl + 100*time.Millisecond)
 	rec, err = g.reg.Get(ctx, conv)
@@ -2121,6 +2134,7 @@ func TestSlackGatewayDetachedTaskIsNotARunningTask(t *testing.T) {
 	// The stop went out, no terminal came back, and the activity is stale.
 	rec.ActiveTask.Detached = true
 	rec.LastActivity = time.Now().Add(-2 * ttl)
+	rec.LastTaskActivity = rec.LastActivity
 	if err := g.reg.Put(ctx, rec); err != nil {
 		t.Fatalf("detaching the task: %v", err)
 	}

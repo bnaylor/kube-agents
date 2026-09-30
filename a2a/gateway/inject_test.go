@@ -27,7 +27,7 @@ import (
 // Compile-time contract. The inject backend is the one adapter that has to
 // answer ABOUT a task. Discord and gchat deliberately do not -- a human reads
 // the chat, so the rendered text is their whole interface -- and Slack
-// implements TaskObserver for TaskStarted only, to learn which threads a task
+// implements TaskObserver for TaskStarted and TaskTerminal, to learn which threads a task
 // started in; it answers about nothing. The negative assertions are in
 // TestWhichAdaptersObserveTasks below, which a compile-time var cannot
 // express.
@@ -901,7 +901,7 @@ func TestWhichAdaptersObserveTasks(t *testing.T) {
 		t.Error("the Google Chat adapter implements InboundObserver; the gateway now calls into it untested")
 	}
 	// The Slack adapter is the one chat backend that implements TaskObserver,
-	// for TaskStarted alone: a task starting in a thread is what makes the
+	// for TaskStarted and TaskTerminal: a task starting in a thread is what makes the
 	// thread a session thread (SessionLookup). Pinned so the rule above is
 	// read as "Discord and gchat", not "every chat backend".
 	slackA := &SlackAdapter{}

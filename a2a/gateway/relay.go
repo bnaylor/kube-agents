@@ -255,13 +255,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.editLine(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, progress))
 		}
 		rec.ActiveTask = nil
-		// The task's end is activity. The idle TTL that bounds the session
-		// (the reap, and the Slack adapter's session-thread rule through
-		// hasSession) counts from here, not from the ask that started the
-		// task: a long task's thread must not go quiet the instant its
-		// answer posts, and the user's follow-up right after the result is
-		// the most ordinary message a session carries.
-		rec.LastActivity = time.Now().UTC()
+		// An executor's end of a live task is activity. The idle TTL that
+		// bounds the session (the reap, and the Slack adapter's session-
+		// thread rule through hasSession) counts from here, not from the ask
+		// that started the task: a long task's thread must not go quiet the
+		// instant its answer posts, and the user's follow-up right after the
+		// result is the most ordinary message a session carries. Two
+		// terminals are NOT activity: the supervisor's, which is the reap's
+		// own word about a session it has just judged idle (stamping it
+		// would re-open the window the reap closed), and a detached task's,
+		// which the user already stopped.
+		if source == TerminalFromExecutor && !active.Detached {
+			now := time.Now().UTC()
+			rec.LastActivity = now
+			rec.LastTaskActivity = now
+		}
 	}
 	// Retire the routing state. A post-final straggler then finds no route
 	// and is dropped rather than re-rendered (assertion 10 lives in the lib

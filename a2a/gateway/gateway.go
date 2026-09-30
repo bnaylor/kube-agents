@@ -926,7 +926,12 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 		return true, now.Add(g.cfg.IdleTTL), nil
 	}
 	if len(rec.Tasks) > 0 {
-		if until := rec.LastActivity.Add(g.cfg.IdleTTL); now.Before(until) {
+		// The last TASK's activity, not the record's: LastActivity moves on
+		// every verified turn, a "@bot stop" with nothing running included,
+		// and a turn that starts nothing must not re-admit a thread whose
+		// last task ended hours ago. LastTaskActivity moves only when a task
+		// starts (startTask) or an executor ends a live one (relayTerminal).
+		if until := rec.LastTaskActivity.Add(g.cfg.IdleTTL); now.Before(until) {
 			return true, until, nil
 		}
 	}
@@ -937,7 +942,7 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
 // reads the chat and the rendered text is the whole interface. The Slack
-// adapter implements it for TaskStarted alone: a task starting in a thread is
+// adapter implements it for TaskStarted and TaskTerminal: a task starting in a thread is
 // what makes that thread a session thread, and the adapter learns it here
 // rather than inferring it from a mention it has not yet seen verified.
 func (g *Gateway) observeTaskStarted(conversation, taskID string) {
@@ -1088,6 +1093,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
 		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now()}
 	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID})
+	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 	}

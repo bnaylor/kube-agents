@@ -101,7 +101,7 @@ type Adapter interface {
 // asserts for it and calls it where it mints and retires tasks; an adapter
 // that does not implement it sees no change at all, which is Discord and
 // Google Chat — a human reads the chat, so the chat text is the whole
-// interface. The Slack adapter implements it for TaskStarted alone, because
+// interface. The Slack adapter implements it for TaskStarted and TaskTerminal, because
 // a task starting in a thread is what makes that thread a session thread and
 // the adapter has to know (see SessionLookup).
 //

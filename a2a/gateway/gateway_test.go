@@ -1345,8 +1345,116 @@ func TestTaskEndCountsAsActivity(t *testing.T) {
 	if !after.LastActivity.After(asked) {
 		t.Fatalf("the task's end did not count as activity: LastActivity %v is not after the ask's %v", after.LastActivity, asked)
 	}
+	if !after.LastTaskActivity.Equal(after.LastActivity) {
+		t.Fatalf("the executor's terminal must move the task's own clock with the session's: task=%v session=%v", after.LastTaskActivity, after.LastActivity)
+	}
 	held, until, err := r.g.hasSession(ctx, conv)
-	if err != nil || !held || !until.Equal(after.LastActivity.Add(r.g.cfg.IdleTTL)) {
-		t.Fatalf("after the terminal the session must be held until LastActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
+	if err != nil || !held || !until.Equal(after.LastTaskActivity.Add(r.g.cfg.IdleTTL)) {
+		t.Fatalf("after the terminal the session must be held until LastTaskActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
+	}
+}
+
+// TestSupervisorTerminalIsNotActivity: the reap closes an idle session's
+// detached task by publishing a supervisor terminal, and that terminal must
+// not re-open the window the reap just closed. Only an executor's end of a
+// live task is activity.
+func TestSupervisorTerminalIsNotActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-sup-terminal"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "s-1", Text: "long one"}
+	origin := r.awaitTask(t, "platform")
+	ctx := context.Background()
+
+	// The session went idle with the task stopped and unconfirmed: what the
+	// reap sees right before it publishes the supervisor's canceled.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("no active task after the ask: %+v err=%v", rec, err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask.Detached = true
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("an idle session with a detached task must not be held before the terminal: held=%v err=%v", held, err)
+	}
+
+	payload, err := json.Marshal(lib.StatusUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateCanceled}, Final: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskSupervisorSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the supervisor's terminal to clear the task", func() bool {
+		got, err := r.g.reg.Get(ctx, conv)
+		return err == nil && got != nil && got.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastTaskActivity.Equal(stale) || !after.LastActivity.Equal(stale) {
+		t.Fatalf("the supervisor's terminal counted as activity: task=%v session=%v, want both %v", after.LastTaskActivity, after.LastActivity, stale)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("the reap's own terminal re-admitted the thread: held=%v err=%v", held, err)
+	}
+}
+
+// TestNoTaskTurnDoesNotReadmitAThread: a verified turn that starts nothing
+// ("stop" with nothing running) moves the reap's clock, as any turn does,
+// but must not move the clock the session-thread rule bounds on. Otherwise
+// one "@bot stop" in a thread whose task ended hours ago re-admits it for a
+// whole idle TTL.
+func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-no-task-turn"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "n-1", Text: "first ask"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask = nil
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("an idle thread must not be held: held=%v err=%v", held, err)
+	}
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "n-2", Text: "stop"}
+	waitFor(t, "the no-task stop to be answered", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "nothing is running") {
+				return true
+			}
+		}
+		return false
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastActivity.After(stale) {
+		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
+	}
+	if !after.LastTaskActivity.Equal(stale) {
+		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("a no-task turn re-admitted the thread: held=%v err=%v", held, err)
 	}
 }

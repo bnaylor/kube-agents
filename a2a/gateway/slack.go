@@ -307,6 +307,12 @@ func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ T
 func (s *SlackAdapter) expireMark(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// With no lookup wired there is nothing to re-ask, and the contract for
+	// that embedder (see sessions and startedExpiry) is that a true never
+	// expires; making it due would turn the next reply into a drop.
+	if s.sessions == nil || s.sessionTTL <= 0 {
+		return
+	}
 	if s.sessionThreads[key] {
 		s.sessionExpiresAt[key] = s.now()
 	}
