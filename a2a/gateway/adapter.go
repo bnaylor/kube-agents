@@ -99,8 +99,11 @@ type Adapter interface {
 // TaskObserver is the optional extension an Adapter implements when it has to
 // answer questions ABOUT a task rather than only render one. The gateway type
 // asserts for it and calls it where it mints and retires tasks; an adapter
-// that does not implement it sees no change at all, which is every chat
-// backend — a human reads the chat, so the chat text is the whole interface.
+// that does not implement it sees no change at all, which is Discord and
+// Google Chat — a human reads the chat, so the chat text is the whole
+// interface. The Slack adapter implements it for TaskStarted alone, because
+// a task starting in a thread is what makes that thread a session thread and
+// the adapter has to know (see SessionLookup).
 //
 // The inject backend is the case that needs more. Its caller is a program: it
 // posts a message and has to know which task that started and when that task
@@ -260,9 +263,11 @@ type ProbeSink interface {
 	SetProbe(ConversationProbe)
 }
 
-// SessionLookup answers whether the gateway holds a session record for a
-// conversation key. It is a PURE READ of the session registry, like
-// ConversationProbe: no lock, no heal, no post, no write, one KV read.
+// SessionLookup answers whether the gateway has started a task in a
+// conversation -- not merely whether a session record exists, since one is
+// minted for any verified turn, including a "stop" with nothing running. It
+// is a PURE READ of the session registry, like ConversationProbe: no lock,
+// no heal, no post, no write, one KV read.
 //
 // It exists because an adapter can be asked whether a conversation is one
 // the gateway is in before it has been told so on this process. The Slack

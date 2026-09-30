@@ -41,8 +41,8 @@ type sideDoorAdapter struct {
 
 // WithSideDoor puts the inject door beside a real backend, or hands back the
 // door alone when there is no real backend to pair it with -- an eval install
-// with neither a Discord token nor a Chat relay, which is the case that makes
-// the door #1660's answer.
+// with no Discord token, Slack pair or Chat relay, which is the case that
+// makes the door #1660's answer.
 func WithSideDoor(primary Adapter, door *InjectAdapter, log *slog.Logger) Adapter {
 	if primary == nil {
 		return door

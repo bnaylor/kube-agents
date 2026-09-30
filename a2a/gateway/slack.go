@@ -611,6 +611,15 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 // thread that becomes a session mid-conversation stops dropping its
 // unmentioned messages from that task on. Without the overwrite the negative
 // entry would outlive — and silence — the very session it was cached before.
+// The reverse overwrite is refused (markSessionThread never downgrades).
+//
+// One stated limit: an unmentioned reply that reaches the pump after the
+// adopting ask was enqueued but before its worker's TaskStarted finds no
+// task in the registry and no mention in the root, and is discarded. That
+// window is about one Slack round trip (the worker's Roster read), it costs
+// that one message and nothing after it, and closing it would mean not
+// caching a false at all, which is a root read per unmentioned reply in
+// every busy thread the bot is not in.
 func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS string) bool {
 	key := channel + "/" + threadTS
 	s.mu.Lock()
@@ -663,15 +672,28 @@ func (s *SlackAdapter) isSessionThread(ctx context.Context, channel, threadTS st
 // existing entry deliberately does NOT re-append to threadsOrder: the
 // eviction ring holds one position per key, and a flip from false to true
 // must not move a key's place in it or let it hold two.
+//
+// It never downgrades. A true comes from the gateway's TaskStarted, from
+// the registry, or from the ask that rooted the thread; the only false that
+// can arrive after one is a root read that was already in flight when the
+// true landed (isSessionThread releases the lock across its reads, and
+// TaskStarted runs on a gateway worker, not the pump), and letting that
+// stale read win would silence a live session thread for the life of the
+// entry. A session that has since ended keeps its thread marked, the same
+// as a channel-rooted thread whose root will always mention the bot.
 func (s *SlackAdapter) markSessionThread(key string, isSession bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.sessionThreads[key]; !exists {
+	existing, exists := s.sessionThreads[key]
+	switch {
+	case !exists:
 		s.threadsOrder = append(s.threadsOrder, key)
 		if len(s.threadsOrder) > slackThreadsCap {
 			delete(s.sessionThreads, s.threadsOrder[0])
 			s.threadsOrder = s.threadsOrder[1:]
 		}
+	case existing && !isSession:
+		return
 	}
 	s.sessionThreads[key] = isSession
 }

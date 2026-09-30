@@ -918,7 +918,8 @@ in someone else's thread mints a session keyed on that thread - and the adapter 
 that from the gateway's `TaskStarted`, not from the mention itself: a bare mention
 inside someone else's thread starts nothing and makes nothing a session thread, whoever
 typed it. After a restart or a cache eviction the adapter asks the gateway's session
-registry, which is the source of truth for the threads the gateway is in, before it
+registry whether a task has started in that thread (a record alone is not enough, since
+one is minted for any verified turn, a "stop" with nothing running included) before it
 falls back to reading the thread root. A rule that only ever looked at the root message
 dropped an adopted thread's follow-ups silently while the task ran on, because a steer
 or a "stop" arrives unmentioned. Two subtypes count as turns besides plain messages: `thread_broadcast` (a

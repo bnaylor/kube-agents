@@ -876,17 +876,23 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 }
 
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
-// whether the registry holds a record for the key, read and reported with
-// nothing changed. A pure read, as SessionLookup requires -- no lock, no
-// heal, no post, no publish, no write. A record exists from the first turn
-// the gateway ran for the conversation (mintSession, under the session lock),
-// so "true" means a verified sender's message reached routing there.
+// whether a task has ever started in the conversation, read from the
+// registry and reported with nothing changed. A pure read, as SessionLookup
+// requires -- no lock, no heal, no post, no publish, no write.
+//
+// A record alone is not the answer. mintSession Creates one for ANY verified
+// turn before the text is dispatched, so a mapped user's "@bot stop" with
+// nothing running, or an ask refused at the session cap, leaves a record
+// behind and starts nothing; answering true on that would adopt the thread
+// the way TaskStarted never did, and the two sources would disagree. A
+// started task is what startTask writes -- ActiveTask while it runs, and a
+// TaskRef in Tasks for the record's life -- so that is what this reads.
 func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, error) {
 	rec, err := g.reg.Get(ctx, conversation)
-	if err != nil {
+	if err != nil || rec == nil {
 		return false, err
 	}
-	return rec != nil, nil
+	return rec.ActiveTask != nil || len(rec.Tasks) > 0, nil
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements

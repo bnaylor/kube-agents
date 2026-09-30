@@ -897,6 +897,17 @@ func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 	if _, ok := any(gchat).(InboundObserver); ok {
 		t.Error("the Google Chat adapter implements InboundObserver; the gateway now calls into it untested")
 	}
+	// The Slack adapter is the one chat backend that implements TaskObserver,
+	// for TaskStarted alone: a task starting in a thread is what makes the
+	// thread a session thread (SessionLookup). Pinned so the rule above is
+	// read as "Discord and gchat", not "every chat backend".
+	slackA := &SlackAdapter{}
+	if _, ok := any(slackA).(TaskObserver); !ok {
+		t.Error("the Slack adapter does not implement TaskObserver, so it can no longer learn which threads are session threads")
+	}
+	if _, ok := any(slackA).(InboundObserver); ok {
+		t.Error("the Slack adapter implements InboundObserver; the gateway now calls into it untested")
+	}
 	inject := &InjectAdapter{}
 	if _, ok := any(inject).(TaskObserver); !ok {
 		t.Error("the inject adapter does not implement TaskObserver, so POST /inject can never return a task id")

@@ -236,6 +236,99 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 	}
 }
 
+// TestSlackMarkNeverDowngrades: a true in sessionThreads is the gateway's
+// word (TaskStarted), the registry's, or the ask that rooted the thread, and
+// the only false that can follow it is a root read that was in flight when
+// it landed. That read must not win.
+func TestSlackMarkNeverDowngrades(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.markSessionThread("C1/1.0", true)
+	a.markSessionThread("C1/1.0", false)
+	if !a.sessionThreads["C1/1.0"] {
+		t.Fatal("a stale false overwrote a true")
+	}
+	a.markSessionThread("C1/2.0", false)
+	a.markSessionThread("C1/2.0", true)
+	if !a.sessionThreads["C1/2.0"] {
+		t.Fatal("a true must still overwrite a cached false (the un-poison)")
+	}
+	a.markSessionThread("C1/3.0", false)
+	if v, ok := a.sessionThreads["C1/3.0"]; !ok || v {
+		t.Fatalf("a fresh false must be recorded; got ok=%v v=%v", ok, v)
+	}
+	if n := len(a.threadsOrder); n != 3 {
+		t.Errorf("threadsOrder = %d entries, want 3: one slot per key, refusals included", n)
+	}
+}
+
+// TestSlackGatewayDoesNotAdoptOnATasklessTurn: a session record is minted
+// for any verified turn, so a mapped user's "@bot stop" with nothing running
+// in someone else's thread leaves a record and starts no task. The registry
+// lookup must answer false for it, or the thread is adopted the way
+// TaskStarted never adopted it. An ask afterwards starts a task and does.
+func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U1 test:jayanti\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-slack-stop"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	api := &fakeSlackAPI{replies: map[string][]slack.Message{
+		"C1/200.1": {{Msg: slack.Msg{Text: "lunch?", User: "U2"}}},
+	}}
+	a := newTestSlackAdapter(api)
+	cfg := &Config{
+		NATSURL:          url,
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
+	}
+	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// A verified "stop" with nothing running: routed, answered, no task.
+	g.handleInbound(InboundMessage{Conversation: "slack:C1/200.1", Kind: "group", AuthorID: "U1", MessageID: "4.0", Text: "stop"})
+	rec, err := g.reg.Get(ctx, "slack:C1/200.1")
+	if err != nil || rec == nil {
+		t.Fatalf("the verified turn should have minted a record: rec=%v err=%v", rec, err)
+	}
+	if rec.ActiveTask != nil || len(rec.Tasks) != 0 {
+		t.Fatalf("a stop with nothing running started a task: %+v", rec)
+	}
+	if held, err := a.sessions(ctx, "slack:C1/200.1"); err != nil || held {
+		t.Fatalf("the lookup adopted a thread no task ever started in: held=%v err=%v", held, err)
+	}
+	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U2", "anyway, lunch?", "5.0", "200.1")); ok {
+		t.Fatal("an unmentioned reply in a thread with a record but no task must not be a turn")
+	}
+
+	// The ask that does start a task adopts the thread, cache wiped or not.
+	g.handleInbound(InboundMessage{Conversation: "slack:C1/200.1", Kind: "group", AuthorID: "U1", MessageID: "6.0", Text: "drain node 3"})
+	if held, err := a.sessions(ctx, "slack:C1/200.1"); err != nil || !held {
+		t.Fatalf("a started task must make the lookup answer true: held=%v err=%v", held, err)
+	}
+	a.mu.Lock()
+	a.sessionThreads = map[string]bool{}
+	a.threadsOrder = nil
+	a.mu.Unlock()
+	if _, ok := a.inbound(ctx, slackMsg("channel", "C1", "U1", "stop", "7.0", "200.1")); !ok {
+		t.Fatal("after a task started, the unmentioned follow-up must deliver from the registry")
+	}
+}
+
 // recordingHandler captures log records so a test can assert on the LEVEL a
 // message came out at, not only on its text — the shutdown-path filters are
 // entirely about level, and a test that only matched the words would pass
@@ -434,7 +527,7 @@ func TestSlackInboundFilters(t *testing.T) {
 	edited := slackMsg("im", "D1", "U1", "edited", "3.0", "")
 	edited.SubType = "message_changed"
 	if _, ok := a.inbound(context.Background(), edited); ok {
-		t.Error("non-empty subtypes must drop")
+		t.Error("subtypes outside the turn set (plain, thread_broadcast, file_share) must drop")
 	}
 	dup := slackMsg("im", "D1", "U1", "once", "4.0", "")
 	if _, ok := a.inbound(context.Background(), dup); !ok {
@@ -918,14 +1011,20 @@ func slackCancelledPumpRun(apiURL, envelopeID, ts string, logs *recordingHandler
 	// possibly connection_error — carries no Request, so matching on the
 	// envelope ID answers exactly one question: did the pump take OUR
 	// envelope, or did its top-of-loop select take ctx.Done instead?
+	//
+	// Nothing but the pump reads Events, so finding our envelope still there
+	// means the pump left at the select and never took it; draining the
+	// channel without meeting it means the pump took it. The first version
+	// of this helper returned the inverse, which made the anti-vacuity guard
+	// below count the runs that skipped the code under test.
 	for {
 		select {
 		case evt := <-a.sm.Events:
 			if evt.Request != nil && evt.Request.EnvelopeID == envelopeID {
-				return true
+				return false
 			}
 		default:
-			return false
+			return true
 		}
 	}
 }
