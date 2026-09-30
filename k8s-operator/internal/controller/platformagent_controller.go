@@ -3133,6 +3133,60 @@ func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now
 	})
 }
 
+// a2aVerifierNotReady reports whether the CR should carry the A2AVerifier
+// condition: the stack is rendered, the verifier Deployment exists, and no
+// replica of it is ready.
+//
+// Existence is part of the test on purpose. An absent Deployment is the
+// ordinary shape of a pass that has not rendered it yet, and reconcileA2A
+// creates it every pass, so "absent" is not a state an install sits in --
+// whereas reporting it would put the condition on every install for the
+// first seconds of its life. What this is for is the durable case: the
+// Deployment is there and its pods cannot run.
+//
+// A read error leaves the condition alone rather than asserting either way.
+// The API server being unreachable is not a fact about the verifier, it is
+// already the reconcile's problem, and the next pass re-reads.
+func (r *PlatformAgentReconciler) a2aVerifierNotReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aStackRendering(agent) {
+		return false
+	}
+	verifier := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aVerifierName(agent)}, verifier); err != nil {
+		return false
+	}
+	return verifier.Status.ReadyReplicas == 0
+}
+
+// a2aVerifierConditionCurrent reports whether the CR's A2AVerifier condition
+// already says what this pass would write.
+func a2aVerifierConditionCurrent(agent *agentv1alpha1.PlatformAgent, notReady bool) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aVerifierConditionType)
+	if !notReady {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionFalse &&
+		existing.Reason == a2aVerifierNotReadyReason
+}
+
+// setA2AVerifierCondition writes the verifier condition on the same
+// present-while-it-holds pattern as A2AGateway. Not Degraded, and not a Ready
+// row: see a2aVerifierConditionType for why the CR stays Ready through this.
+func setA2AVerifierCondition(agent *agentv1alpha1.PlatformAgent, notReady bool, now metav1.Time) {
+	if !notReady {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aVerifierConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aVerifierConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             a2aVerifierNotReadyReason,
+		Message:            a2aVerifierNotReadyMessage,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
 // wantBusProvisioned is the provisioned-once record's desired presence:
 // sticky under next once this pass or an earlier one saw the Job complete,
 // absent under today, where the flip's teardown took the bus with it.
@@ -3185,12 +3239,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		dark = a2a.gatewayDarkReason
 	}
 	want := wantBusProvisioned(agent, a2a)
-	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) {
+	verifierNotReady := r.a2aVerifierNotReady(ctx, agent)
+	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) &&
+		a2aVerifierConditionCurrent(agent, verifierNotReady) {
 		return nil
 	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
+	setA2AVerifierCondition(agent, verifierNotReady, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -3547,6 +3604,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
+	setA2AVerifierCondition(agent, r.a2aVerifierNotReady(ctx, agent), now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
@@ -3859,6 +3917,25 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// the skew itself -- a second reason there would report the freeze as a fault.
 	if a2aStackRendering(agent) {
 		selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
+	}
+
+	// The verifier, for the opposite reason to the gateway's and so worth its own
+	// paragraph: it is scanned precisely because it does NOT gate Ready.
+	//
+	// readSplitWorkloads leaves it out on purpose -- a verifier rollout should not
+	// flip a serving install to Provisioning, and the CRD page says so. But every
+	// executor turns a Check that gets no answer into a terminal rejected, so a
+	// verifier stuck in ImagePullBackOff (the default image is a dev-registry tag an
+	// install is expected to override) refuses every submission while the CR reports
+	// Ready=True. Not gating is the decision; reporting nothing is not. Scanned, the
+	// operator at least reads the container fault instead of a green CR and a bus
+	// that rejects everything.
+	//
+	// This is the one selector here whose pod is not counted toward Ready, so it can
+	// only ever add a reason to a phase some other workload already set -- it cannot
+	// by itself move a CR off Ready, and the ordering note above still holds.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
 	}
 
 	pods := make([]corev1.Pod, 0)

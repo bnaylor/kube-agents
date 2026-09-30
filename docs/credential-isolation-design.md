@@ -950,7 +950,12 @@ file and never a `.git` it can write into.
   bullet is about.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
-- The operator reports Ready only when every workload it renders is ready.
+- The operator reports Ready only when every workload it renders is ready, with
+  one deliberate exception: under `mode: next` the capability verifier is not
+  counted. It is a request-path workload, and a rollout of it should not flip a
+  serving install to Provisioning. Because an install whose verifier is down
+  refuses every submission, it reports itself through the `A2AVerifier`
+  condition instead, which an install can be Ready and still carry.
 
 ## Deployment and Migration
 

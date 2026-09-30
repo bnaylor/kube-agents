@@ -1,13 +1,19 @@
 package hermesbridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -428,4 +434,139 @@ func TestAVerifierOutageDoesNotDelayACancel(t *testing.T) {
 	if text := terminalText(t, url, doomed); !strings.Contains(text, "canceled-before-start") {
 		t.Errorf("the terminal event is not the cancel's: %q", text)
 	}
+}
+
+// A bridge that is refused its verify subject must say so, rather than
+// reporting the refusal as a verifier outage.
+//
+// This is the failure the async handler is for. NATS refuses a publish on
+// a2a.cap.verify.<profile> asynchronously and nats.go delivers that -ERR only
+// to the connection's AsyncErrorCB. With no handler installed it is dropped:
+// Check simply times out, returns "the verifier could not be reached", and
+// that string goes into the task's terminal reason and into the log. So a
+// bridge whose identity lost one of its two verify grants -- a render
+// regression, a hand-written Deployment, BRIDGE_PROFILE pointing somewhere the
+// operator did not grant -- refuses every task while every signal blames the
+// verifier Deployment, which is a different team and a different fix.
+//
+// The refusal is still a refusal; nothing here changes the outcome. What the
+// handler changes is that the cause names itself at the moment it happens.
+//
+// Driven through the real New(), because the connection under test is the one
+// New builds and the defect was in how it was built. A test that dialled its
+// own connection would be asserting its own option list.
+func TestAGrantRefusalOnTheVerifySubjectNamesItself(t *testing.T) {
+	const user, pass = "bridge", "bridge-pw"
+
+	opts := &natsserver.Options{
+		Host: "127.0.0.1", Port: int(testPort.Add(1)),
+		JetStream: true, StoreDir: t.TempDir(), NoLog: true, NoSigs: true,
+		Users: []*natsserver.User{{
+			Username: user, Password: pass,
+			Permissions: &natsserver.Permissions{
+				// Everything the bridge needs, minus the one grant this is
+				// about. Deny rather than a narrow Allow so the test cannot
+				// pass by starving some unrelated subject.
+				Publish:   &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{capability.VerifyPrefix + ">"}},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
+			},
+		}},
+	}
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	url := fmt.Sprintf("nats://127.0.0.1:%d", opts.Port)
+
+	creds := nats.UserInfo(user, pass)
+	provision, err := nats.Connect(url, creds)
+	if err != nil {
+		t.Fatalf("provision connect: %v", err)
+	}
+	defer provision.Close()
+	js, err := jetstream.New(provision)
+	if err != nil {
+		t.Fatalf("provision jetstream: %v", err)
+	}
+	ctx := testCtx(t)
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: lib.TasksStream, Subjects: []string{"a2a.tasks.>"},
+		Retention: jetstream.LimitsPolicy, MaxAge: 72 * time.Hour,
+	}); err != nil {
+		t.Fatalf("create TASKS: %v", err)
+	}
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "runtime-state"}); err != nil {
+		t.Fatalf("create runtime-state: %v", err)
+	}
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
+		t.Fatalf("create cap: %v", err)
+	}
+
+	var buf lockedBuffer
+	b, err := New(ctx, Config{
+		NATSURL:     url,
+		Scope:       capability.NamespaceScope(""),
+		NATSOptions: []nats.Option{creds},
+		Logger:      slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+	if err != nil {
+		t.Fatalf("bridge new: %v", err)
+	}
+	t.Cleanup(b.close)
+
+	// The real client on the bridge's real KV connection, publishing on the
+	// subject the grant is missing. The Check itself is expected to fail --
+	// that is the outage-shaped symptom. What is under test is whether the
+	// cause was reported alongside it.
+	client, err := capability.NewClient(b.nc, b.cfg.Profile)
+	if err != nil {
+		t.Fatalf("capability client: %v", err)
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := client.Check(checkCtx, capability.Ref{Key: "no-such-key", Revision: 1},
+		capability.VerbTaskExecute, b.cfg.Scope); err == nil {
+		t.Fatal("the check succeeded against a bus that refuses its subject")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "the bus refused this bridge") {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "the bus refused this bridge") {
+		t.Fatalf("a permission refusal on %s was dropped: an operator sees only "+
+			"\"the verifier could not be reached\" and goes looking at the verifier Deployment.\nlog was: %s",
+			capability.VerifyPrefix+"platform", logged)
+	}
+	if !strings.Contains(logged, "platform") {
+		t.Errorf("the refusal does not name the profile whose grant is missing: %s", logged)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for the async handler (which runs on
+// nats.go's own goroutine) to write while the test reads.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

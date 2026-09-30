@@ -486,6 +486,30 @@ const (
 		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
 	tasksSubjectCapRenderedDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
 
+	// The condition that reports the verifier, and the reason it is a
+	// condition rather than a Ready row.
+	//
+	// The verifier is deliberately not counted toward Ready: it is a
+	// request-path workload, and a rollout of it should not flip a serving
+	// install to Provisioning. But every executor turns a capability Check
+	// that gets no answer into a terminal rejected, so an install whose
+	// verifier never comes up refuses every submission -- and with the
+	// verifier out of Ready and out of the pod scan, it did that behind a
+	// green CR with nothing anywhere in status to read. (The scan could not
+	// have caught it either: updateStatusReady returns Ready before it runs,
+	// so a fault in a workload nothing else waits on never reached it.)
+	//
+	// So: not a Ready row, which would change when an install goes ready, but
+	// a condition of its own, which changes nothing and still says the thing
+	// an operator needs to see. Absent when the verifier is ready or the
+	// stack is not rendered, on the EventWatcher pattern the A2AGateway
+	// condition above uses.
+	a2aVerifierConditionType   = "A2AVerifier"
+	a2aVerifierNotReadyReason  = "VerifierNotReady"
+	a2aVerifierNotReadyMessage = "the capability verifier has no ready replica; " +
+		"submissions are refused terminally while this holds (the CR stays Ready: " +
+		"the verifier is on the request path, not the readiness path)"
+
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
 	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node

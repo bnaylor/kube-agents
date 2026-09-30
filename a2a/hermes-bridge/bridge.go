@@ -310,9 +310,39 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.nc, err = nats.Connect(cfg.NATSURL, append([]nats.Option{
+	// An async error handler, for the same reason the session executor has one
+	// (worker-adapter/adapter.go) and one this connection made sharper.
+	//
+	// This is the connection the capability check rides: capability.NewClient
+	// publishes on a2a.cap.verify.<profile> and subscribes to
+	// a2a.cap.reply.<profile>.*. NATS refuses either asynchronously, and nats.go
+	// delivers that -ERR only to the async handler -- with none installed it is
+	// dropped on the floor. Check then simply times out, and the bridge
+	// publishes "the verifier could not be reached" as the task's terminal
+	// reason. So a bridge missing or mis-spelling one of its two verify grants
+	// refuses every task while every log line and every terminal event blames
+	// the verifier Deployment, which is the wrong team's pager and the wrong
+	// hour of debugging.
+	//
+	// The handler does not change any of those outcomes. It makes the refusal
+	// name itself at the moment it happens, which is the difference between "the
+	// verifier is down" and "this bridge was never granted the subject".
+	natsOpts := append([]nats.Option{
 		nats.Name(b.from.Session + "-kv"), nats.MaxReconnects(-1),
-	}, cfg.NATSOptions...)...)
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			subject := ""
+			if sub != nil {
+				subject = sub.Subject
+			}
+			if errors.Is(err, nats.ErrPermissionViolation) || errors.Is(err, nats.ErrAuthorization) {
+				cfg.Logger.Error("the bus refused this bridge", "err", err, "subject", subject,
+					"profile", cfg.Profile, "session", b.from.Session)
+				return
+			}
+			cfg.Logger.Warn("nats async error", "err", err, "subject", subject)
+		}),
+	}, cfg.NATSOptions...)
+	b.nc, err = nats.Connect(cfg.NATSURL, natsOpts...)
 	if err != nil {
 		b.c.Close()
 		return nil, fmt.Errorf("kv connection: %w", err)
