@@ -122,8 +122,8 @@ func run() int {
 // assertion about what the environment maps to had to be made against a
 // Config the test built itself, which is an assertion about the test. The
 // capability switch is the one that matters — see CapabilityOptional below.
-// The bool is false when the required trio is missing, which run reports as
-// exit 1.
+// The bool is false when the required trio is missing or A2A_AUTHORITY_SCOPE
+// is malformed, which run reports as exit 1.
 func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
@@ -131,6 +131,23 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	if taskID == "" || profile == "" || natsURL == "" {
 		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract)")
 		return workeradapter.Config{}, false
+	}
+
+	// The scope arrives resolved and already validated -- the gateway's
+	// spawner writes it from a ceiling FromEnv ran Entry.Validate over --
+	// so this refuses a shape that should not reach a rendered pod at all.
+	// It is here because the bridge's sibling of this variable IS hand
+	// typed, and one binary validating a security input while its twin
+	// takes it raw is how the two executors drift. Empty is not checked:
+	// unset is a legitimate state that the executor's own scope handling
+	// governs, and NamespaceScope never produces a malformed pair.
+	scope := capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE"))
+	if scope != "" {
+		if err := scope.Validate(); err != nil {
+			log.Error("A2A_AUTHORITY_SCOPE is not a well-formed scope; it is kind/name pairs, e.g. namespace/kubeagents-system",
+				"scope", string(scope), "err", err)
+			return workeradapter.Config{}, false
+		}
 	}
 
 	originSeq, originSeqStated := originSeq(log)
@@ -144,7 +161,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		Profile:      profile,
 		Session:      os.Getenv("A2A_SESSION"),
 		Namespace:    os.Getenv("POD_NAMESPACE"),
-		Scope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		Scope:        scope,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a

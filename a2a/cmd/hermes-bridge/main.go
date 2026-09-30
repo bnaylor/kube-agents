@@ -92,9 +92,11 @@ const (
 	saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 )
 
-// errUsage is what realMain returns when NATS_URL is missing, so run can
-// keep the usage exit code distinct from every other failure.
-var errUsage = errors.New("NATS_URL is required")
+// errUsage is what configFromEnv returns when the environment itself is
+// unusable -- NATS_URL missing, A2A_AUTHORITY_SCOPE malformed -- so run can
+// keep the usage exit code distinct from every other failure. Each site logs
+// the specific variable; this sentinel carries only the class.
+var errUsage = errors.New("the environment is not usable")
 
 func main() {
 	os.Exit(run())
@@ -217,7 +219,11 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 		// because writing it out here is how `!= "true"` gets in.
 		CapabilityOptional: capability.OptionalFromEnv(),
 	}
-	cfg.Scope = capabilityScope(log)
+	scope, err := capabilityScope(log)
+	if err != nil {
+		return hermesbridge.Config{}, err
+	}
+	cfg.Scope = scope
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
 		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
 	}
@@ -265,9 +271,25 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 // and the install fails loudly at the first turn — the alternative, defaulting
 // to a plausible namespace, would pass the check against a capability minted
 // for a different one.
-func capabilityScope(log *slog.Logger) capability.Scope {
+//
+// The override is validated and a bad one fails boot, which is what the
+// gateway does with the same variable (validateCapabilityCeiling). It is the
+// one rung a human types, and an odd segment count -- `kubeagents-system`
+// rather than `namespace/kubeagents-system` -- otherwise buys a bridge that
+// starts cleanly and refuses every `platform` task with "the resource is not
+// a well-formed scope", with nothing at startup saying why. The derived rungs
+// below are not validated the same way because they cannot be malformed:
+// NamespaceScope builds the pair, and a namespace it could not resolve is
+// left empty on purpose, below.
+func capabilityScope(log *slog.Logger) (capability.Scope, error) {
 	if s := os.Getenv("A2A_AUTHORITY_SCOPE"); s != "" {
-		return capability.Scope(s)
+		scope := capability.Scope(s)
+		if err := scope.Validate(); err != nil {
+			log.Error("A2A_AUTHORITY_SCOPE is not a well-formed scope; it is kind/name pairs, e.g. namespace/kubeagents-system",
+				"scope", s, "err", err)
+			return "", errUsage
+		}
+		return scope, nil
 	}
 	ns := os.Getenv("POD_NAMESPACE")
 	if ns == "" {
@@ -275,15 +297,15 @@ func capabilityScope(log *slog.Logger) capability.Scope {
 		if err != nil {
 			log.Error("cannot resolve this pod's namespace; every task will be refused for want of a scope",
 				"file", saNamespaceFile, "err", err)
-			return ""
+			return "", nil
 		}
 		ns = strings.TrimSpace(string(b))
 	}
 	if ns == "" {
 		log.Error("this pod's namespace resolved empty; every task will be refused for want of a scope")
-		return ""
+		return "", nil
 	}
-	return capability.NamespaceScope(ns)
+	return capability.NamespaceScope(ns), nil
 }
 
 func envOr(key, def string) string {

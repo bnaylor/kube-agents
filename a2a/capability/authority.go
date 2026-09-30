@@ -26,6 +26,21 @@ type authorityBlock struct {
 // all, which is the pre-arming gateway's envelope and the rollout window an
 // executor's CapabilityOptional governs; err is non-nil when a block is there
 // but does not parse, which is never a rollout state and always a refusal.
+//
+// "No capability at all" is three shapes, not one. `"grants": null` is what
+// the pre-arming gateway emits and is the obvious one; `"grants": {}` and
+// `"grants": {"capability": null}` both unmarshal to a non-nil Grants holding
+// a zero Ref, and a Ref with no key names nothing. Reporting those as present
+// sends the executor to spend a verifier round trip on Ref{}, which the
+// verifier's fetch refuses as "the reference has no key" and Answer converges
+// to a walk refusal -- so the task is rejected for the wrong rule, and in the
+// CapabilityOptional window a block that carries no capability is refused
+// where the comment above says it runs. Fail-closed either way, wrong name
+// either way, so the key is what the question is asked against.
+//
+// A revision of zero is NOT folded in here. An unpinned reference is a
+// reference, and it has its own refusal (Entry.Validate, "parent reference is
+// not pinned to a revision") that says so precisely.
 func RefFromAuthority(raw json.RawMessage) (ref Ref, present bool, err error) {
 	if len(raw) == 0 {
 		return Ref{}, false, nil
@@ -34,7 +49,7 @@ func RefFromAuthority(raw json.RawMessage) (ref Ref, present bool, err error) {
 	if err := json.Unmarshal(raw, &block); err != nil {
 		return Ref{}, false, err
 	}
-	if block.Grants == nil {
+	if block.Grants == nil || block.Grants.Capability.Key == "" {
 		return Ref{}, false, nil
 	}
 	return block.Grants.Capability, true, nil

@@ -225,6 +225,17 @@ func (e Entry) Validate() error {
 	return nil
 }
 
+// Validate is scope well-formedness, exported so a program that takes a scope
+// from its environment can refuse a bad one at boot rather than at every task.
+// The gateway does this through Entry.Validate on its ceiling; the two
+// executors take A2A_AUTHORITY_SCOPE directly and have no Entry to run, and
+// without this the failure mode is a process that starts cleanly and then
+// refuses every submission with "the resource is not a well-formed scope" and
+// nothing at startup saying why.
+//
+// The error is a *Refusal, so Reason reads the rule out of it.
+func (s Scope) Validate() error { return s.validate() }
+
 func (s Scope) validate() error {
 	if s == "" {
 		return refuse("entry carries an empty scope")

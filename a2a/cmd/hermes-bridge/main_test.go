@@ -197,3 +197,56 @@ func TestTheBridgeBinaryRequiresACapabilityUnlessExactlyFalse(t *testing.T) {
 		})
 	}
 }
+
+// TestAMalformedAuthorityScopeIsABootFailure: A2A_AUTHORITY_SCOPE is the one
+// rung of capabilityScope a human types, and the gateway fails boot on the
+// same variable (validateCapabilityCeiling). Without this the bridge starts
+// clean on `kubeagents-system` — the namespace with the `namespace/` kind
+// left off, which is the mistake — and then refuses every `platform` task
+// with "the resource is not a well-formed scope", with nothing at startup
+// connecting the two.
+//
+// It is the usage exit, not the failure exit: the environment is wrong, which
+// is the same class as a missing NATS_URL and not the same class as a bus
+// that will not answer.
+func TestAMalformedAuthorityScopeIsABootFailure(t *testing.T) {
+	for _, tc := range []struct {
+		scope   string
+		wantErr bool
+	}{
+		{scope: "kubeagents-system", wantErr: true},
+		{scope: "namespace/", wantErr: true},
+		{scope: "namespace/a/task", wantErr: true},
+		{scope: "namespace/kubeagents-system"},
+		{scope: "namespace/kubeagents-system/task/t-1"},
+		// Unset is not malformed: the POD_NAMESPACE rung below takes over.
+		{scope: ""},
+	} {
+		t.Run(tc.scope, func(t *testing.T) {
+			t.Setenv("NATS_URL", unreachableNATSURL)
+			t.Setenv("A2A_AUTHORITY_SCOPE", tc.scope)
+			t.Setenv("POD_NAMESPACE", "kubeagents-system")
+			log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+			_, err := configFromEnv(log)
+			if tc.wantErr {
+				if !errors.Is(err, errUsage) {
+					t.Fatalf("configFromEnv with A2A_AUTHORITY_SCOPE=%q returned %v, want errUsage", tc.scope, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("configFromEnv with A2A_AUTHORITY_SCOPE=%q: %v", tc.scope, err)
+			}
+		})
+	}
+}
+
+// And the usage exit reaches the process, so a rendered pod shows the
+// operator a distinct code rather than the generic failure.
+func TestAMalformedAuthorityScopeExitsUsage(t *testing.T) {
+	t.Setenv("NATS_URL", unreachableNATSURL)
+	t.Setenv("A2A_AUTHORITY_SCOPE", "kubeagents-system")
+	if got := run(); got != exitUsage {
+		t.Errorf("run() with a malformed A2A_AUTHORITY_SCOPE = %d, want %d", got, exitUsage)
+	}
+}

@@ -262,3 +262,37 @@ func TestTheWorkerBinaryRequiresACapabilityUnlessExactlyFalse(t *testing.T) {
 		})
 	}
 }
+
+// TestAMalformedAuthorityScopeRefusesToStart: the session executor's
+// A2A_AUTHORITY_SCOPE arrives resolved from the gateway's spawner, so a bad
+// one should not reach a rendered pod. The check is here anyway because the
+// bridge's sibling of this variable IS hand-typed and validates at boot, and
+// the two executors sharing a security parser but not a validation is how the
+// pair drifts. Unset stays legitimate.
+func TestAMalformedAuthorityScopeRefusesToStart(t *testing.T) {
+	for _, tc := range []struct {
+		scope  string
+		wantOK bool
+	}{
+		{scope: "kubeagents-system"},
+		{scope: "namespace/"},
+		{scope: "namespace/a/task"},
+		{scope: "namespace/kubeagents-system", wantOK: true},
+		{scope: "namespace/kubeagents-system/task/t-1", wantOK: true},
+		{scope: "", wantOK: true},
+	} {
+		t.Run(tc.scope, func(t *testing.T) {
+			t.Setenv("TASK_ID", "task-scope-contract")
+			t.Setenv("PROFILE", "chat")
+			t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+			t.Setenv("A2A_AUTHORITY_SCOPE", tc.scope)
+			cfg, ok := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			if ok != tc.wantOK {
+				t.Fatalf("configFromEnv with A2A_AUTHORITY_SCOPE=%q ok = %v, want %v", tc.scope, ok, tc.wantOK)
+			}
+			if ok && string(cfg.Scope) != tc.scope {
+				t.Errorf("configFromEnv scope = %q, want %q", cfg.Scope, tc.scope)
+			}
+		})
+	}
+}
