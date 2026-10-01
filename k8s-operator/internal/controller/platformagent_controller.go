@@ -156,9 +156,9 @@ const (
 	reasonCrashLoopBackOff  = "CrashLoopBackOff"
 
 	// a2aVerifierContainerName is the verifier Deployment's only container
-	// (buildA2AVerifierDeployment). The pod scan names it to tell the
-	// verifier's one by-design crash loop from a real fault; see
-	// getDeploymentStatusDetails.
+	// (buildA2AVerifierDeployment). The pod scan names it to tell the one
+	// crash loop that is the a2a stack still coming up from a real fault;
+	// see getDeploymentStatusDetails.
 	a2aVerifierContainerName = "verifier"
 
 	// The condition reporting that cluster event ingestion has been switched off
@@ -4027,27 +4027,33 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		initThenApp := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
 		initThenApp = append(initThenApp, pod.Status.InitContainerStatuses...)
 		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
-		// The verifier's wait for its bucket is the one crash loop here that is
-		// the design working, so it is the one the scan has to not report.
+		// A verifier crash loop in the window before the provision Job completes
+		// is the a2a stack still coming up, not a fault, and it is the one crash
+		// loop here the scan has to not report.
 		//
-		// reconcileA2A applies the verifier BEFORE the provision Job and says so
-		// in its own comment: the verifier binds the cap bucket at boot and exits
-		// when it cannot, "so on a fresh install it crash-loops until the
-		// provision Job below has created the bucket". Meanwhile `notReady` holds
-		// "bus provisioning" until that same Job completes, which keeps
-		// updateStatusReady in the `case errWorkload == nil:` arm -- the arm that
-		// calls this scan. So without this, every fresh `next` install spends the
-		// window between NATS answering and the Job finishing reporting
-		// Degraded/CrashLoopBackOff for a workload behaving exactly as designed.
-		// Before the verifier joined the selectors that window read Provisioning,
-		// and it has to go on reading Provisioning.
+		// The two dependencies the verifier can outrun no longer restart it at
+		// all: a bus that is not answering yet and a bucket the Job has not
+		// created yet are both waited out in-process (a2a/cmd/verifier's
+		// bindStore). What can still end the process in this same window is
+		// authentication. reconcileA2A applies the callout one step before the
+		// verifier, and applying it is not the same as it serving; a bus that
+		// refuses the same identity twice running aborts nats.go's reconnect
+		// loop for good (processAuthError), which the verifier answers by
+		// exiting so the pod restarts. That is right of the verifier and
+		// transient on a fresh install. Meanwhile `notReady` holds "bus
+		// provisioning" until the Job completes, which keeps updateStatusReady
+		// in the `case errWorkload == nil:` arm -- the arm that calls this scan.
+		// So without this, a fresh `next` install can spend that window
+		// reporting Degraded/CrashLoopBackOff for a stack that is merely not up
+		// yet. Before the verifier joined the selectors that window read
+		// Provisioning, and it has to go on reading Provisioning.
 		//
 		// Narrow on purpose, three ways: this container, this reason, and only
 		// while the bucket is unprovisioned. ImagePullBackOff on the verifier is
 		// a real fault at any time -- it is the fault this selector was added
 		// for, and unreachable at any of a2aReleaseImage's three rungs -- and a
 		// crash loop that outlives the Job is the verifier failing at something
-		// other than the wait.
+		// other than coming up.
 		//
 		// Suppressing rather than skipping the pod: a verifier pod can carry a
 		// genuine fault on another container in the same window, and the loop

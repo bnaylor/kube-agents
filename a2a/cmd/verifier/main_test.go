@@ -22,8 +22,9 @@ import (
 // authenticates with a projected token, so a revoked identity or a callout
 // that has lost the verifier's user lands exactly there.
 //
-// What made it silent is the probe split. /readyz is honest — it reports
-// nc.IsConnected() — but /healthz is unconditional, deliberately, so that a
+// What made it silent is the probe split. /readyz is honest — it reports the
+// connection, and the bucket bind with it — but /healthz is unconditional,
+// deliberately, so that a
 // transient disconnect does not kill a verifier that is about to reconnect.
 // The liveness probe is on /healthz. So without the handler this test pins,
 // the pod goes NotReady and stays there: nothing restarts it, and while it is

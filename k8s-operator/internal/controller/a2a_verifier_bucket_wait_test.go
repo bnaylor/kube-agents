@@ -13,13 +13,19 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// The verifier crash-loops on purpose until the provision Job creates the cap
-// bucket -- reconcileA2A applies it before the Job and its comment says so. The
-// pod scan has to tell that wait from a fault, because the arm of
-// updateStatusReady that calls the scan is live for exactly that window (notReady
-// holds "bus provisioning" until the same Job completes). Reporting it would turn
-// every fresh `next` install's ordinary Provisioning into a Degraded an operator
-// acts on, for a workload behaving as designed.
+// A verifier that is restarting before the provision Job has created the cap
+// bucket is the a2a stack coming up, not a fault. The verifier waits in-process
+// for the bus and for the bucket itself (a2a/cmd/verifier's bindStore), so what
+// reaches this window is the dependency it cannot wait out: the callout is
+// applied one step ahead of it and takes its own moment to serve, and a bus
+// that refuses the same identity twice aborts nats.go's reconnect loop for
+// good, which the verifier answers by exiting so the pod restarts.
+//
+// The pod scan has to tell that from a fault, because the arm of
+// updateStatusReady that calls the scan is live for exactly that window
+// (notReady holds "bus provisioning" until the same Job completes). Reporting
+// it would turn a fresh `next` install's ordinary Provisioning into a Degraded
+// an operator acts on, for a stack that is merely not up yet.
 //
 // The suppression is narrow in three directions and each gets a case here: the
 // container, the reason, and the bucket not yet existing.

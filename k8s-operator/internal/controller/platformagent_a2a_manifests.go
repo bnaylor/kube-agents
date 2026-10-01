@@ -3954,11 +3954,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 
-	// The capability verifier. It binds the `cap` bucket at boot and exits
-	// if the bind fails, so on a fresh install it crash-loops until the
-	// provision Job below has created the bucket — loud, bounded by the
-	// kubelet's restart backoff, and preferable to a verifier that comes up
-	// answering nothing. Applied before the Job rather than after it because
+	// The capability verifier. It binds the `cap` bucket at boot, and when it
+	// cannot — the bucket does not exist until the provision Job below has
+	// run — it waits in-process rather than exiting, so on a fresh install it
+	// comes up NotReady and starts answering when the Job lands. It does not
+	// crash-loop through that wait: the kubelet's restart backoff reaches five
+	// minutes and does not know the dependency arrived, so the restart would
+	// outlast the wait it was reacting to. a2a/cmd/verifier's bindStore
+	// carries the reasoning. Applied before the Job rather than after it because
 	// ordering inside one reconcile buys nothing here: the Job takes seconds
 	// to schedule and complete either way.
 	if err := r.reconcileA2AVerifier(ctx, agent); err != nil {

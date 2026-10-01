@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -58,7 +59,20 @@ const (
 	// bounded wait that logs is more useful than an unbounded one that gets
 	// killed mid-sentence. A verify round trip is a single KV read.
 	drainTimeout = 10 * time.Second
+
+	// bindRetryInterval paces bindStore. It is deliberately short: every
+	// dependency it waits on is seconds away on a healthy install, and the
+	// whole point of retrying in-process is to beat the kubelet's restart
+	// backoff rather than reproduce it. A failed bind against an
+	// unreachable bus already costs jetstream's own 5s API timeout, so the
+	// real floor on the loop is that, not this.
+	bindRetryInterval = 2 * time.Second
 )
+
+// errBusClosed ends the bind wait when the connection will not come back. It
+// is not a bind failure: the pod has to restart either way, and run tells the
+// two apart to pick an exit code.
+var errBusClosed = errors.New("the bus connection ended and will not recover in this process")
 
 func main() { os.Exit(run()) }
 
@@ -93,14 +107,28 @@ func run() int {
 		log.Error("jetstream", "err", err)
 		return 1
 	}
-	// The store binds the bucket, which is a $JS.API.STREAM.INFO read. If
-	// the grants are wrong this is where it shows, at boot, rather than as
-	// every task in the deployment being refused one at a time.
-	store, err := capability.NewStore(ctx, js)
+	// The status server comes up before the bind, not after it, and that
+	// ordering is load-bearing: the bind below can take as long as the bus
+	// and the provision Job take, and a /healthz that is not answering yet
+	// is a liveness failure at 10s x 6 regardless of why. serving keeps
+	// readiness honest across the gap -- see readyMux.
+	var serving atomic.Bool
+	srv := serveReady(log, nc, &serving)
+
+	store, err := bindStore(ctx, log, js, busClosed)
 	if err != nil {
-		log.Error("bind the capability bucket; the verifier cannot answer anything without it",
-			"bucket", capability.Bucket, "err", err)
-		return 1
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), readyTimeout)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		if errors.Is(err, errBusClosed) {
+			log.Error("the bus connection ended while waiting for the capability bucket; " +
+				"exiting so the pod restarts")
+			return 1
+		}
+		// Signalled mid-wait. Nothing was ever subscribed, so there is
+		// nothing to drain and this is an ordinary stop, not a failure.
+		log.Info("stopped before the capability bucket could be bound")
+		return 0
 	}
 
 	svc := &capability.Service{
@@ -128,8 +156,7 @@ func run() int {
 	}
 	log.Info("verifying", "subject", capability.VerifySubscribe, "queue", capability.VerifyQueue,
 		"bucket", capability.Bucket)
-
-	srv := serveReady(log, nc)
+	serving.Store(true)
 
 	select {
 	case <-ctx.Done():
@@ -162,12 +189,72 @@ func run() int {
 	return 0
 }
 
-// serveReady answers the readiness probe. Ready means connected to the bus:
-// a verifier that cannot reach the bus cannot answer, and taking it out of
-// the queue group's endpoints is better than having it silently not receive.
-func serveReady(log *slog.Logger, nc *nats.Conn) *http.Server {
+// bindStore binds the capability bucket, retrying for as long as the process
+// is alive rather than exiting on the first failure.
+//
+// The bind is a $JS.API.STREAM.INFO read, so it needs a bus that answers AND a
+// bucket that exists, and a verifier pod can legitimately start before either:
+// reconcileA2A applies this Deployment ahead of the provision Job that creates
+// the bucket, and a node drain can reschedule NATS and a verifier together.
+// Exiting on that is the thing connect's options already refuse to do -- "while
+// this is disconnected no task in the deployment can start, so crash-looping to
+// get a fresh connection is strictly worse than reconnecting" -- and the bind
+// has to hold the same line or those options buy nothing. nats.Connect hands
+// back a connection in the reconnecting state and returns no error, so the
+// first bind runs against it, times out (jetstream wraps a deadline-less
+// context in its own 5s API timeout, defaultAPITimeout), and the process exits
+// into a kubelet backoff that climbs to five minutes -- outlasting, by minutes,
+// the outage that triggered it, with every task in the install refused for the
+// whole of it once both replicas are in the window.
+//
+// What the old single-shot bind was for is kept: a grant that is wrong rather
+// than a dependency that is late still shows here, at boot and in the log,
+// instead of as every task being refused one at a time. It is just no longer
+// spelled as an exit. Readiness stays false for the whole wait, so a verifier
+// that never binds never joins the Service and the Deployment never reports it
+// Available.
+func bindStore(ctx context.Context, log *slog.Logger, js jetstream.JetStream, busClosed <-chan struct{}) (capability.Store, error) {
+	for attempt := 1; ; attempt++ {
+		store, err := capability.NewStore(ctx, js)
+		if err == nil {
+			if attempt > 1 {
+				log.Info("bound the capability bucket", "bucket", capability.Bucket, "attempts", attempt)
+			}
+			return store, nil
+		}
+		log.Warn("cannot bind the capability bucket yet; this verifier answers nothing until it can, "+
+			"and will keep trying",
+			"bucket", capability.Bucket, "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-busClosed:
+			return nil, errBusClosed
+		case <-time.After(bindRetryInterval):
+		}
+	}
+}
+
+// readyMux is the status server's routing, split out from the listener so the
+// two probes can be tested without a port.
+//
+// Ready means connected to the bus AND bound to the bucket. Connected alone is
+// not enough: bindStore can be waiting with a live connection -- that is the
+// whole fresh-install case -- and a pod that is up, connected, and has not
+// subscribed yet would otherwise report Ready and be handed requests it cannot
+// answer. Taking an unready verifier out of the queue group's endpoints is
+// better than having it silently not receive.
+//
+// /healthz is deliberately unconditional and consults neither: a transient
+// disconnect must not kill a verifier that is about to reconnect, and the
+// bucket wait must not kill one that is about to bind.
+func readyMux(nc *nats.Conn, serving *atomic.Bool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !serving.Load() {
+			http.Error(w, "the capability bucket is not bound yet", http.StatusServiceUnavailable)
+			return
+		}
 		if !nc.IsConnected() {
 			http.Error(w, "not connected to the bus", http.StatusServiceUnavailable)
 			return
@@ -177,7 +264,13 @@ func serveReady(log *slog.Logger, nc *nats.Conn) *http.Server {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	srv := &http.Server{Addr: readyPort, Handler: mux, ReadHeaderTimeout: readyTimeout}
+	return mux
+}
+
+// serveReady starts the status listener. It is started before the bucket bind,
+// so it must not depend on anything the bind produces.
+func serveReady(log *slog.Logger, nc *nats.Conn, serving *atomic.Bool) *http.Server {
+	srv := &http.Server{Addr: readyPort, Handler: readyMux(nc, serving), ReadHeaderTimeout: readyTimeout}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("readiness listener", "err", err)
