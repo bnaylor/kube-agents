@@ -212,6 +212,14 @@ type rig struct {
 // to a test principal, and runs it.
 func startRig(t *testing.T) *rig {
 	t.Helper()
+	return startRigWith(t, nil)
+}
+
+// startRigWith is startRig with one hook into the Config the gateway is built
+// from, for the cases that have to arm a switch before Run starts rather than
+// reach into a running gateway.
+func startRigWith(t *testing.T, tweak func(*Config)) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -242,6 +250,9 @@ func startRig(t *testing.T) *rig {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+	}
+	if tweak != nil {
+		tweak(cfg)
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
 	if err != nil {
@@ -2190,5 +2201,86 @@ func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate
 		t.Fatal("a principal the root does not name resolved it anyway")
 	} else if !errors.Is(err, capability.ErrRefused) {
 		t.Fatalf("wrong holder refused for the wrong reason: %v", err)
+	}
+}
+
+// deleteCapBucket takes the capability bucket away, the way deleteTasksStream
+// takes the task stream away: it is how an install that never provisioned the
+// bucket, or a gateway whose $KV.cap.root.* grant is missing, looks from here.
+func deleteCapBucket(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteKeyValue(ctx, capability.Bucket); err != nil {
+		t.Fatalf("delete cap bucket: %v", err)
+	}
+}
+
+// TestAMintFailureRefusesTheTurn covers the armed half of the mint-failure
+// branch, which had no test: every other gateway test provisions the cap
+// bucket in provision(), so Mint never fails and neither arm was reachable.
+//
+// Enforcement on is the default, and the contract is that a gateway which
+// cannot mint refuses rather than passes. The alternative -- send it anyway --
+// is not a smaller failure: the executor refuses the capability-less
+// submission regardless, one round trip and (on the session route) one pod
+// later, with the reason surfacing in a different component's log than the
+// one the operator is reading.
+func TestAMintFailureRefusesTheTurn(t *testing.T) {
+	r := startRig(t)
+	deleteCapBucket(t, r.url)
+	conv := "discord:g1/thread-mint-refuses"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do a thing"}
+
+	waitFor(t, "the refusal to be posted", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "could not mint") {
+				return true
+			}
+		}
+		return false
+	})
+	// And nothing went to an executor: the refusal is the whole outcome.
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("a submission was published despite the mint failing: %d envelope(s) on the in subject", len(envs))
+	}
+}
+
+// TestAMintFailureUnderCapabilityOptionalSendsGrantsNull covers the relaxed
+// twin -- the mixed-version window, and the only path in the tree that reaches
+// an executor with grants null. It is asserted because it is the one way a
+// capability-less submission is legitimate, so a regression that reached it by
+// accident (the return dropped, the condition inverted) would otherwise look
+// exactly like correct behaviour.
+func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.CapabilityOptional = true })
+	deleteCapBucket(t, r.url)
+	conv := "discord:g1/thread-mint-relaxed"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do a thing"}
+
+	var env *lib.Envelope
+	waitFor(t, "the submission to reach the executor anyway", func() bool {
+		envs := inSubjectEnvelopes(t, r.url, "platform")
+		if len(envs) == 0 {
+			return false
+		}
+		env = envs[0]
+		return true
+	})
+	var auth Authority
+	if err := json.Unmarshal(env.Authority, &auth); err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+	if string(auth.Grants) != "null" {
+		t.Fatalf("grants = %s, want null -- this is the one path that may carry no capability", auth.Grants)
 	}
 }

@@ -782,3 +782,100 @@ func TestADownVerifierIsReportedWithoutMovingReady(t *testing.T) {
 		}
 	})
 }
+
+// TestTheVerifierConditionMovesOnASettledCR is the case the first version of
+// this test missed, and the reason it missed it is worth keeping.
+//
+// updateStatusReady does not write status unconditionally: it compares the
+// state it just computed against what is already on the CR and returns early
+// when nothing moved. That early return requires an existing Ready condition
+// (existingCond != nil), and splitReadinessNextAgent builds a bare ObjectMeta
+// with no conditions at all -- so every subtest in
+// TestADownVerifierIsReportedWithoutMovingReady takes the unconditional-write
+// path, and all four stayed green against a tree where the verifier was not a
+// term in the early-return check. They pinned "the condition can be written",
+// never "the condition moves when only the verifier moves".
+//
+// That is the whole scenario: a settled Ready install whose verifier loses its
+// last replica. Phase, message, replica counts and every other term are
+// identical, because the verifier is deliberately not counted toward Ready --
+// which is exactly why nothing else dirties the pass. So this test settles
+// first, then moves only the verifier, and reads the PERSISTED CR rather than
+// the in-memory one, because the early return skips the Update and an
+// assertion against the local object would pass on a mutated copy.
+func TestTheVerifierConditionMovesOnASettledCR(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := splitReadinessNextAgent()
+	scheme := setupScheme()
+	verifier := a2aVerifierWorkload(agent, 1)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1),
+			credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1), a2aNATS(agent, 1),
+			a2aCallout(agent, 1), a2aProvisionJob(agent, true), verifier).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	settle := func() {
+		t.Helper()
+		if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone,
+			r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	persistedCond := func() *metav1.Condition {
+		t.Helper()
+		persisted := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), persisted); err != nil {
+			t.Fatal(err)
+		}
+		return meta.FindStatusCondition(persisted.Status.Conditions, a2aVerifierConditionType)
+	}
+	setVerifierReplicas := func(ready int32) {
+		t.Helper()
+		live := &appsv1.Deployment{}
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(verifier), live); err != nil {
+			t.Fatal(err)
+		}
+		live.Status.ReadyReplicas = ready
+		if err := cl.Status().Update(ctx, live); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Settle twice: the second pass is the one that proves we are parked on
+	// the early return, because by then nothing at all is moving.
+	settle()
+	settle()
+	if persistedCond() != nil {
+		t.Fatal("precondition: a settled install with a ready verifier carries no A2AVerifier condition")
+	}
+	if meta.FindStatusCondition(agent.Status.Conditions, "Ready") == nil {
+		t.Fatal("precondition: the CR did not settle with a Ready condition, so the early return is not reachable " +
+			"and this test cannot see the defect it exists for")
+	}
+
+	// 1 -> 0, and nothing else in status moves.
+	setVerifierReplicas(0)
+	settle()
+	cond := persistedCond()
+	if cond == nil {
+		t.Fatal("the verifier lost its last replica on a settled CR and no A2AVerifier condition was persisted: " +
+			"the write is being skipped by updateStatusReady's early return, so every submission is refused " +
+			"terminally behind a Ready CR with nothing in status to read")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != a2aVerifierNotReadyReason {
+		t.Errorf("got status=%s reason=%s, want False/%s", cond.Status, cond.Reason, a2aVerifierNotReadyReason)
+	}
+
+	// 0 -> 1: recovery has to clear it, or `kubectl describe` keeps telling an
+	// operator that submissions are being refused on an install that is fine.
+	setVerifierReplicas(1)
+	settle()
+	if cond := persistedCond(); cond != nil {
+		t.Errorf("the verifier recovered but the A2AVerifier condition survived: %+v", cond)
+	}
+}

@@ -277,10 +277,20 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 // one rung a human types, and an odd segment count -- `kubeagents-system`
 // rather than `namespace/kubeagents-system` -- otherwise buys a bridge that
 // starts cleanly and refuses every `platform` task with "the resource is not
-// a well-formed scope", with nothing at startup saying why. The derived rungs
-// below are not validated the same way because they cannot be malformed:
-// NamespaceScope builds the pair, and a namespace it could not resolve is
-// left empty on purpose, below.
+// a well-formed scope", with nothing at startup saying why.
+//
+// The namespace rung is validated too, and the earlier claim that it could not
+// be malformed was wrong. NamespaceScope is "namespace/" + ns with no check on
+// ns, and POD_NAMESPACE is a default the operator renders rather than a value
+// it owns -- a CR that sets the name deliberately wins. So a POD_NAMESPACE
+// carrying a slash ("team/x") yields a three-segment scope that Validate
+// refuses, and the bridge would start cleanly and refuse every platform task:
+// the exact failure the A2A_AUTHORITY_SCOPE check above exists to prevent, on
+// the rung that is just as human-settable. The kubelet file is left unchecked
+// by the same test only because it goes through this one too.
+//
+// A namespace that could not be resolved at all is still left empty on
+// purpose, below -- that is a different condition and it already says so.
 func capabilityScope(log *slog.Logger) (capability.Scope, error) {
 	if s := os.Getenv("A2A_AUTHORITY_SCOPE"); s != "" {
 		scope := capability.Scope(s)
@@ -305,7 +315,29 @@ func capabilityScope(log *slog.Logger) (capability.Scope, error) {
 		log.Error("this pod's namespace resolved empty; every task will be refused for want of a scope")
 		return "", nil
 	}
-	return capability.NamespaceScope(ns), nil
+	// The test is on the namespace, not on the scope it builds, and the
+	// difference matters. A scope is kind/name pairs, so a namespace with an
+	// ODD number of separators ("team/x") makes "namespace/team/x" -- three
+	// segments, which Validate refuses, and the bridge would otherwise boot
+	// and refuse every task. But an EVEN number ("a/b/c") makes
+	// "namespace/a/b/c", four segments, which Validate ACCEPTS: it reads as
+	// namespace=a plus a second pair b/c. Validating the scope would catch
+	// the first and wave the second through as a different, silently wrong
+	// ceiling. A namespace name is a DNS-1123 label and never contains a
+	// separator, so that is the thing to check.
+	if strings.Contains(ns, "/") {
+		log.Error("this pod's namespace is not a namespace name; a namespace cannot contain a separator, "+
+			"and the scope it would build is a different ceiling than the one intended",
+			"namespace", ns, "separator", "/")
+		return "", errUsage
+	}
+	scope := capability.NamespaceScope(ns)
+	if err := scope.Validate(); err != nil {
+		log.Error("this pod's namespace does not make a well-formed scope",
+			"namespace", ns, "scope", string(scope), "err", err)
+		return "", errUsage
+	}
+	return scope, nil
 }
 
 func envOr(key, def string) string {

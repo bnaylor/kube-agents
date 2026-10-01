@@ -3490,6 +3490,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The provisioned-once record, same shape (wantBusProvisioned).
 	busProvisionedWanted := wantBusProvisioned(agent, a2a)
 	busProvisionedUnchanged := busProvisionedConditionCurrent(agent, busProvisionedWanted)
+	// The verifier term has to be computed here, with the others, rather than
+	// read at the write below: the early return a few lines down is what
+	// decides whether there is a write at all. Left out of the check, the
+	// condition is only ever written on a pass that some *other* status change
+	// already dirtied -- so on a settled Ready install, the one state it exists
+	// to report (verifier loses its last replica, nothing else moves) never
+	// reaches status, and the recovery never clears it. That is the shape the
+	// A2AGateway and BusProvisioned terms above are in, and for the same
+	// reason.
+	verifierNotReady := r.a2aVerifierNotReady(ctx, agent)
+	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady)
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
@@ -3531,6 +3542,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		hostPathDroppedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
+		a2aVerifierUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
@@ -3604,7 +3616,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
-	setA2AVerifierCondition(agent, r.a2aVerifierNotReady(ctx, agent), now)
+	setA2AVerifierCondition(agent, verifierNotReady, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err

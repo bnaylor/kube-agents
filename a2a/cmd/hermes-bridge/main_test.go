@@ -250,3 +250,50 @@ func TestAMalformedAuthorityScopeExitsUsage(t *testing.T) {
 		t.Errorf("run() with a malformed A2A_AUTHORITY_SCOPE = %d, want %d", got, exitUsage)
 	}
 }
+
+// TestAMalformedPodNamespaceIsABootFailure is the sibling of
+// TestAMalformedAuthorityScopeIsABootFailure, on the rung that test holds
+// well-formed in every row.
+//
+// POD_NAMESPACE is a default the operator renders, not a value it owns: a CR
+// that sets the name deliberately wins. So it is as human-settable as
+// A2A_AUTHORITY_SCOPE, and NamespaceScope does not check it -- it concatenates.
+// A name with a separator in it makes a three-segment scope, and without this
+// the bridge booted cleanly and refused every platform task with "the resource
+// is not a well-formed scope", which is the precise failure the authority-scope
+// check was added to prevent.
+func TestAMalformedPodNamespaceIsABootFailure(t *testing.T) {
+	for _, tc := range []struct {
+		ns      string
+		wantErr bool
+	}{
+		{ns: "team/x", wantErr: true},
+		{ns: "a/b/c", wantErr: true},
+		{ns: "kubeagents-system"},
+		// A namespace that resolves to nothing is a different condition: the
+		// bridge starts scopeless and says so, rather than failing usage.
+		{ns: ""},
+	} {
+		name := tc.ns
+		if name == "" {
+			name = "(unset)"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("NATS_URL", unreachableNATSURL)
+			t.Setenv("A2A_AUTHORITY_SCOPE", "")
+			t.Setenv("POD_NAMESPACE", tc.ns)
+			log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+			_, err := configFromEnv(log)
+			if tc.wantErr {
+				if !errors.Is(err, errUsage) {
+					t.Fatalf("configFromEnv with POD_NAMESPACE=%q returned %v, want errUsage "+
+						"(it would otherwise boot and refuse every platform task)", tc.ns, err)
+				}
+				return
+			}
+			if errors.Is(err, errUsage) {
+				t.Fatalf("configFromEnv with POD_NAMESPACE=%q returned errUsage, want a clean boot", tc.ns)
+			}
+		})
+	}
+}
