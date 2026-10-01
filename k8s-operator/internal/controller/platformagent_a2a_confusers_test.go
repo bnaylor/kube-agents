@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -59,9 +60,12 @@ func TestAOneSidedStaticUserRendersADenyOnTheEmptySide(t *testing.T) {
 	}
 }
 
-// Neither side populated still means no permissions block at all. This is how
-// the $SYS user ships: it holds the system account's own privileges, and a
-// block naming no subjects would take them away.
+// Neither side populated still means no permissions block at all, which is how
+// the $SYS user ships. Note what the omission is NOT doing: an empty
+// "permissions {}" block would not close the user down either -- it parses to a
+// non-nil *Permissions with both sides nil and reads as unrestricted, same as
+// no block. Omitting it is how sys keeps the $SYS account's own privileges,
+// which is what sys is for, not a denial.
 func TestAStaticUserWithNoSubjectsRendersNoPermissionsBlock(t *testing.T) {
 	got := renderA2AStaticUser(a2aIdentity{
 		user:    "sys",
@@ -71,6 +75,32 @@ func TestAStaticUserWithNoSubjectsRendersNoPermissionsBlock(t *testing.T) {
 	}, "pw")
 
 	if strings.Contains(got, "permissions") {
-		t.Errorf("a user with no subject lists gained a permissions block, which would deny it everything:\n%s", got)
+		t.Errorf("a user with no subject lists gained a permissions block; it would not be denied anything by it, so the block is noise:\n%s", got)
+	}
+}
+
+// The load-bearing half of the case above. Rendering no permissions block is
+// safe for sys and for nothing else: the user that gets it is unrestricted
+// inside its account, which is the whole defect this file otherwise closes. sys
+// is allowed it because it is the $SYS account's own operator login. If a
+// second identity ever arrives with neither side populated, it would be handed
+// the entire subject space silently -- no validator covers this path, and the
+// render itself cannot tell the two apart. So the invariant is pinned here
+// rather than inferred: exactly one static identity has no subjects, and it is
+// sys.
+func TestSysIsTheOnlyStaticIdentityWithNoSubjectsOfItsOwn(t *testing.T) {
+	var unrestricted []string
+	for _, id := range staticIdentities(identityTestAgent()) {
+		if len(id.publish) == 0 && len(id.subscribe) == 0 {
+			unrestricted = append(unrestricted, id.user)
+		}
+	}
+
+	want := []string{"sys"}
+	if !slices.Equal(unrestricted, want) {
+		t.Errorf("static identities rendering no permissions block = %v, want %v.\n"+
+			"Every name here is unrestricted inside its account. A new one needs either subjects of its own "+
+			"or a recorded reason it should hold its account's full privileges the way sys does.",
+			unrestricted, want)
 	}
 }

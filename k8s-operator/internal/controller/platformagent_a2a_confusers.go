@@ -76,9 +76,19 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 
 	// Three cases, and only the middle one is a judgement call.
 	//
-	// NEITHER side: no permissions block at all. $SYS's user holds the system
-	// account's own privileges and carries no subject lists, and a block with
-	// no keys in it would deny it everything.
+	// NEITHER side: no permissions block at all. Note what this is NOT: an
+	// empty "permissions {}" block would not close the user down. It parses to
+	// a non-nil *Permissions with both sides nil (parseUserPermissions,
+	// server/opts.go, builds &Permissions{} up front and fills only the keys it
+	// finds), setPermissions then sets c.perms from it, and
+	// pubAllowedFullCheck's second disjunct reads nil/nil as unrestricted. An
+	// absent block and an empty block both mean "no restrictions", by two
+	// different routes. Omitting it is therefore not a denial; it is how sys
+	// gets the $SYS account's own privileges, which is what sys is for. That is
+	// safe because sys is the only identity with neither side, and
+	// TestSysIsTheOnlyStaticIdentityWithNoSubjectsOfItsOwn keeps it that way --
+	// a second one would be handed the whole subject space silently, which is
+	// exactly the defect the rest of this function closes.
 	//
 	// BOTH sides: render both allow lists, which is every static user today.
 	//
