@@ -1789,11 +1789,12 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
-// early exit. The exit reads six sentinels and returns when all are absent,
+// early exit. The exit reads seven sentinels and returns when all are absent,
 // which is only sound while nothing it deletes can outlive them: the
 // StatefulSet is deleted last, the gateway Deployment first, the callout
 // keys and config Secrets are the deletable objects the render creates first,
-// and the two fences are what the guardrail path writes on a refusal.
+// the two fences are what the guardrail path writes on a refusal, and the
+// inject fence is what a hand-deleted pair leaves of them.
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere holds that soundness
 // one object at a time; this one holds it across a pass that dies partway, and
 // TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall across one that
@@ -1896,11 +1897,11 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsSixReadsWhenThereIsNothingToClean measures the thing the
-// change was for. Counting is the only honest check here: the early exit is a
-// cost optimisation, and a correctness test passes just as well with the reads
-// still happening one object at a time.
-func TestCleanupA2ACostsSixReadsWhenThereIsNothingToClean(t *testing.T) {
+// TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean measures the thing
+// the change was for. Counting is the only honest check here: the early exit
+// is a cost optimisation, and a correctness test passes just as well with the
+// reads still happening one object at a time.
+func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -1924,19 +1925,21 @@ func TestCleanupA2ACostsSixReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Six sentinel Gets and nothing else: no per-object walk, and in
+	// Seven sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
 	// The literal moved 3 -> 4 when the callout keys Secret joined the
-	// sentinels, and 4 -> 6 when the two fences did (#2197); the fences are
-	// Owns kinds, so those two reads come from the cache. Raising it is a
+	// sentinels, 4 -> 6 when the two fences did (#2197), and 6 -> 7 when the
+	// inject door's fence did, for the hand-deleted pair that leaves it
+	// standing alone; the fences are Owns kinds, so those three reads come
+	// from the cache and only the two Secrets are uncached. Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 6 {
-		t.Errorf("Gets = %d, want 6 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 7 {
+		t.Errorf("Gets = %d, want 7 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -1949,11 +1952,13 @@ func TestCleanupA2ACostsSixReadsWhenThereIsNothingToClean(t *testing.T) {
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
 // half of the optimisation the test above prices.
 //
-// cleanupA2A answers "is there anything to tear down?" from four objects. That
-// is sound only while every render that leaves residue leaves at least one of
-// the four, and the case that breaks it is not a full render -- it is a render
-// that died partway. Miss it and an A2A object stays alive on a today install,
-// which is the darkness property.
+// cleanupA2A answers "is there anything to tear down?" from seven objects: the
+// NATS StatefulSet, the gateway Deployment, the NATS, session and inject
+// fences, and the callout keys and NATS config Secrets. That is sound only
+// while every render that leaves residue leaves at least one of the seven, and
+// the case that breaks it is not a full render -- it is a render that died
+// partway. Miss it and an A2A object stays alive on a today install, which is
+// the darkness property.
 //
 // The reachable partial renders are the prefixes of reconcileA2A's own order,
 // so that is what this walks: fail the Nth object the render writes, for every
@@ -2210,6 +2215,10 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 	sessionFence := func(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 		return buildA2ASessionNetworkPolicy(agent, nil)
 	}
+	// The inject fence is a sentinel whatever the flag says, so its rows run
+	// with the door unarmed: the ownership rule has to hold on the operator
+	// that was redeployed without the flag and still has the fence.
+	injectFence := buildA2AGatewayNetworkPolicy
 	for _, tc := range []struct {
 		name  string
 		fence func(*agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy
@@ -2218,10 +2227,13 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 	}{
 		{"NATS fence under a stale UID", natsFence, &staleOwner, false},
 		{"session fence under a stale UID", sessionFence, &staleOwner, false},
+		{"inject fence under a stale UID", injectFence, &staleOwner, false},
 		{"NATS fence with no owner at all", natsFence, nil, false},
 		{"session fence with no owner at all", sessionFence, nil, false},
+		{"inject fence with no owner at all", injectFence, nil, false},
 		{"control: NATS fence owned by this CR is torn down", natsFence, nil, true},
 		{"control: session fence owned by this CR is torn down", sessionFence, nil, true},
+		{"control: inject fence owned by this CR is torn down", injectFence, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
@@ -3269,6 +3281,122 @@ func TestARefusedFirstReconcileDropsTheA2AFencesOnTheFlipToToday(t *testing.T) {
 				t.Errorf("these A2A-labelled objects survive the flip to today: %v", leftovers)
 			}
 		})
+	}
+}
+
+// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip is the shape the
+// test above's door rows do not reach, and it is why the inject fence is a
+// sentinel beside the NATS and session fences rather than riding on them.
+//
+// The argument for leaving it out was ordering: the inject fence is written
+// after both and deleted before both, so a render or a cleanup that dies
+// partway always leaves one of the two standing beside it. A hand does not
+// die partway. An operator triaging an EgressAllowlistRefused on an armed
+// next CR deletes the two fences they recognise -- the restore check in
+// TestARefusalDoesNotSuspendTheA2AFences is built on exactly that move -- and
+// flips the CR to today before the reconcile that delete enqueued has
+// re-applied them. The first today reconcile then reaches cleanupA2A with the
+// inject fence alone: owned, present, A2A-labelled, and seen by no sentinel.
+// The exit returns, nothing on the today path but the walk deletes it, and
+// every later reconcile takes the same exit, so it survives forever.
+//
+// Delete the pair through the client with no reconcile in between, flip, and
+// require the inject fence gone and the namespace clean.
+func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Mode = ptr.To(string(ModeNext))
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	readyReason := func() string {
+		t.Helper()
+		stored := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+			t.Fatalf("failed to re-read the agent: %v", err)
+		}
+		for _, condition := range stored.Status.Conditions {
+			if condition.Type == "Ready" {
+				return condition.Reason
+			}
+		}
+		return ""
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	if reason := readyReason(); reason != reasonEgressAllowlistRefused {
+		t.Fatalf("Ready reason = %q, want %s; this test is not exercising the refused shape", reason, reasonEgressAllowlistRefused)
+	}
+
+	pair := []types.NamespacedName{
+		{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
+		{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+	}
+	inject := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	for _, fence := range append(append([]types.NamespacedName{}, pair...), inject) {
+		if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
+			t.Fatalf("%s was not rendered on the refusal, so the hand has nothing to delete: %v", fence.Name, err)
+		}
+	}
+
+	// The hand. No Reconcile between this and the flip: that is the window
+	// the finding names, and running one here would re-apply the pair and
+	// turn this into the door row of the test above.
+	for _, fence := range pair {
+		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
+		}); err != nil {
+			t.Fatalf("delete %s by hand: %v", fence.Name, err)
+		}
+	}
+	if n := countA2ALabelled(ctx, t, cl); n != 1 {
+		t.Fatalf("%d A2A-labelled objects remain after the hand-delete, want 1 (the inject fence alone); "+
+			"this is not the shape the test names", n)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	fresh.Spec.Security.EgressAllowlist = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("flip to today: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the flip: %v", i+1, err)
+		}
+	}
+	if reason := readyReason(); reason == reasonEgressAllowlistRefused {
+		t.Fatalf("the flipped CR is still refused (%s); cleanupA2A never ran and this proves nothing", reason)
+	}
+
+	if err := cl.Get(ctx, inject, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+		t.Errorf("%s survived the flip to today (err=%v): with the pair deleted by hand it was the only "+
+			"A2A object standing, and cleanupA2A's early exit does not key on it", inject.Name, err)
+	}
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("these A2A-labelled objects survive the flip to today: %v", leftovers)
 	}
 }
 
