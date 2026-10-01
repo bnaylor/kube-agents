@@ -661,10 +661,10 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // the one it opens. The defusing is a visible space, not an invisible
 // character.
 //
-// The defang runs first, over the whole text, code spans included, the way
-// the Slack adapter escapes first: every <users/…> and every <url|text the
-// executor opened, closed or not, is defused before the markdown rules see
-// it, and the markdown link's destination class excludes `<`, so the
+// The defang runs first, the way the Slack adapter escapes first: every
+// <users/…> anywhere in the text, and every <url|text the executor opened
+// outside a code span, closed or not, is defused before the markdown rules
+// see it, and the markdown link's destination class excludes `<`, so the
 // <url|text> rewriteLinks generates afterwards is the adapter's own — which
 // is the distinction the <users/…> defang already drew, applied to the
 // sequence next to it. The markdown rules (bold pairs, code spans, links,
@@ -676,12 +676,23 @@ func toGchatText(s string) string {
 
 // defangGchatControls neutralizes Chat's in-text control sequences in a span
 // the adapter did not author, so the text renders as itself. The mention pass
-// runs first: it is unconditional, and running it first also splits any
-// angle pair that wraps a mention so the link pass sees both.
+// runs first and over the whole text, code included: a ping-all that Chat
+// honoured from inside a code span would be loud, and the cost of defusing
+// one that it would not is a space in a code span that was quoting a
+// mention's resource name. Running it first also splits any angle pair that
+// wraps a mention so the link pass sees both. The link pass reads only
+// outside code spans and fenced blocks (rewriteOutsideCode): its shape is a
+// shell's as well -- `cat <(gen)|wc -l`, `sort <f|uniq` -- and a space in
+// a quoted command is an altered answer, where the opener it is defending
+// against is one the next markdown link's `>` would close, and that link is
+// made in prose. An opener in prose keeps being defanged when a code span
+// cuts its text short, since the opener alone is the match.
 func defangGchatControls(s string) string {
 	s = strings.ReplaceAll(s, "<users/", "< users/")
-	return gchatPipeRe.ReplaceAllStringFunc(s, func(m string) string {
-		return "< " + m[1:]
+	return rewriteOutsideCode(s, func(prose string) string {
+		return gchatPipeRe.ReplaceAllStringFunc(prose, func(m string) string {
+			return "< " + m[1:]
+		})
 	})
 }
 

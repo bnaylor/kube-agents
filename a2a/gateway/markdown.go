@@ -76,17 +76,40 @@ const (
 
 // rewriteMarkdown translates the two markdown forms the relay emits, bold
 // pairs and links, into the form both chat surfaces read, leaving code spans
-// as written. It runs after the surface's own escaping or defang, which
-// covers the whole text, code included -- a prompt-injected <!channel> or
-// <users/all> in a code span is as live as one in prose -- so no control
-// sequence the executor wrote is live by the time rewriteLinks writes the
-// adapter's own, and what reaches here needs no further escaping. Bold
-// first, so a pair that wraps a whole link still converts; the link pass
-// finds its code spans again afterwards, since the bold pass moved them
-// without touching a backtick.
+// as written. It runs after the surface's own escaping or defang: Slack's
+// escaping and Chat's mention defang cover the whole text, code included --
+// a prompt-injected <!channel> or <users/all> in a code span is as live as
+// one in prose -- and Chat's link defang covers everything outside code
+// (rewriteOutsideCode), so no control sequence the executor wrote is live
+// by the time rewriteLinks writes the adapter's own, and what reaches here
+// needs no further escaping. Bold first, so a pair that wraps a whole link
+// still converts; the link pass finds its code spans again afterwards,
+// since the bold pass moved them without touching a backtick.
 func rewriteMarkdown(s string, linkRE *regexp.Regexp) string {
 	s = rewriteBoldPairs(s, mdCodeSpanRE.FindAllStringIndex(s, -1), linkRE)
 	return rewriteLinks(s, mdCodeSpanRE.FindAllStringIndex(s, -1), linkRE)
+}
+
+// rewriteOutsideCode applies rewrite to each stretch of s that lies outside
+// a code span (mdCodeSpanRE: a fenced block, a double-backtick span, an
+// inline span), and keeps the spans as written. It is the segmentation the
+// bold and link passes read code through, offered to a surface's own pass
+// that runs before them -- Chat's link defang, which would otherwise read a
+// shell's `<(gen)|` or `<f|` as a link opener and put a space in the
+// command. The stretches are rewritten one at a time, so a rewrite that
+// finds a sequence in one cannot read into the next; a sequence that is
+// recognised by its opener alone is still found when a span cuts its text
+// short.
+func rewriteOutsideCode(s string, rewrite func(string) string) string {
+	var b strings.Builder
+	end := 0
+	for _, r := range mdCodeSpanRE.FindAllStringIndex(s, -1) {
+		b.WriteString(rewrite(s[end:r[0]]))
+		b.WriteString(s[r[0]:r[1]])
+		end = r[1]
+	}
+	b.WriteString(rewrite(s[end:]))
+	return b.String()
 }
 
 // insideAny reports whether offset i of a string falls inside one of the

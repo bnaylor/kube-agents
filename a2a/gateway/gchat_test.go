@@ -493,6 +493,16 @@ func TestToGchatText(t *testing.T) {
 		// An opener nested inside another's text is its own sequence, not
 		// the outer one's text; both are defanged.
 		"<https://a.example|x <https://evil.example|https://good.example>": "< https://a.example|x < https://evil.example|https://good.example>",
+		// The link defang does not read code: the opener's shape is a
+		// shell's too, and a space in a quoted command is an altered
+		// answer. Inline, fenced, and inside parentheses.
+		"`cat <(gen)|wc -l`":     "`cat <(gen)|wc -l`",
+		"```\nsort <f|uniq\n```": "```\nsort <f|uniq\n```",
+		"`if (a<b|c)`":           "`if (a<b|c)`",
+		// Prose beside code is still read: an opener left unclosed before
+		// a markdown link, and one whose text a code span cuts short.
+		"see <https://evil.example|docs": "see < https://evil.example|docs",
+		"<x|`y`":                         "< x|`y`",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
@@ -516,9 +526,10 @@ func TestToGchatTextSharesTheMarkdownRules(t *testing.T) {
 		"`**x**`":                     "`**x**`",
 		"```\n**x**\n```":             "```\n**x**\n```",
 		"**a** and `**b**` and **c**": "*a* and `**b**` and *c*",
-		// The defang is not a markdown rule and still reaches code, and a
-		// code span inside an injected <url|text> does not split the
-		// sequence out of the defang's sight.
+		// The mention defang is not a markdown rule and still reaches
+		// code (the link defang does not; TestToGchatText), and a code
+		// span inside an injected <url|text> does not split the sequence
+		// out of the defang's sight.
 		"`<users/all>` in code":                  "`< users/all>` in code",
 		"<https://evil.example|`x` text>":        "< https://evil.example|`x` text>",
 		"<https://evil.example|see `code` here>": "< https://evil.example|see `code` here>",
@@ -544,6 +555,11 @@ func TestToGchatTextSharesTheMarkdownRules(t *testing.T) {
 		// A link's destination is never altered; a pair around a link is.
 		"[doc](https://x.example/**a**/b)": "<https://x.example/**a**/b|doc>",
 		"**[doc](https://x.example/p)**":   "*<https://x.example/p|doc>*",
+		// A `**` inside a code span does not open a pair, and one inside a
+		// link's destination does not close one: the pair is read from the
+		// stars outside both, as CommonMark reads it.
+		"`**`a**b**":                           "`**`a*b*",
+		"**x [doc](https://x.example/**a) y**": "*x <https://x.example/**a|doc> y*",
 		// A URL-shaped label naming another host is refused, as written.
 		"[https://good.example](https://evil.example)": "[https://good.example](https://evil.example)",
 		"[https://x.example/p](https://x.example/p)":   "<https://x.example/p|https://x.example/p>",

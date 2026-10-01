@@ -967,6 +967,11 @@ func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
 		// link still converts, since only its own stars change.
 		"[doc](https://x.example/**a**/b)": "<https://x.example/**a**/b|doc>",
 		"**[doc](https://x.example/p)**":   "*<https://x.example/p|doc>*",
+		// A `**` inside a code span does not open a pair, and one inside a
+		// link's destination does not close one: the pair is read from the
+		// stars outside both, as CommonMark reads it (`a**b**` is bold b).
+		"`**`a**b**":                           "`**`a*b*",
+		"**x [doc](https://x.example/**a) y**": "*x <https://x.example/**a|doc> y*",
 		// A bare URL is not a shape the adapter recognises (Slack auto-links
 		// it), so a closed pair inside one is rewritten exactly as before.
 		"see https://x.example/**a**/b": "see https://x.example/*a*/b",
