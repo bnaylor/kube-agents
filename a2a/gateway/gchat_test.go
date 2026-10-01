@@ -504,10 +504,10 @@ func TestToGchatText(t *testing.T) {
 		"see <https://evil.example|docs": "see < https://evil.example|docs",
 		"<x|`y`":                         "< x|`y`",
 		// A fence that never closes does not hide an opener after it: the
-		// adapter sees a chunk of the result, not the whole of it
-		// (TestToGchatTextDefangsAfterAChunkedFence), so the fence is as
-		// likely a closer the chunker separated from its opener as a real
-		// one. The bold and link passes still read it as a fence.
+		// adapter sees a chunk of the result, not the whole of it, and
+		// though the chunker now balances the fences in each chunk
+		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
+		// lean on that. The bold and link passes still read it as a fence.
 		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
 	}
 	for in, want := range cases {
@@ -519,29 +519,70 @@ func TestToGchatText(t *testing.T) {
 
 // TestToGchatTextDefangsAfterAChunkedFence: Gateway.post splits a result
 // with chatChunks(text, discordChunk) and the adapter translates each chunk
-// on its own, so a fenced block the chunker cuts leaves the next chunk
-// opening inside the block and carrying only its closing fence, which an
-// unclosed-fence-to-the-end reading takes for an opener -- and everything
-// the executor wrote after the block for code. The link defang must still
-// reach a <url|text> there; the fenced content itself is left as written.
+// on its own. The chunker closes a fenced block it cuts and reopens it in
+// the next chunk (TestChatChunksKeepFencesBalanced), so no chunk opens with
+// an orphan closing fence; before it did, the fence read as an opener --
+// with everything the executor wrote after the block for code, or, with a
+// second block further on, pairing with that block's opener and leaving
+// the prose between the two live. The link defang must reach a <url|text>
+// in that prose on both shapes; the fenced content itself is left as
+// written, the second block's included.
 func TestToGchatTextDefangsAfterAChunkedFence(t *testing.T) {
 	block := "```\n" + strings.Repeat("log line\n", 300) + "```\n"
-	big := "intro\n" + block + "see <https://evil.example|https://good.example> now"
+	cases := map[string]string{
+		"one block":  "intro\n" + block + "see <https://evil.example|https://good.example> now",
+		"two blocks": "intro\n" + block + "see <https://evil.example|https://good.example>\n```\nkubectl get pods\n```\n",
+	}
+	for name, big := range cases {
+		chunks := chatChunks(big, discordChunk)
+		if len(chunks) < 2 {
+			t.Fatalf("%s: chatChunks gave %d chunks; the block must be cut for the test to mean anything", name, len(chunks))
+		}
+		defanged := false
+		for i, chunk := range chunks {
+			got := toGchatText(chunk)
+			if strings.Contains(got, "<https://evil.example|") {
+				t.Errorf("%s: chunk %d: toGchatText left the executor's link opener live: %q", name, i, got)
+			}
+			if strings.Contains(chunk, "<https://evil.example|") {
+				if !strings.Contains(got, "< https://evil.example|") {
+					t.Errorf("%s: chunk %d: the opener is neither live nor defanged: %q", name, i, got)
+				}
+				defanged = true
+			}
+			if strings.Contains(chunk, "kubectl get pods") && !strings.Contains(got, "```\nkubectl get pods\n```") {
+				t.Errorf("%s: chunk %d: the second block was not left as written: %q", name, i, got)
+			}
+		}
+		if !defanged {
+			t.Errorf("%s: no chunk carried the opener", name)
+		}
+		if got := toGchatText(chunks[0]); got != chunks[0] {
+			t.Errorf("%s: the first chunk, an opened fence and its content, was altered:\n got %q\nwant %q", name, got, chunks[0])
+		}
+	}
+}
+
+// TestToGchatTextConvertsProseAfterAChunkedFence: the prose after a block
+// the chunker cut converts as prose -- bold and links -- rather than
+// riding to the end of the chunk as the content of a fence that was never
+// opened. The fence lines before it are untouched. The Slack twin is
+// TestToMrkdwnConvertsProseAfterAChunkedFence.
+func TestToGchatTextConvertsProseAfterAChunkedFence(t *testing.T) {
+	big := "```\n" + strings.Repeat("log line\n", 300) + "```\n**Summary:** see [runbook](https://x.example/r)"
 	chunks := chatChunks(big, discordChunk)
-	if len(chunks) < 2 {
-		t.Fatalf("chatChunks gave %d chunks; the block must be cut for the test to mean anything", len(chunks))
+	last := chunks[len(chunks)-1]
+	if !strings.HasSuffix(last, "**Summary:** see [runbook](https://x.example/r)") {
+		t.Fatalf("the last chunk does not carry the summary: %q", last)
 	}
-	for i, chunk := range chunks {
-		got := toGchatText(chunk)
-		if strings.Contains(got, "<https://evil.example|") {
-			t.Errorf("chunk %d: toGchatText left the executor's link opener live: %q", i, got)
-		}
-		if strings.Contains(chunk, "<https://evil.example|") && !strings.Contains(got, "< https://evil.example|") {
-			t.Errorf("chunk %d: the opener is neither live nor defanged: %q", i, got)
-		}
+	got := toGchatText(last)
+	wantTail := "```\n*Summary:* see <https://x.example/r|runbook>"
+	if !strings.HasSuffix(got, wantTail) {
+		t.Errorf("the summary after the cut block was not converted:\n got %q\nwant suffix %q", got, wantTail)
 	}
-	if got := toGchatText(chunks[0]); got != chunks[0] {
-		t.Errorf("the first chunk, an opened fence and its content, was altered:\n got %q\nwant %q", got, chunks[0])
+	fence := strings.TrimSuffix(last, "**Summary:** see [runbook](https://x.example/r)")
+	if !strings.HasPrefix(got, fence) {
+		t.Errorf("the fence lines before the summary were altered:\n got %q\nwant prefix %q", got, fence)
 	}
 }
 

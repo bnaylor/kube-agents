@@ -1070,9 +1070,11 @@ than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - rela
 text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
 would ping the room. The Google Chat adapter applies the same markdown rules behind its
 own defang, in two halves: the link defang reads prose, link text and an unclosed fence
-(the adapter posts a result in chunks, so the fence may be the closing one of a block the
-chunker cut) but not a closed code span or fenced block; the mention defang reads
-everything, code included.
+but not a closed code span or fenced block; the mention defang reads everything, code
+included. The adapters translate each chunk of a result alone, so the chunker closes a
+fenced block it cuts and reopens it, language tag and all, at the start of the next chunk:
+every chunk parses as it would in the whole, and the fences added stay within the chunk
+cap.
 
 ## What stage 2 builds from this doc
 

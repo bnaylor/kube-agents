@@ -896,6 +896,31 @@ func TestToMrkdwn(t *testing.T) {
 	}
 }
 
+// TestToMrkdwnConvertsProseAfterAChunkedFence: Gateway.post splits a result
+// with chatChunks(text, discordChunk) and the adapter translates each chunk
+// on its own, so the chunker closes a fenced block it cuts and reopens it in
+// the next chunk (TestChatChunksKeepFencesBalanced). The prose after the
+// block then converts -- bold and links -- rather than riding to the end of
+// the chunk as the content of a fence opened by the block's orphan closer.
+// The fence lines before it are untouched.
+func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
+	big := "```\n" + strings.Repeat("log line\n", 300) + "```\n**Summary:** see [runbook](https://x.example/r)"
+	chunks := chatChunks(big, discordChunk)
+	last := chunks[len(chunks)-1]
+	if !strings.HasSuffix(last, "**Summary:** see [runbook](https://x.example/r)") {
+		t.Fatalf("the last chunk does not carry the summary: %q", last)
+	}
+	got := toMrkdwn(last)
+	wantTail := "```\n*Summary:* see <https://x.example/r|runbook>"
+	if !strings.HasSuffix(got, wantTail) {
+		t.Errorf("the summary after the cut block was not converted:\n got %q\nwant suffix %q", got, wantTail)
+	}
+	fence := strings.TrimSuffix(last, "**Summary:** see [runbook](https://x.example/r)")
+	if !strings.HasPrefix(got, fence) {
+		t.Errorf("the fence lines before the summary were altered:\n got %q\nwant prefix %q", got, fence)
+	}
+}
+
 // TestToMrkdwnRewritesBoldOnlyOnClosedPairs: the bold rewrite used to be a
 // whole-string "**" -> "*", and executor output is full of "**" that is not
 // bold -- a Python **kwargs, a **/*.yaml glob, a horizontal rule -- so the

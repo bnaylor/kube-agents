@@ -112,12 +112,14 @@ func rewriteMarkdown(s string, linkRE *regexp.Regexp) string {
 // An unclosed fence (mdFenceUnclosed) is not kept: it is rewritten with the
 // prose around it. The bold and link passes read one as a fence to the end
 // of the text, as CommonMark does, but a pass that defuses a control
-// sequence cannot afford to: the adapter sees a chunk of the result
-// (Gateway.post, chatChunks), not the whole of it, so a fence that never
-// closes is as likely the tail of a block the chunker cut -- whose closing
-// fence now reads as an opener, with the executor's prose after it -- as a
-// real opener, and the defang errs to defanging. The cost is a space in a
-// `<f|` the executor left in a fence it forgot to close.
+// sequence cannot afford to. The adapter sees a chunk of the result
+// (Gateway.post, chatChunks), not the whole of it; the chunker closes a
+// block it cuts and reopens it in the next chunk, so every chunk is
+// balanced and an unclosed fence should only come from the executor's own
+// output -- but this pass is the last line, and does not lean on that: a
+// fence that never closes is read as prose, and the defang errs to
+// defanging. The cost is a space in a `<f|` the executor left in a fence it
+// forgot to close.
 func rewriteOutsideCode(s string, rewrite func(string) string) string {
 	var b strings.Builder
 	end := 0
