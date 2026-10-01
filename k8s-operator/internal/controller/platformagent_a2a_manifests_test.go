@@ -2182,7 +2182,8 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 // returns that refusal before status is written. So if a sentinel counted on
 // presence alone, a NetworkPolicy under a reserved name that this CR does not
 // own would send every reconcile of a today install into the refusal with no
-// phase, no conditions and no requeue -- a wedge. The shape is concrete: a
+// phase and no conditions, requeued only by the error path's backoff -- a
+// wedge. The shape is concrete: a
 // next CR refused on its first reconcile, deleted, and re-created under the
 // same name in today mode holds its predecessor's fences under the old UID
 // until the garbage collector reaps them. A hand-written NetworkPolicy
