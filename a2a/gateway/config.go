@@ -606,6 +606,16 @@ func (c *Config) defaultCapabilityCeiling() {
 // minted entry gets, so a bad tier or scope is a boot failure the operator
 // sees rather than a per-task refusal in the gateway's log.
 func (c *Config) validateCapabilityCeiling() error {
+	// The namespace first, because it is the rung the default ceiling is
+	// built from and Entry.Validate cannot speak for it: a namespace with an
+	// even number of separators makes a scope that validates cleanly as a
+	// DIFFERENT ceiling, so running the Entry check alone would pass the
+	// gateway out of boot minting against something nobody chose. Checked
+	// even when A2A_AUTHORITY_SCOPE is set, because an explicit scope does
+	// not make a malformed namespace correct -- it only hides it here.
+	if err := capability.ValidateNamespace(c.Namespace); err != nil {
+		return fmt.Errorf("POD_NAMESPACE: %w", err)
+	}
 	e := capability.Entry{Tier: c.AuthorityTier, Scope: c.AuthorityScope, Delegate: "boot-check"}
 	if err := e.Validate(); err != nil {
 		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)

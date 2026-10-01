@@ -140,7 +140,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	// typed, and one binary validating a security input while its twin
 	// takes it raw is how the two executors drift. Empty is not checked:
 	// unset is a legitimate state that the executor's own scope handling
-	// governs, and NamespaceScope never produces a malformed pair.
+	// governs, and what it falls back to is checked just below.
 	scope := capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE"))
 	if scope != "" {
 		if err := scope.Validate(); err != nil {
@@ -148,6 +148,23 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 				"scope", string(scope), "err", err)
 			return workeradapter.Config{}, false
 		}
+	}
+
+	// The fallback rung, checked whether or not the scope above is set,
+	// because POD_NAMESPACE is read for more than the ceiling. An earlier
+	// version of the comment above waived this on the grounds that
+	// "NamespaceScope never produces a malformed pair"; that was false.
+	// NamespaceScope is "namespace/" + ns with no check on ns, so with the
+	// scope unset -- a hand-run harness, a Deployment the operator did not
+	// render -- a POD_NAMESPACE carrying a separator gives adapter.go the
+	// three-segment scope that refuses every submission, or worse the
+	// four-segment one that quietly means something else. Same rule, same
+	// function, as the bridge and the gateway: see
+	// capability.ValidateNamespace.
+	namespace := os.Getenv("POD_NAMESPACE")
+	if err := capability.ValidateNamespace(namespace); err != nil {
+		log.Error("POD_NAMESPACE is not a namespace name", "namespace", namespace, "err", err)
+		return workeradapter.Config{}, false
 	}
 
 	originSeq, originSeqStated := originSeq(log)
@@ -160,7 +177,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		TaskID:       taskID,
 		Profile:      profile,
 		Session:      os.Getenv("A2A_SESSION"),
-		Namespace:    os.Getenv("POD_NAMESPACE"),
+		Namespace:    namespace,
 		Scope:        scope,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway

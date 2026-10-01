@@ -316,19 +316,13 @@ func capabilityScope(log *slog.Logger) (capability.Scope, error) {
 		return "", nil
 	}
 	// The test is on the namespace, not on the scope it builds, and the
-	// difference matters. A scope is kind/name pairs, so a namespace with an
-	// ODD number of separators ("team/x") makes "namespace/team/x" -- three
-	// segments, which Validate refuses, and the bridge would otherwise boot
-	// and refuse every task. But an EVEN number ("a/b/c") makes
-	// "namespace/a/b/c", four segments, which Validate ACCEPTS: it reads as
-	// namespace=a plus a second pair b/c. Validating the scope would catch
-	// the first and wave the second through as a different, silently wrong
-	// ceiling. A namespace name is a DNS-1123 label and never contains a
-	// separator, so that is the thing to check.
-	if strings.Contains(ns, "/") {
-		log.Error("this pod's namespace is not a namespace name; a namespace cannot contain a separator, "+
-			"and the scope it would build is a different ceiling than the one intended",
-			"namespace", ns, "separator", "/")
+	// difference matters -- an even separator count makes a scope that
+	// VALIDATES as a different ceiling. capability.ValidateNamespace carries
+	// that argument and is shared with the gateway and the session executor,
+	// which read the same variable; a copy here is how the three drifted
+	// apart in the first place.
+	if err := capability.ValidateNamespace(ns); err != nil {
+		log.Error("this pod's namespace is not a namespace name", "namespace", ns, "err", err)
 		return "", errUsage
 	}
 	scope := capability.NamespaceScope(ns)

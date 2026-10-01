@@ -587,3 +587,44 @@ func TestAMissingEntryAndARefusedEntryAreNotDistinguishable(t *testing.T) {
 		t.Fatalf("reason = %q, want the one converged walk refusal", missing.Reason)
 	}
 }
+
+// TestValidateNamespaceRefusesBothSeparatorParities is the reason this rule
+// lives in the package rather than in each of its three callers. The two
+// parities fail differently, and a caller that reasoned from the loud one
+// would write a check that misses the quiet one.
+//
+// Odd ("team/x") makes a three-segment scope that Scope.Validate refuses: the
+// component boots and refuses every request, which is loud. Even ("a/b/c")
+// makes a four-segment scope that Scope.Validate ACCEPTS as namespace=a plus
+// a second pair b/c: the component runs normally under a ceiling nobody
+// chose, which is silent and is the one worth having a test for. The scope
+// assertions below are the proof of that asymmetry, not decoration — delete
+// them and the test no longer explains why validating the scope is not
+// enough.
+func TestValidateNamespaceRefusesBothSeparatorParities(t *testing.T) {
+	for _, tc := range []struct {
+		namespace string
+		wantErr   bool
+		// What Scope.Validate alone would have said, which is the whole
+		// argument for checking the namespace instead.
+		scopeAlonePasses bool
+	}{
+		{namespace: "team/x", wantErr: true},
+		{namespace: "a/b/c", wantErr: true, scopeAlonePasses: true},
+		{namespace: "/", wantErr: true},
+		{namespace: "kubeagents-system"},
+		{namespace: ""},
+	} {
+		t.Run(tc.namespace, func(t *testing.T) {
+			if err := ValidateNamespace(tc.namespace); (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateNamespace(%q) err = %v, wantErr %v", tc.namespace, err, tc.wantErr)
+			}
+			scopeErr := NamespaceScope(tc.namespace).Validate()
+			if got := scopeErr == nil; got != (tc.scopeAlonePasses || !tc.wantErr) {
+				t.Errorf("NamespaceScope(%q).Validate() passes = %v, want %v — if this moved, the "+
+					"argument in ValidateNamespace's doc comment needs re-reading, not this number",
+					tc.namespace, got, tc.scopeAlonePasses || !tc.wantErr)
+			}
+		})
+	}
+}

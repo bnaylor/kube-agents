@@ -16,6 +16,7 @@
 package capability
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -320,4 +321,35 @@ func NamespaceScope(namespace string) Scope {
 		return Scope("namespace/-")
 	}
 	return Scope("namespace/" + namespace)
+}
+
+// ValidateNamespace refuses a namespace that cannot make the one-pair scope
+// NamespaceScope claims to build. Every component that defaults its ceiling
+// from its own namespace calls this before NamespaceScope, so the rule exists
+// once rather than once per binary: the gateway (config.go), the bridge and
+// the session executor all read the same POD_NAMESPACE and all three used to
+// disagree about whether it needed checking.
+//
+// The test is on the namespace rather than on the scope it builds, and the
+// difference is the whole point. A Scope is kind/name pairs, so a namespace
+// with an ODD number of separators ("team/x") makes "namespace/team/x" --
+// three segments, which Scope.Validate refuses, so validating the scope
+// catches it. But an EVEN number ("a/b/c") makes "namespace/a/b/c", four
+// segments, which Scope.Validate ACCEPTS: it reads as namespace=a plus a
+// second pair b/c. A caller that validated only the scope would refuse the
+// first and boot on the second with a ceiling that is not the one it meant,
+// and nothing downstream would ever say so. A namespace name is a DNS-1123
+// label and cannot contain a separator, so the namespace is the thing to ask.
+//
+// Empty is not an error here. It is a real state with a per-caller answer --
+// the gateway falls back to a default name, the bridge reports that it could
+// resolve no namespace and refuses tasks for want of a scope, and a Config
+// built without one gets the "namespace/-" mismatch marker -- so collapsing
+// those into one error message would lose what each of them says.
+func ValidateNamespace(namespace string) error {
+	if strings.Contains(namespace, "/") {
+		return fmt.Errorf("namespace %q contains %q: a namespace is a DNS-1123 label, and the scope this "+
+			"would build is a different ceiling than the one intended", namespace, "/")
+	}
+	return nil
 }

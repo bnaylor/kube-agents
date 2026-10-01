@@ -296,3 +296,53 @@ func TestAMalformedAuthorityScopeRefusesToStart(t *testing.T) {
 		})
 	}
 }
+
+// TestAMalformedPodNamespaceRefusesToStart is the sibling of the bridge's
+// TestAMalformedPodNamespaceIsABootFailure, and it exists because the bridge
+// got that check one review round before this binary did. The comment here
+// used to waive it on the grounds that "NamespaceScope never produces a
+// malformed pair", which is false: NamespaceScope is "namespace/" + ns with
+// no check on ns.
+//
+// Both separator parities are rows, because they fail differently and only
+// one of them is loud. "team/x" builds a three-segment scope that
+// Scope.Validate refuses, so the adapter boots and refuses every submission
+// with "the resource is not a well-formed scope". "a/b/c" builds a
+// four-segment scope that Scope.Validate ACCEPTS, as namespace=a plus a
+// second pair b/c — the adapter runs, submissions are checked, and the
+// ceiling is simply not the one anyone chose. A check written against the
+// scope rather than the namespace would pass this test's first row and fail
+// its second.
+//
+// The scope is left unset on every row: with it set, adapter.go never calls
+// NamespaceScope and the namespace reaches nothing that parses it. That is
+// also why the shipped install does not hit this — the spawner always writes
+// A2A_AUTHORITY_SCOPE — and why the rows below describe a hand-run harness
+// or a Deployment the operator did not render.
+func TestAMalformedPodNamespaceRefusesToStart(t *testing.T) {
+	for _, tc := range []struct {
+		namespace string
+		wantOK    bool
+	}{
+		{namespace: "team/x"},
+		{namespace: "a/b/c"},
+		{namespace: "/"},
+		{namespace: "kubeagents-system", wantOK: true},
+		{namespace: "", wantOK: true},
+	} {
+		t.Run(tc.namespace, func(t *testing.T) {
+			t.Setenv("TASK_ID", "task-namespace-contract")
+			t.Setenv("PROFILE", "chat")
+			t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+			t.Setenv("A2A_AUTHORITY_SCOPE", "")
+			t.Setenv("POD_NAMESPACE", tc.namespace)
+			cfg, ok := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			if ok != tc.wantOK {
+				t.Fatalf("configFromEnv with POD_NAMESPACE=%q ok = %v, want %v", tc.namespace, ok, tc.wantOK)
+			}
+			if ok && cfg.Namespace != tc.namespace {
+				t.Errorf("configFromEnv namespace = %q, want %q", cfg.Namespace, tc.namespace)
+			}
+		})
+	}
+}
