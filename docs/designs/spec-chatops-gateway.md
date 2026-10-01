@@ -1063,9 +1063,13 @@ section gives.
 `verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
 the socket and asserted the `user_id`, our table joined it to a principal. Rendering
 into mrkdwn is a narrow deterministic translation of the two forms the relay emits
-(bold, links); the legacy Hermes converter stays where it is. Everything posted is
-escaped first (`&`, `<`, `>`) - relayed text is executor-authored, ie model output,
-and an unescaped `<!channel>` in a result would ping the room.
+(bold, links); the legacy Hermes converter stays where it is. The translation leaves
+code spans as written, converts bold only on a closed `**` pair, never alters a
+link's destination, and refuses a link whose label carries a URL naming a host other
+than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - relayed
+text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
+would ping the room. The Google Chat adapter applies the same markdown rules behind its
+own defang.
 
 ## What stage 2 builds from this doc
 

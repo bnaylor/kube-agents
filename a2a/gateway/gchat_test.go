@@ -472,9 +472,11 @@ func TestToGchatText(t *testing.T) {
 		"[real](https://x.example/p) vs <https://evil.example|real>": "<https://x.example/p|real> vs < https://evil.example|real>",
 		// A mention or an angle pair inside a markdown link's display text
 		// is inside the sequence the adapter generates, so it is defanged
-		// there too rather than riding out on the exemption.
+		// there too rather than riding out on the exemption. The angle pair
+		// also names a host the link does not open, so that link is refused
+		// as well: the markdown stays, defanged, and no <...|...> is made.
 		"[<users/all>](https://x.example/p)":               "<https://x.example/p|< users/all>>",
-		"[<https://evil.example|hi>](https://x.example/p)": "<https://x.example/p|< https://evil.example|hi>>",
+		"[<https://evil.example|hi>](https://x.example/p)": "[< https://evil.example|hi>](https://x.example/p)",
 		// A `|` or an angle bracket in the URL would let a crafted link close
 		// the generated sequence early and choose its own display text. The
 		// URL class refuses them, so the markdown is left as written instead.
@@ -483,6 +485,63 @@ func TestToGchatText(t *testing.T) {
 		// shape Chat linkifies, and defanging it would mangle ordinary text.
 		"latency < 5 | p99 > ok": "latency < 5 | p99 > ok",
 		"if a < b then":          "if a < b then",
+		// An opener the executor never closed is defanged too: the next
+		// link the adapter writes would otherwise close it. The cost is one
+		// visible space in prose of that exact shape.
+		"see <https://evil.example|docs: [doc](https://x.example/p)": "see < https://evil.example|docs: <https://x.example/p|doc>",
+		"if x<y|z then": "if x< y|z then",
+		// An opener nested inside another's text is its own sequence, not
+		// the outer one's text; both are defanged.
+		"<https://a.example|x <https://evil.example|https://good.example>": "< https://a.example|x < https://evil.example|https://good.example>",
+	}
+	for in, want := range cases {
+		if got := toGchatText(in); got != want {
+			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToGchatTextSharesTheMarkdownRules: the bold, code-span, link-URL and
+// label-host rules are the same on both surfaces (Chat reads *x* as bold,
+// _x_ as italic, backticks as code and <url|text> as a link, the same as
+// Slack), so toGchatText takes them from the same helpers toMrkdwn does. The
+// rows mirror TestToMrkdwnRewritesBoldOnlyOnClosedPairs and its two link
+// siblings in slack_test.go, with Chat's defang in place of Slack's escaping.
+func TestToGchatTextSharesTheMarkdownRules(t *testing.T) {
+	cases := map[string]string{
+		"**kwargs":                    "**kwargs",
+		"**/*.yaml":                   "**/*.yaml",
+		"a ** b":                      "a ** b",
+		"***x***":                     "*_x_*",
+		"`**x**`":                     "`**x**`",
+		"```\n**x**\n```":             "```\n**x**\n```",
+		"**a** and `**b**` and **c**": "*a* and `**b**` and *c*",
+		// The defang is not a markdown rule and still reaches code, and a
+		// code span inside an injected <url|text> does not split the
+		// sequence out of the defang's sight.
+		"`<users/all>` in code":                  "`< users/all>` in code",
+		"<https://evil.example|`x` text>":        "< https://evil.example|`x` text>",
+		"<https://evil.example|see `code` here>": "< https://evil.example|see `code` here>",
+		// A pair around a code span and a code span in a link's label.
+		"**`x`**": "*`x`*",
+		// An unclosed <url|text in a label is defanged before the adapter's
+		// closing > could complete it, and the label then names a second
+		// host the link does not open, so the link is refused as well.
+		"[https://x.example/p <https://evil.example|real](https://x.example/p)": "[https://x.example/p < https://evil.example|real](https://x.example/p)",
+		"[`kubectl`](https://x.example/p)":                                      "<https://x.example/p|`kubectl`>",
+		// The label's URL is found through emphasis; userinfo is refused.
+		"[**https://good.example**](https://evil.example)":          "[**https://good.example**](https://evil.example)",
+		"[**https**://good.example](https://evil.example)":          "[**https**://good.example](https://evil.example)",
+		"[https://good.example@evil.example](https://evil.example)": "[https://good.example@evil.example](https://evil.example)",
+		// A link's destination is never altered; a pair around a link is.
+		"[doc](https://x.example/**a**/b)": "<https://x.example/**a**/b|doc>",
+		"**[doc](https://x.example/p)**":   "*<https://x.example/p|doc>*",
+		// A URL-shaped label naming another host is refused, as written.
+		"[https://good.example](https://evil.example)": "[https://good.example](https://evil.example)",
+		"[https://x.example/p](https://x.example/p)":   "<https://x.example/p|https://x.example/p>",
+		// One level of balanced parentheses in a destination.
+		"[Foo](https://en.wikipedia.org/wiki/Foo_(bar))": "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"[a](https://x.example/(p)":                      "[a](https://x.example/(p)",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {

@@ -144,19 +144,29 @@ func unverifiedRemedyFor(backend string) string {
 	return "the principal map"
 }
 
-// gchatLinkRe rewrites markdown links to Chat's <url|text> form. The URL class
-// excludes `<`, `>` and `|` so a crafted markdown link cannot close the
-// generated sequence early and pick its own display text; none of the three is
-// legal in a URL unencoded, so refusing them costs nothing real.
-var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s<>|]+)\)`)
+// gchatLinkRe matches markdown links for rewriteLinks to turn into Chat's
+// <url|text> form. The URL class excludes `<`, `>` and `|` so a crafted
+// markdown link cannot close the generated sequence early and pick its own
+// display text; none of the three is legal in a URL unencoded, so refusing
+// them costs nothing real. It admits one level of balanced parentheses, as
+// slackLinkRE does and for the same reason: a `.../wiki/Foo_(bar)`
+// destination otherwise ends at the first `)`.
+var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://(?:[^()\s<>|]|\([^()\s<>|]*\))+)\)`)
 
 // gchatPipeRe matches Chat's other in-text control sequence, the <url|text>
-// link. The segment before the pipe must be non-empty and space-free, which is
-// the shape Chat linkifies; prose like `a < b | c >` is left alone. Where the
-// two readings are ambiguous this errs towards defanging: the cost of that
-// error is one visible space, and the cost of the other is a link whose
-// visible text names a host it does not open.
-var gchatPipeRe = regexp.MustCompile(`<[^\s<>|]+\|[^>]*>`)
+// link, closed or not. The segment before the pipe must be non-empty and
+// space-free, which is the shape Chat linkifies; prose like `a < b | c >` is
+// left alone. An opener the executor never closed counts too: the adapter
+// writes its own <url|text> for every markdown link that follows, and that
+// link's `>` would close the executor's opener around it, making one link to
+// the executor's host with the adapter's link inside its text. The text
+// before the `>` admits no `<` either, so an opener nested inside another's
+// text is a sequence of its own and is defanged as one, rather than read
+// over as the outer sequence's text. Where the two readings are ambiguous
+// this errs towards defanging: the cost of that error is one visible space,
+// and the cost of the other is a link whose visible text names a host it
+// does not open.
+var gchatPipeRe = regexp.MustCompile(`<[^\s<>|]+\|(?:[^<>]*>)?`)
 
 // gchatSpace, gchatSender and gchatMessage are the Chat resources both event
 // shapes carry; only the fields the adapter reads are declared.
@@ -651,21 +661,17 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // the one it opens. The defusing is a visible space, not an invisible
 // character.
 //
-// Only the <url|text> this function generates from a markdown link reaches
-// Chat live. Every other span is defanged, including a link's own display
-// text, so the sequence survives exactly where the adapter authored it and
-// nowhere the executor did — which is the distinction the <users/…> defang
-// already drew, applied to the sequence next to it.
+// The defang runs first, over the whole text, code spans included, the way
+// the Slack adapter escapes first: every <users/…> and every <url|text the
+// executor opened, closed or not, is defused before the markdown rules see
+// it, and the markdown link's destination class excludes `<`, so the
+// <url|text> rewriteLinks generates afterwards is the adapter's own — which
+// is the distinction the <users/…> defang already drew, applied to the
+// sequence next to it. The markdown rules (bold pairs, code spans, links,
+// the label-host refusal) are the ones markdown.go holds for both chat
+// surfaces.
 func toGchatText(s string) string {
-	var b strings.Builder
-	end := 0
-	for _, m := range gchatLinkRe.FindAllStringSubmatchIndex(s, -1) {
-		b.WriteString(defangGchatControls(s[end:m[0]]))
-		b.WriteString("<" + s[m[4]:m[5]] + "|" + defangGchatControls(s[m[2]:m[3]]) + ">")
-		end = m[1]
-	}
-	b.WriteString(defangGchatControls(s[end:]))
-	return strings.ReplaceAll(b.String(), "**", "*")
+	return rewriteMarkdown(defangGchatControls(s), gchatLinkRe)
 }
 
 // defangGchatControls neutralizes Chat's in-text control sequences in a span
