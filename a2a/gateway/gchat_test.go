@@ -522,8 +522,16 @@ func TestToGchatTextSharesTheMarkdownRules(t *testing.T) {
 		"`<users/all>` in code":                  "`< users/all>` in code",
 		"<https://evil.example|`x` text>":        "< https://evil.example|`x` text>",
 		"<https://evil.example|see `code` here>": "< https://evil.example|see `code` here>",
-		// A pair around a code span and a code span in a link's label.
-		"**`x`**": "*`x`*",
+		// A pair around a code span, also when the span holds a `**` of
+		// its own (the same span with no pair around it, or with an opener
+		// that never closes, is as written), and a code span in a link's
+		// label.
+		"**`x`**":                 "*`x`*",
+		"**`**kwargs`**":          "*`**kwargs`*",
+		"use **`**kwargs`** for":  "use *`**kwargs`* for",
+		"**see `a**b`**":          "*see `a**b`*",
+		"pass `**kwargs` through": "pass `**kwargs` through",
+		"**`**kwargs` unclosed":   "**`**kwargs` unclosed",
 		// An unclosed <url|text in a label is defanged before the adapter's
 		// closing > could complete it, and the label then names a second
 		// host the link does not open, so the link is refused as well.

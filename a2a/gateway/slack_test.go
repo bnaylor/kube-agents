@@ -931,8 +931,18 @@ func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
 		// A pair that wraps a code span still converts (only its own stars
 		// change), a link whose label holds a code span still converts, and
 		// a link written inside a code span is code, not a link.
-		"**`kubectl get pods`**":                    "*`kubectl get pods`*",
-		"see **`values.yaml`** for":                 "see *`values.yaml`* for",
+		"**`kubectl get pods`**":    "*`kubectl get pods`*",
+		"see **`values.yaml`** for": "see *`values.yaml`* for",
+		// And still converts when the span it wraps holds a `**` of its
+		// own: the closer is sought outside code spans, so the span's
+		// stars are neither a closer nor altered. The same span with no
+		// pair around it, or with an opener that never closes, is as
+		// written.
+		"**`**kwargs`**":                            "*`**kwargs`*",
+		"use **`**kwargs`** for":                    "use *`**kwargs`* for",
+		"**see `a**b`**":                            "*see `a**b`*",
+		"pass `**kwargs` through":                   "pass `**kwargs` through",
+		"**`**kwargs` unclosed":                     "**`**kwargs` unclosed",
 		"[`kubectl`](https://x.example/p)":          "<https://x.example/p|`kubectl`>",
 		"run `[x](https://x.example/p)` as written": "run `[x](https://x.example/p)` as written",
 		// Escaping is not a markdown rule and still reaches code: a

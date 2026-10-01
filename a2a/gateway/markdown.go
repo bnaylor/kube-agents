@@ -101,16 +101,19 @@ func insideAny(i int, ranges [][]int) bool {
 }
 
 // rewriteBoldPairs rewrites each closed bold pair in s to the single-star
-// form both surfaces read, and a matched bold-italic triple to *_x_*. A pair
-// is left as written when its opening or closing stars sit inside a code
-// span, inside the destination of a markdown link (one linkRE matches), or
-// anywhere in a link rewriteLinks will refuse (linkRefused), so neither a
-// code span nor a URL is ever altered and a refused link stays the markdown
-// it arrived as; a pair that wraps a whole code span or a whole link still
-// converts, since only its own stars change. A triple closed by a double, or the reverse, is
-// not a pair and is left as written. A bare URL is not a shape this
-// recognises (both surfaces auto-link it), so a closed pair inside one is
-// rewritten.
+// form both surfaces read, and a matched bold-italic triple to *_x_*. The
+// pairs are sought in a copy of s with every protected range blanked
+// (maskRanges): a code span, the destination of a markdown link (one linkRE
+// matches), and the whole of a link rewriteLinks will refuse (linkRefused).
+// A star inside one is not a candidate for either side of a pair, so a `**`
+// in a code span or a URL never opens or closes one and is never altered,
+// a refused link stays the markdown it arrived as, and a pair that wraps a
+// whole code span or a whole link converts, since only its own stars
+// change, even when the span holds a `**` of its own (**`**kwargs`**). The
+// mask keeps newlines, so a pair is still one line of content. A triple
+// closed by a double, or the reverse, is not a pair and is left as written.
+// A bare URL is not a shape this recognises (both surfaces auto-link it),
+// so a closed pair inside one is rewritten.
 func rewriteBoldPairs(s string, code [][]int, linkRE *regexp.Regexp) string {
 	protected := append([][]int(nil), code...)
 	for _, m := range linkRE.FindAllStringSubmatchIndex(s, -1) {
@@ -122,12 +125,12 @@ func rewriteBoldPairs(s string, code [][]int, linkRE *regexp.Regexp) string {
 	}
 	var b strings.Builder
 	end := 0
-	for _, m := range mdBoldRE.FindAllStringSubmatchIndex(s, -1) {
+	for _, m := range mdBoldRE.FindAllStringSubmatchIndex(maskRanges(s, protected), -1) {
 		b.WriteString(s[end:m[0]])
 		end = m[1]
 		open, content, close := s[m[2]:m[3]], s[m[4]:m[5]], s[m[6]:m[7]]
 		switch {
-		case insideAny(m[0], protected) || insideAny(m[1]-1, protected) || open != close:
+		case open != close:
 			b.WriteString(s[m[0]:m[1]])
 		case open == "":
 			b.WriteString(mdStrong + content + mdStrong)
@@ -137,6 +140,27 @@ func rewriteBoldPairs(s string, code [][]int, linkRE *regexp.Regexp) string {
 	}
 	b.WriteString(s[end:])
 	return b.String()
+}
+
+// mdMaskByte stands in for every byte of a protected range in the copy
+// rewriteBoldPairs searches: not a star, not a space, so it can neither
+// open nor close a pair nor break the content of one that wraps the range.
+const mdMaskByte = 'x'
+
+// maskRanges returns s with every byte inside one of the [start, end)
+// ranges replaced by mdMaskByte, newlines excepted, so a search over the
+// result reads nothing inside them and still sees where each line ends.
+// Byte for byte, so an offset into the result is the same offset into s.
+func maskRanges(s string, ranges [][]int) string {
+	b := []byte(s)
+	for _, r := range ranges {
+		for i := r[0]; i < r[1]; i++ {
+			if b[i] != '\n' {
+				b[i] = mdMaskByte
+			}
+		}
+	}
+	return string(b)
 }
 
 // rewriteLinks rewrites each markdown link linkRE matches in s to <url|text>,
