@@ -1028,6 +1028,22 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # removes the CR whole, so the flip-back-with-sidecar failure the bridge doc
 # names never arises here.
 #
+# The verifier is gated too, and gated LAST of everything here, which is not
+# where its dependency would put it. Its precondition is the provisioning Job
+# -- it binds the capability bucket at boot and exits when it cannot, so until
+# the Job has created the bucket it crash-loops -- but its deadline is the
+# first submission, which is hack/ci-eval-pr.sh, after this step. Waiting on
+# it right after the Job would put a kubelet restart backoff of up to five
+# minutes AHEAD of the sidecar patch this script has yet to issue, and so add
+# that backoff to the deploy; waiting on it at the end spends the same backoff
+# alongside the two agent rollouts and the bridge coming up, and still answers
+# the only question that matters, which is whether the verifier is answering
+# before anything asks it. Gated rather than reported because every executor
+# turns an unanswered Check into a terminal rejection: a verifier still in
+# backoff when the eval starts does not slow a case down, it refuses it, and
+# the whole eval reads as a broken product (the same reason the slice pins
+# A2A_VERIFIER_IMAGE through operator.extraEnv at all).
+#
 # Reported, not gated: the A2A gateway Deployment. It used to exit on start
 # without a chat backend (#1660); the inject door is one, so it now starts,
 # but no pool-project run has shown it coming up yet and a gateway that is
@@ -1044,6 +1060,15 @@ dump_mode_next_state() {
   kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
   kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp | tail -"${MODE_NEXT_DIAG_EVENT_LINES}" || true
   kubectl logs -n "${NAMESPACE}" "deployment/${OPERATOR_DEPLOYMENT_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+  # The verifier's own log, on every failure path and not only its gate's.
+  # Its one durable failure -- it could not bind the capability bucket, so it
+  # exited -- is a line in this log and nowhere else: `describe` shows a
+  # CrashLoopBackOff without the reason, and the CR's A2AVerifier condition
+  # says zero replicas are ready without saying why. Previous as well as
+  # current, because by the time anything reads this the container that
+  # printed it has usually already been restarted.
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier" --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier" --previous --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
 }
 
 # Waits for the operator to create the workload, then for its rollout; on
@@ -1373,6 +1398,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     exit 1
   fi
   echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch: ${BRIDGE_CONSUMING}"
+
+  # Last, for the reason in this step's header: the bucket it needs exists by
+  # now, and the backoff it may still be in has been running against the two
+  # rollouts above rather than in front of them.
+  gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's

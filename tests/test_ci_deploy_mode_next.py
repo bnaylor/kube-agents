@@ -637,6 +637,12 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
+                # Last, not after the Job its bucket comes from: see the
+                # step header. A verifier still in its crash-loop backoff
+                # when the eval starts submitting refuses every case
+                # terminally, so this one is a gate and not a report, but
+                # the backoff is spent alongside the rollouts above.
+                "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier",
             ],
         )
         markers = [
@@ -653,6 +659,7 @@ class FlagSetIsNextTest(unittest.TestCase):
             'gate_cr_not_degraded "the sidecar patch"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
+            'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"',
         ]
         position = 0
         for marker in markers:
