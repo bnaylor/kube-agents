@@ -148,7 +148,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
-						Name:  "verifier",
+						Name:  a2aVerifierContainerName,
 						Image: a2aVerifierImage(),
 						// #1259, on the same distroless base the gateway and
 						// the callout carry it for: the image's WORKDIR

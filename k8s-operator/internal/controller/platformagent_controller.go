@@ -153,6 +153,13 @@ const (
 	reasonContainerCreating = "ContainerCreating"
 	reasonPodInitializing   = "PodInitializing"
 	reasonContainerError    = "Error"
+	reasonCrashLoopBackOff  = "CrashLoopBackOff"
+
+	// a2aVerifierContainerName is the verifier Deployment's only container
+	// (buildA2AVerifierDeployment). The pod scan names it to tell the
+	// verifier's one by-design crash loop from a real fault; see
+	// getDeploymentStatusDetails.
+	a2aVerifierContainerName = "verifier"
 
 	// The condition reporting that cluster event ingestion has been switched off
 	// on the spec. It is written only in that state — see updateStatusReady.
@@ -3388,7 +3395,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			}
 		}
 	case errWorkload == nil:
-		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
+		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent, a2a.done); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
@@ -3915,7 +3922,10 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 	return true
 }
 
-func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (phase string, reason string, message string) {
+// capBucketProvisioned is the provision Job having completed, which is this
+// operator's only cheap proxy for "the capability bucket exists". It qualifies
+// exactly one container's crash loop; see the verifier paragraph below.
+func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, capBucketProvisioned bool) (phase string, reason string, message string) {
 	phase = "Provisioning"
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
@@ -3958,15 +3968,25 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// readSplitWorkloads leaves it out on purpose -- a verifier rollout should not
 	// flip a serving install to Provisioning, and the CRD page says so. But every
 	// executor turns a Check that gets no answer into a terminal rejected, so a
-	// verifier stuck in ImagePullBackOff (the default image is a dev-registry tag an
-	// install is expected to override) refuses every submission while the CR reports
-	// Ready=True. Not gating is the decision; reporting nothing is not. Scanned, the
-	// operator at least reads the container fault instead of a green CR and a bus
-	// that rejects everything.
+	// verifier stuck in ImagePullBackOff refuses every submission while the CR
+	// reports Ready=True. Not gating is the decision; reporting nothing is not.
+	// Scanned, the operator at least reads the container fault instead of a green
+	// CR and a bus that rejects everything.
 	//
-	// This is the one selector here whose pod is not counted toward Ready, so it can
-	// only ever add a reason to a phase some other workload already set -- it cannot
-	// by itself move a CR off Ready, and the ordering note above still holds.
+	// The reference is a2aReleaseImage's: A2A_VERIFIER_IMAGE if set, else derived
+	// from the operator's tag, else from the agent image (b1ee482e graduated it off
+	// the private dev-registry default it had when this paragraph was first
+	// written). All three rungs can name something unpullable -- an override typo,
+	// a release whose verifier image was never pushed, an unreachable registry --
+	// so the fault stays worth scanning for; it is just no longer the default.
+	//
+	// This is the one selector here whose pod is not counted toward Ready, so it
+	// cannot by itself move a CR off Ready, and the ordering note above still
+	// holds. It CAN move the phase, though, which is the thing to keep in mind
+	// when reading the paragraph above as a safety argument: the reason it adds
+	// turns a Provisioning into a Degraded an operator will act on. That is
+	// wanted for an unoverridden image and wrong for the bucket wait, and the
+	// pod loop below draws the line.
 	if a2aStackRendering(agent) {
 		selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
 	}
@@ -4007,7 +4027,38 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		initThenApp := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
 		initThenApp = append(initThenApp, pod.Status.InitContainerStatuses...)
 		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
+		// The verifier's wait for its bucket is the one crash loop here that is
+		// the design working, so it is the one the scan has to not report.
+		//
+		// reconcileA2A applies the verifier BEFORE the provision Job and says so
+		// in its own comment: the verifier binds the cap bucket at boot and exits
+		// when it cannot, "so on a fresh install it crash-loops until the
+		// provision Job below has created the bucket". Meanwhile `notReady` holds
+		// "bus provisioning" until that same Job completes, which keeps
+		// updateStatusReady in the `case errWorkload == nil:` arm -- the arm that
+		// calls this scan. So without this, every fresh `next` install spends the
+		// window between NATS answering and the Job finishing reporting
+		// Degraded/CrashLoopBackOff for a workload behaving exactly as designed.
+		// Before the verifier joined the selectors that window read Provisioning,
+		// and it has to go on reading Provisioning.
+		//
+		// Narrow on purpose, three ways: this container, this reason, and only
+		// while the bucket is unprovisioned. ImagePullBackOff on the verifier is
+		// a real fault at any time -- it is the fault this selector was added
+		// for, and unreachable at any of a2aReleaseImage's three rungs -- and a
+		// crash loop that outlives the Job is the verifier failing at something
+		// other than the wait.
+		//
+		// Suppressing rather than skipping the pod: a verifier pod can carry a
+		// genuine fault on another container in the same window, and the loop
+		// below still has to find it.
+		crashIsTheBucketWait := !capBucketProvisioned && pod.Labels["app"] == a2aVerifierName(agent)
+
 		for _, cs := range initThenApp {
+			if crashIsTheBucketWait && cs.Name == a2aVerifierContainerName &&
+				cs.State.Waiting != nil && cs.State.Waiting.Reason == reasonCrashLoopBackOff {
+				continue
+			}
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" &&
 				cs.State.Waiting.Reason != reasonContainerCreating && cs.State.Waiting.Reason != reasonPodInitializing {
 				phase = "Degraded"
