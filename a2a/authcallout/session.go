@@ -79,7 +79,7 @@ const (
 // incarnation per task, which makes those the same thing today; the gateway
 // pins that when it routes a session (gateway.go, the SessionRouted branch,
 // which retires the previous incarnation and re-mints rec.BusSession).
-func sessionGrants(pod string) Grants {
+func sessionGrants(pod string) (Grants, error) {
 	inbox := "_INBOX." + pod + ".>"
 	g := Grants{
 		Publish: []string{
@@ -129,22 +129,27 @@ func sessionGrants(pod string) Grants {
 	// the gateway's delegate flow mints the successor's root itself. A grant
 	// for a client that does not exist is a standing authorization, not
 	// documentation of a plan; it lands with the hop that needs it.
+	//
+	// Both of these are unreachable today: validSessionName has already
+	// accepted the pod name as a dot-free DNS-1123 label, and every such
+	// string also satisfies capability's checkToken. They return an error
+	// rather than an empty grant set anyway, because an empty grant set is
+	// not the fail-closed value it reads as — the server mints it as an
+	// UNRESTRICTED client (see Service.authorize). There is no value of this
+	// type that means "refuse", so refusing has to be said out of band.
 	verify, err := capability.VerifySubject(pod)
 	if err != nil {
-		// Unreachable: validSessionName has already checked the pod name
-		// against the same rule. Refusing the whole grant set rather than
-		// dropping one subject is the fail-closed reading of "unreachable".
-		return Grants{}
+		return Grants{}, fmt.Errorf("the attested pod name is not a usable capability caller: %w", err)
 	}
 	reply, err := capability.ReplySubscribe(pod)
 	if err != nil {
-		return Grants{}
+		return Grants{}, fmt.Errorf("the attested pod name is not a usable capability caller: %w", err)
 	}
 	g.Publish = append(g.Publish, verify)
 	g.Subscribe = append(g.Subscribe, reply)
 
 	g.Publish = append(g.Publish, inbox)
-	return g
+	return g, nil
 }
 
 // validSessionName is the check the whole derivation stands on: the pod name

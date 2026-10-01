@@ -124,7 +124,10 @@ func TestEveryRenderedPrincipalIsUsable(t *testing.T) {
 			if len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0 {
 				t.Errorf("%q narrows on %q but the operator rendered grants for it", id.User, id.Narrowing)
 			}
-			derived := sessionGrants("chat-otter-1a2b")
+			derived, err := sessionGrants("chat-otter-1a2b")
+			if err != nil {
+				t.Fatalf("%q derives no grants for a well-formed pod name: %v", id.User, err)
+			}
 			inbox := "_INBOX.chat-otter-1a2b.>"
 			if !contains(derived.Subscribe, inbox) || !contains(derived.Publish, inbox) {
 				t.Errorf("%q derives grants that do not cover its own inbox %s; every reply it waits on would time out", id.User, inbox)

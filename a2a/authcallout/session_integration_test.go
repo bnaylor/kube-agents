@@ -357,7 +357,10 @@ func containsString(hay []string, needle string) bool {
 // else. This catches the shape where a refactor threads some ambient session
 // name through instead of the attested one.
 func TestSessionGrantsMentionNoPodButTheirOwn(t *testing.T) {
-	g := sessionGrants(podA)
+	g, err := sessionGrants(podA)
+	if err != nil {
+		t.Fatalf("sessionGrants(%q): %v", podA, err)
+	}
 	for _, subject := range append(append([]string{}, g.Publish...), g.Subscribe...) {
 		if strings.Contains(subject, podB) {
 			t.Errorf("grant %q mentions another pod", subject)
