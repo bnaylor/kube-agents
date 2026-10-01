@@ -2175,6 +2175,115 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 	}
 }
 
+// TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall pins the
+// ownership rule the early exit applies to its sentinels, from both sides.
+//
+// The walk refuses to delete anything this CR does not own, and Reconcile
+// returns that refusal before status is written. So if a sentinel counted on
+// presence alone, a NetworkPolicy under a reserved name that this CR does not
+// own would send every reconcile of a today install into the refusal with no
+// phase, no conditions and no requeue -- a wedge. The shape is concrete: a
+// next CR refused on its first reconcile, deleted, and re-created under the
+// same name in today mode holds its predecessor's fences under the old UID
+// until the garbage collector reaps them. A hand-written NetworkPolicy
+// squatting the name is the same shape without the collector coming.
+//
+// The sentinel rule is: an object counts only when this CR owns it. The rows
+// below plant each fence under a stale UID and under no owner at all and
+// require the reconcile to go through and leave the object alone; the control
+// plants the same object owned by the CR and requires the walk to remove it
+// (#2197), so a change that stopped the exit seeing owned residue reds here
+// rather than passing as "nothing wedged".
+func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.T) {
+	staleOwner := metav1.OwnerReference{
+		APIVersion:         agentv1alpha1.GroupVersion.String(),
+		Kind:               "PlatformAgent",
+		Name:               "test-agent",
+		UID:                types.UID("the-previous-agent-uid"),
+		Controller:         ptr.To(true),
+		BlockOwnerDeletion: ptr.To(true),
+	}
+	natsFence := func(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+		return buildA2ANATSNetworkPolicy(agent)
+	}
+	sessionFence := func(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+		return buildA2ASessionNetworkPolicy(agent, nil)
+	}
+	for _, tc := range []struct {
+		name  string
+		fence func(*agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy
+		owner *metav1.OwnerReference // nil plants the object with no owner at all
+		owned bool                   // true plants it under this CR, the control row
+	}{
+		{"NATS fence under a stale UID", natsFence, &staleOwner, false},
+		{"session fence under a stale UID", sessionFence, &staleOwner, false},
+		{"NATS fence with no owner at all", natsFence, nil, false},
+		{"session fence with no owner at all", sessionFence, nil, false},
+		{"control: NATS fence owned by this CR is torn down", natsFence, nil, true},
+		{"control: session fence owned by this CR is torn down", sessionFence, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			// A today CR: mode absent, and the finalizer already on so the
+			// first reconcile reaches the mode gate rather than returning
+			// after adding it.
+			agent := egressPolicyAgent()
+			planted := tc.fence(agent)
+			planted.OwnerReferences = nil
+			switch {
+			case tc.owned:
+				if err := ctrl.SetControllerReference(agent, planted, scheme); err != nil {
+					t.Fatal(err)
+				}
+			case tc.owner != nil:
+				planted.OwnerReferences = []metav1.OwnerReference{*tc.owner}
+			}
+			if owned := metav1.IsControlledBy(planted, agent); owned != tc.owned {
+				t.Fatalf("planted object controlled by the CR = %t, want %t; the row is not the shape it names", owned, tc.owned)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, planted).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d of a today CR beside %s: %v\n"+
+						"The early exit counted an object this CR does not own as its own residue, "+
+						"and the walk's ownership refusal wedged the reconcile before status.", i+1, planted.Name, err)
+				}
+			}
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+				t.Fatalf("re-read the agent: %v", err)
+			}
+			if stored.Status.Phase == "" {
+				t.Errorf("the reconcile returned nil but wrote no phase; it did not get past the mode gate")
+			}
+
+			after := &networkingv1.NetworkPolicy{}
+			err := cl.Get(ctx, client.ObjectKeyFromObject(planted), after)
+			if tc.owned {
+				if !errors.IsNotFound(err) {
+					t.Errorf("%s is owned by this CR and survived the today reconcile (err=%v): the exit no longer sees owned residue, which is #2197 again", planted.Name, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s is not this CR's and must be left to its owner or the garbage collector, got err=%v", planted.Name, err)
+			}
+			if !reflect.DeepEqual(after.OwnerReferences, planted.OwnerReferences) {
+				t.Errorf("%s was adopted or re-owned: ownerReferences = %+v, want %+v", planted.Name, after.OwnerReferences, planted.OwnerReferences)
+			}
+		})
+	}
+}
+
 func TestBuildNetworkPolicyBusEgressGatedOnMode(t *testing.T) {
 	findBusRule := func(np *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
 		for i := range np.Spec.Egress {

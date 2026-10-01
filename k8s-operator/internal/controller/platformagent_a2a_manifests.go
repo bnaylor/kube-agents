@@ -4052,6 +4052,15 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// property. The first four are Owns kinds and free; the two Secret reads
 	// are uncached and happen only when the free four all miss.
 	//
+	// A sentinel counts only when this CR owns it: a squatted or stale-UID
+	// object under a reserved name is not residue of this CR and is left to
+	// its owner or to the garbage collector. The walk below refuses to delete
+	// anything this CR does not own, so a present-but-unowned sentinel that
+	// counted would send every reconcile of a today install into that refusal
+	// -- the shape a next CR deleted and re-created under the same name in
+	// today mode takes, while its old fences still carry the old UID.
+	// Ownership is read off the fetched object, so the exit stays at six Gets.
+	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
 	// reconcileA2ANetworkFences ahead of the NATS fence, means adding it here.
 	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
@@ -4070,8 +4079,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	for _, s := range sentinels {
 		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
 		if err == nil {
-			anyPresent = true
-			break
+			if metav1.IsControlledBy(s.obj, agent) {
+				anyPresent = true
+				break
+			}
+			continue
 		}
 		if client.IgnoreNotFound(err) != nil {
 			return err
