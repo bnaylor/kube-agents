@@ -200,45 +200,71 @@ func joinTextParts(parts []lib.Part) string {
 // opener and turns the prose after it into code -- or, with a second block
 // further on, pairs with that block's opener and leaves the prose between
 // them live. So a cut that falls inside a fence closes it at the end of the
-// chunk and reopens it, info string and all, at the start of the next, and
-// the budget for the text between shrinks by both so no chunk exceeds size.
-// Text with no fence open at the cut is split exactly as before.
+// chunk and reopens it with a bare fence at the start of the next, and the
+// budget for the text between shrinks by both so no chunk exceeds size.
+// Whether a candidate chunk ends inside a fence is read by fenceOpenAtEnd,
+// the same parse the adapters make of it, so the two cannot disagree. The
+// opener's info string is not carried onto the reopened fence: it is
+// unbounded (a single-line opener carries its whole line), and carrying it
+// both repeated that content at the head of every continuation and left
+// the budget nothing to cut with. A continuation chunk therefore loses the
+// language tag on Discord; the text between the inserted fences is the
+// original, byte for byte. Text with no fence open at the cut is split
+// exactly as before.
 func chatChunks(text string, size int) []string {
 	if text == "" {
 		return nil
 	}
 	var chunks []string
-	var state fenceState
-	reopen := "" // the fence line that reopens a block cut by the previous chunk
+	reopen := "" // after a cut inside a block: mdFence, with a line break where the cut left none
 	for {
+		// reopen is at most mdFence+"\n" (4 bytes), so the budget is at
+		// least size-4 and the recut below is given at least size-8: with
+		// size the Discord cap, chunkCut always has room to make progress.
 		budget := size - len(reopen)
 		if len(text) <= budget {
 			return append(chunks, reopen+text)
 		}
 		cut := chunkCut(text, budget)
-		at := state.advance(text[:cut])
-		if at.open {
+		open := fenceOpenAtEnd(reopen + text[:cut])
+		if open {
 			cut = chunkCut(text, budget-len(fenceClose))
-			at = state.advance(text[:cut])
+			open = fenceOpenAtEnd(reopen + text[:cut])
 		}
 		chunk := reopen + text[:cut]
 		reopen = ""
-		if at.open {
+		if open {
 			chunk += fenceClose
-			reopen = mdFence + at.info
+			reopen = mdFence
 			if !strings.HasPrefix(text[cut:], "\n") {
 				reopen += "\n"
 			}
 		}
 		chunks = append(chunks, chunk)
 		text = text[cut:]
-		state = at
 	}
 }
 
 // fenceClose ends a chunk that was cut inside a fenced block; the next
-// chunk reopens the block with mdFence and the opener's info string.
+// chunk reopens the block with a bare mdFence.
 const fenceClose = "\n```"
+
+// fenceOpenAtEnd reports whether chunk ends inside a fenced block, read as
+// the adapters read a chunk: the last span mdCodeSpanRE finds is a fence
+// that ran to the end of the text without its closer (mdFenceUnclosed). A
+// line such as `use ``` to open a fence` holds no fence by this parse --
+// the first backtick of the three closes the inline span `use ` and the
+// other two are a span of their own -- where a count of ``` per line would
+// say a fence opened, and the chunker would then wrap the prose after the
+// cut in fences of its own.
+func fenceOpenAtEnd(chunk string) bool {
+	spans := mdCodeSpanRE.FindAllStringIndex(chunk, -1)
+	if len(spans) == 0 {
+		return false
+	}
+	last := spans[len(spans)-1]
+	return last[1] == len(chunk) && mdFenceUnclosed(chunk[last[0]:last[1]])
+}
 
 // chunkCut finds where to cut text so the head fits in size: the last line
 // break in the second half of the budget, else a hard cut at a rune start.
@@ -251,35 +277,6 @@ func chunkCut(text string, size int) int {
 		}
 	}
 	return cut
-}
-
-// fenceState is where a scan of text stands with respect to fenced blocks:
-// whether one is open, and the info string (language tag) of its opener,
-// for the chunker to carry onto the fence that reopens it.
-type fenceState struct {
-	open bool
-	info string
-}
-
-// advance reads s line by line from state f and returns the state at its
-// end. Every ``` toggles the state, which is how mdCodeSpanRE pairs them
-// when it reads a chunk alone; the info string is kept only for an opener
-// that starts its line, the form the executors write.
-func (f fenceState) advance(s string) fenceState {
-	for _, line := range strings.Split(s, "\n") {
-		n := strings.Count(line, mdFence)
-		if n == 0 {
-			continue
-		}
-		if n%2 == 1 {
-			f.open = !f.open
-		}
-		f.info = ""
-		if f.open && n%2 == 1 && strings.HasPrefix(strings.TrimLeft(line, " "), mdFence) {
-			f.info = strings.TrimSpace(line[strings.LastIndex(line, mdFence)+len(mdFence):])
-		}
-	}
-	return f
 }
 
 // truncateRunes bounds s to n bytes at a rune boundary, with an ellipsis

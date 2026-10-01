@@ -3,6 +3,7 @@ package gateway
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsStatusQuery(t *testing.T) {
@@ -85,15 +86,15 @@ func TestIsDelegate(t *testing.T) {
 
 // TestChatChunksKeepFencesBalanced: the adapters translate each chunk alone,
 // so a cut inside a fenced block must close the block at the end of the
-// chunk and reopen it, info string and all, at the start of the next. Every
+// chunk and reopen it with a bare fence at the start of the next. Every
 // chunk then parses as it would in the whole; no chunk exceeds the cap even
 // with the fences added; and the text between the inserted fences is the
-// original, byte for byte.
+// original, byte for byte. The opener's info string is not carried: a
+// continuation of a yaml block reopens with ``` alone.
 func TestChatChunksKeepFencesBalanced(t *testing.T) {
 	logs := strings.Repeat("log line\n", 300)
 	cases := map[string]struct {
 		text string
-		tag  string // the info string the reopened fence must carry
 	}{
 		"two blocks with prose between": {
 			text: "intro\n```\n" + logs + "```\nsee <https://evil.example|https://good.example>\n```\nkubectl get pods\n```\n",
@@ -103,7 +104,6 @@ func TestChatChunksKeepFencesBalanced(t *testing.T) {
 		},
 		"a language tag": {
 			text: "```yaml\n" + logs + "```\ndone",
-			tag:  "yaml",
 		},
 	}
 	for name, tc := range cases {
@@ -127,7 +127,7 @@ func TestChatChunksKeepFencesBalanced(t *testing.T) {
 			}
 			body := chunk
 			if closed {
-				reopen := "```" + tc.tag
+				reopen := "```"
 				if !strings.HasPrefix(body, reopen) {
 					t.Errorf("%s: chunk %d follows a cut block and does not reopen it with %q: %q", name, i, reopen, body[:min(len(body), 40)])
 				}
@@ -186,5 +186,162 @@ func TestChatChunksUnchangedOutsideFences(t *testing.T) {
 		if i > 0 && !strings.HasPrefix(c, "```\n") {
 			t.Errorf("hard cuts: chunk %d does not reopen the fence: %q", i, c[:min(len(c), 20)])
 		}
+	}
+}
+
+// endsInsideFence reads chunk as the adapters do (mdCodeSpanRE) and reports
+// whether its last span is a fence that ran to the end without a closer: the
+// state the chunker exists to keep every chunk out of.
+func endsInsideFence(chunk string) bool {
+	spans := mdCodeSpanRE.FindAllStringIndex(chunk, -1)
+	if len(spans) == 0 {
+		return false
+	}
+	last := spans[len(spans)-1]
+	return last[1] == len(chunk) && mdFenceUnclosed(chunk[last[0]:last[1]])
+}
+
+// unchunk checks the chunker's contract over chunks, the split of orig at
+// discordChunk, and returns the text they carry once the inserted fences are
+// removed, for the caller to compare with orig byte for byte: no chunk is
+// over the cap or ends inside a fence when parsed alone; a chunk cut inside
+// a block ends with fenceClose and the next opens with a bare mdFence,
+// followed by a line break of its own only where the cut left none (which
+// orig tells).
+func unchunk(t *testing.T, name string, chunks []string, orig string) string {
+	t.Helper()
+	var joined strings.Builder
+	reopened := false
+	for i, chunk := range chunks {
+		if len(chunk) > discordChunk {
+			t.Errorf("%s: chunk %d is %d bytes, over the cap of %d", name, i, len(chunk), discordChunk)
+		}
+		if endsInsideFence(chunk) {
+			t.Errorf("%s: chunk %d ends inside a fence when parsed alone: %q", name, i, chunk)
+		}
+		body := chunk
+		if reopened {
+			if !strings.HasPrefix(body, mdFence) {
+				t.Fatalf("%s: chunk %d follows a cut block and does not reopen it: %q", name, i, body[:min(len(body), 40)])
+			}
+			body = strings.TrimPrefix(body, mdFence)
+			if !strings.HasPrefix(orig[joined.Len():], "\n") {
+				if !strings.HasPrefix(body, "\n") {
+					t.Fatalf("%s: chunk %d reopened the fence mid-line: %q", name, i, chunk[:min(len(chunk), 40)])
+				}
+				body = strings.TrimPrefix(body, "\n")
+			}
+		}
+		// The closer is the chunker's when the chunk without it, read as
+		// the adapter reads it, ends inside a fence; a block's own closer
+		// at the end of a chunk leaves it balanced.
+		reopened = i < len(chunks)-1 && strings.HasSuffix(chunk, fenceClose) &&
+			strings.HasPrefix(chunks[i+1], mdFence) && endsInsideFence(strings.TrimSuffix(chunk, fenceClose))
+		if reopened {
+			body = strings.TrimSuffix(body, fenceClose)
+		}
+		joined.WriteString(body)
+	}
+	return joined.String()
+}
+
+// TestChatChunksSurviveALongOpenerLine: the reopened fence used to carry the
+// opener's info string, which is the rest of the opener's line and so as
+// long as the executor made it. With an opener line near the chunk cap the
+// budget left for the next chunk fell to a few bytes or below zero, and
+// chunkCut either made no progress (the relay spun) or sliced past the start
+// of the text (the relay panicked, and Gateway.post has no recover). Each
+// input returns, within the cap, and with the inserted fences removed is the
+// original text.
+func TestChatChunksSurviveALongOpenerLine(t *testing.T) {
+	cases := map[string]string{
+		// The three lengths that spun or panicked at the Discord cap.
+		"opener of 1892": "```" + strings.Repeat("x", 1892) + "\nbody\n```\n",
+		"opener of 1894": "```" + strings.Repeat("x", 1894) + "\nbody\n```\n",
+		"opener of 1897": "```" + strings.Repeat("x", 1897) + "\nbody\n```\n",
+		// One line, no break at all: every cut is a hard cut inside the
+		// opener's own line.
+		"single-line blob": "```" + strings.Repeat(`{"a":1},`, 500) + "```",
+	}
+	for name, text := range cases {
+		var chunks []string
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			chunks = chatChunks(text, discordChunk)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: chatChunks did not return", name)
+		}
+		if len(chunks) < 2 {
+			t.Fatalf("%s: chatChunks gave %d chunks; the text must be cut for the test to mean anything", name, len(chunks))
+		}
+		if got := unchunk(t, name, chunks, text); got != text {
+			t.Errorf("%s: the chunks, with the inserted fences removed, are not the original text:\n got %q\nwant %q", name, got, text)
+		}
+	}
+}
+
+// TestChatChunksReadFencesAsTheAdaptersDo: the chunker decides whether a cut
+// fell inside a fence with the parse the adapters make of the chunk,
+// mdCodeSpanRE. A line such as `use ``` to open a fence` holds three
+// backticks and no fence by that parse (the first closes the inline span,
+// the other two are a span of their own); a count of ``` per line read it as
+// an opener, and a cut after it closed a fence that was never open and
+// reopened it at the head of the next chunk, so the adapter rendered the
+// prose after the cut as code. The cut is pinned to land on that line's
+// break; no fence is inserted, every chunk parses alone outside a fence, and
+// the bold after the cut converts as prose.
+func TestChatChunksReadFencesAsTheAdaptersDo(t *testing.T) {
+	line := "`use ``` to open a fence`\n"
+	head := strings.Repeat("a line of prose that goes on\n", 64) + line
+	tail := "after the cut this is prose with **bold** and a [link](https://x.example/r) in it\n" + strings.Repeat("more prose\n", 10)
+	text := head + tail
+	chunks := chatChunks(text, discordChunk)
+	// A cut on a line break leaves the break at the head of the next chunk.
+	if len(chunks) != 2 || chunks[0] != strings.TrimSuffix(head, "\n") {
+		t.Fatalf("the cut did not land after the backtick line; got %d chunks, the first ending %q", len(chunks), chunks[0][max(0, len(chunks[0])-40):])
+	}
+	if strings.Join(chunks, "") != text {
+		t.Fatalf("a fence was inserted around the cut:\n%q\n%q", chunks[0][len(chunks[0])-40:], chunks[1][:40])
+	}
+	for i, c := range chunks {
+		if endsInsideFence(c) {
+			t.Errorf("chunk %d ends inside a fence when parsed alone: %q", i, c)
+		}
+	}
+	bold := strings.Index(chunks[1], "**bold**")
+	if insideAny(bold, mdCodeSpanRE.FindAllStringIndex(chunks[1], -1)) {
+		t.Errorf("the prose after the cut parses as code: %q", chunks[1][:80])
+	}
+	if got := toMrkdwn(chunks[1]); !strings.Contains(got, "with *bold* and a <https://x.example/r|link>") {
+		t.Errorf("the prose after the cut was not converted as prose: %q", got[:min(len(got), 120)])
+	}
+}
+
+// TestChatChunksDoNotRepeatTheOpenersLine: the info string carried onto the
+// reopened fence was the rest of the opener's line, so an executor that
+// wrote content on the opener's line (a one-line JSON blob after ```) saw it
+// posted once in the first chunk and again at the head of every chunk after.
+// The content appears once across the chunks, and each continuation reopens
+// with a bare fence.
+func TestChatChunksDoNotRepeatTheOpenersLine(t *testing.T) {
+	text := "```{\"a\":1}\n" + strings.Repeat("log line\n", 300) + "```\n"
+	chunks := chatChunks(text, discordChunk)
+	if len(chunks) < 2 {
+		t.Fatalf("chatChunks gave %d chunks; the block must be cut for the test to mean anything", len(chunks))
+	}
+	if n := strings.Count(strings.Join(chunks, ""), `{"a":1}`); n != 1 {
+		t.Errorf("the opener's content appears %d times across the chunks, want once", n)
+	}
+	for i, c := range chunks[1:] {
+		if !strings.HasPrefix(c, "```\nlog line\n") {
+			t.Errorf("chunk %d does not reopen with a bare fence: %q", i+1, c[:min(len(c), 40)])
+		}
+	}
+	if got := unchunk(t, "opener content", chunks, text); got != text {
+		t.Errorf("the chunks, with the inserted fences removed, are not the original text:\n got %q\nwant %q", got, text)
 	}
 }

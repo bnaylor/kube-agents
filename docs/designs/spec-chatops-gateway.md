@@ -1072,9 +1072,12 @@ would ping the room. The Google Chat adapter applies the same markdown rules beh
 own defang, in two halves: the link defang reads prose, link text and an unclosed fence
 but not a closed code span or fenced block; the mention defang reads everything, code
 included. The adapters translate each chunk of a result alone, so the chunker closes a
-fenced block it cuts and reopens it, language tag and all, at the start of the next chunk:
-every chunk parses as it would in the whole, and the fences added stay within the chunk
-cap.
+fenced block it cuts and reopens it with a bare fence at the start of the next chunk,
+reading the cut with the same code-span parse the adapters use: every chunk parses as it
+would in the whole, the fences added stay within the chunk cap, and the text between
+them is the original, byte for byte. The opener's language tag is not carried onto the
+reopened fence (it is the rest of the opener's line, unbounded), so a continuation chunk
+loses the tag on Discord.
 
 ## What stage 2 builds from this doc
 
