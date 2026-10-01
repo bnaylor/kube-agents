@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -211,5 +213,184 @@ func TestAContainerNamedVerifierElsewhereIsStillAFault(t *testing.T) {
 	}
 	if !strings.Contains(message, impostor.Name) {
 		t.Errorf("the Degraded does not name the faulting pod: %q", message)
+	}
+}
+
+// The cases above inject capBucketProvisioned straight into the scan, so every
+// one of them would still pass if the caller handed it the wrong reading. The
+// caller's choice of input is a separate thing to get right, and this pins it.
+//
+// "Has the bucket been created" and "did this pass watch the Job finish" are
+// not the same question. The provision Job carries a 24h
+// TTLSecondsAfterFinished and a name digested from its own spec, so a settled
+// install loses it daily and re-renders it on any operator upgrade that moves
+// the digest. Across that re-run a2a.done is false while the bucket it created
+// is still there. A verifier crash loop in that window is the only kind left
+// since the bind wait moved in-process -- a real fault — and keying the
+// suppression on this pass's Job status would file it as Provisioning for as
+// long as the re-run takes, with every submission refused the whole time.
+func TestAVerifierCrashLoopDuringAProvisionJobReRunIsAFault(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+
+	// Settle the install far enough that the bus is provisioned once.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(stored) {
+		t.Fatal("precondition: the install did not record the bus provisioned once")
+	}
+
+	// The verifier is genuinely crash looping, on the settled install.
+	if err := cl.Create(ctx, verifierPod(agent, a2aVerifierContainerName, reasonCrashLoopBackOff)); err != nil {
+		t.Fatalf("create the verifier pod: %v", err)
+	}
+
+	// Now move the digest, which is what a TTL sweep or an operator upgrade
+	// does to the Job: a new one is rendered and this pass does not see it
+	// complete.
+	t.Setenv(a2aProvisionImageEnvVar, "example.com/nats-box:rerender")
+	state, err := r.reconcileA2A(ctx, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.done {
+		t.Fatal("precondition: the re-rendered provision Job already reads complete, so this pass is not the re-run window")
+	}
+
+	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatal("no Ready condition was written")
+	}
+	if phase != "Degraded" || ready.Reason != reasonCrashLoopBackOff {
+		t.Errorf("phase/reason = %q/%q, want Degraded/%s: the bucket exists, so this crash loop is a fault (message %q)",
+			phase, ready.Reason, reasonCrashLoopBackOff, ready.Message)
+	}
+	if !strings.Contains(ready.Message, a2aVerifierContainerName) {
+		t.Errorf("the Degraded does not name the verifier container: %q", ready.Message)
+	}
+}
+
+// The other half of the same call: on a genuinely fresh install -- no
+// provisioned-once record and no completed Job -- the same crash loop still has
+// to read Provisioning. Without this, keying the suppression on the sticky
+// record alone (dropping the a2a.done term) would pass the test above and
+// reintroduce the false Degraded the suppression exists to prevent.
+func TestAVerifierCrashLoopOnAFreshInstallStillReadsProvisioning(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if busProvisioned(stored) {
+		t.Fatal("precondition: the install already records the bus provisioned, so this is not the fresh-install window")
+	}
+	if err := cl.Create(ctx, verifierPod(agent, a2aVerifierContainerName, reasonCrashLoopBackOff)); err != nil {
+		t.Fatalf("create the verifier pod: %v", err)
+	}
+
+	state, err := r.reconcileA2A(ctx, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.done {
+		t.Fatal("precondition: the provision Job reads complete on a fresh install")
+	}
+
+	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatal("no Ready condition was written")
+	}
+	if phase == "Degraded" || ready.Reason == reasonCrashLoopBackOff {
+		t.Errorf("phase/reason = %q/%q, want Provisioning: the bucket does not exist yet, so this crash loop is the stack coming up (message %q)",
+			phase, ready.Reason, ready.Message)
+	}
+}
+
+// And the a2a.done term, which the two tests above cannot tell from the sticky
+// record because on both of them the two readings agree. They disagree on
+// exactly one pass: the one that first watches the Job complete, before the
+// provisioned-once record has been written to the CR. The bucket exists from
+// that moment, so a verifier crash loop on that pass is already a fault --
+// dropping a2a.done and keying on the record alone would report the install's
+// first genuine verifier failure as Provisioning for one more pass.
+func TestTheFirstPassThatSeesTheJobCompleteAlreadyTreatsACrashLoopAsAFault(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+
+	// Deliberately no Reconcile after the completion: that is the writer of
+	// the provisioned-once record, and this test is the pass before it.
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if busProvisioned(stored) {
+		t.Fatal("precondition: the provisioned-once record is already written, so the two readings agree and this test proves nothing")
+	}
+	if err := cl.Create(ctx, verifierPod(agent, a2aVerifierContainerName, reasonCrashLoopBackOff)); err != nil {
+		t.Fatalf("create the verifier pod: %v", err)
+	}
+
+	state, err := r.reconcileA2A(ctx, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.done {
+		t.Fatal("precondition: this pass did not see the provision Job complete")
+	}
+	if busProvisioned(stored) {
+		t.Fatal("precondition: reconcileA2A wrote the provisioned-once record, so the two readings agree by the time the scan runs")
+	}
+
+	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatal("no Ready condition was written")
+	}
+	if phase != "Degraded" || ready.Reason != reasonCrashLoopBackOff {
+		t.Errorf("phase/reason = %q/%q, want Degraded/%s: the Job completed on this pass, so the bucket exists and the wait is over (message %q)",
+			phase, ready.Reason, reasonCrashLoopBackOff, ready.Message)
 	}
 }

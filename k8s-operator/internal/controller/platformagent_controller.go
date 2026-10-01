@@ -3395,7 +3395,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			}
 		}
 	case errWorkload == nil:
-		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent, a2a.done); reasonOverride != "Provisioning" {
+		// The bucket question the scan asks is "has this install ever
+		// provisioned the bus", not "did this pass watch the Job finish".
+		// a2a.done is only the latter: the Job carries a 24h
+		// TTLSecondsAfterFinished and a spec-digested name, so it is reaped
+		// daily and re-rendered on any operator upgrade that changes the
+		// digest, and done is false for the whole re-run while the bucket
+		// has existed the entire time. busProvisioned is the sticky record
+		// of the first completion, and the disjunction is the same one
+		// readSplitWorkloads and wantBusProvisioned already use.
+		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent, a2a.done || busProvisioned(agent)); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
@@ -3922,9 +3931,13 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 	return true
 }
 
-// capBucketProvisioned is the provision Job having completed, which is this
-// operator's only cheap proxy for "the capability bucket exists". It qualifies
-// exactly one container's crash loop; see the verifier paragraph below.
+// capBucketProvisioned is "this install has provisioned the bus at least
+// once", which is this operator's only cheap proxy for "the capability bucket
+// exists". It qualifies exactly one container's crash loop; see the verifier
+// paragraph below. Callers pass the sticky reading -- a2a.done for the pass
+// that watched the Job finish, OR the provisioned-once record for every pass
+// after it -- because the Job is reaped and re-rendered while the bucket it
+// made stays put.
 func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, capBucketProvisioned bool) (phase string, reason string, message string) {
 	phase = "Provisioning"
 	reason = "Provisioning"
@@ -4052,8 +4065,10 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		// while the bucket is unprovisioned. ImagePullBackOff on the verifier is
 		// a real fault at any time -- it is the fault this selector was added
 		// for, and unreachable at any of a2aReleaseImage's three rungs -- and a
-		// crash loop that outlives the Job is the verifier failing at something
-		// other than coming up.
+		// crash loop that outlives the install's first provisioning is the
+		// verifier failing at something other than coming up -- which is why
+		// capBucketProvisioned has to be the sticky reading and not this
+		// pass's Job status, or a TTL re-run would file a real fault here.
 		//
 		// Suppressing rather than skipping the pod: a verifier pod can carry a
 		// genuine fault on another container in the same window, and the loop
