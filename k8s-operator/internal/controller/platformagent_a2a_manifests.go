@@ -4648,6 +4648,28 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
 		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The verifier fence goes before the session fence, not after it, even
+		// though the verifier is rendered after the session one. Two reasons,
+		// and the second is the load-bearing one.
+		//
+		// The verifier Deployment is deleted far above, so by the time this
+		// runs the only thing this fence confines is a pod already terminating
+		// — and it is first-party code, not the model-steered worker the
+		// session fence holds. Of the two, the session fence is the one worth
+		// keeping longest.
+		//
+		// And the session fence has to be LAST of the fences, because it is
+		// the only one standing at the end of a teardown that dies partway.
+		// An install refused on its first reconcile under mode next has the
+		// fences and nothing else — reconcileAgentNetworkGuardrails applies
+		// them on every refusal path, before reconcileA2A is reached — so on
+		// the flip to today the fences are the only objects a resumed pass can
+		// recognise. A fence deleted after the session fence would, on exactly
+		// that install, be left behind by a pass that died in between, with
+		// nothing remaining to say the teardown was unfinished. Append a new
+		// fence ABOVE this entry, not below it.
+		// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins that.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The session fence goes after the gateway Deployment above, which is
 		// what stops new pods being spawned. It does not close the window:
 		// Delete returns as soon as the API server accepts it, and the pods
@@ -4658,7 +4680,6 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// removing it, and removing it would take a foreground delete and a
 		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with

@@ -6277,3 +6277,51 @@ func TestTheExecutorEnvIsNotSharedBetweenSidecars(t *testing.T) {
 			"the loop, or the first in-place edit to one container's env reaches the other")
 	}
 }
+
+// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins the ordering the
+// early exit's soundness rests on for one install shape: a CR refused on its
+// first reconcile under mode next. reconcileAgentNetworkGuardrails applies the
+// fences on every refusal path, and every refusal returns before reconcileA2A
+// is reached, so that install has the fences and none of the other objects
+// a2aNamespacedTeardown walks. On the flip to today the fences are therefore
+// the ONLY objects a resumed teardown pass can recognise as unfinished work.
+//
+// Which makes the last fence in the list special: a fence deleted after it
+// would, on that install, be left behind by a pass that died in between, with
+// every object that could have said so already gone. The residue is a
+// NetworkPolicy standing forever in a namespace that is supposed to look like
+// it has never heard of A2A.
+//
+// Asserted as a property of the list rather than as a literal expected order,
+// because the thing that must stay true is "nothing is appended after the
+// session fence" — a test that spelled the whole order out would go red on
+// every unrelated reordering and teach the next author to re-bless it.
+//
+// The inject door's flag is not read here: a2aNamespacedTeardown lists the
+// door's four unconditionally (see its comment), so every fence the operator
+// can render is in the list either way.
+func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
+	agent := a2aTestAgent()
+	r := &PlatformAgentReconciler{}
+
+	lastFence := ""
+	fences := 0
+	for _, entry := range r.a2aNamespacedTeardown(agent) {
+		if _, isNetpol := entry.obj.(*networkingv1.NetworkPolicy); !isNetpol {
+			continue
+		}
+		fences++
+		lastFence = entry.obj.GetName()
+	}
+
+	// Without this the test passes vacuously on a list that lost its fences
+	// entirely, which is a worse bug than the one it is written to catch.
+	if want := 4; fences != want {
+		t.Fatalf("the teardown walks %d NetworkPolicies, want %d — if a fence was added or removed, "+
+			"re-read the ordering argument above before changing this number", fences, want)
+	}
+	if got, want := lastFence, a2aSessionNetpolName(agent); got != want {
+		t.Errorf("the last fence the teardown deletes is %q, want %q; a fence deleted after the session "+
+			"fence is left behind forever on an install refused on its first reconcile", got, want)
+	}
+}
