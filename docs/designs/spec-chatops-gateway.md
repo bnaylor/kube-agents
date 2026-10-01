@@ -1069,7 +1069,10 @@ link's destination, and refuses a link whose label carries a URL naming a host o
 than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - relayed
 text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
 would ping the room. The Google Chat adapter applies the same markdown rules behind its
-own defang, which reads prose and link text but not code spans or fenced blocks.
+own defang, in two halves: the link defang reads prose, link text and an unclosed fence
+(the adapter posts a result in chunks, so the fence may be the closing one of a block the
+chunker cut) but not a closed code span or fenced block; the mention defang reads
+everything, code included.
 
 ## What stage 2 builds from this doc
 

@@ -59,6 +59,14 @@ var mdLabelMarksRE = regexp.MustCompile("[*_`\\p{Cf}]")
 // it is trimmed before the host is compared.
 const mdHostTrailingPunct = ".,;!"
 
+// mdFence is the three-backtick fence that opens and closes a fenced block.
+const mdFence = "```"
+
+// mdMaskByte stands in for every byte of a protected range in the copy
+// rewriteBoldPairs searches: not a star, not a space, so it can neither
+// open nor close a pair nor break the content of one that wraps the range.
+const mdMaskByte = 'x'
+
 // mdStrong and mdEmphasis are the one-character marks both surfaces read:
 // *bold*, _italic_, and *_both_*.
 const (
@@ -79,8 +87,8 @@ const (
 // as written. It runs after the surface's own escaping or defang: Slack's
 // escaping and Chat's mention defang cover the whole text, code included --
 // a prompt-injected <!channel> or <users/all> in a code span is as live as
-// one in prose -- and Chat's link defang covers everything outside code
-// (rewriteOutsideCode), so no control sequence the executor wrote is live
+// one in prose -- and Chat's link defang covers everything outside closed
+// code (rewriteOutsideCode), so no control sequence the executor wrote is live
 // by the time rewriteLinks writes the adapter's own, and what reaches here
 // needs no further escaping. Bold first, so a pair that wraps a whole link
 // still converts; the link pass finds its code spans again afterwards,
@@ -91,25 +99,47 @@ func rewriteMarkdown(s string, linkRE *regexp.Regexp) string {
 }
 
 // rewriteOutsideCode applies rewrite to each stretch of s that lies outside
-// a code span (mdCodeSpanRE: a fenced block, a double-backtick span, an
-// inline span), and keeps the spans as written. It is the segmentation the
-// bold and link passes read code through, offered to a surface's own pass
-// that runs before them -- Chat's link defang, which would otherwise read a
-// shell's `<(gen)|` or `<f|` as a link opener and put a space in the
+// a closed code span (mdCodeSpanRE: a fenced block, a double-backtick span,
+// an inline span), and keeps the spans as written. It is the segmentation
+// the bold and link passes read code through, offered to a surface's own
+// pass that runs before them -- Chat's link defang, which would otherwise
+// read a shell's `<(gen)|` or `<f|` as a link opener and put a space in the
 // command. The stretches are rewritten one at a time, so a rewrite that
 // finds a sequence in one cannot read into the next; a sequence that is
 // recognised by its opener alone is still found when a span cuts its text
 // short.
+//
+// An unclosed fence (mdFenceUnclosed) is not kept: it is rewritten with the
+// prose around it. The bold and link passes read one as a fence to the end
+// of the text, as CommonMark does, but a pass that defuses a control
+// sequence cannot afford to: the adapter sees a chunk of the result
+// (Gateway.post, chatChunks), not the whole of it, so a fence that never
+// closes is as likely the tail of a block the chunker cut -- whose closing
+// fence now reads as an opener, with the executor's prose after it -- as a
+// real opener, and the defang errs to defanging. The cost is a space in a
+// `<f|` the executor left in a fence it forgot to close.
 func rewriteOutsideCode(s string, rewrite func(string) string) string {
 	var b strings.Builder
 	end := 0
 	for _, r := range mdCodeSpanRE.FindAllStringIndex(s, -1) {
+		if mdFenceUnclosed(s[r[0]:r[1]]) {
+			continue
+		}
 		b.WriteString(rewrite(s[end:r[0]]))
 		b.WriteString(s[r[0]:r[1]])
 		end = r[1]
 	}
 	b.WriteString(rewrite(s[end:]))
 	return b.String()
+}
+
+// mdFenceUnclosed reports whether span, one mdCodeSpanRE match, is a fence
+// that ran to the end of the text without its closing fence: it opens with
+// one and does not also close with one. A double-backtick or inline span
+// does not open with a fence, and is always closed.
+func mdFenceUnclosed(span string) bool {
+	return strings.HasPrefix(span, mdFence) &&
+		(len(span) < 2*len(mdFence) || !strings.HasSuffix(span, mdFence))
 }
 
 // insideAny reports whether offset i of a string falls inside one of the
@@ -121,6 +151,22 @@ func insideAny(i int, ranges [][]int) bool {
 		}
 	}
 	return false
+}
+
+// maskRanges returns s with every byte inside one of the [start, end)
+// ranges replaced by mdMaskByte, newlines excepted, so a search over the
+// result reads nothing inside them and still sees where each line ends.
+// Byte for byte, so an offset into the result is the same offset into s.
+func maskRanges(s string, ranges [][]int) string {
+	b := []byte(s)
+	for _, r := range ranges {
+		for i := r[0]; i < r[1]; i++ {
+			if b[i] != '\n' {
+				b[i] = mdMaskByte
+			}
+		}
+	}
+	return string(b)
 }
 
 // rewriteBoldPairs rewrites each closed bold pair in s to the single-star
@@ -163,27 +209,6 @@ func rewriteBoldPairs(s string, code [][]int, linkRE *regexp.Regexp) string {
 	}
 	b.WriteString(s[end:])
 	return b.String()
-}
-
-// mdMaskByte stands in for every byte of a protected range in the copy
-// rewriteBoldPairs searches: not a star, not a space, so it can neither
-// open nor close a pair nor break the content of one that wraps the range.
-const mdMaskByte = 'x'
-
-// maskRanges returns s with every byte inside one of the [start, end)
-// ranges replaced by mdMaskByte, newlines excepted, so a search over the
-// result reads nothing inside them and still sees where each line ends.
-// Byte for byte, so an offset into the result is the same offset into s.
-func maskRanges(s string, ranges [][]int) string {
-	b := []byte(s)
-	for _, r := range ranges {
-		for i := r[0]; i < r[1]; i++ {
-			if b[i] != '\n' {
-				b[i] = mdMaskByte
-			}
-		}
-	}
-	return string(b)
 }
 
 // rewriteLinks rewrites each markdown link linkRE matches in s to <url|text>,

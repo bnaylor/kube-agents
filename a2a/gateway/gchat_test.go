@@ -503,11 +503,45 @@ func TestToGchatText(t *testing.T) {
 		// a markdown link, and one whose text a code span cuts short.
 		"see <https://evil.example|docs": "see < https://evil.example|docs",
 		"<x|`y`":                         "< x|`y`",
+		// A fence that never closes does not hide an opener after it: the
+		// adapter sees a chunk of the result, not the whole of it
+		// (TestToGchatTextDefangsAfterAChunkedFence), so the fence is as
+		// likely a closer the chunker separated from its opener as a real
+		// one. The bold and link passes still read it as a fence.
+		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
 			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestToGchatTextDefangsAfterAChunkedFence: Gateway.post splits a result
+// with chatChunks(text, discordChunk) and the adapter translates each chunk
+// on its own, so a fenced block the chunker cuts leaves the next chunk
+// opening inside the block and carrying only its closing fence, which an
+// unclosed-fence-to-the-end reading takes for an opener -- and everything
+// the executor wrote after the block for code. The link defang must still
+// reach a <url|text> there; the fenced content itself is left as written.
+func TestToGchatTextDefangsAfterAChunkedFence(t *testing.T) {
+	block := "```\n" + strings.Repeat("log line\n", 300) + "```\n"
+	big := "intro\n" + block + "see <https://evil.example|https://good.example> now"
+	chunks := chatChunks(big, discordChunk)
+	if len(chunks) < 2 {
+		t.Fatalf("chatChunks gave %d chunks; the block must be cut for the test to mean anything", len(chunks))
+	}
+	for i, chunk := range chunks {
+		got := toGchatText(chunk)
+		if strings.Contains(got, "<https://evil.example|") {
+			t.Errorf("chunk %d: toGchatText left the executor's link opener live: %q", i, got)
+		}
+		if strings.Contains(chunk, "<https://evil.example|") && !strings.Contains(got, "< https://evil.example|") {
+			t.Errorf("chunk %d: the opener is neither live nor defanged: %q", i, got)
+		}
+	}
+	if got := toGchatText(chunks[0]); got != chunks[0] {
+		t.Errorf("the first chunk, an opened fence and its content, was altered:\n got %q\nwant %q", got, chunks[0])
 	}
 }
 

@@ -663,13 +663,13 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 //
 // The defang runs first, the way the Slack adapter escapes first: every
 // <users/…> anywhere in the text, and every <url|text the executor opened
-// outside a code span, closed or not, is defused before the markdown rules
-// see it, and the markdown link's destination class excludes `<`, so the
-// <url|text> rewriteLinks generates afterwards is the adapter's own — which
-// is the distinction the <users/…> defang already drew, applied to the
-// sequence next to it. The markdown rules (bold pairs, code spans, links,
-// the label-host refusal) are the ones markdown.go holds for both chat
-// surfaces.
+// outside a closed code span, whether or not the executor closed it, is
+// defused before the markdown rules see it, and the markdown link's
+// destination class excludes `<`, so the <url|text> rewriteLinks generates
+// afterwards is the adapter's own — which is the distinction the <users/…>
+// defang already drew, applied to the sequence next to it. The markdown
+// rules (bold pairs, code spans, links, the label-host refusal) are the
+// ones markdown.go holds for both chat surfaces.
 func toGchatText(s string) string {
 	return rewriteMarkdown(defangGchatControls(s), gchatLinkRe)
 }
@@ -686,7 +686,10 @@ func toGchatText(s string) string {
 // a quoted command is an altered answer, where the opener it is defending
 // against is one the next markdown link's `>` would close, and that link is
 // made in prose. An opener in prose keeps being defanged when a code span
-// cuts its text short, since the opener alone is the match.
+// cuts its text short, since the opener alone is the match, and an opener
+// after a fence that never closes is defanged too: this adapter posts a
+// result in chunks, so the fence is as likely the closing one of a block
+// the chunker cut as an opener (rewriteOutsideCode).
 func defangGchatControls(s string) string {
 	s = strings.ReplaceAll(s, "<users/", "< users/")
 	return rewriteOutsideCode(s, func(prose string) string {
