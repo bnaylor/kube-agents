@@ -89,6 +89,15 @@
       "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
     },
     {
+      "name": "a2a-verifier",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-verifier",
+      "tagPolicy": "release",
+      "override": "A2A_VERIFIER_IMAGE",
+      "pulledBy": "The capability verifier Deployment the operator renders under spec.mode: next, and nothing on a default install. It resolves the same way the gateway, the worker and the callout do.",
+      "description": "The one reader of the capability bucket: it answers every executor's capability check over the bus and holds no RBAC (a2a/Dockerfile.verifier)."
+    },
+    {
       "name": "hermes-bridge",
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",

@@ -62,6 +62,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way. |
 | `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. |
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install. |
+| `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders under spec.mode: next, and nothing on a default install. It resolves the same way the gateway, the worker and the callout do. |
 | `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | — | The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's. |
 
 ### Pulled by an install, built elsewhere

@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -62,15 +61,15 @@ import (
 // being alive.
 
 const (
-	// The stage 1 dev registry, on the same terms as the gateway, the worker
-	// and the auth callout: built and published here rather than by the
-	// release pipeline, so deliberately absent from images.json and
-	// overridable only by env var until the stack graduates (#1557). The
-	// enumerations that have to name all four live in
-	// platformagent_a2a_manifests.go, hack/check-image-inventory.sh and
-	// docs/site/src/content/docs/deploy/docker-images.md.
-	defaultA2AVerifierImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/verifier:latest"
-	a2aVerifierImageEnvVar  = "A2A_VERIFIER_IMAGE"
+	// Release surface, on the same terms as the gateway, the worker and the
+	// auth callout: a bare name, resolved through a2aReleaseImage, with the
+	// registry and tag taken from OPERATOR_IMAGE when it carries one and
+	// from the agent image otherwise. a2aGatewayImageName carries the full
+	// argument for the shape. The enumerations that have to name all four
+	// live in platformagent_a2a_manifests.go, hack/check-image-inventory.sh,
+	// images.json and docs/site/src/content/docs/deploy/docker-images.md.
+	a2aVerifierImageName   = "a2a-verifier"
+	a2aVerifierImageEnvVar = "A2A_VERIFIER_IMAGE"
 
 	// a2aVerifierStatusPort serves readiness and health. Same number as the
 	// callout's, on a different pod.
@@ -78,10 +77,7 @@ const (
 )
 
 func a2aVerifierImage() string {
-	if override := os.Getenv(a2aVerifierImageEnvVar); override != "" {
-		return override
-	}
-	return defaultA2AVerifierImage
+	return a2aReleaseImage(a2aVerifierImageEnvVar, a2aVerifierImageName)
 }
 
 // buildA2AVerifierServiceAccount is the verifier's identity, and it is a bus

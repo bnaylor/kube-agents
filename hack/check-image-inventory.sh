@@ -300,6 +300,7 @@ check_compiled_repository() {
 check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName
 check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName
 check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
+check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
