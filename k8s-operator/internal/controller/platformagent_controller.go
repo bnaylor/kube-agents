@@ -3144,23 +3144,40 @@ func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now
 // first seconds of its life. What this is for is the durable case: the
 // Deployment is there and its pods cannot run.
 //
-// A read error leaves the condition alone rather than asserting either way.
-// The API server being unreachable is not a fact about the verifier, it is
-// already the reconcile's problem, and the next pass re-reads.
-func (r *PlatformAgentReconciler) a2aVerifierNotReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
+// The second result is whether this pass has an answer at all, and it is the
+// reason "not ready" is not a plain bool. A read error leaves the condition
+// alone rather than asserting either way: the API server being unreachable is
+// not a fact about the verifier, it is already the reconcile's problem, and
+// the next pass re-reads. Returning false for it would not be neutral --
+// setA2AVerifierCondition REMOVES the condition on false -- so a single
+// transient Get error on a settled install would clear a correct "the verifier
+// has no ready replica" off the CR and report the stack healthy until the next
+// pass put it back.
+//
+// An absent Deployment is a real answer (not ready is false; see above) and a
+// read error is not, so NotFound is not folded in with the rest.
+func (r *PlatformAgentReconciler) a2aVerifierNotReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (notReady, known bool) {
 	if !a2aStackRendering(agent) {
-		return false
+		return false, true
 	}
 	verifier := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aVerifierName(agent)}, verifier); err != nil {
-		return false
+		if errors.IsNotFound(err) {
+			return false, true
+		}
+		return false, false
 	}
-	return verifier.Status.ReadyReplicas == 0
+	return verifier.Status.ReadyReplicas == 0, true
 }
 
 // a2aVerifierConditionCurrent reports whether the CR's A2AVerifier condition
 // already says what this pass would write.
-func a2aVerifierConditionCurrent(agent *agentv1alpha1.PlatformAgent, notReady bool) bool {
+func a2aVerifierConditionCurrent(agent *agentv1alpha1.PlatformAgent, notReady, known bool) bool {
+	// Unknown contributes no change: this pass would not touch the
+	// condition, so it cannot be the reason to write status.
+	if !known {
+		return true
+	}
 	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aVerifierConditionType)
 	if !notReady {
 		return existing == nil
@@ -3172,7 +3189,11 @@ func a2aVerifierConditionCurrent(agent *agentv1alpha1.PlatformAgent, notReady bo
 // setA2AVerifierCondition writes the verifier condition on the same
 // present-while-it-holds pattern as A2AGateway. Not Degraded, and not a Ready
 // row: see a2aVerifierConditionType for why the CR stays Ready through this.
-func setA2AVerifierCondition(agent *agentv1alpha1.PlatformAgent, notReady bool, now metav1.Time) {
+func setA2AVerifierCondition(agent *agentv1alpha1.PlatformAgent, notReady, known bool, now metav1.Time) {
+	// No answer this pass, so whatever the CR already says stands.
+	if !known {
+		return
+	}
 	if !notReady {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aVerifierConditionType)
 		return
@@ -3239,15 +3260,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		dark = a2a.gatewayDarkReason
 	}
 	want := wantBusProvisioned(agent, a2a)
-	verifierNotReady := r.a2aVerifierNotReady(ctx, agent)
+	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) &&
-		a2aVerifierConditionCurrent(agent, verifierNotReady) {
+		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
 		return nil
 	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
-	setA2AVerifierCondition(agent, verifierNotReady, now)
+	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -3499,8 +3520,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// reaches status, and the recovery never clears it. That is the shape the
 	// A2AGateway and BusProvisioned terms above are in, and for the same
 	// reason.
-	verifierNotReady := r.a2aVerifierNotReady(ctx, agent)
-	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady)
+	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
+	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
@@ -3616,7 +3637,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
-	setA2AVerifierCondition(agent, verifierNotReady, now)
+	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
