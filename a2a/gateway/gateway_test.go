@@ -899,6 +899,54 @@ func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 	}
 }
 
+// A refusal reaches chat with the cause the executor named. gke-labs#1884
+// put a capability check in front of every task, so an unreachable verifier
+// now lands as `rejected` where only an empty submission used to -- and a
+// bare "the executor rejected the task" sends the user to re-read their own
+// prompt for a fault that is in the install. Asserted on the reason the
+// verifier outage produces, not on any refusal, because that is the one the
+// bare line was actively misleading about.
+func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-rejected"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+
+	const reason = "reason: capability-refused - the verifier could not be reached"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateRejected, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-reject",
+			Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: "platform"}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskEventsSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the refusal posts with its reason", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, reason) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread8"
