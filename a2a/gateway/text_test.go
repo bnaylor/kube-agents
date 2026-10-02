@@ -87,10 +87,14 @@ func TestIsDelegate(t *testing.T) {
 // TestChatChunksKeepFencesBalanced: the adapters translate each chunk alone,
 // so a cut inside a fenced block must close the block at the end of the
 // chunk and reopen it with a bare fence at the start of the next. Every
-// chunk then parses as it would in the whole; no chunk exceeds the cap even
-// with the fences added; and the text between the inserted fences is the
-// original, byte for byte. The opener's info string is not carried: a
-// continuation of a yaml block reopens with ``` alone.
+// chunk is then balanced on its fences, so a fenced block never leaks its
+// closer into the next chunk; no chunk exceeds the cap even with the fences
+// added; and the text between the inserted fences is the original, byte for
+// byte. The guarantee is about fences only: a cut inside a multi-line
+// double-backtick span, or a hard cut inside a mid-line fence opener, still
+// makes the next chunk parse differently from the whole (tracked as a
+// follow-up). The opener's info string is not carried: a continuation of a
+// yaml block reopens with ``` alone.
 func TestChatChunksKeepFencesBalanced(t *testing.T) {
 	logs := strings.Repeat("log line\n", 300)
 	cases := map[string]struct {
