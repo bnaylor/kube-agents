@@ -142,8 +142,9 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
    genuinely resolved, per the root `AGENTS.md`.
 2. Trigger a green bot pass yourself - comment `/review` (or `/review all`
    for a wider re-check). A green pass is what puts the change in front of a
-   human reviewer: clean on the first review, or nothing above Medium and no
-   open description thread on a later one, per the root `AGENTS.md`; `/request-review` assigns one immediately when a review
+   human reviewer: clean on the first review, or nothing above Medium and the
+   description answered (the body edited, not just its thread resolved) on a
+   later one, per the root `AGENTS.md`; `/request-review` assigns one immediately when a review
    never arrives or you have answered a finding you disagree with. It reacts
    👀 to the comment when it requested someone and 😕 when it declined; the
    workflow run's annotations say why.

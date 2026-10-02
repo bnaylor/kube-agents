@@ -277,8 +277,8 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
 - **First review of a pull request:** `success` only on "No findings" (low-severity items folded
   into the body do not count); `neutral` under `Found N issues` when anything held.
 - **Any later review of the same pull request**, once the bot has reviewed it at an earlier commit
-  and can read that round back: only 🔴 High holds, and the description thread if the body still
-  owes a section. 🟠 Medium findings are still posted as threads with their fix and still
+  and can read that round back: only 🔴 High holds, and the description finding if the body still
+  owes an answer, whether or not its thread is resolved. 🟠 Medium findings are still posted as threads with their fix and still
   counted in the title, but the check is `success` under `Found N issues, none holding`, and the
   review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
   further round: fix it, or answer it in its thread and resolve — the thread still has to be
@@ -397,12 +397,13 @@ Five ways that goes wrong quietly:
   something you resolved.
 - No unresolved threads does not mean the bot is answered. Its finding about the pull request
   description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
-  and only editing the body answers it. Once that thread is resolved, every later review that still
-  finds the body owing a section repeats the finding in its summary body, under **The pull request
-  description is still unanswered.**, and opens no new thread — so a pull request with every thread
-  resolved can still hold the `AI Review` check. Read the latest review's body with the first poll
-  command in [Waiting for it](#waiting-for-it) before reporting a pull request clear, and resolve
-  the description thread only after the body is edited.
+  and only editing the body answers it. After that, every review that still finds the body owing an
+  answer — a missing section, or one the tree contradicts — repeats the finding in its summary body,
+  under **The pull request description is still unanswered.**, and opens no new thread, so a pull
+  request with every thread resolved can still hold the `AI Review` check. Resolve the description
+  thread only after the body is edited. Editing the body starts no review, so comment `/review`
+  afterwards and read the body of a review newer than your edit, with the first poll command in
+  [Waiting for it](#waiting-for-it), before reporting the pull request clear.
 
 ## How a change merges
 
