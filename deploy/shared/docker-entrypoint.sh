@@ -476,8 +476,13 @@ fi
 # service address is not in this file at all — the operator derives it from the
 # agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
 # when the file is silent. That is why no `api_url` key belongs here.
+#
+# The onboarding prompts are in this list because bootstrap_onboarding reads the PVC
+# copy ahead of the image's, and the first-install-hello eval cases grade the greeting
+# they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
+        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
@@ -954,7 +959,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # only id this call may force, which keeps the merge it does alongside the
 # retirement a subset of 2c-bis rather than a second policy for the same file:
 # two of the jobs in this roster DELETE THEMSELVES — bootstrap_delivery.py's
-# _cleanup removes the scan/delivery pair once the onboarding report lands — and
+# _retire_jobs removes the scan/delivery pair once the onboarding report lands — and
 # an unfiltered merge would put both back.
 if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
@@ -999,7 +1004,7 @@ fi
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
-# bootstrap_delivery.py:_cleanup retired the two onboarding jobs, so they would look new and
+# bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
 # be reinstalled. .bootstrap_completed is that record.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
