@@ -382,7 +382,7 @@ mutation($thread: ID!) {
 }' -f thread='<PRRT_...>'
 ```
 
-Four ways that goes wrong quietly:
+Five ways that goes wrong quietly:
 
 - `first: 100` is a cap, not a promise. A long-lived pull request can carry more threads than that;
   page for the rest, or say you only looked at the first hundred rather than reporting the branch
@@ -395,6 +395,14 @@ Four ways that goes wrong quietly:
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
   something you resolved.
+- No unresolved threads does not mean the bot is answered. Its finding about the pull request
+  description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
+  and only editing the body answers it. Once that thread is resolved, every later review that still
+  finds the body owing a section repeats the finding in its summary body, under **The pull request
+  description is still unanswered.**, and opens no new thread — so a pull request with every thread
+  resolved can still hold the `AI Review` check. Read the latest review's body with the first poll
+  command in [Waiting for it](#waiting-for-it) before reporting a pull request clear, and resolve
+  the description thread only after the body is edited.
 
 ## How a change merges
 
