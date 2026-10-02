@@ -3525,9 +3525,20 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 			t.Fatalf("delete %s by hand: %v", fence.Name, err)
 		}
 	}
-	if n := countA2ALabelled(ctx, t, cl); n != 1 {
-		t.Fatalf("%d A2A-labelled objects remain after the hand-delete, want 1 (the inject fence alone); "+
-			"this is not the shape the test names", n)
+	// The inject fence is what drives the flip, and it has to be the only
+	// thing standing that could: the verifier's own fence survives beside it
+	// because the hand deleted the pair, not the verifier. Named rather than
+	// counted, so a third fence added to the render fails here with its name
+	// instead of moving a number.
+	survived := map[string]bool{}
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) { survived[kind+"/"+name] = true })
+	want := map[string]bool{
+		"NetworkPolicy/" + a2aInjectName(agent):         true,
+		"NetworkPolicy/" + a2aVerifierNetpolName(agent): true,
+	}
+	if !maps.Equal(survived, want) {
+		t.Fatalf("A2A-labelled objects after the hand-delete = %v, want %v; "+
+			"this is not the shape the test names", survived, want)
 	}
 
 	fresh := &agentv1alpha1.PlatformAgent{}
