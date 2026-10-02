@@ -687,7 +687,7 @@ func TestRosterCapAndPseudonyms(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("u%d", i)
 	}
-	auth := BuildAuthority(ps, pm, "test:bnaylor", "discord", "1001", "principal-map",
+	auth := BuildAuthority(ps, pm.Resolve, "test:bnaylor", "discord", "1001", "principal-map",
 		"discord:g/x", "group", big, true)
 	if len(auth.Audience.Roster) != rosterCap {
 		t.Fatalf("roster len = %d, want %d", len(auth.Audience.Roster), rosterCap)
