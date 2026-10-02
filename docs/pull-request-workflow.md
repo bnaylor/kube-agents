@@ -289,8 +289,10 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
   reviews listing past its page cap, or a last-reviewed commit with no manifest in its bucket); the
   bot's log line `not a second look at …` is the only tell.
 - **`/review` on a commit the bot already reviewed** re-cuts that review at whichever bar it
-  recorded, without reading again: it neither earns nor loses the second look.
-- **`neutral` on any round** also covers the description thread, a change not fully checked, a
+  recorded, without reading again: it neither earns nor loses the second look. Of the description
+  it re-checks only that no section is missing or empty; `/review fresh` reads the commit and the
+  body again.
+- **`neutral` on any round** also covers the description finding, a change not fully checked, a
   review that broke, and a push since the last review (the pushed commit carries the previous title
   and no verdict).
 
@@ -398,11 +400,13 @@ Five ways that goes wrong quietly:
 - No unresolved threads does not mean the bot is answered. Its finding about the pull request
   description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
   and only editing the body answers it. After that, every review that still finds the body owing an
-  answer — a missing section, or one the tree contradicts — repeats the finding in its summary body,
-  under **The pull request description is still unanswered.**, and opens no new thread, so a pull
-  request with every thread resolved can still hold the `AI Review` check. Resolve the description
-  thread only after the body is edited. Editing the body starts no review, so comment `/review`
-  afterwards and read the body of a review newer than your edit, with the first poll command in
+  answer — a section missing, empty, contradicted by the tree, or judged not to answer — repeats the
+  finding in its summary body, under **The pull request description is still unanswered.**, and
+  opens a new thread only for a section no earlier thread named. A pull request with every thread
+  resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
+  the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
+  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` and read
+  the body of a review newer than your edit, with the first poll command in
   [Waiting for it](#waiting-for-it), before reporting the pull request clear.
 
 ## How a change merges
