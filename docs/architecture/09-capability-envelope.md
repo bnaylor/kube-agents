@@ -655,8 +655,18 @@ randomly, so the conservative figure is the one to quote. Either is far out of r
 install and neither is a security property: a collision is not required for an attacker who can
 influence which name gets minted, and the design has no statement about who can. The correct
 reading is that reaping narrows the window, not that it closes it, and that binding `delegate` to
-name-and-UID would close it. Whether to do that is a design call this document should not make
-alone.
+name-and-UID would close it.
+
+**Decided 10/2: bind the UID.** It cannot be bound at mint, because the mint deliberately precedes
+the spawn -- the entry must name the principal before that principal's credential exists, which is
+the ordering §5 requires -- and a pod UID is the API server's to assign, so at mint time it does
+not exist. The gateway already receives it and discards it: `Pods.Create` returns it on the created
+object and the spawn path returns only the name. The shape this takes, then, is a write-back: mint
+the entry naming the pod name, spawn, then write the attested UID into the entry, with the verifier
+requiring UID-present before it accepts. That leaves one sub-question this document does not settle
+-- what an entry that has a name and no UID yet is good for, in the window between the mint and the
+write-back -- and that window needs a stated rule rather than an implied one. Tracked as #2282;
+not this document's change to make, and not a change to the PR carrying it.
 
 **Revocation names no actor.** Deleting an entry is a stated goal and nothing says who deletes. The
 verifier holds read only, so it cannot. The gateway holds `$KV.cap.root.*`, so it can revoke roots
