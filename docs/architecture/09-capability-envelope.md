@@ -156,9 +156,13 @@ the per-agent broker in front of each agent, and the verification service were n
 though they were furniture. **Resolved 9/9:** [05](05-system-architecture.md)'s inventory now
 carries them as C16 (the bus), C18 (the session pod, which is the broker on the hop that exists)
 and C19 (the verifier), alongside C17 for the auth callout -- four missing rather than three, which
-is the sort of thing you find only by going to add one. 05's "broker" (C6) is still the GitHub
-token minter, a different thing wearing the same word, so read every "the broker" below as this
-document's sense of the word and not C6.
+is the sort of thing you find only by going to add one. **Amended 10/2: five, not four.** The
+component that mints every entry in this document -- the a2a chat gateway, `a2a/gateway` -- was
+missing too, and was the hardest of the set to see, because 05 already had a C15 called "ChatOps
+gateway" and the word covered for it. They are two deployments: C15 is the Hermes runtime's chat
+ingress and mints nothing; the minter is now C20. 05's "broker" (C6) is still the GitHub token
+minter, a third thing wearing a shared word, so read every "the broker" below as this document's
+sense of the word and not C6.
 
 **What is settled and what is not.** The mechanism is agreed, and as of 9/9 the first hop is built
 and enforcing -- section 0 says exactly what shipped and what did not. The multi-hop topology the
