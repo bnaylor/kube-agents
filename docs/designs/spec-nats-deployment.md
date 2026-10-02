@@ -214,9 +214,11 @@ Three KV buckets ride the same JetStream deployment:
   capabilities. **Armed 9/9**, and the one bucket here whose grant story is a read
   _denial_ rather than a writer narrowing: the gateway may publish under
   `$KV.cap.root.*` and may not read the bucket by any route, no broker may read it at
-  all, and the capability verifier is the only principal holding read on an entry. The seed
-  Job's `$JS.API.STREAM.INFO.KV_cap` is the one carve-out - the provision script's
-  `kv info cap || kv add cap` guard needs it, and it returns stream state, not a capability. That asymmetry is
+  all, and the capability verifier is the only principal holding read on an entry. The carve-out
+  is `$JS.API.STREAM.CREATE.KV_cap` and `$JS.API.STREAM.INFO.KV_cap`, held by the
+  callout-authenticated `provision` principal the rendered Job runs as and by the static `seed`
+  identity the hand-applied tooling still uses - the `kv info cap || kv add cap` guard needs both
+  verbs, and neither returns an entry. That asymmetry is
   the point - the minter must not be able to see what anyone else minted - and because
   it is a denial it has to be enumerated over every principal on the bus rather than
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in

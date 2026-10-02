@@ -287,14 +287,18 @@ authenticates and evaluated by the server on every operation**. So, writing a bu
 - Only the gateway may publish under `$KV.cap.root.*`
 - Each broker may publish only under `$KV.cap.hop.<its-own-principal>.*`
 - **No broker may read the bucket at all.** Only the verification service holds read on
-  `$KV.cap.>` and on the JetStream API subjects that return a capability. One carve-out, stated
-  here rather than discovered: the seed Job holds `$JS.API.STREAM.INFO.KV_cap` and nothing else
-  on this path, because `kv info cap || kv add cap` is the provision script's idempotency guard.
-  `STREAM.INFO` returns stream state — a message count, a subject list, a first and last
-  sequence — and no capability. Every subject that does return one stays refused for seed as for
-  everyone else, which is what makes it a carve-out and not a hole, and it is asserted as an
-  allow in the conformance suite so that taking the grant away fails there instead of in an
-  install.
+  `$KV.cap.>` and on the JetStream API subjects that return a capability. Two principals hold a
+  carve-out, stated here rather than discovered. The rendered provisioning Job authenticates as
+  `provision`, through the callout -- not as `seed`, which it moved off -- and the hand-applied
+  `seed` tooling beside it is the static twin; each holds `$JS.API.STREAM.CREATE.KV_cap` and
+  `$JS.API.STREAM.INFO.KV_cap`, and nothing else on this path. Both verbs are the one guard:
+  `kv info cap || kv add cap` needs `INFO` for the probe and `CREATE` for the `kv add` it falls
+  through to. Neither returns an entry. `STREAM.INFO` returns stream state — a message count, a
+  subject list, a first and last sequence; `STREAM.CREATE` against a bucket that already exists
+  returns that stream's config unchanged, or fails outright if the config differs. Every subject
+  that does return a capability stays refused for both as for everyone else, which is what makes
+  it a carve-out and not a hole, and it is asserted as an allow in the conformance suite so that
+  taking the grant away fails there instead of in an install.
 
 > **The third bullet was false when it was first implemented, and it is worth knowing how** (9/9).
 > The verifier's own grants were correct. The hole was on the other side: the gateway, the worker
@@ -306,8 +310,13 @@ authenticates and evaluated by the server on every operation**. So, writing a bu
 > the bus - so it has to be tested as "nobody reads this", enumerated over principals, not as "the
 > verifier reads this and others were not given it." And a wildcard grant issued for one stream is
 > a grant on every stream that ever gets added afterwards; the capability bucket was added later
-> and walked straight into it. Closed with an explicit `deny`; re-scoping `$JS.API.>` itself is
-> the right fix and is separate work.
+> and walked straight into it. Closed by enumeration rather than by a `deny`: the allow lists
+> stopped containing those subjects, and no `deny` entry appears anywhere in the rendered
+> `nats.conf`. **Amended 10/2:** the re-scoping of `$JS.API.>` itself, filed here as separate
+> work, has since been done in pieces — #1306 took seed's wildcard, #1316 the worker's, A1 and A5
+> split the enumerations across the workloads that had been sharing them, and #1672 took the
+> gateway's, which was the last one left. `TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant`
+> now pins the set of principals holding a bare `$JS.API.>` at empty.
 
 **Writing a deny for a JetStream stream takes two wildcards, not one.** The stream name lands at
 different depths depending on the API call -- `$JS.API.STREAM.INFO.KV_cap` at depth 4,
@@ -569,9 +578,10 @@ across the bucket -- mint a root at any tier, and read every capability in fligh
 verifier exposes what is in the store; compromising the seed lets you write to it as the gateway.
 Neither is a reason not to do this, and both belong in the same tier of scrutiny, but the seed is
 the one to write the custody and rotation story for first. It now has an object to write
-that story about: the seed lives in Secret `<agent>-a2a-callout-keys`, mounted by the auth
-callout Deployment and nothing else and deliberately not in the per-user credentials
-Secret that several workloads read. `docs/designs/spec-nats-deployment.md` owns the
+that story about: the seed lives in Secret `<agent>-a2a-callout-keys`, read by the auth
+callout Deployment and nothing else -- as an environment variable through a `secretKeyRef`,
+not a volume; the Deployment has no volumes at all -- and deliberately not in the per-user
+credentials Secret that several workloads read. `docs/designs/spec-nats-deployment.md` owns the
 detail. Rotation is not a credential refresh: the public half is in `nats.conf`, and the
 server refuses a config reload that touches the callout block at all, so rotating it is a
 bus restart.
@@ -603,8 +613,10 @@ Three gaps stand open:
 - **It is delivered as an environment variable rather than a projected file**, and the code comment
   claimed the opposite -- said "mounted", while the pod has no volumes at all. `secretKeyRef` does
   keep the value out of the pod spec and out of `describe`, so this is narrower than it first
-  reads, but env is inherited by every child process and lands in core dumps. The comment is fixed;
-  the delivery is not.
+  reads, but env is inherited by every child process and lands in core dumps. Neither the
+  comment nor the delivery is fixed: `platformagent_a2a_calloutkeys.go` still says "mounted by
+  the callout Deployment", and so does the env block in `platformagent_a2a_callout.go` ("the
+  only thing that mounts them"). Both are code, so they are filed rather than carried here.
 - **No application-layer secrets encryption.** The seed sits in etcd under disk encryption alone --
   no KMS envelope, no external secret store. "Gateway-grade custody" should mean at least the
   envelope.
@@ -622,9 +634,25 @@ home. "For the request it is serving" is not observable to the mechanism as spec
 **Shipped unsolved, deliberately** (9/9). The bucket's history is one revision per key and nothing
 sweeps it, so every capability ever minted is still resolvable. What limits the blast radius today
 is only that the delegate is a session pod name and session pods are reaped: a stale root names a
-principal that no longer exists, so nothing can present it. That is an accident of the topology
-rather than a property of the design, and it stops being true the moment a delegate outlives the
-request. Do not read it as expiry.
+principal that is usually not running, so usually nothing presents it. That is an accident of the
+topology rather than a property of the design, and it stops being true the moment a delegate
+outlives the request. Do not read it as expiry.
+
+**And "nothing can present it" is the wrong strength** (10/2). The entry's `delegate` is the pod
+name alone. The API server attests the pod UID too, and `a2a/authcallout` requires it to be
+present, but the UID never enters the principal the name is checked against -- so a future pod
+that happens to be minted with the same name satisfies the delegate check on every stale entry
+naming it. Names are not reserved after a reap. `mintSessionName` builds
+`<profile>-<animal>-<hex>` from a time-indexed pick out of eight animals and `randHex(4)`, which
+is four random _bytes_ rendered as eight hex characters: 2^32 per animal, about 3.4x10^10 per
+profile. A birthday argument puts the first repeat around 232,000 session names on that pool, or
+around 82,000 if the animal is not counted as entropy -- it is derived from `UnixNano`, not drawn
+randomly, so the conservative figure is the one to quote. Either is far out of reach of a normal
+install and neither is a security property: a collision is not required for an attacker who can
+influence which name gets minted, and the design has no statement about who can. The correct
+reading is that reaping narrows the window, not that it closes it, and that binding `delegate` to
+name-and-UID would close it. Whether to do that is a design call this document should not make
+alone.
 
 **Revocation names no actor.** Deleting an entry is a stated goal and nothing says who deletes. The
 verifier holds read only, so it cannot. The gateway holds `$KV.cap.root.*`, so it can revoke roots

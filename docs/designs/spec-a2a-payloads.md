@@ -689,9 +689,10 @@ Verified identity (added 9/9):
     rather than against the resolver in-process. Like 24 these are permissions
     invariants as much as protocol ones: no principal but the gateway may write under
     `$KV.cap.root.*`, and no principal but the verifier may read the store by any JetStream
-    path that returns a capability (the provisioner's `STREAM.INFO` on the bucket is the one
-    carve-out, and it returns stream state rather than an entry). Per `AGENTS.md` those belong
-    in `tests/conformance/`.
+    path that returns a capability (`STREAM.CREATE` and `STREAM.INFO` on the bucket are the
+    carve-out, held by the `provision` principal the rendered Job authenticates as and by the
+    static `seed` identity beside it; neither verb returns an entry). Per `AGENTS.md` those
+    belong in `tests/conformance/`.
 
 ## Open Questions
 
