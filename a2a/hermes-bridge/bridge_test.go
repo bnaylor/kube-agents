@@ -196,7 +196,7 @@ func startBridge(t *testing.T, url string, command []string) {
 // Cleanup still cancels, so cancelling twice is expected and harmless.
 func startBridgeCancelable(t *testing.T, url string, command []string) context.CancelFunc {
 	t.Helper()
-	return startBridgeCfg(t, url, command, 0, false, nil)
+	return startBridgeCap(t, url, command, 0, false, nil)
 }
 
 // startBridgeOptional runs a bridge with A2A_CAPABILITY_REQUIRED=false's

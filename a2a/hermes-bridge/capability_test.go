@@ -418,7 +418,7 @@ func TestAVerifierOutageDoesNotDelayACancel(t *testing.T) {
 	// the verify slot for a full timeout each, so the queued third cannot
 	// be picked up and flipped to running underneath the cancel.
 	start := time.Now()
-	_ = startBridgeCfg(t, url, noCommand, 1, false, nil)
+	_ = startBridgeCap(t, url, noCommand, 1, false, nil)
 
 	task := waitTerminal(t, c, doomed)
 	elapsed := time.Since(start)
