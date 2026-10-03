@@ -369,6 +369,12 @@ func TestTheVerifierSpreadsAcrossNodesWithoutRefusingToSchedule(t *testing.T) {
 	if !reflect.DeepEqual(spread.LabelSelector, dep.Spec.Selector) {
 		t.Errorf("spread selector %v != Deployment selector %v; the scheduler would balance a different pod set", spread.LabelSelector, dep.Spec.Selector)
 	}
+	// Scoped to one ReplicaSet, as the chart's helper is: counted across old
+	// and new pods together, a MaxSurge 1 rollout over two nodes can end
+	// with both new replicas on one node (the argument is on the constant).
+	if !reflect.DeepEqual(spread.MatchLabelKeys, []string{"pod-template-hash"}) {
+		t.Errorf("spread matchLabelKeys = %v, want [pod-template-hash]; without it a rollout can re-co-locate the replicas", spread.MatchLabelKeys)
+	}
 	// Spread is the mechanism, not anti-affinity beside it: two mechanisms on
 	// one key is a second thing to keep in step with the selector.
 	if pod.Affinity != nil && pod.Affinity.PodAntiAffinity != nil {

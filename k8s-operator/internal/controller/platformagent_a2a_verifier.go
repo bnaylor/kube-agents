@@ -97,12 +97,28 @@ const (
 	// keyed on the node. Hostname rather than zone because the failure this
 	// guards is one node's drain taking both replicas, and a zone key is
 	// satisfied by two pods on one node. A topology spread rather than pod
-	// anti-affinity because it is the shape §3.8's remediation prescribes,
-	// it is what §3.19 reads when it checks whether a spread was achieved,
-	// and nothing else the operator renders uses either mechanism, so there
-	// is no local precedent to match instead.
+	// anti-affinity because it is the shape §3.8's remediation prescribes
+	// and the shape the chart already renders for its own multi-replica
+	// workloads (charts/kube-agents/templates/_helpers.tpl,
+	// kube-agents.topologySpreadConstraints, whose comment is the canonical
+	// home for the argument); the operator renders neither mechanism
+	// anywhere else, so that helper is the precedent this follows. Being
+	// advisory, the spread has no audit behind it here: §3.19, the check for
+	// a spread the scheduler ignored, reads placement off the EndpointSlices
+	// of a Service the workload backs, and nothing fronts the verifier with
+	// one. The budget is the enforced half; the spread is a preference.
 	a2aVerifierSpreadTopologyKey = "kubernetes.io/hostname"
 	a2aVerifierSpreadMaxSkew     = 1
+	// a2aVerifierSpreadMatchLabelKey scopes the skew to one ReplicaSet, for
+	// the chart helper's reason. Without it the constraint counts old and
+	// new pods together during a rollout: with two nodes holding one replica
+	// each, the surge pod lands beside an old one, the controller deletes
+	// the old pod that shares a node, and the second new pod then sees a tie
+	// and can land beside the first — both live verifiers on one node until
+	// the next rollout, which is the placement this constraint exists to
+	// prevent, reached through ordinary use. pod-template-hash is the label
+	// the Deployment controller stamps per revision.
+	a2aVerifierSpreadMatchLabelKey = "pod-template-hash"
 )
 
 func a2aVerifierImage() string {
@@ -193,14 +209,13 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 					// old ones hold their nodes: on a two-node cluster a
 					// DoNotSchedule spread has nowhere to put it, the surge
 					// pod pends, and the rollout never completes. The SOP's
-					// §3.8 prescribes ScheduleAnyway for the same reason, and
-					// §3.19 is the check that catches an advisory spread the
-					// scheduler then ignored.
+					// §3.8 prescribes ScheduleAnyway for the same reason.
 					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
 						MaxSkew:           a2aVerifierSpreadMaxSkew,
 						TopologyKey:       a2aVerifierSpreadTopologyKey,
 						WhenUnsatisfiable: corev1.ScheduleAnyway,
 						LabelSelector:     &metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
+						MatchLabelKeys:    []string{a2aVerifierSpreadMatchLabelKey},
 					}},
 					// No default-audience token. The only credential this pod
 					// carries is the projected bus token below, and the
