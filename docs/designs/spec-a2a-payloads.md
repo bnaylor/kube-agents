@@ -237,7 +237,7 @@ required. It does not mean "unarmed".
 the guarantee that a null-grants submission cannot come from somewhere the minting path
 does not cover, and that guarantee is not a convention: `a2a.tasks.*.*.in` publish is held
 by exactly one rendered identity, the a2a chat gateway (C20), and the gateway mints before
-it publishes. Every other principal on the bus -- the bridge included -- holds subscribe on
+it publishes. Every other principal on the bus - the bridge included - holds subscribe on
 that subject and not publish, so there is no second author to produce the shape rule 2
 refuses. Eval traffic is not an exception: it enters through the gateway's inject side door
 and takes the same mint path as a chat message, rather than publishing envelopes of its own.
@@ -582,7 +582,11 @@ Envelope:
    require them, nor one whose `taskId` or addressee fails the dot-free token rule.
 3. The library never populates `identity`. It populates `authority` only on the gateway's
    ingress path; every other producer emits it null. Inbound values are passed through
-   byte-identical and are not consulted for any decision.
+   byte-identical and are not consulted for any decision **by the library**. That is a
+   statement about the library, not about consumers: an executor does decide on
+   `authority.grants`, by resolving the reference against the verifier under the Authority
+   section's four conditions, and it is still the case that nothing decides by reading the
+   block.
 4. A consumer on a wildcard ignores envelopes whose `to` names another session, and an
    envelope whose `to` disagrees with its subject's addressee token is surfaced as a
    protocol error. (Refined 9/9: checking a `to` that is present is every task subject's
