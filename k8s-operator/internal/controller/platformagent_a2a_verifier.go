@@ -117,7 +117,15 @@ const (
 	// and can land beside the first — both live verifiers on one node until
 	// the next rollout, which is the placement this constraint exists to
 	// prevent, reached through ordinary use. pod-template-hash is the label
-	// the Deployment controller stamps per revision.
+	// the Deployment controller stamps per revision, and the field is on by
+	// default from Kubernetes 1.27 (MatchLabelKeysInPodTopologySpread),
+	// inside the chart's 1.29 floor (charts/kube-agents/Chart.yaml,
+	// kubeVersion ">=1.29.0-0"). The floor is doing work here rather than
+	// being a footnote: on a server with that gate off the API server DROPS
+	// the field at admission, silently — the render test still passes, the
+	// pods still schedule, and the rollout re-co-location above happens
+	// unseen. Nothing here reads the live object back for it; the floor is
+	// what rules the case out.
 	a2aVerifierSpreadMatchLabelKey = "pod-template-hash"
 )
 
@@ -301,6 +309,10 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 // exists. maxUnavailable: 1, never minAvailable — the constant's comment has
 // the argument. Labelled as a verifier object so the teardown's residue sweep
 // sees it and the flip to today removes it with the Deployment.
+//
+// The budget counts READY pods, and this workload's readiness is borrowed
+// from a sibling, which is why the unhealthy-pod policy below is not left at
+// its default.
 func buildA2AVerifierPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
 		TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
@@ -312,6 +324,23 @@ func buildA2AVerifierPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrup
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MaxUnavailable: ptr.To(intstr.FromInt32(a2aVerifierPDBMaxUnavailable)),
 			Selector:       &metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
+			// AlwaysAllow rather than the IfHealthyBudget default. /readyz
+			// is "connected to the bus and bound to the bucket", and the
+			// bus is a one-replica StatefulSet, so while it is down — or
+			// its PVC is Pending, or the provision Job has failed — BOTH
+			// verifiers are Running and NotReady. Under the default that
+			// is currentHealthy 0 against desiredHealthy 1, zero
+			// disruptions allowed, and the eviction API answering 429 for
+			// either pod until the bus returns, which in the failed-Job
+			// and Pending-PVC cases is never without a human: a budget
+			// guarding a workload that is already fully down, and holding
+			// the drain of the node it sits on for nothing. KEP-3017 added
+			// this policy for exactly that shape. A Running pod that is
+			// not Ready may be evicted regardless of the budget, and
+			// maxUnavailable: 1 still governs the ready ones, which are
+			// the only ones whose loss refuses a task. On by default since
+			// 1.27, inside the chart's 1.29 floor.
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
 		},
 	}
 }
