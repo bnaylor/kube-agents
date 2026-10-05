@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` from the admin-created `a2a-slack-bot` Secret, counted as a backend when both keys are present) with the `a2a-slack-principal-map` mount, projected beside the Discord table at the gateway's one principal-map path; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -894,9 +894,9 @@ that treated the three alike is what this value exists to stop.
 **What it also settles.** The gateway refuses to start without a backend. It used to be
 rendered regardless, so any install with neither a Discord token nor a Chat relay carried a
 gateway Deployment that crash-looped forever and nothing could rollout-gate on. The operator
-now asks first: a `mode: next` install with no chat backend - no `discord-bot` Secret in the
-namespace, no door armed and `spec.integration.googleChat` not enabled - gets no gateway
-Deployment at all, its `Ready` counts the rest
+now asks first: a `mode: next` install with no chat backend - no `discord-bot` or
+`a2a-slack-bot` Secret in the namespace, no door armed and `spec.integration.googleChat` not
+enabled - gets no gateway Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
 would render it. The rule is creation-only, like the callout ordering gate: a gateway that
@@ -907,6 +907,11 @@ for the same reason. An install that enables Google Chat under `next` has a back
 fact alone: the render asks the CR before it reads any Secret, and, because the gateway
 refuses two real backends, omits the Discord reference when Chat is armed, so a
 `discord-bot` Secret left in the namespace does not stop a Chat gateway starting. The
+`a2a-slack-bot` Secret is a backend when it carries both `bot-token` and `app-token`; with
+one key it is withheld and the condition names the missing key, because the gateway refuses
+half a pair. The Secret-armed references are rendered on every gateway, optional, since only
+the creating pass reads a Secret, so an install that creates both Secrets gets the gateway's
+own two-backend refusal rather than a silent choice. The
 rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
 has no other backend re-renders the existing gateway without one, and it exits on
 `no chat backend` until the admin flips the CR to `today` (which tears the stack down), creates
@@ -1072,7 +1077,12 @@ and the first backend with a real identity join - gchat needs none, since the em
 asserts is already the principal. Transport is Socket Mode - an outbound websocket, so no inbound endpoint
 on the cluster and no ingress to secure, the same property that made Discord cheap. The
 existing `SlackSpec` already carries the two Secret refs Socket Mode needs (bot token
-for the Web API, app token for the socket).
+for the Web API, app token for the socket); under `next` the gateway's pair comes from the
+admin-created `a2a-slack-bot` Secret instead (`bot-token`, `app-token`), because those refs
+feed the credential broker's own Socket Mode connection for the legacy path, and Slack
+distributes an app's events across its open connections, so arming the gateway on the same
+field would split one workspace's messages between two consumers. Which path an install
+runs is which it configures.
 
 **Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
 threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
@@ -1116,16 +1126,19 @@ group ingress.
 `user_id` against a table sourced from our own IdP; never `profile.email` (the identity
 section above says why). The table is a Kubernetes Secret, mounted read-only at the
 gateway's principal-map path, same file format the Discord ConfigMap uses.
-`a2a-slack-principal-map` is the name for the hand-made Secret today and the one the
-future `principalMapSecretRef` render binds - nothing in-tree creates it yet, like the
-rest of the gateway's env. A Secret rather than a ConfigMap because a
+`a2a-slack-principal-map` is the name the operator mounts under `next`: projected beside
+the Discord table at the gateway's one principal-map path, optional, so an install without
+its table is the gateway's own case (it runs, and every Slack sender drops at verification,
+with the warning the gateway logs for an empty map). Nothing in-tree creates its content. A
+Secret rather than a ConfigMap because a
 write to this table grants a principal - it is an impersonation primitive, and it holds
 emails besides. Write access is the install admin's, through the install path. No
 product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
-it, so nothing an agent can be talked into doing edits its own identity table. When the
-W6 rendering series reaches the gateway, the operator renders the mount from a
-`principalMapSecretRef` on `spec.integration.slack`, which makes write authority "may
-write the PlatformAgent CR" and puts changes in the API server audit log. Generating
+it, so nothing an agent can be talked into doing edits its own identity table; the
+conformance suite's D1 holds that no Role the operator mints names `secrets`. A
+`principalMapSecretRef` on `spec.integration.slack`, not built, would let an install bind
+another name and make write authority "may write the PlatformAgent CR", with changes in
+the API server audit log. Generating
 the Secret's content from the IdP is a job we do not build yet; until it exists the
 table is maintained by hand, which is honest at the current install count.
 
