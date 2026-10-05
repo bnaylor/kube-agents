@@ -116,6 +116,92 @@ func TestASlackSecretWithHalfAPairIsNotABackend(t *testing.T) {
 	}
 }
 
+// TestACompleteSlackPairBesideAHalfDiscordSecretIsABackend: the table's
+// order must not decide the verdict. A discord-bot Secret missing its key
+// beside a complete a2a-slack-bot Secret is a Slack gateway, not a withheld
+// one.
+func TestACompleteSlackPairBesideAHalfDiscordSecretIsABackend(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	wrong := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aDiscordBotSecretName, Namespace: agent.Namespace},
+		Data:       map[string][]byte{"DISCORD_TOKEN": []byte("misnamed")},
+	}
+	for _, s := range []*corev1.Secret{wrong, slackBotSecret(agent, a2aSlackBotTokenKey, a2aSlackAppTokenKey)} {
+		if err := cl.Create(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if state.gatewayDark {
+		t.Fatalf("a complete Slack pair was withheld because an earlier Secret in the table is half-populated: %q", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway Deployment was not rendered: %v", err)
+	}
+}
+
+// TestAHalfSlackPairBesideACompleteDiscordSecretIsWithheld: the gateway
+// refuses half a pair before it looks at any other backend, so a complete
+// discord-bot Secret does not rescue a half-populated a2a-slack-bot one;
+// rendered, that gateway would crash-loop on the half-pair refusal.
+func TestAHalfSlackPairBesideACompleteDiscordSecretIsWithheld(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	for _, s := range []*corev1.Secret{discordBotSecret(agent), slackBotSecret(agent, a2aSlackBotTokenKey)} {
+		if err := cl.Create(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if !state.gatewayDark {
+		t.Fatal("a half Slack pair beside a complete Discord Secret rendered the gateway; it would exit on the half-pair refusal")
+	}
+	if !strings.Contains(state.gatewayDarkReason, a2aSlackAppTokenKey) {
+		t.Errorf("the reason does not name the missing key %s: %q", a2aSlackAppTokenKey, state.gatewayDarkReason)
+	}
+}
+
+// TestTwoCompleteSecretsAreWithheld: both references would resolve and the
+// gateway refuses to start on two backends, so the gate withholds and names
+// both Secrets rather than rendering the refusal.
+func TestTwoCompleteSecretsAreWithheld(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	for _, s := range []*corev1.Secret{discordBotSecret(agent), slackBotSecret(agent, a2aSlackBotTokenKey, a2aSlackAppTokenKey)} {
+		if err := cl.Create(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if !state.gatewayDark {
+		t.Fatal("two complete backend Secrets rendered the gateway; it would exit on the two-backend refusal")
+	}
+	for _, want := range []string{a2aDiscordBotSecretName, a2aSlackBotSecretName, "delete one"} {
+		if !strings.Contains(state.gatewayDarkReason, want) {
+			t.Errorf("the reason does not say %q: %q", want, state.gatewayDarkReason)
+		}
+	}
+}
+
 // TestTheDarkReasonNamesSlack: the remedy an admin reads off the A2AGateway
 // condition names the Slack Secret and both of its keys beside the Chat
 // field, the Discord Secret and the door, in one list built from the arming

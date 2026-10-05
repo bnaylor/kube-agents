@@ -242,9 +242,10 @@ func New(o Options) (*Gateway, error) {
 	// does not use one either: its grant is the mechanism, since only the
 	// console credential may publish on the console subject. And a gateway
 	// whose only ingress is the side door uses the door's map below instead
-	// of this one. Slack is the case that matters operationally: nothing
-	// renders its map yet (#2099), so a Slack gateway whose map path is
-	// missing would otherwise pass boot silently and drop every sender.
+	// of this one. Slack is the case that matters operationally: the
+	// operator projects its map Secret as optional, so a Slack gateway on
+	// an install that never created it would otherwise pass boot silently
+	// and drop every sender.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
 	if (backend == discordBackend || backend == slackBackend) && pm.Len() == 0 {

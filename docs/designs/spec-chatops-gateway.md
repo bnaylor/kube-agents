@@ -905,17 +905,19 @@ every session pod that hangs off its UID. An eval install with this door armed h
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat under `next` has a backend by that
 fact alone: the render asks the CR before it reads any Secret, and, because the gateway
-refuses two real backends, omits the Discord reference when Chat is armed, so a
-`discord-bot` Secret left in the namespace does not stop a Chat gateway starting. The
+refuses two real backends, omits the Secret-armed references when Chat is armed, so a
+`discord-bot` or `a2a-slack-bot` Secret left in the namespace does not stop a Chat gateway starting. The
 `a2a-slack-bot` Secret is a backend when it carries both `bot-token` and `app-token`; with
 one key it is withheld and the condition names the missing key, because the gateway refuses
-half a pair. The Secret-armed references are rendered on every gateway, optional, since only
-the creating pass reads a Secret, so an install that creates both Secrets gets the gateway's
-own two-backend refusal rather than a silent choice. The
+half a pair, whatever other Secret is present; a `discord-bot` Secret with none of its key is
+inert and is named only when nothing else arms the gateway. The Secret-armed references are
+rendered on every gateway, optional, since only the creating pass reads a Secret; an install
+that creates both Secrets complete is withheld too, naming both, because the gateway refuses
+two real backends. The
 rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
 has no other backend re-renders the existing gateway without one, and it exits on
 `no chat backend` until the admin flips the CR to `today` (which tears the stack down), creates
-a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
+a `discord-bot` or `a2a-slack-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
 same shape as removing the Secret from under a Discord gateway, reached through the CR.
 
 ## The Google Chat adapter (added 9/5)
@@ -1129,7 +1131,8 @@ gateway's principal-map path, same file format the Discord ConfigMap uses.
 `a2a-slack-principal-map` is the name the operator mounts under `next`: projected beside
 the Discord table at the gateway's one principal-map path, optional, so an install without
 its table is the gateway's own case (it runs, and every Slack sender drops at verification,
-with the warning the gateway logs for an empty map). Nothing in-tree creates its content. A
+with the warning the gateway logs when the map is empty altogether; a Discord table in the same
+projection keeps it non-empty). Nothing in-tree creates its content. A
 Secret rather than a ConfigMap because a
 write to this table grants a principal - it is an impersonation primitive, and it holds
 emails besides. Write access is the install admin's, through the install path. No

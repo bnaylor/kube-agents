@@ -244,10 +244,10 @@ func TestSlackRunAuthTestHonoursCancel(t *testing.T) {
 
 // TestSlackEmptyPrincipalMapWarnsAtBoot: the boot-time warning for an empty
 // map fires for every backend whose identity join IS the map — Slack as
-// much as Discord — and not for gchat, which never reads it. Nothing renders
-// the Slack map yet, so a Slack gateway with a missing map file is the
-// ordinary case until #2099, and it must not pass boot silently and then
-// drop every sender.
+// much as Discord — and not for gchat, which never reads it. The operator
+// projects the Slack map Secret as optional, so a Slack gateway on an
+// install that never created it has a missing map, and it must not pass
+// boot silently and then drop every sender.
 func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 	s := startServer(t)
 	url := s.ClientURL()

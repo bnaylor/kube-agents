@@ -464,7 +464,7 @@ const (
 	// the same field would split one workspace's messages between two
 	// consumers. The env names are the gateway's; docs/README.md says this
 	// file must agree with a2a/gateway/config.go.
-	a2aSlackBotSecretName  = "a2a-slack-bot"
+	a2aSlackBotSecretName  = "a2a-slack-bot"   // #nosec G101 -- Secret name, not a credential
 	a2aSlackBotTokenKey    = "bot-token"       // #nosec G101 -- Secret key name, not a credential
 	a2aSlackAppTokenKey    = "app-token"       // #nosec G101 -- Secret key name, not a credential
 	a2aSlackBotTokenEnvVar = "SLACK_BOT_TOKEN" // #nosec G101 -- Environment variable name, not a credential
@@ -4311,9 +4311,12 @@ func a2aSecretKeysPhrase(keys []string) string {
 // the inject door armed on the operator (the eval install's case; the door
 // alone is an ingress by the A2A owner's decision recorded in the spec); the
 // CR's Google Chat integration under next (a2aChatArmed, which needs no read
-// at all); then each Secret-armed backend (a2aSecretBackends: the discord-bot
-// Secret, the a2a-slack-bot Secret) present in the namespace with every key
-// the gateway reads. The A2A door joins when its render lands.
+// at all); then the Secret-armed backends (a2aSecretBackends: the discord-bot
+// Secret, the a2a-slack-bot Secret), read as a set, since the gateway refuses
+// half a pair and refuses two real backends: exactly one complete Secret and
+// no half-populated one is a backend; a Secret with none of its keys is
+// inert and named only when nothing else arms the gateway. The A2A door
+// joins when its render lands.
 //
 // The Secrets are read through a2aReader, uncached, for the reason every
 // other Secret read here is (see removeA2AInjectBackend): the operator ships
@@ -4328,6 +4331,17 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 	if a2aChatArmed(agent) {
 		return true, "", nil
 	}
+	// Every Secret is read before any verdict, because the gateway's own
+	// rules are about the set: it refuses half a pair, and it refuses two
+	// real backends. So a Secret with some of its keys and not others is
+	// a crash at boot whatever else is present; a Secret with none of its
+	// keys is inert at boot (the optional references omit the variables),
+	// named only when nothing else arms the gateway, since it is most
+	// likely a misnamed key; and one complete Secret is a backend when it
+	// is the only one. The order of the table decides nothing but which
+	// Secret is named when two are at fault.
+	var complete []string
+	var half, keyless string
 	for _, b := range a2aSecretBackends {
 		secret := &corev1.Secret{}
 		err := r.a2aReader().Get(ctx, types.NamespacedName{Name: b.secretName, Namespace: agent.Namespace}, secret)
@@ -4344,17 +4358,39 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 			}
 		}
 		if len(missing) == 0 {
-			return true, "", nil
+			complete = append(complete, b.secretName)
+			continue
 		}
 		// The Secret is there and a key the gateway reads is not: the env
 		// references are optional, so a rendered gateway would start with
 		// a missing or half-populated credential and exit on "no chat
 		// backend" or on the half-pair refusal, which is the crash loop
 		// this check exists to prevent. Withheld, with the keys named.
-		return false, fmt.Sprintf("the %s Secret in %s carries no %s, so the A2A gateway has no chat backend and its "+
+		reason := fmt.Sprintf("the %s Secret in %s carries no %s, so the A2A gateway has no chat backend and its "+
 			"Deployment is not rendered: put %s under %s, or %s",
 			b.secretName, agent.Namespace, a2aSecretKeysPhrase(missing), b.what, a2aSecretKeysPhrase(b.keys),
-			a2aGatewayBackendOptions(agent.Namespace, b.secretName)), nil
+			a2aGatewayBackendOptions(agent.Namespace, b.secretName))
+		switch {
+		case len(missing) < len(b.keys) && half == "":
+			half = reason
+		case len(missing) == len(b.keys) && keyless == "":
+			keyless = reason
+		}
+	}
+	switch {
+	case half != "":
+		return false, half, nil
+	case len(complete) > 1:
+		// Two complete Secrets would render a gateway that resolves both
+		// references and refuses to start on two backends (a2a/gateway/
+		// config.go, "more than one chat backend is configured"): the same
+		// crash loop, withheld for the same reason.
+		return false, fmt.Sprintf("the %s Secrets in %s each arm a chat backend and the A2A gateway runs one backend per "+
+			"process, so its Deployment is not rendered: delete one of them", strings.Join(complete, " and "), agent.Namespace), nil
+	case len(complete) == 1:
+		return true, "", nil
+	case keyless != "":
+		return false, keyless, nil
 	}
 	return false, "no chat backend is configured for the A2A gateway, so its Deployment is not rendered: " +
 		a2aGatewayBackendOptions(agent.Namespace, ""), nil
