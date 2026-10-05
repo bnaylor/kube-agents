@@ -234,6 +234,16 @@ mount_point_exists() {
   awk -v path="$1" '$5 == path { found = 1 } END { exit !found }' "$SANDBOX_MOUNTINFO"
 }
 
+# Whether $DEFAULTS holds at least one tree. The loops over "$DEFAULTS"/* skip
+# an unmatched glob, so an empty $DEFAULTS would stage nothing and check nothing
+# while every step still reported success.
+defaults_hold_a_tree() {
+  for entry in "$DEFAULTS"/*; do
+    [ -e "$entry" ] && return 0
+  done
+  return 1
+}
+
 # 1. The model's durable directory. A PVC mounts over the image's /opt/data and
 #    arrives owned by root, so the agent could not write to it. Not recursive:
 #    only the mount point needs fixing, and a recursive chown over a volume that
@@ -254,9 +264,9 @@ chown agent:agent "$DATA"
 # It exits before the marker below and before steps 2 to 4, so it writes
 # nothing outside $DATA: no authorized_keys, no host keys, no sshd drop-in.
 if [ "${1:-}" = "$PREPARE_IMAGE_TREES_ARG" ]; then
-  if [ ! -d "$DEFAULTS" ]; then
-    log "no $DEFAULTS in this image: there are no image trees to stage, and the"
-    log "shell container's read-only mounts over them would be empty."
+  if [ ! -d "$DEFAULTS" ] || ! defaults_hold_a_tree; then
+    log "no image trees under $DEFAULTS in this image: there is nothing to stage, and"
+    log "the shell container's read-only mounts over them would be empty."
     exit 1
   fi
   for root in $SANDBOX_HOME_ROOTS; do
@@ -329,6 +339,13 @@ chown agent:agent "$DATA/.sandbox"
 #     by the machine-home path and by the profile-home path the SOPs use. They
 #     are copies rather than symlinks so that each is a real directory the
 #     operator can mount read-only on its own.
+# Under the operator the per-tree check below is the guarantee, and with no
+# tree under $DEFAULTS, missing or empty, it would check nothing and pass.
+if [ "$SANDBOX_IMAGE_TREES" = "$IMAGE_TREES_READ_ONLY_MOUNTS" ] && ! defaults_hold_a_tree; then
+  log "no image trees under $DEFAULTS, so there is nothing to check the read-only"
+  log "mounts against. Refusing to start; the image is broken."
+  exit 1
+fi
 if [ -d "$DEFAULTS" ]; then
   for root in $SANDBOX_HOME_ROOTS; do
     home="$(home_for_root "$root")"
@@ -362,6 +379,13 @@ if [ -d "$DEFAULTS" ]; then
       log "$(cd "$DEFAULTS" && echo *) in $home are read-only mounts"
       ;;
     "")
+      # Outside the operator a broken image only warns, as a missing $DEFAULTS
+      # does below, but it must not report a sync that staged nothing.
+      if ! defaults_hold_a_tree; then
+        log "no image trees under $DEFAULTS — the agent's skills, SOPs and shared"
+        log "scripts will be absent from $home and every skill that names one will fail."
+        continue
+      fi
       for entry in "$DEFAULTS"/*; do
         [ -e "$entry" ] || continue
         stage_image_tree "$home" "$(basename "$entry")"
@@ -454,7 +478,10 @@ if [ ! -r "$AUTHORIZED_KEYS_SRC" ]; then
   log "Mount the sandbox key secret there, or set SANDBOX_AUTHORIZED_KEYS."
   exit 1
 fi
-install -m 0600 -o agent -g agent "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
+# Root-owned, like the home and the .ssh above it (deploy/sandbox/Dockerfile):
+# a file the agent owns is one the model can add a key of its own to. 0644
+# because sshd reads it as the user it is authenticating.
+install -m 0644 -o root -g root "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
 # The same key also authorises `hermes`, the principal trusted agent-pod code
 # connects as instead of `agent`. The Dockerfile comment on that account says
 # why the two cannot be the same login. Nothing else here needs changing: the
@@ -546,12 +573,12 @@ done
 #    gitops_workspace.agent_home() reads PLATFORM_AGENT_HOME to decide where a
 #    leased clone goes. sshd starts sessions with neither.
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
-SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
-# /opt/vcs/libexec is deliberately not on this list. The image carries a second,
-# credential-free git there for the version-control skill, and the skill reaches
-# it by absolute path; putting its directory ahead of the shim would take the
-# name `git` from every caller that means the shim, so that PATH edit travels
-# with those callers. deploy/sandbox/Dockerfile has the argument.
+SANDBOX_PATH=/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+# /opt/vcs/bin holds the only `git` in the sandbox, the credential-free wrapper
+# (deploy/sandbox/vcs-git.sh); /opt/credential-proxy/bin holds gcloud and
+# kubectl and nothing named git or gh, so the order between the two decides
+# nothing. Login shells get the same prepend from /etc/profile.d/vcs-path.sh,
+# because /etc/profile overwrites this PATH before profile.d runs.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
 # CREDENTIAL_PROXY_TOKEN_FILE is a path, not a token: the file it names is a
 # projected volume, and forwarding the name is what lets the client read it. It
@@ -591,9 +618,9 @@ if ! sshd -t; then
   exit 1
 fi
 if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
-  log "CREDENTIAL_PROXY_URL is unset — kubectl, gcloud, gh and git will report"
-  log "that they are not configured. Expected until #737 Part C makes the"
-  log "credential proxy reachable from outside the agent pod."
+  log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
+  log "they are not configured, and the version-control verbs cannot reach the"
+  log "broker."
 fi
 
 log "ready; starting $*"

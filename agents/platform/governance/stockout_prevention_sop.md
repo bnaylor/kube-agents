@@ -28,7 +28,7 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 - `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger. Write a manifest for each one while you inspect (Step 4), or the promotion fails for want of a file.
 - `start` creates and resets no branch. There is no report branch.
 
-The helper owns every `git`/`gh` operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `gh issue create`, `gh pr create`, or `gh issue comment` yourself.**
+The helper owns every git and forge operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `vcs.py issue create`, `vcs.py proposal create`, or `vcs.py issue comment` yourself, and do none of it any other way.**
 
 **Never comment on the ledger yourself.** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit: an agent that posts it is authorizing its own pull request.
 
@@ -81,12 +81,12 @@ gcloud compute regions describe <region> --project=<project> --format="json(quot
 # 4. Check Spot Capacity & Preemption Advice History.
 #    One machine type per call -- `--machine-type` is singular. Repeat for each
 #    shape the fleet's Spot ComputeClasses actually request.
-gcloud beta compute advice capacity-history --region=<region> --machine-type=g2-standard-4 --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json
+gcloud beta compute advice capacity-history --project=<project> --region=<region> --machine-type=g2-standard-4 --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json
 
 # Or check capacity obtainability for target machine types. This is the sibling
 # command, and it is the one that takes the plural
 # `--instance-selection-machine-types` and `--size`:
-gcloud beta compute advice capacity --region=<region> --provisioning-model=SPOT --size=1 --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --target-distribution-shape=any --format=json
+gcloud beta compute advice capacity --project=<project> --region=<region> --provisioning-model=SPOT --size=1 --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --target-distribution-shape=any --format=json
 
 # 5. Autoscaler Visibility Logs (Stage 1 Triage Query)
 gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND resource.labels.location="<location>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format=json  # both schemas; see §3.11
@@ -205,7 +205,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
-- **Command:** run by the §3 collector — `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
+- **Command:** run by the §3 collector — `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --project=<project> --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
 - **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks. The collector reads the **mean** of the daily `preemptionRate` values, over at least seven of them — one bad afternoon inside a calm month is a zonal incident that already resolved, and a shape with less history than that is reported as unmeasured rather than clean.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
 - **Severity:** `major`.
@@ -215,7 +215,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 #### 3.9 Single-zone node pool, or one at its autoscaling ceiling (`single-zone-nodepool`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
-- **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
+- **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --project=<project> --format=json`
 - **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) and no untainted zonal pool's fallback — an untainted multi-zone node pool of the same machine type (a tainted zonal pool is flagged regardless; the excerpt says which test failed), or a node pool's live node count is `>= 90%` of its **effective** ceiling — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call. Effective, because `autoscaling.maxNodeCount` is a _per-location_ limit ("maximum number of nodes for one location in the NodePool", in the API's words) while the live count is a pool total summed over every zone: the pool-wide ceiling is `maxNodeCount` times the zones the pool spans, unless the pool sets the mutually-exclusive `totalMaxNodeCount`, which is already pool-wide. The collector computes this and names the basis in the excerpt.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); an untainted single-zone pool beside an untainted multi-zone pool of the same machine type on the same cluster; a tainted multi-zone pool is no fallback, since the zonal pool's pods do not tolerate its taints.
 - **Severity:** `major`.
@@ -293,7 +293,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-pre
 
 Always pass `--manifest-file`: nothing else checks the document against what the collector actually ran. On a run where §3's collector never produced one — it crashed, or the fleet was unreachable, and every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether.
 
-One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`skills/fleet-audit/SKILL.md`, step 3). Exit 1 is fatal. Exit 0 means it published.
 
 `partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload or ComputeClass you never queried is not one that got resolved: `resolved` comes back `0` and no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out. A run that audited no cluster is partial too unless every `project/<id>` target carries `clusters_listed: 0`: a project target without it may hold clusters nobody read.
 
@@ -313,7 +313,7 @@ What to report in each case:
 ## Red Lines
 
 - **Read-only against every cluster.** No `apply`, `patch`, `edit`, `delete`, `scale`, `drain`, `cordon`, or eviction.
-- **No hand-written issue or PR bodies, and no direct git/gh calls.** `audit_report.py` owns the ledger issue, the remediation branches, the commits, and every body it renders.
+- **No hand-written issue or PR bodies, and no direct git or forge calls.** `audit_report.py` owns the ledger issue, the remediation branches, the commits, and every body it renders.
 - **No credentials in evidence.** A Secret's `data:` block, a token, or a private key never enters an excerpt; re-read with a projection that omits it.
 - **A finding you cannot reproduce is dropped, not softened.** `evidence.command` is the literal command you executed; if the confirm read fails or the condition has cleared, the finding does not ship.
 - **No fabricated numbers.** Resource quantities and machine families are either read off the live object or left to a human.

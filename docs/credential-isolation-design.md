@@ -26,8 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key. It holds no credential path.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
-durable `/opt/data`, and the shims that stand in for `gcloud`, `kubectl`, `gh`, and
-`git`. This is the Pod that executes anything the model wrote. Its ServiceAccount
+durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
+`git` that holds no credential and reaches no forge. This is the Pod that executes anything the model wrote. Its ServiceAccount
 carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server hands it
 an unbound principal that IAM grants nothing.
 
@@ -115,10 +115,13 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
-grant access, or change what code runs. `KAGE_SLACK_UX` is the nearest case: it
-switches between code paths the image already ships, which its comment there lists.
+grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
-`k8s-operator/internal/controller/platformagent_manifests.go` is the list.
+`k8s-operator/internal/controller/platformagent_manifests.go`. `KAGE_SLACK_UX`
+is the nearest case: it switches between Slack code paths the image already
+ships, adds no destination or credential, and writes only to Slack, in the
+channels and threads the gateway already serves; its comment in
+`safeSandboxEnvOverrides` lists each path.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
 
@@ -163,7 +166,7 @@ and the route table it feeds
 
 - PlatformAgent only.
 - Credentials managed by the operator.
-- CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
+- CLI forwarding for `gcloud` and `kubectl`.
 - Read-only Google Cloud REST relay for the reads no CLI exposes
   ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
 - Slack and Google Chat credentialed relays.
@@ -220,13 +223,17 @@ namespace, where the managed-Prometheus collector runs, and to no other peer.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
-pod, `kubeagents-credential-proxy` for the sandbox and
-`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
+pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
+the gateway and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's and does not vary
-on which one presented the token — the audience and the route table it feeds do —
-so the allowlist itself keeps other workloads out rather than telling those two
-apart. The token crosses the cluster network in cleartext;
+That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
+consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+which one presented the token — the audience and the route table it feeds do — so the
+allowlist itself keeps other workloads out rather than telling those callers apart. The token
+crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
@@ -318,9 +325,9 @@ proxy. The credential runtime directly executes the corresponding real CLI and
 returns output and exit status. It never evaluates an agent-supplied shell
 command.
 
-Only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy also rejects
-known credential-disclosure, credential-replacement, and self-modification
-operations, and the GitHub **write** path: merging a pull request
+Only `gcloud` and `kubectl` are forwarded from the sandbox. The proxy also
+rejects known credential-disclosure, credential-replacement, and
+self-modification operations, and the GitHub **write** path: merging a pull request
 (`github.merge`), approving a review (`github.assent`), mutating through the
 REST API (`github.api-mutation`), triggering workflows or releases
 (`github.pipeline-trigger`), and repository administration — secrets,
