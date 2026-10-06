@@ -157,6 +157,117 @@ func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 	}
 }
 
+// TestNoFirstEventNoticeSkipsDetachedAndStaleScans: a detached task no longer
+// holds the conversation and gets no notice; and a scan that read the record
+// before a turn swapped in a new task neither posts for the old task nor
+// marks the new one, because the fresh record under the lock is what decides.
+func TestNoFirstEventNoticeSkipsDetachedAndStaleScans(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+
+	detached := "discord:g1/thread-notice-detached"
+	rec := seedTasklessFixed(t, r, detached, defaultFirstEventGrace+time.Minute)
+	rec.ActiveTask.Detached = true
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.reapOnce(ctx)
+	if got := noticePosts(r.adapter, "task-never"); len(got) != 0 {
+		t.Fatalf("a detached task was noticed: %q", got)
+	}
+
+	swapped := "discord:g1/thread-notice-swapped"
+	current := seedTasklessFixed(t, r, swapped, defaultFirstEventGrace+time.Minute)
+	current.ActiveTask.TaskID = "task-current"
+	current.Tasks = append(current.Tasks, TaskRef{ID: "task-current", Addressee: "platform"})
+	if err := r.g.reg.Put(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	stale := *current
+	staleTask := *current.ActiveTask
+	staleTask.TaskID = "task-never"
+	stale.ActiveTask = &staleTask
+	r.g.noticeNoFirstEvent(ctx, &stale)
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "starts a new task instead of going to it") {
+			t.Fatalf("a stale scan posted a notice: %q", p)
+		}
+	}
+	got, err := r.g.reg.Get(ctx, swapped)
+	if err != nil || got == nil || got.ActiveTask == nil {
+		t.Fatalf("record lost: %+v (err=%v)", got, err)
+	}
+	if !got.ActiveTask.NoFirstEventNoticeAt.IsZero() {
+		t.Fatal("a stale scan marked the task that replaced the one it read")
+	}
+}
+
+// TestNoFirstEventNoticeOpensNoConsumer: the reap scan asks every record past
+// the grace whether its task has a first event, once a minute, for as long as
+// the record holds the task. A replay per question would open an ephemeral
+// consumer on TASKS each time, out of a consumer budget sized without this
+// caller; the question is answered with direct gets instead.
+func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	const conversations = 5
+	for i := 0; i < conversations; i++ {
+		conv := "discord:g1/thread-notice-budget-" + string(rune('a'+i))
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+			AuthorID: "1001", MessageID: "b-" + conv, Text: "check the fleet"}
+		var taskID string
+		waitFor(t, "task on the record for "+conv, func() bool {
+			rec, err := r.g.reg.Get(ctx, conv)
+			if err == nil && rec != nil && rec.ActiveTask != nil {
+				taskID = rec.ActiveTask.TaskID
+				return true
+			}
+			return false
+		})
+		var origin *lib.Envelope
+		waitFor(t, "submission for "+conv, func() bool {
+			for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+				if e.Kind == lib.KindMessage && e.TaskID == taskID {
+					origin = e
+					return true
+				}
+			}
+			return false
+		})
+		if err := r.execFor(t, origin, "platform").PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+			t.Fatal(err)
+		}
+		l := r.g.lockSession(conv)
+		l.Lock()
+		rec, err := r.g.reg.Get(ctx, conv)
+		if err == nil && rec != nil && rec.ActiveTask != nil {
+			rec.ActiveTask.SubmittedAt = time.Now().Add(-(defaultFirstEventGrace + time.Hour))
+			err = r.g.reg.Put(ctx, rec)
+		}
+		l.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream, err := r.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumers := func() int {
+		info, err := stream.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.State.Consumers
+	}
+	before := consumers()
+	r.g.reapOnce(ctx)
+	r.g.reapOnce(ctx)
+	if after := consumers(); after > before {
+		t.Fatalf("reap passes over %d started tasks past the grace opened consumers: %d before, %d after", conversations, before, after)
+	}
+}
+
 // TestSteerIntoTaskWithNoFirstEventPromisesNoReply (#2405 b): a steer into a
 // task with nothing on its stream is still sent, but the acknowledgement
 // promises no reply on either route, and says when the conversation frees up.
@@ -186,7 +297,7 @@ func TestSteerIntoTaskWithNoFirstEventPromisesNoReply(t *testing.T) {
 					t.Fatalf("steer into a task with no first event promised a reply: %q", ack)
 				}
 			}
-			if !strings.Contains(ack, "task-never") || !strings.Contains(ack, "nothing may answer this") ||
+			if !strings.Contains(ack, "task-never") || !strings.Contains(ack, "no reply is promised") ||
 				!strings.Contains(ack, defaultFirstEventGrace.String()) {
 				t.Fatalf("ack does not say the task is silent and when the conversation frees up: %q", ack)
 			}
@@ -205,28 +316,25 @@ func TestSteerIntoTaskWithNoFirstEventPromisesNoReply(t *testing.T) {
 }
 
 // TestNoFirstEventPastGrace pins the shared test the heal and the notice
-// both draw the line with: TaskNotFound only, strictly past the grace, and
+// both draw the line with: an empty stream only, strictly past the grace, and
 // never on a task with no age.
 func TestNoFirstEventPastGrace(t *testing.T) {
 	now := time.Now()
 	grace := defaultFirstEventGrace
-	notFound := &lib.A2AError{Code: lib.CodeTaskNotFound}
-	other := &lib.A2AError{Code: lib.CodeInvalidParams}
 	aged := func(age time.Duration) *ActiveTask { return &ActiveTask{TaskID: "t", SubmittedAt: now.Add(-age)} }
 	for name, tc := range map[string]struct {
 		active *ActiveTask
-		err    error
+		empty  bool
 		want   bool
 	}{
-		"not found past the grace":   {aged(grace + time.Second), notFound, true},
-		"not found exactly at grace": {aged(grace), notFound, false},
-		"not found inside the grace": {aged(time.Minute), notFound, false},
-		"events past the grace":      {aged(grace + time.Hour), nil, false},
-		"transport error past grace": {aged(grace + time.Hour), other, false},
-		"no submittedAt":             {&ActiveTask{TaskID: "t"}, notFound, false},
-		"no active task":             {nil, notFound, false},
+		"empty past the grace":   {aged(grace + time.Second), true, true},
+		"empty exactly at grace": {aged(grace), true, false},
+		"empty inside the grace": {aged(time.Minute), true, false},
+		"events past the grace":  {aged(grace + time.Hour), false, false},
+		"no submittedAt":         {&ActiveTask{TaskID: "t"}, true, false},
+		"no active task":         {nil, true, false},
 	} {
-		if got := noFirstEventPastGrace(tc.active, tc.err, grace, now); got != tc.want {
+		if got := noFirstEventPastGrace(tc.active, tc.empty, grace, now); got != tc.want {
 			t.Errorf("%s: got %v, want %v", name, got, tc.want)
 		}
 	}

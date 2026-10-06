@@ -52,11 +52,12 @@ const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event s
 
 // steerNoFirstEventAck is the steer acknowledgement for a task with nothing
 // on its event stream yet: the steer is on the stream, but no executor has
-// shown it holds the task, so the line promises no reply. When the task has
+// shown it holds the task (a session pod may still be starting, or nothing
+// took it), so the line promises no reply. When the task has
 // an age, steerNoFirstEventRelease follows it and says when the conversation
 // is released instead (the grace the heal judges by).
 const (
-	steerNoFirstEventAck     = "✏️ steering sent — task `%s` has shown nothing on its event stream yet, so nothing may answer this"
+	steerNoFirstEventAck     = "✏️ steering sent — task `%s` has shown nothing on its event stream yet, so no reply is promised: it may still be starting, or nothing may have taken it"
 	steerNoFirstEventRelease = "; if it is still silent %s after it was submitted, your next message here starts a new task"
 )
 
@@ -886,7 +887,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource = true, source
-	case noFirstEventPastGrace(active, err, g.cfg.FirstEventGrace, time.Now()):
+	case noFirstEventPastGrace(active, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
 			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
 			"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
@@ -1605,11 +1606,13 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// input and publishes its refusal itself. Neither line claims the steer
 	// was absorbed, which the gateway cannot know. Both assume an executor
 	// holds the task, so a task with nothing on its stream gets neither: no
-	// executor has shown it took the task, and nothing may ever answer. A
-	// read that fails says nothing either way and keeps the route's line.
-	_, _, getErr := g.client.TasksGetAttributed(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	// executor has shown it took the task, which is a pod still starting or
+	// nothing at all, and the line promises no reply. A read that fails says
+	// nothing either way and keeps the route's line. The read is direct gets
+	// (taskStreamEmpty), not a replay, so a steer opens no consumer.
+	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	switch {
-	case isTaskNotFound(getErr):
+	case emptyErr == nil && empty:
 		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
 		if !active.SubmittedAt.IsZero() {
 			ack += fmt.Sprintf(steerNoFirstEventRelease, g.cfg.FirstEventGrace)

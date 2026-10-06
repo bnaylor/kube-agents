@@ -187,8 +187,10 @@ gateway knows the route and the two executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
 if the task is still running; on a fixed-routed one, that the standing executor does
 not take mid-task input and the reply will say so. A task with nothing on its stream
-yet gets neither, on either route: both assume an executor holds the task, so the line
-says that nothing may answer and when the conversation frees up. None of these claims
+yet gets neither, on either route: both assume an executor holds the task, and none
+has shown it does (a session pod may still be starting, or nothing took the task), so
+the line promises no reply and, when the task has a submission time to measure from,
+says when the conversation frees up. None of these claims
 the steer was absorbed, which the gateway cannot know. The payload spec's refusal posture - both
 the fixed-route refusal and the race-window one - is what closes the loop on the
 stream.
@@ -385,17 +387,17 @@ under the stream's retention, which is what the content posture below needs). A 
 with nothing on either of its event subjects - no pod, or a pod that never ran - is
 released from the serialization at the conversation's next turn once it is older than the
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
-conversation saying so. A human who waits rather than writes is told too: the reap scan
-posts one line once the grace has passed with nothing on the stream, naming the task and
-saying the next message starts a new task. It marks the active-task record before it
-posts, so the line goes out at most once per task, across gateway restarts, and it
-releases nothing; the release stays with the next turn, which reads the stream again
-first. Both subjects, not just `…events`: the fold reads them together,
+conversation saying so. Both subjects, not just `…events`: the fold reads them together,
 and assertion 9 exists because a task whose only event is its supervisor's terminal is not
 empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
-named here rather than papered over. Otherwise the terminal event this chain
+named here rather than papered over. A human who waits rather than writes is told too: the reap scan
+posts one line once the grace has passed with nothing on the stream, naming the task and
+saying the next message starts a new task. It marks the active-task record before it
+posts, so the line goes out at most once per task, across gateway restarts, and it
+releases nothing; the release stays with the next turn, which reads the stream again
+first. Otherwise the terminal event this chain
 guarantees is what deletes the active-task record (and the `ask` copy riding it). A
 detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and

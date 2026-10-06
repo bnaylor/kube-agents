@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -32,7 +33,8 @@ const noFirstEventNotice = "⚠️ task `%s` has produced nothing on its event s
 // reapLoop enforces the idle TTL — a session silent past the TTL loses its
 // pod — and the ask bound (boundAskCopy), which runs on every record the
 // scan visits, pod or no pod. It also enforces SessionTTL, deleting session
-// records that have been idle past the retention horizon.
+// records that have been idle past the retention horizon, and posts the
+// no-first-event notice (noticeNoFirstEvent) on the same visit.
 func (g *Gateway) reapLoop(ctx context.Context) {
 	ticker := time.NewTicker(reapInterval)
 	defer ticker.Stop()
@@ -238,33 +240,61 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 }
 
 // noFirstEventPastGrace is the one test for "this task has produced nothing
-// past the first-event grace": the stream answered TaskNotFound for the
-// task's subjects (both of them; the fold reads them together) and the task
-// is older than grace. A pure function of its arguments, so the heal, the
-// reap scan's notice, and any later caller that has to tell a task nobody
-// took from one in flight (a count of queued tasks, say) all draw the line
-// in the same place. Only TaskNotFound qualifies: a transport failure cannot
-// rule out events. A task with no SubmittedAt has no age to judge and never
-// qualifies. Detach is the caller's business: a detached task no longer
-// holds the conversation, so neither the heal nor the notice looks at one.
-func noFirstEventPastGrace(active *ActiveTask, streamErr error, grace time.Duration, now time.Time) bool {
-	return active != nil && isTaskNotFound(streamErr) &&
+// past the first-event grace": nothing is on either of the task's replay
+// subjects (streamEmpty; the events subject and the supervisor's, which the
+// fold reads together) and the task is older than grace. A pure function of
+// its arguments, so the heal, the reap scan's notice, and any later caller
+// that has to tell a task nobody took from one in flight (a count of queued
+// tasks, say) all draw the line in the same place. streamEmpty is true only
+// on a read that found the subjects empty: the heal passes TasksGet's
+// TaskNotFound, the notice taskStreamEmpty's answer, and a read that failed
+// passes false, because a transport failure cannot rule out events. A task
+// with no SubmittedAt has no age to judge and never qualifies. Detach is the
+// caller's business: a detached task no longer holds the conversation, so
+// neither the heal nor the notice looks at one.
+func noFirstEventPastGrace(active *ActiveTask, streamEmpty bool, grace time.Duration, now time.Time) bool {
+	return active != nil && streamEmpty &&
 		!active.SubmittedAt.IsZero() && now.Sub(active.SubmittedAt) > grace
 }
 
+// taskStreamEmpty reports whether nothing is on either of a task's replay
+// subjects in the retention window. It is the test the replay makes before
+// it opens a consumer (TasksGet answers TaskNotFound exactly when this
+// answers true), made with direct gets and no consumer, so a caller that
+// only needs to know whether the task has a first event does not spend one
+// of the TASKS stream's consumer slots on a five-second ephemeral. An error
+// is the read failing, not the subjects being empty.
+func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string) (bool, error) {
+	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		return false, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
+	}
+	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
+		_, err := stream.GetLastMsgForSubject(ctx, subject)
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, jetstream.ErrMsgNotFound) {
+			return false, fmt.Errorf("newest message on %s: %w", subject, err)
+		}
+	}
+	return true, nil
+}
+
 // firstEventOverdue is noFirstEventPastGrace for a caller holding only the
-// record: it reads the active task's stream, when the task is old enough
-// for the answer to matter, and applies the test. A read and nothing else:
-// no lock, no post, no write. A task inside the grace is answered without
-// touching the stream, which is what keeps a scan over every record cheap.
+// record: when the active task is old enough for the answer to matter, it
+// asks the stream whether the task has a first event (taskStreamEmpty, no
+// consumer) and applies the test. A read and nothing else: no lock, no post,
+// no write. A task inside the grace is answered without touching the stream.
+// A read that fails answers false.
 func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) bool {
 	active := rec.ActiveTask
 	if active == nil || active.SubmittedAt.IsZero() ||
 		time.Since(active.SubmittedAt) <= g.cfg.FirstEventGrace {
 		return false
 	}
-	_, _, err := g.client.TasksGetAttributed(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
-	return noFirstEventPastGrace(active, err, g.cfg.FirstEventGrace, time.Now())
+	empty, err := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, time.Now())
 }
 
 // noticeNoFirstEvent tells a conversation, without waiting for it to speak,
