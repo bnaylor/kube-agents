@@ -167,7 +167,13 @@ collect_bench_results() {
 # cannot be reached costs the run its gateway log and nothing else. The
 # failure dumper below calls this rather than taking its own, shorter tail, so
 # the failure path never overwrites the every-run capture with less.
+# Once per process, like collect_agent_pod_diagnostics: ci-eval-pr.sh takes it
+# before the next lane's rollback round trip replaces the pod, and the EXIT
+# trap's call after that must not overwrite the eval's log with the new pod's.
+GATEWAY_LOG_COLLECTED=""
 collect_gateway_log() {
+  [ -z "${GATEWAY_LOG_COLLECTED}" ] || return 0
+  GATEWAY_LOG_COLLECTED=1
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   mkdir -p "${artifact_dir}" || true

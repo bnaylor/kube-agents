@@ -69,10 +69,12 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before. Three places read the flag: section 4 below; the baseline
+# as before. Four places read the flag: section 4 below; the baseline
 # recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
-# step after the fan-out); and the dashboard publisher's gate, which mirrors
-# the recorder's. A flagged run passes neither: the next lane's periodic on
+# step after the fan-out); the dashboard publisher's gate, which mirrors
+# the recorder's; and the rollback round trip after the suite verdict
+# (run_rollback_roundtrip, below). A flagged run passes neither the recorder
+# nor the publisher: the next lane's periodic on
 # main runs under it with no PULL_NUMBER, the shape both otherwise write
 # from, and a next-mode sample in today's window would be indistinguishable
 # once written (VersionKey in bench/kube_agents_bench/baselines.py carries
@@ -86,6 +88,23 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 # fan-out on one listener that the first unit to finish tears down. The base
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
+
+# The rollback round trip under EVAL_MODE_NEXT=1 (run_rollback_roundtrip, after
+# the suite verdict is computed): hack/rollback-roundtrip.sh flips the install
+# next -> today -> next and checks the JetStream PVC and the bus creds Secret
+# come through it (cutover condition 6, #2461). Reported beside the verdict,
+# never in it: its own log section and artifacts, no case, no effect on the
+# exit status. It starts only while the run is young enough that its own
+# bound still ends inside the presubmit's 360m deadline with the deploy
+# (about 45m on the next lane) in front of it: 210m of eval plus 60m of round
+# trip plus the deploy leaves about 45m. The bound kills a run that outlives
+# it, after a grace for its port-forwards to close.
+readonly EVAL_ROLLBACK_SCRIPT="rollback-roundtrip.sh"
+readonly EVAL_ROLLBACK_START_BY_SECONDS=12600
+readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
+readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
+readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
+readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -2888,6 +2907,54 @@ announce_suite_verdict() {
   return 1
 }
 
+# The rollback round trip, under EVAL_MODE_NEXT=1 only (the constants at the
+# top say why it runs and how long it may). Called after the suite step has
+# written eval-verdict.json and eval-verdict.md and captured SUITE_STATUS,
+# and before the final line announces them, so it can change neither: it
+# runs in a child process whose status it reports and then drops, and it
+# always returns 0. Its own section of this log, its own artifacts
+# (EVAL_ROLLBACK_LOG, the transcript; EVAL_ROLLBACK_RESULTS, the PASS/FAIL
+# lines and an outcome), and no case in the matrix.
+#
+# The flip replaces the agent pod and tears the A2A gateway down, and the
+# EXIT trap reads both for the run's diagnostics, so the eval's gateway log
+# and pod diagnostics are taken first; the gateway log collector keeps the
+# first capture of a process, so the trap does not overwrite it with the
+# replacement pod's.
+run_rollback_roundtrip() {
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    return 0
+  fi
+  local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"
+  local elapsed=$((SECONDS - START_TIME)) status=0 outcome
+  local -a bound=()
+  profile_begin "rollback round trip (report-only)"
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip (next -> today -> next), reported beside the eval verdict and not part of it ==="
+  : >"${results}" || true
+  if [ "${elapsed}" -gt "${EVAL_ROLLBACK_START_BY_SECONDS}" ]; then
+    echo "SKIPPED: the eval took ${elapsed}s, past ${EVAL_ROLLBACK_START_BY_SECONDS}s, and the round trip's ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound would not end inside the job's deadline" | tee -a "${results}"
+    echo "OUTCOME: skipped" >>"${results}" || true
+    return 0
+  fi
+  collect_gateway_log
+  collect_agent_pod_diagnostics
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
+  fi
+  # Streamed as it runs, and kept whole in its own file.
+  ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" \
+    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" 2>&1 |
+    tee "${log}" || status=${PIPESTATUS[0]}
+  if [ "${status}" -eq 0 ]; then
+    outcome="passed"
+  else
+    outcome="failed (exit ${status})"
+  fi
+  echo "OUTCOME: ${outcome}" >>"${results}" || true
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip ${outcome}; report-only, so the eval verdict below is unchanged by it (transcript: ${log}) ==="
+  return 0
+}
+
 TOTAL_DURATION=$((SECONDS - START_TIME))
 SUITE_STATUS=0
 # From here the run writes its own verdict; the EXIT trap's cut-off report
@@ -2897,5 +2964,6 @@ EVAL_SUITE_REACHED=1
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
   --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
+run_rollback_roundtrip || true
 announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
   "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?
