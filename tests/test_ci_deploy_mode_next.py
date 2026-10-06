@@ -912,6 +912,7 @@ def run_provision_wait(
                 f"PHASE_STUB=({' '.join(shlex.quote(p) for p in phases)})",
                 f"READY_STUB=({' '.join(shlex.quote(r) for r in readies)})",
                 'READS_FILE="$(mktemp)"',
+                'trap \'rm -f "${READS_FILE}"\' EXIT',
                 'echo 0 >"${READS_FILE}"',
                 'NAMESPACE="kubeagents-system"',
                 'PLATFORM_AGENT_CR_NAME="platform-agent"',

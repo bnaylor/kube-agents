@@ -1441,8 +1441,8 @@ gate_cr_not_degraded() {
     else
       phase="${pair%%$'\t'*}"
       condition="${pair#*$'\t'}"
-      # The first read keeps main's rule: one that fails reads as unphased
-      # and passes.
+      # A first read that fails reads as unphased and passes, as the gate's
+      # one read of the phase always did before the wait.
       if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
         break
       fi
