@@ -79,10 +79,11 @@ func publishTerminal(t *testing.T, r *rig, origin *lib.Envelope, party lib.Party
 	}
 }
 
-// Each terminal logs one "task terminal" line that joins its "ingress" line
-// on taskId and names how the task ended: state, whose word (executor or
-// supervisor) and the executor's reason token. Before this line the gateway
-// logged a task going out and nothing about how it ended (#2406).
+// Each terminal the relay delivers logs one "task terminal" line that joins
+// its "ingress" line on taskId and names how the task ended: state, whose
+// word (executor or supervisor) and the executor's reason token. Before this
+// line the gateway logged a task going out and nothing about how it ended
+// (#2406).
 func TestTaskTerminalLogsOneLinePerTerminal(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -222,5 +223,53 @@ func TestReasonToken(t *testing.T) {
 		if got := reasonToken(in); got != want {
 			t.Errorf("reasonToken(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The logged addressee is the one the task was published to, which is what
+// ingress logged, not the record's current one: after a Delegate re-home the
+// record points somewhere else while the delegated task is still running, and
+// its terminal must still join its ingress line.
+func TestTaskTerminalLogNamesTheTasksOwnAddressee(t *testing.T) {
+	logs := &syncBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
+	conv := "discord:g1/thread-terminal-log-rehomed"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tl-3", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The re-home, as the record sees it: the standing addressee moves on
+	// while the task's own ref keeps the addressee it was published to.
+	// Under the session lock, so a relay batch still applying the submitted
+	// status cannot write back the record it read before this edit.
+	waitFor(t, "the submitted status applied", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+	l := r.g.lockSession(conv)
+	l.Lock()
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		l.Unlock()
+		t.Fatalf("no record after the ask: %+v err=%v", rec, err)
+	}
+	rec.Addressee = "chat-rehomed"
+	err = r.g.reg.Put(ctx, rec)
+	l.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	publishTerminal(t, r, origin, lib.Party{Session: "platform"}, lib.TaskEventsSubject("platform", origin.TaskID), lib.StateFailed, "reason: spawn-failed")
+	waitFor(t, "the terminal log line", func() bool { return len(logRecords(t, logs, "task terminal")) > 0 })
+
+	got := logRecords(t, logs, "task terminal")[0]
+	ingress := logRecords(t, logs, "ingress")[0]
+	if got["addressee"] != "platform" || got["addressee"] != ingress["addressee"] {
+		t.Fatalf("addressee = %v, want platform (ingress logged %v)", got["addressee"], ingress["addressee"])
 	}
 }

@@ -23,16 +23,18 @@ const progressCap = 300
 // `reason: <token>[ - detail]` (docs/designs/eval-next-transport.md), and the
 // detail is free text from the executor or the bus: the bridge puts the tails
 // of the Hermes subprocess's stdout and stderr there, which can hold anything
-// the model or a tool printed. The token is taken the way the eval harness
-// takes it (bench/kube_agents_bench/inject_transport.py, REASON_PREFIX): strip
-// the prefix, read up to the first whitespace. A token longer than
+// the model or a tool printed. The token follows the eval harness's rule
+// (bench/kube_agents_bench/inject_transport.py, parse_reason): strip the
+// prefix, read the first word. It is stricter than the harness: nothing is
+// trimmed first, and any whitespace ends the word, not only a space, so a
+// newline can never ride into the token. A token longer than
 // reasonTokenCap, or with a byte outside [A-Za-z0-9._-], is logged as
 // reasonTokenMalformed, which no executor token can equal because its
 // parentheses are outside that set. No prefix logs an empty reason, the
 // harness's "no token".
 const (
 	reasonPrefix         = "reason: "
-	reasonTokenCap       = 64
+	reasonTokenCap       = 64 // the longest executor token today is 34 bytes
 	reasonTokenMalformed = "(malformed)"
 )
 
