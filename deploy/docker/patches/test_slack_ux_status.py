@@ -108,14 +108,15 @@ def _run(coro):
 class _Client:
     """A Slack client that records the calls this patch makes."""
 
-    def __init__(self, fail=()):
+    def __init__(self, fail=(), error="refused"):
         self.calls = []
         self.fail = set(fail)
+        self.error = error
 
     async def _record(self, name, value):
         self.calls.append((name, value))
         if name in self.fail:
-            raise RuntimeError(f"{name} refused")
+            raise RuntimeError(f"{name} {self.error}")
         return {"ok": True, "ts": PLAN_TS}
 
     async def agents_sessions_setStatus(self, **kw):
@@ -129,6 +130,17 @@ class _Client:
 
     async def chat_update(self, **kw):
         return await self._record("update", kw["blocks"])
+
+
+class _SlowClient(_Client):
+    """A client whose next ``chat_update`` waits ``slow`` seconds first."""
+
+    slow = 0.0
+
+    async def chat_update(self, **kw):
+        delay, self.slow = self.slow, 0.0
+        await asyncio.sleep(delay)
+        return await super().chat_update(**kw)
 
 
 class _Root:
@@ -417,12 +429,12 @@ class SessionTest(_RuntimeCase):
             adapter.calls,
             [
                 ("setStatus", "processing"),
-                ("rename", "why is #payments slow, see dash"),
+                ("rename", "why is payments slow, see dash"),
                 ("setStatus", "closed"),
                 ("setStatus", "processing"),
             ],
         )
-        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is #payments slow, see dash")
+        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is payments slow, see dash")
 
     def test_a_follow_up_ask_keeps_the_title(self):
         adapter = _Adapter()
@@ -450,6 +462,24 @@ class SessionTest(_RuntimeCase):
         runtime.note_ask(CHANNEL, THREAD, "scale it")
         self._status(adapter, PHRASE)
         self.assertNotIn((CHANNEL, THREAD), runtime._titles)
+
+    def test_a_refused_rename_is_a_warning_once(self):
+        adapter = _Adapter(_Client(fail={"rename"}, error="invalid_name"))
+        runtime.note_ask(CHANNEL, THREAD, "scale it")
+        with self.assertLogs(runtime.logger, "DEBUG") as logs:
+            self._status(adapter, PHRASE)
+            self._status(adapter, "")
+            self._status(adapter, PHRASE)
+        warnings = [line for line in logs.output if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1, logs.output)
+        self.assertIn("agents.sessions.rename refused", warnings[0])
+
+    def test_a_rename_that_fails_otherwise_is_debug(self):
+        adapter = _Adapter(_Client(fail={"rename"}, error="not_found"))
+        runtime.note_ask(CHANNEL, THREAD, "scale it")
+        with self.assertLogs(runtime.logger, "DEBUG") as logs:
+            self._status(adapter, PHRASE)
+        self.assertFalse([line for line in logs.output if line.startswith("WARNING")], logs.output)
 
     def test_a_refused_rename_keeps_the_first_ask_for_the_next_session(self):
         adapter = _Adapter(_Client(fail={"rename"}))
@@ -481,7 +511,7 @@ class TitleTest(unittest.TestCase):
     def test_clipped_to_the_limit_on_a_word(self):
         title = slack_status.session_title("word " * 40)
         self.assertLessEqual(len(title), slack_status.TITLE_MAX)
-        self.assertTrue(title.endswith("word" + slack_status.ELLIPSIS))
+        self.assertTrue(title.endswith("word" + slack_status.TITLE_ELLIPSIS))
 
     def test_blank_is_empty(self):
         self.assertEqual(slack_status.session_title("<@U1>"), "")
@@ -571,7 +601,7 @@ class PlanTest(_RuntimeCase):
         adapter.client.fail.add("update")
         self.assertFalse(self._note(adapter, 2, "reading metrics"))
         row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
-        self.assertEqual((row.lines, row.last_event_id), (["reading logs"], 1))
+        self.assertEqual((row.lines, row.steps, row.note, row.last_event_id), (["reading logs"], 1, "reading logs", 1))
 
     def test_a_fallen_back_plan_is_retried_once_its_cards_settle(self):
         adapter = _Adapter(_Client(fail={"post"}))
@@ -596,6 +626,17 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(blocks[0]["tasks"][0]["status"], "complete")
         self.assertEqual(adapter.calls[3], ("setStatus", "closed"))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_row_reads_as_its_current_step_then_its_result(self):
+        adapter = _Adapter()
+        last = slack_status.STEPS_MAX + 2
+        for event_id in range(1, last + 1):
+            self._note(adapter, event_id, f"note {event_id}")
+        running = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual(running["title"], f"note {last} · step {last} ▸")
+        _run(runtime.settle_row(adapter, _sub(), "completed", "both pods are up"))
+        done = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual((done["status"], done["title"]), ("complete", "both pods are up"))
 
     def test_a_waiting_row_keeps_the_plan(self):
         adapter = _Adapter()
@@ -675,6 +716,18 @@ class PlanTest(_RuntimeCase):
         self.assertTrue(self._move(adapter, 1, "ready"))
         self.assertEqual((adapter.calls, runtime._plans), ([], {}))
 
+    def test_a_move_is_never_the_rows_title_whatever_its_wording(self):
+        # A status event with no status falls back to upstream's own move line, which has no "→ ".
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.deliver_row(adapter, _sub(), 2, "check payments", "🔄 moved", ""))
+        self._move(adapter, 3, "todo")
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual(task["title"], "reading logs")
+        self._note(adapter, 4, "→ rolling back the node pool")
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual(task["title"], "→ rolling back the node pool · step 2 ▸")
+
     def test_a_move_joins_the_trail_and_leaves_a_settled_row_settled(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs", task="t_a")
@@ -700,7 +753,7 @@ class PlanTest(_RuntimeCase):
         adapter.client.fail.add("update")
         self.assertFalse(self._move(adapter, 2, "review"))
         row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
-        self.assertEqual((row.lines, row.last_event_id), (["reading logs"], 1))
+        self.assertEqual((row.lines, row.steps, row.note, row.last_event_id), (["reading logs"], 1, "reading logs", 1))
 
     def test_a_move_for_a_card_rolling_on_a_set_aside_plan_goes_to_its_rolling_message(self):
         async def scenario(adapter):
@@ -971,6 +1024,38 @@ class PlanTest(_RuntimeCase):
         self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed"])
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
 
+    def test_a_lapse_due_during_a_notes_render_keeps_the_plan(self):
+        # The note lands within one chat.update of the hold running out.
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "reading logs")
+            await asyncio.sleep(0.1)
+            adapter.client.slow = 0.6  # the hold runs out 0.2 s into this render
+            await runtime.deliver_row(adapter, _sub("t_a"), 2, "check payments", "reading metrics")
+            await runtime.deliver_row(adapter, _sub("t_a"), 3, "check payments", "restarting")
+
+        adapter = _Adapter(_SlowClient())
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.3):
+            _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter).count("post"), 1)
+        self.assertNotIn((CHANNEL, THREAD), runtime._lapsed)
+
+    def test_an_expiry_due_while_an_unblocked_row_renders_keeps_its_plan(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "asking")
+            await runtime.settle_row(adapter, _sub("t_a"), "blocked")
+            await asyncio.sleep(0.4)  # set aside at 0.1 s; its expiry is due at 0.5 s
+            adapter.client.slow = 0.25
+            await runtime.settle_row(adapter, _sub("t_a"), "unblocked")
+            await runtime.deliver_row(adapter, _sub("t_a"), 2, "check payments", "restarting")
+
+        adapter = _Adapter(_SlowClient())
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.1), mock.patch.object(
+            runtime, "SET_ASIDE_MAX_SECONDS", 0.4,
+        ):
+            _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter).count("post"), 1)
+        self.assertIn((CHANNEL, THREAD), runtime._plans)
+
     def test_a_card_after_a_lapse_starts_a_new_plan(self):
         # t_a's terminal event was lost; t_b must not land on its stale plan.
         async def scenario(adapter):
@@ -1005,13 +1090,14 @@ class PlanTest(_RuntimeCase):
         async def scenario(adapter):
             await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs")
             await asyncio.sleep(0.2)
-            await runtime.settle_row(adapter, _sub(), "completed")
+            await runtime.settle_row(adapter, _sub(), "completed", "both pods are up")
 
         adapter = _Adapter()
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "setStatus", "update"])
-        self.assertEqual(adapter.calls[-1][1][0]["tasks"][0]["status"], "complete")
+        task = adapter.calls[-1][1][0]["tasks"][0]
+        self.assertEqual((task["status"], task["title"]), ("complete", "both pods are up"))
         self.assertEqual(adapter.calls[2], ("setStatus", "closed"))
         self.assertEqual(runtime._lapsed, {})
 
@@ -1113,8 +1199,9 @@ class PlanTest(_RuntimeCase):
 
     def test_a_card_answered_beside_a_newer_plan_ends_on_its_own_timer(self):
         # The answered plan is armed well after the newer plan, so the newer
-        # plan's lapse is not what ends its processing.
-        hold = 0.2
+        # plan's lapse is not what ends its processing. Every step sits at
+        # least 150 ms from the timer it must precede or follow.
+        hold = 0.5
 
         async def scenario(adapter):
             await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")
@@ -1122,10 +1209,10 @@ class PlanTest(_RuntimeCase):
             await asyncio.sleep(hold * 2)
             await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "reading logs")
             await runtime.settle_row(adapter, _sub("t_b"), "blocked")
-            await asyncio.sleep(hold * 0.6)
+            await asyncio.sleep(hold * 0.5)
             await runtime.settle_row(adapter, _sub("t_w"), "unblocked")
             self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
-            await asyncio.sleep(hold * 0.6)
+            await asyncio.sleep(hold * 0.7)
             self.assertEqual(adapter.calls[-1], ("setStatus", "processing"), "the newer plan lapsed")
             await asyncio.sleep(hold * 1.5)
             self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))

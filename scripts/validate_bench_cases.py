@@ -186,6 +186,12 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "networking-audit-second-project": (
+        "#1865: needs a second GCP project per pool project that the agent's "
+        "service account can read, holding a PSC endpoint its service attachment "
+        "rejects; the evaluation fleet has one project per install today, so no "
+        "CI tier can run it; run it by hand against an install with such a project"
+    ),
     "vcs-history-only-fact": (
         "#1253: needs the git-access-ab/r200 branch pushed to every pool "
         "project's GitOps repository; the dev project carries it, the pool does "
@@ -221,6 +227,12 @@ KNOWN_NO_DOMAIN = {
         "a skill-governance refusal graded on the worker's card result and on "
         "its skill_manage calls (none may succeed); reads no fleet, and no "
         "domains.yaml row describes skill or self-modification governance"
+    ),
+    "vcs-forge-cli-request-uses-the-verbs": (
+        "a read-only forge question that names gh, graded on the route the "
+        "worker took to the answer (the version-control verbs, not a forge "
+        "CLI); like vcs-history-only-fact, no domains.yaml row describes "
+        "repository access"
     ),
     "vcs-history-only-fact": (
         "a repository-history question graded on the answer and on the route "
@@ -316,6 +328,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),
+    "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
+    # No field: "the gateway would post nothing" is the assertion.
+    "reply_is_silent": (),
     # This repository, agent-disk-reading: the discovery sweep a cron job filed.
     "bootstrap_fanout": ("require",),
     # This repository, sandbox-reading: the findings the onboarding
