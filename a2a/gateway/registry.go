@@ -51,6 +51,12 @@ type ActiveTask struct {
 	// retarget). A detached task no longer serializes the session; its events,
 	// if they ever arrive, still relay.
 	Detached bool `json:"detached,omitempty"`
+	// NoFirstEventNoticeAt is when the reap scan told the conversation that
+	// this task had produced nothing past FirstEventGrace. Zero until then.
+	// On the record rather than in memory so the notice is posted once per
+	// task across gateway restarts; it goes with ActiveTask when the task is
+	// released or ends.
+	NoFirstEventNoticeAt time.Time `json:"noFirstEventNoticeAt,omitempty"`
 }
 
 // SessionRecord is one conversation's durable state in the session-state KV

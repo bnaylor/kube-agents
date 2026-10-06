@@ -50,6 +50,16 @@ const relayDurable = "gateway-relay"
 // the evidence (nothing on the stream in that long), not the inference.
 const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
 
+// steerNoFirstEventAck is the steer acknowledgement for a task with nothing
+// on its event stream yet: the steer is on the stream, but no executor has
+// shown it holds the task, so the line promises no reply. When the task has
+// an age, steerNoFirstEventRelease follows it and says when the conversation
+// is released instead (the grace the heal judges by).
+const (
+	steerNoFirstEventAck     = "✏️ steering sent — task `%s` has shown nothing on its event stream yet, so nothing may answer this"
+	steerNoFirstEventRelease = "; if it is still silent %s after it was submitted, your next message here starts a new task"
+)
+
 // Hex-suffix widths for the ids the gateway mints. Context and correlation
 // ids are wider than task and message ids: they outlive one task and join
 // records across surfaces, so a collision costs more.
@@ -876,8 +886,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource = true, source
-	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
-		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
+	case noFirstEventPastGrace(active, err, g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
 			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
 			"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
@@ -1594,10 +1603,21 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// amended 8/31) - a session worker absorbs at its next turn boundary if
 	// the task is still running; the fixed-route executor refuses mid-task
 	// input and publishes its refusal itself. Neither line claims the steer
-	// was absorbed, which the gateway cannot know.
-	if rec.AddressedToOwnSession() {
+	// was absorbed, which the gateway cannot know. Both assume an executor
+	// holds the task, so a task with nothing on its stream gets neither: no
+	// executor has shown it took the task, and nothing may ever answer. A
+	// read that fails says nothing either way and keeps the route's line.
+	_, _, getErr := g.client.TasksGetAttributed(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	switch {
+	case isTaskNotFound(getErr):
+		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
+		if !active.SubmittedAt.IsZero() {
+			ack += fmt.Sprintf(steerNoFirstEventRelease, g.cfg.FirstEventGrace)
+		}
+		g.post(rec.Key, ack)
+	case rec.AddressedToOwnSession():
 		g.post(rec.Key, "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running")
-	} else {
+	default:
 		g.post(rec.Key, "✏️ steering sent — the standing executor does not take mid-task input; its reply will say so")
 	}
 }
