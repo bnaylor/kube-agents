@@ -53,10 +53,9 @@ class D1Attributable(unittest.TestCase):
         """A write to the Slack principal map grants a principal.
 
         The A2A gateway joins a Slack `user_id` to a principal through the
-        admin-owned `a2a-slack-principal-map` Secret (the Slack token pair
-        is `a2a-slack-bot` beside it), so write access to that table is an
-        impersonation primitive, and spec-chatops-gateway.md says no product
-        ServiceAccount gets it. The operator reaches those Secrets by the
+        admin-owned `a2a-slack-principal-map` Secret, so write access to that
+        table is an impersonation primitive, and spec-chatops-gateway.md says
+        no product ServiceAccount gets it. The operator reaches that Secret by the
         kubelet's mount alone: this asserts that no Role or ClusterRole it
         mints names `secrets` at all, or a wildcard that would.
 
