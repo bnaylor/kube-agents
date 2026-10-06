@@ -861,6 +861,7 @@ def run_provision_wait(
     phase: str | list[str] = "",
     status_attempts: int = 1,
     unschedulable_attempts: int = 2,
+    pods: str | list[str] = "",
 ) -> subprocess.CompletedProcess:
     """Run wait_provision_job or gate_cr_not_degraded as step 6b calls them,
     against a kubectl stub that answers each jsonpath read with what the test
@@ -880,12 +881,24 @@ def run_provision_wait(
     phase is DROPPED_READ answers every read of it with nothing and a failed
     kubectl, as a GET the API drops does. The output counts the status reads
     (READS=) on both the pass and the fail line, so a test can tell one read
-    from a wait."""
+    from a wait.
+
+    `pods` is the agent's pods as the gate's one pod read lists them (a line
+    per pod: name, a tab, the node it is bound to), and may be a list too,
+    one entry per pod read, the last repeating. An entry of DROPPED_READ is
+    a pod read the API drops. The stub answers only a read by the agent
+    Deployment's own label; any other selector reads back as dropped. The
+    pod reads are counted too, on a line of their own after the pass or fail
+    line (POD_READS=)."""
     consts = constants()
     phases = phase if isinstance(phase, list) else [phase]
     readies = ready if isinstance(ready, list) else [ready]
+    pod_lists = pods if isinstance(pods, list) else [pods]
     stub = (
         'kubectl() { local v; case "$*" in '
+        '*"get pods"*) v="$(pod_version)"; [[ "$*" == *"-l app=platform-agent-gateway "* ]] || return 1; '
+        f'[ "$(stub_nth "${{v}}" "${{POD_STUB[@]}}")" = {shlex.quote(DROPPED_READ)} ] && return 1; '
+        'stub_nth "${v}" "${POD_STUB[@]}" ;; '
         '*"get jobs"*) printf "%s" "${JOBS_STUB}" ;; '
         '*observedGeneration*) printf "%s" "${OBSERVED_STUB}" ;; '
         "*status.phase*'type==\"Ready\"'*) v=\"$(stub_version)\"; stub_dropped \"${v}\" && return 1; "
@@ -896,6 +909,8 @@ def run_provision_wait(
     )
     # The status version this read sees (from zero), counting the read.
     stub_version = 'stub_version() { local n; n="$(<"${READS_FILE}")"; echo $((n + 1)) >"${READS_FILE}"; echo "${n}"; }'
+    # The same for the pod reads, on a count of their own.
+    pod_version = 'pod_version() { local n; n="$(<"${POD_READS_FILE}")"; echo $((n + 1)) >"${POD_READS_FILE}"; echo "${n}"; }'
     # The Nth (from zero) of the entries after N, or the last past the end.
     stub_nth = (
         'stub_nth() { local n="$1"; shift; '
@@ -911,11 +926,15 @@ def run_provision_wait(
                 f'export JOBS_STUB="{jobs}" OBSERVED_STUB="{observed}"',
                 f"PHASE_STUB=({' '.join(shlex.quote(p) for p in phases)})",
                 f"READY_STUB=({' '.join(shlex.quote(r) for r in readies)})",
+                f"POD_STUB=({' '.join(shlex.quote(p) for p in pod_lists)})",
                 'READS_FILE="$(mktemp)"',
-                'trap \'rm -f "${READS_FILE}"\' EXIT',
+                'POD_READS_FILE="$(mktemp)"',
+                'trap \'rm -f "${READS_FILE}" "${POD_READS_FILE}"\' EXIT',
                 'echo 0 >"${READS_FILE}"',
+                'echo 0 >"${POD_READS_FILE}"',
                 'NAMESPACE="kubeagents-system"',
                 'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                f'AGENT_DEPLOYMENT_NAME="{consts["AGENT_DEPLOYMENT_NAME"]}"',
                 f'A2A_PROVISION_JOB_SELECTOR="{consts["A2A_PROVISION_JOB_SELECTOR"]}"',
                 'A2A_NATS_POD_SELECTOR="app=platform-agent-a2a-nats"',
                 "MODE_NEXT_DIAG_LOG_LINES=5",
@@ -931,6 +950,7 @@ def run_provision_wait(
                 f"SCHEDULER_CAPACITY_SHORTFALL_RE={shlex.quote(consts['SCHEDULER_CAPACITY_SHORTFALL_RE'])}",
                 "MODE_NEXT_START=0",
                 stub_version,
+                pod_version,
                 stub_nth,
                 stub_dropped,
                 stub,
@@ -938,7 +958,7 @@ def run_provision_wait(
                 # so a five-read wait costs nothing. The Job wait polls by the
                 # clock and keeps its one-second poll.
                 'gate_cr_not_degraded_fast() { MODE_NEXT_POLL_SECONDS=0 gate_cr_not_degraded "$@"; }',
-                'dump_mode_next_state() { echo "DUMPED ELAPSED=${SECONDS} READS=$(<"${READS_FILE}")"; }',
+                'dump_mode_next_state() { echo "DUMPED ELAPSED=${SECONDS} READS=$(<"${READS_FILE}")"; echo "POD_READS=$(<"${POD_READS_FILE}")"; }',
                 shell_function("cr_phase_and_ready_condition"),
                 shell_function("cr_ready_condition"),
                 shell_function("wait_provision_job"),
@@ -946,6 +966,7 @@ def run_provision_wait(
                 "SECONDS=0",
                 call,
                 'echo "PASSED NAME=${PROVISION_JOB_NAME:-} CONDITIONS=${PROVISION_JOB_CONDITIONS:-} RERENDERED=${PROVISION_JOB_RERENDERED:-} ELAPSED=${SECONDS} READS=$(<"${READS_FILE}")"',
+                'echo "POD_READS=$(<"${POD_READS_FILE}")"',
             ]
         )
     )
@@ -1376,6 +1397,134 @@ class TransientUnschedulableGateTest(unittest.TestCase):
         controller = text(_CONTROLLER / "platformagent_controller.go")
         self.assertIn(f'reason = "{consts["CR_READY_REASON_POD_UNSCHEDULABLE"]}"', controller)
         self.assertIn('message = fmt.Sprintf("Pod %s cannot be scheduled onto any available node: %s.", pod.Name, cleanMsg)', controller)
+
+
+# The agent pod _WAITING_FOR_CAPACITY names, as the gate's pod read lists it:
+# unscheduled (no node yet), and bound to a node.
+_AGENT_POD = "platform-agent-gateway-57ddfbc5bf-25f5x"
+_POD_UNSCHEDULED = f"{_AGENT_POD}\t\n"
+_POD_SCHEDULED = f"{_AGENT_POD}\tgk3-autopilot-pool-2-1a2b3c4d-x7k9\n"
+
+
+class CapacityWaitReadsThePodTest(unittest.TestCase):
+    """While the gate forgives a capacity PodUnschedulable it also reads the
+    agent's pods, once per poll, and hands off to the rollout gate once one
+    is bound to a node. The CR cannot be waited on for that: the operator
+    watches no Pods, so the scheduler binding the pod moves nothing that
+    wakes it, and its status keeps the scheduler's old message until its
+    next pass -- the Deployment's status changing when the pod is Ready, or
+    a requeue that is fifteen minutes once the provision Job is done. Image
+    pulls and the agent's start on a fresh node all ran inside the window on
+    that stale text."""
+
+    _GATE = 'gate_cr_not_degraded_fast "the sidecar patch"'
+
+    def _count(self, name: str, result: subprocess.CompletedProcess) -> int:
+        return int(re.search(rf"(?:^| ){name}=(\d+)", result.stdout, re.MULTILINE).group(1))
+
+    def _handed_off(self, result: subprocess.CompletedProcess, rereads: int) -> None:
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASSED", result.stdout)
+        self.assertRegex(
+            result.stdout,
+            re.escape(f"✓ the wait for capacity handed off after {rereads} re-reads, ")
+            + r"\d+s"
+            + re.escape(
+                ": the agent pod was scheduled on gk3-autopilot-pool-2-1a2b3c4d-x7k9"
+                f" ({_AGENT_POD}); the rollout gate decides from here"
+                f" (platform-agent still reads Degraded; Ready condition: {_WAITING_FOR_CAPACITY})\n"
+            ),
+        )
+        # A hand-off, not the CR read as healthy.
+        self.assertNotIn("✓ platform-agent is", result.stdout)
+        self.assertNotIn("cleared", result.stdout)
+        self.assertNotIn("ERROR", result.stdout)
+
+    def test_a_scheduled_pod_under_a_stale_condition_hands_off_on_that_poll(self) -> None:
+        result = run_provision_wait(
+            jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, pods=_POD_SCHEDULED, unschedulable_attempts=5
+        )
+        self._handed_off(result, 0)
+        self.assertEqual(self._count("READS", result), 1)
+        self.assertEqual(self._count("POD_READS", result), 1)
+        self.assertNotIn("re-read 1/", result.stdout)
+
+    def test_a_pod_scheduled_on_the_third_poll_hands_off_then(self) -> None:
+        result = run_provision_wait(
+            jobs="",
+            call=self._GATE,
+            phase="Degraded",
+            ready=_WAITING_FOR_CAPACITY,
+            pods=[_POD_UNSCHEDULED, _POD_UNSCHEDULED, _POD_SCHEDULED],
+            unschedulable_attempts=5,
+        )
+        self._handed_off(result, 2)
+        self.assertEqual(self._count("READS", result), 3)
+        self.assertEqual(self._count("POD_READS", result), 3)
+        self.assertIn("re-read 2/5", result.stdout)
+        self.assertNotIn("re-read 3/5", result.stdout)
+
+    def test_a_pod_never_scheduled_fails_at_the_end_of_the_window_as_before(self) -> None:
+        for name, pods in {"unscheduled throughout": _POD_UNSCHEDULED, "no agent pod listed": ""}.items():
+            with self.subTest(name):
+                result = run_provision_wait(
+                    jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, pods=pods, unschedulable_attempts=3
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self._count("READS", result), 4)
+                # Every poll read the pod, the window's last included.
+                self.assertEqual(self._count("POD_READS", result), 4)
+                self.assertIn("re-read 3/3", result.stdout)
+                self.assertIn("the wait for capacity ended after 3 re-reads", result.stdout)
+                self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+                self.assertIn("DUMPED", result.stdout)
+                self.assertNotIn("handed off", result.stdout)
+                self.assertNotIn("PASSED", result.stdout)
+
+    def test_a_dropped_pod_read_is_one_more_poll(self) -> None:
+        result = run_provision_wait(
+            jobs="",
+            call=self._GATE,
+            phase="Degraded",
+            ready=_WAITING_FOR_CAPACITY,
+            pods=[DROPPED_READ, _POD_SCHEDULED],
+            unschedulable_attempts=5,
+        )
+        self._handed_off(result, 1)
+        self.assertEqual(self._count("READS", result), 2)
+        self.assertEqual(self._count("POD_READS", result), 2)
+        self.assertIn("re-read 1/5", result.stdout)
+        # And dropped to the end of the window, the gate fails closed.
+        result = run_provision_wait(
+            jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, pods=DROPPED_READ, unschedulable_attempts=3
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self._count("POD_READS", result), 4)
+        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertNotIn("handed off", result.stdout)
+
+    def test_a_condition_about_another_workloads_pod_is_not_handed_off_by_the_agents(self) -> None:
+        """The rollout gate the hand-off leads to is the agent Deployment's,
+        so only a condition about an agent pod is handed off on one. The
+        operator scans the A2A gateway, the sandbox and the proxy pods too."""
+        other = _WAITING_FOR_CAPACITY.replace(_AGENT_POD, "platform-agent-a2a-gateway-6c9f7d8b5-q2wzn")
+        result = run_provision_wait(jobs="", call=self._GATE, phase="Degraded", ready=other, pods=_POD_SCHEDULED, unschedulable_attempts=3)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self._count("READS", result), 4)
+        self.assertEqual(self._count("POD_READS", result), 0)
+        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {other}", result.stdout)
+        self.assertNotIn("handed off", result.stdout)
+
+    def test_the_pod_read_is_the_operators_selector_for_the_agent_pod(self) -> None:
+        """The stub answers only `-l app=platform-agent-gateway`; this pins
+        that to what the operator lists the agent's pods by when it writes
+        PodUnschedulable, and to the Deployment the rollout gate waits on."""
+        consts = constants()
+        self.assertEqual(consts["AGENT_DEPLOYMENT_NAME"], "${PLATFORM_AGENT_CR_NAME}-gateway")
+        controller = text(_CONTROLLER / "platformagent_controller.go")
+        scan = controller[controller.index("func (r *PlatformAgentReconciler) getDeploymentStatusDetails(") :]
+        self.assertIn('{"app": agent.Name + "-gateway"},', scan[: scan.index("pods := make(")])
+        self.assertIn('-l "app=${AGENT_DEPLOYMENT_NAME}"', shell_function("gate_cr_not_degraded"))
 
 
 class SidecarPatchTest(unittest.TestCase):

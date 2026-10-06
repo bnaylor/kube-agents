@@ -312,13 +312,18 @@ readonly MODE_NEXT_STATUS_ATTEMPTS=12
 readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
 readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
 # How many more reads, MODE_NEXT_POLL_SECONDS apart, that Degraded gets before
-# the gate fails on it: five minutes. The three runs in #2414 had the pod
-# assigned within seconds, but the CR's status does not move when the pod is
-# assigned. The operator rewrites it on its next pass, and nothing it watches
-# changes on an assignment; the Deployment's status does once the pod is
-# Ready. So the window covers adding a node, pulling both images onto it, and
-# the agent's start, with room for a scale-up that takes a few minutes rather
-# than one. Half the rollout budget the next gate gives the same Deployment.
+# the gate fails on it: five minutes, for the scheduler to place the pod. The
+# CR's status does not say when it has: the operator watches no Pods, so an
+# assignment wakes nothing, and the status keeps the scheduler's message
+# until the operator's next pass -- the Deployment's status moving once the
+# pod is Ready, or a requeue that is fifteen minutes once the provision Job
+# is done. So while it forgives that Degraded about an agent pod the gate
+# also reads the agent's pods, and the first one bound to a node ends the
+# wait: the image pulls and the agent's start on the new node are the next
+# gate's to time, on its rollout budget for the same Deployment, not this
+# window's. The three runs in #2414 had the pod assigned within seconds; five
+# minutes leaves room for a scale-up that takes a few minutes rather than one,
+# and is half that rollout budget.
 readonly MODE_NEXT_UNSCHEDULABLE_ATTEMPTS=60
 readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
@@ -1418,7 +1423,11 @@ wait_provision_job() {
 # clears on its own (#2414). That one is re-read up to
 # MODE_NEXT_UNSCHEDULABLE_ATTEMPTS times, with a line per read, and fails as
 # any other Degraded does if it is still there at the end or turns into
-# something else. A read that returns nothing, the first read included, is
+# something else. When the condition is about an agent pod, each of those
+# reads also reads the agent's pods, in one read, and a pod bound to a node
+# ends the gate as a hand-off to the agent Deployment's rollout gate that
+# follows it, because the condition can outlive the wait it describes (the
+# window's constant says why). A read that returns nothing, the first read included, is
 # one more re-read against that window, never a pass: the read swallows a
 # failed GET, and the CR carries a status once its provisioning Job has run,
 # so nothing read is no answer. A window that ends with no read answering
@@ -1426,6 +1435,7 @@ wait_provision_job() {
 # the artifact says what the CR said.
 gate_cr_not_degraded() {
   local what="$1" pair phase="" condition="" rereads=0 answered="" capacity="" unanswered="" gate_start=$SECONDS
+  local agent_pods pod_line pod_node="" pod_name=""
   while :; do
     # One read, so the phase and the condition are one object version's.
     pair="$(cr_phase_and_ready_condition)"
@@ -1461,6 +1471,26 @@ gate_cr_not_degraded() {
       if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
         break
       fi
+      if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: Pod ${AGENT_DEPLOYMENT_NAME}-"* ]] &&
+        [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
+        # The condition may be stale: the operator watches no Pods, so the
+        # scheduler binding the agent pod wakes nothing, and the status keeps
+        # the old message until the operator's next pass. So the pod itself,
+        # by the label the operator lists the agent's pods by, in one read a
+        # line per pod. Bound to a node is the end of what this gate forgives;
+        # the agent Deployment's rollout gate, which runs next, decides the
+        # rest. Nothing listed, a pod not yet bound, or a dropped read (the
+        # read swallows the failure) is one more poll like any other here.
+        agent_pods="$(kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}' 2>/dev/null || true)"
+        while IFS= read -r pod_line; do
+          if [[ "${pod_line}" == *$'\t'?* ]]; then
+            pod_name="${pod_line%%$'\t'*}"
+            pod_node="${pod_line#*$'\t'}"
+            break
+          fi
+        done <<<"${agent_pods}"
+        [ -n "${pod_node}" ] && break
+      fi
       if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
         [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] && [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
         rereads=$((rereads + 1))
@@ -1481,6 +1511,10 @@ gate_cr_not_degraded() {
     dump_mode_next_state
     exit 1
   done
+  if [ -n "${pod_node}" ]; then
+    echo "✓ the wait for capacity handed off after ${rereads} re-reads, $((SECONDS - gate_start))s: the agent pod was scheduled on ${pod_node} (${pod_name}); the rollout gate decides from here (${PLATFORM_AGENT_CR_NAME} still reads ${phase}; Ready condition: ${condition})"
+    return 0
+  fi
   if [ -n "${capacity}" ]; then
     echo "✓ the wait for capacity cleared after ${rereads} re-reads, $((SECONDS - gate_start))s"
   elif [ "${rereads}" -gt 0 ]; then
