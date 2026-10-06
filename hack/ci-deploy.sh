@@ -1412,50 +1412,68 @@ wait_provision_job() {
 # not show: phase Degraded, or Ready carrying the reason a refused provision is
 # given.
 # A refusal is already written when the Job is done, not a lag, so it fails
-# on the first read, and so does every other Degraded but one: a pod waiting
-# for CPU or memory (CR_READY_REASON_POD_UNSCHEDULABLE with a count matching
-# SCHEDULER_CAPACITY_SHORTFALL_RE), which an Autopilot scale-up clears on its
-# own (#2414). That one is re-read up to MODE_NEXT_UNSCHEDULABLE_ATTEMPTS
-# times, with a line per read, and fails as any other Degraded does if it is
-# still there at the end or turns into something else. A read that returns
-# nothing inside that wait is one more re-read, never a pass; the first read
-# keeps the rule it had, a failed read passing as unphased. Prints the
-# condition either way, so the artifact says what the CR said.
+# on the first read that answers, and so does every other Degraded but one: a
+# pod waiting for CPU or memory (CR_READY_REASON_POD_UNSCHEDULABLE with a
+# count matching SCHEDULER_CAPACITY_SHORTFALL_RE), which an Autopilot scale-up
+# clears on its own (#2414). That one is re-read up to
+# MODE_NEXT_UNSCHEDULABLE_ATTEMPTS times, with a line per read, and fails as
+# any other Degraded does if it is still there at the end or turns into
+# something else. A read that returns nothing, the first read included, is
+# one more re-read against that window, never a pass: the read swallows a
+# failed GET, and the CR carries a status once its provisioning Job has run,
+# so nothing read is no answer. A window that ends with no read answering
+# fails as a CR that could not be read. Prints the condition either way, so
+# the artifact says what the CR said.
 gate_cr_not_degraded() {
-  local what="$1" pair phase condition rereads=0 unanswered="" gate_start=$SECONDS
+  local what="$1" pair phase="" condition="" rereads=0 answered="" capacity="" unanswered="" gate_start=$SECONDS
   while :; do
     # One read, so the phase and the condition are one object version's.
     pair="$(cr_phase_and_ready_condition)"
-    if [ "${rereads}" -gt 0 ] && [ -z "${pair//$'\t'/}" ]; then
-      # Nothing read mid-wait: a GET the API dropped (the read swallows the
-      # failure) or a status read back empty. One more poll against the
-      # window, never a pass: the read before it said Degraded. phase and
-      # condition keep that read's, so a window that ends here fails on it.
+    if [ -z "${pair//$'\t'/}" ]; then
+      # Nothing read: a GET the API dropped (the read swallows the failure)
+      # or a status read back empty. One more poll against the window, never
+      # a pass. phase and condition keep the last answering read's, so a
+      # window that ends here fails on it, or, with none, as unread.
       if [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ]; then
         rereads=$((rereads + 1))
-        echo "the read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (last Ready condition: ${condition})"
+        if [ -n "${answered}" ]; then
+          echo "the read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (last Ready condition: ${condition})"
+        elif [ "${rereads}" -eq 1 ]; then
+          echo "the first read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (no read has answered yet)"
+        else
+          echo "the read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing again, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (no read has answered yet)"
+        fi
         sleep "${MODE_NEXT_POLL_SECONDS}"
         continue
       fi
+      if [ -z "${answered}" ]; then
+        echo "ERROR: could not read ${PLATFORM_AGENT_CR_NAME} after ${what}: all $((rereads + 1)) reads in $((SECONDS - gate_start))s returned nothing, so there is no phase or Ready condition to judge"
+        echo "--- provisioning Job pod logs ---"
+        kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+        dump_mode_next_state
+        exit 1
+      fi
       unanswered="; the last read returned nothing, so this is the last one that answered"
     else
+      answered="true"
       phase="${pair%%$'\t'*}"
       condition="${pair#*$'\t'}"
-      # A first read that fails reads as unphased and passes, as the gate's
-      # one read of the phase always did before the wait.
       if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
         break
       fi
       if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
         [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] && [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
         rereads=$((rereads + 1))
+        capacity="true"
         echo "${PLATFORM_AGENT_CR_NAME} is ${phase} after ${what} on a pod waiting for CPU or memory, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (Ready condition: ${condition})"
         sleep "${MODE_NEXT_POLL_SECONDS}"
         continue
       fi
     fi
-    if [ "${rereads}" -gt 0 ]; then
+    if [ -n "${capacity}" ]; then
       echo "the wait for capacity ended after ${rereads} re-reads, $((SECONDS - gate_start))s${unanswered}"
+    elif [ "${rereads}" -gt 0 ]; then
+      echo "${PLATFORM_AGENT_CR_NAME} answered after ${rereads} reads that returned nothing, $((SECONDS - gate_start))s"
     fi
     echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what}; Ready condition: ${condition:-none}"
     echo "--- provisioning Job pod logs ---"
@@ -1463,8 +1481,10 @@ gate_cr_not_degraded() {
     dump_mode_next_state
     exit 1
   done
-  if [ "${rereads}" -gt 0 ]; then
+  if [ -n "${capacity}" ]; then
     echo "✓ the wait for capacity cleared after ${rereads} re-reads, $((SECONDS - gate_start))s"
+  elif [ "${rereads}" -gt 0 ]; then
+    echo "✓ ${PLATFORM_AGENT_CR_NAME} answered after ${rereads} reads that returned nothing, $((SECONDS - gate_start))s"
   fi
   echo "✓ ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what} (Ready condition: ${condition:-none})"
 }

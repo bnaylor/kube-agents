@@ -1030,7 +1030,6 @@ class ProvisionRerunGateTest(unittest.TestCase):
             ("Degraded", "A2AProvisionFailed: TASKS holds 64 consumers"): 1,
             ("Ready", "A2AProvisionFailed: TASKS holds 64 consumers"): 1,
             ("Degraded", "InvalidGitRepoURL: not this PR's"): 1,
-            ("", ""): 0,
         }
         for (phase, ready), status in cases.items():
             with self.subTest(phase=phase, ready=ready):
@@ -1038,11 +1037,19 @@ class ProvisionRerunGateTest(unittest.TestCase):
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 if status == 0:
                     self.assertIn("PASSED", result.stdout)
-                    self.assertIn(f"✓ platform-agent is {phase or 'unphased'} after the sidecar patch", result.stdout)
+                    self.assertIn(f"✓ platform-agent is {phase} after the sidecar patch", result.stdout)
                 else:
                     self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
                     self.assertIn("DUMPED", result.stdout)
                     self.assertNotIn("PASSED", result.stdout)
+        # A status read back empty is no answer: the CR carries a status once
+        # its provisioning Job has run. Re-read to the end of the window,
+        # then red as unread, never a pass as an unphased CR.
+        result = run_provision_wait(jobs="", call=gate, phase="", ready="")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ERROR: could not read platform-agent after the sidecar patch: all 3 reads in ", result.stdout)
+        self.assertNotIn("unphased", result.stdout)
+        self.assertNotIn("PASSED", result.stdout)
 
     def test_the_status_words_are_the_operators(self) -> None:
         consts = constants()
@@ -1086,7 +1093,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
     CPU or memory while a node is added; the operator calls that Degraded.
     The gate re-reads that one Degraded for a bounded window and nothing
     else: a refused provision and every other Degraded fail on the first
-    read, as they did before."""
+    read that answers, as they did before."""
 
     _GATE = 'gate_cr_not_degraded_fast "the sidecar patch"'
 
@@ -1249,15 +1256,71 @@ class TransientUnschedulableGateTest(unittest.TestCase):
         self.assertIn("DUMPED", result.stdout)
         self.assertNotIn("PASSED", result.stdout)
 
-    def test_a_dropped_first_read_passes_as_it_did_before(self) -> None:
-        """Outside a wait there is no Degraded to hold on to, and main's gate
-        took a first read that failed as an unphased CR. That is kept: this
-        change is the wait, not the first read. Every read is dropped here,
-        so main's gate, which made two, passes this too."""
-        result = run_provision_wait(jobs="", call=self._GATE, phase=DROPPED_READ)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("✓ platform-agent is unphased after the sidecar patch (Ready condition: none)", result.stdout)
-        self.assertNotIn("re-read", result.stdout)
+    def test_a_dropped_first_read_is_one_more_poll(self) -> None:
+        """One GET reads both the phase and the condition and swallows its
+        failure, so a first read the API drops reads back as nothing. That
+        is one more poll against the window, as it is mid-wait, never a pass
+        as an unphased CR: main's gate made two reads, and a refusal passed
+        only if both were dropped. The second read here is the answer."""
+        refusal = "A2AProvisionFailed: TASKS holds 64 consumers and this configuration needs 71"
+        cases = {
+            "dropped, then Degraded with a refused provision": ("Degraded", refusal, 1),
+            "dropped, then a refused provision under Ready": ("Ready", refusal, 1),
+            "dropped, then another Degraded": ("Degraded", "InvalidGitRepoURL: not this PR's", 1),
+            "dropped, then Ready": ("Ready", _ALL_READY, 0),
+        }
+        for name, (phase, ready, status) in cases.items():
+            with self.subTest(name):
+                result = run_provision_wait(
+                    jobs="", call=self._GATE, phase=[DROPPED_READ, phase], ready=["", ready], unschedulable_attempts=5
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(self._reads(result), 2)
+                self.assertIn(
+                    "the first read of platform-agent after the sidecar patch returned nothing; re-read 1/5 in 0s (no read has answered yet)\n",
+                    result.stdout,
+                )
+                self.assertNotIn("re-read 2/5", result.stdout)
+                self.assertNotIn("unphased", result.stdout)
+                self.assertNotIn("wait for capacity", result.stdout)
+                self.assertRegex(
+                    result.stdout, re.escape(f"{'✓ ' if status == 0 else ''}platform-agent answered after 1 reads that returned nothing, ") + r"\d+s\n"
+                )
+                if status == 0:
+                    self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+                    self.assertNotIn("ERROR", result.stdout)
+                else:
+                    self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
+                    self.assertIn("DUMPED", result.stdout)
+                    self.assertNotIn("PASSED", result.stdout)
+
+    def test_a_window_of_reads_that_all_return_nothing_fails_as_unread(self) -> None:
+        """No read answered, so there is no phase or condition to report and
+        no last answer to fall back on: the gate fails closed and says the CR
+        could not be read, not that it was unphased or Degraded."""
+        result = run_provision_wait(jobs="", call=self._GATE, phase=DROPPED_READ, unschedulable_attempts=3)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self._reads(result), 4)
+        self.assertIn("the first read of platform-agent after the sidecar patch returned nothing; re-read 1/3 in 0s (no read has answered yet)", result.stdout)
+        self.assertRegex(
+            result.stdout,
+            re.escape("the read of platform-agent after the sidecar patch returned nothing again, ")
+            + r"\d+s"
+            + re.escape(" in; re-read 3/3 in 0s (no read has answered yet)"),
+        )
+        self.assertNotIn("re-read 4/3", result.stdout)
+        self.assertRegex(
+            result.stdout,
+            re.escape("ERROR: could not read platform-agent after the sidecar patch: all 4 reads in ")
+            + r"\d+s"
+            + re.escape(" returned nothing, so there is no phase or Ready condition to judge\n"),
+        )
+        self.assertNotIn("unphased", result.stdout)
+        self.assertNotIn("last Ready condition", result.stdout)
+        self.assertNotIn("wait for capacity", result.stdout)
+        self.assertIn("--- provisioning Job pod logs ---", result.stdout)
+        self.assertIn("DUMPED", result.stdout)
+        self.assertNotIn("PASSED", result.stdout)
 
     def test_a_refused_provision_fails_on_the_first_read(self) -> None:
         refusals = {
