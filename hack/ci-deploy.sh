@@ -302,12 +302,15 @@ readonly MODE_NEXT_STATUS_ATTEMPTS=12
 # PersistentVolume's node affinity, 2 Insufficient cpu, 2 Insufficient
 # memory". One such count is enough, whatever else the message names: a node
 # counted there is one the pod fits but for capacity, so another node like it
-# places the pod. A message with no such count (node affinity or selector
-# only, an untolerated taint only, or the RuntimeClass sentence the operator
-# writes instead of the scheduler's when the CR requests one) names nothing a
-# scale-up fixes, and fails on the first read as before.
+# places the pod. A message with no such count fails on the first read as
+# before: node affinity or selector only, an untolerated taint only, or the
+# RuntimeClass sentence the operator writes instead of the scheduler's when
+# the CR requests one, none of which a scale-up fixes. So do the rarer
+# shortfalls a new node would also fix (Too many pods, Insufficient
+# ephemeral-storage): none of #2414's runs showed one, and widening the match
+# is for when one turns up in a log.
 readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
-readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)([,.]|$)'
+readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
 # How many more reads, MODE_NEXT_POLL_SECONDS apart, that Degraded gets before
 # the gate fails on it: five minutes. The three runs in #2414 had the pod
 # assigned within seconds, but the CR's status does not move when the pod is
