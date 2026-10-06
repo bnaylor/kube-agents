@@ -2594,11 +2594,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsNineReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsNineReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2622,7 +2622,7 @@ func TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Eight sentinel Gets and nothing else: no per-object walk, and in
+	// Nine sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
@@ -2630,15 +2630,17 @@ func TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean(t *testing.T) {
 	// sentinels, 4 -> 6 when the two fences did (#2197), and 6 -> 7 when the
 	// inject door's fence did, for the hand-deleted pair that leaves it
 	// standing alone, and 7 -> 8 when the A2A door's fence did, for the
-	// same pair under the other flag; the fences are Owns kinds, so those
-	// four reads come from the cache and only the two Secrets are uncached.
+	// same pair under the other flag, and 8 -> 9 when the gateway's own
+	// fence did (#2473: it now renders on every next gateway, and the same
+	// hand-deleted pair leaves it alone); the fences are Owns kinds, so those
+	// five reads come from the cache and only the two Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 8 {
-		t.Errorf("Gets = %d, want 8 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 9 {
+		t.Errorf("Gets = %d, want 9 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -2651,10 +2653,11 @@ func TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean(t *testing.T) {
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
 // half of the optimisation the test above prices.
 //
-// cleanupA2A answers "is there anything to tear down?" from seven objects: the
-// NATS StatefulSet, the gateway Deployment, the NATS, session and inject
-// fences, and the callout keys and NATS config Secrets. That is sound only
-// while every render that leaves residue leaves at least one of the seven, and
+// cleanupA2A answers "is there anything to tear down?" from nine objects: the
+// NATS StatefulSet, the gateway Deployment, the NATS, session, inject, A2A
+// door and gateway fences, and the callout keys and NATS config Secrets. That
+// is sound only while every render that leaves residue leaves at least one of
+// the nine, and
 // the case that breaks it is not a full render -- it is a render that died
 // partway. Miss it and an A2A object stays alive on a today install, which is
 // the darkness property.
@@ -2918,6 +2921,10 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 	// with the door unarmed: the ownership rule has to hold on the operator
 	// that was redeployed without the flag and still has the fence.
 	injectFence := buildA2AGatewayNetworkPolicy
+	// The gateway's own fence is the ninth sentinel and keyed on no flag; a
+	// today CR that inherits one under its predecessor's UID is the same
+	// wedge shape.
+	gatewayFence := buildA2AGatewayFencePolicy
 	for _, tc := range []struct {
 		name  string
 		fence func(*agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy
@@ -2930,9 +2937,12 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 		{"NATS fence with no owner at all", natsFence, nil, false},
 		{"session fence with no owner at all", sessionFence, nil, false},
 		{"inject fence with no owner at all", injectFence, nil, false},
+		{"gateway fence under a stale UID", gatewayFence, &staleOwner, false},
+		{"gateway fence with no owner at all", gatewayFence, nil, false},
 		{"control: NATS fence owned by this CR is torn down", natsFence, nil, true},
 		{"control: session fence owned by this CR is torn down", sessionFence, nil, true},
 		{"control: inject fence owned by this CR is torn down", injectFence, nil, true},
+		{"control: gateway fence owned by this CR is torn down", gatewayFence, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
@@ -7457,8 +7467,8 @@ func TestTheExecutorEnvIsNotSharedBetweenSidecars(t *testing.T) {
 //
 // The doors' flags are not read here: a2aNamespacedTeardown lists each
 // door's four unconditionally (see its comment), so every fence the operator
-// can render is in the list either way: the NATS, verifier and session fences
-// and the inject and A2A door fences.
+// can render is in the list either way: the NATS, verifier and session fences,
+// the inject and A2A door fences, and the gateway's own fence.
 func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 	agent := a2aTestAgent()
 	r := &PlatformAgentReconciler{}
@@ -7475,7 +7485,7 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 
 	// Without this the test passes vacuously on a list that lost its fences
 	// entirely, which is a worse bug than the one it is written to catch.
-	if want := 5; fences != want {
+	if want := 6; fences != want {
 		t.Fatalf("the teardown walks %d NetworkPolicies, want %d — if a fence was added or removed, "+
 			"re-read the ordering argument above before changing this number", fences, want)
 	}

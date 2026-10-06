@@ -1210,6 +1210,13 @@ func a2aInjectName(agent *agentv1alpha1.PlatformAgent) string { return agent.Nam
 // door's, so each door's objects come and go with its own flag.
 func a2aDoorName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-door" }
 
+// a2aGatewayNetpolName is the gateway's own fence, the one no door flag
+// decides: it comes and goes with the gateway Deployment
+// (buildA2AGatewayFencePolicy).
+func a2aGatewayNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-gateway-netpol"
+}
+
 // a2aVerifierName is the capability verifier's Deployment, ServiceAccount and
 // pod-selector name, all one string like the callout's. The verifier is the
 // only principal on the bus that may read the `cap` bucket, so the name is
@@ -3975,6 +3982,18 @@ func (r *PlatformAgentReconciler) ensureA2ADoorTokenSecret(ctx context.Context, 
 	return r.Create(ctx, secret)
 }
 
+// buildA2AGatewayFencePolicy is the gateway's own fence: the pod selector and
+// the one collector rule of buildA2AGatewayNetworkPolicy, under the gateway's
+// name rather than a door's, so it renders wherever the gateway Deployment
+// does and no door flag decides it. Why it exists at all is on
+// buildA2AGatewayNetworkPolicy.
+func buildA2AGatewayFencePolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	np := buildA2AGatewayNetworkPolicy(agent)
+	np.Name = a2aGatewayNetpolName(agent)
+	np.Labels = a2aLabels(agent, "gateway-netpol")
+	return np
+}
+
 // buildA2ADoorNetworkPolicy is the A2A door's copy of the gateway fence: the
 // same pod selector and the same one collector rule, under the door's own
 // name so it comes and goes with the door's flag and never with the inject
@@ -4010,15 +4029,21 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // buildA2ANATSNetworkPolicy says so at length). What answers that caller is
 // the bearer token (ensureA2AInjectTokenSecret).
 //
-// Rendered only with the backend, deliberately. A fence that admits only the
-// collector is a good idea on the gateway whatever the backend, but rendering one on every
-// next install is a change to installs that did not ask for this, and it
-// would outlive the object it exists to protect. When an in-cluster caller
-// legitimately needs the gateway, it becomes a peer in this rule. The cost of
-// that choice: on an install with neither door armed no policy selects the
-// gateway pod, so the metrics port is as reachable from the pod network as the
-// rest of a pod that otherwise listens on nothing, and what it serves there is
-// the counters.
+// This one renders only with the backend, under the door's name, and the
+// gateway also carries a copy under its own name that renders on every next
+// install whatever the doors say (buildA2AGatewayFencePolicy). That copy used
+// to not exist: rendering a policy on every next install was a change to
+// installs that did not ask for one, and with no door the gateway listened on
+// nothing outside its loopback, so there was nothing to fence. The metrics
+// listener ended that. It binds every interface on every next gateway, so
+// without a policy selecting the pod the counters were reachable from the
+// whole pod network on an install with neither door armed. Brian's call on
+// #2473 (2026-10-06) was to always render the gateway's own fence rather than
+// leave that open. The door fences stay as they are, identical in what they
+// admit; two identical policies on one pod admit exactly what one does, and
+// each door's objects still come and go with its own flag. When an in-cluster
+// caller legitimately needs the gateway, it becomes a peer in this rule, and
+// in every copy of it.
 func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -4449,9 +4474,10 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 	return r.ungatedDNSClusterIPs(ctx, agent)
 }
 
-// reconcileA2ANetworkFences applies the three NetworkPolicies that fence the
-// next stack: the bus's ingress policy, the session pods' egress one, and the
-// capability verifier's.
+// reconcileA2ANetworkFences applies the NetworkPolicies that fence the next
+// stack: the bus's ingress policy, the session pods' egress one, and the
+// capability verifier's, plus the gateway's own fence while the gateway
+// Deployment exists and each door's fence while its flag is set.
 //
 // Separate from the rest of reconcileA2A because a NetworkPolicy is not
 // rendering, it is a guardrail, and #1247 settled what that distinction costs:
@@ -4490,6 +4516,20 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	if a2aAgentDoorEnabled() {
 		fences = append(fences, buildA2ADoorNetworkPolicy(agent))
+	}
+	// The gateway's own fence, keyed on the gateway rather than a flag: the
+	// metrics listener binds every interface whenever the pod runs. Here for
+	// the refusal-path rescue, so it is applied over a gateway that exists;
+	// the first render's write is reconcileA2A's, just ahead of the
+	// Deployment it fences. Not applied when the Deployment is absent, so a
+	// gateway withheld for want of a backend, or held for the callout, does
+	// not get a fence over nothing. Read from the cache: Deployment is an
+	// Owns() kind. A stale hit renders a fence the next dark pass removes;
+	// a stale miss skips it for one pass on the refusal path only.
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
+		fences = append(fences, buildA2AGatewayFencePolicy(agent))
+	} else if !errors.IsNotFound(err) {
+		return err
 	}
 	for _, np := range fences {
 		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
@@ -4875,6 +4915,9 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			state.gatewayDark = true
 			state.gatewayDarkReason = why
 			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
+			if err := r.removeA2AGatewayFence(ctx, agent); err != nil {
+				return state, err
+			}
 			if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 				return state, err
 			}
@@ -4897,7 +4940,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		// at all (the hold is creation-only), so nothing is listening and
 		// the removal is safe to run now; skipping it would leave a flag
 		// that went off during the hold with the door's objects rendered
-		// until the callout serves.
+		// until the callout serves. The gateway's own fence goes too: it
+		// fences a pod that does not exist.
+		if err := r.removeA2AGatewayFence(ctx, agent); err != nil {
+			return state, err
+		}
 		if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 			return state, err
 		}
@@ -4905,6 +4952,17 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			return state, err
 		}
 		return state, nil
+	}
+	// The gateway's own fence, ahead of the Deployment so the metrics
+	// listener never binds on a pod no policy selects. Every next gateway
+	// gets it, door or no door (#2473, 2026-10-06); see
+	// buildA2AGatewayNetworkPolicy for why.
+	fence := buildA2AGatewayFencePolicy(agent)
+	if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
+		return state, err
+	}
+	if err := r.applyManaged(ctx, agent, fence); err != nil {
+		return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
@@ -4928,6 +4986,19 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 
 	return state, nil
+}
+
+// removeA2AGatewayFence takes the gateway's own fence away on a pass that
+// withholds or holds the gateway. Both happen only while the Deployment is
+// absent, so nothing is listening and the order the doors' removal needs
+// (after the apply) does not arise. One cached read: NetworkPolicy is an
+// Owns() kind.
+func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
+	if err := r.deleteOwnedA2AObject(ctx, agent, np, r.Client); err != nil {
+		return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy: %w", err)
+	}
+	return nil
 }
 
 // applyA2AInjectBackend renders the inject backend's own objects, and does
@@ -5362,6 +5433,12 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
 		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The gateway's own fence. Its Deployment is deleted far above, so
+		// what it fences by now is a terminating pod; it goes here rather
+		// than beside the door fences so it outlives that pod for as long as
+		// the teardown's order allows, and above the verifier fence for the
+		// reason that entry gives.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The verifier fence goes before the session fence, not after it, even
 		// though the verifier is rendered after the session one. Two reasons,
 		// and the second is the load-bearing one.
@@ -5425,7 +5502,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Eight reads answer it instead of walking every object
+	// cost for a no-op. Nine reads answer it instead of walking every object
 	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
@@ -5458,6 +5535,13 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//   - the A2A door's fence, the same shape under the other flag: written
 	//     after the pair and deleted before it, left alone only by the hand,
 	//     removed on the today path by nothing but this walk,
+	//   - the gateway's own fence, the same shape again, under no flag. Since
+	//     #2473 every next gateway has it. It is written after the pair and
+	//     deleted between them (after the NATS fence, before the session
+	//     one), so a render or cleanup that dies partway leaves one of the
+	//     pair beside it; the hand that deletes the pair and flips to today
+	//     leaves it alone, and then nothing on the today path but this walk
+	//     removes it,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -5470,8 +5554,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first six are Owns kinds and free; the two Secret reads
-	// are uncached and happen only when the free six all miss.
+	// property. The first seven are Owns kinds and free; the two Secret reads
+	// are uncached and happen only when the free seven all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
 	// object under a reserved name is not residue of this CR and is left to
@@ -5480,7 +5564,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// counted would send every reconcile of a today install into that refusal
 	// -- the shape a next CR deleted and re-created under the same name in
 	// today mode takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at eight
+	// Ownership is read off the fetched object, so the exit stays at nine
 	// Gets.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
@@ -5489,9 +5573,10 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
 	// without the fences every guardrail prefix does. The two door fences
-	// are the ones no prefix leaves alone;
-	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip and its A2A
-	// door twin are what red without them.
+	// and the gateway's are the ones no prefix leaves alone;
+	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip, its A2A door
+	// twin, and TestTheA2AGatewayFenceComesAndGoesWithTheGateway are what
+	// red without them.
 	sentinels := []a2aTeardownEntry{
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -5499,6 +5584,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}

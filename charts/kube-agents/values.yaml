@@ -598,8 +598,7 @@ platformAgent:
   # the A2A gateway a spec.mode next install runs, which serves its counters on
   # the metrics-only a2a-metrics port (9096). The operator's policies admit the
   # collector's namespace, gke-gmp-system, on those ports whatever this is set
-  # to (the A2A gateway's policy renders while an eval door is armed); this
-  # decides only whether a scrape is configured.
+  # to; this decides only whether a scrape is configured.
   # A tri-state: null (the default) renders them when the cluster serves
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a

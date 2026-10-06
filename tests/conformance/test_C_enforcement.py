@@ -476,12 +476,19 @@ class C1IsolationIsStructural(unittest.TestCase):
         gateway past what the metrics listener needed.
 
         Read from the operator's real render (the fixture its Go test keeps
-        equal to the builder), with both doors armed so both fences exist.
+        equal to the builder), with both doors armed so all three fences
+        exist: each door's, and the gateway's own, which renders on every next
+        gateway door or no door because the metrics listener binds every
+        interface (#2473).
         """
         documents = h.yaml_documents("a2a_gateway_ingress_fixture")
         policies = h.objects_of_kind(documents, "NetworkPolicy")
         deployments = h.objects_of_kind(documents, "Deployment")
-        self.assertEqual(len(policies), 2, "the fixture no longer renders both gateway fences")
+        self.assertEqual(len(policies), 3, "the fixture no longer renders the three gateway fences")
+        self.assertTrue(
+            any(p["metadata"]["name"].endswith("-a2a-gateway-netpol") for p in policies),
+            "the fixture no longer renders the gateway's own fence, the one no door flag decides",
+        )
         self.assertEqual(len(deployments), 1, "the fixture no longer carries the gateway's ports")
 
         gateway = deployments[0]

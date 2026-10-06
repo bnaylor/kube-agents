@@ -28,8 +28,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
@@ -37,8 +39,8 @@ import (
 )
 
 // a2aGatewayIngressFixturePath is the A2A gateway's rendered ingress surface
-// with both doors armed: its two NetworkPolicies and the gateway container's
-// declared ports, nothing else. The conformance suite reads it
+// with both doors armed: its three NetworkPolicies (the two doors' and the
+// gateway's own) and the gateway container's declared ports, nothing else. The conformance suite reads it
 // (tests/conformance, C1) to hold the policies to "the collector, on the
 // metrics port, and nobody else": the suite cannot run Go, and no golden
 // renders mode next, so this file is the contract between the two.
@@ -153,8 +155,8 @@ func TestTheA2AGatewayDeclaresItsMetricsListener(t *testing.T) {
 
 // TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule: the gateway's one
 // ingress rule is the credential broker's second rule with the gateway's
-// metrics port in it, the same peer byte for byte, on both fences (the
-// inject door's and the A2A door's copy).
+// metrics port in it, the same peer byte for byte, on every fence (the
+// inject door's, the A2A door's copy, and the gateway's own).
 func TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule(t *testing.T) {
 	agent := a2aTestAgent()
 	broker := buildCredentialProxyNetworkPolicy(brokerPodAgent())
@@ -162,7 +164,7 @@ func TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule(t *testing.T) {
 		t.Fatalf("the broker's policy has %d rules; this test compares against its second, the collector's", len(broker.Spec.Ingress))
 	}
 	collector := broker.Spec.Ingress[1]
-	for _, np := range []*networkingv1.NetworkPolicy{buildA2AGatewayNetworkPolicy(agent), buildA2ADoorNetworkPolicy(agent)} {
+	for _, np := range []*networkingv1.NetworkPolicy{buildA2AGatewayNetworkPolicy(agent), buildA2ADoorNetworkPolicy(agent), buildA2AGatewayFencePolicy(agent)} {
 		t.Run(np.Name, func(t *testing.T) {
 			assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
 			if !reflect.DeepEqual(np.Spec.Ingress[0].From, collector.From) {
@@ -188,7 +190,9 @@ func TestRenderedA2AGatewayIngressMatchesTheConformanceFixture(t *testing.T) {
 			corev1.Container{Name: c.Name, Ports: c.Ports})
 	}
 	var docs []string
-	for _, obj := range []any{buildA2AGatewayNetworkPolicy(agent), buildA2ADoorNetworkPolicy(agent), trimmed} {
+	// The inject door's fence stays first: the conformance mutations anchor on
+	// the first match in this file and their descriptions name that fence.
+	for _, obj := range []any{buildA2AGatewayNetworkPolicy(agent), buildA2ADoorNetworkPolicy(agent), buildA2AGatewayFencePolicy(agent), trimmed} {
 		out, err := yaml.Marshal(obj)
 		if err != nil {
 			t.Fatal(err)
@@ -241,7 +245,9 @@ func a2aGatewayFixtureDocs(t *testing.T, data string) []any {
 // TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest applies the gateway
 // Deployment and the fences the way reconcileA2A does, against a real API
 // server, and reads back what it accepted: the metrics port and env on the
-// container, and on each fence the collector rule alone.
+// container, and on each fence the collector rule alone. The gateway's own
+// fence is applied by the second fences pass, the refusal path's, which is
+// the one that reads whether the Deployment exists.
 func TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest(t *testing.T) {
 	cl, scheme := startEnvtest(t)
 	ctx := context.Background()
@@ -260,6 +266,9 @@ func TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest(t *testing.T) {
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, buildA2AGatewayDeployment(agent)); err != nil {
 		t.Fatalf("applyA2AGatewayDeployment: %v", err)
+	}
+	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2ANetworkFences over a running gateway: %v", err)
 	}
 
 	dep := &appsv1.Deployment{}
@@ -281,11 +290,247 @@ func TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest(t *testing.T) {
 		t.Errorf("the accepted gateway carries %s=%q, want %d", a2aGatewayMetricsPortEnvVar, got, a2aGatewayMetricsPort)
 	}
 
-	for _, name := range []string{a2aInjectName(agent), a2aDoorName(agent)} {
+	for _, name := range []string{a2aInjectName(agent), a2aDoorName(agent), a2aGatewayNetpolName(agent)} {
 		np := &networkingv1.NetworkPolicy{}
 		if err := cl.Get(ctx, client.ObjectKey{Name: name, Namespace: agent.Namespace}, np); err != nil {
 			t.Fatalf("the API server holds no fence %s: %v", name, err)
 		}
 		assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
 	}
+}
+
+// a2aGatewayFenceKey is where the gateway's own fence lives: under the
+// gateway's name, not a door's, so no door flag decides it. Spelled out here
+// rather than through the builder's helper so a rename is a decision this
+// test sees.
+func a2aGatewayFenceKey(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+	return types.NamespacedName{Name: agent.Name + "-a2a-gateway-netpol", Namespace: agent.Namespace}
+}
+
+// assertA2AGatewayFence reads the gateway's fence and holds it to selecting
+// the gateway pod, governing ingress alone (no egress rule set on a pod that
+// dials the bus out), and admitting the collector to the metrics port and
+// nobody else.
+func assertA2AGatewayFence(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	np := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, a2aGatewayFenceKey(agent), np); err != nil {
+		t.Fatalf("the gateway renders and no fence %s selects it: %v", a2aGatewayFenceKey(agent).Name, err)
+	}
+	if !reflect.DeepEqual(np.Spec.PodSelector.MatchLabels, map[string]string{"app": a2aGatewayName(agent)}) {
+		t.Errorf("%s selects %+v, want the gateway pod", np.Name, np.Spec.PodSelector)
+	}
+	if !reflect.DeepEqual(np.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}) {
+		t.Errorf("%s governs %v, want Ingress alone: an Egress type would cut the gateway off the bus", np.Name, np.Spec.PolicyTypes)
+	}
+	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
+}
+
+// TestTheA2AGatewayFenceComesAndGoesWithTheGateway: the gateway's metrics
+// listener binds every interface on every next install, so the fence that
+// admits only the collector to it renders wherever the gateway Deployment
+// does, door or no door (bnaylor's call on #2473, 2026-10-06), and not where
+// the gateway is withheld.
+func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
+	ctx := context.Background()
+	gatewayRendered := func(t *testing.T, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
+		t.Helper()
+		if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+			t.Fatalf("precondition: the gateway Deployment was not rendered, so this case proves nothing: %v", err)
+		}
+	}
+	doorFences := func(agent *agentv1alpha1.PlatformAgent) []types.NamespacedName {
+		return []types.NamespacedName{
+			{Name: a2aInjectName(agent), Namespace: agent.Namespace},
+			{Name: a2aDoorName(agent), Namespace: agent.Namespace},
+		}
+	}
+
+	t.Run("discord, no door", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconciler(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		for _, key := range doorFences(agent) {
+			if err := cl.Get(ctx, key, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+				t.Errorf("door fence %s rendered with no door armed (err=%v)", key.Name, err)
+			}
+		}
+	})
+
+	t.Run("chat, no door", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := gchatTestAgent("next", true)
+		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+	})
+
+	t.Run("both doors", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "true")
+		t.Setenv(a2aAgentDoorEnvVar, "true")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		for _, key := range doorFences(agent) {
+			np := &networkingv1.NetworkPolicy{}
+			if err := cl.Get(ctx, key, np); err != nil {
+				t.Fatalf("door fence %s not rendered with its door armed: %v", key.Name, err)
+			}
+			assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
+		}
+	})
+
+	t.Run("withheld for want of a backend", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil || !state.gatewayDark {
+			t.Fatalf("precondition: want a dark gateway (state=%+v err=%v)", state, err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway is withheld and its fence %s rendered anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+	})
+
+	t.Run("held for the callout", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconciler(t, agent)
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil || !state.gatewayHeld {
+			t.Fatalf("precondition: want a held gateway (state=%+v err=%v)", state, err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway is held and its fence %s rendered anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+	})
+
+	// The Deployment taken away by hand and the flag that was its backend
+	// turned off: the next pass is dark, and the fence goes with the gateway.
+	t.Run("a dark pass removes it", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "true")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		if err := cl.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil || !state.gatewayDark {
+			t.Fatalf("precondition: want a dark pass (state=%+v err=%v)", state, err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway is gone and its fence %s survived the dark pass (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+	})
+
+	// The refusal path: reconcileAgentNetworkGuardrails reaches the fences
+	// and not the render, so a gateway that exists keeps its fence through a
+	// refused CR, and deleting it then does not stick.
+	t.Run("the guardrail path keeps it over a running gateway", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconciler(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
+			t.Fatalf("precondition: the fence was not there to delete: %v", err)
+		}
+		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		assertA2AGatewayFence(t, ctx, cl, agent)
+	})
+
+	t.Run("the guardrail path renders none without a gateway", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconciler(t, agent)
+		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("no gateway exists and the fences rendered %s anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+	})
+
+	// A flip to today takes the fence with the stack, and the early exit
+	// keys on it: a fence left standing alone (the Deployment and the bus
+	// fences deleted by hand) still drives the walk.
+	t.Run("the flip to today removes it, even alone", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconciler(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		if err := r.cleanupA2A(ctx, agent); err != nil {
+			t.Fatalf("cleanupA2A: %v", err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway's fence %s survived the teardown (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+
+		alone := &networkingv1.NetworkPolicy{
+			TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace,
+				Labels: a2aLabels(agent, "gateway-netpol"),
+			},
+			Spec: networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}},
+		}
+		stored := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+			t.Fatal(err)
+		}
+		if err := ctrl.SetControllerReference(stored, alone, r.Scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.Create(ctx, alone); err != nil {
+			t.Fatalf("seeding the fence alone: %v", err)
+		}
+		if err := r.cleanupA2A(ctx, stored); err != nil {
+			t.Fatalf("cleanupA2A over the fence alone: %v", err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway's fence, standing alone, survived the flip (err=%v): the early exit does not key on it", err)
+		}
+	})
 }

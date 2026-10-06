@@ -114,7 +114,7 @@ misconfigurations:
       - "bench/tf/prebuilt/gitops-fix-cycle/manifests/**"
   # Ignore KSV-0014 and KSV-0118 on the A2A gateway's conformance fixture
   # only. It is a generated extract of the rendered gateway's ingress surface
-  # (its two NetworkPolicies and the container's declared ports, nothing else)
+  # (its three NetworkPolicies and the container's declared ports, nothing else)
   # that tests/conformance reads, not a manifest anything applies; the
   # Deployment it was cut from carries the hardened pod and container security
   # contexts (buildA2AGatewayDeployment, hardenedSecurityContext), which the

@@ -1366,10 +1366,13 @@ costs the gateway its metrics and logs an `ALERT` line; conversations carry on. 
 renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
-gateway's NetworkPolicy, rendered while either door is armed, admits one peer: the
-`gke-gmp-system` namespace, to 9096 alone, the broker's second rule with the gateway's port in it.
-The doors' ports admit no pod. On an install with neither door armed no policy selects the gateway
-pod, and the metrics port is as reachable from the pod network as the rest of that pod.
+gateway's own NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway Deployment
+does, door or no door, and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
+broker's second rule with the gateway's port in it. Each armed door renders a copy under its own
+name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
+left the metrics port, bound on every interface, reachable from the whole pod network on an install
+with neither door armed; it renders on every `next` install now so that it is not (decided
+10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
 
 The site's [Observability page](../site/src/content/docs/concepts/observability.md) is
 canonical for what an operator reads off these series; this section is the design. Every label
