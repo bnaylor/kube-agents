@@ -2915,18 +2915,19 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "HERMES_HOME_MODE",
 		Value: hermesHomeMode,
 	})
-	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
-	// own home while the shell is local. agent/file_safety.py checks the path prefix in
-	// the agent process before the write is routed anywhere, so with the shell in the
-	// sandbox this has to name sandbox paths or write_file and patch return "Write
-	// denied" for everything — which is how the earlier value was found wrong on a
-	// live install. The sandbox's data volume carries the same /opt/data path
-	// deliberately. /home/agent is listed too, but current sandbox images make it
-	// root-owned (deploy/sandbox/Dockerfile), so a write there passes this check and
-	// then fails on the directory's mode. The value is written out rather than left
-	// to the image default so the policy is visible in the pod spec. It gives up no
-	// isolation: with backend: ssh
-	// the file tools cannot reach the agent's own filesystem to begin with.
+	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which matches
+	// the sandbox data volume path (shellSandboxDataPath). agent/file_safety.py
+	// checks the path prefix in the agent process before the write is routed
+	// anywhere. The ephemeral sandbox home (/home/agent) is root-owned in the
+	// container image (deploy/sandbox/Dockerfile, #2245) and is not a durable write
+	// destination, so it is omitted here (#2284): write attempts naming
+	// /home/agent/... fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the
+	// gateway's prefix check rather than failing on directory mode in the sandbox.
+	// (Writes to `~` expand in the agent process against HOME under the data volume
+	// — by default /opt/data/home — and are admitted under /opt/data).
+	// The value is written out rather than left to the image default so the policy is
+	// visible in the pod spec. It gives up no isolation: with backend: ssh the file
+	// tools cannot reach the agent's own filesystem to begin with.
 	//
 	// TERMINAL_CWD is what stops the agent working in a directory that does not
 	// survive a restart. Hermes' ssh backend defaults cwd to `~`
@@ -2939,7 +2940,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// for. A managed-scope value could not be narrowed by anything.
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "HERMES_WRITE_SAFE_ROOT",
-		Value: strings.Join([]string{shellSandboxDataPath, shellSandboxHomePath}, ":"),
+		Value: shellSandboxDataPath,
 	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "TERMINAL_CWD",
@@ -3533,12 +3534,31 @@ const scopedSAPoolKey = "scoped-sa-pool.json"
 
 const scopedSAPoolMountPath = "/etc/credential-proxy/" + scopedSAPoolKey
 
+// scopedSAPoolVersion is the pool-file format the broker's `parse_pool`
+// accepts. Version 2 keys each member on the bare project id; version 1
+// carried a cluster tuple, and the broker refuses it by name rather than
+// matching nothing, so a stale operator against a new broker is a startup
+// error that says "version 2" instead of a refusal on every request.
+const scopedSAPoolVersion = 2
+
 // scopedSAPoolJSON renders the mapping the broker consumes, or "" when the
-// agent has none configured.
+// pool is not armed.
 //
-// Sorted by the scope key. The CR is a list and Kubernetes preserves its order,
+// Keyed on `enabled`, not on the list: a non-empty list with the pool off
+// renders nothing, so a file nothing reads is never written, and an armed
+// pool with an empty list (which admission refuses, but a CR applied before
+// the rule or with validation off still reaches here) renders the empty
+// document rather than nothing. The three things that have to agree — flag,
+// ConfigMap key, SubPath mount — then agree on every shape, and the failure
+// an empty armed pool produces is the broker's own "empty pool" refusal,
+// which names the cause, rather than a SubPath on a missing key, which
+// does not.
+//
+// Sorted by projectId. The CR is a list and Kubernetes preserves its order,
 // so an operator reordering two entries would otherwise rewrite the ConfigMap,
-// change its hash and roll the broker for no change in meaning.
+// change its hash and roll the broker for no change in meaning. Byte order is
+// what `sort(keys(...))` in the Terraform composition and `sorted()` in the
+// broker produce, so all three renderings of the list agree.
 //
 // No error return, because there is no failure to report: the document is a
 // struct of strings and ints, which json.Marshal cannot fail on. An error
@@ -3546,45 +3566,38 @@ const scopedSAPoolMountPath = "/etc/credential-proxy/" + scopedSAPoolKey
 // that has nowhere to put it, and a swallowed one would leave the broker armed
 // by its environment variable with no mapping file to read.
 func scopedSAPoolJSON(agent *agentv1alpha1.PlatformAgent) string {
-	if agent.Spec.Security == nil || len(agent.Spec.Security.ScopedServiceAccounts) == 0 {
+	if !scopedSAPoolEnabled(agent) {
 		return ""
 	}
 	type entry struct {
 		ProjectID           string `json:"projectId"`
-		Location            string `json:"location"`
-		ClusterName         string `json:"clusterName"`
 		ServiceAccountEmail string `json:"serviceAccountEmail"`
 	}
-	entries := make([]entry, 0, len(agent.Spec.Security.ScopedServiceAccounts))
-	for _, account := range agent.Spec.Security.ScopedServiceAccounts {
+	members := agent.Spec.Security.ScopedServiceAccountPool.ServiceAccounts
+	entries := make([]entry, 0, len(members))
+	for _, account := range members {
 		entries = append(entries, entry{
 			ProjectID:           account.ProjectID,
-			Location:            account.Location,
-			ClusterName:         account.ClusterName,
 			ServiceAccountEmail: account.ServiceAccountEmail,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		return scopedSAPoolScopeKey(entries[i].ProjectID, entries[i].Location, entries[i].ClusterName) <
-			scopedSAPoolScopeKey(entries[j].ProjectID, entries[j].Location, entries[j].ClusterName)
+		return entries[i].ProjectID < entries[j].ProjectID
 	})
 	document, _ := json.Marshal(struct {
 		Version         int     `json:"version"`
 		ServiceAccounts []entry `json:"serviceAccounts"`
-	}{Version: 1, ServiceAccounts: entries})
+	}{Version: scopedSAPoolVersion, ServiceAccounts: entries})
 	return string(document)
 }
 
-// scopedSAPoolScopeKey is the GKE resource name. Written here as well as in the
-// broker and in Terraform because all three have to agree; the broker's
-// `scoped_sa_pool.scope_key` and the key the Terraform module files each pool
-// member under are the other two, and tests compare them.
-func scopedSAPoolScopeKey(project, location, cluster string) string {
-	return fmt.Sprintf("projects/%s/locations/%s/clusters/%s", project, location, cluster)
-}
-
+// scopedSAPoolEnabled is the arming rule: the explicit switch, and only the
+// switch. The list arms nothing on its own (see ScopedServiceAccountPool on
+// the CRD for why), and declaring a project in spec.scope arms nothing either.
 func scopedSAPoolEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return agent.Spec.Security != nil && len(agent.Spec.Security.ScopedServiceAccounts) > 0
+	return agent.Spec.Security != nil &&
+		agent.Spec.Security.ScopedServiceAccountPool != nil &&
+		agent.Spec.Security.ScopedServiceAccountPool.Enabled
 }
 
 func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
@@ -4372,6 +4385,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//     telling the Planning Agent not to ask it again, the one effect that
 	//     reaches a model.
 	//   - Reactions: which reaction goes on an ask and when it settles.
+	//   - Reports: a fleet-audit cron report and the first inventory report
+	//     post as Block Kit, laid out again as a headline and the top findings
+	//     (the audit's rest counted and left to its ledger, the inventory's
+	//     behind a "See all" button), through the credential
+	//     proxy's Slack relay to the channel or thread the report was already
+	//     bound for; the audit's counts come from its ledger issue, read
+	//     through the forge broker.
 	//   - Thread status: less of a delegated card's delivery posts in the
 	//     thread, the thread's cards show as one plan message, and Slack shows
 	//     a session status and title on the thread.
