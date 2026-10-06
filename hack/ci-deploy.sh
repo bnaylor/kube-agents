@@ -315,15 +315,18 @@ readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
 # the gate fails on it: five minutes, for the scheduler to place the pod. The
 # CR's status does not say when it has: the operator watches no Pods, so an
 # assignment wakes nothing, and the status keeps the scheduler's message
-# until the operator's next pass -- the Deployment's status moving once the
-# pod is Ready, or a requeue that is fifteen minutes once the provision Job
-# is done. So while it forgives that Degraded about an agent pod the gate
+# until the operator's next pass, which no Pod event starts: in practice the
+# Deployment's status moving once the pod is Ready, or the steady-state
+# requeue (fifteen minutes) once the provision Job is done. So while it
+# forgives that Degraded about an agent pod the gate
 # also reads the agent's pods, and the first one bound to a node ends the
 # wait: the image pulls and the agent's start on the new node are the next
 # gate's to time, on its rollout budget for the same Deployment, not this
 # window's. The three runs in #2414 had the pod assigned within seconds; five
 # minutes leaves room for a scale-up that takes a few minutes rather than one,
-# and is half that rollout budget.
+# and is half that rollout budget. Reads that return nothing count against
+# the same window, the first read included, so it also bounds how long the
+# gate tolerates a CR it cannot read.
 readonly MODE_NEXT_UNSCHEDULABLE_ATTEMPTS=60
 readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
@@ -1423,14 +1426,15 @@ wait_provision_job() {
 # clears on its own (#2414). That one is re-read up to
 # MODE_NEXT_UNSCHEDULABLE_ATTEMPTS times, with a line per read, and fails as
 # any other Degraded does if it is still there at the end or turns into
-# something else. When the condition is about an agent pod, each of those
-# reads also reads the agent's pods, in one read, and a pod bound to a node
-# ends the gate as a hand-off to the agent Deployment's rollout gate that
-# follows it, because the condition can outlive the wait it describes (the
-# window's constant says why). A read that returns nothing, the first read included, is
-# one more re-read against that window, never a pass: the read swallows a
-# failed GET, and the CR carries a status once its provisioning Job has run,
-# so nothing read is no answer. A window that ends with no read answering
+# something else. When the condition is about an agent pod, every read that
+# returns it, the first and the last included, also reads the agent's pods,
+# in one read, and a pod bound to a node ends the gate as a hand-off to the
+# agent Deployment's rollout gate that follows it, because the condition can
+# outlive the wait it describes (the window's constant says why). A read
+# that returns nothing, the first read included, is one more re-read against
+# that window, never a pass: the read swallows a failed GET, and the CR
+# carries a status once its provisioning Job has run, so nothing read is no
+# answer. A window that ends with no read answering
 # fails as a CR that could not be read. Prints the condition either way, so
 # the artifact says what the CR said.
 gate_cr_not_degraded() {

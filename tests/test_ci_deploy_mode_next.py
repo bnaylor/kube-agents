@@ -1464,6 +1464,15 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
         self.assertIn("re-read 2/5", result.stdout)
         self.assertNotIn("re-read 3/5", result.stdout)
 
+    def test_an_unbound_pod_listed_first_does_not_hide_a_bound_one(self) -> None:
+        """The scan skips a line with no node rather than stopping on it."""
+        unbound = "platform-agent-gateway-57ddfbc5bf-9q8rw\t\n"
+        result = run_provision_wait(
+            jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, pods=unbound + _POD_SCHEDULED, unschedulable_attempts=5
+        )
+        self._handed_off(result, 0)
+        self.assertEqual(self._count("POD_READS", result), 1)
+
     def test_a_pod_never_scheduled_fails_at_the_end_of_the_window_as_before(self) -> None:
         for name, pods in {"unscheduled throughout": _POD_UNSCHEDULED, "no agent pod listed": ""}.items():
             with self.subTest(name):

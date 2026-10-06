@@ -600,8 +600,8 @@ provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the
 budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
 that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
 being read past; the one `Degraded` it waits out, for up to five minutes, is a pod waiting
-for CPU or memory while Autopilot adds a node, in practice the rolled agent pod, #2414; it
-reads the agent pod as it waits and hands off to the agent Deployment's rollout gate once the
+for CPU or memory while Autopilot adds a node, in practice the rolled agent pod, #2414; when
+the pod is the agent's, it reads that pod as it waits and hands off to the agent Deployment's rollout gate once the
 pod is bound to a node, because the operator watches no Pods and the CR keeps the scheduler's
 message until its next pass), and ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
