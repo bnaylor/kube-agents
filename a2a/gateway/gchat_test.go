@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1653,4 +1655,125 @@ func TestGchatRefusedPullRecordsTheSubscription(t *testing.T) {
 			t.Errorf("summary after refused pulls does not name the subscription: %s", line)
 		}
 	}
+	// Every pull was refused, so every interval counts failed pulls and no
+	// empty ones: that split is what tells a refused proxy from a Chat that
+	// publishes nothing.
+	sums := gchatSummaries(t, out)
+	if len(sums) == 0 {
+		t.Fatalf("no parseable summary line:\n%s", out)
+	}
+	for _, c := range sums {
+		if c.failed == 0 || c.empty != 0 || c.events != 0 {
+			t.Errorf("summary over refused pulls = %+v; want failedPulls>0, emptyPulls=0, events=0", c)
+		}
+	}
+}
+
+// gchatSummaryCounts is one parsed "gchat events received" line.
+type gchatSummaryCounts struct{ events, empty, failed int }
+
+var gchatSummaryRE = regexp.MustCompile(
+	`msg="gchat events received" events=(\d+) emptyPulls=(\d+) failedPulls=(\d+) `)
+
+// gchatSummaries parses every summary line in out, in order. A line that
+// names the summary but does not match the pattern fails the test, so a
+// reworded line cannot leave the counter assertions checking nothing.
+func gchatSummaries(t *testing.T, out string) []gchatSummaryCounts {
+	t.Helper()
+	var sums []gchatSummaryCounts
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, `msg="gchat events received"`) {
+			continue
+		}
+		m := gchatSummaryRE.FindStringSubmatch(line)
+		if m == nil {
+			t.Fatalf("summary line does not carry events=, emptyPulls=, failedPulls=: %s", line)
+		}
+		var c gchatSummaryCounts
+		c.events, _ = strconv.Atoi(m[1])
+		c.empty, _ = strconv.Atoi(m[2])
+		c.failed, _ = strconv.Atoi(m[3])
+		sums = append(sums, c)
+	}
+	return sums
+}
+
+// TestGchatEmptyPullsCountAsEmptyNotFailed: an install that Chat publishes
+// nothing to pulls empty forever, and the summary has to say so as
+// emptyPulls, not failedPulls. Run checks the interval before each pull, so
+// every summary window holds at least one pull: the assertion is >0 versus
+// =0, not an exact count, and does not depend on pacing.
+func TestGchatEmptyPullsCountAsEmptyNotFailed(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs, `msg="gchat events received"`)
+	sums := gchatSummaries(t, out)
+	if len(sums) == 0 {
+		t.Fatalf("no parseable summary line:\n%s", out)
+	}
+	for _, c := range sums {
+		if c.empty == 0 || c.failed != 0 || c.events != 0 {
+			t.Errorf("summary over empty pulls = %+v; want emptyPulls>0, failedPulls=0, events=0", c)
+		}
+	}
+}
+
+// TestGchatPullCountsResetEachInterval: each summary counts its own
+// interval. The relay goes empty, then refused, then empty again; after each
+// flip a summary has to show the old kind at zero, which a count carried
+// over from the previous interval never does.
+func TestGchatPullCountsResetEachInterval(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	refuse := func(on bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if on {
+			f.pullStatus = http.StatusServiceUnavailable
+			f.pullBody = `{"error":"a2a chat event pull failed","pubsub":{"type":"PermissionDenied","code":403}}`
+		} else {
+			f.pullStatus, f.pullBody = 0, ""
+		}
+	}
+	// waitSummary waits for a summary after the first skip ones that
+	// matches ok, and returns how many summaries the log then holds.
+	waitSummary := func(skip int, what string, ok func(gchatSummaryCounts) bool) int {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for {
+			sums := gchatSummaries(t, logs.String())
+			for _, c := range sums[min(skip, len(sums)):] {
+				if ok(c) {
+					return len(sums)
+				}
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("no summary with %s after the first %d; log:\n%s", what, skip, logs.String())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+
+	n := waitSummary(0, "emptyPulls>0 failedPulls=0",
+		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
+	refuse(true)
+	n = waitSummary(n, "failedPulls>0 emptyPulls=0",
+		func(c gchatSummaryCounts) bool { return c.failed > 0 && c.empty == 0 })
+	refuse(false)
+	waitSummary(n, "emptyPulls>0 failedPulls=0",
+		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
 }
