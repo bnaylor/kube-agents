@@ -848,6 +848,10 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertEqual(block.index("kubectl patch platformagent"), block.index(markers[2]))
 
 
+# A `phase` entry for run_provision_wait that stands for a dropped read.
+DROPPED_READ = "<dropped>"
+
+
 def run_provision_wait(
     *,
     jobs: str,
@@ -872,9 +876,11 @@ def run_provision_wait(
     operator wrote a new status between any two reads, and reads past the
     end repeat the last entry. So a read of both answers the Nth phase and
     the Nth condition together, and two separate reads straddle versions,
-    the way a status update landing between two GETs would. The output
-    counts the status reads (READS=) on both the pass and the fail line, so
-    a test can tell one read from a wait."""
+    the way a status update landing between two GETs would. A version whose
+    phase is DROPPED_READ answers every read of it with nothing and a failed
+    kubectl, as a GET the API drops does. The output counts the status reads
+    (READS=) on both the pass and the fail line, so a test can tell one read
+    from a wait."""
     consts = constants()
     phases = phase if isinstance(phase, list) else [phase]
     readies = ready if isinstance(ready, list) else [ready]
@@ -882,10 +888,10 @@ def run_provision_wait(
         'kubectl() { local v; case "$*" in '
         '*"get jobs"*) printf "%s" "${JOBS_STUB}" ;; '
         '*observedGeneration*) printf "%s" "${OBSERVED_STUB}" ;; '
-        "*status.phase*'type==\"Ready\"'*) v=\"$(stub_version)\"; "
+        "*status.phase*'type==\"Ready\"'*) v=\"$(stub_version)\"; stub_dropped \"${v}\" && return 1; "
         'printf "%s\t%s" "$(stub_nth "${v}" "${PHASE_STUB[@]}")" "$(stub_nth "${v}" "${READY_STUB[@]}")" ;; '
-        "*'type==\"Ready\"'*) v=\"$(stub_version)\"; stub_nth \"${v}\" \"${READY_STUB[@]}\" ;; "
-        '*status.phase*) v="$(stub_version)"; stub_nth "${v}" "${PHASE_STUB[@]}" ;; '
+        "*'type==\"Ready\"'*) v=\"$(stub_version)\"; stub_dropped \"${v}\" && return 1; stub_nth \"${v}\" \"${READY_STUB[@]}\" ;; "
+        '*status.phase*) v="$(stub_version)"; stub_dropped "${v}" && return 1; stub_nth "${v}" "${PHASE_STUB[@]}" ;; '
         '*) echo "kubectl $*" ;; esac; }'
     )
     # The status version this read sees (from zero), counting the read.
@@ -896,6 +902,9 @@ def run_provision_wait(
         'if [ "${n}" -ge "$#" ]; then n=$(($# - 1)); fi; '
         'shift "${n}"; printf "%s" "$1"; }'
     )
+    # A version whose phase is DROPPED_READ is a read the API drops: kubectl
+    # prints nothing and fails, as a GET that errors does.
+    stub_dropped = f'stub_dropped() {{ [ "$(stub_nth "$1" "${{PHASE_STUB[@]}}")" = {shlex.quote(DROPPED_READ)} ]; }}'
     return run_bash(
         "\n".join(
             [
@@ -922,6 +931,7 @@ def run_provision_wait(
                 "MODE_NEXT_START=0",
                 stub_version,
                 stub_nth,
+                stub_dropped,
                 stub,
                 # The gate's re-reads sleep MODE_NEXT_POLL_SECONDS; zero here,
                 # so a five-read wait costs nothing. The Job wait polls by the
@@ -997,6 +1007,19 @@ class ProvisionRerunGateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("platform-agent Ready condition: Ready: fine", result.stdout)
         self.assertLess(int(re.search(r"DUMPED ELAPSED=(\d+)", result.stdout).group(1)), 4)
+
+    def test_a_dropped_status_read_after_a_failed_rerun_is_one_more_poll(self) -> None:
+        """The status wait after a Failed re-run shares the gate's read. A read
+        the API drops there matches no refusal, so it is one more poll, and
+        the step fails on the Job either way; it never passes."""
+        refusal = "A2AProvisionFailed: TASKS holds 64 consumers and this configuration needs 71"
+        result = run_provision_wait(
+            jobs="j2:Failed, ", call=self._RERUN, observed="3", phase=[DROPPED_READ, "Degraded"], ready=["", refusal], status_attempts=3
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"platform-agent Ready condition: {refusal}", result.stdout)
+        self.assertRegex(result.stdout, r"DUMPED ELAPSED=\d+ READS=2\n")
+        self.assertNotIn("PASSED", result.stdout)
 
     def test_the_degraded_gate_reds_on_a_refusal_the_job_did_not_show(self) -> None:
         gate = 'gate_cr_not_degraded "the sidecar patch"'
@@ -1148,9 +1171,92 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(self._reads(result), 2)
+                # The first read was forgiven, and the second ended the wait:
+                # a gate that failed on the first read, or took the phase and
+                # the condition from two reads that straddle the update, can
+                # land on READS=2 and this ERROR line without having waited.
+                self.assertIn(f"re-read 1/5 in 0s (Ready condition: {_WAITING_FOR_CAPACITY})", result.stdout)
+                self.assertNotIn("re-read 2/5", result.stdout)
+                self.assertRegex(result.stdout, re.escape("the wait for capacity ended after 1 re-reads, ") + r"\d+s\n")
                 self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
                 self.assertIn("DUMPED", result.stdout)
                 self.assertNotIn("PASSED", result.stdout)
+
+    def test_a_read_dropped_mid_wait_is_one_more_poll(self) -> None:
+        """The read the wait sits on swallows a failed kubectl (the gate's
+        first read always has, as main's did), so a GET the API drops reads
+        back as no phase and no condition. Mid-wait that is one more poll,
+        counted against the window, never the CR turning healthy: the read
+        before it said Degraded. So is a status read back empty."""
+        cases = {
+            "dropped, then another Degraded": (
+                ["Degraded", DROPPED_READ, "Degraded"],
+                [_WAITING_FOR_CAPACITY, "", "ImagePullBackOff: Container 'hermes-bridge' is waiting"],
+                1,
+            ),
+            "dropped, then a refused provision": (
+                ["Degraded", DROPPED_READ, "Ready"],
+                [_WAITING_FOR_CAPACITY, "", "A2AProvisionFailed: TASKS holds 64 consumers and this configuration needs 71"],
+                1,
+            ),
+            "dropped, then Ready": (["Degraded", DROPPED_READ, "Ready"], [_WAITING_FOR_CAPACITY, "", _ALL_READY], 0),
+            "an empty status, then another Degraded": (
+                ["Degraded", "", "Degraded"],
+                [_WAITING_FOR_CAPACITY, "", "ImagePullBackOff: Container 'hermes-bridge' is waiting"],
+                1,
+            ),
+        }
+        for name, (phases, readies, status) in cases.items():
+            with self.subTest(name):
+                result = run_provision_wait(jobs="", call=self._GATE, phase=phases, ready=readies, unschedulable_attempts=5)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(self._reads(result), 3)
+                self.assertIn(f"re-read 1/5 in 0s (Ready condition: {_WAITING_FOR_CAPACITY})", result.stdout)
+                self.assertRegex(
+                    result.stdout,
+                    re.escape("the read of platform-agent after the sidecar patch returned nothing, ")
+                    + r"\d+s"
+                    + re.escape(f" in; re-read 2/5 in 0s (last Ready condition: {_WAITING_FOR_CAPACITY})"),
+                )
+                self.assertNotIn("re-read 3/5", result.stdout)
+                self.assertNotIn("is unphased", result.stdout)
+                if status == 0:
+                    self.assertRegex(result.stdout, re.escape("✓ the wait for capacity cleared after 2 re-reads, ") + r"\d+s\n")
+                    self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+                    self.assertNotIn("ERROR", result.stdout)
+                else:
+                    self.assertRegex(result.stdout, re.escape("the wait for capacity ended after 2 re-reads, ") + r"\d+s\n")
+                    self.assertIn(f"ERROR: platform-agent is {phases[2]} after the sidecar patch; Ready condition: {readies[2]}", result.stdout)
+                    self.assertIn("DUMPED", result.stdout)
+                    self.assertNotIn("PASSED", result.stdout)
+
+    def test_reads_dropped_to_the_end_of_the_window_fail_on_the_last_one_that_answered(self) -> None:
+        result = run_provision_wait(
+            jobs="", call=self._GATE, phase=["Degraded", DROPPED_READ], ready=[_WAITING_FOR_CAPACITY, ""], unschedulable_attempts=3
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self._reads(result), 4)
+        self.assertIn("re-read 3/3", result.stdout)
+        self.assertNotIn("re-read 4/3", result.stdout)
+        self.assertRegex(
+            result.stdout,
+            re.escape("the wait for capacity ended after 3 re-reads, ")
+            + r"\d+s"
+            + re.escape("; the last read returned nothing, so this is the last one that answered\n"),
+        )
+        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertIn("DUMPED", result.stdout)
+        self.assertNotIn("PASSED", result.stdout)
+
+    def test_a_dropped_first_read_passes_as_it_did_before(self) -> None:
+        """Outside a wait there is no Degraded to hold on to, and main's gate
+        took a first read that failed as an unphased CR. That is kept: this
+        change is the wait, not the first read. Every read is dropped here,
+        so main's gate, which made two, passes this too."""
+        result = run_provision_wait(jobs="", call=self._GATE, phase=DROPPED_READ)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("✓ platform-agent is unphased after the sidecar patch (Ready condition: none)", result.stdout)
+        self.assertNotIn("re-read", result.stdout)
 
     def test_a_refused_provision_fails_on_the_first_read(self) -> None:
         refusals = {

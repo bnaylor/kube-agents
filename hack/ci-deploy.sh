@@ -1417,27 +1417,45 @@ wait_provision_job() {
 # SCHEDULER_CAPACITY_SHORTFALL_RE), which an Autopilot scale-up clears on its
 # own (#2414). That one is re-read up to MODE_NEXT_UNSCHEDULABLE_ATTEMPTS
 # times, with a line per read, and fails as any other Degraded does if it is
-# still there at the end or turns into something else. Prints the condition
-# either way, so the artifact says what the CR said.
+# still there at the end or turns into something else. A read that returns
+# nothing inside that wait is one more re-read, never a pass; the first read
+# keeps the rule it had, a failed read passing as unphased. Prints the
+# condition either way, so the artifact says what the CR said.
 gate_cr_not_degraded() {
-  local what="$1" pair phase condition rereads=0 gate_start=$SECONDS
+  local what="$1" pair phase condition rereads=0 unanswered="" gate_start=$SECONDS
   while :; do
     # One read, so the phase and the condition are one object version's.
     pair="$(cr_phase_and_ready_condition)"
-    phase="${pair%%$'\t'*}"
-    condition="${pair#*$'\t'}"
-    if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
-      break
-    fi
-    if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
-      [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] && [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
-      rereads=$((rereads + 1))
-      echo "${PLATFORM_AGENT_CR_NAME} is ${phase} after ${what} on a pod waiting for CPU or memory, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (Ready condition: ${condition})"
-      sleep "${MODE_NEXT_POLL_SECONDS}"
-      continue
+    if [ "${rereads}" -gt 0 ] && [ -z "${pair//$'\t'/}" ]; then
+      # Nothing read mid-wait: a GET the API dropped (the read swallows the
+      # failure) or a status read back empty. One more poll against the
+      # window, never a pass: the read before it said Degraded. phase and
+      # condition keep that read's, so a window that ends here fails on it.
+      if [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ]; then
+        rereads=$((rereads + 1))
+        echo "the read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (last Ready condition: ${condition})"
+        sleep "${MODE_NEXT_POLL_SECONDS}"
+        continue
+      fi
+      unanswered="; the last read returned nothing, so this is the last one that answered"
+    else
+      phase="${pair%%$'\t'*}"
+      condition="${pair#*$'\t'}"
+      # The first read keeps main's rule: one that fails reads as unphased
+      # and passes.
+      if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
+        break
+      fi
+      if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
+        [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] && [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
+        rereads=$((rereads + 1))
+        echo "${PLATFORM_AGENT_CR_NAME} is ${phase} after ${what} on a pod waiting for CPU or memory, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (Ready condition: ${condition})"
+        sleep "${MODE_NEXT_POLL_SECONDS}"
+        continue
+      fi
     fi
     if [ "${rereads}" -gt 0 ]; then
-      echo "the wait for capacity ended after ${rereads} re-reads, $((SECONDS - gate_start))s"
+      echo "the wait for capacity ended after ${rereads} re-reads, $((SECONDS - gate_start))s${unanswered}"
     fi
     echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what}; Ready condition: ${condition:-none}"
     echo "--- provisioning Job pod logs ---"
