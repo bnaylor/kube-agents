@@ -2080,12 +2080,12 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // mode: next and needs its own live test.
 //
 // And the rotation it notices rolls the bus, not the bus's clients. This hash
-// rides the NATS pod template alone; the gateway Deployment and the provision
-// Job take their passwords through valueFrom.secretKeyRef, which a running pod
-// does not re-read. The gateway is covered separately: its pod template carries
-// the secret-env digest (stampSecretEnvHash in reconcileA2A), which moves when
-// its password's value does, within secretEnvReprobeInterval. The provision Job
-// is not.
+// rides the NATS pod template alone; the gateway Deployment takes its password
+// through valueFrom.secretKeyRef, which a running pod does not re-read. The
+// gateway is covered separately: its pod template carries the secret-env digest
+// (stampSecretEnvHash in reconcileA2A), which moves when its password's value
+// does, within secretEnvReprobeInterval. The provision Job holds no password: it
+// authenticates with its projected bus token (a2aBusTokenVolumeSource).
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)

@@ -107,7 +107,10 @@ import (
 // key still needs a restart because an init container copies it to an emptyDir
 // at pod start — unchanged by this file. The shell sandbox pod is not involved:
 // it mounts its own <agent>-shell-authorized-keys and deliberately never names
-// platform-agent-secrets.
+// platform-agent-secrets. The A2A gateway has a second such mount: a
+// Slack-armed gateway mounts the a2a-slack-principal-map Secret
+// (a2aPrincipalMapVolumeSource), and the gateway reads that map once, at start
+// (a2a/gateway/gateway.go, New), so an edit to it also needs a restart.
 //
 // Reading the refs off the rendered pod spec rather than naming
 // platform-agent-secrets also covers the case where the CR supplies its own

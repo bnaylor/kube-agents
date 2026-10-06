@@ -1140,7 +1140,7 @@ registry, which it asks whether a task has started in that thread (a record alon
 not enough, since one is minted for any verified turn, a "stop" with nothing running
 included). Nothing is derived from the root message. A mention on its own starts
 nothing and makes nothing a session thread, whoever typed it, so a channel mention from
-a sender the principal map refuses roots nothing. A session thread stays one while a
+a sender the gateway refuses (the allowlist, then the principal map) roots nothing. A session thread stays one while a
 task runs there or the session has had activity within the idle TTL; past that, the
 thread needs a fresh mention. The activity that counts is the last task's own: its start,
 and an executor's terminal for it, so the window opens at the answer, not at the ask that

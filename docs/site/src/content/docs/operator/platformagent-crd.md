@@ -1052,6 +1052,9 @@ Five details decide whether you will see it happen.
   and because an init container copies it into an `emptyDir` at pod start, rotating that one key
   still needs a restart — as it did before this change. The shell sandbox mounts its own
   `<agent>-shell-authorized-keys`, and deliberately never names `platform-agent-secrets` at all.
+  The A2A gateway has a second such mount: on a Slack-armed install it mounts the
+  `a2a-slack-principal-map` Secret, and the gateway reads that map once, when it starts, so an edit
+  to it needs `kubectl rollout restart deployment/<agent>-a2a-gateway`.
 - **Whichever Secret the pod actually names.** The refs are read off the rendered pod spec, so a CR
   that supplies its own `SecretKeyRef` pointing at a different Secret is covered without naming it
   anywhere.
@@ -1070,6 +1073,8 @@ Five details decide whether you will see it happen.
 across the gap — up to the startup budget of roughly fifteen minutes on a cold image pull. Expect one
 such restart per agent the first time an operator carrying this change reconciles: the annotation is
 new, so the first pass adds it and the template changes once, whether or not anything was rotated.
+The A2A gateway joined the stamped pods later, so the first operator that stamps it restarts each
+`mode: next` A2A gateway once in the same way.
 An operator upgrade that changes how the digest is computed restarts each stamped pod once in the
 same way.
 
