@@ -292,6 +292,31 @@ readonly CR_READY_REASON_PROVISION_FAILED="A2AProvisionFailed"
 # its requeue (30s while a provision Job runs), so the status lags the Job by
 # up to one requeue. Polls of MODE_NEXT_POLL_SECONDS.
 readonly MODE_NEXT_STATUS_ATTEMPTS=12
+# The one Degraded the gate after the sidecar patch waits out rather than
+# failing on (#2414): the operator gives the Ready condition this reason for
+# any pod the scheduler marked Unschedulable, and that includes a pod waiting
+# for the node an Autopilot scale-up is adding. The gate tells that case from
+# the rest by the scheduler's own words in the message, which the operator
+# copies in after "cannot be scheduled onto any available node:" -- a count
+# of nodes short of CPU or memory, as in "1 node(s) didn't match
+# PersistentVolume's node affinity, 2 Insufficient cpu, 2 Insufficient
+# memory". One such count is enough, whatever else the message names: a node
+# counted there is one the pod fits but for capacity, so another node like it
+# places the pod. A message with no such count (node affinity or selector
+# only, an untolerated taint only, or the RuntimeClass sentence the operator
+# writes instead of the scheduler's when the CR requests one) names nothing a
+# scale-up fixes, and fails on the first read as before.
+readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
+readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)([,.]|$)'
+# How many more reads, MODE_NEXT_POLL_SECONDS apart, that Degraded gets before
+# the gate fails on it: five minutes. The three runs in #2414 had the pod
+# assigned within seconds, but the CR's status does not move when the pod is
+# assigned. The operator rewrites it on its next pass, and nothing it watches
+# changes on an assignment; the Deployment's status does once the pod is
+# Ready. So the window covers adding a node, pulling both images onto it, and
+# the agent's start, with room for a scale-up that takes a few minutes rather
+# than one. Half the rollout budget the next gate gives the same Deployment.
+readonly MODE_NEXT_UNSCHEDULABLE_ATTEMPTS=60
 readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
 readonly A2A_NATS_POD_SELECTOR="app=${PLATFORM_AGENT_CR_NAME}-a2a-nats"
@@ -1372,18 +1397,40 @@ wait_provision_job() {
 # Reads the CR's phase and Ready condition after a provisioning Job completed
 # and stops the deploy on a refusal the Job's own conditions did not show:
 # phase Degraded, or Ready carrying the reason a refused provision is given.
-# One read: a Degraded here is a refusal already written, not a lag. Prints
-# the condition either way, so the artifact says what the CR said.
+# A refusal is already written when the Job is done, not a lag, so it fails
+# on the first read, and so does every other Degraded but one: a pod waiting
+# for CPU or memory (CR_READY_REASON_POD_UNSCHEDULABLE with a count matching
+# SCHEDULER_CAPACITY_SHORTFALL_RE), which an Autopilot scale-up clears on its
+# own (#2414). That one is re-read up to MODE_NEXT_UNSCHEDULABLE_ATTEMPTS
+# times, with a line per read, and fails as any other Degraded does if it is
+# still there at the end or turns into something else. Prints the condition
+# either way, so the artifact says what the CR said.
 gate_cr_not_degraded() {
-  local what="$1" phase condition
-  phase="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-  condition="$(cr_ready_condition)"
-  if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || [[ "${condition}" == "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
+  local what="$1" phase condition rereads=0 gate_start=$SECONDS
+  while :; do
+    phase="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    condition="$(cr_ready_condition)"
+    if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
+      break
+    fi
+    if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
+      [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] && [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
+      rereads=$((rereads + 1))
+      echo "${PLATFORM_AGENT_CR_NAME} is ${phase} after ${what} on a pod waiting for CPU or memory, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (Ready condition: ${condition})"
+      sleep "${MODE_NEXT_POLL_SECONDS}"
+      continue
+    fi
+    if [ "${rereads}" -gt 0 ]; then
+      echo "the wait for capacity ended after ${rereads} re-reads, $((SECONDS - gate_start))s"
+    fi
     echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what}; Ready condition: ${condition:-none}"
     echo "--- provisioning Job pod logs ---"
     kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
     dump_mode_next_state
     exit 1
+  done
+  if [ "${rereads}" -gt 0 ]; then
+    echo "✓ the wait for capacity cleared after ${rereads} re-reads, $((SECONDS - gate_start))s"
   fi
   echo "✓ ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what} (Ready condition: ${condition:-none})"
 }
@@ -1534,7 +1581,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # for, and the CR read after it: a refusal here used to park the CR
   # Degraded over a working bus while this step went on to a green bridge
   # line (#2077). The first patch's maxSessions was sized so this budget
-  # fits; this is the guard for a budget that moves.
+  # fits; this is the guard for a budget that moves. The same patch rolls
+  # the agent pod, which can wait a minute for a node on Autopilot; the gate
+  # waits that one Degraded out and no other (#2414).
   wait_provision_job "the sidecar patch" "${FIRST_PROVISION_JOB}" "${SIDECAR_CR_GENERATION}"
   gate_cr_not_degraded "the sidecar patch"
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
