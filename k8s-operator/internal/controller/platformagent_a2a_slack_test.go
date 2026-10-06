@@ -294,54 +294,124 @@ func TestNoRenderCarriesTwoSlackSocketModeConsumers(t *testing.T) {
 	}
 }
 
-// TestTheGatewayReadsOneMapFromBothTables: the principal map is one volume
-// at the gateway's one path, projected from the Discord ConfigMap and the
-// Slack Secret, both optional - the gateway's own rule for a missing table -
-// with A2A_PRINCIPAL_MAP rendered at that path so the two are one fact. No
-// DefaultMode: the pod runs as uid 1000 with no fsGroup, so a 0400 Secret
-// file would be root's and unreadable.
-func TestTheGatewayReadsOneMapFromBothTables(t *testing.T) {
-	t.Setenv(a2aInjectBackendEnvVar, "")
-	dep := buildA2AGatewayDeployment(a2aTestAgent())
-	c := dep.Spec.Template.Spec.Containers[0]
-	if got := envMapOf(c.Env)[a2aPrincipalMapEnvVar].Value; got != a2aPrincipalMapDir {
-		t.Errorf("%s = %q, want %q", a2aPrincipalMapEnvVar, got, a2aPrincipalMapDir)
-	}
-	var mount *corev1.VolumeMount
-	for i := range c.VolumeMounts {
-		if c.VolumeMounts[i].Name == a2aPrincipalMapVolume {
-			mount = &c.VolumeMounts[i]
-		}
-	}
-	if mount == nil || mount.MountPath != a2aPrincipalMapDir || !mount.ReadOnly {
-		t.Fatalf("principal map mount = %+v, want read-only at %s", mount, a2aPrincipalMapDir)
-	}
-	vol := podVolume(dep.Spec.Template, a2aPrincipalMapVolume)
-	if vol == nil || vol.Projected == nil {
-		t.Fatalf("volume %s is not projected: %+v", a2aPrincipalMapVolume, vol)
-	}
-	if vol.Projected.DefaultMode != nil {
-		t.Errorf("the projected map carries DefaultMode %o; without an fsGroup a non-default mode leaves the Secret's files root-owned", *vol.Projected.DefaultMode)
-	}
-	var cm, secret bool
-	for _, src := range vol.Projected.Sources {
-		switch {
-		case src.ConfigMap != nil && src.ConfigMap.Name == a2aPrincipalMapConfigMapName:
-			cm = true
-			if src.ConfigMap.Optional == nil || !*src.ConfigMap.Optional {
-				t.Error("the Discord table is not optional; an install without it would not schedule the gateway")
+// principalMapSources names every ConfigMap and Secret the gateway's
+// principal-map volume reads, whatever shape the volume takes (a plain
+// ConfigMap or Secret volume, or a projection of either), each with whether
+// its reference is optional. A test that read one shape only would pass a
+// render that moved the ConfigMap into the other.
+func principalMapSources(t *testing.T, vol *corev1.Volume) (configMaps, secrets map[string]bool) {
+	t.Helper()
+	configMaps, secrets = map[string]bool{}, map[string]bool{}
+	opt := func(b *bool) bool { return b != nil && *b }
+	switch {
+	case vol.ConfigMap != nil:
+		configMaps[vol.ConfigMap.Name] = opt(vol.ConfigMap.Optional)
+	case vol.Secret != nil:
+		secrets[vol.Secret.SecretName] = opt(vol.Secret.Optional)
+	case vol.Projected != nil:
+		for _, src := range vol.Projected.Sources {
+			switch {
+			case src.ConfigMap != nil:
+				configMaps[src.ConfigMap.Name] = opt(src.ConfigMap.Optional)
+			case src.Secret != nil:
+				secrets[src.Secret.Name] = opt(src.Secret.Optional)
+			default:
+				t.Errorf("unexpected projection source in the principal map: %+v", src)
 			}
-		case src.Secret != nil && src.Secret.Name == a2aSlackPrincipalMapSecretName:
-			secret = true
-			if src.Secret.Optional == nil || !*src.Secret.Optional {
-				t.Errorf("the %s Secret is not optional; the gateway's rule for a missing map is to run and drop every sender", a2aSlackPrincipalMapSecretName)
-			}
-		default:
-			t.Errorf("unexpected projection source in the principal map: %+v", src)
 		}
+	default:
+		t.Fatalf("volume %s reads neither a ConfigMap nor a Secret: %+v", vol.Name, vol)
 	}
-	if !cm || !secret {
-		t.Errorf("the principal map projects ConfigMap=%v Secret=%v, want both", cm, secret)
+	return configMaps, secrets
+}
+
+// TestTheGatewayMapIsTheArmedBackendsTable: the principal map is one volume
+// at the gateway's one path, with A2A_PRINCIPAL_MAP rendered at that path so
+// the two are one fact, and what it reads is the armed backend's table and
+// nothing else. A Slack-armed gateway reads the a2a-slack-principal-map
+// Secret alone: the gateway loads the directory as one flat map and resolves
+// a Slack sender against every key in it, so a ConfigMap in the same
+// directory would let a configmaps write grant a Slack principal - the
+// impersonation primitive spec-chatops-gateway.md keeps the table out of a
+// ConfigMap to avoid. Every other render keeps main's volume, the hand-made
+// principal-map ConfigMap, and does not reference the Slack Secret. Both
+// optional, the gateway's own rule for a missing table. No DefaultMode: the
+// pod runs as uid 1000 with no fsGroup, so a 0400 Secret file would be root's
+// and unreadable. The door rows check that arming the eval door changes none
+// of this: its map is its own ConfigMap at its own path.
+func TestTheGatewayMapIsTheArmedBackendsTable(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		agent  *agentv1alpha1.PlatformAgent
+		door   bool
+		secret bool // true: the Slack Secret alone; false: the Discord ConfigMap alone
+	}{
+		{name: "discord", agent: a2aTestAgent()},
+		{name: "door", agent: a2aTestAgent(), door: true},
+		{name: "slack on the legacy path", agent: slackTestAgent("", true)},
+		{name: "chat holds the gateway over slack", agent: chatAndSlackTestAgent("next")},
+		{name: "slack armed", agent: slackTestAgent("next", true), secret: true},
+		{name: "slack armed beside the door", agent: slackTestAgent("next", true), door: true, secret: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.door {
+				t.Setenv(a2aInjectBackendEnvVar, "true")
+			} else {
+				t.Setenv(a2aInjectBackendEnvVar, "")
+			}
+			dep := buildA2AGatewayDeployment(tc.agent)
+			c := dep.Spec.Template.Spec.Containers[0]
+			if got := envMapOf(c.Env)[a2aPrincipalMapEnvVar].Value; got != a2aPrincipalMapDir {
+				t.Errorf("%s = %q, want %q", a2aPrincipalMapEnvVar, got, a2aPrincipalMapDir)
+			}
+			var mounts []corev1.VolumeMount
+			for _, m := range c.VolumeMounts {
+				if m.MountPath == a2aPrincipalMapDir {
+					mounts = append(mounts, m)
+				}
+			}
+			if len(mounts) != 1 || mounts[0].Name != a2aPrincipalMapVolume || !mounts[0].ReadOnly {
+				t.Fatalf("mounts at %s = %+v, want one, read-only, of volume %s", a2aPrincipalMapDir, mounts, a2aPrincipalMapVolume)
+			}
+			vol := podVolume(dep.Spec.Template, a2aPrincipalMapVolume)
+			if vol == nil {
+				t.Fatalf("no volume %s", a2aPrincipalMapVolume)
+			}
+			if vol.Projected != nil && vol.Projected.DefaultMode != nil {
+				t.Errorf("the map carries DefaultMode %o; without an fsGroup a non-default mode leaves a Secret's files root-owned", *vol.Projected.DefaultMode)
+			}
+			if vol.Secret != nil && vol.Secret.DefaultMode != nil {
+				t.Errorf("the map carries DefaultMode %o; without an fsGroup a non-default mode leaves the Secret's files root-owned", *vol.Secret.DefaultMode)
+			}
+			configMaps, secrets := principalMapSources(t, vol)
+			if tc.secret {
+				if len(configMaps) != 0 {
+					t.Errorf("a Slack-armed gateway's map reads ConfigMaps %v; a configmaps write would grant a Slack principal", configMaps)
+				}
+				if optional, ok := secrets[a2aSlackPrincipalMapSecretName]; !ok || len(secrets) != 1 {
+					t.Errorf("a Slack-armed gateway's map reads Secrets %v, want %s alone", secrets, a2aSlackPrincipalMapSecretName)
+				} else if !optional {
+					t.Errorf("the %s Secret is not optional; the gateway's rule for a missing map is to run and drop every sender", a2aSlackPrincipalMapSecretName)
+				}
+			} else {
+				if len(secrets) != 0 {
+					t.Errorf("a gateway without Slack armed reads Secrets %v in its map, want main's ConfigMap alone", secrets)
+				}
+				if optional, ok := configMaps[a2aPrincipalMapConfigMapName]; !ok || len(configMaps) != 1 {
+					t.Errorf("the map reads ConfigMaps %v, want %s alone", configMaps, a2aPrincipalMapConfigMapName)
+				} else if !optional {
+					t.Error("the Discord table is not optional; an install without it would not schedule the gateway")
+				}
+			}
+			// The door's map is untouched by the Slack arm: its own
+			// operator-rendered ConfigMap, at its own path.
+			if tc.door {
+				door := podVolume(dep.Spec.Template, "inject-principal-map")
+				if door == nil || door.ConfigMap == nil || door.ConfigMap.Name != a2aInjectName(tc.agent) {
+					t.Errorf("the door's map volume = %+v, want ConfigMap %s", door, a2aInjectName(tc.agent))
+				}
+			}
+		})
 	}
 }
 

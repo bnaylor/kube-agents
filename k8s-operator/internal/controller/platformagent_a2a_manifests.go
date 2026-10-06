@@ -462,14 +462,13 @@ const (
 	a2aSlackAppTokenEnvVar = "SLACK_APP_TOKEN" // #nosec G101 -- Environment variable name, not a credential
 	// The principal map the gateway resolves Discord and Slack senders
 	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
-	// out), one volume, two optional sources projected into it - the
-	// hand-made principal-map ConfigMap that is Discord's test table, and
-	// the admin-owned a2a-slack-principal-map Secret of
-	// spec-chatops-gateway.md, "The Slack adapter". Both optional, which is
-	// the gateway's own rule for a missing map: it runs, and every sender
-	// drops at verification. No DefaultMode: the pod runs as uid 1000 with
-	// no fsGroup, and the kubelet chowns only a projected ServiceAccount
-	// token to the pod's user, so a 0400 Secret file here would be root's.
+	// out), one volume, and one source in it, the armed backend's table
+	// (a2aPrincipalMapVolumeSource): the admin-owned a2a-slack-principal-map
+	// Secret of spec-chatops-gateway.md, "The Slack adapter", when Slack is
+	// armed, and otherwise the hand-made principal-map ConfigMap that is
+	// Discord's test table. Optional either way, which is the gateway's own
+	// rule for a missing map: it runs, and every sender drops at
+	// verification.
 	a2aPrincipalMapEnvVar          = "A2A_PRINCIPAL_MAP"
 	a2aPrincipalMapDir             = "/etc/a2a/principal-map"
 	a2aPrincipalMapVolume          = "principal-map"
@@ -3924,29 +3923,44 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 	}
 }
 
-// a2aPrincipalMapVolumeSource is the gateway's one principal-map volume: the
-// Discord test table and the Slack identity table projected into the same
-// directory, because the gateway reads one map from one path
-// (A2A_PRINCIPAL_MAP) for both backends and resolves a sender against it by
-// backend-native id, which the two id grammars cannot collide on. Both
-// sources optional, for the gateway's own reason: an install without its
-// table runs and drops every sender at verification, visibly. The Secret is
-// referenced, never rendered: it is the install admin's to write, through the
-// install path, and no product ServiceAccount holds a verb on it.
-func a2aPrincipalMapVolumeSource() corev1.Volume {
+// a2aPrincipalMapVolumeSource is the gateway's one principal-map volume, at
+// the one path the gateway reads its map from (A2A_PRINCIPAL_MAP), and it is
+// the armed backend's table and nothing else. The gateway loads that
+// directory as one flat map and resolves a sender against every key in it,
+// with no record of which source a key came from, so whatever else is
+// mounted there can admit a sender too.
+//
+// A Slack-armed gateway reads the a2a-slack-principal-map Secret alone. The
+// hand-made principal-map ConfigMap is not projected beside it, because a
+// Slack-shaped key written into that ConfigMap would resolve a Slack sender:
+// a configmaps write would grant a principal, which is the impersonation
+// primitive spec-chatops-gateway.md, "The mapping table", keeps the table out
+// of a ConfigMap to avoid. The Secret is referenced, never rendered: it is the
+// install admin's to write, through the install path, and no product
+// ServiceAccount holds a verb on it. No DefaultMode: the pod runs as uid 1000
+// with no fsGroup, and a 0400 Secret file would be root's and unreadable.
+//
+// Every other gateway keeps the volume it had before Slack could arm one: the
+// principal-map ConfigMap, Discord's test table, which never maps a real
+// principal. The eval door's map is its own ConfigMap at its own path and is
+// not this volume. Optional either way, for the gateway's own reason: an
+// install without its table runs and drops every sender at verification,
+// visibly.
+func a2aPrincipalMapVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	if a2aSlackArmed(agent) {
+		return corev1.Volume{
+			Name: a2aPrincipalMapVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: a2aSlackPrincipalMapSecretName,
+				Optional:   ptr.To(true),
+			}},
+		}
+	}
 	return corev1.Volume{
 		Name: a2aPrincipalMapVolume,
-		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-			Sources: []corev1.VolumeProjection{
-				{ConfigMap: &corev1.ConfigMapProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aPrincipalMapConfigMapName},
-					Optional:             ptr.To(true),
-				}},
-				{Secret: &corev1.SecretProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aSlackPrincipalMapSecretName},
-					Optional:             ptr.To(true),
-				}},
-			},
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aPrincipalMapConfigMapName},
+			Optional:             ptr.To(true),
 		}},
 	}
 }
@@ -4244,7 +4258,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						}}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource()}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},

@@ -1133,11 +1133,14 @@ group ingress.
 `user_id` against a table sourced from our own IdP; never `profile.email` (the identity
 section above says why). The table is a Kubernetes Secret, mounted read-only at the
 gateway's principal-map path, same file format the Discord ConfigMap uses.
-`a2a-slack-principal-map` is the name the operator mounts under `next`: projected beside
-the Discord table at the gateway's one principal-map path, optional, so an install without
-its table is the gateway's own case (it runs, and every Slack sender drops at verification,
-with the warning the gateway logs when the map is empty altogether; a Discord table in the same
-projection keeps it non-empty). The gateway reads the map once, at start, so a table
+`a2a-slack-principal-map` is the name the operator mounts under `next`: alone at the
+gateway's one principal-map path, optional, so an install without its table is the
+gateway's own case (it runs, and every Slack sender drops at verification, with the
+warning the gateway logs when the map is empty). Alone because the gateway reads that
+directory as one flat map and resolves a Slack sender against every key in it: the
+hand-made `principal-map` ConfigMap, Discord's table, mounted there too would let a
+ConfigMap write add a Slack `user_id`, so a Slack-armed gateway does not mount it. Every
+other gateway mounts that ConfigMap, as before. The gateway reads the map once, at start, so a table
 created or edited after the gateway is running takes effect at its next restart. Nothing
 in-tree creates its content. A
 Secret rather than a ConfigMap because a
