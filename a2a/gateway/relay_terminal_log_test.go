@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -275,4 +276,142 @@ func TestTaskTerminalLogNamesTheTasksOwnAddressee(t *testing.T) {
 	if got["addressee"] != "platform" || got["addressee"] != ingress["addressee"] {
 		t.Fatalf("addressee = %v, want platform (ingress logged %v)", got["addressee"], ingress["addressee"])
 	}
+}
+
+// terminalLinesFor is the "task terminal" lines that name taskID.
+func terminalLinesFor(t *testing.T, logs *syncBuffer, taskID string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range logRecords(t, logs, "task terminal") {
+		if line["taskId"] == taskID {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// assertTerminalLine checks every field the line carries, so a dropped key
+// fails as loudly as a wrong one.
+func assertTerminalLine(t *testing.T, line map[string]any, want map[string]any) {
+	t.Helper()
+	for _, k := range []string{"level", "taskId", "conversation", "addressee", "state", "source", "reason"} {
+		if _, ok := line[k]; !ok {
+			t.Errorf("task terminal line has no %q key: %v", k, line)
+		}
+	}
+	for k, v := range want {
+		if line[k] != v {
+			t.Errorf("%s = %v, want %v (line %v)", k, line[k], v, line)
+		}
+	}
+}
+
+// The terminals that never reach the relay log the same line: the heal of a
+// terminal the relay missed, the heal of a task no executor took, and a
+// submission that never reached the bus. The line lives in
+// observeTaskTerminal, the one place every terminal is handed to the
+// adapter, so an operator joining "ingress" to "task terminal" on taskId
+// finds an outcome for each of these too (#2406, #2410 review).
+
+// The stale-task heal: the relay missed a final the stream holds, and the
+// next turn finds it and delivers it. One line, with the fold's state,
+// whose word it was, and the reason token from the final message.
+func TestTaskTerminalLogCoversTheStaleTaskHeal(t *testing.T) {
+	logs := &syncBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
+	conv := "discord:g1/thread-terminal-log-stale-heal"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "th-1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	publishTerminal(t, r, origin, lib.Party{Session: "platform"}, lib.TaskEventsSubject("platform", origin.TaskID),
+		lib.StateFailed, "reason: hermes-exited-nonzero - exit status 1")
+	waitFor(t, "the task index retired", func() bool { return r.g.sessionForTask(ctx, origin.TaskID) == "" })
+	if got := terminalLinesFor(t, logs, origin.TaskID); len(got) != 1 {
+		t.Fatalf("the relayed terminal logged %d lines, want 1: %v", len(got), got)
+	}
+
+	// The relay having missed the terminal: the active task restored, the
+	// state a transient KV failure on the final event leaves.
+	l := r.g.lockSession(conv)
+	l.Lock()
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		l.Unlock()
+		t.Fatalf("no record: %+v err=%v", rec, err)
+	}
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID}
+	err = r.g.reg.Put(ctx, rec)
+	l.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "th-2", Text: "next"}
+	waitFor(t, "the heal's terminal line", func() bool { return len(terminalLinesFor(t, logs, origin.TaskID)) >= 2 })
+	waitFor(t, "the next turn's ingress", func() bool { return len(logRecords(t, logs, "ingress")) == 2 })
+
+	got := terminalLinesFor(t, logs, origin.TaskID)
+	if len(got) != 2 {
+		t.Fatalf("want one line from the relay and one from the heal, got %d: %v", len(got), got)
+	}
+	assertTerminalLine(t, got[1], map[string]any{
+		"level": "INFO", "taskId": origin.TaskID, "conversation": conv, "addressee": "platform",
+		"state": string(lib.StateFailed), "source": string(TerminalFromExecutor), "reason": "hermes-exited-nonzero",
+	})
+}
+
+// The never-started heal: a task older than the grace with nothing on its
+// stream is released as the install's failure, and logged as one.
+func TestTaskTerminalLogCoversTheNeverStartedHeal(t *testing.T) {
+	logs := &syncBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
+	conv := "discord:g1/thread-terminal-log-never-started"
+	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tn-1", Text: "anyone there?"}
+	waitFor(t, "the heal's terminal line", func() bool { return len(terminalLinesFor(t, logs, "task-never")) > 0 })
+	waitFor(t, "the next turn's ingress", func() bool { return len(logRecords(t, logs, "ingress")) == 1 })
+
+	got := terminalLinesFor(t, logs, "task-never")
+	if len(got) != 1 {
+		t.Fatalf("want one task terminal line, got %d: %v", len(got), got)
+	}
+	assertTerminalLine(t, got[0], map[string]any{
+		"level": "INFO", "taskId": "task-never", "conversation": conv, "addressee": "chat-otter-dead",
+		"state": string(lib.StateFailed), "source": string(TerminalNeverStarted), "reason": "",
+	})
+}
+
+// The publish failure: the task was announced and never reached the bus.
+// Its ingress line is already written, so the line is its only outcome.
+func TestTaskTerminalLogCoversThePublishFailure(t *testing.T) {
+	logs := &syncBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
+	deleteTasksStream(t, r.url)
+	conv := "discord:g1/thread-terminal-log-no-bus"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tp-1", Text: "start"}
+
+	waitFor(t, "the terminal log line", func() bool { return len(logRecords(t, logs, "task terminal")) > 0 })
+	waitFor(t, "the failure edit", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "could not reach the bus") {
+				return true
+			}
+		}
+		return false
+	})
+
+	got := logRecords(t, logs, "task terminal")
+	ingress := logRecords(t, logs, "ingress")
+	if len(got) != 1 || len(ingress) != 1 {
+		t.Fatalf("want one ingress and one task terminal line, got %d and %d: %v", len(ingress), len(got), got)
+	}
+	assertTerminalLine(t, got[0], map[string]any{
+		"level": "INFO", "taskId": ingress[0]["taskId"], "conversation": conv, "addressee": "platform",
+		"state": string(lib.StateFailed), "source": string(TerminalFromGateway), "reason": "",
+	})
 }

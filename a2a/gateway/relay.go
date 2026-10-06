@@ -379,20 +379,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
-	// The outcome side of the "ingress" line: same keys, so one task's two
-	// ends join on taskId. Chat already showed the user the reason; the log
-	// keeps only its token (reasonToken), so a failing install's log says
-	// how each task ended without copying executor output into it. The
-	// addressee is the one the task was published to, which is what ingress
-	// logged; after a Delegate re-home rec.Addressee is not it.
-	g.log.Info("task terminal",
-		"taskId", taskID,
-		"conversation", rec.Key,
-		"addressee", rec.AddresseeFor(taskID),
-		"state", s.Status.State,
-		"source", source,
-		"reason", reasonToken(reason))
-	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, source, reason)
+	// observeTaskTerminal also logs the terminal, against the addressee the
+	// task was published to (ingress logged that one, not rec.Addressee).
+	g.observeTaskTerminal(rec.Key, rec.AddresseeFor(taskID), taskID, s.Status.State, source, reason)
 }
 
 // reasonToken is the token of an executor's `reason: <token>[ - detail]`

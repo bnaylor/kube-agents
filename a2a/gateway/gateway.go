@@ -922,7 +922,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 				}
 			}
 		}
-		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
+		g.observeTaskTerminal(rec.Key, addressee, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource = true, source
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
@@ -937,7 +937,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// failed answer decides whether a run is the agent's fault or
 		// the install's. Nothing is published: as handleInbound's comment
 		// says, age is not evidence.
-		g.observeTaskTerminal(rec.Key, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
+		g.observeTaskTerminal(rec.Key, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
@@ -1342,7 +1342,24 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	}
 }
 
-func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+// observeTaskTerminal is also where every terminal is logged, because every
+// terminal reaches it: the relay's, the heal's (a final the relay missed, a
+// task no executor took) and the gateway's own for a submission that never
+// reached the bus. The line is the outcome side of "ingress": the same keys,
+// so one task's two ends join on taskId. The addressee is the one the task
+// was published to, which is what ingress logged; after a Delegate re-home
+// rec.Addressee is not it, so each caller passes the one it holds. Chat
+// already showed the user the reason; the log keeps only its token
+// (reasonToken), so a failing install's log says how each task ended without
+// copying executor output into it.
+func (g *Gateway) observeTaskTerminal(conversation, addressee, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	g.log.Info("task terminal",
+		"taskId", taskID,
+		"conversation", conversation,
+		"addressee", addressee,
+		"state", state,
+		"source", source,
+		"reason", reasonToken(reason))
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(conversation, taskID, state, source, reason)
 	}
@@ -1594,7 +1611,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		// is the gateway telling its own adapter, not a terminal on the
 		// stream, which would be a claim about a task the stream has never
 		// heard of.
-		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
+		g.observeTaskTerminal(rec.Key, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		return
 	}
 
