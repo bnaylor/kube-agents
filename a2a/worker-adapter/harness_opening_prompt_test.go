@@ -16,15 +16,46 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// openingPromptBytes is larger than any pipe buffer the adapter can meet, so
-// the opening-prompt write cannot complete into the buffer and return before
-// the stub exits. The write blocks until the stub's exit closes the read end,
-// then fails with EPIPE, every run. A prompt that fits the buffer would let
-// the write succeed and send the task down supervise's failure arm instead,
-// which is not the path under test. Linux pipes default to 64 KiB and macOS
-// pipes grow to 64 KiB at most; 256 KiB is four times either, and the
-// submission envelope stays well under the embedded server's 1 MB payload cap.
-const openingPromptBytes = 256 * 1024
+// The opening-prompt tests need a write that cannot complete into the pipe
+// buffer and return before the stub exits. The write then blocks until the
+// stub's exit closes the read end and fails with EPIPE, every run. A prompt
+// that fits the buffer would let the write succeed and send the task down
+// supervise's failure arm instead, which is not the path under test.
+//
+// The buffer is not a fixed size. Linux gives a fresh pipe 16 pages
+// (PIPE_DEF_BUFFERS in fs/pipe.c): 64 KiB on 4 KiB pages, but 1 MiB on a
+// 64 KiB-page arm64 kernel. macOS pipes grow to 64 KiB at most. So the size is
+// derived from the page size rather than assumed.
+const (
+	// minOpeningPromptBytes is four times the 64 KiB buffer of a 4 KiB-page
+	// Linux kernel or a macOS one.
+	minOpeningPromptBytes = 256 * 1024
+	// pipeDefBuffers is Linux's PIPE_DEF_BUFFERS: a fresh pipe's capacity in
+	// pages.
+	pipeDefBuffers = 16
+)
+
+// openingPromptBytesFor is the prompt size that overruns a fresh pipe on a
+// kernel with the given page size: twice Linux's default capacity, and never
+// less than minOpeningPromptBytes.
+func openingPromptBytesFor(pageSize int) int {
+	return max(minOpeningPromptBytes, 2*pipeDefBuffers*pageSize)
+}
+
+// openingPromptBytes is openingPromptBytesFor on this machine.
+func openingPromptBytes() int { return openingPromptBytesFor(os.Getpagesize()) }
+
+// TestOpeningPromptBytes_OverrunsAFreshPipe: the size carries the premise on
+// every page size, including the 64 KiB pages where a fixed 256 KiB would fit
+// a fresh Linux pipe four times over.
+func TestOpeningPromptBytes_OverrunsAFreshPipe(t *testing.T) {
+	for _, page := range []int{4096, 16384, 65536} {
+		linuxPipe := pipeDefBuffers * page
+		if got := openingPromptBytesFor(page); got <= linuxPipe || got <= 64*1024 {
+			t.Errorf("page size %d: prompt of %d bytes does not overrun a %d-byte Linux pipe or a 64 KiB macOS one", page, got, linuxPipe)
+		}
+	}
+}
 
 // TestLifecycle_OpeningPromptWriteFailureKeepsEvidence: a harness that dies
 // before reading its prompt fails the opening-prompt write, and the terminal
@@ -34,8 +65,17 @@ const openingPromptBytes = 256 * 1024
 func TestLifecycle_OpeningPromptWriteFailureKeepsEvidence(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
+	// The prompt rides one bus message, so it must fit the server's payload
+	// cap with room for the envelope. Where the page size makes the prompt
+	// too large for that, the direct startHarness test below, which has no
+	// cap, still covers the write failure.
+	size := openingPromptBytes()
+	const envelopeRoom = 4096
+	if limit := c.Conn().MaxPayload(); int64(size+envelopeRoom) > limit {
+		t.Skipf("a %d-byte opening prompt (enough to overrun a fresh pipe on %d-byte pages) does not fit the test server's %d-byte payload cap; TestStartHarness_OpeningPromptReapIsBounded covers the write failure without the bus", size, os.Getpagesize(), limit)
+	}
 	const session, taskID = "chat-okapi-c5d6", "task-openfail-1"
-	submit(t, c, session, taskID, strings.Repeat("x", openingPromptBytes))
+	submit(t, c, session, taskID, strings.Repeat("x", size))
 
 	// Never reads stdin: bash reads the script from its path, not stdin.
 	harness := stub(t, `
@@ -64,31 +104,35 @@ exit 7
 	if !strings.HasPrefix(text, "reason: spawn-failed ") {
 		t.Errorf("terminal reason does not lead with the spawn-failed token:\n%s", text)
 	}
+	// Nothing held stderr here, so the reap ended on EOF and the reason must
+	// not claim the tail was cut at the bound.
+	if strings.Contains(text, "kept stderr open") {
+		t.Errorf("terminal reason claims a held stderr the stub never left:\n%s", text)
+	}
 }
 
-// TestStartHarness_OpeningPromptReapIsBounded: the reap after a failed
-// opening-prompt write cannot be held open by a descendant the process-group
-// kill does not reach. The stub backgrounds a sleep under job control (its
-// own process group, out of the kill's reach) that inherits stderr, then
-// exits without reading stdin. Unbounded, Wait would read stderr until the
-// sleep exits; bounded, startHarness returns about one reapBound after the
-// stub's exit, still carrying the exit status and the stderr tail.
-func TestStartHarness_OpeningPromptReapIsBounded(t *testing.T) {
-	const (
-		reapBound = 500 * time.Millisecond
-		// The sleep outlives the test's patience by a wide margin, so an
-		// unbounded reap fails on returnWithin rather than finishing late.
-		sleepSeconds = 120
-		returnWithin = 30 * time.Second
-	)
+// reapBoundForTest is the bound the direct startHarness tests pass. The
+// assertions name it as Go prints it.
+const reapBoundForTest = 500 * time.Millisecond
+
+// escapingChildStub is a harness that never reads stdin and leaves a child
+// holding its stderr. The stub backgrounds a sleep under job control (its own
+// process group, out of the group kill's reach) that inherits stderr, writes
+// one stderr line, and exits with exitCode. The sleep outlives any test's
+// patience, so an unbounded reap fails on time rather than finishing late.
+// It returns the argv and the file the sleep's pid lands in; the sleep is
+// killed at cleanup.
+func escapingChildStub(t *testing.T, exitCode int, stderrLine string) ([]string, string) {
+	t.Helper()
+	const sleepSeconds = 120
 	pidFile := filepath.Join(t.TempDir(), "escaped.pid")
 	harness := stub(t, fmt.Sprintf(`
 set -m
 sleep %d </dev/null >/dev/null &
 echo $! > %q
-echo "stub left a child holding stderr" >&2
-exit 7
-`, sleepSeconds, pidFile))
+echo %q >&2
+exit %d
+`, sleepSeconds, pidFile, stderrLine, exitCode))
 	t.Cleanup(func() {
 		raw, err := os.ReadFile(pidFile)
 		if err != nil {
@@ -98,12 +142,20 @@ exit 7
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	})
+	return harness, pidFile
+}
 
+// startHarnessWithin runs startHarness with the opening prompt against
+// harness and returns its error, failing the test if it has not returned
+// within returnWithin (an unbounded reap) or if it succeeded.
+func startHarnessWithin(t *testing.T, harness []string) error {
+	t.Helper()
+	const returnWithin = 30 * time.Second
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		_, err := startHarness(harness, os.Environ(), strings.Repeat("x", openingPromptBytes), reapBound, log)
+		_, err := startHarness(harness, os.Environ(), strings.Repeat("x", openingPromptBytes()), reapBoundForTest, log)
 		done <- err
 	}()
 	var err error
@@ -115,10 +167,16 @@ exit 7
 	if err == nil {
 		t.Fatal("startHarness succeeded against a harness that never read its prompt")
 	}
-	// The premise: the sleep led its own process group, so the group kill
-	// could not reach it and only the bound ended the reap. Without this, a
-	// shell whose background jobs stayed in the stub's group would let the
-	// test pass with the bound removed.
+	t.Logf("startHarness returned after %s: %s", time.Since(start).Round(time.Millisecond), err)
+	return err
+}
+
+// requireEscaped is the premise of the bounded-reap tests: the sleep led its
+// own process group, so the group kill could not reach it and only the bound
+// ended the reap. Without this, a shell whose background jobs stayed in the
+// stub's group would let the tests pass with the bound removed.
+func requireEscaped(t *testing.T, pidFile string) {
+	t.Helper()
 	raw, rerr := os.ReadFile(pidFile)
 	if rerr != nil {
 		t.Fatalf("escaped child pid: %v", rerr)
@@ -130,15 +188,49 @@ exit 7
 	if pgid, gerr := syscall.Getpgid(pid); gerr != nil || pgid != pid {
 		t.Fatalf("background sleep %d is not its own process group leader (pgid %d, err %v); the test proves nothing", pid, pgid, gerr)
 	}
-	msg := err.Error()
+}
+
+// TestStartHarness_OpeningPromptReapIsBounded: the reap after a failed
+// opening-prompt write cannot be held open by a descendant the process-group
+// kill does not reach. Unbounded, Wait would read stderr until the escaped
+// sleep exits; bounded, startHarness returns about one reapBound after the
+// stub's exit, still carrying the exit status and the stderr tail, and says
+// the tail stopped at the bound.
+func TestStartHarness_OpeningPromptReapIsBounded(t *testing.T) {
+	harness, pidFile := escapingChildStub(t, 7, "stub left a child holding stderr")
+	msg := startHarnessWithin(t, harness).Error()
+	requireEscaped(t, pidFile)
 	for _, want := range []string{
 		"write opening prompt: ",
-		" - exit status 7",
+		" - exit status 7 - a process the harness started kept stderr open past 500ms; the stderr tail stops there",
 		"\nstderr tail:\nstub left a child holding stderr",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q:\n%s", want, msg)
 		}
 	}
-	t.Logf("startHarness returned after %s: %s", time.Since(start).Round(time.Millisecond), msg)
+}
+
+// TestStartHarness_OpeningPromptCleanExitHeldStderr: a harness that exits 0
+// without reading its prompt (a --version or --help misconfiguration is the
+// realistic shape) and leaves a child holding stderr. Wait then reports Go's
+// own exec.ErrWaitDelay, not an exit status. The error must say the harness
+// exited cleanly and that something it started held stderr past the bound,
+// not relay "exec: WaitDelay expired before I/O complete".
+func TestStartHarness_OpeningPromptCleanExitHeldStderr(t *testing.T) {
+	harness, pidFile := escapingChildStub(t, 0, "usage: harness [--version]")
+	msg := startHarnessWithin(t, harness).Error()
+	requireEscaped(t, pidFile)
+	for _, want := range []string{
+		"write opening prompt: ",
+		" - harness exited 0; a process the harness started kept stderr open past 500ms; the stderr tail stops there",
+		"\nstderr tail:\nusage: harness [--version]",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "WaitDelay") {
+		t.Errorf("error relays Go's WaitDelay message instead of saying what happened:\n%s", msg)
+	}
 }

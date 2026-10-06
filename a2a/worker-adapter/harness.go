@@ -9,6 +9,7 @@ package workeradapter
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -253,11 +254,36 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 		// Context, which this one is not, so setting it here takes effect.
 		p.kill(0)
 		cmd.WaitDelay = reapBound
+		reapStart := time.Now()
 		waitErr := cmd.Wait()
+		reapTook := time.Since(reapStart)
 		p.reaped()
-		return nil, fmt.Errorf("write opening prompt: %w%s%s", err, exitEvidence(waitErr), p.stderrEvidence())
+		return nil, fmt.Errorf("write opening prompt: %w%s%s", err, reapEvidence(waitErr, reapTook, reapBound), p.stderrEvidence())
 	}
 	return p, nil
+}
+
+// reapEvidence is exitEvidence for a reap that WaitDelay bounds, which can
+// end with stderr still held open by a process the harness started.
+//
+// Wait reports that differently by exit status. After a clean exit it
+// returns exec.ErrWaitDelay, whose text names a Go I/O timeout and not the
+// exit, so it is replaced by a line that says both. After a failed exit it
+// returns the exit status and drops ErrWaitDelay, so the bound is inferred
+// from the reap's length: the harness was SIGKILLed before Wait, so its own
+// Wait returns at once, and a reap that lasted the bound is one the bound
+// ended. A zero bound is no bound: Wait read stderr to EOF. Either way the
+// stderr tail stops where the bound cut it, and the reason says so.
+func reapEvidence(waitErr error, took, bound time.Duration) string {
+	held := fmt.Sprintf("a process the harness started kept stderr open past %s; the stderr tail stops there", bound)
+	switch {
+	case errors.Is(waitErr, exec.ErrWaitDelay):
+		return reasonDetailSeparator + "harness exited 0; " + held
+	case waitErr != nil && bound > 0 && took >= bound:
+		return exitEvidence(waitErr) + reasonDetailSeparator + held
+	default:
+		return exitEvidence(waitErr)
+	}
 }
 
 // exitEvidence is a harness's exit as a failure reason carries it: the Wait
