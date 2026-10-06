@@ -265,6 +265,49 @@ FAKE_KUBECTL = textwrap.dedent(
             return " ".join(v["persistentVolumeClaim"]["claimName"] for v in obj["spec"]["volumes"])
         sys.exit("fake kubectl: unsupported jsonpath " + path)
 
+    def port_forward(args, dead):
+        # A tunnel to the test's door server, as kubectl's would be to the
+        # Service. One that is dead accepts and drops every connection, the
+        # way a tunnel whose stream the API server lost does.
+        import socket, threading
+        local = int(args[2].split(":")[0])
+        with open(os.environ["FAKE_PF_PIDS"], "a") as f:
+            f.write("%d\n" % os.getpid())
+        srv = socket.socket()
+        # What Go's net.Listen sets, so a port whose last tunnel left
+        # connections in TIME_WAIT binds again; a port someone still
+        # listens on does not.
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", local))
+        except OSError as exc:
+            sys.stderr.write("Unable to listen on port %d: %s\n" % (local, exc))
+            return 1
+        srv.listen(16)
+        def pump(a, b):
+            try:
+                while True:
+                    data = a.recv(65536)
+                    if not data:
+                        break
+                    b.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for x in (a, b):
+                    try:
+                        x.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+        while True:
+            conn, _ = srv.accept()
+            if dead:
+                conn.close()
+                continue
+            up = socket.create_connection(("127.0.0.1", int(os.environ["FAKE_DOOR_PORT"])))
+            threading.Thread(target=pump, args=(conn, up), daemon=True).start()
+            threading.Thread(target=pump, args=(up, conn), daemon=True).start()
+
     def main(argv):
         s = load()
         tick(s)
@@ -317,7 +360,10 @@ FAKE_KUBECTL = textwrap.dedent(
                 else:
                     out = jsonpath(obj, fmt[len("jsonpath="):])
         elif verb == "port-forward":
-            save(s); time.sleep(3600)
+            n = s["counters"].get("port-forward", 0)
+            s["counters"]["port-forward"] = n + 1
+            save(s)
+            return port_forward(args, dead=bool(s["scenario"].get("dead_first_tunnel")) and n == 0)
         else:
             sys.exit("fake kubectl: unsupported " + " ".join(argv))
         save(s)
@@ -452,6 +498,7 @@ class Sim:
         kubectl.write_text(FAKE_KUBECTL)
         kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
         self.results = root / "results.txt"
+        self.pf_pids = root / "pf_pids"
         handler = type("Door", (_Door,), {"state_path": self.state_path})
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -474,6 +521,8 @@ class Sim:
                 "ROLLBACK_INJECT_URL": url,
                 "ROLLBACK_RESULTS_FILE": str(self.results),
                 "ROLLBACK_KUBE_CONTEXT": "gke_test_ctx",
+                "FAKE_PF_PIDS": str(self.pf_pids),
+                "FAKE_DOOR_PORT": str(self.server.server_address[1]),
             }
         )
         env.update(extra)
@@ -582,6 +631,50 @@ class KeptRoundTripTest(RoundTripTest):
         result, _, _ = self.run_sim(healthy_next_state(unschedulable_on="next"))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("PodUnschedulable", result.stdout)
+
+
+def free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+class PortForwardTest(RoundTripTest):
+    """The path CI takes: no door URLs, so every turn and task goes through a
+    port-forward the script starts and stops."""
+
+    def tunnel_env(self) -> dict:
+        return {"ROLLBACK_AGENT_URL": "", "ROLLBACK_INJECT_URL": "", "ROLLBACK_AGENT_LOCAL_PORT": str(free_port()), "ROLLBACK_INJECT_LOCAL_PORT": str(free_port()), "ROLLBACK_PORT_FORWARD_WAIT": "10"}
+
+    def test_a_round_trip_through_port_forwards_passes_and_leaves_none_running(self) -> None:
+        result, state, sim = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(passed(result), _PASSING_ORDER)
+        forwards = [call for call in state["calls"] if "port-forward" in call]
+        self.assertEqual(len(forwards), 3, forwards)
+        self.assertTrue(all(call[:2] == ["--context", "gke_test_ctx"] for call in forwards))
+        pids = [int(line) for line in sim.pf_pids.read_text().split()]
+        time.sleep(0.5)
+        self.assertEqual([pid for pid in pids if alive(pid)], [])
+
+    def test_a_dead_first_tunnel_is_replaced_by_a_fresh_one(self) -> None:
+        # The first port-forward (the pre bus task's) accepts and drops every
+        # connection. The script's retry has to be a new tunnel on the same
+        # port, which only binds if the dead one was really stopped.
+        result, _, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS pre.bus-task:", result.stdout)
+        self.assertIn("pre.bus-task: attempt 1/2", result.stdout)
 
 
 class FailureTest(RoundTripTest):
@@ -903,6 +996,53 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertEqual(lines[call[0]], "run_rollback_roundtrip || true")
         # Not on the exit path: a run cut short never flips the install.
         self.assertNotIn("run_rollback_roundtrip", ci_eval_function("profile_and_dump_on_exit"))
+
+    def test_a_deadline_term_during_the_round_trip_is_passed_on_and_exits_143(self) -> None:
+        # Prow's deadline arrives as SIGTERM. Waited on in the foreground,
+        # the round trip would hold it off for up to its hour; the wait lets
+        # the trap run, the round trip hears the TERM, and the script exits
+        # 143 with its EXIT trap, as the global trap would have it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "artifacts").mkdir()
+            started = root / "started"
+            (root / "rollback-roundtrip.sh").write_text(
+                f"trap 'echo stub interrupted; exit 1' TERM\ntouch {started}\nwhile :; do sleep 1 & wait $!; done\n"
+            )
+            script = textwrap.dedent(
+                f"""\
+                set -euo pipefail
+                {ci_eval_constants()}
+                SCRIPT_DIR={root}
+                ARTIFACT_DIR={root}/artifacts
+                TARGET_NAMESPACE=kubeagents-system
+                AGENT_SERVICE_NAME=platform-agent
+                START_TIME=$SECONDS
+                EVAL_MODE_NEXT=1
+                profile_begin() {{ :; }}
+                collect_gateway_log() {{ :; }}
+                collect_agent_pod_diagnostics() {{ :; }}
+                timeout() {{ shift 2; exec "$@"; }}
+                trap 'echo EXIT TRAP RAN' EXIT
+                trap 'exit 143' TERM INT
+                {ci_eval_function("run_rollback_roundtrip")}
+                run_rollback_roundtrip || true
+                echo NOT REACHED
+                """
+            )
+            proc = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            deadline = time.monotonic() + 30
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertTrue(started.exists())
+            sent = time.monotonic()
+            proc.send_signal(signal.SIGTERM)
+            out, _ = proc.communicate(timeout=30)
+        self.assertLess(time.monotonic() - sent, 10)
+        self.assertEqual(proc.returncode, 143, out)
+        self.assertIn("stub interrupted", out)
+        self.assertIn("EXIT TRAP RAN", out)
+        self.assertNotIn("NOT REACHED", out)
 
     def test_the_function_never_assigns_the_suite_status(self) -> None:
         self.assertNotIn("SUITE_STATUS", ci_eval_function("run_rollback_roundtrip"))

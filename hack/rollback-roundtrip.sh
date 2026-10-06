@@ -155,6 +155,10 @@ readonly DEFAULT_BUS_TASK_ATTEMPTS=2
 readonly DEFAULT_PORT_FORWARD_WAIT=30
 # One read retried this many times before it counts as failed.
 readonly READ_ATTEMPTS=3
+# How much of a port-forward's or the bus client's own output a failure
+# carries.
+readonly PF_LOG_TAIL_LINES=5
+readonly CLIENT_ERR_TAIL_LINES=5
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
@@ -625,11 +629,20 @@ print(json.dumps([c for c in sidecars if not on_bus(c)]))
 '
 
 # ─── Port-forwards ───────────────────────────────────────────────────────────
+# kubectl itself is the background job, not a function or a subshell around
+# it: $! must be the process that holds the port, or stop_port_forward kills
+# a wrapper and leaves the tunnel bound, and every later attempt's probe is
+# answered by the first, possibly dead, tunnel.
 start_port_forward() {
   local service="$1" local_port="$2" remote_port="$3" waited=0
+  local -a pf=(kubectl)
   stop_port_forward
   [ -n "${PF_LOG}" ] || PF_LOG="$(mktemp)"
-  k port-forward "svc/${service}" "${local_port}:${remote_port}" >>"${PF_LOG}" 2>&1 &
+  if [ -n "${ROLLBACK_KUBE_CONTEXT:-}" ]; then
+    pf+=(--context "${ROLLBACK_KUBE_CONTEXT}")
+  fi
+  pf+=(-n "${NAMESPACE}" port-forward "svc/${service}" "${local_port}:${remote_port}")
+  "${pf[@]}" >>"${PF_LOG}" 2>&1 &
   PF_PID=$!
   while [ "${waited}" -lt "${PORT_FORWARD_WAIT}" ]; do
     if (exec 3<>"/dev/tcp/127.0.0.1/${local_port}") 2>/dev/null; then
@@ -638,6 +651,7 @@ start_port_forward() {
     sleep 1
     waited=$((waited + 1))
   done
+  note "port-forward to svc/${service} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
   return 1
 }
 
@@ -711,7 +725,7 @@ done = exchange.outcome in (it.OUTCOME_TERMINAL, it.OUTCOME_STREAM_TERMINAL) and
 sys.exit(0 if done else 1)
 '
 assert_bus_task() {
-  local name="$1" token attempt url line rc conversation
+  local name="$1" token attempt url line rc conversation err
   token="$(secret_value "${INJECT_NAME}" "${INJECT_TOKEN_FIELD}")" || fail "${name}" "secret/${INJECT_NAME} could not be read"
   [ -n "${token}" ] || fail "${name}" "secret/${INJECT_NAME} has no ${INJECT_TOKEN_FIELD}: the install has no inject door (A2A_INJECT_BACKEND=true on the operator)"
   conversation="${BUS_TASK_CONVERSATION_PREFIX}/${name}/$(date -u +%s)"
@@ -726,13 +740,18 @@ assert_bus_task() {
       url="http://127.0.0.1:${INJECT_LOCAL_PORT}"
     fi
     rc=0
+    err="$(mktemp)"
     line="$(python3 -c "${PY_BUS_TASK}" "${BENCH_DIR}" "${url}" "${token}" "${conversation}" \
-      "${BUS_TASK_PROMPT}" "${BUS_TASK_TIMEOUT}" "${BUS_TASK_UNREACHABLE_STATUS}" 2>/dev/null)" || rc=$?
+      "${BUS_TASK_PROMPT}" "${BUS_TASK_TIMEOUT}" "${BUS_TASK_UNREACHABLE_STATUS}" 2>"${err}")" || rc=$?
     stop_port_forward
     if [ "${rc}" -eq 0 ]; then
+      rm -f "${err}"
       pass "${name}" "${line}"
       return 0
     fi
+    # The client's log and any traceback, which say what the one line cannot.
+    note "${name}: the client's stderr: $(tail -n "${CLIENT_ERR_TAIL_LINES}" "${err}" | tr '\n' ' ')"
+    rm -f "${err}"
     [ "${rc}" -eq "${BUS_TASK_UNREACHABLE_STATUS}" ] || break
     note "${name}: attempt ${attempt}/${BUS_TASK_ATTEMPTS}: ${line}"
   done

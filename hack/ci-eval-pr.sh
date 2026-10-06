@@ -2916,11 +2916,18 @@ announce_suite_verdict() {
 # (EVAL_ROLLBACK_LOG, the transcript; EVAL_ROLLBACK_RESULTS, the PASS/FAIL
 # lines and an outcome), and no case in the matrix.
 #
-# The flip replaces the agent pod and tears the A2A gateway down, and the
-# EXIT trap reads both for the run's diagnostics, so the eval's gateway log
-# and pod diagnostics are taken first; the gateway log collector keeps the
-# first capture of a process, so the trap does not overwrite it with the
+# The flip replaces the agent pod, whose log and diagnostics the EXIT trap
+# collects, so the eval's are taken first; the gateway log collector keeps
+# the first capture of a process, so the trap does not overwrite it with the
 # replacement pod's.
+#
+# The round trip runs in the background and is waited on, so a SIGTERM (the
+# job's deadline) reaches this script's trap during the wait rather than
+# after an hour: the handler here passes it on to the round trip, which
+# reports itself interrupted, and then exits 143 as the global trap does, so
+# the EXIT trap's collection still runs inside the grace period. The start-by
+# bound assumes the deploy in front of this script took about 45m; a slower
+# one is what this handler is for.
 run_rollback_roundtrip() {
   if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
     return 0
@@ -2941,10 +2948,15 @@ run_rollback_roundtrip() {
   if command -v timeout >/dev/null 2>&1; then
     bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
   fi
-  # Streamed as it runs, and kept whole in its own file.
+  # Streamed as it runs, and kept whole in its own file. timeout passes a
+  # TERM it receives on to the script.
   ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" \
-    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" 2>&1 |
-    tee "${log}" || status=${PIPESTATUS[0]}
+    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
+    > >(tee "${log}") 2>&1 &
+  EVAL_ROLLBACK_PID=$!
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  wait "${EVAL_ROLLBACK_PID}" || status=$?
+  trap 'exit 143' TERM INT
   if [ "${status}" -eq 0 ]; then
     outcome="passed"
   else

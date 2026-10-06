@@ -346,8 +346,9 @@ dump_prow_artifacts_on_failure() {
     } > "${artifact_dir}/ci-failure-summary.txt" 2>&1 || true
 
     # 2. Current running & previous crashed pod logs (crucial for rollout deadline / CrashLoopBackOff failures).
-    #    The running pod's log is the every-run capture above, taken again here
-    #    so a caller without a green-path collector (ci-deploy.sh) still gets it.
+    #    The running pod's log is the every-run capture above, taken here for a
+    #    caller without a green-path collector (ci-deploy.sh); in a process that
+    #    already took it (ci-eval-pr.sh) the collector keeps that first capture.
     #    The previous agent container (platform-agent-previous.log), the
     #    bridge sidecar, pod restarts and events come from the every-run
     #    collector, called here for the same reason, with its bounds.
