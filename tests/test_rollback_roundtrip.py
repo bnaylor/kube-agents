@@ -56,6 +56,18 @@ _BRIDGE = {
 }
 _OTHER_SIDECAR = {"name": "log-shipper", "image": "shipper:1", "env": [{"name": "X", "value": "y"}]}
 
+# What both drivers start from instead of the caller's environment: a shell
+# that drove the lane or the script by hand carries EVAL_MODE_NEXT, BUILD_ID,
+# ROLLBACK_* knobs or a proxy, and any of them changes what is under test.
+# The tool path and the locale only.
+def minimal_env() -> dict:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    for name in ("HOME", "TMPDIR"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
+
 # Bounds for a run that is meant to pass: never reached. The timeout cases
 # lower the one they test.
 _FAST_ENV = {
@@ -85,10 +97,10 @@ _PASSING_ORDER = [
     "pre.pvc-present",
     "pre.creds-present",
     "pre.bus-task",
-    "leg1.bus-sidecar-unset.patched",
-    "leg1.bus-sidecar-unset.reconciled",
-    "leg1.bus-sidecar-unset.agent-rolled",
-    "leg1.bus-sidecar-unset.ready",
+    "leg1.sidecars-unset.patched",
+    "leg1.sidecars-unset.reconciled",
+    "leg1.sidecars-unset.agent-rolled",
+    "leg1.sidecars-unset.ready",
     "leg1.mode-today.patched",
     "leg1.mode-today.reconciled",
     "leg1.mode-today.agent-rolled",
@@ -109,10 +121,10 @@ _PASSING_ORDER = [
     "leg2.pvc-kept",
     "leg2.nats-on-kept-pvc",
     "leg2.creds-kept",
-    "leg2.bus-sidecar-restored.patched",
-    "leg2.bus-sidecar-restored.reconciled",
-    "leg2.bus-sidecar-restored.agent-rolled",
-    "leg2.bus-sidecar-restored.ready",
+    "leg2.sidecars-restored.patched",
+    "leg2.sidecars-restored.reconciled",
+    "leg2.sidecars-restored.agent-rolled",
+    "leg2.sidecars-restored.ready",
     "leg2.reprovisioned",
     "leg2.bridge-consuming",
     "leg2.verifier-serving",
@@ -232,6 +244,8 @@ FAKE_KUBECTL = textwrap.dedent(
                 o.pop("pvc/" + PVC, None)
         if p["kind"] == "sidecars" and leg == "next":
             s["jobs"].append(job(bump(s, "job", "provision"), "Complete"))
+        if p["kind"] == "sidecars" and sc.get("status_stale_on_sidecars"):
+            return
         if sc.get("stuck_pod_on") == leg and p["kind"] == "mode":
             s["pods"].append(sc["stuck_pod"])
         if sc.get("status_stale_on") == leg and p["kind"] == "mode":
@@ -527,7 +541,7 @@ class Sim:
 
     def env(self, **extra: str) -> dict:
         url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        env = dict(os.environ)
+        env = minimal_env()
         env.update(_FAST_ENV)
         env.update(
             {
@@ -604,17 +618,42 @@ class KeptRoundTripTest(RoundTripTest):
             ],
         )
 
-    def test_a_sidecar_that_does_not_talk_to_the_bus_is_left_alone(self) -> None:
-        result, state, _ = self.run_sim(healthy_next_state(sidecars=[_OTHER_SIDECAR, _BRIDGE]))
+    def test_every_sidecar_is_unset_and_the_whole_list_restored(self) -> None:
+        # Not only the bridge: the list goes whole, and comes back whole and
+        # in its order.
+        original = healthy_next_state(sidecars=[_OTHER_SIDECAR, _BRIDGE])
+        before = json.dumps(original["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True)
+        result, state, _ = self.run_sim(original)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(state["patches"][0], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR]}}})
+        self.assertEqual(state["patches"][0], {"spec": {"deployment": {"sidecars": None}}})
         self.assertEqual(state["patches"][-1], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR, _BRIDGE]}}})
+        self.assertEqual(json.dumps(state["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True), before)
+        self.assertIn("PASS leg2.bridge-consuming: hermes-bridge logged", result.stdout)
 
-    def test_no_bus_sidecar_skips_the_unset_and_the_restore(self) -> None:
+    def test_a_cr_with_only_a_sidecar_off_the_bus_has_it_unset_and_restored_too(self) -> None:
+        original = healthy_next_state(sidecars=[_OTHER_SIDECAR])
+        before = json.dumps(original["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True)
+        result, state, _ = self.run_sim(original)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            state["patches"],
+            [
+                {"spec": {"deployment": {"sidecars": None}}},
+                {"spec": {"mode": "today"}},
+                {"spec": {"mode": "next"}},
+                {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR]}}},
+            ],
+        )
+        self.assertEqual(json.dumps(state["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True), before)
+        self.assertIn("PASS leg1.sidecars-unset.ready", result.stdout)
+        self.assertIn("PASS leg2.sidecars-restored.ready", result.stdout)
+        self.assertIn("SKIP leg2.bridge-consuming:", result.stdout)
+
+    def test_no_sidecars_patches_nothing_but_the_mode(self) -> None:
         result, state, _ = self.run_sim(healthy_next_state(sidecars=[]))
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("SKIP leg1.bus-sidecar-unset:", result.stdout)
-        self.assertIn("SKIP leg2.bus-sidecar-restored:", result.stdout)
+        self.assertIn("SKIP leg1.sidecars-unset:", result.stdout)
+        self.assertIn("SKIP leg2.sidecars-restored:", result.stdout)
         self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}])
 
     def test_every_kubectl_call_is_pinned_to_the_context(self) -> None:
@@ -856,10 +895,33 @@ class FailureTest(RoundTripTest):
         self.assert_fails_at(result, "pre.mode-next", "spec.mode is today")
         self.assertEqual(after["patches"], [])
 
-    def test_a_failure_after_the_unset_says_where_the_sidecars_are(self) -> None:
-        result, _, _ = self.run_sim(healthy_next_state(replace_on_today=["pvc"]))
-        self.assertIn("this run unset the bus sidecar(s) hermes-bridge", result.stdout)
+    def test_a_failure_under_today_leaves_the_sidecars_unset_and_says_where_they_are(self) -> None:
+        # Declaring the bridge again under today is the outage the bridge doc
+        # names, so the run does not; the saved list is handed over instead.
+        result, state, _ = self.run_sim(healthy_next_state(sidecars=[_OTHER_SIDECAR, _BRIDGE], replace_on_today=["pvc"]))
+        self.assert_fails_at(result, "leg1.pvc-kept")
+        self.assertIn("this run unset the sidecar(s) log-shipper hermes-bridge; the CR's original spec.deployment.sidecars is in", result.stdout)
         self.assertIn("install left at spec.mode=today during leg1", result.stdout)
+        self.assertEqual(state["patches"][-1], {"spec": {"mode": "today"}})
+        self.assertNotIn("sidecars", state["cr"]["spec"].get("deployment", {}))
+
+    def test_a_failure_under_next_with_the_sidecars_unset_declares_them_again(self) -> None:
+        # After the flip forward, before the restore: the CR is at next, so the
+        # way out puts the list back as it was.
+        original = healthy_next_state(sidecars=[_OTHER_SIDECAR, _BRIDGE], replace_on_next=["pvc"])
+        before = json.dumps(original["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True)
+        result, state, _ = self.run_sim(original)
+        self.assert_fails_at(result, "leg2.pvc-kept")
+        self.assertIn("declared them again on the way out", result.stdout)
+        self.assertEqual(state["patches"][-1], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR, _BRIDGE]}}})
+        self.assertEqual(json.dumps(state["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True), before)
+
+    def test_a_failure_before_the_flip_with_the_sidecars_unset_declares_them_again(self) -> None:
+        # The unset itself never settles: the CR is still at next.
+        result, state, _ = self.run_sim(healthy_next_state(status_stale_on_sidecars=True), ROLLBACK_READY_TIMEOUT="2")
+        self.assert_fails_at(result, "leg1.sidecars-unset.ready")
+        self.assertIn("declared them again on the way out", result.stdout)
+        self.assertEqual(state["patches"], [{"spec": {"deployment": {"sidecars": None}}}, {"spec": {"deployment": {"sidecars": [_BRIDGE]}}}])
 
     def test_a_signal_is_a_named_failure(self) -> None:
         sim = Sim(healthy_next_state(never_ready_on="today"))
@@ -879,8 +941,8 @@ class FailureTest(RoundTripTest):
 _NATS = "platform-agent-a2a-nats"
 
 
-def bridge_with(env: list | None = None, env_from: list | None = None, name: str = "hermes-bridge") -> dict:
-    sidecar: dict = {"name": name, "image": "bridge:dev"}
+def bridge_with(env: list | None = None, env_from: list | None = None, name: str = "hermes-bridge", **fields) -> dict:
+    sidecar: dict = {"name": name, "image": "bridge:dev", **fields}
     if env is not None:
         sidecar["env"] = env
     if env_from is not None:
@@ -892,95 +954,59 @@ def url(value: str) -> list:
     return [{"name": "NATS_URL", "value": value}]
 
 
-class SidecarClassificationTest(unittest.TestCase):
-    """PY_SIDECARS, lifted from the script and run on one sidecar at a time."""
+class BusClientGuessTest(unittest.TestCase):
+    """PY_SIDECARS, lifted from the script: every sidecar's name on the first
+    line (all of them are unset), and on the second the ones whose consumer
+    log the run waits on."""
 
-    def classify(self, sidecar: dict, configmaps: dict | None = None) -> bool:
+    def split(self, *sidecars: dict) -> tuple[list[str], list[str]]:
         src = _SCRIPT.read_text()
         code = re.search(r"^readonly PY_SIDECARS='\n(.*?)^'$", src, re.DOTALL | re.MULTILINE).group(1)
-        with tempfile.TemporaryDirectory() as cm_dir:
-            for cm_name, data in (configmaps or {}).items():
-                pathlib.Path(cm_dir, f"{cm_name}.json").write_text("" if data is None else json.dumps({"data": data}))
-            cr = {"spec": {"deployment": {"sidecars": [sidecar]}}}
-            out = subprocess.run(["python3", "-c", code, _CREDS, _NATS, _NS, cm_dir], input=json.dumps(cr), capture_output=True, text=True, check=True).stdout
-        bus, keep = out.split("\n")[:2]
-        self.assertEqual(bool(bus), not json.loads(keep))
-        return bool(bus)
+        cr = {"spec": {"deployment": {"sidecars": list(sidecars)}}}
+        out = subprocess.run(["python3", "-c", code, _CREDS, _NATS], input=json.dumps(cr), capture_output=True, text=True, check=True).stdout
+        names, bus = out.split("\n")[:2]
+        return names.split(), bus.split()
 
-    def test_every_form_of_the_service_host_is_on_the_bus(self) -> None:
-        for value in (
-            f"nats://{_NATS}:4222",
-            f"nats://{_NATS}",
-            f"nats://{_NATS}.{_NS}:4222",
-            f"nats://{_NATS}.{_NS}.svc:4222",
-            f"nats://{_NATS}.{_NS}.svc.cluster.local:4222",
-            f"nats://{_NATS}.{_NS}.svc.cluster.local.:4222",
-            f"nats://bridge:pw@{_NATS}:4222",
-            f"nats://elsewhere:4222,nats://{_NATS}:4222",
-            f"{_NATS}:4222",
-            f"tls://{_NATS}.{_NS}.svc/",
+    def test_every_sidecar_is_named_for_the_unset(self) -> None:
+        names, _ = self.split(_OTHER_SIDECAR, _BRIDGE, bridge_with(name="args-only", args=[f"--nats-url=nats://{_NATS}:4222"]))
+        self.assertEqual(names, ["log-shipper", "hermes-bridge", "args-only"])
+
+    def test_the_log_wait_is_for_sidecars_that_reference_the_creds_or_name_the_service(self) -> None:
+        for sidecar in (
+            bridge_with(env=url(f"nats://{_NATS}.{_NS}.svc:4222")),
+            bridge_with(env=[{"name": "NATS_HOST", "value": f'{{"host":"{_NATS}"}}'}]),
+            bridge_with(env=[{"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": _CREDS, "key": "bridge-password"}}}]),
+            bridge_with(env_from=[{"prefix": "BUS_", "secretRef": {"name": _CREDS}}]),
         ):
-            with self.subTest(value=value):
-                self.assertTrue(self.classify(bridge_with(env=url(value))))
+            with self.subTest(sidecar=sidecar):
+                self.assertEqual(self.split(sidecar)[1], ["hermes-bridge"])
+        self.assertEqual(self.split(_OTHER_SIDECAR, bridge_with(env_from=[{"secretRef": {"name": "some-other-secret"}}]))[1], [])
 
-    def test_names_that_only_contain_the_service_name_are_not(self) -> None:
-        for value in (
-            f"nats://{_NATS}-other:4222",
-            f"nats://other-{_NATS}:4222",
-            f"nats://{_NATS}.other-ns.svc:4222",
-            _CREDS,
-            "nats://elsewhere:4222",
-        ):
-            with self.subTest(value=value):
-                self.assertFalse(self.classify(bridge_with(env=url(value))))
-
-    def test_a_reference_to_the_creds_secret_through_env_or_env_from(self) -> None:
-        self.assertTrue(self.classify(bridge_with(env=[{"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": _CREDS, "key": "bridge-password"}}}])))
-        self.assertTrue(self.classify(bridge_with(env_from=[{"secretRef": {"name": _CREDS}}])))
-        self.assertTrue(self.classify(bridge_with(env_from=[{"prefix": "BUS_", "secretRef": {"name": _CREDS}}])))
-        self.assertFalse(self.classify(bridge_with(env_from=[{"secretRef": {"name": "some-other-secret"}}])))
-
-    def test_a_url_from_a_configmap_through_env_or_env_from(self) -> None:
-        cms = {"bridge-env": {"NATS_URL": f"nats://{_NATS}:4222", "OTHER": "x"}, "plain": {"X": "y"}, "gone": None}
-        self.assertTrue(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]), cms))
-        self.assertTrue(self.classify(bridge_with(env=[{"name": "NATS_URL", "valueFrom": {"configMapKeyRef": {"name": "bridge-env", "key": "NATS_URL"}}}]), cms))
-        self.assertFalse(self.classify(bridge_with(env=[{"name": "O", "valueFrom": {"configMapKeyRef": {"name": "bridge-env", "key": "OTHER"}}}]), cms))
-        self.assertFalse(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "plain"}}]), cms))
-        self.assertFalse(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "gone"}}]), cms))
-        self.assertFalse(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "never-fetched"}}]), cms))
+    def test_no_sidecars(self) -> None:
+        self.assertEqual(self.split(), ([], []))
 
 
 class SidecarRoundTripTest(RoundTripTest):
-    """The same forms end to end: the script fetches the ConfigMaps a sidecar
-    reads and unsets the sidecar before the flip."""
+    """Shapes a reading of the sidecar's data would miss (round 2 of the
+    review): each is unset before the flip and declared again after, because
+    every sidecar is."""
 
-    def assert_unset_and_restored(self, sidecar: dict, **objects: dict) -> None:
+    def assert_unset_and_restored(self, sidecar: dict) -> None:
         state = healthy_next_state(sidecars=[_OTHER_SIDECAR, sidecar])
-        state["objects"].update(objects)
         result, after, _ = self.run_sim(state)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("PASS leg1.bus-sidecar-unset.patched", result.stdout)
-        self.assertEqual(after["patches"][0], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR]}}})
+        self.assertIn("PASS leg1.sidecars-unset.patched", result.stdout)
+        self.assertEqual(after["patches"][0], {"spec": {"deployment": {"sidecars": None}}})
         self.assertEqual(after["patches"][-1], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR, sidecar]}}})
 
-    def test_a_short_name_url(self) -> None:
-        self.assert_unset_and_restored(bridge_with(env=url(f"nats://{_NATS}:4222")))
+    def test_a_url_in_args(self) -> None:
+        self.assert_unset_and_restored(bridge_with(args=[f"--nats-url=nats://{_NATS}:4222"]))
 
-    def test_creds_through_env_from(self) -> None:
-        self.assert_unset_and_restored(bridge_with(env_from=[{"secretRef": {"name": _CREDS}}]))
+    def test_a_reference_to_a_secret_the_teardown_deletes(self) -> None:
+        self.assert_unset_and_restored(bridge_with(env=[{"name": "T", "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-inject", "key": "token"}}}]))
 
-    def test_a_url_in_a_configmap_read_through_env_from(self) -> None:
-        self.assert_unset_and_restored(
-            bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]),
-            **{"configmap/bridge-env": {"uid": "cm", "data": {"NATS_URL": f"nats://{_NATS}.{_NS}.svc.cluster.local:4222"}}},
-        )
-
-    def test_a_configmap_that_does_not_exist_is_not_the_bus(self) -> None:
-        state = healthy_next_state(sidecars=[bridge_with(env_from=[{"configMapRef": {"name": "missing"}}])])
-        result, after, _ = self.run_sim(state)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("SKIP leg1.bus-sidecar-unset:", result.stdout)
-        self.assertEqual(after["patches"][0], {"spec": {"mode": "today"}})
+    def test_a_url_in_a_configmap(self) -> None:
+        self.assert_unset_and_restored(bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]))
 
 
 class NamesMatchTheOperatorTest(unittest.TestCase):
@@ -1064,13 +1090,24 @@ def ci_eval_function(name: str) -> str:
 
 
 def ci_eval_constants() -> str:
-    return "\n".join(line for line in _CI_EVAL.read_text().splitlines() if line.startswith("readonly EVAL_ROLLBACK_"))
+    prefixes = ("readonly EVAL_ROLLBACK_", "readonly EVAL_SNOWFLAKE_", "readonly EVAL_JOB_START_")
+    return "\n".join(line for line in _CI_EVAL.read_text().splitlines() if line.startswith(prefixes))
+
+
+def snowflake(epoch_seconds: int) -> int:
+    """A Prow BUILD_ID that decodes to the given time (scripts/pool_pressure.py)."""
+    return (epoch_seconds * 1000 - 1288834974657) << 22
 
 
 class CiEvalWiringTest(unittest.TestCase):
     """run_rollback_roundtrip in hack/ci-eval-pr.sh, lifted and run."""
 
-    def run_wiring(self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, timeout_on_path: bool = False) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+    def run_wiring(
+        self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, job_age: int | None = None, build_id: str | None = None, timeout_on_path: bool = False
+    ) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        """`elapsed` is the eval's age (START_TIME), `job_age` this script's
+        (EVAL_SCRIPT_STARTED_EPOCH, defaulting to the eval's), `build_id` the
+        Prow BUILD_ID, unset when None."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = pathlib.Path(tmp.name)
@@ -1081,7 +1118,9 @@ class CiEvalWiringTest(unittest.TestCase):
             "echo 'PASS pre.mode-next: x' >> \"${ROLLBACK_RESULTS_FILE}\"\n"
             f"exit {script_status}\n"
         )
-        flag = "" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
+        flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
+        build = "unset BUILD_ID" if build_id is None else f"export BUILD_ID={build_id}"
+        age = elapsed if job_age is None else job_age
         script = textwrap.dedent(
             f"""\
             set -euo pipefail
@@ -1092,11 +1131,14 @@ class CiEvalWiringTest(unittest.TestCase):
             AGENT_SERVICE_NAME=platform-agent
             AGENT_CLUSTER_CONTEXT=gke_p_r_c
             START_TIME=$((SECONDS - {elapsed}))
+            EVAL_SCRIPT_STARTED_EPOCH=$(($(date +%s) - {age}))
             {flag}
+            {build}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
             collect_agent_pod_diagnostics() {{ echo COLLECT_DIAG; }}
             {"" if timeout_on_path else "timeout() { shift 2; \"$@\"; }"}
+            {ci_eval_function("job_started_epoch")}
             {ci_eval_function("run_rollback_roundtrip")}
             SUITE_STATUS=1
             run_rollback_roundtrip || true
@@ -1105,7 +1147,7 @@ class CiEvalWiringTest(unittest.TestCase):
             echo "returned=$?"
             """
         )
-        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, check=False)
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, check=False, env=minimal_env())
         return result, artifacts
 
     def test_skipped_outside_next_mode(self) -> None:
@@ -1127,7 +1169,8 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertIn("stub ran: kubeagents-system platform-agent context=gke_p_r_c", result.stdout)
         self.assertIn("stub ran", (artifacts / "rollback-roundtrip.log").read_text())
         results = (artifacts / "rollback-roundtrip.txt").read_text().splitlines()
-        self.assertEqual(results, ["PASS pre.mode-next: x", "OUTCOME: failed (exit 1)"])
+        self.assertEqual(results[1:], ["PASS pre.mode-next: x", "OUTCOME: failed (exit 1)"])
+        self.assertTrue(results[0].startswith("the job started "), results[0])
 
     def test_a_passing_round_trip_is_reported(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", script_status=0)
@@ -1142,10 +1185,43 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertLess(out.index("COLLECT_DIAG"), out.index("stub ran"))
 
     def test_a_run_too_late_for_its_bound_is_skipped(self) -> None:
-        result, artifacts = self.run_wiring(mode_next="1", elapsed=13000)
+        result, artifacts = self.run_wiring(mode_next="1", elapsed=16000)
         self.assertNotIn("stub ran", result.stdout)
-        self.assertIn("SKIPPED:", result.stdout)
+        self.assertIn("SKIPPED: not enough time left in the job", result.stdout)
         self.assertEqual((artifacts / "rollback-roundtrip.txt").read_text().splitlines()[-1], "OUTCOME: skipped")
+
+    def test_a_long_deploy_skips_the_round_trip_however_short_the_eval(self) -> None:
+        # The eval has just started, but the job is 5h old by its BUILD_ID: a
+        # slow deploy in front. Measured from the eval, the round trip would
+        # start and run into the deadline.
+        now = int(time.time())
+        result, artifacts = self.run_wiring(mode_next="1", elapsed=0, job_age=0, build_id=str(snowflake(now - 5 * 3600)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        line = next(x for x in result.stdout.splitlines() if x.startswith("SKIPPED:"))
+        self.assertIn("not enough time left in the job", line)
+        self.assertRegex(line, r"it started 1800\ds ago \(BUILD_ID \d+\), past the 15600s start-by bound")
+        self.assertEqual((artifacts / "rollback-roundtrip.txt").read_text().splitlines()[-1], "OUTCOME: skipped")
+
+    def test_a_young_job_runs_and_says_how_old_it_was(self) -> None:
+        now = int(time.time())
+        result, artifacts = self.run_wiring(mode_next="1", build_id=str(snowflake(now - 3600)))
+        self.assertIn("stub ran", result.stdout)
+        self.assertRegex((artifacts / "rollback-roundtrip.txt").read_text(), r"the job started 3\d\d\ds ago \(BUILD_ID \d+\)")
+
+    def test_without_a_build_id_that_decodes_the_age_is_the_scripts(self) -> None:
+        now = int(time.time())
+        for build_id in (None, "local", str(snowflake(now + 3600)), str(snowflake(now - 3 * 86400))):
+            with self.subTest(build_id=build_id):
+                result, artifacts = self.run_wiring(mode_next="1", elapsed=0, job_age=16000, build_id=build_id)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertIn("(this script's start; BUILD_ID gave none)", result.stdout)
+
+    def test_the_snowflake_layout_is_the_pool_pressure_scripts(self) -> None:
+        values = dict(re.findall(r"readonly (EVAL_SNOWFLAKE_\w+)=(\d+)", ci_eval_constants()))
+        pool = (_REPO_ROOT / "scripts" / "pool_pressure.py").read_text()
+        self.assertEqual(values["EVAL_SNOWFLAKE_EPOCH_MS"], re.search(r"^SNOWFLAKE_EPOCH_MS = (\d+)", pool, re.MULTILINE).group(1))
+        self.assertEqual(values["EVAL_SNOWFLAKE_TIMESTAMP_SHIFT"], re.search(r"^SNOWFLAKE_TIMESTAMP_SHIFT = (\d+)", pool, re.MULTILINE).group(1))
 
     def test_it_runs_after_the_verdict_is_computed_and_before_it_is_announced(self) -> None:
         lines = _CI_EVAL.read_text().splitlines()
@@ -1183,6 +1259,8 @@ class CiEvalWiringTest(unittest.TestCase):
                 TARGET_NAMESPACE=kubeagents-system
                 AGENT_SERVICE_NAME=platform-agent
                 START_TIME=$SECONDS
+                EVAL_SCRIPT_STARTED_EPOCH=$(date +%s)
+                unset BUILD_ID
                 EVAL_MODE_NEXT=1
                 profile_begin() {{ :; }}
                 collect_gateway_log() {{ :; }}
@@ -1190,12 +1268,13 @@ class CiEvalWiringTest(unittest.TestCase):
                 timeout() {{ shift 2; exec "$@"; }}
                 trap 'echo EXIT TRAP RAN' EXIT
                 trap 'exit 143' TERM INT
+                {ci_eval_function("job_started_epoch")}
                 {ci_eval_function("run_rollback_roundtrip")}
                 run_rollback_roundtrip || true
                 echo NOT REACHED
                 """
             )
-            proc = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            proc = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=minimal_env())
             deadline = time.monotonic() + 30
             while not started.exists() and time.monotonic() < deadline:
                 time.sleep(0.1)
@@ -1213,11 +1292,20 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertNotIn("SUITE_STATUS", ci_eval_function("run_rollback_roundtrip"))
 
     def test_the_bound_ends_inside_the_deadline(self) -> None:
+        # Job-relative: the start-by bound is on the job's age, so job start +
+        # bound + the round trip's limit + its kill grace must leave room for
+        # the verdict, the EXIT trap and the teardown's 10m uninstall.
         values = dict(re.findall(r"readonly (EVAL_ROLLBACK_\w+)=(\d+)", ci_eval_constants()))
         presubmit_deadline = 360 * 60
-        deploy = 45 * 60
-        total = int(values["EVAL_ROLLBACK_START_BY_SECONDS"]) + int(values["EVAL_ROLLBACK_TIMEOUT_SECONDS"]) + int(values["EVAL_ROLLBACK_KILL_AFTER_SECONDS"]) + deploy
-        self.assertLess(total, presubmit_deadline)
+        self.assertEqual(int(values["EVAL_ROLLBACK_JOB_DEADLINE_SECONDS"]), presubmit_deadline)
+        margin = 30 * 60
+        total = int(values["EVAL_ROLLBACK_START_BY_SECONDS"]) + int(values["EVAL_ROLLBACK_TIMEOUT_SECONDS"]) + int(values["EVAL_ROLLBACK_KILL_AFTER_SECONDS"]) + margin
+        self.assertLessEqual(total, presubmit_deadline)
+
+    def test_the_age_is_the_jobs_not_the_evals(self) -> None:
+        body = ci_eval_function("run_rollback_roundtrip")
+        self.assertNotIn("START_TIME", body)
+        self.assertIn("job_started_epoch", body)
 
     def test_the_script_named_exists(self) -> None:
         name = re.search(r'readonly EVAL_ROLLBACK_SCRIPT="([^"]+)"', ci_eval_constants()).group(1)

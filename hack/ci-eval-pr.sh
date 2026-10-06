@@ -22,6 +22,11 @@
 
 set -euo pipefail
 
+# Wall clock at this script's entry, before the lease heartbeat, the cluster
+# auth and section 1: the fallback job start for the rollback round trip's
+# start-by bound when BUILD_ID does not give one (job_started_epoch).
+EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
+
 # The eval rosters, three files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, and
 # what the nightly adds. Section 6 reads the first and third into TASKS and
@@ -94,13 +99,18 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 # next -> today -> next and checks the JetStream PVC and the bus creds Secret
 # come through it (cutover condition 6, #2461). Reported beside the verdict,
 # never in it: its own log section and artifacts, no case, no effect on the
-# exit status. It starts only while the run is young enough that its own
-# bound still ends inside the presubmit's 360m deadline with the deploy
-# (about 45m on the next lane) in front of it: 210m of eval plus 60m of round
-# trip plus the deploy leaves about 45m. The bound kills a run that outlives
-# it, after a grace for its port-forwards to close.
+# exit status. It starts only while the JOB is young enough that its own
+# bound still ends inside the presubmit's 360m deadline, measured from the
+# job's start (job_started_epoch), not from the eval's, so a slow deploy in
+# front counts against it too. The arithmetic: start by 15600s (260m), plus
+# the 3600s bound, plus the 60s kill grace, ends by 19260s; the 360m deadline
+# is 21600s, which leaves 2340s (39m) for the verdict line, the EXIT trap's
+# artifact collection and the teardown's 10m uninstall bound
+# (hack/ci-teardown.sh, RELEASE_UNINSTALL_TIMEOUT). The bound kills a run that
+# outlives it, after a grace for its port-forwards to close.
 readonly EVAL_ROLLBACK_SCRIPT="rollback-roundtrip.sh"
-readonly EVAL_ROLLBACK_START_BY_SECONDS=12600
+readonly EVAL_ROLLBACK_JOB_DEADLINE_SECONDS=21600
+readonly EVAL_ROLLBACK_START_BY_SECONDS=15600
 readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
 readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
 readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
@@ -2907,6 +2917,32 @@ announce_suite_verdict() {
   return 1
 }
 
+# When the job started, for the rollback round trip's start-by bound: sets
+# EVAL_JOB_STARTED_EPOCH and EVAL_JOB_STARTED_FROM (what it was read from).
+# Prow's BUILD_ID is a Twitter snowflake whose top bits are milliseconds since
+# a fixed epoch, and it decodes to the pod's pendingTime within seconds
+# (scripts/pool_pressure.py, SNOWFLAKE_*, which scripts/test_pool_pressure.py
+# holds to recorded prowjobs): before the clone, the build and the deploy, so
+# an age read from it is never short. Without one that decodes to a time in
+# the last day, the fallback is this script's own entry, which misses only
+# what ran before it.
+readonly EVAL_SNOWFLAKE_EPOCH_MS=1288834974657
+readonly EVAL_SNOWFLAKE_TIMESTAMP_SHIFT=22
+readonly EVAL_JOB_START_MAX_AGE_SECONDS=86400
+job_started_epoch() {
+  local now decoded
+  now="$(date +%s)"
+  EVAL_JOB_STARTED_EPOCH="${EVAL_SCRIPT_STARTED_EPOCH}"
+  EVAL_JOB_STARTED_FROM="this script's start; BUILD_ID gave none"
+  if [[ "${BUILD_ID:-}" =~ ^[0-9]{15,19}$ ]]; then
+    decoded=$((((10#${BUILD_ID} >> EVAL_SNOWFLAKE_TIMESTAMP_SHIFT) + EVAL_SNOWFLAKE_EPOCH_MS) / 1000))
+    if [ "${decoded}" -le "${now}" ] && [ $((now - decoded)) -le "${EVAL_JOB_START_MAX_AGE_SECONDS}" ]; then
+      EVAL_JOB_STARTED_EPOCH="${decoded}"
+      EVAL_JOB_STARTED_FROM="BUILD_ID ${BUILD_ID}"
+    fi
+  fi
+}
+
 # The rollback round trip, under EVAL_MODE_NEXT=1 only (the constants at the
 # top say why it runs and how long it may). Called after the suite step has
 # written eval-verdict.json and eval-verdict.md and captured SUITE_STATUS,
@@ -2926,23 +2962,27 @@ announce_suite_verdict() {
 # after an hour: the handler here passes it on to the round trip, which
 # reports itself interrupted, and then exits 143 as the global trap does, so
 # the EXIT trap's collection still runs inside the grace period. The start-by
-# bound assumes the deploy in front of this script took about 45m; a slower
-# one is what this handler is for.
+# bound is on the job's age, so that handler is for a deadline that moved,
+# not for a slow deploy.
 run_rollback_roundtrip() {
   if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
     return 0
   fi
   local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"
-  local elapsed=$((SECONDS - START_TIME)) status=0 outcome
+  local now job_age status=0 outcome
   local -a bound=()
   profile_begin "rollback round trip (report-only)"
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip (next -> today -> next), reported beside the eval verdict and not part of it ==="
   : >"${results}" || true
-  if [ "${elapsed}" -gt "${EVAL_ROLLBACK_START_BY_SECONDS}" ]; then
-    echo "SKIPPED: the eval took ${elapsed}s, past ${EVAL_ROLLBACK_START_BY_SECONDS}s, and the round trip's ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound would not end inside the job's deadline" | tee -a "${results}"
+  job_started_epoch
+  now="$(date +%s)"
+  job_age=$((now - EVAL_JOB_STARTED_EPOCH))
+  if [ "${job_age}" -gt "${EVAL_ROLLBACK_START_BY_SECONDS}" ]; then
+    echo "SKIPPED: not enough time left in the job: it started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}), past the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound, so the round trip's ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound would not end inside the job's ${EVAL_ROLLBACK_JOB_DEADLINE_SECONDS}s deadline with room for the verdict and the teardown" | tee -a "${results}"
     echo "OUTCOME: skipped" >>"${results}" || true
     return 0
   fi
+  echo "the job started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}); inside the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound" | tee -a "${results}"
   collect_gateway_log
   collect_agent_pod_diagnostics
   if command -v timeout >/dev/null 2>&1; then

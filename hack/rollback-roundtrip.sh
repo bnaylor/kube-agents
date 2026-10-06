@@ -33,9 +33,11 @@
 # it), because a task over the bus is submitted through it, as the lane's
 # matrix submits its cases; and python3, which runs that submission through
 # the lane's own client (bench/kube_agents_bench/inject_transport.py, stdlib
-# only, so no virtualenv). A sidecar the CR declares that talks to the bus
-# (the Hermes bridge) is unset before the flip to today, as
-# a2a/docs/hermes-bridge.md requires, and declared again once the bus is back.
+# only, so no virtualenv). The CR's spec.deployment.sidecars, whatever they
+# are, is unset before the flip to today, as a2a/docs/hermes-bridge.md
+# requires, and declared again, byte for byte, once the bus is back; a run
+# that fails or is stopped with the list unset and the CR at next declares it
+# again on its way out.
 #
 # Every assertion prints one PASS or FAIL line with its name. The first FAIL
 # stops the run, which exits non-zero after a line naming it. Every wait has a
@@ -157,6 +159,9 @@ readonly DEFAULT_BUS_TASK_TIMEOUT=900
 readonly DEFAULT_BUS_TASK_ATTEMPTS=2
 # A port-forward listening.
 readonly DEFAULT_PORT_FORWARD_WAIT=30
+# The one patch that declares the sidecars again on a failed or stopped run:
+# inside the 60s grace ci-eval-pr.sh gives a stopped run before its KILL.
+readonly RESTORE_REQUEST_TIMEOUT="20s"
 # One read retried this many times before it counts as failed.
 readonly READ_ATTEMPTS=3
 # How much of a port-forward's or the bus client's own output a failure
@@ -207,10 +212,12 @@ readonly A2A_VERIFIER_NAME="${CR_NAME}${A2A_VERIFIER_SUFFIX}"
 readonly INJECT_NAME="${CR_NAME}${INJECT_NAME_SUFFIX}"
 readonly AGENT_DEPLOYMENT="${CR_NAME}${AGENT_DEPLOYMENT_SUFFIX}"
 
-# State the failure report reads.
+# State the failure report reads. SIDECARS_FILE is set while this run has the
+# CR's sidecars unset, and cleared once they are declared again.
 CURRENT_LEG="preflight"
 BUS_SIDECARS=""
 SIDECARS_FILE=""
+SIDECAR_NAMES=""
 PF_PID=""
 PF_LOG=""
 
@@ -253,17 +260,40 @@ fail() {
 # What a person picking up a failed run needs: where the install was left,
 # and what this run took off it. No sidecar contents: they carry the agent's
 # environment.
+#
+# The sidecars go back on the way out when that is safe: with the CR at next
+# the list is what the install ran before the run (a failure before the flip
+# to today, or after the flip forward), so it is patched back once, not
+# awaited. At today it is not: declaring a bus sidecar there is the outage
+# a2a/docs/hermes-bridge.md describes, so the saved list stays in its file
+# and the line says where.
+STATE_REPORTED=""
 report_state_at_failure() {
   local mode
+  STATE_REPORTED=1
   mode="$(k get platformagent "${CR_NAME}" -o jsonpath='{.spec.mode}' 2>/dev/null || true)"
   echo "install left at spec.mode=${mode:-unset} during ${CURRENT_LEG}"
-  if [ -n "${BUS_SIDECARS}" ] && [ -n "${SIDECARS_FILE}" ]; then
-    echo "this run unset the bus sidecar(s) ${BUS_SIDECARS}; the CR's original spec.deployment.sidecars is in ${SIDECARS_FILE} (merge-patch it back once the bus is up)"
+  [ -n "${SIDECARS_FILE}" ] || return 0
+  if [ "${mode}" = "${MODE_NEXT}" ] \
+    && k patch platformagent "${CR_NAME}" --type merge --request-timeout="${RESTORE_REQUEST_TIMEOUT}" -p "$(cat "${SIDECARS_FILE}")" >/dev/null 2>&1; then
+    echo "this run had unset the sidecar(s) ${SIDECAR_NAMES}; declared them again on the way out (patch applied, rollout not awaited)"
+    rm -f "${SIDECARS_FILE}"
+    SIDECARS_FILE=""
+    return 0
   fi
+  echo "this run unset the sidecar(s) ${SIDECAR_NAMES}; the CR's original spec.deployment.sidecars is in ${SIDECARS_FILE} (merge-patch it back once spec.mode is next and the bus is up)"
 }
 
+# On every exit. A run that dies outside fail() and on_signal (a set -e
+# death) has not been through the failure report, and may still have the
+# sidecars unset: it goes through it here.
 cleanup() {
+  local status=$?
   stop_port_forward
+  if [ -n "${SIDECARS_FILE}" ] && [ -z "${STATE_REPORTED}" ]; then
+    echo "the run exited with status ${status} outside an assertion"
+    report_state_at_failure
+  fi
 }
 
 on_signal() {
@@ -647,72 +677,38 @@ assert_nats_on_claim() {
 }
 
 # ─── Sidecars ────────────────────────────────────────────────────────────────
-# A sidecar is an ordinary corev1.Container (a2a/docs/hermes-bridge.md), so
-# one that talks to the bus can say so in any of the ways a container takes
-# env. It is on the bus when it
-#   - references the creds Secret: env[].valueFrom.secretKeyRef or
-#     envFrom[].secretRef; or
-#   - carries a value naming the NATS Service as a host: in env[].value, or in
-#     a ConfigMap it reads through env[].valueFrom.configMapKeyRef or
-#     envFrom[].configMapRef. The host is the Service's short name
-#     (<cr>-a2a-nats, which resolves in the namespace), its namespace-qualified
-#     name (<cr>-a2a-nats.<ns>), or the .svc and FQDN forms
-#     (<cr>-a2a-nats.<ns>.svc[.<cluster domain>][.]), after "//", "@" (a URL
-#     with credentials in it), "," (a server list) or nothing, and before ":",
-#     "/", ",", whitespace or the end.
-# Data only: a $(VAR) the kubelet would expand, or a URL held in some other
-# Secret, is not read.
+# The whole of spec.deployment.sidecars is unset before the flip to today and
+# declared again after the flip forward, not only the sidecars that look like
+# they talk to the bus: a sidecar is an ordinary corev1.Container
+# (a2a/docs/hermes-bridge.md), and one the flip breaks can say so in more ways
+# than a reading of its data finds (a host in args, a reference to a Secret
+# cleanupA2A deletes). A miss there kept a broken sidecar across the flip and
+# took the agent down; unsetting them all costs one rollout for a sidecar that
+# would have survived.
 #
-# PY_SIDECAR_CONFIGMAPS prints the ConfigMaps the sidecars read, one per line;
-# PY_SIDECARS splits them, given a directory holding each of those ConfigMaps
-# as <name>.json (an empty file for one that does not exist), and prints the
-# bus sidecars' names on the first line and the sidecars to keep, as JSON, on
-# the second.
-readonly PY_SIDECAR_CONFIGMAPS='
+# PY_SIDECARS prints the sidecars' names on the first line, and on the second
+# the ones that look like bus clients, for wait_bridges_consuming alone: one
+# that references the creds Secret (env[].valueFrom.secretKeyRef,
+# envFrom[].secretRef) or names the NATS Service anywhere in an env value. A
+# miss there costs that sidecar's log wait, nothing else.
+readonly PY_SIDECARS='
 import json, sys
 cr = json.load(sys.stdin)
-names = set()
-for c in ((cr.get("spec") or {}).get("deployment") or {}).get("sidecars") or []:
-    for e in c.get("env") or []:
-        name = ((e.get("valueFrom") or {}).get("configMapKeyRef") or {}).get("name")
-        if name: names.add(name)
-    for f in c.get("envFrom") or []:
-        name = (f.get("configMapRef") or {}).get("name")
-        if name: names.add(name)
-print("\n".join(sorted(names)))
-'
-readonly PY_SIDECARS='
-import json, os, re, sys
-cr = json.load(sys.stdin)
-creds, nats, ns, cm_dir = sys.argv[1:5]
-host = re.compile(r"(?:^|[/@,\s])%s(?:\.%s(?:\.svc(?:\.[A-Za-z0-9-]+)*)?)?\.?(?=[:/,\s]|$)" % (re.escape(nats), re.escape(ns)))
-def configmap(name):
-    try:
-        with open(os.path.join(cm_dir, name + ".json")) as f:
-            raw = f.read().strip()
-    except OSError:
-        return {}
-    return (json.loads(raw).get("data") or {}) if raw else {}
-def names_bus(value):
-    return bool(host.search(value or ""))
+creds, nats = sys.argv[1:3]
 sidecars = ((cr.get("spec") or {}).get("deployment") or {}).get("sidecars") or []
 def on_bus(c):
     for e in c.get("env") or []:
-        source = e.get("valueFrom") or {}
-        if (source.get("secretKeyRef") or {}).get("name") == creds or names_bus(e.get("value")):
+        if ((e.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name") == creds or nats in (e.get("value") or ""):
             return True
-        ref = source.get("configMapKeyRef") or {}
-        if ref.get("name") and names_bus(configmap(ref["name"]).get(ref.get("key", ""))):
-            return True
-    for f in c.get("envFrom") or []:
-        if (f.get("secretRef") or {}).get("name") == creds:
-            return True
-        ref = (f.get("configMapRef") or {}).get("name")
-        if ref and any(names_bus(v) for v in configmap(ref).values()):
-            return True
-    return False
+    return any((f.get("secretRef") or {}).get("name") == creds for f in c.get("envFrom") or [])
+print(" ".join(c.get("name", "?") for c in sidecars))
 print(" ".join(c.get("name", "?") for c in sidecars if on_bus(c)))
-print(json.dumps([c for c in sidecars if not on_bus(c)]))
+'
+# The CR's spec.deployment.sidecars as a merge patch that declares it again.
+readonly PY_SIDECARS_PATCH='
+import json, sys
+cr = json.load(sys.stdin)
+print(json.dumps({"spec": {"deployment": {"sidecars": ((cr.get("spec") or {}).get("deployment") or {}).get("sidecars")}}}))
 '
 
 # ─── Port-forwards ───────────────────────────────────────────────────────────
@@ -845,7 +841,8 @@ assert_bus_task() {
   fail "${name}" "${line:-the client printed nothing}"
 }
 
-# Waits for every bus sidecar to log that its consumer is bound.
+# Waits for every sidecar that looks like a bus client to log that its
+# consumer is bound.
 wait_bridges_consuming() {
   local name="$1" bound="$2" deadline sidecar missing
   deadline=$((SECONDS + bound))
@@ -923,27 +920,20 @@ assert_bus_task "pre.bus-task"
 # Leg 1: next -> today.
 CURRENT_LEG="leg1"
 CR_JSON="$(k_read get platformagent "${CR_NAME}" -o json)" || fail "leg1.cr-readable" "platformagent/${CR_NAME} could not be read"
-CONFIGMAP_DIR="$(mktemp -d)"
-for configmap in $(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECAR_CONFIGMAPS}"); do
-  k_read get configmap "${configmap}" --ignore-not-found -o json >"${CONFIGMAP_DIR}/${configmap}.json" \
-    || fail "leg1.sidecars-classified" "configmap/${configmap}, which a sidecar takes env from, could not be read"
-done
-SIDECAR_SPLIT="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}" "${NAMESPACE}" "${CONFIGMAP_DIR}")"
-rm -rf "${CONFIGMAP_DIR}"
-BUS_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 1p)"
-KEEP_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 2p)"
-if [ -n "${BUS_SIDECARS}" ]; then
+SIDECAR_SPLIT="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}")"
+UNSET_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 1p)"
+BUS_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 2p)"
+if [ -n "${UNSET_SIDECARS}" ]; then
   # Kept out of the log: a sidecar copied from the agent container carries
-  # its environment.
+  # its environment. Saved before the patch, so a failure from here on
+  # finds it.
+  SIDECAR_NAMES="${UNSET_SIDECARS}"
   SIDECARS_FILE="$(umask 077 && mktemp)"
-  printf '%s' "${CR_JSON}" | python3 -c 'import json, sys; print(json.dumps({"spec": {"deployment": {"sidecars": ((json.load(sys.stdin).get("spec") or {}).get("deployment") or {}).get("sidecars")}}}))' >"${SIDECARS_FILE}"
-  if [ "${KEEP_SIDECARS}" = "[]" ]; then
-    KEEP_SIDECARS="null"
-  fi
-  note "unsetting the bus sidecar(s) ${BUS_SIDECARS} before the flip (a2a/docs/hermes-bridge.md)"
-  patch_and_settle "leg1" "bus-sidecar-unset" "{\"spec\":{\"deployment\":{\"sidecars\":${KEEP_SIDECARS}}}}"
+  printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS_PATCH}" >"${SIDECARS_FILE}"
+  note "unsetting spec.deployment.sidecars (${UNSET_SIDECARS}) before the flip (a2a/docs/hermes-bridge.md)"
+  patch_and_settle "leg1" "sidecars-unset" '{"spec":{"deployment":{"sidecars":null}}}'
 else
-  skip "leg1.bus-sidecar-unset" "the CR declares no sidecar that talks to the bus"
+  skip "leg1.sidecars-unset" "the CR declares no sidecars"
 fi
 patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
 # The teardown ran to its end: the StatefulSet is the last thing cleanupA2A
@@ -995,20 +985,23 @@ wait_cr_ready "leg2.mode-next.ready" "$(bringup_left)"
 assert_same_uid "leg2.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
 assert_nats_on_claim "leg2.nats-on-kept-pvc"
 assert_same_uid "leg2.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
-if [ -n "${BUS_SIDECARS}" ]; then
-  patch_and_settle "leg2" "bus-sidecar-restored" "$(cat "${SIDECARS_FILE}")"
-  BUS_SIDECARS_RESTORED="${BUS_SIDECARS}"
-  # The restored sidecar is an input to the TASKS consumer budget, so the
-  # patch re-renders the provisioning Job; its run is measured against the
+if [ -n "${SIDECARS_FILE}" ]; then
+  patch_and_settle "leg2" "sidecars-restored" "$(cat "${SIDECARS_FILE}")"
+  # Declared again: nothing for the failure report to hand back any more.
+  rm -f "${SIDECARS_FILE}"
+  SIDECARS_FILE=""
+  # A restored bridge is an input to the TASKS consumer budget, so the patch
+  # can re-render the provisioning Job; its run is measured against the
   # stream the kept PVC still holds.
   wait_provision_complete "leg2.reprovisioned" "${BUS_UP_TIMEOUT}"
-  wait_bridges_consuming "leg2.bridge-consuming" "${BRIDGE_TIMEOUT}"
-  # Restored: nothing for the failure report to hand back any more.
-  BUS_SIDECARS=""
-  rm -f "${SIDECARS_FILE}"
-  note "bus sidecar(s) ${BUS_SIDECARS_RESTORED} declared again"
+  if [ -n "${BUS_SIDECARS}" ]; then
+    wait_bridges_consuming "leg2.bridge-consuming" "${BRIDGE_TIMEOUT}"
+  else
+    skip "leg2.bridge-consuming" "no restored sidecar looks like a bus client (${SIDECAR_NAMES}), so no consumer log is waited on"
+  fi
+  note "sidecar(s) ${SIDECAR_NAMES} declared again"
 else
-  skip "leg2.bus-sidecar-restored" "no bus sidecar was unset in leg 1"
+  skip "leg2.sidecars-restored" "no sidecars were unset in leg 1"
 fi
 wait_rolled "leg2.verifier-serving" deployment "${A2A_VERIFIER_NAME}" "${ROLLOUT_TIMEOUT}"
 wait_rolled "leg2.gateway-serving" deployment "${A2A_GATEWAY_NAME}" "${ROLLOUT_TIMEOUT}"

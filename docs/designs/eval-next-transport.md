@@ -631,13 +631,13 @@ they were, and the presubmit's own tests hold that.
 
 Under the flag the run also checks the rollback path once the suite verdict is computed and
 before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
-and back to `next`, with the bridge sidecar unset before the first flip and declared again
-after the second, and asserts that the JetStream PVC and the bus creds Secret keep their
+and back to `next`, with `spec.deployment.sidecars` unset before the first flip and declared
+again after the second, and asserts that the JetStream PVC and the bus creds Secret keep their
 UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
 afterwards. It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
-on the job's exit status. It is skipped when the eval ran too long for its one-hour bound to
-end inside the job's deadline. The eval's gateway log and pod diagnostics are collected
+on the job's exit status. It is skipped when the job, counted from its Prow `BUILD_ID`, is too
+old for its one-hour bound to end inside the job's deadline. The eval's gateway log and pod diagnostics are collected
 before it starts, because the flip replaces the pods they come from.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes

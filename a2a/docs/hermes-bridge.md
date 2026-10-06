@@ -72,8 +72,8 @@ resolves. Confirmed live 2026-09-05: the sidecar crash-loops, and because it sha
 agent's pod the pod never reaches Ready - the whole agent is down, not merely carrying
 an A2A trace. Unset `spec.deployment.sidecars` _before_ flipping to `today`. In any
 flip runbook that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh` follows
-it: it unsets the sidecars that talk to the bus, flips, and declares them again once
-`next` is back.
+it: it unsets the whole list, not only the sidecars that look like bus clients, flips,
+and declares the saved list again once `next` is back.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
