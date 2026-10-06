@@ -1146,6 +1146,11 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 // as it holds it over the discord-bot Secret, and Slack stays on the legacy
 // consumer rather than reaching nobody. renderMode fails closed, so skew
 // reads as today here too.
+//
+// The CR alone decides, by decision (2026-10-06): the token Secret is not
+// read, so a multi-workspace bot token (the broker's comma-separated list,
+// which the gateway cannot use) is armed anyway. Such installs must stay on
+// today; the spec's Slack section and the CRD page say so.
 func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return renderMode(agent, "gateway") == ModeNext && slackEnabled(agent) && !a2aChatArmed(agent)
 }
