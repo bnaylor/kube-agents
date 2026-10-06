@@ -4019,9 +4019,11 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 // docs/designs/spec-chatops-gateway.md). Which chat backend it starts on is
 // the install's: the Google Chat env and relay token when a2aChatArmed, the
 // optional discord-bot Secret reference otherwise, and the inject door under
-// its own flag beside either. The render is withheld while none of those is
-// configured (a2aGatewayBackend); once rendered, a pod still crash-loops
-// until the gateway image is reachable.
+// its own flag beside either. While none of those is configured
+// (a2aGatewayBackend) the first creation is withheld, and a Deployment that
+// already exists is applied at zero replicas over this render's one (the
+// caller sets it); with one, a pod still crash-loops until the gateway image
+// is reachable.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")
@@ -4333,13 +4335,19 @@ type a2aProvisionState struct {
 	// written on the way OUT of the previous one, and nothing else is
 	// guaranteed to wake the reconcile that finally sees it.
 	gatewayHeld bool
-	// gatewayDark reports that the gateway Deployment was withheld because
-	// the install configures no chat backend for it: no discord-bot Secret,
-	// no door armed and Chat not taken by next (a2aGatewayBackend). gatewayDarkReason is the
-	// remedy, for the condition the status writer publishes. A gateway that
-	// already exists is never withheld on this account; see the call site.
+	// gatewayDark reports that the gateway runs nothing because the install
+	// configures no chat backend for it (a2aGatewayBackend): its first
+	// creation was withheld, or the Deployment that exists was applied at
+	// zero replicas. gatewayDarkReason is the remedy, for the condition the
+	// status writer publishes. See the call site.
 	gatewayDark       bool
 	gatewayDarkReason string
+	// gatewayWaking reports that a backend has come back for a gateway an
+	// earlier pass darkened, the apply has asked for one replica again, and
+	// the informer does not yet count it ready. The status writers keep the
+	// A2AGateway condition the dark pass wrote while it holds, and it shares
+	// the requeue with gatewayDark.
+	gatewayWaking bool
 	// jobName is the provisioning Job this pass rendered, by its digest
 	// name. The status writer names it when it is what Ready waits on,
 	// and carrying it saves re-rendering the JobSpec to hash it again.
@@ -4808,46 +4816,91 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 	// Before the callout gate: a gateway with no chat backend to start on
-	// is a crash loop, so its first creation is withheld and the CR says
-	// why (#1660, option 1). Creation only, the same rule as the callout
-	// gate below and for the same reason: a gateway that exists is
-	// reconciled whatever happened to its backend, because deleting it
-	// would hand every session pod that hangs off its UID to the garbage
-	// collector. An operator who removes the discord-bot Secret from under
-	// a running gateway gets the crash loop that has always followed that,
-	// visible on the pod; an operator who never created one gets no
-	// Deployment and a condition instead.
+	// is a crash loop (a2a/gateway/config.go, "no chat backend"), so it is
+	// never run without one, and the CR says why. What "not run" means
+	// depends on whether the Deployment exists yet.
 	//
-	// Existence first, backend second, so the backend question (an uncached
-	// Secret read when no door is armed) is asked only on the pass that
-	// would create the gateway, and a running install pays nothing for it.
-	// Through the informer rather than a2aReader, unlike the callout gate
-	// below, because the stale directions cost differently here: a stale
-	// NotFound withholds an apply the gateway does not need for one pass,
-	// and a stale hit -- the Deployment deleted inside the informer's lag,
-	// with the Secret gone at the same moment -- falls through to the callout
-	// gate's live read and at worst re-creates the crash-looping gateway
-	// every install had before this gate. A live read would buy that corner
-	// with one API call per pass on every next install.
-	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); errors.IsNotFound(err) {
-		configured, why, berr := r.a2aGatewayBackend(ctx, agent)
-		if berr != nil {
-			return state, berr
-		}
-		if !configured {
-			state.gatewayDark = true
-			state.gatewayDarkReason = why
+	// Absent: its first creation is withheld (#1660, option 1), and the
+	// install gets no Deployment and a condition.
+	//
+	// Present: it is applied at zero replicas, never deleted (#2481).
+	// Deleting it would hand every session pod that hangs off its UID to
+	// the garbage collector; leaving it at one replica is the crash loop
+	// this gate exists to prevent, and disarming the last backend is a
+	// normal step (turning the inject door off on an eval install, taking
+	// the discord-bot Secret away, disabling Chat on the CR), not a
+	// mistake. At zero the object and its UID stay, so the sessions stay
+	// owned, and the same condition the creation path writes says why.
+	// When a backend comes back, the next pass falls through to the
+	// ordinary apply below, which renders one replica on the same object;
+	// the dark state shares the reconcile's requeue (platformagent_controller.go,
+	// the gatewayDark term) so a Secret, which is not watched, is seen
+	// within one requeue. The condition stays until the scaled-up pod is
+	// ready (gatewayWaking).
+	//
+	// So the backend question is asked on every pass, existing gateway or
+	// not, or a running gateway would never see its backend leave. The door
+	// flags and Chat answer from the environment and the CR without a read;
+	// only an install whose sole backend is a Secret pays a2aGatewayBackend's
+	// one uncached GET per pass. The answer is a2aGatewayBackend's alone:
+	// nothing here assumes which backends are Secret-backed.
+	//
+	// The Deployment read goes through the informer rather than a2aReader,
+	// unlike the callout gate below, because the stale directions cost
+	// differently here: a stale NotFound on a dark pass withholds an apply
+	// for one pass (and the requeue comes back), and a stale hit -- the
+	// Deployment deleted inside the informer's lag -- applies it at zero
+	// replicas, which creates a Deployment that runs nothing, and the next
+	// pass sees it as the one that exists. A live read would buy that
+	// corner with one API call per pass on every next install.
+	liveGateway := &appsv1.Deployment{}
+	getErr := r.Get(ctx, client.ObjectKeyFromObject(dep), liveGateway)
+	if getErr != nil && !errors.IsNotFound(getErr) {
+		return state, getErr
+	}
+	gatewayExists := getErr == nil
+	configured, why, berr := r.a2aGatewayBackend(ctx, agent)
+	if berr != nil {
+		return state, berr
+	}
+	if !configured {
+		state.gatewayDark = true
+		state.gatewayDarkReason = why
+		if gatewayExists {
+			// The callout gate and anything after it are skipped: the
+			// callout gate never holds a gateway that exists, and nothing
+			// later in the ordinary path is needed to run zero pods.
+			dep.Spec.Replicas = ptr.To(int32(0))
+			logf.FromContext(ctx).Info("scaling the A2A gateway to zero: no chat backend is configured", "deployment", dep.Name)
+			if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
+				return state, fmt.Errorf("failed to scale the A2A gateway Deployment to zero: %w", err)
+			}
+		} else {
 			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
-			if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
-				return state, err
-			}
-			if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
-				return state, err
-			}
-			return state, nil
 		}
-	} else if err != nil {
-		return state, err
+		// The door removals AFTER the apply, as on the ordinary path below,
+		// and the argument there still holds at zero replicas: the apply is
+		// what stops the gateway listening, here by taking the door's env
+		// away and scaling the pod away in the same write, so the fence
+		// outlives the apply. The previous pod can serve the port unfenced
+		// for the rest of its termination, the window the ordinary path
+		// already has; once it is gone nothing listens at zero replicas.
+		// Absent, there was never a listener.
+		if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+			return state, err
+		}
+		if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
+			return state, err
+		}
+		return state, nil
+	}
+	// A backend, and a gateway an earlier pass darkened: the apply below
+	// scales it back to one replica, and until that replica is ready the
+	// CR keeps the condition the dark pass wrote rather than clearing it
+	// over a pod that is not serving yet. The ready count is the informer's,
+	// and the status writer re-reads it before keeping the condition.
+	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayDarkMessage(agent) != "" {
+		state.gatewayWaking = true
 	}
 	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err

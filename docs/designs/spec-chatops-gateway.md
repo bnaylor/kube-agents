@@ -899,19 +899,27 @@ namespace, no door armed and `spec.integration.googleChat` not enabled - gets no
 Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
-would render it. The rule is creation-only, like the callout ordering gate: a gateway that
-exists keeps reconciling whatever happened to its backend, because deleting it would take
-every session pod that hangs off its UID. An eval install with this door armed has an ingress
+would render it. A gateway that already exists when its last backend goes is not deleted,
+because deleting it would take every session pod that hangs off its UID, and it is not left at
+one replica either, because that replica exits on `no chat backend` and crash-loops. The
+operator applies it at zero replicas, keeping the object and its UID, and writes the same
+`A2AGateway` condition; `Ready` does not wait on it. So the backend question is asked on every
+pass: the door flags and Chat answer it without a read, and an install whose only backend is a
+Secret pays one uncached read per pass. When a backend comes back, the next pass applies one
+replica on the same Deployment, and the condition stays until that replica is ready. The dark
+state shares the reconcile's 30 s requeue, so a Secret, which is not watched, is seen within
+one requeue; a door flag comes back with the operator restart that changing it causes, and
+Chat with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat under `next` has a backend by that
 fact alone: the render asks the CR before it reads any Secret, and, because the gateway
 refuses two real backends, omits the Discord reference when Chat is armed, so a
-`discord-bot` Secret left in the namespace does not stop a Chat gateway starting. The
-rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
-has no other backend re-renders the existing gateway without one, and it exits on
-`no chat backend` until the admin flips the CR to `today` (which tears the stack down), creates
-a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
-same shape as removing the Secret from under a Discord gateway, reached through the CR.
+`discord-bot` Secret left in the namespace does not stop a Chat gateway starting. Disabling
+Google Chat on an install whose gateway has no other backend takes the same path as removing
+the Secret from under a Discord gateway, or turning off the door an eval gateway started on:
+the existing gateway goes to zero replicas with the condition, its session pods stay, and
+enabling Chat again, creating a `discord-bot` Secret or arming a door brings it back on the
+same object.
 
 ## The Google Chat adapter (added 9/5)
 

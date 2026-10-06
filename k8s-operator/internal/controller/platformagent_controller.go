@@ -907,10 +907,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// predicate's false negatives, a terminated pod still counted and an
 	// informer copy older than the pass's own apply, clear on a Deployment
 	// event the requeue does not need to wait for.
-	// gatewayDark shares it too: the discord-bot Secret is not watched, so
-	// its creation is invisible without a requeue, and the pass that renders
-	// the gateway once it exists has to be a pass that happens.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark) {
+	// gatewayDark shares it too: a backend Secret is not watched, so its
+	// creation is invisible without a requeue, and the pass that renders the
+	// gateway (or scales a darkened one back to a replica) once it exists has
+	// to be a pass that happens. gatewayWaking rides the same term: the
+	// A2AGateway condition is kept until the scaled-up replica is ready, and
+	// the pass that clears it should not depend on the Deployment's status
+	// event alone.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark || a2aState.gatewayWaking) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -3016,12 +3020,15 @@ type splitWorkloadStatus struct {
 // rather than reporting a readiness it could not check. NotFound is not an error here: it
 // is the ordinary state between applying the objects and the API server serving them back,
 // and it reads as not-ready, which is what it is.
-// The second result is non-empty when a next install's A2A gateway is
-// withheld for want of a chat backend (a2aGatewayBackend): the remedy text
-// the status writer publishes as the A2AGateway condition. A withheld gateway
-// is left out of the list rather than counted as not ready, because it is
-// absent on purpose and Ready would otherwise never be true on such an
-// install (#1660, option 1).
+// The second result is non-empty when a next install's A2A gateway runs
+// nothing for want of a chat backend (a2aGatewayBackend), withheld or scaled
+// to zero: the remedy text the status writer publishes as the A2AGateway
+// condition. Such a gateway is left out of the list rather than counted as
+// not ready, because it runs nothing on purpose and Ready would otherwise
+// never be true on such an install (#1660, option 1; #2481). It is also
+// non-empty while a darkened gateway is coming back (a2a.gatewayWaking) and
+// has no ready replica, carrying the condition's existing text; that gateway
+// IS counted, as the not-ready workload it is.
 func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) ([]splitWorkloadStatus, string, error) {
 	shell := &appsv1.StatefulSet{}
 	shellName := shellSandboxName(agent)
@@ -3134,7 +3141,18 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			} else {
 				workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
 			}
+		} else if a2a.gatewayDark {
+			// Present at zero replicas, scaled there for want of a backend:
+			// the same report as the absent case above, since what it runs
+			// is the same nothing.
+			gatewayDark = a2a.gatewayDarkReason
 		} else {
+			// Coming back from dark: the condition stays until a replica is
+			// ready, by this read rather than the render's, so a pod that
+			// turned ready since the render clears it on this pass.
+			if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
+				gatewayDark = a2aGatewayDarkMessage(agent)
+			}
 			workloads = append(workloads, splitWorkloadStatus{
 				name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
 			})
@@ -3165,6 +3183,17 @@ func a2aGatewayConditionCurrent(agent *agentv1alpha1.PlatformAgent, dark string)
 	}
 	return existing != nil && existing.Status == metav1.ConditionFalse &&
 		existing.Reason == a2aGatewayDarkReason && existing.Message == dark
+}
+
+// a2aGatewayDarkMessage is the message of the CR's A2AGateway condition when
+// it says dark, and "" otherwise. The way back from dark keeps that text
+// while the scaled-up gateway is not ready yet (gatewayWaking).
+func a2aGatewayDarkMessage(agent *agentv1alpha1.PlatformAgent) string {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
+	if existing == nil || existing.Status != metav1.ConditionFalse || existing.Reason != a2aGatewayDarkReason {
+		return ""
+	}
+	return existing.Message
 }
 
 // setA2AGatewayCondition writes the withheld-gateway condition on the
@@ -3310,8 +3339,13 @@ func setBusProvisionedCondition(agent *agentv1alpha1.PlatformAgent, want bool, j
 // pass whose conditions already match writes nothing.
 func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) error {
 	dark := ""
-	if a2a.gatewayDark {
+	switch {
+	case a2a.gatewayDark:
 		dark = a2a.gatewayDarkReason
+	case a2a.gatewayWaking:
+		// The render's ready count, not a fresh read: this writer reads no
+		// workloads, and the requeue brings the pass that clears it.
+		dark = a2aGatewayDarkMessage(agent)
 	}
 	want := wantBusProvisioned(agent, a2a)
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
@@ -3438,7 +3472,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
 			if a2aGatewayDark != "" {
 				condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout and bus provisioning are all ready; " +
-					"the A2A gateway is not rendered (no chat backend, see the A2AGateway condition)"
+					"the A2A gateway is not running (no chat backend, see the A2AGateway condition)"
 			}
 		}
 	case errWorkload == nil:
