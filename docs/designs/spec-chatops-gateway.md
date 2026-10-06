@@ -1099,9 +1099,13 @@ Slack target under `next`, the cost the Chat section states for Chat.
 Nothing enforces the multi-workspace rule. The arm reads the CR alone and never opens the
 token Secret, so an install already on `next` whose bot-token Secret holds a list is flipped
 by the operator upgrade that brings the arm: the broker is no longer handed the pair, the
-gateway takes the whole list as one token, Slack refuses it at `auth.test` and the gateway
-pod exits, and Slack has no consumer until the Secret holds one workspace's token or the
-install goes back to `today`. Reading the Secret in the arm would catch it, at the cost of a
+gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
+not exit: the console is the mux's essential backend, so the Slack backend is contained and
+retried on a backoff, the pod stays Running and Ready, and Slack has no consumer until the
+Secret holds one workspace's token or the install goes back to `today`. Nothing in the CR's
+`.status` says why, since no `A2AGateway` condition is written for a gateway the arm called
+configured; the gateway pod's log carries the cause, and its events do for a missing Secret
+or key. Reading the Secret in the arm would catch it, at the cost of a
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
 CR-only arm was kept and the limitation documented instead (2026-10-06).
 
@@ -1110,8 +1114,10 @@ Chat's rule, so an unrecognised `spec.mode` reads as `today` and the legacy cons
 again: the broker's Socket Mode relay and the Hermes slack platform. The reconciler freezes
 the A2A objects on skew rather than touching them, and a Slack gateway holds the token pair
 in its own pod env, so the frozen gateway keeps its own Socket Mode connection beside the
-legacy one. Slack spreads the app's events across both, so messages are split between the
-two consumers and none are dropped, until the operator recognises the mode again. Chat's
+legacy one, until the operator recognises the mode again. Slack delivers each event to one
+of the two connections, and the two consumers do not admit the same senders: both gate on
+`allowedUsers`, but the gateway also requires the principal map. A sender admitted by one gate
+and not the other is answered or dropped depending on which consumer receives the event. Chat's
 frozen gateway goes quiet instead, because it reaches Chat only through the broker's A2A
 relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
 behaviour documented (2026-10-06).
