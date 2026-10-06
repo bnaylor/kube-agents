@@ -577,3 +577,89 @@ func TestAnUnarmedGatewayCarriesNoSlackAllowlist(t *testing.T) {
 		}
 	}
 }
+
+// gatewayDigestAfterPass runs one A2A pass and returns the secret-env digest
+// on the rendered gateway's pod template, failing if there is no gateway: a
+// digest read off an absent Deployment is "" and would pass on absence.
+func gatewayDigestAfterPass(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
+	t.Helper()
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatalf("the gateway Deployment was not rendered: %v", err)
+	}
+	return dep.Spec.Template.Annotations[secretEnvHashAnnotation]
+}
+
+// rotateSecretKey rewrites one key of a Secret in place, the way `kubectl
+// apply` of a new value does: same object, same UID, new data.
+func rotateSecretKey(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, namespace, name, key, value string) {
+	t.Helper()
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, secret); err != nil {
+		t.Fatalf("read Secret %s back: %v", name, err)
+	}
+	secret.Data[key] = []byte(value)
+	if err := r.Update(ctx, secret); err != nil {
+		t.Fatalf("rotate %s/%s: %v", name, key, err)
+	}
+}
+
+// TestRotatingASlackTokenRollsTheArmedGateway: on a Slack-armed next install
+// the pair is read by the A2A gateway, not the broker (legacySlackConsumer is
+// off), so the secret-env digest has to ride the gateway's pod template or a
+// rotated token reaches no pod at all. A rotated bot token alone is the
+// silent case: the socket stays up on the app token and every post fails.
+func TestRotatingASlackTokenRollsTheArmedGateway(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	agent := slackTestAgent("next", true)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	if err := cl.Create(ctx, secretHashTestSecret(slackTestSecret, map[string][]byte{
+		slackTestBotKey: []byte("xoxb-before-rotation"),
+		slackTestAppKey: []byte("xapp-unchanged"),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	theCalloutIsServing(t, ctx, cl, r, agent)
+
+	before := gatewayDigestAfterPass(t, ctx, r, agent)
+	if before == "" {
+		t.Fatalf("the Slack-armed gateway carries no %s; a rotated Slack token would reach nothing", secretEnvHashAnnotation)
+	}
+	if idle := gatewayDigestAfterPass(t, ctx, r, agent); idle != before {
+		t.Fatalf("the digest moved on an idle pass (%s then %s): every pass would roll the gateway", before, idle)
+	}
+	rotateSecretKey(t, ctx, r, agent.Namespace, slackTestSecret, slackTestBotKey, "xoxb-after-rotation")
+	if after := gatewayDigestAfterPass(t, ctx, r, agent); after == before {
+		t.Errorf("the gateway's pod template is unchanged after the bot token rotated (%s), so the running pod keeps the revoked token", before)
+	}
+}
+
+// TestRotatingTheDiscordTokenRollsTheGatewayToo: the stamp covers the
+// gateway's Secret-sourced env generally, not Slack's pair alone, so the
+// Discord gateway (never stamped before) is digested on the same terms, and
+// it does not move on an idle pass.
+func TestRotatingTheDiscordTokenRollsTheGatewayToo(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+
+	before := gatewayDigestAfterPass(t, ctx, r, agent)
+	if before == "" {
+		t.Fatalf("the Discord gateway carries no %s", secretEnvHashAnnotation)
+	}
+	if idle := gatewayDigestAfterPass(t, ctx, r, agent); idle != before {
+		t.Fatalf("the digest moved on an idle pass (%s then %s)", before, idle)
+	}
+	rotateSecretKey(t, ctx, r, agent.Namespace, a2aDiscordBotSecretName, a2aDiscordBotTokenKey, "rotated-token")
+	if after := gatewayDigestAfterPass(t, ctx, r, agent); after == before {
+		t.Errorf("the gateway's pod template is unchanged after the Discord token rotated (%s)", before)
+	}
+}

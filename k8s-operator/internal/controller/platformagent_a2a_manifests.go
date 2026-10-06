@@ -2082,10 +2082,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // And the rotation it notices rolls the bus, not the bus's clients. This hash
 // rides the NATS pod template alone; the gateway Deployment and the provision
 // Job take their passwords through valueFrom.secretKeyRef, which a running pod
-// does not re-read, so a repaired credential leaves the gateway holding the old
-// one until something else restarts it. That gap predates this function — the
-// conf digest rolled only the StatefulSet too — and closing it means deciding
-// what a rotation should restart, which is not this function's call.
+// does not re-read. The gateway is covered separately: its pod template carries
+// the secret-env digest (stampSecretEnvHash in reconcileA2A), which moves when
+// its password's value does, within secretEnvReprobeInterval. The provision Job
+// is not.
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
@@ -5022,6 +5022,17 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			return state, err
 		}
 		return state, nil
+	}
+	// The secret-env digest, on the same terms as the agent gateway and the
+	// broker (platformagent_secret_hash.go). On a Slack-armed install this pod,
+	// not the broker, reads the Slack pair, so without it a rotated token would
+	// reach no pod at all; the stamp covers every Secret ref the render carries
+	// (the bus password, the salt, the Discord or Slack tokens, a door's token)
+	// rather than special-casing Slack. After both gates, so a withheld gateway
+	// pays no Secret read; once one exists this is one Get per referenced Secret
+	// per pass, the cost the other two stamped pods already carry.
+	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
+		return state, err
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
