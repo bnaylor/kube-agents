@@ -218,6 +218,9 @@ CURRENT_LEG="preflight"
 BUS_SIDECARS=""
 SIDECARS_FILE=""
 SIDECAR_NAMES=""
+# Set from the flip to today until leg 2's provisioning passes: the bus is
+# down or not yet back, and the sidecars must not be declared again.
+BUS_DOWN=""
 PF_PID=""
 PF_LOG=""
 
@@ -261,12 +264,13 @@ fail() {
 # and what this run took off it. No sidecar contents: they carry the agent's
 # environment.
 #
-# The sidecars go back on the way out when that is safe: with the CR at next
-# the list is what the install ran before the run (a failure before the flip
-# to today, or after the flip forward), so it is patched back once, not
-# awaited. At today it is not: declaring a bus sidecar there is the outage
-# a2a/docs/hermes-bridge.md describes, so the saved list stays in its file
-# and the line says where.
+# The sidecars go back on the way out only when the bus is up: the CR at next
+# and BUS_DOWN unset, which is before the flip to today or once leg 2's
+# provisioning has passed. Then the list is what the install ran before the
+# run, so it is patched back once, not awaited. Anywhere else (under today,
+# or at next with the bus still coming back) the list may hold a bus
+# sidecar, and declaring one there is the outage a2a/docs/hermes-bridge.md
+# describes, so the saved list stays in its file and the line says where.
 STATE_REPORTED=""
 report_state_at_failure() {
   local mode
@@ -274,7 +278,7 @@ report_state_at_failure() {
   mode="$(k get platformagent "${CR_NAME}" -o jsonpath='{.spec.mode}' 2>/dev/null || true)"
   echo "install left at spec.mode=${mode:-unset} during ${CURRENT_LEG}"
   [ -n "${SIDECARS_FILE}" ] || return 0
-  if [ "${mode}" = "${MODE_NEXT}" ] \
+  if [ "${mode}" = "${MODE_NEXT}" ] && [ -z "${BUS_DOWN}" ] \
     && k patch platformagent "${CR_NAME}" --type merge --request-timeout="${RESTORE_REQUEST_TIMEOUT}" -p "$(cat "${SIDECARS_FILE}")" >/dev/null 2>&1; then
     echo "this run had unset the sidecar(s) ${SIDECAR_NAMES}; declared them again on the way out (patch applied, rollout not awaited)"
     rm -f "${SIDECARS_FILE}"
@@ -690,7 +694,9 @@ assert_nats_on_claim() {
 # the ones that look like bus clients, for wait_bridges_consuming alone: one
 # that references the creds Secret (env[].valueFrom.secretKeyRef,
 # envFrom[].secretRef) or names the NATS Service anywhere in an env value. A
-# miss there costs that sidecar's log wait, nothing else.
+# miss there costs that sidecar's log wait, nothing else; a sidecar picked
+# that never logs the Hermes bridge's line fails leg2.bridge-consuming at its
+# bound, with its name.
 readonly PY_SIDECARS='
 import json, sys
 cr = json.load(sys.stdin)
@@ -935,6 +941,7 @@ if [ -n "${UNSET_SIDECARS}" ]; then
 else
   skip "leg1.sidecars-unset" "the CR declares no sidecars"
 fi
+BUS_DOWN=1
 patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
 # The teardown ran to its end: the StatefulSet is the last thing cleanupA2A
 # deletes, and the callout keys Secret is one it deletes rather than keeps,
@@ -965,8 +972,9 @@ CURRENT_LEG="leg2"
 # the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1 and the rest of
 # leg 2, which take minutes on a healthy install; a run that needs more is
 # stopped there and reports itself interrupted at the leg it was in. The
-# job-level sum is unchanged: start by 12600s, 3600s plus a 60s kill grace,
-# and about 2700s of deploy in front, 18960s inside the 21600s deadline. The
+# job-level bound is ci-eval-pr.sh's, beside EVAL_ROLLBACK_START_BY_SECONDS:
+# the run starts by 15600s of job age, deploy included, and with the 3600s
+# bound and its 60s kill grace ends by 19260s, inside the 21600s deadline. The
 # deploy gives the Job its 1500s (MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS,
 # which its comment says covers the wait for the callout too) after its NATS
 # gate; here NATS comes out of the same 1500s, one StatefulSet pod binding a
@@ -980,6 +988,7 @@ wait_rolled "leg2.nats-ready" statefulset "${NATS_NAME}" "$(bringup_left)"
 wait_rolled "leg2.callout-serving" deployment "${CALLOUT_NAME}" "$(bringup_left)"
 # Any provisioning Job now is this leg's: leg1.nothing-stuck saw none left.
 wait_provision_complete "leg2.provisioned" "$(bringup_left)"
+BUS_DOWN=""
 wait_rolled "leg2.mode-next.agent-rolled" deployment "${AGENT_DEPLOYMENT}" "$(bringup_left)"
 wait_cr_ready "leg2.mode-next.ready" "$(bringup_left)"
 assert_same_uid "leg2.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"

@@ -636,9 +636,11 @@ again after the second, and asserts that the JetStream PVC and the bus creds Sec
 UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
 afterwards. It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
-on the job's exit status. It is skipped when the job, counted from its Prow `BUILD_ID`, is too
-old for its one-hour bound to end inside the job's deadline. The eval's gateway log and pod diagnostics are collected
-before it starts, because the flip replaces the pods they come from.
+on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
+inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
+the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+log and pod diagnostics are collected before it starts, because the flip replaces the pods
+they come from.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.

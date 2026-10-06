@@ -376,6 +376,9 @@ FAKE_KUBECTL = textwrap.dedent(
                 out = json.dumps({"items": s["pods"]})
             elif kind == "jobs":
                 out = json.dumps({"items": s["jobs"]})
+            elif (kind == "deployment" and name == "platform-agent-gateway" and fmt == "json"
+                  and s["scenario"].get("garbled_agent_after_unset") and s["patches"]):
+                out = "not json"
             else:
                 obj = s["objects"].get("%s/%s" % (kind, name))
                 if obj is None:
@@ -916,6 +919,28 @@ class FailureTest(RoundTripTest):
         self.assertEqual(state["patches"][-1], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR, _BRIDGE]}}})
         self.assertEqual(json.dumps(state["cr"]["spec"]["deployment"]["sidecars"], sort_keys=True), before)
 
+    def test_a_failure_at_next_before_the_bus_is_back_does_not_declare_them(self) -> None:
+        # The flip forward is patched but provisioning fails: the CR is at
+        # next with no bus behind it, and a bridge declared now would crash-loop
+        # the agent's pod.
+        result, state, _ = self.run_sim(healthy_next_state(provision_job="Failed"))
+        self.assert_fails_at(result, "leg2.provisioned")
+        self.assertIn("install left at spec.mode=next during leg2", result.stdout)
+        self.assertIn("this run unset the sidecar(s) hermes-bridge; the CR's original spec.deployment.sidecars is in", result.stdout)
+        self.assertEqual(state["patches"][-1], {"spec": {"mode": "next"}})
+
+    def test_a_death_outside_an_assertion_still_declares_them_again(self) -> None:
+        # The agent Deployment answers garbage after the unset: rollout_state's
+        # parse fails and set -e ends the run without a FAIL line. The EXIT
+        # trap takes it through the failure report, and at next with the bus
+        # up the list goes back.
+        result, state, _ = self.run_sim(healthy_next_state(garbled_agent_after_unset=True))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(failed(result), [])
+        self.assertIn("outside an assertion", result.stdout)
+        self.assertIn("declared them again on the way out", result.stdout)
+        self.assertEqual(state["patches"], [{"spec": {"deployment": {"sidecars": None}}}, {"spec": {"deployment": {"sidecars": [_BRIDGE]}}}])
+
     def test_a_failure_before_the_flip_with_the_sidecars_unset_declares_them_again(self) -> None:
         # The unset itself never settles: the CR is still at next.
         result, state, _ = self.run_sim(healthy_next_state(status_stale_on_sidecars=True), ROLLBACK_READY_TIMEOUT="2")
@@ -987,9 +1012,8 @@ class BusClientGuessTest(unittest.TestCase):
 
 
 class SidecarRoundTripTest(RoundTripTest):
-    """Shapes a reading of the sidecar's data would miss (round 2 of the
-    review): each is unset before the flip and declared again after, because
-    every sidecar is."""
+    """Shapes a reading of the sidecar's data would miss: each is unset before
+    the flip and declared again after, because every sidecar is."""
 
     def assert_unset_and_restored(self, sidecar: dict) -> None:
         state = healthy_next_state(sidecars=[_OTHER_SIDECAR, sidecar])
@@ -1215,7 +1239,14 @@ class CiEvalWiringTest(unittest.TestCase):
             with self.subTest(build_id=build_id):
                 result, artifacts = self.run_wiring(mode_next="1", elapsed=0, job_age=16000, build_id=build_id)
                 self.assertNotIn("stub ran", result.stdout)
-                self.assertIn("(this script's start; BUILD_ID gave none)", result.stdout)
+                self.assertIn("(this script's start less 2700s for the deploy; BUILD_ID gave none)", result.stdout)
+
+    def test_the_fallback_counts_the_deploy_in_front(self) -> None:
+        # The script is 13000s old and BUILD_ID gives nothing: with the
+        # deploy's allowance the job is past the start-by bound.
+        result, _ = self.run_wiring(mode_next="1", elapsed=0, job_age=13000)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertRegex(result.stdout, r"it started 1570\ds ago \(this script's start less 2700s")
 
     def test_the_snowflake_layout_is_the_pool_pressure_scripts(self) -> None:
         values = dict(re.findall(r"readonly (EVAL_SNOWFLAKE_\w+)=(\d+)", ci_eval_constants()))

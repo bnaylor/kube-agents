@@ -2924,16 +2924,18 @@ announce_suite_verdict() {
 # (scripts/pool_pressure.py, SNOWFLAKE_*, which scripts/test_pool_pressure.py
 # holds to recorded prowjobs): before the clone, the build and the deploy, so
 # an age read from it is never short. Without one that decodes to a time in
-# the last day, the fallback is this script's own entry, which misses only
-# what ran before it.
+# the last day, the fallback is this script's own entry less an allowance for
+# the deploy that ran before it as a separate script (about 45m on the next
+# lane), so the start-by arithmetic holds on that path too.
 readonly EVAL_SNOWFLAKE_EPOCH_MS=1288834974657
 readonly EVAL_SNOWFLAKE_TIMESTAMP_SHIFT=22
 readonly EVAL_JOB_START_MAX_AGE_SECONDS=86400
+readonly EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS=2700
 job_started_epoch() {
   local now decoded
   now="$(date +%s)"
-  EVAL_JOB_STARTED_EPOCH="${EVAL_SCRIPT_STARTED_EPOCH}"
-  EVAL_JOB_STARTED_FROM="this script's start; BUILD_ID gave none"
+  EVAL_JOB_STARTED_EPOCH=$((EVAL_SCRIPT_STARTED_EPOCH - EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS))
+  EVAL_JOB_STARTED_FROM="this script's start less ${EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS}s for the deploy; BUILD_ID gave none"
   if [[ "${BUILD_ID:-}" =~ ^[0-9]{15,19}$ ]]; then
     decoded=$((((10#${BUILD_ID} >> EVAL_SNOWFLAKE_TIMESTAMP_SHIFT) + EVAL_SNOWFLAKE_EPOCH_MS) / 1000))
     if [ "${decoded}" -le "${now}" ] && [ $((now - decoded)) -le "${EVAL_JOB_START_MAX_AGE_SECONDS}" ]; then
