@@ -991,6 +991,20 @@ const (
 	a2aTasksMaxMsgsPerSubject = 4096
 )
 
+// a2aGatewayMetricsPort is the A2A gateway's metrics-only listener
+// (a2a/gateway/metrics.go), the gateway's copy of credentialProxyMetricsPort:
+// its own port, so the managed-Prometheus collector is admitted to a listener
+// that serves counters and nothing else, and the doors keep their loopback
+// listeners. One constant for the container port, the value of
+// A2A_METRICS_PORT the gateway binds, and the collector's ingress rule in
+// buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
+// number, held to this one by tests/test_chart_platform_agent_monitoring.py.
+const (
+	a2aGatewayMetricsPort       int32 = 9096
+	a2aGatewayMetricsPortName         = "a2a-metrics"
+	a2aGatewayMetricsPortEnvVar       = "A2A_METRICS_PORT"
+)
+
 func a2aNATSImage() string {
 	if override := os.Getenv(a2aNATSImageEnvVar); override != "" {
 		return override
@@ -3962,9 +3976,9 @@ func (r *PlatformAgentReconciler) ensureA2ADoorTokenSecret(ctx context.Context, 
 }
 
 // buildA2ADoorNetworkPolicy is the A2A door's copy of the gateway fence: the
-// same pod selector and the same empty ingress, under the door's own name so
-// it comes and goes with the door's flag and never with the inject door's.
-// Two identical deny-all policies on one pod deny exactly what one does.
+// same pod selector and the same one collector rule, under the door's own
+// name so it comes and goes with the door's flag and never with the inject
+// door's. Two identical policies on one pod admit exactly what one does.
 func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	np := buildA2AGatewayNetworkPolicy(agent)
 	np.Name = a2aDoorName(agent)
@@ -3975,11 +3989,14 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
 // inject backend is armed.
 //
-// PolicyTypes carries Ingress with NO rules, which denies every pod. That is
-// the intent rather than an omission: the two chat backends dial out and
-// listen for nothing, so until this door existed no pod had any business
-// reaching the gateway at all, and the inject port must not become the one
-// that does.
+// PolicyTypes carries Ingress with one rule, and every pod but the one it
+// names is denied. That is the intent rather than an omission: the chat
+// backends dial out and listen for nothing, so until this door existed no
+// pod had any business reaching the gateway at all, and the inject port must
+// not become the one that does. The one rule is the credential broker's
+// second rule, copied (buildCredentialProxyNetworkPolicy): the
+// managed-Prometheus collector, from its own namespace, to the metrics-only
+// port alone (a2aGatewayMetricsPort). The doors' ports admit nobody.
 //
 // This fence is a second control over an edge the bind address already
 // closes, not the first. The door listens on the pod's loopback
@@ -3997,7 +4014,11 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // the gateway is a good idea whatever the backend, but rendering one on every
 // next install is a change to installs that did not ask for this, and it
 // would outlive the object it exists to protect. When an in-cluster caller
-// legitimately needs the gateway, it becomes a peer in this rule.
+// legitimately needs the gateway, it becomes a peer in this rule. The cost of
+// that choice: on an install with neither door armed no policy selects the
+// gateway pod, so the metrics port is as reachable from the pod network as the
+// rest of a pod that otherwise listens on nothing, and what it serves there is
+// the counters.
 func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -4011,6 +4032,14 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 				MatchLabels: map[string]string{"app": a2aGatewayName(agent)},
 			},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aGatewayMetricsPort)},
+			}},
 		},
 	}
 }
@@ -4178,6 +4207,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The metrics-only listener's port (see
+		// a2aGatewayMetricsPort): the container port below
+		// and the collector's ingress rule name the same one.
+		{Name: a2aGatewayMetricsPortEnvVar, Value: strconv.Itoa(int(a2aGatewayMetricsPort))},
 		// Arms the spawner. The gateway shipped its
 		// session-spawn path dark behind this flag; the
 		// worker image it spawns and the Role that lets
@@ -4291,7 +4324,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						WorkingDir: "/",
 						Resources:  a2aResources(a2aGatewayCPURequest, a2aGatewayMemoryRequest, a2aGatewayCPULimit, a2aGatewayMemoryLimit),
 						Env:        env,
-						Ports:      injectPorts,
+						// The doors' ports, then the metrics-only
+						// listener's, for the chart's PodMonitoring.
+						Ports: append(injectPorts, corev1.ContainerPort{
+							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
+						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
 						}}, chatMounts...), injectMounts...),

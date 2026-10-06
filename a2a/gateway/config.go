@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -52,6 +53,16 @@ const (
 // defaultA2ADoorPrincipalMapPath is the same for the A2A door's map: its own
 // file, keys prefixed a2a:, for the reason the inject door's is.
 const defaultA2ADoorPrincipalMapPath = "/etc/a2a/a2a-door-principal-map/principals"
+
+// metricsPortEnv names the metrics listener's port (see MetricsPath in
+// metrics.go). Unset or empty means no listener, the broker's rule for
+// CREDENTIAL_PROXY_METRICS_PORT; metricsPortMin and metricsPortMax are the
+// range a set value has to fall in.
+const (
+	metricsPortEnv = "A2A_METRICS_PORT"
+	metricsPortMin = 1
+	metricsPortMax = 65535
+)
 
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
@@ -173,6 +184,14 @@ type Config struct {
 	// which behind a port-forward or an ingress is not the listen address.
 	// Empty makes the card advertise the address it was fetched from.
 	A2ADoorPublicURL string
+
+	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
+	// zero means no listener. It binds every interface, because its caller
+	// is the managed-Prometheus collector on the pod network, and serves
+	// MetricsPath and nothing else. It may not be either door's port: a door
+	// that lost its port to this listener would fail to bind, and a door
+	// that won it would be what the collector's NetworkPolicy rule admits.
+	MetricsPort int
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
@@ -446,6 +465,11 @@ func FromEnv() (*Config, error) {
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
+	metricsPort, err := metricsPortFromEnv(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MetricsPort = metricsPort
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -633,6 +657,33 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
+}
+
+// metricsPortFromEnv reads A2A_METRICS_PORT: zero when unset or empty, else
+// a port in range that neither door's listen address already names. A bad
+// value refuses the boot, like every other setting FromEnv reads; the
+// operator renders a valid one, so only a hand edit reaches these refusals.
+func metricsPortFromEnv(cfg *Config) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(metricsPortEnv))
+	if raw == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < metricsPortMin || port > metricsPortMax {
+		return 0, fmt.Errorf("%s %q: need a port in %d-%d", metricsPortEnv, raw, metricsPortMin, metricsPortMax)
+	}
+	for _, door := range []struct{ name, listen string }{
+		{"the inject door", cfg.InjectListen},
+		{"the A2A door", cfg.A2ADoorListen},
+	} {
+		if door.listen == "" {
+			continue
+		}
+		if _, doorPort, err := net.SplitHostPort(door.listen); err == nil && doorPort == strconv.Itoa(port) {
+			return 0, fmt.Errorf("%s %d is the port %s listens on; the metrics listener needs a port of its own", metricsPortEnv, port, door.name)
+		}
+	}
+	return port, nil
 }
 
 func envOr(key, def string) string {

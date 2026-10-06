@@ -6053,8 +6053,8 @@ func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
 			t.Errorf("A2A_PRINCIPAL_MAP is repointed without the flag: %+v", e)
 		}
 	}
-	if len(container.Ports) != 0 {
-		t.Errorf("the gateway publishes %d container ports without the flag", len(container.Ports))
+	if doors := a2aGatewayDoorPorts(container.Ports); len(doors) != 0 {
+		t.Errorf("the gateway publishes %d door ports without the flag", len(doors))
 	}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if strings.Contains(v.Name, "inject") {
@@ -6230,10 +6230,10 @@ func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
 		t.Errorf("policyTypes = %v, want Ingress alone -- Egress here would cut the gateway off the bus",
 			np.Spec.PolicyTypes)
 	}
-	if len(np.Spec.Ingress) != 0 {
-		t.Errorf("the fence admits %d ingress rules; the inject port must be reachable from no pod, "+
-			"only through the node path a port-forward uses", len(np.Spec.Ingress))
-	}
+	// The inject port must be reachable from no pod, only through the node
+	// path a port-forward uses; the one rule is the collector's, to the
+	// metrics port alone.
+	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
 }
 
 // TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff: unsetting the operator's
@@ -7011,8 +7011,8 @@ func TestA2AAgentDoorIsOffWithoutTheFlag(t *testing.T) {
 			t.Errorf("%s is rendered without the flag", e.Name)
 		}
 	}
-	if len(container.Ports) != 0 {
-		t.Errorf("the gateway publishes %d container ports without either flag", len(container.Ports))
+	if doors := a2aGatewayDoorPorts(container.Ports); len(doors) != 0 {
+		t.Errorf("the gateway publishes %d door ports without either flag", len(doors))
 	}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if strings.Contains(v.Name, "a2a-door") {
@@ -7186,8 +7186,8 @@ func TestA2AAgentDoorRendersUnderTheFlag(t *testing.T) {
 	if !mounted {
 		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aDoorPrincipalMapDir)
 	}
-	if len(container.Ports) != 1 || container.Ports[0].ContainerPort != a2aDoorPort {
-		t.Errorf("container ports = %+v, want the door port alone", container.Ports)
+	if doors := a2aGatewayDoorPorts(container.Ports); len(doors) != 1 || doors[0].ContainerPort != a2aDoorPort {
+		t.Errorf("container ports = %+v, want the door port alone beside the metrics port", container.Ports)
 	}
 
 	cm := &corev1.ConfigMap{}
@@ -7237,9 +7237,10 @@ func TestA2AAgentDoorRendersUnderTheFlag(t *testing.T) {
 	if np.Spec.PodSelector.MatchLabels["app"] != a2aGatewayName(agent) {
 		t.Errorf("the fence selects %v, want the gateway pod", np.Spec.PodSelector.MatchLabels)
 	}
-	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress || len(np.Spec.Ingress) != 0 {
-		t.Errorf("the fence is %+v, want Ingress with no rules", np.Spec)
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("the fence is %+v, want Ingress alone", np.Spec)
 	}
+	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
 }
 
 // TestA2AAgentDoorAndInjectDoorArmTogether: both flags on, both doors
@@ -7262,8 +7263,8 @@ func TestA2AAgentDoorAndInjectDoorArmTogether(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
 		t.Fatal(err)
 	}
-	if ports := dep.Spec.Template.Spec.Containers[0].Ports; len(ports) != 2 {
-		t.Errorf("container ports = %+v, want one per door", ports)
+	if ports := dep.Spec.Template.Spec.Containers[0].Ports; len(a2aGatewayDoorPorts(ports)) != 2 {
+		t.Errorf("container ports = %+v, want one per door beside the metrics port", ports)
 	}
 
 	// The inject flag goes off; the A2A door stays whole.

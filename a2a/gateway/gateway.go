@@ -114,6 +114,8 @@ type Gateway struct {
 	ps      *Pseudonymizer
 	log     *slog.Logger
 	spawner spawner // nil until SpawnSessions arms (W4)
+	// metrics is the gateway's counters (metrics.go); never nil after New.
+	metrics *Metrics
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -194,6 +196,10 @@ type Options struct {
 	Backend string
 	// Spawner overrides the k8s-backed pod spawner - test injection only.
 	Spawner spawner
+	// Metrics is where the gateway counts what it relays, shared with the
+	// metrics listener and the chat adapter that counts its own pulls. Nil
+	// means a private set nobody serves, which is what a test gets.
+	Metrics *Metrics
 	// RelayDurable overrides the event relay's durable consumer name (the
 	// default relayDurable). Two gateways bound to one durable SPLIT the
 	// event deliveries - and this relay acks what it cannot route - so an
@@ -390,8 +396,15 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.SessionClusterView && o.Config.CredentialProxyURL == "" {
 		return nil, fmt.Errorf("A2A_SESSION_CLUSTER_VIEW=true requires A2A_CREDENTIAL_PROXY_URL: a session pod with the view and no broker address would have wrappers that dial nothing")
 	}
+	g.metrics = o.Metrics
+	if g.metrics == nil {
+		g.metrics = NewMetrics()
+	}
 	return g, nil
 }
+
+// Metrics is the gateway's counters, for the metrics listener to serve.
+func (g *Gateway) Metrics() *Metrics { return g.metrics }
 
 // Run subscribes the event relay, starts the reap and sweep loops, and runs
 // the adapter until ctx is done.
