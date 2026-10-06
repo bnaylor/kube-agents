@@ -115,6 +115,21 @@ exit 7
 	if err == nil {
 		t.Fatal("startHarness succeeded against a harness that never read its prompt")
 	}
+	// The premise: the sleep led its own process group, so the group kill
+	// could not reach it and only the bound ended the reap. Without this, a
+	// shell whose background jobs stayed in the stub's group would let the
+	// test pass with the bound removed.
+	raw, rerr := os.ReadFile(pidFile)
+	if rerr != nil {
+		t.Fatalf("escaped child pid: %v", rerr)
+	}
+	pid, perr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if perr != nil {
+		t.Fatalf("escaped child pid %q: %v", raw, perr)
+	}
+	if pgid, gerr := syscall.Getpgid(pid); gerr != nil || pgid != pid {
+		t.Fatalf("background sleep %d is not its own process group leader (pgid %d, err %v); the test proves nothing", pid, pgid, gerr)
+	}
 	msg := err.Error()
 	for _, want := range []string{
 		"write opening prompt: ",

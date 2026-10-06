@@ -116,7 +116,8 @@ type Config struct {
 	// activeDeadlineSeconds so the failure is ours to report, not the
 	// enforcer's.
 	TaskDeadline time.Duration
-	// KillGrace is SIGTERM-to-SIGKILL escalation time.
+	// KillGrace is SIGTERM-to-SIGKILL escalation time. It also bounds how
+	// long a failed start waits for the killed harness's stderr to close.
 	KillGrace time.Duration
 
 	Logger *slog.Logger
