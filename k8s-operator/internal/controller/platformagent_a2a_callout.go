@@ -161,10 +161,18 @@ const (
 	// What it can hold, stated rather than implied: the eviction of the one
 	// READY callout while the other is not ready (Pending, pulling, or not
 	// yet attached). That is the last authorizer on the bus, and refusing
-	// to take it is the point of the budget; the hold ends by itself when
-	// the second replica becomes Ready, with no edit to the budget needed.
-	// It never holds when both are unready (the eviction policy on
-	// buildA2ACalloutPDB), and never because the replica count changed.
+	// to take it is the point of the budget. The hold ends when the second
+	// replica becomes Ready, with no edit to the budget, which needs a node
+	// other than the one draining to put it on. Where there is none — a
+	// single-node install, or a cluster whose only other schedulable node
+	// is cordoned — the replacement stays Pending and a drain that honours
+	// budgets waits until the node is uncordoned or the drain overrides the
+	// budget (kubectl drain --disable-eviction; a managed node upgrade after
+	// its own budget timeout). Without the budget that drain would finish
+	// and take the bus's last authorizer with it; the verifier's budget
+	// behaves the same way on the same clusters. It never holds when both
+	// replicas are unready (the eviction policy on buildA2ACalloutPDB), and
+	// never because the replica count changed.
 	a2aCalloutPDBMaxUnavailable = 1
 
 	// The spread, on the verifier's terms (a2aVerifierSpreadTopologyKey has
