@@ -34,7 +34,6 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "hack" / "rollback-roundtrip.sh"
 _CI_EVAL = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
-_CI_ENV = _REPO_ROOT / "hack" / "ci-env.sh"
 _OPERATOR = _REPO_ROOT / "k8s-operator"
 _A2A_MANIFESTS = _OPERATOR / "internal" / "controller" / "platformagent_a2a_manifests.go"
 _CONTROLLER = _OPERATOR / "internal" / "controller" / "platformagent_controller.go"
@@ -79,6 +78,7 @@ _FAST_ENV = {
 _PASSING_ORDER = [
     "pre.mode-next",
     "pre.ready",
+    "pre.degraded-baseline",
     "pre.nats-ready",
     "pre.callout-serving",
     "pre.gateway-serving",
@@ -101,11 +101,11 @@ _PASSING_ORDER = [
     "leg1.today-turn",
     "leg2.mode-next.patched",
     "leg2.mode-next.reconciled",
-    "leg2.mode-next.agent-rolled",
-    "leg2.mode-next.ready",
     "leg2.nats-ready",
     "leg2.callout-serving",
     "leg2.provisioned",
+    "leg2.mode-next.agent-rolled",
+    "leg2.mode-next.ready",
     "leg2.pvc-kept",
     "leg2.nats-on-kept-pvc",
     "leg2.creds-kept",
@@ -172,6 +172,11 @@ FAKE_KUBECTL = textwrap.dedent(
         if p and s["tick"] >= p["at"]:
             s["pending"] = None
             reconcile(s, p)
+        d = s.get("provision_done_at")
+        if d is not None and time.time() >= d:
+            s["provision_done_at"] = None
+            s["jobs"][-1]["status"]["conditions"] = [{"type": "Complete", "status": "True"}]
+            set_ready(s)
         u = s.get("unschedulable_until")
         if u is not None and s["tick"] >= u:
             s["unschedulable_until"] = None
@@ -183,9 +188,11 @@ FAKE_KUBECTL = textwrap.dedent(
             {"type": "Ready", "status": status, "reason": reason, "message": "m",
              "observedGeneration": cr["metadata"]["generation"]}]}
         # Once armed, every later status write carries it, as the operator's
-        # would for a cause that has not gone away.
-        if s.get("degraded_armed"):
-            cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": "RBACIncomplete", "message": "m"})
+        # would for a cause that has not gone away; so does one the install
+        # had before the run (degraded_baseline), until something replaces it.
+        reason = "RBACIncomplete" if s.get("degraded_armed") else s["scenario"].get("degraded_baseline")
+        if reason:
+            cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": reason, "message": "m"})
 
     def reconcile(s, p):
         sc, cr, o = s["scenario"], s["cr"], s["objects"]
@@ -242,6 +249,13 @@ FAKE_KUBECTL = textwrap.dedent(
             return
         if sc.get("degraded_on") == leg and p["kind"] == "mode":
             s["degraded_armed"] = True
+        if sc.get("provision_seconds") and leg == "next" and p["kind"] == "mode":
+            # The Job runs for a while, and under next the operator does not
+            # report Ready until it is done (readSplitWorkloads).
+            s["jobs"][-1]["status"]["conditions"] = []
+            set_ready(s, phase="Provisioning", reason="Provisioning", status="False")
+            s["provision_done_at"] = time.time() + sc["provision_seconds"]
+            return
         set_ready(s)
 
     PVC = "data-platform-agent-a2a-nats-0"
@@ -411,6 +425,8 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
         "spec": spec,
         "status": {"phase": "Ready", "conditions": [{"type": "Ready", "status": "True", "reason": "Reconciled", "message": "m", "observedGeneration": 4}]},
     }
+    if scenario.get("degraded_baseline"):
+        cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": scenario["degraded_baseline"], "message": "m"})
     pods = [
         {"metadata": {"name": "platform-agent-gateway-abc", "labels": {}}, "status": {"phase": "Running", "containerStatuses": [{"name": "platform-agent", "state": {"running": {}}}]}},
         {"metadata": {"name": "platform-agent-a2a-nats-0", "labels": {"app.kubernetes.io/part-of": "a2a-next"}}, "status": {"phase": "Running"}},
@@ -632,6 +648,32 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("PodUnschedulable", result.stdout)
 
+    def test_provisioning_slower_than_the_ready_bound_gets_the_bus_up_budget(self) -> None:
+        # Under next the CR is not Ready until the provisioning Job is done.
+        # The flip forward waits for the Job before Ready, under the bring-up's
+        # shared BUS_UP_TIMEOUT, so a run longer than READY_TIMEOUT but inside
+        # that budget passes.
+        result, _, _ = self.run_sim(healthy_next_state(provision_seconds=4), ROLLBACK_READY_TIMEOUT="2", ROLLBACK_BUS_UP_TIMEOUT="30")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(passed(result), _PASSING_ORDER)
+
+    def test_a_degraded_that_predates_the_run_is_carried_not_blamed(self) -> None:
+        # MinterPruningHeld: Degraded=True beside phase Ready, from before the
+        # round trip started. Both legs carry it, and the run passes.
+        result, _, sim = self.run_sim(healthy_next_state(degraded_baseline="MinterPruningHeld"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(passed(result), _PASSING_ORDER)
+        self.assertIn("PASS pre.degraded-baseline: Degraded=True/MinterPruningHeld before the flip", result.stdout)
+        for leg in ("leg1", "leg2"):
+            line = next(x for x in result.stdout.splitlines() if x.startswith(f"PASS {leg}.not-degraded:"))
+            self.assertIn("Degraded=True/MinterPruningHeld is the one the install carried before the flip", line)
+        self.assertIn("PASS pre.degraded-baseline: Degraded=True/MinterPruningHeld", sim.results.read_text())
+
+    def test_a_clean_baseline_is_reported_too(self) -> None:
+        result, _, _ = self.run_sim(healthy_next_state())
+        self.assertIn("PASS pre.degraded-baseline: no Degraded condition set before the flip", result.stdout)
+        self.assertRegex(result.stdout, r"PASS leg1\.not-degraded: .*\(baseline: none\)")
+
 
 def free_port() -> int:
     import socket
@@ -745,10 +787,26 @@ class FailureTest(RoundTripTest):
     def test_degraded_after_the_flip_to_today(self) -> None:
         result, _, _ = self.run_sim(healthy_next_state(degraded_on="today"))
         self.assert_fails_at(result, "leg1.not-degraded", "Degraded=True/RBACIncomplete")
+        self.assert_fails_at(result, "leg1.not-degraded", "(baseline: none)")
 
     def test_degraded_after_the_flip_back(self) -> None:
         result, _, _ = self.run_sim(healthy_next_state(degraded_on="next"))
         self.assert_fails_at(result, "leg2.not-degraded", "Degraded=True/RBACIncomplete")
+
+    def test_a_new_degraded_on_an_install_that_already_carried_one(self) -> None:
+        # The baseline is MinterPruningHeld; the flip replaces it with another
+        # reason. That is new, and the line says what the baseline was.
+        result, _, _ = self.run_sim(healthy_next_state(degraded_baseline="MinterPruningHeld", degraded_on="today"))
+        self.assert_fails_at(result, "leg1.not-degraded", "a Degraded condition new since the flip")
+        self.assert_fails_at(result, "leg1.not-degraded", "Degraded=True/RBACIncomplete")
+        self.assert_fails_at(result, "leg1.not-degraded", "(baseline Degraded=True/MinterPruningHeld)")
+
+    def test_a_bring_up_past_its_budget_fails_at_the_slow_gate(self) -> None:
+        # The five bring-up waits share one deadline: a Job that outlasts it
+        # fails as the Job, and the run never gets to wait on Ready on top.
+        result, _, _ = self.run_sim(healthy_next_state(provision_seconds=60), ROLLBACK_BUS_UP_TIMEOUT="3")
+        self.assert_fails_at(result, "leg2.provisioned", "the provisioning Jobs did not settle within")
+        self.assertNotIn("leg2.mode-next.agent-rolled", result.stdout)
 
     def test_never_ready_under_today_times_out_at_its_bound(self) -> None:
         started = time.monotonic()
@@ -816,6 +874,113 @@ class FailureTest(RoundTripTest):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("FAIL leg1.interrupted:", out)
         self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted")
+
+
+_NATS = "platform-agent-a2a-nats"
+
+
+def bridge_with(env: list | None = None, env_from: list | None = None, name: str = "hermes-bridge") -> dict:
+    sidecar: dict = {"name": name, "image": "bridge:dev"}
+    if env is not None:
+        sidecar["env"] = env
+    if env_from is not None:
+        sidecar["envFrom"] = env_from
+    return sidecar
+
+
+def url(value: str) -> list:
+    return [{"name": "NATS_URL", "value": value}]
+
+
+class SidecarClassificationTest(unittest.TestCase):
+    """PY_SIDECARS, lifted from the script and run on one sidecar at a time."""
+
+    def classify(self, sidecar: dict, configmaps: dict | None = None) -> bool:
+        src = _SCRIPT.read_text()
+        code = re.search(r"^readonly PY_SIDECARS='\n(.*?)^'$", src, re.DOTALL | re.MULTILINE).group(1)
+        with tempfile.TemporaryDirectory() as cm_dir:
+            for cm_name, data in (configmaps or {}).items():
+                pathlib.Path(cm_dir, f"{cm_name}.json").write_text("" if data is None else json.dumps({"data": data}))
+            cr = {"spec": {"deployment": {"sidecars": [sidecar]}}}
+            out = subprocess.run(["python3", "-c", code, _CREDS, _NATS, _NS, cm_dir], input=json.dumps(cr), capture_output=True, text=True, check=True).stdout
+        bus, keep = out.split("\n")[:2]
+        self.assertEqual(bool(bus), not json.loads(keep))
+        return bool(bus)
+
+    def test_every_form_of_the_service_host_is_on_the_bus(self) -> None:
+        for value in (
+            f"nats://{_NATS}:4222",
+            f"nats://{_NATS}",
+            f"nats://{_NATS}.{_NS}:4222",
+            f"nats://{_NATS}.{_NS}.svc:4222",
+            f"nats://{_NATS}.{_NS}.svc.cluster.local:4222",
+            f"nats://{_NATS}.{_NS}.svc.cluster.local.:4222",
+            f"nats://bridge:pw@{_NATS}:4222",
+            f"nats://elsewhere:4222,nats://{_NATS}:4222",
+            f"{_NATS}:4222",
+            f"tls://{_NATS}.{_NS}.svc/",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self.classify(bridge_with(env=url(value))))
+
+    def test_names_that_only_contain_the_service_name_are_not(self) -> None:
+        for value in (
+            f"nats://{_NATS}-other:4222",
+            f"nats://other-{_NATS}:4222",
+            f"nats://{_NATS}.other-ns.svc:4222",
+            _CREDS,
+            "nats://elsewhere:4222",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self.classify(bridge_with(env=url(value))))
+
+    def test_a_reference_to_the_creds_secret_through_env_or_env_from(self) -> None:
+        self.assertTrue(self.classify(bridge_with(env=[{"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": _CREDS, "key": "bridge-password"}}}])))
+        self.assertTrue(self.classify(bridge_with(env_from=[{"secretRef": {"name": _CREDS}}])))
+        self.assertTrue(self.classify(bridge_with(env_from=[{"prefix": "BUS_", "secretRef": {"name": _CREDS}}])))
+        self.assertFalse(self.classify(bridge_with(env_from=[{"secretRef": {"name": "some-other-secret"}}])))
+
+    def test_a_url_from_a_configmap_through_env_or_env_from(self) -> None:
+        cms = {"bridge-env": {"NATS_URL": f"nats://{_NATS}:4222", "OTHER": "x"}, "plain": {"X": "y"}, "gone": None}
+        self.assertTrue(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]), cms))
+        self.assertTrue(self.classify(bridge_with(env=[{"name": "NATS_URL", "valueFrom": {"configMapKeyRef": {"name": "bridge-env", "key": "NATS_URL"}}}]), cms))
+        self.assertFalse(self.classify(bridge_with(env=[{"name": "O", "valueFrom": {"configMapKeyRef": {"name": "bridge-env", "key": "OTHER"}}}]), cms))
+        self.assertFalse(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "plain"}}]), cms))
+        self.assertFalse(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "gone"}}]), cms))
+        self.assertFalse(self.classify(bridge_with(env_from=[{"configMapRef": {"name": "never-fetched"}}]), cms))
+
+
+class SidecarRoundTripTest(RoundTripTest):
+    """The same forms end to end: the script fetches the ConfigMaps a sidecar
+    reads and unsets the sidecar before the flip."""
+
+    def assert_unset_and_restored(self, sidecar: dict, **objects: dict) -> None:
+        state = healthy_next_state(sidecars=[_OTHER_SIDECAR, sidecar])
+        state["objects"].update(objects)
+        result, after, _ = self.run_sim(state)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS leg1.bus-sidecar-unset.patched", result.stdout)
+        self.assertEqual(after["patches"][0], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR]}}})
+        self.assertEqual(after["patches"][-1], {"spec": {"deployment": {"sidecars": [_OTHER_SIDECAR, sidecar]}}})
+
+    def test_a_short_name_url(self) -> None:
+        self.assert_unset_and_restored(bridge_with(env=url(f"nats://{_NATS}:4222")))
+
+    def test_creds_through_env_from(self) -> None:
+        self.assert_unset_and_restored(bridge_with(env_from=[{"secretRef": {"name": _CREDS}}]))
+
+    def test_a_url_in_a_configmap_read_through_env_from(self) -> None:
+        self.assert_unset_and_restored(
+            bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]),
+            **{"configmap/bridge-env": {"uid": "cm", "data": {"NATS_URL": f"nats://{_NATS}.{_NS}.svc.cluster.local:4222"}}},
+        )
+
+    def test_a_configmap_that_does_not_exist_is_not_the_bus(self) -> None:
+        state = healthy_next_state(sidecars=[bridge_with(env_from=[{"configMapRef": {"name": "missing"}}])])
+        result, after, _ = self.run_sim(state)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SKIP leg1.bus-sidecar-unset:", result.stdout)
+        self.assertEqual(after["patches"][0], {"spec": {"mode": "today"}})
 
 
 class NamesMatchTheOperatorTest(unittest.TestCase):
@@ -1058,29 +1223,6 @@ class CiEvalWiringTest(unittest.TestCase):
         name = re.search(r'readonly EVAL_ROLLBACK_SCRIPT="([^"]+)"', ci_eval_constants()).group(1)
         self.assertEqual(_CI_EVAL.parent / name, _SCRIPT)
         self.assertTrue(os.access(_SCRIPT, os.X_OK))
-
-
-class GatewayLogOnceTest(unittest.TestCase):
-    def test_the_second_capture_does_not_overwrite_the_first(self) -> None:
-        match = re.search(r"^GATEWAY_LOG_COLLECTED=\"\"\ncollect_gateway_log\(\) \{\n.*?^\}$", _CI_ENV.read_text(), re.DOTALL | re.MULTILINE)
-        self.assertIsNotNone(match)
-        with tempfile.TemporaryDirectory() as tmp:
-            script = textwrap.dedent(
-                f"""\
-                set -euo pipefail
-                GATEWAY_LOG_TAIL_LINES=10
-                GATEWAY_LOG_MAX_BYTES=1000
-                ARTIFACTS={tmp}
-                kubectl() {{ echo x >> {tmp}/calls; echo "capture $(wc -l < {tmp}/calls | tr -d ' ')"; }}
-                {match.group(0)}
-                collect_gateway_log
-                collect_gateway_log
-                cat {tmp}/platform-agent-gateway.log
-                """
-            )
-            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "capture 1")
 
 
 if __name__ == "__main__":

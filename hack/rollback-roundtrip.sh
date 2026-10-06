@@ -131,13 +131,17 @@ readonly DEFAULT_PRE_READY_TIMEOUT=300
 # reconciled it. Then the rollout of that generation finishing.
 readonly DEFAULT_GENERATION_TIMEOUT=300
 readonly DEFAULT_ROLLOUT_TIMEOUT=600
-# The CR reporting Ready at the patched generation.
+# The CR reporting Ready at the patched generation, for every patch but the
+# flip forward (which shares BUS_UP_TIMEOUT below).
 readonly DEFAULT_READY_TIMEOUT=900
 # The flip to today's teardown reaching its end (the NATS StatefulSet, which
 # cleanupA2A deletes last).
 readonly DEFAULT_TEARDOWN_TIMEOUT=300
-# The bus back after the flip forward: the StatefulSet, the callout, the
-# provisioning Job (the deploy's MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS).
+# The bus back after the flip forward, one deadline for all of it: the
+# StatefulSet, the callout, the provisioning Job, the agent's rollout and the
+# CR's Ready (the deploy's MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS; leg 2
+# below has the arithmetic). Also the bound on the re-run after the bridge is
+# declared again.
 readonly DEFAULT_BUS_UP_TIMEOUT=1500
 # The bridge logging that it consumes, after its pod rolled.
 readonly DEFAULT_BRIDGE_TIMEOUT=300
@@ -591,13 +595,47 @@ assert_same_uid() {
   pass "${name}" "${kind}/${object} kept, uid ${uid}"
 }
 
+# The Degraded condition the install carried before anything was changed:
+# its reason when Degraded=True, empty otherwise. The operator sets
+# Degraded=True beside phase Ready for causes that are not the workload's
+# (MinterPruningHeld; RBACIncomplete it preserves), so a healthy next install
+# can start with one, and the flip is not what put it there.
+PRE_DEGRADED_REASON=""
+record_degraded_baseline() {
+  local name="$1"
+  read_cr_state || fail "${name}" "the CR could not be read"
+  if [ "${CR_DEGRADED}" = "${CR_CONDITION_TRUE}" ]; then
+    PRE_DEGRADED_REASON="${CR_DEGRADED_REASON:-unspecified}"
+    pass "${name}" "Degraded=True/${PRE_DEGRADED_REASON} before the flip; the not-degraded checks fail only on a Degraded that is new or changed from this"
+  else
+    pass "${name}" "no Degraded condition set before the flip"
+  fi
+}
+
+degraded_baseline_summary() {
+  if [ -n "${PRE_DEGRADED_REASON}" ]; then
+    echo "baseline Degraded=True/${PRE_DEGRADED_REASON}"
+  else
+    echo "baseline: none"
+  fi
+}
+
+# Fails on a Degraded phase, or on a Degraded condition the baseline did not
+# carry with the same reason.
 assert_not_degraded() {
   local name="$1"
   read_cr_state || fail "${name}" "the CR could not be read"
-  if [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ] || [ "${CR_DEGRADED}" = "${CR_CONDITION_TRUE}" ]; then
-    fail "${name}" "$(cr_state_summary)"
+  if [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ]; then
+    fail "${name}" "$(cr_state_summary) ($(degraded_baseline_summary))"
   fi
-  pass "${name}" "phase ${CR_PHASE}, no Degraded condition set"
+  if [ "${CR_DEGRADED}" = "${CR_CONDITION_TRUE}" ]; then
+    if [ "${CR_DEGRADED_REASON:-unspecified}" != "${PRE_DEGRADED_REASON}" ]; then
+      fail "${name}" "a Degraded condition new since the flip: $(cr_state_summary) ($(degraded_baseline_summary))"
+    fi
+    pass "${name}" "phase ${CR_PHASE}; Degraded=True/${CR_DEGRADED_REASON:-unspecified} is the one the install carried before the flip, not new"
+    return 0
+  fi
+  pass "${name}" "phase ${CR_PHASE}, no Degraded condition set ($(degraded_baseline_summary))"
 }
 
 # The NATS pod mounts the kept claim, by name, now that the bus is back.
@@ -609,19 +647,68 @@ assert_nats_on_claim() {
 }
 
 # ─── Sidecars ────────────────────────────────────────────────────────────────
-# Splits the CR's spec.deployment.sidecars into the ones that talk to the bus
-# (an env reference to the creds Secret, or a value naming the NATS Service)
-# and the rest. Prints the bus sidecars' names on the first line and the
-# sidecars to keep, as JSON, on the second.
-readonly PY_SIDECARS='
+# A sidecar is an ordinary corev1.Container (a2a/docs/hermes-bridge.md), so
+# one that talks to the bus can say so in any of the ways a container takes
+# env. It is on the bus when it
+#   - references the creds Secret: env[].valueFrom.secretKeyRef or
+#     envFrom[].secretRef; or
+#   - carries a value naming the NATS Service as a host: in env[].value, or in
+#     a ConfigMap it reads through env[].valueFrom.configMapKeyRef or
+#     envFrom[].configMapRef. The host is the Service's short name
+#     (<cr>-a2a-nats, which resolves in the namespace), its namespace-qualified
+#     name (<cr>-a2a-nats.<ns>), or the .svc and FQDN forms
+#     (<cr>-a2a-nats.<ns>.svc[.<cluster domain>][.]), after "//", "@" (a URL
+#     with credentials in it), "," (a server list) or nothing, and before ":",
+#     "/", ",", whitespace or the end.
+# Data only: a $(VAR) the kubelet would expand, or a URL held in some other
+# Secret, is not read.
+#
+# PY_SIDECAR_CONFIGMAPS prints the ConfigMaps the sidecars read, one per line;
+# PY_SIDECARS splits them, given a directory holding each of those ConfigMaps
+# as <name>.json (an empty file for one that does not exist), and prints the
+# bus sidecars' names on the first line and the sidecars to keep, as JSON, on
+# the second.
+readonly PY_SIDECAR_CONFIGMAPS='
 import json, sys
 cr = json.load(sys.stdin)
-creds, nats = sys.argv[1], sys.argv[2]
+names = set()
+for c in ((cr.get("spec") or {}).get("deployment") or {}).get("sidecars") or []:
+    for e in c.get("env") or []:
+        name = ((e.get("valueFrom") or {}).get("configMapKeyRef") or {}).get("name")
+        if name: names.add(name)
+    for f in c.get("envFrom") or []:
+        name = (f.get("configMapRef") or {}).get("name")
+        if name: names.add(name)
+print("\n".join(sorted(names)))
+'
+readonly PY_SIDECARS='
+import json, os, re, sys
+cr = json.load(sys.stdin)
+creds, nats, ns, cm_dir = sys.argv[1:5]
+host = re.compile(r"(?:^|[/@,\s])%s(?:\.%s(?:\.svc(?:\.[A-Za-z0-9-]+)*)?)?\.?(?=[:/,\s]|$)" % (re.escape(nats), re.escape(ns)))
+def configmap(name):
+    try:
+        with open(os.path.join(cm_dir, name + ".json")) as f:
+            raw = f.read().strip()
+    except OSError:
+        return {}
+    return (json.loads(raw).get("data") or {}) if raw else {}
+def names_bus(value):
+    return bool(host.search(value or ""))
 sidecars = ((cr.get("spec") or {}).get("deployment") or {}).get("sidecars") or []
 def on_bus(c):
     for e in c.get("env") or []:
-        ref = ((e.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name")
-        if ref == creds or "//%s." % nats in (e.get("value") or ""):
+        source = e.get("valueFrom") or {}
+        if (source.get("secretKeyRef") or {}).get("name") == creds or names_bus(e.get("value")):
+            return True
+        ref = source.get("configMapKeyRef") or {}
+        if ref.get("name") and names_bus(configmap(ref["name"]).get(ref.get("key", ""))):
+            return True
+    for f in c.get("envFrom") or []:
+        if (f.get("secretRef") or {}).get("name") == creds:
+            return True
+        ref = (f.get("configMapRef") or {}).get("name")
+        if ref and any(names_bus(v) for v in configmap(ref).values()):
             return True
     return False
 print(" ".join(c.get("name", "?") for c in sidecars if on_bus(c)))
@@ -781,15 +868,30 @@ wait_bridges_consuming() {
 }
 
 # Merge-patches the CR and waits for the operator to reconcile it: the agent
-# Deployment's generation moves, it rolls, and the CR reports Ready.
-patch_and_settle() {
+# Deployment's generation moves.
+patch_and_reconcile() {
   local leg="$1" what="$2" patch="$3" before
   before="$(agent_generation)" || fail "${leg}.${what}.patched" "deployment/${AGENT_DEPLOYMENT} could not be read"
   k patch platformagent "${CR_NAME}" --type merge -p "${patch}" >/dev/null || fail "${leg}.${what}.patched" "kubectl patch was refused"
   pass "${leg}.${what}.patched" "merge patch applied"
   wait_generation_past "${leg}.${what}.reconciled" "${before}" "${GENERATION_TIMEOUT}"
-  wait_rolled "${leg}.${what}.agent-rolled" deployment "${AGENT_DEPLOYMENT}" "${ROLLOUT_TIMEOUT}"
-  wait_cr_ready "${leg}.${what}.ready" "${READY_TIMEOUT}"
+}
+
+# patch_and_reconcile, then the agent rolls and the CR reports Ready. For a
+# patch whose Ready waits on nothing slower than the agent's own rollout:
+# not the flip forward, whose Ready waits on provisioning (leg 2 below).
+patch_and_settle() {
+  patch_and_reconcile "$@"
+  wait_rolled "$1.$2.agent-rolled" deployment "${AGENT_DEPLOYMENT}" "${ROLLOUT_TIMEOUT}"
+  wait_cr_ready "$1.$2.ready" "${READY_TIMEOUT}"
+}
+
+# What is left of the leg 2 bring-up's budget, never below zero (a wait given
+# zero reads once and fails if it is not there yet).
+BRINGUP_DEADLINE=0
+bringup_left() {
+  local left=$((BRINGUP_DEADLINE - SECONDS))
+  echo $((left > 0 ? left : 0))
 }
 
 # ─── The run ─────────────────────────────────────────────────────────────────
@@ -807,6 +909,7 @@ read_cr_state || fail "pre.cr-readable" "platformagent/${CR_NAME} could not be r
 [ "${CR_MODE}" = "${MODE_NEXT}" ] || fail "pre.mode-next" "spec.mode is ${CR_MODE}; the round trip starts from a next install"
 pass "pre.mode-next" "spec.mode is next"
 wait_cr_ready "pre.ready" "${PRE_READY_TIMEOUT}"
+record_degraded_baseline "pre.degraded-baseline"
 wait_rolled "pre.nats-ready" statefulset "${NATS_NAME}" "${PRE_READY_TIMEOUT}"
 wait_rolled "pre.callout-serving" deployment "${CALLOUT_NAME}" "${PRE_READY_TIMEOUT}"
 wait_rolled "pre.gateway-serving" deployment "${A2A_GATEWAY_NAME}" "${PRE_READY_TIMEOUT}"
@@ -820,7 +923,13 @@ assert_bus_task "pre.bus-task"
 # Leg 1: next -> today.
 CURRENT_LEG="leg1"
 CR_JSON="$(k_read get platformagent "${CR_NAME}" -o json)" || fail "leg1.cr-readable" "platformagent/${CR_NAME} could not be read"
-SIDECAR_SPLIT="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}")"
+CONFIGMAP_DIR="$(mktemp -d)"
+for configmap in $(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECAR_CONFIGMAPS}"); do
+  k_read get configmap "${configmap}" --ignore-not-found -o json >"${CONFIGMAP_DIR}/${configmap}.json" \
+    || fail "leg1.sidecars-classified" "configmap/${configmap}, which a sidecar takes env from, could not be read"
+done
+SIDECAR_SPLIT="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}" "${NAMESPACE}" "${CONFIGMAP_DIR}")"
+rm -rf "${CONFIGMAP_DIR}"
 BUS_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 1p)"
 KEEP_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 2p)"
 if [ -n "${BUS_SIDECARS}" ]; then
@@ -850,11 +959,39 @@ assert_today_turn "leg1.today-turn"
 
 # Leg 2: today -> next, on the kept objects.
 CURRENT_LEG="leg2"
-patch_and_settle "leg2" "mode-next" "{\"spec\":{\"mode\":\"${MODE_NEXT}\"}}"
-wait_rolled "leg2.nats-ready" statefulset "${NATS_NAME}" "${BUS_UP_TIMEOUT}"
-wait_rolled "leg2.callout-serving" deployment "${CALLOUT_NAME}" "${BUS_UP_TIMEOUT}"
+# The bring-up, in the deploy's order (hack/ci-deploy.sh, the mode patch):
+# NATS, the callout, the provisioning Job, then the agent and the CR's Ready.
+# Under next the operator reports Ready only once every split workload is,
+# the Job included (readSplitWorkloads), and leg 1's flip dropped the
+# BusProvisioned record that would otherwise stand in for it, so Ready here
+# waits on a full provisioning run. Waiting on Ready first, under its own
+# READY_TIMEOUT, would cut that run short of the budget it has; so the five
+# waits share one deadline, BUS_UP_TIMEOUT from the reconcile, each getting
+# what the ones before it left, and the slow one fails under its own name.
+#
+# The arithmetic, at the defaults: patch to Ready is at most
+# GENERATION_TIMEOUT + BUS_UP_TIMEOUT = 300 + 1500 = 1800s, whatever the
+# split between the five. That leaves 1800s of the 3600s ci-eval-pr.sh gives
+# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1 and the rest of
+# leg 2, which take minutes on a healthy install; a run that needs more is
+# stopped there and reports itself interrupted at the leg it was in. The
+# job-level sum is unchanged: start by 12600s, 3600s plus a 60s kill grace,
+# and about 2700s of deploy in front, 18960s inside the 21600s deadline. The
+# deploy gives the Job its 1500s (MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS,
+# which its comment says covers the wait for the callout too) after its NATS
+# gate; here NATS comes out of the same 1500s, one StatefulSet pod binding a
+# claim that already exists. The 19.5-minute run that comment records
+# predates the operator holding the Job until a callout serves (#1702), and
+# would still fit.
+patch_and_reconcile "leg2" "mode-next" "{\"spec\":{\"mode\":\"${MODE_NEXT}\"}}"
+BRINGUP_DEADLINE=$((SECONDS + BUS_UP_TIMEOUT))
+note "leg 2 bring-up: NATS, callout, provisioning, agent rollout and Ready share ${BUS_UP_TIMEOUT}s"
+wait_rolled "leg2.nats-ready" statefulset "${NATS_NAME}" "$(bringup_left)"
+wait_rolled "leg2.callout-serving" deployment "${CALLOUT_NAME}" "$(bringup_left)"
 # Any provisioning Job now is this leg's: leg1.nothing-stuck saw none left.
-wait_provision_complete "leg2.provisioned" "${BUS_UP_TIMEOUT}"
+wait_provision_complete "leg2.provisioned" "$(bringup_left)"
+wait_rolled "leg2.mode-next.agent-rolled" deployment "${AGENT_DEPLOYMENT}" "$(bringup_left)"
+wait_cr_ready "leg2.mode-next.ready" "$(bringup_left)"
 assert_same_uid "leg2.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
 assert_nats_on_claim "leg2.nats-on-kept-pvc"
 assert_same_uid "leg2.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"

@@ -170,9 +170,11 @@ collect_bench_results() {
 # Once per process, like collect_agent_pod_diagnostics: ci-eval-pr.sh takes it
 # before the next lane's rollback round trip replaces the pod, and the EXIT
 # trap's call after that must not overwrite the eval's log with the new pod's.
+# Read with a default, so the function alone, without this assignment, still
+# runs under `set -u` (the test suites lift it that way).
 GATEWAY_LOG_COLLECTED=""
 collect_gateway_log() {
-  [ -z "${GATEWAY_LOG_COLLECTED}" ] || return 0
+  [ -z "${GATEWAY_LOG_COLLECTED:-}" ] || return 0
   GATEWAY_LOG_COLLECTED=1
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
