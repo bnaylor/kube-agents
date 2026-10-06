@@ -1287,10 +1287,20 @@ wait_agent_generation_past() {
   echo "Agent Deployment generation ${before} -> ${after} at $((SECONDS - MODE_NEXT_START))s after ${what}"
 }
 
-# The CR's Ready condition as "<reason>: <message>", or nothing when the CR
-# carries none, for the two readers below and the artifact log.
+# The CR's phase, a tab, then its Ready condition as "<reason>: <message>"
+# (nothing for either the CR does not carry), in one read. The operator writes
+# the phase and the condition in one status update, so a reader that needs
+# both takes them from this one read, never from two that can straddle that
+# update and pair a stale phase with a fresh condition.
+cr_phase_and_ready_condition() {
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.reason}{": "}{.message}{end}' 2>/dev/null || true
+}
+
+# The CR's Ready condition alone, for the reader below that needs only that.
 cr_ready_condition() {
-  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.reason}{": "}{.message}{end}' 2>/dev/null || true
+  local pair
+  pair="$(cr_phase_and_ready_condition)"
+  printf '%s' "${pair#*$'\t'}"
 }
 
 # Waits for the A2A provisioning Job to reach a terminal condition and stops
@@ -1397,9 +1407,10 @@ wait_provision_job() {
   fi
 }
 
-# Reads the CR's phase and Ready condition after a provisioning Job completed
-# and stops the deploy on a refusal the Job's own conditions did not show:
-# phase Degraded, or Ready carrying the reason a refused provision is given.
+# Reads the CR's phase and Ready condition, in one read, after a provisioning
+# Job completed and stops the deploy on a refusal the Job's own conditions did
+# not show: phase Degraded, or Ready carrying the reason a refused provision is
+# given.
 # A refusal is already written when the Job is done, not a lag, so it fails
 # on the first read, and so does every other Degraded but one: a pod waiting
 # for CPU or memory (CR_READY_REASON_POD_UNSCHEDULABLE with a count matching
@@ -1409,10 +1420,12 @@ wait_provision_job() {
 # still there at the end or turns into something else. Prints the condition
 # either way, so the artifact says what the CR said.
 gate_cr_not_degraded() {
-  local what="$1" phase condition rereads=0 gate_start=$SECONDS
+  local what="$1" pair phase condition rereads=0 gate_start=$SECONDS
   while :; do
-    phase="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    condition="$(cr_ready_condition)"
+    # One read, so the phase and the condition are one object version's.
+    pair="$(cr_phase_and_ready_condition)"
+    phase="${pair%%$'\t'*}"
+    condition="${pair#*$'\t'}"
     if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
       break
     fi

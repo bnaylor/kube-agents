@@ -866,27 +866,34 @@ def run_provision_wait(
     seconds and a one-second poll; the Degraded gate's re-reads poll at zero
     seconds, on a window of `unschedulable_attempts`.
 
-    `phase` and `ready` may each be a list, one entry per read of the CR's
-    phase: the Nth phase read answers the Nth phase, the Ready read after it
-    the Nth condition, and reads past the end repeat the last entry. The
-    output counts the phase reads (READS=) on both the pass and the fail
-    line, so a test can tell one read from a wait."""
+    `phase` and `ready` may each be a list, one entry per version of the
+    CR's status: every read of the CR's status (phase, Ready condition, or
+    both in one jsonpath) is answered from the next version, as if the
+    operator wrote a new status between any two reads, and reads past the
+    end repeat the last entry. So a read of both answers the Nth phase and
+    the Nth condition together, and two separate reads straddle versions,
+    the way a status update landing between two GETs would. The output
+    counts the status reads (READS=) on both the pass and the fail line, so
+    a test can tell one read from a wait."""
     consts = constants()
     phases = phase if isinstance(phase, list) else [phase]
     readies = ready if isinstance(ready, list) else [ready]
     stub = (
-        'kubectl() { case "$*" in '
+        'kubectl() { local v; case "$*" in '
         '*"get jobs"*) printf "%s" "${JOBS_STUB}" ;; '
         '*observedGeneration*) printf "%s" "${OBSERVED_STUB}" ;; '
-        "*'type==\"Ready\"'*) stub_nth \"$(($(<\"${READS_FILE}\") - 1))\" \"${READY_STUB[@]}\" ;; "
-        '*status.phase*) echo $(($(<"${READS_FILE}") + 1)) >"${READS_FILE}"; stub_nth "$(($(<"${READS_FILE}") - 1))" "${PHASE_STUB[@]}" ;; '
+        "*status.phase*'type==\"Ready\"'*) v=\"$(stub_version)\"; "
+        'printf "%s\t%s" "$(stub_nth "${v}" "${PHASE_STUB[@]}")" "$(stub_nth "${v}" "${READY_STUB[@]}")" ;; '
+        "*'type==\"Ready\"'*) v=\"$(stub_version)\"; stub_nth \"${v}\" \"${READY_STUB[@]}\" ;; "
+        '*status.phase*) v="$(stub_version)"; stub_nth "${v}" "${PHASE_STUB[@]}" ;; '
         '*) echo "kubectl $*" ;; esac; }'
     )
-    # The Nth (from zero) of the entries after N, or the last past the end; a
-    # negative N (a Ready read before any phase read) is the first.
+    # The status version this read sees (from zero), counting the read.
+    stub_version = 'stub_version() { local n; n="$(<"${READS_FILE}")"; echo $((n + 1)) >"${READS_FILE}"; echo "${n}"; }'
+    # The Nth (from zero) of the entries after N, or the last past the end.
     stub_nth = (
         'stub_nth() { local n="$1"; shift; '
-        'if [ "${n}" -lt 0 ]; then n=0; fi; if [ "${n}" -ge "$#" ]; then n=$(($# - 1)); fi; '
+        'if [ "${n}" -ge "$#" ]; then n=$(($# - 1)); fi; '
         'shift "${n}"; printf "%s" "$1"; }'
     )
     return run_bash(
@@ -913,6 +920,7 @@ def run_provision_wait(
                 f'CR_READY_REASON_POD_UNSCHEDULABLE="{consts["CR_READY_REASON_POD_UNSCHEDULABLE"]}"',
                 f"SCHEDULER_CAPACITY_SHORTFALL_RE={shlex.quote(consts['SCHEDULER_CAPACITY_SHORTFALL_RE'])}",
                 "MODE_NEXT_START=0",
+                stub_version,
                 stub_nth,
                 stub,
                 # The gate's re-reads sleep MODE_NEXT_POLL_SECONDS; zero here,
@@ -920,6 +928,7 @@ def run_provision_wait(
                 # clock and keeps its one-second poll.
                 'gate_cr_not_degraded_fast() { MODE_NEXT_POLL_SECONDS=0 gate_cr_not_degraded "$@"; }',
                 'dump_mode_next_state() { echo "DUMPED ELAPSED=${SECONDS} READS=$(<"${READS_FILE}")"; }',
+                shell_function("cr_phase_and_ready_condition"),
                 shell_function("cr_ready_condition"),
                 shell_function("wait_provision_job"),
                 shell_function("gate_cr_not_degraded"),
@@ -1073,16 +1082,43 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("PASSED", result.stdout)
                 self.assertEqual(self._reads(result), 3)
-                # The artifact shows the transient and how long it took.
-                self.assertIn(
-                    f"platform-agent is Degraded after the sidecar patch on a pod waiting for CPU or memory, 0s in; re-read 1/5 in 0s (Ready condition: {ready})",
+                # The artifact shows the transient and how long it took. The
+                # seconds are $SECONDS deltas, which step on a wall-clock
+                # second boundary however little time passed, so any count
+                # is taken; the poll interval is the stub's zero.
+                self.assertRegex(
                     result.stdout,
+                    re.escape("platform-agent is Degraded after the sidecar patch on a pod waiting for CPU or memory, ")
+                    + r"\d+s"
+                    + re.escape(f" in; re-read 1/5 in 0s (Ready condition: {ready})"),
                 )
                 self.assertIn("re-read 2/5", result.stdout)
                 self.assertNotIn("re-read 3/5", result.stdout)
-                self.assertIn("✓ the wait for capacity cleared after 2 re-reads, 0s", result.stdout)
+                self.assertRegex(result.stdout, re.escape("✓ the wait for capacity cleared after 2 re-reads, ") + r"\d+s\n")
                 self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
                 self.assertNotIn("ERROR", result.stdout)
+
+    def test_the_phase_and_condition_come_from_one_read(self) -> None:
+        """The operator writes the phase and the Ready condition in one status
+        update, and the wait polls across exactly that update. The stub
+        answers each status read from the next version: here the first is
+        Degraded waiting for capacity, the second healthy. One read per poll
+        sees each version whole, waits once and passes. Two reads per poll
+        would pair the first version's Degraded with the second's
+        `Ready: all workloads ready` and fail on a contradiction."""
+        result = run_provision_wait(
+            jobs="",
+            call=self._GATE,
+            phase=["Degraded", "Ready"],
+            ready=[_WAITING_FOR_CAPACITY, _ALL_READY],
+            unschedulable_attempts=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._reads(result), 2)
+        self.assertIn(f"re-read 1/5 in 0s (Ready condition: {_WAITING_FOR_CAPACITY})", result.stdout)
+        self.assertNotIn("re-read 2/5", result.stdout)
+        self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+        self.assertNotIn("ERROR", result.stdout)
 
     def test_a_wait_for_capacity_that_outlasts_the_window_fails_as_before(self) -> None:
         result = run_provision_wait(jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, unschedulable_attempts=3)
