@@ -583,6 +583,48 @@ func TestFromEnvSlackAllowlist(t *testing.T) {
 	}
 }
 
+// TestFromEnvSlackTokensStripLikeTheBroker: the broker reads the same Secret
+// keys with Python's str.strip() (credential_proxy.py, SLACK_BOT_TOKEN and
+// SLACK_APP_TOKEN), so a value with a trailing newline (a Secret made with
+// --from-file, or an `echo` without -n) worked under `today`. The gateway
+// strips the same set and nothing else: the separators U+001C-U+001F that
+// Python counts as whitespace and Go's unicode.IsSpace does not, and no
+// comma handling (a list stays one token, which auth.test then refuses).
+func TestFromEnvSlackTokensStripLikeTheBroker(t *testing.T) {
+	for _, tc := range []struct {
+		name, bot, app, wantBot, wantApp string
+	}{
+		{"trailing newline", "xoxb-1\n", "xapp-1\n", "xoxb-1", "xapp-1"},
+		{"trailing space", "xoxb-1 ", "xapp-1 ", "xoxb-1", "xapp-1"},
+		{"surrounding mixed", " \txoxb-1\r\n", "\u00a0xapp-1\u3000", "xoxb-1", "xapp-1"},
+		{"python-only separators", "\x1cxoxb-1\x1f", "xapp-1\x1d\x1e", "xoxb-1", "xapp-1"},
+		{"inner text untouched", "xoxb-A, xoxb-B\n", "xapp-1", "xoxb-A, xoxb-B", "xapp-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			t.Setenv("SLACK_BOT_TOKEN", tc.bot)
+			t.Setenv("SLACK_APP_TOKEN", tc.app)
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SlackBotToken != tc.wantBot || cfg.SlackAppToken != tc.wantApp {
+				t.Fatalf("tokens = %q, %q; want %q, %q", cfg.SlackBotToken, cfg.SlackAppToken, tc.wantBot, tc.wantApp)
+			}
+		})
+	}
+	// A whitespace-only value strips to empty, as the broker's does, so it
+	// counts as unset: half a pair is refused rather than armed.
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", " \n")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "arm Slack together") {
+		t.Fatalf("whitespace-only app token: err = %v, want the half-pair refusal", err)
+	}
+}
+
 // TestFromEnvInjectDoorArmsOnItsOwn: the door alone is enough for the gateway
 // to start, which is what makes it the answer for an eval install (#1660) --
 // a gateway with no ingress at all crash-loops, so a `mode: next` install

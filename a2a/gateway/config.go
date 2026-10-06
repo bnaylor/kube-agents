@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -426,8 +427,8 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
-		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
-		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
+		SlackBotToken:    pyStrip(os.Getenv("SLACK_BOT_TOKEN")),
+		SlackAppToken:    pyStrip(os.Getenv("SLACK_APP_TOKEN")),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
@@ -650,6 +651,18 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
+}
+
+// pyStrip trims what Python's str.strip() trims and nothing more. The Slack
+// pair is the one credential the gateway shares with the broker, which reads
+// the same Secret keys with .strip() (credential_proxy.py); reading them the
+// same way keeps a value that worked under `today` (a trailing newline from
+// --from-file or an `echo` without -n) working under `next`. Python's
+// whitespace is Go's unicode.IsSpace plus the four separators U+001C-U+001F.
+func pyStrip(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
+	})
 }
 
 func envOr(key, def string) string {
