@@ -452,6 +452,34 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		}
 	})
 
+	// The gateway and its callout both taken away by hand: the callout is
+	// re-applied with no serving replica, so the next pass holds the gateway,
+	// and the fence goes with it.
+	t.Run("a held pass removes it", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconciler(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		for _, name := range []string{a2aGatewayName(agent), a2aCalloutName(agent)} {
+			if err := cl.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil || !state.gatewayHeld {
+			t.Fatalf("precondition: want a held pass (state=%+v err=%v)", state, err)
+		}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway is held and its fence %s survived the pass (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+	})
+
 	// The refusal path: reconcileAgentNetworkGuardrails reaches the fences
 	// and not the render, so a gateway that exists keeps its fence through a
 	// refused CR, and deleting it then does not stick.
