@@ -1100,6 +1100,17 @@ install goes back to `today`. Reading the Secret in the arm would catch it, at t
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
 CR-only arm was kept and the limitation documented instead (2026-10-06).
 
+Version skew double-consumes Slack, and this is where Slack differs from Chat. The arm uses
+Chat's rule, so an unrecognised `spec.mode` reads as `today` and the legacy consumer renders
+again: the broker's Socket Mode relay and the Hermes slack platform. The reconciler freezes
+the A2A objects on skew rather than touching them, and a Slack gateway holds the token pair
+in its own pod env, so the frozen gateway keeps its own Socket Mode connection beside the
+legacy one. Slack spreads the app's events across both, so messages are split between the
+two consumers and none are dropped, until the operator recognises the mode again. Chat's
+frozen gateway goes quiet instead, because it reaches Chat only through the broker's A2A
+relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
+behaviour documented (2026-10-06).
+
 **Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
 threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
 channel mention binds the session to the mention message's own ts as thread root, with

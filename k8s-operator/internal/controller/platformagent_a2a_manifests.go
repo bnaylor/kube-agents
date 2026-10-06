@@ -1145,7 +1145,9 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 // (a2a/gateway/config.go, FromEnv): when Chat is armed it holds the gateway,
 // as it holds it over the discord-bot Secret, and Slack stays on the legacy
 // consumer rather than reaching nobody. renderMode fails closed, so skew
-// reads as today here too.
+// reads as today here too. Unlike Chat, that double-consumes: the frozen
+// gateway holds the pair itself and stays connected beside the re-rendered
+// legacy relay. Accepted and documented in the spec (2026-10-06).
 //
 // The CR alone decides, by decision (2026-10-06): the token Secret is not
 // read, so a multi-workspace bot token (the broker's comma-separated list,
