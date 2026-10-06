@@ -210,14 +210,17 @@ func TestReasonToken(t *testing.T) {
 		"reason: spawn-failed":                  "spawn-failed",
 		"reason: spawn-failed - exec: boom":     "spawn-failed",
 		"reason: bus-publish-failed at working": "bus-publish-failed",
-		"reason: spawn-failed\nforged line":     "spawn-failed",
-		"reason: spawn-failed\tx":               "spawn-failed",
-		"reason: ":                              reasonTokenMalformed,
-		"reason:  leading-space":                reasonTokenMalformed,
-		"reason: bad\"quote":                    reasonTokenMalformed,
-		"reason: ünïcode":                       reasonTokenMalformed,
-		"reason: " + strings.Repeat("a", reasonTokenCap):   strings.Repeat("a", reasonTokenCap),
-		"reason: " + strings.Repeat("a", reasonTokenCap+1): reasonTokenMalformed,
+		// The worker adapter's no-text-parts refusal, written as the bridge
+		// writes it; it was prose once and logged as `no`.
+		"reason: no-text-parts - the submission message carries nothing to execute": "no-text-parts",
+		"reason: spawn-failed\nforged line":                                         "spawn-failed",
+		"reason: spawn-failed\tx":                                                   "spawn-failed",
+		"reason: ":                                                                  reasonTokenMalformed,
+		"reason:  leading-space":                                                    reasonTokenMalformed,
+		"reason: bad\"quote":                                                        reasonTokenMalformed,
+		"reason: ünïcode":                                                           reasonTokenMalformed,
+		"reason: " + strings.Repeat("a", reasonTokenCap):                            strings.Repeat("a", reasonTokenCap),
+		"reason: " + strings.Repeat("a", reasonTokenCap+1):                          reasonTokenMalformed,
 	}
 	for in, want := range cases {
 		if got := reasonToken(in); got != want {
