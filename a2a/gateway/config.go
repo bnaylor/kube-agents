@@ -679,8 +679,19 @@ func metricsPortFromEnv(cfg *Config) (int, error) {
 		if door.listen == "" {
 			continue
 		}
-		if _, doorPort, err := net.SplitHostPort(door.listen); err == nil && doorPort == strconv.Itoa(port) {
-			return 0, fmt.Errorf("%s %d is the port %s listens on; the metrics listener needs a port of its own", metricsPortEnv, port, door.name)
+		// Compared as the number net.Listen will bind, not as the string:
+		// net.LookupPort is the parse net.Listen runs on the port, so a
+		// zero-padded, signed or named spelling of this port is caught here
+		// rather than as a door that loses the bind to this listener. An
+		// address or port it cannot read is skipped, because the door's own
+		// net.Listen refuses it the same way when it binds; that failure is
+		// the door's, and not a collision with this listener.
+		_, doorPortRaw, err := net.SplitHostPort(door.listen)
+		if err != nil {
+			continue
+		}
+		if doorPort, err := net.LookupPort("tcp", doorPortRaw); err == nil && doorPort == port {
+			return 0, fmt.Errorf("%s %d is the port %s listens on (%q); the metrics listener needs a port of its own", metricsPortEnv, port, door.name, door.listen)
 		}
 	}
 	return port, nil

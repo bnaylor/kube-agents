@@ -329,7 +329,8 @@ func TestMetricsServerStopsWithItsContext(t *testing.T) {
 }
 
 // TestFromEnvReadsTheMetricsPort: unset is no listener, a port in range is
-// read, and junk, out-of-range values and a door's own port refuse the boot.
+// read, and junk, out-of-range values and a door's own port, in any spelling
+// net.Listen reads as that port, refuse the boot.
 func TestFromEnvReadsTheMetricsPort(t *testing.T) {
 	cases := []struct {
 		name, value, inject, door string
@@ -347,6 +348,18 @@ func TestFromEnvReadsTheMetricsPort(t *testing.T) {
 		{name: "the inject door's port", value: "8099", inject: "127.0.0.1:8099", refused: true},
 		{name: "the A2A door's port", value: "8098", door: "127.0.0.1:8098", refused: true},
 		{name: "beside both doors", value: "9096", inject: "127.0.0.1:8099", door: "127.0.0.1:8098", want: 9096},
+		// net.Listen reads a door's port the way net.LookupPort does, not as
+		// the literal string, so every spelling it binds to the metrics port
+		// is a collision. Each was admitted when the check compared strings.
+		{name: "the inject door's port zero-padded", value: "9096", inject: "127.0.0.1:09096", refused: true},
+		{name: "the inject door's port signed", value: "9096", inject: "127.0.0.1:+9096", refused: true},
+		{name: "the inject door's port signed and padded", value: "9096", inject: "127.0.0.1:+09096", refused: true},
+		{name: "the inject door's port after a space", value: "9096", inject: "127.0.0.1: 9096", refused: true},
+		{name: "the A2A door's port zero-padded", value: "8098", door: "127.0.0.1:008098", refused: true},
+		{name: "the A2A door's port as a service name", value: "80", door: "127.0.0.1:http", refused: true},
+		// A port net.Listen cannot read either is the door's own boot failure
+		// when it binds, not a collision with this listener.
+		{name: "beside a door port that cannot bind", value: "9096", inject: "127.0.0.1:-9096", want: 9096},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
