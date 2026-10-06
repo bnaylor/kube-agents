@@ -883,7 +883,8 @@ that treated the three alike is what this value exists to stop.
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
    port.
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
-   network**: ingress with no rules. It is a second control over the edge the bind already
+   network**: one ingress rule, which admits the managed-Prometheus collector's namespace to
+   the metrics-only port and nothing to the door (see "Metrics" below). It is a second control over the edge the bind already
    closes, kept so that a reader of the rendered objects sees the intent and so that a later
    change to the bind address does not open the pod network by itself. Neither it nor the bind
    governs the port-forward, which the kubelet serves from inside the pod's network namespace;
@@ -1357,8 +1358,8 @@ then it is a dev and eval door like the other.
 ## Metrics (added 10/6)
 
 The gateway serves Prometheus counters on a metrics-only listener, the credential broker's
-pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any other
-method 405), every interface rather than loopback because its caller is the managed-Prometheus
+pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any method
+but GET or HEAD 405), every interface rather than loopback because its caller is the managed-Prometheus
 collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
 value that is not a port, or is either door's port, refuses the boot. A port that will not bind
 costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
@@ -1370,7 +1371,9 @@ gateway's NetworkPolicy, rendered while either door is armed, admits one peer: t
 The doors' ports admit no pod. On an install with neither door armed no policy selects the gateway
 pod, and the metrics port is as reachable from the pod network as the rest of that pod.
 
-Every label value comes from a closed list, never from a task, a conversation or an executor's
+The site's [Observability page](../site/src/content/docs/concepts/observability.md) is
+canonical for what an operator reads off these series; this section is the design. Every label
+value comes from a closed list, never from a task, a conversation or an executor's
 text, so nothing a chat user or an executor sends can mint a series:
 
 | Metric                                               | Labels                                                                                                       | Counts                                                                                                                                                                                                          |
@@ -1385,7 +1388,7 @@ equals `gchat_pulls_total{outcome="events"}`; they are separate so the first kee
 pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
 and `events` flat; a refused relay shows `failed` rising.
 
-The terminal counter is the relay's, not every terminal a caller can see. Three routes deliver a
+The terminal counter is the relay's, not every terminal a caller can see. These routes deliver a
 terminal to the adapter without the relay and are not counted: the stale-task heal, which
 delivers the terminal the relay missed; the never-started heal (`gateway-never-started`); and a
 submission that never reached the bus (`gateway`). The executor's reason token is not a label.

@@ -213,8 +213,8 @@ func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsSer
 	return &MetricsServer{listen: fmt.Sprintf(":%d", port), metrics: metrics, log: log}, nil
 }
 
-// Run serves MetricsPath until ctx is done. Every other path is 404 and
-// every other method on it 405.
+// Run serves MetricsPath until ctx is done. Every other path is 404, and
+// every method on it but GET (and the HEAD the mux answers with it) 405.
 func (s *MetricsServer) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle(http.MethodGet+" "+MetricsPath, s.metrics.Handler())
