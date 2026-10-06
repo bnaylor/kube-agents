@@ -1624,7 +1624,10 @@ class KubeAgentsHarness(AgentHarness):
         """Send a planted card's wake and, for a question, the user's answer.
 
         The answer goes on the wake's conversation, or on a new one for a
-        ``session: fresh`` replay (:meth:`_execute_fresh_answer`).
+        ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
+        ``answer_by: click`` replay it is the click's turn the plant built. A
+        wake turn that replied still gets its answer, whatever errors it carried; only
+        one that errored with no reply (:func:`card_wake.no_reply`) ends the run.
 
         See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the
         plant fails: a script that never ran to completion is infrastructure,
@@ -1641,6 +1644,12 @@ class KubeAgentsHarness(AgentHarness):
             )
         try:
             planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
+        except card_wake.ReplayMismatch as exc:
+            # Not infrastructure: the image no longer retries as the case
+            # asserts, and an excluded run would leave the case silent. One
+            # such repetition is an absolute red at the gate (empty
+            # trajectory, null tokens); the error names the mismatch.
+            return AgentResult.errored(str(exc))
         except card_wake.ReplayUnavailable as exc:
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
@@ -1649,10 +1658,10 @@ class KubeAgentsHarness(AgentHarness):
         answer_turn = None
         try:
             wake_turn = self._execute(planted.wake, workspace_path)
-            if not wake_turn.errors and not failure and replay.fresh:
+            if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
-            elif not wake_turn.errors and not failure:
-                answer_turn = self._execute(replay.answer, workspace_path)
+            elif not card_wake.no_reply(wake_turn) and not failure:
+                answer_turn = self._execute(planted.answer(replay), workspace_path)
         finally:
             _PINNED_RUN_ID.reset(pinned)
             settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
@@ -1660,6 +1669,9 @@ class KubeAgentsHarness(AgentHarness):
                 _log.warning("card wake: card %s could not be read", planted.card)
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
+        # A failure wake has no answer turn, nor has a wake turn that errored;
+        # both are tagged, since an errored run is the one whose card and wake
+        # are wanted.
         if answer_turn is None:
             return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
         return card_wake.merge(planted, wake_turn, answer_turn, settled)
@@ -1671,7 +1683,7 @@ class KubeAgentsHarness(AgentHarness):
         wake_turn: AgentResult,
         workspace_path: Path | None,
     ) -> AgentResult:
-        """Send the typed answer on a new conversation that starts from the thread's context.
+        """Send the answer on a new conversation that starts from the thread's context.
 
         The wake reply joins the thread only when the gateway would post it.
         A context the image cannot format is infrastructure or an error, as
@@ -1682,7 +1694,7 @@ class KubeAgentsHarness(AgentHarness):
             reply = ""
         messages = card_wake.thread_messages(replay, planted, reply)
         try:
-            prompt = card_wake.fresh_answer(_agent_shell, messages, replay.answer, _EXEC_TIMEOUT)
+            prompt = card_wake.fresh_answer(_agent_shell, messages, planted.answer(replay), _EXEC_TIMEOUT)
         except card_wake.ReplayUnavailable as exc:
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
