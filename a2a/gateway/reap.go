@@ -324,8 +324,11 @@ func (g *Gateway) noticeNoFirstEvent(ctx context.Context, rec *SessionRecord) {
 	if active == nil || active.Detached || !active.NoFirstEventNoticeAt.IsZero() {
 		return
 	}
-	// The stream read happens before the lock, so a slow read never holds
-	// up a turn; everything it decided is re-checked on the fresh record.
+	// The first read is outside the lock, as a filter that keeps the scan
+	// from taking every overdue record's lock; it decides nothing on its
+	// own. Under the lock the fresh record and the stream are both read
+	// again, so a turn that moved the record on, or a first event that
+	// landed (and was relayed) between the two, stops the post.
 	if !g.firstEventOverdue(ctx, rec) {
 		return
 	}
@@ -335,7 +338,7 @@ func (g *Gateway) noticeNoFirstEvent(ctx context.Context, rec *SessionRecord) {
 	fresh, err := g.reg.Get(ctx, rec.Key)
 	if err != nil || fresh == nil || fresh.ActiveTask == nil ||
 		fresh.ActiveTask.TaskID != active.TaskID || fresh.ActiveTask.Detached ||
-		!fresh.ActiveTask.NoFirstEventNoticeAt.IsZero() {
+		!fresh.ActiveTask.NoFirstEventNoticeAt.IsZero() || !g.firstEventOverdue(ctx, fresh) {
 		return
 	}
 	fresh.ActiveTask.NoFirstEventNoticeAt = time.Now().UTC()

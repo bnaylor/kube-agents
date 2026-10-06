@@ -147,6 +147,21 @@ func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 	young := "discord:g1/thread-notice-young"
 	seedTasklessFixed(t, r, young, time.Minute)
 
+	// A task whose only event is on its supervisor subject is not empty
+	// (the fold reads both subjects): a spawn failure's terminal, say,
+	// before the relay has rendered it. Any message there counts, as it
+	// does for the replay.
+	supervised := "discord:g1/thread-notice-supervised"
+	rec2 := seedTasklessFixed(t, r, supervised, defaultFirstEventGrace+time.Minute)
+	rec2.ActiveTask.TaskID = "task-supervised"
+	rec2.Tasks = []TaskRef{{ID: "task-supervised", Addressee: "platform"}}
+	if err := r.g.reg.Put(ctx, rec2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.client.JetStream().Publish(ctx, lib.TaskSupervisorSubject("platform", "task-supervised"), []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+
 	r.g.reapOnce(ctx)
 	r.g.reapOnce(ctx)
 	if got := noticePosts(r.adapter, origin.TaskID); len(got) != 0 {
@@ -154,6 +169,9 @@ func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 	}
 	if got := noticePosts(r.adapter, "task-never"); len(got) != 0 {
 		t.Fatalf("a task inside the grace was noticed: %q", got)
+	}
+	if got := noticePosts(r.adapter, "task-supervised"); len(got) != 0 {
+		t.Fatalf("a task with an event on its supervisor subject was noticed: %q", got)
 	}
 }
 
@@ -265,6 +283,47 @@ func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
 	r.g.reapOnce(ctx)
 	if after := consumers(); after > before {
 		t.Fatalf("reap passes over %d started tasks past the grace opened consumers: %d before, %d after", conversations, before, after)
+	}
+}
+
+// TestSteerOpensNoConsumerOfItsOwn: the steer acknowledgement asks the stream
+// whether the task has a first event with direct gets. The turn's heal still
+// replays the task (one ephemeral consumer, as before this check existed);
+// the steer must not add a second.
+func TestSteerOpensNoConsumerOfItsOwn(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	conv := "discord:g1/thread-steer-budget"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "sb-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	if err := r.execFor(t, origin, "platform").PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := r.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumers := func() int {
+		info, err := stream.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.State.Consumers
+	}
+	before := consumers()
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "sb-2", Text: "actually only prod"}
+	waitFor(t, "steer ack", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "steering sent") {
+				return true
+			}
+		}
+		return false
+	})
+	if after := consumers(); after > before+1 {
+		t.Fatalf("a steer turn opened %d consumers; the heal's replay accounts for one", after-before)
 	}
 }
 
