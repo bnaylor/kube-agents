@@ -46,7 +46,7 @@ import (
 // indefinitely, with no sign in the CR or the Deployment that it had happened
 // (#971, finding 5).
 //
-// Three of the operator's pods read credentials that way, and all three are
+// Four of the operator's pods read credentials that way, and three are
 // stamped:
 //
 //   - the gateway, for the API_SERVER_KEY and SESSION_KV_API_KEY keys of
@@ -63,7 +63,9 @@ import (
 //     door's bearer token. Stamped on its Secret refs generally rather than
 //     for Slack alone: Discord's token was never covered either.
 //
-// The mode-next A2A callout is not stamped.
+// The fourth, the mode-next A2A callout, reads NATS_PASSWORD, A2A_ISSUER_SEED
+// and A2A_XKEY_SEED through SecretKeyRef and is not stamped: rotating one of
+// those needs a rollout restart of the callout Deployment.
 //
 // This file is the missing half: a digest of exactly the Secret material a pod
 // consumes as environment, stamped on its template so a rotation rolls it the

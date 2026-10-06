@@ -1029,12 +1029,14 @@ can see. So the operator does for Secrets what the config hash does for ConfigMa
 Secret keys the rendered pod spec consumes as environment, digests them with an HMAC-SHA256 keyed by
 the UID of each Secret they come from, and stamps the result on the pod template as
 `kubeagents.x-k8s.io/secret-env-hash`. Rotating one of those keys moves the digest, which changes the
-template, which rolls the pod onto the new value. Every pod that reads credentials this way is
-stamped: the gateway, the credential proxy, and under `mode: next` the A2A gateway, which on a
-Slack-armed install is the pod that reads the Slack tokens. The digest is keyed because the annotation is
-readable by anyone who can read pods: an unkeyed hash would let that reader verify guesses at a
-low-entropy value offline, whereas the UID is on the Secret object, and reading it takes the same
-`get` on the Secret that reads the values. (A UID also travels on Events and owner references that
+template, which rolls the pod onto the new value. Three pods are stamped: the gateway, the
+credential proxy, and under `mode: next` the A2A gateway, which on a Slack-armed install is the pod
+that reads the Slack tokens. The `mode: next` A2A auth callout also reads Secrets as environment
+(its bus password and its issuer and encryption seeds) but is not stamped, so after rotating one of
+those, run `kubectl rollout restart deployment/<agent>-a2a-callout`. The digest is keyed because
+the annotation is readable by anyone who can read pods: an unkeyed hash would let that reader verify
+guesses at a low-entropy value offline, whereas the UID is on the Secret object, and reading it takes
+the same `get` on the Secret that reads the values. (A UID also travels on Events and owner references that
 point at the Secret; the operator creates neither.)
 
 Five details decide whether you will see it happen.
