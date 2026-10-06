@@ -218,8 +218,16 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
+	return serve(ctx, cfg, metrics, log, gw.Run)
+}
+
+// serve is realMain's last step: the metrics listener beside the gateway,
+// then the gateway until ctx is done. run is gw.Run; it is a parameter so a
+// test can reach this step without a bus and see that a metrics listener
+// which cannot start leaves its ALERT line and does not stop the gateway.
+func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger, run func(context.Context) error) error {
 	startMetricsListener(ctx, cfg, metrics, log)
-	if err := gw.Run(ctx); err != nil && ctx.Err() == nil {
+	if err := run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("gateway exited", "err", err)
 		return err
 	}
