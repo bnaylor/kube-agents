@@ -444,7 +444,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		return Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err)
 	}
 
-	proc, err := startHarness(cfg.HarnessCommand, cfg.HarnessEnv, prompt, log)
+	proc, err := startHarness(cfg.HarnessCommand, cfg.HarnessEnv, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -611,11 +611,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		return Result{State: state}, a.finalize(state, "reason: canceled-by-request", "")
 	default:
 		state := lib.StateFailed
-		evidence := strings.TrimSpace(proc.stderr.String())
-		reason := "reason: stream-ended-without-result"
-		if waitErr != nil {
-			reason += " - " + waitErr.Error()
-		}
+		reason := "reason: stream-ended-without-result" + exitEvidence(waitErr)
 		if serr := proc.scanErr(); serr != nil {
 			// Name the ceiling and its value rather than relaying
 			// "token too long", which says nothing an operator can act on.
@@ -632,9 +628,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				reason += " - stdout: " + serr.Error()
 			}
 		}
-		if evidence != "" {
-			reason += "\nstderr tail:\n" + evidence
-		}
+		reason += proc.stderrEvidence()
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
 }

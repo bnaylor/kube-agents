@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -47,6 +48,13 @@ const (
 	// them, this one bounds untrusted output written to a log, and the two
 	// should be free to move apart.
 	chatterEchoCap = 200
+	// reasonDetailSeparator joins a terminal reason to its detail, the
+	// `reason: <token> - <detail>` shape the eval harness parses the token
+	// out of.
+	reasonDetailSeparator = " - "
+	// stderrTailHeading introduces the stderr tail in a failure reason. The
+	// tail is multi-line and read by a person, so it goes on its own lines.
+	stderrTailHeading = "\nstderr tail:\n"
 )
 
 // harnessEvent is one stream-json line from the harness stdout. Only the
@@ -119,8 +127,9 @@ type harnessProc struct {
 // startHarness launches argv with the given extra environment appended to
 // the parent's, writes the opening prompt as the first stdin line, and
 // starts the stdout scanner. The process runs in its own process group so a
-// kill reaches the harness's own children.
-func startHarness(argv []string, env []string, prompt string, log *slog.Logger) (*harnessProc, error) {
+// kill reaches the harness's own children. reapBound caps how long a failed
+// start waits for the killed harness's stderr to close.
+func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty harness command")
 	}
@@ -232,11 +241,43 @@ func startHarness(argv []string, env []string, prompt string, log *slog.Logger) 
 		p.mu.Unlock()
 	}
 	if err := p.writeUser(prompt); err != nil {
+		// The usual cause is a harness that exited before reading its
+		// prompt, and then its exit status and stderr are the only account
+		// of why. Kill what is left, reap it, and carry both in the error the
+		// way supervise's failure arm does.
+		//
+		// WaitDelay bounds the reap. A descendant that left the process group
+		// survives the kill and can hold stderr open, and Wait reads stderr
+		// to EOF, so without a bound it would block until that descendant
+		// exits. Start consults WaitDelay only for a command built with a
+		// Context, which this one is not, so setting it here takes effect.
 		p.kill(0)
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("write opening prompt: %w", err)
+		cmd.WaitDelay = reapBound
+		waitErr := cmd.Wait()
+		p.reaped()
+		return nil, fmt.Errorf("write opening prompt: %w%s%s", err, exitEvidence(waitErr), p.stderrEvidence())
 	}
 	return p, nil
+}
+
+// exitEvidence is a harness's exit as a failure reason carries it: the Wait
+// error after the detail separator, or nothing for a clean exit.
+func exitEvidence(waitErr error) string {
+	if waitErr == nil {
+		return ""
+	}
+	return reasonDetailSeparator + waitErr.Error()
+}
+
+// stderrEvidence is the harness's stderr tail as a failure reason carries
+// it, or nothing when the harness wrote none. Call it after Wait, which is
+// what guarantees the tail holds everything the harness wrote.
+func (p *harnessProc) stderrEvidence() string {
+	tail := strings.TrimSpace(p.stderr.String())
+	if tail == "" {
+		return ""
+	}
+	return stderrTailHeading + tail
 }
 
 // writeUser writes one user message line onto the harness stdin. Steers
