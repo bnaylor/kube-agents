@@ -267,20 +267,27 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 // end with stderr still held open by a process the harness started.
 //
 // Wait reports that differently by exit status. After a clean exit it
-// returns exec.ErrWaitDelay, whose text names a Go I/O timeout and not the
-// exit, so it is replaced by a line that says both. After a failed exit it
-// returns the exit status and drops ErrWaitDelay, so the bound is inferred
-// from the reap's length: the harness was SIGKILLed before Wait, so its own
-// Wait returns at once, and a reap that lasted the bound is one the bound
-// ended. A zero bound is no bound: Wait read stderr to EOF. Either way the
-// stderr tail stops where the bound cut it, and the reason says so.
+// returns exec.ErrWaitDelay, and that is proof: os/exec starts the WaitDelay
+// timer only after the harness has been reaped, so the copy that outlived it
+// was reading a stderr some other process still held. Its text names a Go
+// I/O timeout and not the exit, so it is replaced by a line that says both.
+//
+// After a failed exit Wait returns the exit status and drops ErrWaitDelay,
+// and nothing else in the error says whether the bound fired. The reap's
+// length cannot stand in for it: the timer covers only the copy after the
+// harness is reaped, while the reap also spans the harness's own Wait, which
+// can stall past the bound on its own (a SIGKILLed harness in uninterruptible
+// sleep on a hung mount does not die until the kernel wait ends). So a reap
+// that ran the full bound says only that, and that the tail may be cut. A
+// zero bound is no bound: Wait read stderr to EOF.
 func reapEvidence(waitErr error, took, bound time.Duration) string {
-	held := fmt.Sprintf("a process the harness started kept stderr open past %s; the stderr tail stops there", bound)
 	switch {
 	case errors.Is(waitErr, exec.ErrWaitDelay):
-		return reasonDetailSeparator + "harness exited 0; " + held
+		return reasonDetailSeparator + "harness exited 0; " +
+			fmt.Sprintf("a process the harness started kept stderr open past %s; the stderr tail stops there", bound)
 	case waitErr != nil && bound > 0 && took >= bound:
-		return exitEvidence(waitErr) + reasonDetailSeparator + held
+		return exitEvidence(waitErr) + reasonDetailSeparator +
+			fmt.Sprintf("the reap ran the full %s; the stderr tail may stop there", bound)
 	default:
 		return exitEvidence(waitErr)
 	}

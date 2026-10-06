@@ -2,10 +2,12 @@ package workeradapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -104,8 +106,10 @@ exit 7
 	if !strings.HasPrefix(text, "reason: spawn-failed ") {
 		t.Errorf("terminal reason does not lead with the spawn-failed token:\n%s", text)
 	}
-	// Nothing held stderr here, so the reap ended on EOF and the reason must
-	// not claim the tail was cut at the bound.
+	// Nothing held stderr and the stub exited 7, so the reason must not
+	// blame a held stderr. It may still say the reap ran the full bound: on a
+	// loaded runner the reap of a dead bash can take KillGrace, and the line
+	// is true when it appears, so the test does not forbid it.
 	if strings.Contains(text, "kept stderr open") {
 		t.Errorf("terminal reason claims a held stderr the stub never left:\n%s", text)
 	}
@@ -195,18 +199,52 @@ func requireEscaped(t *testing.T, pidFile string) {
 // kill does not reach. Unbounded, Wait would read stderr until the escaped
 // sleep exits; bounded, startHarness returns about one reapBound after the
 // stub's exit, still carrying the exit status and the stderr tail, and says
-// the tail stopped at the bound.
+// the reap ran the bound. After a failed exit Wait cannot say whether the
+// bound fired, so the line must not blame a held stderr.
 func TestStartHarness_OpeningPromptReapIsBounded(t *testing.T) {
 	harness, pidFile := escapingChildStub(t, 7, "stub left a child holding stderr")
 	msg := startHarnessWithin(t, harness).Error()
 	requireEscaped(t, pidFile)
 	for _, want := range []string{
 		"write opening prompt: ",
-		" - exit status 7 - a process the harness started kept stderr open past 500ms; the stderr tail stops there",
+		" - exit status 7 - the reap ran the full 500ms; the stderr tail may stop there",
 		"\nstderr tail:\nstub left a child holding stderr",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "kept stderr open") {
+		t.Errorf("error blames a held stderr after a failed exit, which Wait cannot tell from a slow reap:\n%s", msg)
+	}
+}
+
+// TestReapEvidence_SlowReapIsNotAHeldStderr: a failed exit whose reap ran
+// past the bound, with nothing holding stderr. A SIGKILLed harness in
+// uninterruptible sleep is the shape: its own Wait blocks past the bound, and
+// the WaitDelay timer, which starts only after that Wait, never fires. The
+// reason must say what is known, the reap's length, and not that something
+// held stderr. The clean-exit arm keeps its claim: exec.ErrWaitDelay is
+// returned only after the harness was reaped and the copy still ran.
+func TestReapEvidence_SlowReapIsNotAHeldStderr(t *testing.T) {
+	killed := errors.New("signal: killed")
+	for _, tc := range []struct {
+		name    string
+		waitErr error
+		took    time.Duration
+		bound   time.Duration
+		want    string
+	}{
+		{"slow failed reap", killed, 12 * time.Second, 10 * time.Second,
+			" - signal: killed - the reap ran the full 10s; the stderr tail may stop there"},
+		{"fast failed reap", killed, time.Millisecond, 10 * time.Second, " - signal: killed"},
+		{"unbounded failed reap", killed, time.Minute, 0, " - signal: killed"},
+		{"clean exit, bound fired", exec.ErrWaitDelay, 10 * time.Second, 10 * time.Second,
+			" - harness exited 0; a process the harness started kept stderr open past 10s; the stderr tail stops there"},
+		{"clean exit, no bound", nil, time.Millisecond, 10 * time.Second, ""},
+	} {
+		if got := reapEvidence(tc.waitErr, tc.took, tc.bound); got != tc.want {
+			t.Errorf("%s: reapEvidence = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
