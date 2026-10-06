@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/netutil"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -57,19 +58,27 @@ const (
 	gchatPullEmpty  = "empty"
 	gchatPullFailed = "failed"
 
-	// metricsMaxRequestsInFlight caps concurrent scrapes, the bound the
-	// broker's listener puts on its connections (METRICS_MAX_CONNECTIONS);
-	// a request past it is answered 503 without rendering anything.
-	metricsMaxRequestsInFlight = 16
-	// metricsScrapeTimeout bounds one render. The registry holds a few
-	// dozen series, so a render that takes this long is a stuck process.
-	metricsScrapeTimeout = 10 * time.Second
-	// metricsReadHeaderTimeout bounds how long a peer may take to send its
-	// headers, the inject door's bound (injectReadHeaderTimeout).
-	metricsReadHeaderTimeout = injectReadHeaderTimeout
-	// metricsIdleTimeout closes a kept-alive connection between scrapes;
-	// the collector scrapes every 30s and reconnects for free.
-	metricsIdleTimeout = 60 * time.Second
+	// metricsMaxConnections is the broker's METRICS_MAX_CONNECTIONS: at
+	// most this many connections are open at once, so a peer that reaches
+	// the port cannot spend the gateway's memory one idle connection at a
+	// time. A connection past it waits in the kernel's accept queue until
+	// one closes. metricsMaxRequestsInFlight holds concurrent renders to the
+	// same number; a render past it is answered 503.
+	metricsMaxConnections      = 16
+	metricsMaxRequestsInFlight = metricsMaxConnections
+	// metricsConnectionDeadline is the broker's
+	// METRICS_CONNECTION_DEADLINE_SECONDS: how long a peer may take to send
+	// a request, and how long the reply may take to write, so no
+	// connection holds one of the slots above for longer whatever the peer
+	// sends. metricsScrapeTimeout bounds one render inside it; the registry
+	// holds a few dozen series, so a render that takes that long is a stuck
+	// process.
+	metricsConnectionDeadline = 10 * time.Second
+	metricsScrapeTimeout      = 5 * time.Second
+	// metricsIdleTimeout closes a kept-alive connection between scrapes,
+	// which frees its slot; the collector scrapes every 30s and reconnects
+	// for free.
+	metricsIdleTimeout = 10 * time.Second
 	// metricsShutdownGrace is how long the listener waits for an in-flight
 	// scrape once the gateway is stopping.
 	metricsShutdownGrace = 5 * time.Second
@@ -220,7 +229,9 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 	mux.Handle(http.MethodGet+" "+MetricsPath, s.metrics.Handler())
 	srv := &http.Server{
 		Handler:           mux,
-		ReadHeaderTimeout: metricsReadHeaderTimeout,
+		ReadHeaderTimeout: metricsConnectionDeadline,
+		ReadTimeout:       metricsConnectionDeadline,
+		WriteTimeout:      metricsConnectionDeadline,
 		IdleTimeout:       metricsIdleTimeout,
 	}
 
@@ -232,6 +243,7 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 			return fmt.Errorf("metrics listener on %s: %w", s.listen, err)
 		}
 	}
+	ln = netutil.LimitListener(ln, metricsMaxConnections)
 	s.log.Info("metrics listening", "address", ln.Addr().String(), "path", MetricsPath)
 
 	errs := make(chan error, 1)

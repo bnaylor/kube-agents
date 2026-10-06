@@ -4010,8 +4010,8 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // buildA2ANATSNetworkPolicy says so at length). What answers that caller is
 // the bearer token (ensureA2AInjectTokenSecret).
 //
-// Rendered only with the backend, deliberately. A deny-all-ingress fence on
-// the gateway is a good idea whatever the backend, but rendering one on every
+// Rendered only with the backend, deliberately. A fence that admits only the
+// collector is a good idea on the gateway whatever the backend, but rendering one on every
 // next install is a change to installs that did not ask for this, and it
 // would outlive the object it exists to protect. When an in-cluster caller
 // legitimately needs the gateway, it becomes a peer in this rule. The cost of

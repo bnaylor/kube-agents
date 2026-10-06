@@ -376,3 +376,39 @@ func TestFromEnvReadsTheMetricsPort(t *testing.T) {
 		})
 	}
 }
+
+// TestMetricsListenerCapsItsConnections: with metricsMaxConnections idle
+// connections open, a scrape waits rather than adding one more; once they
+// close it is served. The cap is what keeps a peer on the pod network from
+// spending the gateway's memory one idle connection at a time.
+func TestMetricsListenerCapsItsConnections(t *testing.T) {
+	base := startMetricsServer(t, NewMetrics())
+	addr := strings.TrimPrefix(base, "http://")
+	var held []net.Conn
+	for range metricsMaxConnections {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+	}
+	// Give the server time to accept every held connection, so the slots
+	// are taken before the scrape below arrives.
+	time.Sleep(200 * time.Millisecond)
+	quick := &http.Client{Timeout: 500 * time.Millisecond}
+	if resp, err := quick.Get(base + MetricsPath); err == nil {
+		_ = resp.Body.Close()
+		t.Fatalf("a scrape past %d open connections was served (%d); the listener has no cap", metricsMaxConnections, resp.StatusCode)
+	}
+	for _, c := range held {
+		_ = c.Close()
+	}
+	waitFor(t, "a scrape once the held connections close", func() bool {
+		resp, err := quick.Get(base + MetricsPath)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+}
