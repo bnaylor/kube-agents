@@ -906,10 +906,10 @@ operator applies it at zero replicas, keeping the object and its UID, and writes
 `A2AGateway` condition; `Ready` does not wait on it. So the backend question is asked on every
 pass: the door flags and Chat answer it without a read, and an install whose only backend is a
 Secret pays one uncached read per pass. When a backend comes back, the next pass applies one
-replica on the same Deployment, and the condition stays until that replica is ready. The dark
-state shares the reconcile's 30 s requeue, so a Secret, which is not watched, is seen within
-one requeue; a door flag comes back with the operator restart that changing it causes, and
-Chat with the CR edit. An eval install with this door armed has an ingress
+replica on the same Deployment, and the condition stays, as `WaitingForReplica`, until that
+replica is ready. The dark state shares the reconcile's 30 s requeue, so a Secret, which is
+not watched, is seen within one requeue; a door flag comes back with the operator restart that
+changing it causes, and Chat with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat under `next` has a backend by that
 fact alone: the render asks the CR before it reads any Secret, and, because the gateway

@@ -525,12 +525,22 @@ const (
 	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
 
 	// The condition the status writers publish while a next install's gateway
-	// is withheld for want of a backend (#1660, option 1). Informational rather
-	// than Degraded: the install did nothing wrong, it configured no chat
-	// backend, and the rest of the stack is up. The message names what would
-	// render it.
+	// runs nothing for want of a backend: withheld (#1660, option 1), or an
+	// existing Deployment at zero replicas (#2481). Informational rather than
+	// Degraded: the install did nothing wrong, it configured no chat backend,
+	// and the rest of the stack is up. The message names what would run it.
 	a2aGatewayConditionType = "A2AGateway"
 	a2aGatewayDarkReason    = "NoChatBackend"
+	// The same condition on the way back: a backend returned for a gateway
+	// that was at zero, the Deployment asks for one replica again, and none
+	// is ready yet. Its own reason and message, because by then the dark
+	// pass's remedy is wrong -- the backend it asks for exists -- and a
+	// replica that never comes up (an unpullable image, a bad token) would
+	// otherwise leave the CR asking for it indefinitely. What is wrong with
+	// the replica is the Ready condition's to say, from the pod scan.
+	a2aGatewayWakingReason  = "WaitingForReplica"
+	a2aGatewayWakingMessage = "a chat backend is configured again and the A2A gateway, which ran at zero replicas without one, " +
+		"is back at one replica with none ready yet; the Ready condition says what it is waiting on"
 
 	// The condition that records the bus having been provisioned once: written
 	// the first pass that sees the provisioning Job complete, whichever phase
@@ -4393,15 +4403,15 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 		// reference is optional, so a rendered gateway would start with no
 		// token and exit on "no chat backend", which is the crash loop this
 		// check exists to prevent. Withheld, with the key named.
-		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
-			"Deployment is not rendered: put the Discord bot token under that key, or enable spec.integration.googleChat "+
+		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and "+
+			"is not running: put the Discord bot token under that key, or enable spec.integration.googleChat "+
 			"so the next stack takes Google Chat; an eval install arms the inject door (%s=true on the operator) "+
 			"or the A2A door (%s=true) instead",
 			a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 	case !errors.IsNotFound(err):
 		return false, "", err
 	}
-	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
+	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so it is not running: "+
 		"enable spec.integration.googleChat so the next stack takes Google Chat, or create the %s Secret (key %s) in %s; "+
 		"an eval install arms the inject door (%s=true on the operator) or the A2A door (%s=true) instead",
 		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
@@ -4896,10 +4906,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 	// A backend, and a gateway an earlier pass darkened: the apply below
 	// scales it back to one replica, and until that replica is ready the
-	// CR keeps the condition the dark pass wrote rather than clearing it
-	// over a pod that is not serving yet. The ready count is the informer's,
-	// and the status writer re-reads it before keeping the condition.
-	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayDarkMessage(agent) != "" {
+	// CR keeps the A2AGateway condition (as WaitingForReplica) rather than
+	// clearing it over a pod that is not serving yet. The ready count is the
+	// informer's, and the Ready writer re-reads it before keeping the
+	// condition.
+	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent) {
 		state.gatewayWaking = true
 	}
 	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {

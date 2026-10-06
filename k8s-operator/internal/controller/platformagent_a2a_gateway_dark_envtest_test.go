@@ -66,6 +66,10 @@ const darkEnvtestSessionPod = "test-agent-session-1"
 // standing in for `kubectl scale`.
 const darkEnvtestForeignManager = "kubectl-scale"
 
+// darkEnvtestWakingReason is the A2AGateway reason on the way back from dark,
+// spelled out so the test reads the API rather than the constant it checks.
+const darkEnvtestWakingReason = "WaitingForReplica"
+
 // darkRig is one PlatformAgent on its own envtest API server.
 type darkRig struct {
 	t     *testing.T
@@ -374,9 +378,7 @@ func TestTheInjectDoorTurnedOffScalesTheGatewayToZeroAndBackEnvtest(t *testing.T
 	}
 	// The Deployment controller has not reported the new replica: the
 	// condition stays, Ready waits on the gateway, and the pass requeues.
-	if cond := g.gatewayCondition(); cond == nil || cond.Reason != a2aGatewayDarkReason {
-		t.Errorf("door on, no replica ready: the A2AGateway condition cleared over a gateway that is not serving yet: %+v", cond)
-	}
+	g.assertWaking("door on, no replica ready")
 	state, err := g.r.reconcileA2A(g.ctx, g.agent)
 	if err != nil {
 		t.Fatal(err)
@@ -398,6 +400,71 @@ func TestTheInjectDoorTurnedOffScalesTheGatewayToZeroAndBackEnvtest(t *testing.T
 	}
 	// (e) The session pod survived the whole round trip.
 	g.sessionPodStillOwned("round trip")
+}
+
+// assertWaking is the condition on the way back from dark: still there, but
+// no longer the dark pass's remedy, which by now asks for a backend that
+// exists.
+func (g *darkRig) assertWaking(step string) {
+	g.t.Helper()
+	cond := g.gatewayCondition()
+	if cond == nil {
+		g.t.Errorf("%s: the A2AGateway condition cleared over a gateway with no ready replica", step)
+		return
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != darkEnvtestWakingReason ||
+		strings.Contains(cond.Message, a2aDiscordBotSecretName) || !strings.Contains(cond.Message, "configured again") {
+		g.t.Errorf("%s: A2AGateway condition = %+v, want False/%s saying the backend is back and the replica is not ready, without the dark remedy",
+			step, cond, darkEnvtestWakingReason)
+	}
+}
+
+// TestAWakingPassParkedDegradedKeepsTheConditionEnvtest: the way back from
+// dark on a pass that ends Degraded. The Degraded writer reads no workloads,
+// so it has to keep the condition from the render's own answer; if it
+// dropped it, the next pass would find no condition to keep and the CR would
+// stop saying anything before the replica is ready.
+func TestAWakingPassParkedDegradedKeepsTheConditionEnvtest(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	g := newDarkRig(t, "dark-degraded", nil)
+	if err := g.cl.Create(g.ctx, discordBotSecret(g.agent)); err != nil {
+		t.Fatal(err)
+	}
+	g.settle()
+	g.reportGatewayReady(1)
+	uid := g.gateway().UID
+	if err := g.cl.Delete(g.ctx, discordBotSecret(g.agent)); err != nil {
+		t.Fatal(err)
+	}
+	g.assertDark("Secret deleted", uid, g.pass())
+	g.reportGatewayReady(0)
+
+	// Park the install on the missing sandbox keypair, then bring the
+	// backend back: every pass from here ends in the Degraded writer.
+	if err := g.cl.Delete(g.ctx, shellSandboxKeysSecret(g.agent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.cl.Create(g.ctx, discordBotSecret(g.agent)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		g.pass()
+		if ready := meta.FindStatusCondition(g.agent.Status.Conditions, "Ready"); ready == nil || ready.Reason != reasonShellSandboxKeysMissing {
+			t.Fatalf("precondition, pass %d: the install is not parked on the missing keypair: %+v", i+1, ready)
+		}
+		if got := g.replicas(); got != 1 {
+			t.Errorf("parked pass %d: the gateway asks for %d replicas with the Secret back, want 1", i+1, got)
+		}
+		g.assertWaking("parked pass")
+	}
+
+	// The replica ready: the condition clears, on the parked path too.
+	g.reportGatewayReady(1)
+	g.pass()
+	if cond := g.gatewayCondition(); cond != nil {
+		t.Errorf("replica ready: the CR still carries %+v", cond)
+	}
 }
 
 // TestTheDiscordSecretRoundTripScalesTheGatewayEnvtest: the #2057 shape, the

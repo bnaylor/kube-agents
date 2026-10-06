@@ -987,8 +987,9 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 // TestARunningGatewayReadsTheSecretOncePerPass: the backend question is
 // asked on every pass now, existing gateway or not, or a running gateway
 // would never see its backend leave (#2481). On an install whose only backend
-// is the discord-bot Secret that is one uncached read per pass, and no more:
-// the status writers reuse the render's answer rather than asking again.
+// is the discord-bot Secret that is one uncached read per render pass. This
+// counts reconcileA2A's reads only; the status writers do not ask the
+// question, they read the render's answer off a2aProvisionState.
 func TestARunningGatewayReadsTheSecretOncePerPass(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
