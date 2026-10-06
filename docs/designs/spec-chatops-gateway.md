@@ -397,7 +397,11 @@ posts one line once the grace has passed with nothing on the stream, naming the 
 saying the next message starts a new task. It marks the active-task record before it
 posts, so the line goes out at most once per task, across gateway restarts, and it
 releases nothing; the release stays with the next turn, which reads the stream again
-first. Otherwise the terminal event this chain
+first. The line is for a placeholder somebody may still be watching, so it has a ceiling:
+a task older than three graces (30 minutes by default) gets none, and neither does a
+record the same reap pass deletes past `A2A_SESSION_TTL`. Without the ceiling the first
+pass after a rollout, or after an outage longer than the grace, would post into every
+conversation that wedged in the last week. Otherwise the terminal event this chain
 guarantees is what deletes the active-task record (and the `ask` copy riding it). A
 detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and

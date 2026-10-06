@@ -398,3 +398,105 @@ func TestNoFirstEventPastGrace(t *testing.T) {
 		}
 	}
 }
+
+// seedTasklessFixedAs is seedTasklessFixed with its own task id, so several
+// records in one rig can be told apart in the posts.
+func seedTasklessFixedAs(t *testing.T, r *rig, conv, taskID string, age time.Duration) *SessionRecord {
+	t.Helper()
+	rec := seedTasklessFixed(t, r, conv, age)
+	rec.ActiveTask.TaskID = taskID
+	rec.Tasks = []TaskRef{{ID: taskID, Addressee: "platform"}}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+// TestNoFirstEventNoticeAgeCeiling (round-1 review of #2412): the notice is
+// for the placeholder somebody may still be watching. A task twice the grace
+// old is noticed, once, however many passes run; one four times the grace old
+// is past the ceiling and is not, so the first pass after a rollout does not
+// post into every conversation that wedged in the last SessionTTL.
+func TestNoFirstEventNoticeAgeCeiling(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	seedTasklessFixedAs(t, r, "discord:g1/thread-notice-2x", "task-2x", 2*defaultFirstEventGrace)
+	seedTasklessFixedAs(t, r, "discord:g1/thread-notice-4x", "task-4x", 4*defaultFirstEventGrace)
+
+	r.g.reapOnce(ctx)
+	r.g.reapOnce(ctx)
+	if got := noticePosts(r.adapter, "task-2x"); len(got) != 1 {
+		t.Fatalf("task at 2x the grace: %d notices, want 1; posts: %q", len(got), r.adapter.postTexts())
+	}
+	if got := noticePosts(r.adapter, "task-4x"); len(got) != 0 {
+		t.Fatalf("task at 4x the grace, past the ceiling, was noticed: %q", got)
+	}
+	rec, err := r.g.reg.Get(ctx, "discord:g1/thread-notice-4x")
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("record past the ceiling lost: %+v (err=%v)", rec, err)
+	}
+	if !rec.ActiveTask.NoFirstEventNoticeAt.IsZero() {
+		t.Fatal("a task past the ceiling was marked as noticed")
+	}
+}
+
+// TestNoFirstEventNoticeSkipsRecordDueForPrune (round-1 review of #2412): a
+// record the same reap pass deletes past SessionTTL gets no notice, because
+// the conversation would be told about a task whose record is gone a few
+// lines later. Two shapes: the ordinary one, where the task is as old as the
+// record and the ceiling alone would skip it; and one whose task is inside
+// the ceiling, which only the prune check stops.
+func TestNoFirstEventNoticeSkipsRecordDueForPrune(t *testing.T) {
+	r := startRigWith(t, func(c *Config) {
+		c.SessionTTL = 24 * time.Hour
+		c.TaskDeadline = defaultFirstEventGrace
+	})
+	ctx := context.Background()
+
+	cases := map[string]time.Duration{
+		"discord:g1/thread-notice-prune-old":   25 * time.Hour,
+		"discord:g1/thread-notice-prune-young": 2 * defaultFirstEventGrace,
+	}
+	for conv, taskAge := range cases {
+		taskID := "task-" + conv[len("discord:g1/thread-notice-"):]
+		rec := seedTasklessFixedAs(t, r, conv, taskID, taskAge)
+		rec.LastActivity = time.Now().Add(-25 * time.Hour).UTC()
+		if err := r.g.reg.Put(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r.g.reapOnce(ctx)
+	for conv := range cases {
+		taskID := "task-" + conv[len("discord:g1/thread-notice-"):]
+		if got := noticePosts(r.adapter, taskID); len(got) != 0 {
+			t.Errorf("%s: a record pruned on the same pass was noticed: %q", conv, got)
+		}
+		if rec, err := r.g.reg.Get(ctx, conv); err != nil || rec != nil {
+			t.Errorf("%s: record not pruned (rec=%+v err=%v); the test no longer exercises the prune", conv, rec, err)
+		}
+	}
+}
+
+// TestWithinNoticeCeiling pins the notice's upper bound: inclusive at
+// noticeCeilingGraces × grace (30m at the 10m default), out one second past.
+func TestWithinNoticeCeiling(t *testing.T) {
+	now := time.Now()
+	grace := defaultFirstEventGrace
+	if noticeCeilingGraces*grace != 30*time.Minute {
+		t.Fatalf("ceiling at the default grace = %v, want 30m", noticeCeilingGraces*grace)
+	}
+	for name, tc := range map[string]struct {
+		age  time.Duration
+		want bool
+	}{
+		"2x the grace":            {2 * grace, true},
+		"exactly at the ceiling":  {3 * grace, true},
+		"one second past ceiling": {3*grace + time.Second, false},
+		"4x the grace":            {4 * grace, false},
+	} {
+		if got := withinNoticeCeiling(now.Add(-tc.age), grace, now); got != tc.want {
+			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+}

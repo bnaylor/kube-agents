@@ -80,28 +80,13 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	g.boundAskCopy(ctx, rec)
 	g.noticeNoFirstEvent(ctx, rec)
 
-	// Check if the session record itself has outlived the retention horizon.
 	// Prune records older than SessionTTL whose pod has been reaped (or never
-	// incarnated). If an ActiveTask is present, only prune if it has also
-	// outlived its execution deadline (stale/abandoned executor).
-	if g.cfg.SessionTTL > 0 && rec.PodName == "" &&
-		!rec.LastActivity.IsZero() &&
-		time.Since(rec.LastActivity) >= g.cfg.SessionTTL {
-		if rec.ActiveTask != nil && !rec.ActiveTask.SubmittedAt.IsZero() &&
-			time.Since(rec.ActiveTask.SubmittedAt) < g.cfg.TaskDeadline {
-			return
-		}
+	// incarnated); sessionPruneDue has the whole test.
+	if g.sessionPruneDue(rec, time.Now()) {
 		l := g.lockSession(rec.Key)
 		l.Lock()
 		fresh, err := g.reg.Get(ctx, rec.Key)
-		if err == nil && fresh != nil && fresh.PodName == "" &&
-			!fresh.LastActivity.IsZero() &&
-			time.Since(fresh.LastActivity) >= g.cfg.SessionTTL {
-			if fresh.ActiveTask != nil && !fresh.ActiveTask.SubmittedAt.IsZero() &&
-				time.Since(fresh.ActiveTask.SubmittedAt) < g.cfg.TaskDeadline {
-				l.Unlock()
-				return
-			}
+		if err == nil && fresh != nil && g.sessionPruneDue(fresh, time.Now()) {
 			if err := g.reg.DeleteSession(ctx, fresh.Key); err != nil {
 				g.log.Error("reap: session record delete failed", "session", fresh.Key, "err", err)
 			} else {
@@ -114,10 +99,9 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 					g.mu.Unlock()
 				}
 			}
-			l.Unlock()
-			return
 		}
 		l.Unlock()
+		return
 	}
 
 	if rec.PodName == "" {
@@ -281,20 +265,64 @@ func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string)
 	return true, nil
 }
 
+// noticeCeilingGraces bounds the no-first-event notice from above, in
+// multiples of FirstEventGrace: a task older than this many graces is past
+// the notice. The notice is for the placeholder somebody may still be
+// watching, and that task is minutes old. A never-started task otherwise
+// stays on its record until the SessionTTL prune (7 days by default), so
+// without a ceiling the first reap pass after a rollout, or after an outage
+// longer than the grace, would post into every conversation that wedged in
+// the last week, one line per record, into threads that may be days cold.
+// 3 leaves the steady-state notice (due at grace, landing within one
+// reapInterval of it) two graces of slack for a slow or missed pass, and is
+// 30m at the 10m default. The heal is not bounded: it runs inside a turn,
+// where the conversation has just spoken.
+const noticeCeilingGraces = 3
+
+// withinNoticeCeiling reports whether a task submitted at submittedAt is
+// still young enough, at now, for the no-first-event notice: no older than
+// noticeCeilingGraces × grace. Inclusive at the bound.
+func withinNoticeCeiling(submittedAt time.Time, grace time.Duration, now time.Time) bool {
+	return now.Sub(submittedAt) <= noticeCeilingGraces*grace
+}
+
+// sessionPruneDue reports whether the reap scan deletes rec on this visit
+// for having outlived SessionTTL: no pod (reaped, or never incarnated),
+// silent past SessionTTL, and, if it still holds an active task, that task
+// past its TaskDeadline (a stale or abandoned executor). reapSession prunes
+// on it, and the no-first-event notice skips a record it answers true for,
+// so a conversation is never told about a task whose record the same pass
+// deletes.
+func (g *Gateway) sessionPruneDue(rec *SessionRecord, now time.Time) bool {
+	if g.cfg.SessionTTL <= 0 || rec.PodName != "" || rec.LastActivity.IsZero() ||
+		now.Sub(rec.LastActivity) < g.cfg.SessionTTL {
+		return false
+	}
+	if a := rec.ActiveTask; a != nil && !a.SubmittedAt.IsZero() &&
+		now.Sub(a.SubmittedAt) < g.cfg.TaskDeadline {
+		return false
+	}
+	return true
+}
+
 // firstEventOverdue is noFirstEventPastGrace for a caller holding only the
-// record: when the active task is old enough for the answer to matter, it
-// asks the stream whether the task has a first event (taskStreamEmpty, no
-// consumer) and applies the test. A read and nothing else: no lock, no post,
-// no write. A task inside the grace is answered without touching the stream.
-// A read that fails answers false.
+// record, bounded for the notice: when the active task is past the grace,
+// inside the ceiling (withinNoticeCeiling), and the record is not about to
+// be pruned (sessionPruneDue), it asks the stream whether the task has a
+// first event (taskStreamEmpty, no consumer) and applies the test. A read
+// and nothing else: no lock, no post, no write. A task outside that window
+// is answered without touching the stream. A read that fails answers false.
 func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) bool {
 	active := rec.ActiveTask
+	now := time.Now()
 	if active == nil || active.SubmittedAt.IsZero() ||
-		time.Since(active.SubmittedAt) <= g.cfg.FirstEventGrace {
+		now.Sub(active.SubmittedAt) <= g.cfg.FirstEventGrace ||
+		!withinNoticeCeiling(active.SubmittedAt, g.cfg.FirstEventGrace, now) ||
+		g.sessionPruneDue(rec, now) {
 		return false
 	}
 	empty, err := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
-	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, time.Now())
+	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, now)
 }
 
 // noticeNoFirstEvent tells a conversation, without waiting for it to speak,
@@ -319,6 +347,10 @@ func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) boo
 // a write that fails posts nothing and the next pass tries again, while a
 // post that fails after the write is not repeated. At most once, because a
 // line that repeats every minute is worse than one that is lost.
+//
+// Bounded above, too (firstEventOverdue): a task past noticeCeilingGraces ×
+// the grace is not noticed, nor is one whose record this same pass prunes
+// past SessionTTL. Both bounds apply to the read under the lock as well.
 func (g *Gateway) noticeNoFirstEvent(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
 	if active == nil || active.Detached || !active.NoFirstEventNoticeAt.IsZero() {
