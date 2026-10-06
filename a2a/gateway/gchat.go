@@ -77,8 +77,8 @@ const (
 	// misbehaving relay from making one failed pull an unbounded read.
 	gchatRelayErrorBodyMaxBytes = 4096
 	// gchatSubscriptionUnreported stands in for the subscription in the
-	// summary line until the relay names one; a relay that predates naming
-	// it never does.
+	// summary line until the relay names one, on a served pull or a refused
+	// one; a relay that predates naming it never does.
 	gchatSubscriptionUnreported = "(not reported by the relay)"
 )
 
@@ -560,9 +560,10 @@ type gchatEnvelope struct {
 // acked-away poison event beats an inbox wedged on one.
 //
 // Run names the relay route it pulls when it starts, the subscription the
-// first time the relay reports one, and every countInterval the number of
-// events received: an install that Chat publishes nothing to pulls empty
-// forever, and those lines are what tell it from a quiet one.
+// first time the relay reports one (a refused pull's answer counts), and
+// every countInterval the number of events received: an install that Chat
+// publishes nothing to pulls empty forever, and those lines are what tell it
+// from a quiet one.
 func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	a.log.Info("gchat event pull starting",
 		"relay", a.relayURL+gchatRelayEventsPath, "summaryEvery", a.countInterval)
@@ -655,6 +656,15 @@ func (a *GoogleChatAdapter) pullEvent(ctx context.Context) (*gchatEnvelope, erro
 		// A read error leaves a partial body, which gchatRelayError reads as
 		// nothing; the status alone still goes out.
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, gchatRelayErrorBodyMaxBytes))
+		// The proxy names the subscription on a refused pull too, and an
+		// install whose every pull is refused never sees a 200 to learn it
+		// from.
+		var refused struct {
+			Subscription string `json:"subscription"`
+		}
+		if json.Unmarshal(errBody, &refused) == nil {
+			a.noteSubscription(refused.Subscription)
+		}
 		return nil, gchatRelayError(fmt.Sprintf("gchat: event pull answered %d", resp.StatusCode), errBody)
 	}
 	var body struct {

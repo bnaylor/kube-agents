@@ -1628,3 +1628,29 @@ func TestGchatPullFailureNamesTheSubscriptionAndTheRefusal(t *testing.T) {
 	runUntilLogged(t, a, logs,
 		`gchat: event pull answered 503: pubsub PermissionDenied 403, subscription projects/p/subscriptions/s`)
 }
+
+// TestGchatRefusedPullRecordsTheSubscription: in #2404's motivating case
+// every pull is refused (the proxy's credentials lack
+// pubsub.subscriptions.consume), and the proxy names the subscription on the
+// 503 as well. The gateway has to record it from that answer, or the summary
+// says "not reported" about a subscription every warning just named.
+func TestGchatRefusedPullRecordsTheSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		pullStatus: http.StatusServiceUnavailable,
+		pullBody: `{"error":"a2a chat event pull failed","subscription":"projects/p/subscriptions/s",` +
+			`"pubsub":{"type":"PermissionDenied","code":403}}`,
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat relay pulls subscription" subscription=projects/p/subscriptions/s`,
+		`msg="gchat events received"`)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `msg="gchat events received"`) &&
+			!strings.Contains(line, "subscription=projects/p/subscriptions/s") {
+			t.Errorf("summary after refused pulls does not name the subscription: %s", line)
+		}
+	}
+}
