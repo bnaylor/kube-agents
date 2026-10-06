@@ -503,3 +503,77 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		}
 	}
 }
+
+// TestAnArmedGatewayCarriesTheSlackAllowlist: under next the gateway gates a
+// Slack sender on spec.integration.slack.allowedUsers as well as the
+// principal map, the way Chat's gateway gates on its own list. The list is
+// normalized with the gateway's grammar and the allow-all flag is the legacy
+// consumer's rule on the RAW list, exactly as Chat's render does
+// (TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt), so a degenerate
+// list restricts to nobody rather than widening to everyone on the flip.
+func TestAnArmedGatewayCarriesTheSlackAllowlist(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name     string
+		users    []string
+		wantList string
+		wantAll  string
+	}{
+		{"one member", []string{"U1"}, "U1", "false"},
+		{"padded and empty entries", []string{" U1 ", "", "U2"}, "U1,U2", "false"},
+		{"a comma inside one entry", []string{"U1, U2"}, "U1,U2", "false"},
+		{"whitespace only", []string{" "}, "", "false"},
+		{"commas only", []string{","}, "", "false"},
+		{"nil", nil, "", "true"},
+		{"empty list", []string{}, "", "true"},
+		{"the legacy pin's single empty string", []string{""}, "", "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", true)
+			agent.Spec.Integration.Slack.AllowedUsers = tc.users
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			list, ok := env[a2aSlackAllowedUsersEnvVar]
+			if !ok {
+				t.Fatalf("%s is not rendered on the armed gateway", a2aSlackAllowedUsersEnvVar)
+			}
+			if list.Value != tc.wantList {
+				t.Errorf("%s = %q, want %q", a2aSlackAllowedUsersEnvVar, list.Value, tc.wantList)
+			}
+			if got := env[a2aSlackAllowAllUsersEnvVar].Value; got != tc.wantAll {
+				t.Errorf("%s = %q, want %q", a2aSlackAllowAllUsersEnvVar, got, tc.wantAll)
+			}
+		})
+	}
+}
+
+// TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
+// to "is every Slack member allowed", whichever consumer the mode renders.
+func TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, users := range [][]string{nil, {}, {""}, {" "}, {","}, {" , ", ",,"}, {"", "  "}, {"U1"}, {" U1 ", ""}} {
+		next := slackTestAgent("next", true)
+		next.Spec.Integration.Slack.AllowedUsers = users
+		today := slackTestAgent("", true)
+		today.Spec.Integration.Slack.AllowedUsers = users
+		a2a := envMapOf(buildA2AGatewayDeployment(next).Spec.Template.Spec.Containers[0].Env)[a2aSlackAllowAllUsersEnvVar].Value
+		legacy := envMapOf(brokerContainerNamed(buildPodTemplateSpec(today, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)["SLACK_ALLOW_ALL_USERS"].Value
+		if a2a == "" || a2a != legacy {
+			t.Errorf("allowedUsers=%q: next renders allow-all %q where today renders %q", users, a2a, legacy)
+		}
+	}
+}
+
+// TestAnUnarmedGatewayCarriesNoSlackAllowlist: the pair rides with the
+// backend, so a gateway Slack does not arm (off next, Slack disabled, or
+// Chat holding the gateway) carries neither.
+func TestAnUnarmedGatewayCarriesNoSlackAllowlist(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, agent := range []*agentv1alpha1.PlatformAgent{a2aTestAgent(), slackTestAgent("next", false), chatAndSlackTestAgent("next")} {
+		env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+		for _, name := range []string{a2aSlackAllowedUsersEnvVar, a2aSlackAllowAllUsersEnvVar} {
+			if _, ok := env[name]; ok {
+				t.Errorf("%s is rendered on a gateway Slack does not arm", name)
+			}
+		}
+	}
+}

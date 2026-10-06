@@ -40,6 +40,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_GCHAT_TOKEN_PATH", "")
 	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_SLACK_ALLOWED_USERS", "")
+	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "")
 	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
 	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_INJECT_TOKEN", "")
@@ -548,6 +550,36 @@ func TestFromEnvGchatBackendSelection(t *testing.T) {
 	}
 	if !cfg.GchatAllowAllUsers {
 		t.Fatal("A2A_GCHAT_ALLOW_ALL_USERS=true not honored")
+	}
+}
+
+// TestFromEnvSlackAllowlist: the Slack backend carries its allowlist the way
+// gchat does (TestFromEnvGchatBackendSelection): split on commas, trimmed,
+// empties dropped, case preserved (Slack member ids compare exactly), and
+// allow-all off unless stated.
+func TestFromEnvSlackAllowlist(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	t.Setenv("A2A_SLACK_ALLOWED_USERS", "U1, u2 ,")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.SlackAllowedUsers) != 2 || cfg.SlackAllowedUsers[0] != "U1" || cfg.SlackAllowedUsers[1] != "u2" {
+		t.Fatalf("allowed users = %v", cfg.SlackAllowedUsers)
+	}
+	if cfg.SlackAllowAllUsers {
+		t.Fatal("allow-all must be off unless stated")
+	}
+	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "true")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SlackAllowAllUsers {
+		t.Fatal("A2A_SLACK_ALLOW_ALL_USERS=true not honored")
 	}
 }
 

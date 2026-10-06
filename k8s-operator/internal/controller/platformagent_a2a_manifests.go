@@ -504,6 +504,10 @@ const (
 	// docs/README.md says this file must agree with a2a/gateway/config.go.
 	a2aSlackBotTokenEnvVar = "SLACK_BOT_TOKEN" // #nosec G101 -- Environment variable name, not a credential
 	a2aSlackAppTokenEnvVar = "SLACK_APP_TOKEN" // #nosec G101 -- Environment variable name, not a credential
+	// The Slack allowlist the gateway gates a sender on before the map,
+	// carried the way Chat's is (a2aGchatAllowedUsersEnvVar).
+	a2aSlackAllowedUsersEnvVar  = "A2A_SLACK_ALLOWED_USERS"
+	a2aSlackAllowAllUsersEnvVar = "A2A_SLACK_ALLOW_ALL_USERS"
 	// The principal map the gateway resolves Discord and Slack senders
 	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
 	// out), one volume, and one source in it, the armed backend's table
@@ -1188,15 +1192,15 @@ func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return gchat != nil && gchat.Enabled != nil && *gchat.Enabled
 }
 
-// a2aGchatAllowlist reads the CR's allowed-users list the way the gateway's
-// FromEnv reads the env it becomes, with the gateway's own grammar: the
+// a2aAllowlist reads a CR allowed-users list (Chat's or Slack's) the way the
+// gateway's FromEnv reads the env it becomes, with the gateway's own grammar: the
 // entries joined on commas and split again, each piece trimmed, the empty
 // ones dropped - so the list the gateway sees is the one it would have
 // parsed, and an entry carrying a comma is the two entries it would read.
 // The allow-all decision is NOT made on the result: it is the legacy rule on
 // the raw list (allowAllUsers), so a degenerate list restricts to nobody in
 // both modes instead of widening to everyone in one of them.
-func a2aGchatAllowlist(users []string) []string {
+func a2aAllowlist(users []string) []string {
 	var out []string
 	for _, u := range strings.Split(strings.Join(users, ","), ",") {
 		if u = strings.TrimSpace(u); u != "" {
@@ -4251,6 +4255,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		backendEnv = []corev1.EnvVar{
 			{Name: a2aSlackBotTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.BotTokenSecretRef, a2aSlackBotTokenEnvVar)}},
 			{Name: a2aSlackAppTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.AppTokenSecretRef, a2aSlackAppTokenEnvVar)}},
+			// The allowed-users gate, carried on Chat's terms (see the Chat
+			// pair below): normalized the way the gateway reads it, the
+			// allow-all flag the legacy rule on the RAW list. The gateway
+			// admits a Slack sender only if this gate AND the principal map
+			// both pass, so a mapped member the CR does not allow is
+			// refused under next as under today.
+			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
+			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
 		}
 	}
 	var chatEnv []corev1.EnvVar
@@ -4258,7 +4270,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var chatVolumes []corev1.Volume
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
-		allowed := a2aGchatAllowlist(gchat.AllowedUsers)
+		allowed := a2aAllowlist(gchat.AllowedUsers)
 		backendEnv = nil
 		chatEnv = []corev1.EnvVar{
 			// The relay is the broker; the gateway pod holds no cloud credential.
@@ -4266,7 +4278,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// The allowed-users gate, carried as environment because
 			// environment is what the agent cannot rewrite, from the same
 			// CR list the legacy pin uses. The list is normalized the way
-			// the gateway reads it (a2aGchatAllowlist); the allow-all flag
+			// the gateway reads it (a2aAllowlist); the allow-all flag
 			// is the legacy consumer's rule on the RAW list (allowAllUsers:
 			// absent, or a single empty string), so one CR means one thing
 			// in both modes. A degenerate list - whitespace or commas only -

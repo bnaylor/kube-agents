@@ -113,6 +113,17 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
+	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
+	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
+	// Unlike gchat, Slack also has a mapping table (PrincipalMapPath), and a
+	// sender must pass both: listed (or allow-all) AND mapped. Member ids
+	// compare exactly.
+	SlackAllowedUsers []string
+	// SlackAllowAllUsers disables the Slack allowlist, stated explicitly -
+	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. The map still
+	// applies.
+	SlackAllowAllUsers bool
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
@@ -439,6 +450,12 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)
+		}
+	}
+	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
