@@ -152,6 +152,11 @@ type Gateway struct {
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool
+	// noticeStreamReadHook is an optional test hook invoked with the task ID
+	// each time firstEventOverdue gets past its age and prune bounds and
+	// reads the stream, so a test can show the notice's read was reached
+	// rather than answered by a bound.
+	noticeStreamReadHook func(taskID string)
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string

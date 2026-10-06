@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,39 @@ func seedTasklessFixed(t *testing.T, r *rig, conv string, age time.Duration) *Se
 		t.Fatal(err)
 	}
 	return rec
+}
+
+// startedNoticeAge is how old the tests that seed a started task make it:
+// past the grace and inside the notice ceiling (noticeCeilingGraces × grace,
+// 30m at the default), the only window in which firstEventOverdue reads the
+// stream. A started task aged past the ceiling is turned away by the age
+// bound before the read, so a test about what the read finds would pass
+// whatever the read does. countNoticeReads fails a test whose seeds have
+// left the window, so a ceiling change cannot empty one silently.
+const startedNoticeAge = defaultFirstEventGrace + 5*time.Minute
+
+// countNoticeReads arms the notice's stream-read hook on r and returns the
+// number of reads made so far for a task ID. It first checks that
+// startedNoticeAge is still inside the window the read is made in.
+func countNoticeReads(t *testing.T, r *rig) func(taskID string) int {
+	t.Helper()
+	grace := r.g.cfg.FirstEventGrace
+	if startedNoticeAge <= grace || startedNoticeAge > noticeCeilingGraces*grace {
+		t.Fatalf("startedNoticeAge %v is outside (grace %v, ceiling %v]; the notice would not read the stream",
+			startedNoticeAge, grace, noticeCeilingGraces*grace)
+	}
+	var mu sync.Mutex
+	reads := map[string]int{}
+	r.g.noticeStreamReadHook = func(taskID string) {
+		mu.Lock()
+		reads[taskID]++
+		mu.Unlock()
+	}
+	return func(taskID string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return reads[taskID]
+	}
 }
 
 // TestNoFirstEventNoticePostsOnceWithoutATurn (#2405): a task with nothing on
@@ -115,8 +149,9 @@ func TestNoFirstEventNoticeNotRepeatedAfterRestart(t *testing.T) {
 }
 
 // TestNoFirstEventNoticeSkipsTasksThatStarted: a task whose first event
-// arrived, however old it is now, and a task with nothing yet but still
-// inside the grace, get no notice.
+// arrived, past the grace and inside the ceiling where the notice reads the
+// stream, and a task with nothing yet but still inside the grace, get no
+// notice.
 func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 	r := startRig(t)
 	ctx := context.Background()
@@ -128,8 +163,11 @@ func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 	if err := r.execFor(t, origin, "platform").PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
 		t.Fatal(err)
 	}
-	// Age the started task past the grace, under the session lock so the
-	// relay's own write of the record cannot interleave with this one.
+	// Age the started task past the grace but inside the ceiling
+	// (startedNoticeAge), under the session lock so the relay's own write of
+	// the record cannot interleave with this one. Past the ceiling the age
+	// bound alone would keep the notice away, and the submitted event would
+	// go untested.
 	l := r.g.lockSession(started)
 	l.Lock()
 	rec, err := r.g.reg.Get(ctx, started)
@@ -137,7 +175,7 @@ func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 		l.Unlock()
 		t.Fatalf("started task not on the record: %+v (err=%v)", rec, err)
 	}
-	rec.ActiveTask.SubmittedAt = time.Now().Add(-(defaultFirstEventGrace + time.Hour))
+	rec.ActiveTask.SubmittedAt = time.Now().Add(-startedNoticeAge)
 	if err := r.g.reg.Put(ctx, rec); err != nil {
 		l.Unlock()
 		t.Fatal(err)
@@ -162,10 +200,16 @@ func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	reads := countNoticeReads(t, r)
 	r.g.reapOnce(ctx)
 	r.g.reapOnce(ctx)
 	if got := noticePosts(r.adapter, origin.TaskID); len(got) != 0 {
 		t.Fatalf("a task with a first event was noticed: %q", got)
+	}
+	for _, id := range []string{origin.TaskID, "task-supervised"} {
+		if reads(id) == 0 {
+			t.Fatalf("the reap scan never read the stream for %s; a bound answered first, so its event went untested", id)
+		}
 	}
 	if got := noticePosts(r.adapter, "task-never"); len(got) != 0 {
 		t.Fatalf("a task inside the grace was noticed: %q", got)
@@ -229,6 +273,7 @@ func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
 	r := startRig(t)
 	ctx := context.Background()
 	const conversations = 5
+	var taskIDs []string
 	for i := 0; i < conversations; i++ {
 		conv := "discord:g1/thread-notice-budget-" + string(rune('a'+i))
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
@@ -255,11 +300,15 @@ func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
 		if err := r.execFor(t, origin, "platform").PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
 			t.Fatal(err)
 		}
+		taskIDs = append(taskIDs, taskID)
+		// Inside the ceiling (startedNoticeAge), so the scan reads the
+		// stream for this task; past it no read is made and a replay there
+		// would never run.
 		l := r.g.lockSession(conv)
 		l.Lock()
 		rec, err := r.g.reg.Get(ctx, conv)
 		if err == nil && rec != nil && rec.ActiveTask != nil {
-			rec.ActiveTask.SubmittedAt = time.Now().Add(-(defaultFirstEventGrace + time.Hour))
+			rec.ActiveTask.SubmittedAt = time.Now().Add(-startedNoticeAge)
 			err = r.g.reg.Put(ctx, rec)
 		}
 		l.Unlock()
@@ -278,9 +327,15 @@ func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
 		}
 		return info.State.Consumers
 	}
+	reads := countNoticeReads(t, r)
 	before := consumers()
 	r.g.reapOnce(ctx)
 	r.g.reapOnce(ctx)
+	for _, id := range taskIDs {
+		if reads(id) == 0 {
+			t.Fatalf("the reap scan never read the stream for %s; a bound answered first, so the read went untested", id)
+		}
+	}
 	if after := consumers(); after > before {
 		t.Fatalf("reap passes over %d started tasks past the grace opened consumers: %d before, %d after", conversations, before, after)
 	}

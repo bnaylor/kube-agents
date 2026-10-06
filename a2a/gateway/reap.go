@@ -321,6 +321,9 @@ func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) boo
 		g.sessionPruneDue(rec, now) {
 		return false
 	}
+	if g.noticeStreamReadHook != nil {
+		g.noticeStreamReadHook(active.TaskID)
+	}
 	empty, err := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, now)
 }
