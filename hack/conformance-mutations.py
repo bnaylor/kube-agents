@@ -1250,8 +1250,8 @@ Mutation(
     Mutation(
         "C1-a2a-gateway-collector-from-every-namespace",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
-        ("    - namespaceSelector:\n        matchLabels:\n          kubernetes.io/metadata.name: gke-gmp-system\n",
-         "    - namespaceSelector: {}\n"),
+        ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: gke-gmp-system\n",
+         "        - namespaceSelector: {}\n"),
         "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
         "drop the matchLabels from the inject fence's collector peer, the edit "
         "that reads as \"admit Prometheus wherever it runs\" and admits every "
@@ -1260,7 +1260,7 @@ Mutation(
     Mutation(
         "C1-a2a-gateway-collector-to-a-door-port",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
-        ("    ports:\n    - port: 9096\n", "    ports:\n    - port: 8099\n"),
+        ("      ports:\n        - port: 9096\n", "      ports:\n        - port: 8099\n"),
         "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
         "point the inject fence's collector rule at the inject door's port, so "
         "the collector's namespace reaches a task-submission endpoint guarded "
@@ -1269,9 +1269,9 @@ Mutation(
     Mutation(
         "C1-a2a-gateway-second-ingress-rule",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
-        ("    ports:\n    - port: 9096\n      protocol: TCP\n  podSelector:",
-         "    ports:\n    - port: 9096\n      protocol: TCP\n  - from:\n    - podSelector: {}\n"
-         "    ports:\n    - port: 8098\n      protocol: TCP\n  podSelector:"),
+        ("      ports:\n        - port: 9096\n          protocol: TCP\n  podSelector:",
+         "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
         "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
         "add a second rule beside the collector's, admitting every pod in the "
         "namespace to the A2A door's port: the 'an in-cluster caller needs the "

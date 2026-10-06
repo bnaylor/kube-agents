@@ -1354,6 +1354,44 @@ install with no `discord-bot` Secret and this door armed gets its gateway rather
 identity classes above are what will let it be rendered on an install a customer reaches; until
 then it is a dev and eval door like the other.
 
+## Metrics (added 10/6)
+
+The gateway serves Prometheus counters on a metrics-only listener, the credential broker's
+pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any other
+method 405), every interface rather than loopback because its caller is the managed-Prometheus
+collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
+value that is not a port, or is either door's port, refuses the boot. A port that will not bind
+costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
+renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
+constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
+`PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
+gateway's NetworkPolicy, rendered while either door is armed, admits one peer: the
+`gke-gmp-system` namespace, to 9096 alone, the broker's second rule with the gateway's port in it.
+The doors' ports admit no pod. On an install with neither door armed no policy selects the gateway
+pod, and the metrics port is as reachable from the pod network as the rest of that pod.
+
+Every label value comes from a closed list, never from a task, a conversation or an executor's
+text, so nothing a chat user or an executor sends can mint a series:
+
+| Metric                                               | Labels                                                                                                       | Counts                                                                                                                                                                                                          |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_a2a_gateway_task_terminals_total`        | `state`: `completed`, `failed`, `canceled`, `rejected`, `other`; `source`: `executor`, `supervisor`, `other` | Each task terminal the relay delivers to a conversation (`relayTerminal`), by its final state and by whose word it is: the executor's on the events subject or the supervisor's on the supervisor subject.      |
+| `kubeagents_a2a_gateway_gchat_events_received_total` | none                                                                                                         | Google Chat events pulled from the broker's relay, before parsing or classification. A payload that does not parse, or an event that is not a turn, still counts.                                               |
+| `kubeagents_a2a_gateway_gchat_pulls_total`           | `outcome`: `events`, `empty`, `failed`                                                                       | Pulls of the Chat relay: one that returned an event, one that returned nothing, one the relay refused or that never answered. The same counts as the 15-minute `gchat events received` line, without the reset. |
+
+Every series is created at zero, so a `rate()` over a state that has not happened reads 0
+rather than no data. A pull carries at most one event today, so `gchat_events_received_total`
+equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
+pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
+and `events` flat; a refused relay shows `failed` rising.
+
+The terminal counter is the relay's, not every terminal a caller can see. Three routes deliver a
+terminal to the adapter without the relay and are not counted: the stale-task heal, which
+delivers the terminal the relay missed; the never-started heal (`gateway-never-started`); and a
+submission that never reached the bus (`gateway`). The executor's reason token is not a label.
+The gateway does not know the executors' tokens, which are theirs to define, so it has no closed
+list to draw one from, and an open one is the cardinality the labels exist to avoid.
+
 ## What stage 2 builds from this doc
 
 - The gateway: Discord, Google Chat and Slack adapters, session manager (spawn / stream
