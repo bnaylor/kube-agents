@@ -4495,7 +4495,11 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 // the bus, and LiteLLM. Delete it while the CR sits Degraded over an unrelated
 // bad CIDR and the confinement is gone from pods that are still running, with
 // the status naming the CIDR and saying nothing about the fence.
-func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+//
+// gatewayFenced reports whether this pass applied the gateway's own fence.
+// reconcileA2A reads it so that fence is written once per pass (see the
+// gateway section there); the refusal path has no use for it.
+func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (gatewayFenced bool, err error) {
 	dnsClusterIPs := r.a2aSessionDNSClusterIPs(ctx, agent)
 	fences := []*networkingv1.NetworkPolicy{
 		buildA2ANATSNetworkPolicy(agent),
@@ -4519,27 +4523,31 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
-	// the refusal-path rescue, so it is applied over a gateway that exists;
-	// the first render's write is reconcileA2A's, just ahead of the
-	// Deployment it fences. Not applied when the Deployment is absent, so a
-	// gateway withheld for want of a backend, or held for the callout, does
-	// not get a fence over nothing. Read from the cache: Deployment is an
-	// Owns() kind. A stale hit renders a fence the next dark pass removes;
-	// a stale miss skips it for one pass on the refusal path only.
+	// the refusal-path rescue, so it is applied over a gateway that exists.
+	// On the first render the Deployment is absent here, and reconcileA2A
+	// writes the fence itself just ahead of the Deployment it fences; it
+	// does so only when this pass reports it did not, so a running install
+	// applies it once per pass, not twice. Not applied when the Deployment
+	// is absent, so a gateway withheld for want of a backend, or held for the
+	// callout, does not get a fence over nothing. Read from the cache:
+	// Deployment is an Owns() kind. A stale hit renders a fence the next dark
+	// pass removes; a stale miss skips it for one pass on the refusal path
+	// only (on the render path reconcileA2A picks it up).
 	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
 		fences = append(fences, buildA2AGatewayFencePolicy(agent))
+		gatewayFenced = true
 	} else if !errors.IsNotFound(err) {
-		return err
+		return false, err
 	}
 	for _, np := range fences {
 		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
-			return err
+			return false, err
 		}
 		if err := r.applyManaged(ctx, agent, np); err != nil {
-			return fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
+			return false, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
 		}
 	}
-	return nil
+	return gatewayFenced, nil
 }
 
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
@@ -4628,7 +4636,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// disappear with the stack they fence — including the skew freeze, where a
 	// frozen, running bus keeps its ingress policy and the workers on it keep
 	// their egress one.
-	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	gatewayFenced, err := r.reconcileA2ANetworkFences(ctx, agent)
+	if err != nil {
 		return state, err
 	}
 
@@ -4957,12 +4966,23 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// listener never binds on a pod no policy selects. Every next gateway
 	// gets it, door or no door (#2473, 2026-10-06); see
 	// buildA2AGatewayNetworkPolicy for why.
-	fence := buildA2AGatewayFencePolicy(agent)
-	if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
-		return state, err
-	}
-	if err := r.applyManaged(ctx, agent, fence); err != nil {
-		return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
+	//
+	// Applied here only when the fences pass above did not apply it. That
+	// pass writes it whenever its cached read finds the Deployment, which it
+	// must, for the refusal path that never reaches this section; writing it
+	// again here would be a second identical SSA request on every pass of a
+	// running install. Keyed on what the fences pass reports, not on a
+	// second read of the Deployment, so the two reads cannot disagree into a
+	// pass that applies the Deployment and no fence: either that pass wrote
+	// it or this one does, and both run before the Deployment apply below.
+	if !gatewayFenced {
+		fence := buildA2AGatewayFencePolicy(agent)
+		if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, fence); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
+		}
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)

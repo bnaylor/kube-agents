@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -261,13 +262,13 @@ func TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest(t *testing.T) {
 	agent.UID = types.UID("a2a-gateway-metrics-uid")
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
-	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2ANetworkFences: %v", err)
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, buildA2AGatewayDeployment(agent)); err != nil {
 		t.Fatalf("applyA2AGatewayDeployment: %v", err)
 	}
-	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2ANetworkFences over a running gateway: %v", err)
 	}
 
@@ -496,7 +497,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
 			t.Fatalf("precondition: the fence was not there to delete: %v", err)
 		}
-		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
 		assertA2AGatewayFence(t, ctx, cl, agent)
@@ -507,7 +508,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		t.Setenv(a2aAgentDoorEnvVar, "")
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
-		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
@@ -561,4 +562,64 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 			t.Errorf("the gateway's fence, standing alone, survived the flip (err=%v): the early exit does not key on it", err)
 		}
 	})
+}
+
+// TestTheA2AGatewayFenceIsAppliedOncePerPass counts the server-side applies of
+// the gateway's own fence and of the gateway Deployment, in order, across one
+// reconcileA2A: the pass that first renders the gateway, then a pass over the
+// running install. Each pass applies the fence exactly once, and ahead of the
+// Deployment, so the first render never runs the pod unfenced and a running
+// install does not pay two identical SSA requests for it (#2473 round 3: the
+// fences pass and the render section both wrote it on every pass).
+func TestTheA2AGatewayFenceIsAppliedOncePerPass(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	ctx := context.Background()
+	agent := a2aTestAgent()
+
+	var applies []string
+	funcs := assigningUIDsOnCreate(fakeServerSideApplyInterceptors())
+	inner := funcs.Patch
+	funcs.Patch = func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if patch.Type() == types.ApplyPatchType && obj.GetNamespace() == agent.Namespace {
+			switch o := obj.(type) {
+			case *networkingv1.NetworkPolicy:
+				if o.Name == a2aGatewayFenceKey(agent).Name {
+					applies = append(applies, "fence")
+				}
+			case *appsv1.Deployment:
+				if o.Name == a2aGatewayName(agent) {
+					applies = append(applies, "deployment")
+				}
+			}
+		}
+		return inner(ctx, cl, obj, patch, opts...)
+	}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent), discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	// The helper's own pass holds the gateway (no callout serves yet), so it
+	// renders neither; the precondition says so rather than assuming it.
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if len(applies) != 0 {
+		t.Fatalf("precondition: the held pass applied %v, want nothing of the gateway's", applies)
+	}
+
+	want := []string{"fence", "deployment"}
+	for _, pass := range []string{"first render", "running install"} {
+		applies = nil
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatalf("%s: reconcileA2A: %v", pass, err)
+		}
+		if !reflect.DeepEqual(applies, want) {
+			t.Errorf("%s: gateway applies in order %v, want %v (the fence once, ahead of the Deployment)", pass, applies, want)
+		}
+	}
+	assertA2AGatewayFence(t, ctx, cl, agent)
 }
