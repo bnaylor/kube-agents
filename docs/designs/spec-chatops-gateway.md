@@ -1084,11 +1084,12 @@ refs feed the credential broker's own Socket Mode connection on the legacy path
 connection it has open, so two consumers would split one workspace's messages. The mode
 chooses, as it does for Chat: under `next` the broker is not handed the pair and the Hermes
 slack platform and its relay env are off (`legacySlackConsumer`); under `today`, or under
-`next` while Chat holds the gateway, the legacy path keeps Slack. Two things do not carry
+`next` while Chat holds the gateway, the legacy path keeps Slack. Three things do not carry
 over on the flip: `allowedUsers` is the legacy consumer's gate, and the gateway's is the
-principal map below; and the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one
+principal map below; the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one
 token per workspace, where the gateway's adapter takes one token, so a multi-workspace
-install stays on `today`.
+install stays on `today`; and `homeChannel` goes with the Hermes slack platform, so proactive
+alerts have no Slack target under `next`, the cost the Chat section states for Chat.
 
 **Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
 threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
@@ -1136,7 +1137,9 @@ gateway's principal-map path, same file format the Discord ConfigMap uses.
 the Discord table at the gateway's one principal-map path, optional, so an install without
 its table is the gateway's own case (it runs, and every Slack sender drops at verification,
 with the warning the gateway logs when the map is empty altogether; a Discord table in the same
-projection keeps it non-empty). Nothing in-tree creates its content. A
+projection keeps it non-empty). The gateway reads the map once, at start, so a table
+created or edited after the gateway is running takes effect at its next restart. Nothing
+in-tree creates its content. A
 Secret rather than a ConfigMap because a
 write to this table grants a principal - it is an impersonation primitive, and it holds
 emails besides. Write access is the install admin's, through the install path. No
