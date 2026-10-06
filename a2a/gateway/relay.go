@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -16,6 +17,24 @@ const discordChunk = 1900
 // progressCap bounds the progress text embedded in rolling lines and status
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
+
+// The terminal log line carries the executor's reason token and never the
+// detail after it. Executors write the terminal message as
+// `reason: <token>[ - detail]` (docs/designs/eval-next-transport.md), and the
+// detail is free text from the executor or the bus: the bridge puts the tails
+// of the Hermes subprocess's stdout and stderr there, which can hold anything
+// the model or a tool printed. The token is taken the way the eval harness
+// takes it (bench/kube_agents_bench/inject_transport.py, REASON_PREFIX): strip
+// the prefix, read up to the first whitespace. A token longer than
+// reasonTokenCap, or with a byte outside [A-Za-z0-9._-], is logged as
+// reasonTokenMalformed, which no executor token can equal because its
+// parentheses are outside that set. No prefix logs an empty reason, the
+// harness's "no token".
+const (
+	reasonPrefix         = "reason: "
+	reasonTokenCap       = 64
+	reasonTokenMalformed = "(malformed)"
+)
 
 // KV access rides withRetry with these shapes: enough to ride out a
 // connection rebuild window without inventing a second resilience layer,
@@ -352,7 +371,52 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
+	// The outcome side of the "ingress" line: same keys, so one task's two
+	// ends join on taskId. Chat already showed the user the reason; the log
+	// keeps only its token (reasonToken), so a failing install's log says
+	// how each task ended without copying executor output into it. The
+	// addressee is the one the task was published to, which is what ingress
+	// logged; after a Delegate re-home rec.Addressee is not it.
+	g.log.Info("task terminal",
+		"taskId", taskID,
+		"conversation", rec.Key,
+		"addressee", rec.AddresseeFor(taskID),
+		"state", s.Status.State,
+		"source", source,
+		"reason", reasonToken(reason))
 	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, source, reason)
+}
+
+// reasonToken is the token of an executor's `reason: <token>[ - detail]`
+// terminal message, safe to log: bounded, one line, no detail. See
+// reasonPrefix for the rule and why the detail stays out.
+func reasonToken(reason string) string {
+	rest, ok := strings.CutPrefix(reason, reasonPrefix)
+	if !ok {
+		return ""
+	}
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" || len(rest) > reasonTokenCap {
+		return reasonTokenMalformed
+	}
+	for i := 0; i < len(rest); i++ {
+		if !isReasonTokenByte(rest[i]) {
+			return reasonTokenMalformed
+		}
+	}
+	return rest
+}
+
+func isReasonTokenByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '-', c == '_', c == '.':
+		return true
+	}
+	return false
 }
 
 // updateRollingLine edits the task's single status message in place. Under
