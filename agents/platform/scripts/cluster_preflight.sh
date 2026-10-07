@@ -76,7 +76,12 @@ if len(raw) > limit:
     sys.exit(INVALID)
 try:
     document = yaml.safe_load(raw.decode("utf-8", errors="replace"))
-except (yaml.YAMLError, RecursionError) as exc:
+# The safe constructors raise plain exceptions, not YAMLError, for a scalar they
+# cannot build: an unquoted 2001-13-45 anywhere in the file is a ValueError, and
+# an explicit tag on a value that does not fit it can be a ValueError, KeyError,
+# IndexError or AttributeError. Only safe_load runs in this try, so each is the
+# file, not the reader.
+except (yaml.YAMLError, RecursionError, ValueError, LookupError, AttributeError) as exc:
     print(f"not parseable as YAML: {exc}", file=sys.stderr)
     sys.exit(INVALID)
 if not isinstance(document, dict):

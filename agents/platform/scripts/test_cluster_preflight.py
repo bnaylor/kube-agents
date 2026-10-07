@@ -367,6 +367,25 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertIn("not a valid kubeconfig", result["reason"])
         self.assertIn("Re-scaffold", result["remediation"])
 
+    def test_a_scalar_pyyaml_cannot_construct_reports_check_3_as_invalid(self):
+        # PyYAML's safe constructors raise plain Python exceptions, not
+        # yaml.YAMLError, for a scalar they cannot build: an impossible date
+        # anywhere in the file (ValueError), or an explicit tag on a value that
+        # does not fit it (ValueError, KeyError, IndexError, AttributeError).
+        for tail in (
+            "x: 2001-13-45\n",
+            "x: !!int abc\n",
+            "x: !!bool abc\n",
+            'x: !!int ""\n',
+            "x: !!timestamp abc\n",
+        ):
+            with self.subTest(tail=tail):
+                self.write_raw_kubeconfig(f"current-context: {EXPECTED_CONTEXT}\n{tail}")
+                result = self.run_preflight()
+                self.assertEqual("3", result["check"])
+                self.assertIn("not a valid kubeconfig", result["reason"])
+                self.assertIn("not parseable as YAML", result["evidence"])
+
     def test_a_kubeconfig_that_is_not_a_mapping_reports_check_3(self):
         self.kubeconfig.write_text("- just\n- a list\n", encoding="utf-8")
         result = self.run_preflight()
