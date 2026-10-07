@@ -19,8 +19,9 @@ EXPECTED_CONTEXT = f"gke_{PROJECT}_{LOCATION}_{CLUSTER}"
 # the hanging fake sleeps: a run this fast cannot have waited on either.
 PREFLIGHT_FAST_SECONDS = 10
 
-# One byte past the reader's 1 MiB cap (KUBECONFIG_READ_MAX_BYTES).
-KUBECONFIG_OVER_CAP_BYTES = 1 << 20
+# Padding one byte longer than the reader's 1 MiB cap (KUBECONFIG_READ_MAX_BYTES),
+# so the file is over it however small the rest of the fixture gets.
+KUBECONFIG_OVER_CAP_BYTES = (1 << 20) + 1
 
 # A fake `kubectl` covering only the three invocations the preflight makes. It
 # reads the context out of a kubeconfig the way the real one does, so a test
@@ -37,6 +38,11 @@ KUBECONFIG_OVER_CAP_BYTES = 1 << 20
 #   FAKE_KUBECONFIG_FLAG_HANGS - make `--kubeconfig=<file> config current-context`
 #                            hang past the preflight's 15s cap, the way a request
 #                            queued behind a saturated credential broker does.
+#                            Only that form, the one check 3 used to run: a real
+#                            broker queues check 4's call too (see the timeout
+#                            test below).
+#   FAKE_CONFIG_TIMES_OUT  - make `config current-context` exit 124, as the
+#                            preflight's `timeout` wrapper does when it fires.
 #   FAKE_KUBECTL_LOG       - append every argv the fake receives to this file.
 #
 # The context is read with PyYAML, as the credential-proxy shim reads it, so a
@@ -47,7 +53,7 @@ FAKE_KUBECTL = textwrap.dedent(
     set -u
     from_file() {
         python3 -c 'import sys, yaml
-    doc = yaml.safe_load(open(sys.argv[1])) or {}
+    doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8", errors="replace")) or {}
     print(doc.get("current-context") or "")' "$1"
     }
     [ -n "${FAKE_KUBECTL_LOG:-}" ] && printf '%s\\n' "$*" >>"$FAKE_KUBECTL_LOG"
@@ -63,6 +69,7 @@ FAKE_KUBECTL = textwrap.dedent(
 
     case "${ARGS[*]}" in
         "config current-context")
+            [ -n "${FAKE_CONFIG_TIMES_OUT:-}" ] && exit 124
             if [ -n "${FAKE_CONFIG_FAILS:-}" ]; then
                 echo "credential proxy unavailable: [Errno 111] Connection refused" >&2
                 exit 1
@@ -248,12 +255,34 @@ class ClusterPreflightTest(unittest.TestCase):
     # request queued at the broker. Check 3 reads the pinned file itself.
 
     def test_check_3_passes_while_kubectl_on_the_pinned_file_hangs(self):
-        # The today-mode smoke failure: the shim's request for check 3 queued past
-        # the 15s cap on a busy broker and a correct pin failed.
+        # The today-mode smoke failure at check 3: the shim's request for it
+        # queued past the 15s cap on a busy broker and a correct pin failed.
+        # Check 4 still asks the broker, and the next test covers it timing out.
         start = time.monotonic()
         result = self.run_preflight(FAKE_KUBECONFIG_FLAG_HANGS="1")
         self.assertEqual("ok", result["status"], result)
         self.assertLess(time.monotonic() - start, PREFLIGHT_FAST_SECONDS)
+
+    def test_a_busy_broker_fails_check_4_as_a_proxy_problem_not_a_bad_pin(self):
+        # With check 3 local, check 4 is the first call through the proxy, so a
+        # saturated broker now times out there. It must say so, not report that
+        # plain kubectl is talking to another cluster.
+        result = self.run_preflight(FAKE_CONFIG_TIMES_OUT="1")
+        self.assertEqual("4", result["check"])
+        self.assertIn("kubectl itself failed", result["reason"])
+        self.assertIn("timed out after 15s", result["evidence"])
+        self.assertIn("not saturated", result["remediation"])
+        self.assertNotIn("another cluster", result["remediation"])
+
+    def test_a_non_utf8_byte_reads_as_the_shim_reads_it(self):
+        # The shim decodes with replacement before parsing; a stray Latin-1 byte
+        # in a comment must not fail check 3 while every proxied kubectl works.
+        self.kubeconfig.write_bytes(
+            b"apiVersion: v1\ncurrent-context: "
+            + EXPECTED_CONTEXT.encode()
+            + b"\n# caf\xe9\n"
+        )
+        self.assertEqual("ok", self.run_preflight()["status"])
 
     def test_check_3_runs_no_kubectl_against_the_pinned_file(self):
         log = Path(self._tmp.name) / "kubectl.log"

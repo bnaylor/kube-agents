@@ -36,10 +36,10 @@ set -u
 # path and the size cap as arguments. It answers with its exit status, and on
 # success prints the `current-context` (nothing when the file names none).
 #
-# PyYAML's `safe_load` because it is what the kubectl shim itself uses to read
-# the same key out of the same file (credential_proxy_client.read_current_context),
-# so this check and every proxied kubectl cannot disagree about what the file
-# selects. The sandbox image installs it for the bare python3
+# PyYAML's `safe_load` on the text decoded as UTF-8 with replacement, because
+# that is how the kubectl shim reads the same key out of the same file
+# (credential_proxy_client.kubeconfig_context and read_current_context), so the
+# two take the same context from it. The sandbox image installs it for the bare python3
 # (deploy/sandbox/Dockerfile, `pip install ... pyyaml`). `-I` keeps a `yaml.py`
 # in the caller's working directory, or a PYTHONPATH, from standing in for it.
 readonly KUBECONFIG_READ_MAX_BYTES=1048576
@@ -53,6 +53,9 @@ readonly RC_TIMED_OUT=124
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
+# How much of a failing command's stderr goes into the evidence, so it stays one
+# readable line on the kanban card.
+readonly ERR_MAX_CHARS=500
 readonly KUBECONFIG_CONTEXT_READER='
 import sys
 UNREADABLE, INVALID, NO_PARSER = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
@@ -72,7 +75,7 @@ if len(raw) > limit:
     print(f"larger than {limit} bytes", file=sys.stderr)
     sys.exit(INVALID)
 try:
-    document = yaml.safe_load(raw)
+    document = yaml.safe_load(raw.decode("utf-8", errors="replace"))
 except (yaml.YAMLError, RecursionError) as exc:
     print(f"not parseable as YAML: {exc}", file=sys.stderr)
     sys.exit(INVALID)
@@ -234,7 +237,7 @@ if [ "$STATUS" = "ok" ]; then
         "$KUBECONFIG_READ_MAX_BYTES" "$KUBECONFIG_READ_RC_UNREADABLE" \
         "$KUBECONFIG_READ_RC_INVALID" "$KUBECONFIG_READ_RC_NO_PARSER" 2>"$CTX_ERR_FILE")"
     CTX_RC=$?
-    CTX_ERR="$(tr '\n' ' ' <"$CTX_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-500)"
+    CTX_ERR="$(tr '\n' ' ' <"$CTX_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-"$ERR_MAX_CHARS")"
     rm -f "$CTX_ERR_FILE"
 
     if [ "$CTX_RC" -eq "$KUBECONFIG_READ_RC_UNREADABLE" ]; then
@@ -296,7 +299,7 @@ if [ "$STATUS" = "ok" ]; then
         EFFECTIVE_RAW="$(capped kubectl config current-context 2>"$EFFECTIVE_ERR_FILE")"
         EFFECTIVE_RC=$?
         EFFECTIVE_CONTEXT="$(printf '%s' "$EFFECTIVE_RAW" | tr -d '[:space:]')"
-        EFFECTIVE_ERR="$(tr '\n' ' ' <"$EFFECTIVE_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-500)"
+        EFFECTIVE_ERR="$(tr '\n' ' ' <"$EFFECTIVE_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-"$ERR_MAX_CHARS")"
         rm -f "$EFFECTIVE_ERR_FILE"
         [ "$EFFECTIVE_RC" -eq "$RC_TIMED_OUT" ] && EFFECTIVE_ERR="timed out after ${KUBECTL_CAP_SECONDS}s"
         if [ "$EFFECTIVE_RC" -ne 0 ]; then
