@@ -5988,6 +5988,26 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     self.assertIn(f"{path} records {key}=", out)
                     self.assertEqual(path.read_text(), content)
 
+    def test_an_empty_topic_or_mode_is_refused_as_empty_not_as_the_default(self):
+        # Empty would become the default before the check, and the refusal
+        # would then name, and tell the operator to adopt, a topic nobody typed.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flag in (
+                ("CHAT_TOPIC_NAME=my-topic\n", "--chat-topic-name"),
+                ("GOOGLE_CHAT_MODE=debug\n", "--google-chat-mode"),
+                ("PROJECT_ID=p\n", "--chat-topic-name"),
+                ("PROJECT_ID=p\n", "--google-chat-mode"),
+            ):
+                with self.subTest(content=content, flag=flag):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args {flag}= && resolve_shared_defaults && {self._CHECK}", path)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn(f"{flag}= was given an empty value.", out)
+                    self.assertNotIn("platform-agent-chat-events", out)
+                    self.assertNotIn("disagrees with the install configuration", out)
+                    self.assertEqual(path.read_text(), content)
+
     def test_the_menu_is_offered_only_for_keys_it_saves(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, slack_users = self._check(tmp, "SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=U2")

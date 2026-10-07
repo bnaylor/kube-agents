@@ -157,7 +157,8 @@ re-run without the flag. The menu is not offered for the topic, which it does no
 for `SLACK_ENABLED`, which it turns on without asking for the tokens; to turn Slack on, set the
 key and re-run with `--slack-bot-token` and `--slack-app-token`. A key with a default (the toggles, the topic, the Chat mode) that
 the file sets empty counts as that default, and the two allowlists compare as the lists they
-render to, so `a,b` and `a, b` agree. `--chat-sub-name` is not held: on a running install the
+render to, so `a,b` and `a, b` agree. `--chat-topic-name=` and `--google-chat-mode=` given an
+empty value are refused, as an empty toggle is, rather than read as the default. `--chat-sub-name` is not held: on a running install the
 subscription name comes from Terraform state, ahead of both the flag and the file. A flag
 whose key the file does not assign at all is appended to the file with the value the run
 applies, as the last step before the apply or the `--generate-only` handoff, so a run refused,

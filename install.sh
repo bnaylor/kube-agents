@@ -821,6 +821,20 @@ validate_bool_flag_value() {
   fi
 }
 
+# The two chat flags with a default, given nothing. resolve_shared_defaults
+# turns an empty value into the default, so over an install.env recording
+# another topic or mode the refusal in check_flag_against_install_env would
+# name a value nobody typed and tell the operator to adopt it, and with no file
+# the run would apply the default where a wrapper meant to pass something.
+# Refused, like an empty toggle.
+require_defaulted_flag_value() {
+  local flag="$1" value="${2:-}"
+  [ -z "$value" ] || return 0
+  print_error "${flag}= was given an empty value."
+  print_info "Pass ${flag} with a value, or leave it out to take the one install.env records (or the default)."
+  exit 1
+}
+
 # A scope flag given nothing cannot mean "leave the recorded scope alone" (the
 # flag is what overrides the file for one run) and must not mean "drop every
 # project" in silence: applied, an empty --scope-projects= would revoke the
@@ -1006,11 +1020,13 @@ parse_args() {
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_CHAT_TOPIC_NAME"
         note_install_env_flag CHAT_TOPIC_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_CHAT_TOPIC_NAME DEFAULT_CHAT_TOPIC_NAME
         shift ;;
       --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*)
         PARAM_GOOGLE_CHAT_MODE="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_GOOGLE_CHAT_MODE"
         note_install_env_flag GOOGLE_CHAT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_MODE DEFAULT_GOOGLE_CHAT_MODE
         shift ;;
       --google-chat-home-channel=*)
