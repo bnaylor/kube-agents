@@ -23,11 +23,13 @@ PREFLIGHT_FAST_SECONDS = 10
 # so the file is over it however small the rest of the fixture gets.
 KUBECONFIG_OVER_CAP_BYTES = (1 << 20) + 1
 
-# A fake `kubectl` covering only the three invocations the preflight makes. It
-# reads the context out of a kubeconfig the way the real one does, so a test
-# fixes the *file* and the script's own logic decides the verdict.
+# A fake `kubectl` covering only the two invocations the preflight makes (check
+# 4's `config current-context`, check 5's `cluster-info`), plus the
+# `--kubeconfig=<file>` form check 3 used to run, kept so a test can make it
+# hang. It reads the context out of a kubeconfig the way the real one does, so
+# a test fixes the *file* and the script's own logic decides the verdict.
 #
-# Two knobs reproduce the failure modes that matter:
+# These knobs reproduce the failure modes that matter:
 #   FAKE_AMBIENT_CONTEXT   - what a plain `kubectl` resolves to when it ignores
 #                            KUBECONFIG, i.e. the credential-proxy sidecar's own
 #                            context leaking in. Unset means KUBECONFIG is honoured.
@@ -285,12 +287,17 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertEqual("ok", self.run_preflight()["status"])
 
     def test_check_3_runs_no_kubectl_against_the_pinned_file(self):
+        # A passing run makes exactly the kubectl calls checks 4 and 5 own, in
+        # order. The whole list is compared, not filtered for one spelling: a
+        # check 3 back on the broker as `env KUBECONFIG=... kubectl config
+        # current-context` (the form check 5 uses) logs the same argv as check
+        # 4's plain call, and only the extra entry gives it away.
         log = Path(self._tmp.name) / "kubectl.log"
         self.assertEqual("ok", self.run_preflight(FAKE_KUBECTL_LOG=str(log))["status"])
         calls = log.read_text(encoding="utf-8").splitlines()
-        self.assertEqual([], [c for c in calls if "--kubeconfig" in c], calls)
-        # Check 4 still asks a plain kubectl, which is the point of check 4.
-        self.assertIn("config current-context", calls)
+        self.assertEqual(
+            ["config current-context", "cluster-info --request-timeout=8s"], calls
+        )
 
     def test_reads_a_double_quoted_context(self):
         self.write_raw_kubeconfig(f'current-context: "{EXPECTED_CONTEXT}"\n')
