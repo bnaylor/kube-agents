@@ -5361,9 +5361,10 @@ class PlatformAgentModeTest(unittest.TestCase):
             for content, flag, recorded, says in (
                 ("PLATFORM_AGENT_MODE=today\n", "next", "today", "records PLATFORM_AGENT_MODE=today"),
                 ("PLATFORM_AGENT_MODE=next\n", "today", "next", "records PLATFORM_AGENT_MODE=next"),
-                # A file that records nothing resolves to the default, and so
-                # does the next run from it: a one-run switch all the same.
-                ("PROJECT_ID=p\n", "next", "today", "records no PLATFORM_AGENT_MODE, which is today"),
+                # A key set empty resolves to the default, and so does the next
+                # run from it: a one-run switch all the same. (A file with no
+                # key at all takes the flag: test_the_flag_fills_in_a_missing_key.)
+                ("PLATFORM_AGENT_MODE=\n", "next", "today", "sets PLATFORM_AGENT_MODE empty, which is today"),
             ):
                 with self.subTest(content=content, flag=flag):
                     path = self._file(tmp, content)
@@ -5380,15 +5381,48 @@ class PlatformAgentModeTest(unittest.TestCase):
                     self.assertIn("docs/designs/spec-mode-switch.md", out)
                     self.assertEqual(path.read_text(), content, "the file is never rewritten")
 
+    def test_the_flag_fills_in_a_missing_key(self):
+        # A hand-written install.env, or one copied from install.env.example
+        # with the line still commented out, sets no mode: --mode is appended
+        # rather than refused, nothing else in the file changes, and the next
+        # run reads it back.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, mode in (
+                ("PROJECT_ID=p\n# PLATFORM_AGENT_MODE=today\n", "next"),
+                ("PROJECT_ID=p", "next"),  # no trailing newline
+                ("PROJECT_ID=p\n", "today"),
+            ):
+                with self.subTest(content=content, mode=mode):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f'parse_args --mode={mode}; rc=0; validate_platform_agent_mode || rc=$?; echo "rc=$rc"',
+                        install_env=path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0", proc.stdout, out)
+                    self.assertIn(f"Recorded PLATFORM_AGENT_MODE={mode} in {path}, which set none", out)
+                    expected = content if content.endswith("\n") else content + "\n"
+                    self.assertEqual(path.read_text(), expected + f"PLATFORM_AGENT_MODE={mode}\n")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                    again = self._run('echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"', install_env=path)
+                    self.assertIn(f"MODE=[{mode}]", again.stdout, again.stderr)
+
+    def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(
+                'parse_args --dry-run --mode=next; rc=0; validate_platform_agent_mode || rc=$?; echo "rc=$rc"',
+                install_env=path,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("a run without --dry-run records PLATFORM_AGENT_MODE=next there", proc.stdout + proc.stderr)
+            self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
     def test_a_shell_export_reaches_a_first_install_and_not_a_recorded_one(self):
         # A first install keeps the environment and records it; once the file
         # exists it is the only way in, as for the scope keys.
         with tempfile.TemporaryDirectory() as tmp:
-            first = self._run(
-                'echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"',
-                install_env=pathlib.Path(tmp) / "absent.install.env",
-                extra_env={"KUBE_AGENTS_INSTALL_ENV": "", "PLATFORM_AGENT_MODE": "next"},
-            )
+            first = self._run_from_fallback(tmp, 'echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"', {"PLATFORM_AGENT_MODE": "next"})
             later = self._run(
                 'echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"',
                 install_env=self._file(tmp, "PROJECT_ID=p\n"),
@@ -5396,6 +5430,32 @@ class PlatformAgentModeTest(unittest.TestCase):
             )
         self.assertIn("MODE=[next]", first.stdout, first.stderr)
         self.assertIn("MODE=[]", later.stdout, later.stderr)
+
+    def _run_from_fallback(self, tmp, body, extra_env):
+        """Source a copy of install.sh with KUBE_AGENTS_INSTALL_ENV unset, from
+        a directory that is not a checkout and under a HOME of its own, so
+        every location the fallback tries (beside the script, the working
+        directory, the HOME clone) is inside tmp and empty. Sourcing the
+        checkout's install.sh would land on <repo>/install.env, the file a
+        developer who installs from this clone has."""
+        bare = pathlib.Path(tmp) / "bare"
+        home = pathlib.Path(tmp) / "home"
+        bare.mkdir()
+        home.mkdir()
+        shutil.copy(_INSTALL_SH, bare / "install.sh")
+        env = self._env({"HOME": str(home), **extra_env})
+        env.pop("KUBE_AGENTS_INSTALL_ENV", None)
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{bare / "install.sh"}"\n'
+            'echo "ENV=[$INSTALL_ENV_FILE]"\n'
+            f"{body}\n"
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=env, cwd=str(bare), stdin=subprocess.DEVNULL,
+        )
+        self.assertIn(f"ENV=[{home}/kube-agents/install.env]", proc.stdout, proc.stderr)
+        return proc
 
     def test_the_first_run_records_the_mode_and_the_next_run_reads_it_back(self):
         with tempfile.TemporaryDirectory() as tmp:

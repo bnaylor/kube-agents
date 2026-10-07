@@ -573,8 +573,9 @@ Flags for AI Agents & Automation:
                                 exists — its live shape wins.
   --mode=MODE                   The PlatformAgent's spec.mode: today | next. next also
                                 renders the NATS bus and the A2A gateway, a development
-                                stack. Recorded in install.env as PLATFORM_AGENT_MODE on
-                                a first install; on a later run, change that key instead
+                                stack. Recorded in install.env as PLATFORM_AGENT_MODE when
+                                the file sets none; one that sets it differently refuses
+                                the flag, so change that key instead
                                 (a mode switch: docs/designs/spec-mode-switch.md)
                                 (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
@@ -3876,21 +3877,50 @@ validate_platform_agent_mode() {
   fi
   [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ] || return 0
   [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ] || return 0
-  local recorded="" source_of_recorded
-  if install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
-    recorded="$(recorded_install_env_value "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE)"
+  # A file that does not assign the key at all (one written by hand, or
+  # copied from install.env.example with the line still commented out) has
+  # no mode to disagree with, so --mode fills it in, as a first install's
+  # bootstrap would have, and every later run keeps it.
+  if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    record_platform_agent_mode_flag "$value"
+    return 0
   fi
+  local recorded="" source_of_recorded
+  recorded="$(recorded_install_env_value "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE)"
   if [ -n "$recorded" ]; then
     source_of_recorded="${INSTALL_ENV_FILE} records PLATFORM_AGENT_MODE=${recorded}"
   else
     recorded="$DEFAULT_PLATFORM_AGENT_MODE"
-    source_of_recorded="${INSTALL_ENV_FILE} records no PLATFORM_AGENT_MODE, which is ${recorded}"
+    source_of_recorded="${INSTALL_ENV_FILE} sets PLATFORM_AGENT_MODE empty, which is ${recorded}"
   fi
   [ "$value" != "$recorded" ] || return 0
   print_error "--mode=${value} disagrees with the install configuration, so it would hold for this run only: ${source_of_recorded}."
-  print_info "The next run without the flag, and every upgrade.sh, reads the file and goes back to ${recorded}. install.sh records --mode only in an install.env it creates."
+  print_info "The next run without the flag, and every upgrade.sh, reads the file and goes back to ${recorded}. install.sh fills in --mode only where install.env sets no PLATFORM_AGENT_MODE; it does not change a key the file sets."
   print_info "Set PLATFORM_AGENT_MODE=${value} in ${INSTALL_ENV_FILE} and re-run without --mode. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}."
   return 1
+}
+
+# --mode against an install.env that sets no PLATFORM_AGENT_MODE: appended to
+# the file, the one write install.sh makes to an install.env it did not
+# create, and only of a key the file lacks, so nothing the operator wrote is
+# changed. Without it the flag would hold for this run alone and the next run,
+# or upgrade.sh, would go back to the default. A --dry-run says what it would
+# record and writes nothing. $1 the mode.
+record_platform_agent_mode_flag() {
+  local value="${1:?mode}" old_umask
+  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+    print_info "${INSTALL_ENV_FILE} sets no PLATFORM_AGENT_MODE; a run without --dry-run records PLATFORM_AGENT_MODE=${value} there."
+    return 0
+  fi
+  old_umask="$(umask)"
+  umask 077
+  # A last line with no newline would run into the appended assignment.
+  if [ -s "$INSTALL_ENV_FILE" ] && [ -n "$(tail -c 1 "$INSTALL_ENV_FILE")" ]; then
+    printf '\n' >> "$INSTALL_ENV_FILE"
+  fi
+  write_env_var "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE "$value"
+  umask "$old_umask"
+  print_info "Recorded PLATFORM_AGENT_MODE=${value} in ${INSTALL_ENV_FILE}, which set none: later runs and upgrade.sh keep this mode. Change it there, not with --mode (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
 }
 
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
@@ -5971,9 +6001,11 @@ main() {
   fi
   # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
   # it is named before the operator confirms the apply. Outside the gate
-  # above, so --dry-run and --generate-only say it too; the reads need this
-  # cluster's context, which the gate fetched for an applying run, and say
-  # nothing without one (a first install has no CR).
+  # above, so --dry-run and --generate-only say it too; it takes the reads the
+  # scope check in the gate just made, and reads for itself when the gate did
+  # not run. The reads need this cluster's context, which the gate fetched for
+  # an applying run, and say nothing without one (a first install has no CR);
+  # a read that fails says the check did not run.
   announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host

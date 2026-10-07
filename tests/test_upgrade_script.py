@@ -566,25 +566,36 @@ class UpgradeRunContractTest(unittest.TestCase):
 
     def test_the_mode_is_announced_on_a_full_upgrade_and_noted_on_a_retag(self):
         """A full apply carries PLATFORM_AGENT_MODE from install.env and says when
-        that switches the install; a retag reuses the release record and says
-        when a full upgrade would move the mode. Both run before the first arm,
-        against the same namespace the rest of the run uses."""
+        that switches the install, right after the scope check whose reads it
+        takes; a retag reuses the release record and says, from the values
+        retag_values just read, when a full upgrade would move the mode. Both
+        before their arm raises the apply gate."""
         source = _UPGRADE_SH.read_text()
-        announce = source.index(
-            '    announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"\n  else'
-        )
-        note = source.index(
-            'note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE"'
-        )
-        arms = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
-        generator = source.index('write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"')
-        self.assertLess(generator, announce)
-        self.assertLess(announce, note)
-        self.assertLess(note, arms)
-        self.assertIn('if [ "$PARAM_UPGRADE_MODE" = "full" ]; then', source[announce - 200 : announce])
-        # The plan says it too: it is the preview of the same full apply.
+        key = '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"'
+        dispatch = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
+        self.assertNotIn("platform_agent_mode_for", source[source.index('exit "$plan_status"'):dispatch])
+        for mode, after, call in (
+            ("full", 'refuse_apply_over_undeclared_scope "$target_namespace" || exit 1\n',
+             f'announce_platform_agent_mode_for_apply "$target_namespace" {key}\n'),
+            ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
+             f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
+            ("harness", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
+             f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
+        ):
+            with self.subTest(mode=mode):
+                arm_at = source.index(f"\n    {mode})\n", dispatch)
+                arm = source[arm_at : source.index("\n      ;;\n", arm_at)]
+                self.assertIn(call, arm)
+                self.assertLess(arm.index(after), arm.index(call))
+                self.assertLess(arm.index(call), arm.index('UPGRADE_APPLY_STARTED="true"'))
+        # The plan says it too, after the scope check whose reads it takes: it
+        # is the preview of the same full apply.
         plan = source.index('print_step "4. Planning (read-only)"')
-        self.assertIn("announce_platform_agent_mode_for_apply", source[plan : plan + 800])
+        block = source[plan : plan + 800]
+        self.assertLess(
+            block.index('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"'),
+            block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}"),
+        )
 
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.

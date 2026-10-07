@@ -411,7 +411,8 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 
 - **Component stack (`--mode`)**: `./install.sh --mode=next` installs with `spec.mode: next`, an
   unsupported development stack; the default is `today`. With an `install.env` you wrote
-  yourself, set `PLATFORM_AGENT_MODE=next` in it instead. Terraform takes `platform_agent_mode`,
+  yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
+  sets a different one. Terraform takes `platform_agent_mode`,
   the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
   `install.env` and re-run `install.sh` or a full `upgrade.sh`;
   [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key.

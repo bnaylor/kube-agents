@@ -56,7 +56,7 @@ their own copies:
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
-| `live_platform_agent_mode [namespace]`                                    | The mode the live CR carries, or nothing; a switch is announced against it             |
+| `read_platform_agent_install_state [namespace]`                           | The CR and release reads shared by the scope check and the mode notice                 |
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -367,13 +367,17 @@ cannot refuse a teardown.
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
 renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the default, on a first install, and from then on the file is
-the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
+takes `--mode` and records it, or the default, on a first install, appends a `--mode` to an
+`install.env` that sets no `PLATFORM_AGENT_MODE`, and from then on the file is the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
 shell, and a `--mode` that disagrees with what the file resolves to is refused rather than
 applied for one run, because the next run, and every `upgrade.sh`, which takes no `--mode`,
 would switch the install back. A switch is an edit to the key. Before an apply the front doors
 read the mode the live CR runs and the one the release's last served revision carries, and say
-when the apply moves the CR (`announce_platform_agent_mode_switch`). Helm patches the CR from
+when the apply moves the CR (`announce_platform_agent_mode_switch`), from the reads the scope
+check beside it made (`read_platform_agent_install_state`). No CR or no release is a first
+install and is quiet; a read that fails says the check did not run. The notice models the
+render from the key alone, so a `platformAgent.mode` in the composition's `extra_helm_values`,
+which wins, is not seen, and every notice says so. Helm patches the CR from
 the difference between that revision's render and the new one, and `today` renders no field,
 so the key removes a recorded mode, and sends no change at all when the record already renders
 it; a mode set on the CR by hand then stays, and the front doors name it rather than announce a

@@ -146,11 +146,16 @@ readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
 # The design document a spec.mode switch points the operator at.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
-# What release_platform_agent_mode and live_platform_agent_mode print for a
-# field that is not there: a record that carries no platformAgent.mode, or a
-# CR with no spec.mode. Told apart from printing nothing, which means nothing
-# could be read.
+# What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
+# a field that is not there: a record that carries no platformAgent.mode, or a
+# CR with no spec.mode. Told apart from printing nothing, which means there is
+# no CR.
 readonly PLATFORM_AGENT_MODE_UNSET="unset"
+# How each of read_platform_agent_install_state's reads came out.
+readonly PLATFORM_AGENT_READ_OK="ok"
+readonly PLATFORM_AGENT_READ_NONE="none"
+readonly PLATFORM_AGENT_READ_FAILED="failed"
+readonly PLATFORM_AGENT_READ_NO_CONTEXT="no-context"
 # The composition's two Helm releases, by their Terraform type and name: the
 # front doors ask the state whether it manages one before deciding what a
 # cert-manager or kube-agents release already on the cluster means.
@@ -359,55 +364,138 @@ is_valid_platform_agent_mode() {
   [[ "${1:-}" =~ ^(today|next)$ ]]
 }
 
-# The platformAgent.mode of the release revision Helm patches the CR from:
-# the latest revision when it served, otherwise the last one that did (a
-# failed upgrade leaves its values as the latest revision while the CR still
-# holds the served one, and Helm diffs the next render against the served
-# one, as refuse_apply_over_undeclared_scope and upgrade.sh's retag_values
-# also read it). PLATFORM_AGENT_MODE_UNSET when that revision has no mode.
-# Prints nothing when nothing can be read -- no context for this cluster, no
-# release, an unreadable record -- because the notice this feeds is a notice,
-# not a gate. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
+# The PlatformAgent and its release, read once for the scope check and the
+# mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
+# and then announce_platform_agent_mode_for_apply against the same namespace,
+# with nothing applied in between, so the reads this fills are held for the
+# notice (PLATFORM_AGENT_READS_HELD_FOR) and the notice takes and clears them
+# instead of asking the cluster again. A run whose scope check did not run
+# (an install.sh --dry-run, a first install) has the notice read for itself.
+#
+# Fills, for $1 namespace:
+#   PLATFORM_AGENT_CR_READ      PLATFORM_AGENT_READ_OK, _NONE (no PlatformAgent
+#                               type served: a cluster this chart never
+#                               reached), _FAILED, or _NO_CONTEXT (the
+#                               kubeconfig has no context for this cluster:
+#                               nothing was asked)
+#   PLATFORM_AGENT_CR_JSON      the `kubectl get platformagents -o json` list
+#   PLATFORM_AGENT_RECORD_READ  _OK, _NONE (no release) or _FAILED; empty when
+#                               the CR read did not answer, or $2 is "cr-only"
+#   PLATFORM_AGENT_RECORD_JSON  the latest revision's values ({} with no release)
+#   PLATFORM_AGENT_SERVED_JSON  the last served revision's values, only when
+#                               the latest did not serve (a failed or pending
+#                               upgrade); {} otherwise
+#   PLATFORM_AGENT_SERVED_REVISION  that revision's number, else empty
+#   PLATFORM_AGENT_SERVED_READ  _FAILED when that revision's values could not
+#                               be read, else empty
+#   PLATFORM_AGENT_READ_ERROR   the failed read's stderr, on one line
+# A missing type and a missing release are answers, told apart from a read
+# that failed by kubectl's and helm's exit status and their own error text,
+# never by empty output. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
 # (gke_context_name).
-release_platform_agent_mode() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" expected_ctx revision values
+read_platform_agent_install_state() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" scope="${2:-}" expected_ctx err_file served_rev
+  PLATFORM_AGENT_READS_HELD_FOR="$namespace"
+  PLATFORM_AGENT_CR_READ="" PLATFORM_AGENT_CR_JSON="" PLATFORM_AGENT_RECORD_READ=""
+  PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}" PLATFORM_AGENT_SERVED_READ=""
+  PLATFORM_AGENT_SERVED_REVISION=""
+  PLATFORM_AGENT_READ_ERROR=""
   expected_ctx="$(gke_context_name)"
-  kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1 || return 0
-  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: a
-  # missing release is an ordinary answer here, not an abort.
-  revision="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
+  if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
+    PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_NO_CONTEXT"
+    return 0
+  fi
+  err_file="$(mktemp)"
+  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
+  # misses classified below are ordinary answers, not aborts.
+  if ! PLATFORM_AGENT_CR_JSON="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>"$err_file")"; then
+    if grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN" "$err_file"; then
+      PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_NONE"
+    else
+      PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_FAILED"
+      PLATFORM_AGENT_READ_ERROR="$(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    fi
+    rm -f "$err_file"
+    return 0
+  fi
+  PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_OK"
+  if [ "$scope" = "cr-only" ]; then
+    rm -f "$err_file"
+    return 0
+  fi
+  if ! PLATFORM_AGENT_RECORD_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
+    if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
+      PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_NONE"
+    else
+      PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_FAILED"
+      PLATFORM_AGENT_READ_ERROR="$(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    fi
+    PLATFORM_AGENT_RECORD_JSON="{}"
+    rm -f "$err_file"
+    return 0
+  fi
+  rm -f "$err_file"
+  PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_OK"
+  # The last revision that served, and only when the latest did not (a
+  # failed or pending upgrade): its values are what the CR still holds, and
+  # what Helm diffs the next render against. On a healthy release the latest
+  # revision is the one record, so a hand edit that happens to restore an
+  # earlier scope is still a hand edit. A history that cannot be read leaves
+  # only the latest revision to compare against.
+  served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
     | python3 -c '
 import json, sys
 statuses = sys.argv[1].split()
-served = [r["revision"] for r in (json.load(sys.stdin) or []) if r.get("status") in statuses]
+revisions = json.load(sys.stdin) or []
+latest = max(revisions, key=lambda r: r["revision"], default=None)
+served = [] if latest is None or latest.get("status") in statuses else [
+    r["revision"] for r in revisions if r.get("status") in statuses
+]
 print(max(served) if served else "")
-' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null)" || return 0
-  [ -n "$revision" ] || return 0
-  values="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$revision" -o json 2>/dev/null)" || return 0
-  printf '%s' "$values" | (trap - ERR; python3 -c '
+' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
+  PLATFORM_AGENT_SERVED_REVISION="$served_rev"
+  if [ -n "$served_rev" ]; then
+    if ! PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null)"; then
+      PLATFORM_AGENT_SERVED_JSON="{}"
+      PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
+      PLATFORM_AGENT_READ_ERROR="revision ${served_rev}, the last one that served, did not answer"
+    fi
+  fi
+}
+
+# The held reads for $1 namespace when the scope check just made them, or
+# fresh ones; either way none are held afterwards, so a later call (the
+# menu's next apply) reads again.
+take_platform_agent_install_state() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  if [ -z "${PLATFORM_AGENT_READS_HELD_FOR:-}" ] || [ "$PLATFORM_AGENT_READS_HELD_FOR" != "$namespace" ]; then
+    read_platform_agent_install_state "$namespace" "${2:-}"
+  fi
+  PLATFORM_AGENT_READS_HELD_FOR=""
+}
+
+# The spec.mode of the one PlatformAgent in $1 (a `kubectl get -o json`
+# list), PLATFORM_AGENT_MODE_UNSET when it carries none, nothing when the
+# list is empty. The CR, not the record, is the mode the install runs: a mode
+# set by hand with kubectl is on the CR and in no record.
+platform_agent_mode_on_cr() {
+  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
 import json, sys
-values = json.load(sys.stdin) or {}
-mode = (values.get("platformAgent") or {}).get("mode")
-sys.stdout.write(mode or sys.argv[1])
+items = (json.load(sys.stdin) or {}).get("items") or []
+if items:
+    sys.stdout.write((items[0].get("spec") or {}).get("mode") or sys.argv[1])
 ' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
 }
 
-# The spec.mode the live PlatformAgent carries, or PLATFORM_AGENT_MODE_UNSET
-# when it has none. Prints nothing when there is no context, no CR or no
-# answer within KUBECTL_PROBE_REQUEST_TIMEOUT. The CR, not the record, is the
-# mode the install runs: a mode set by hand with kubectl is on the CR and in
-# no record.
-live_platform_agent_mode() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" expected_ctx modes
-  expected_ctx="$(gke_context_name)"
-  kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1 || return 0
-  # One entry per CR, each its mode and a `|`, so a CR with no mode still
-  # prints its `|` and is told apart from no CR at all.
-  modes="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o jsonpath='{range .items[*]}{.spec.mode}{"|"}{end}' 2>/dev/null)" || return 0
-  [ -n "$modes" ] || return 0
-  modes="${modes%%|*}"
-  printf '%s' "${modes:-$PLATFORM_AGENT_MODE_UNSET}"
+# The platformAgent.mode of $1 (a release's values as JSON),
+# PLATFORM_AGENT_MODE_UNSET when it records none.
+platform_agent_mode_in_values() {
+  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
+import json, sys
+values = json.load(sys.stdin) or {}
+sys.stdout.write((values.get("platformAgent") or {}).get("mode") or sys.argv[1])
+' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
 }
 
 # A mode as the operator reads it: an absent one is today.
@@ -420,13 +508,16 @@ effective_platform_agent_mode() {
 }
 
 # The spec.mode the CR carries after a full apply of PLATFORM_AGENT_MODE: $1
-# the record's (release_platform_agent_mode), $2 the live CR's, $3 the key.
+# the record's (the served revision's platformAgent.mode), $2 the live CR's,
+# $3 the key.
 # The composition renders "next" as mode: next and "today" as no field, and
 # Helm patches a custom resource from the difference between the served
 # render and the new one. So a render that changes the mode sets it, one
 # that drops a recorded mode removes it, and one the record already matches
 # changes nothing, leaving whatever the CR carries, a mode set by hand
-# included.
+# included. The render is modelled from the key alone: a platformAgent.mode
+# in the composition's extra_helm_values is merged over it and wins, and is
+# not seen here (platform_agent_mode_extra_values_caveat says so).
 platform_agent_mode_after_apply() {
   local record="${1:-}" live="${2:-}" key="${3:-}" rendered="$PLATFORM_AGENT_MODE_UNSET"
   [ "$key" = "next" ] && rendered="$key"
@@ -437,14 +528,25 @@ platform_agent_mode_after_apply() {
   fi
 }
 
+# Said under every mode notice that names what an apply does: the
+# composition merges extra_helm_values over the document it computes from
+# PLATFORM_AGENT_MODE, so a platformAgent.mode set there decides, and the
+# installer cannot read it (it lives in a *.auto.tfvars or
+# TF_VAR_extra_helm_values, beside the tfvars the generator writes).
+platform_agent_mode_extra_values_caveat() {
+  print_info "This compares PLATFORM_AGENT_MODE in install.env with the cluster. A platformAgent.mode set through the composition's extra_helm_values wins over the key, and this check does not see it."
+}
+
 # Says what a full apply does to the install's spec.mode: $1 the record's
 # mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now. A
 # switch is a rollout of a different component stack, not a setting, and the
 # only trace of it in install.env is the one key someone edited, so the run
 # that applies it names it first. A key the apply cannot bring the CR to,
 # because the CR carries a mode set outside this installer, is named too.
-# Silent when either read came back empty (a first install has no CR), and on
-# a re-apply of the same mode. Caller defines print_warning / print_info.
+# Silent when either value is empty (no CR, no release: a first install),
+# and on a re-apply of the same mode. A read that failed is not empty: the
+# front-door call says so itself (announce_platform_agent_mode_for_apply).
+# Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" from to
   [ -n "$record" ] && [ -n "$live" ] || return 0
@@ -454,6 +556,7 @@ announce_platform_agent_mode_switch() {
     if [ "$to" != "$key" ]; then
       print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but the PlatformAgent carries spec.mode ${to}, set outside this installer, and this apply leaves it there: the release already renders ${key}, so Helm has no change to send."
       print_info "To switch it, patch spec.mode on the CR, or apply once with PLATFORM_AGENT_MODE=${to} and then with ${key} (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+      platform_agent_mode_extra_values_caveat
     fi
     return 0
   fi
@@ -464,6 +567,7 @@ announce_platform_agent_mode_switch() {
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
   print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
+  platform_agent_mode_extra_values_caveat
 }
 
 # The retag modes' half: upgrade.sh --upgrade-mode=harness or operator moves
@@ -471,8 +575,7 @@ announce_platform_agent_mode_switch() {
 # CR keeps the mode it has whatever PLATFORM_AGENT_MODE says. Said when a full
 # upgrade would move it, rather than left for that upgrade to switch the
 # install without a word from this run. $1 the record's mode, $2 the live
-# CR's, $3 the key, $4 the upgrade mode. Silent when either read came back
-# empty.
+# CR's, $3 the key, $4 the upgrade mode. Silent when either is empty.
 note_platform_agent_mode_not_applied() {
   local record="${1:-}" live="${2:-}" key="${3:-}" upgrade_mode="${4:-}" running full
   [ -n "$record" ] && [ -n "$live" ] || return 0
@@ -481,25 +584,61 @@ note_platform_agent_mode_not_applied() {
   [ "$running" != "$full" ] || return 0
   print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
   print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
+  platform_agent_mode_extra_values_caveat
 }
 
-# The two front-door calls. The live CR is read first, within
-# KUBECTL_PROBE_REQUEST_TIMEOUT, and the release record only when it
-# answered, so a preview against a context whose cluster is gone does not
-# wait on helm, which takes no request timeout of its own. $1 namespace, $2
-# the key, and for the retag, $3 the upgrade mode.
+# Said when a read the notice needs failed, so the run does not go on as if
+# the notice had been weighed and found nothing to say. $1 what could not be
+# read, $2 the key, $3 namespace.
+_platform_agent_mode_unread() {
+  print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+  print_info "Check before confirming: kubectl get platformagents -n ${3} -o jsonpath='{.items[*].spec.mode}' (empty is today)."
+}
+
+# The front door's call, after the scope check beside it: $1 namespace, $2
+# the key. Quiet where there is nothing to switch (no context to read through,
+# which a first install's dry run has; no PlatformAgent type, no CR, no
+# release), loud where a read failed.
 announce_platform_agent_mode_for_apply() {
-  local live
-  live="$(live_platform_agent_mode "${1:-}")"
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  take_platform_agent_install_state "$namespace"
+  case "$PLATFORM_AGENT_CR_READ" in
+    "$PLATFORM_AGENT_READ_FAILED")
+      _platform_agent_mode_unread "the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
+      return 0
+      ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
   [ -n "$live" ] || return 0
-  announce_platform_agent_mode_switch "$(release_platform_agent_mode "${1:-}")" "$live" "${2:-}"
+  if [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_FAILED" ] || [ "$PLATFORM_AGENT_SERVED_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+    _platform_agent_mode_unread "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
+    return 0
+  fi
+  [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
+  if [ -n "$PLATFORM_AGENT_SERVED_REVISION" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  announce_platform_agent_mode_switch "$record" "$live" "$key"
 }
 
+# upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
+# the upgrade mode, $4 RETAG_VALUES_JSON, the values the retag re-applies and
+# so the record a later full upgrade diffs against. Only the CR is read here.
 note_platform_agent_mode_for_retag() {
-  local live
-  live="$(live_platform_agent_mode "${1:-}")"
-  [ -n "$live" ] || return 0
-  note_platform_agent_mode_not_applied "$(release_platform_agent_mode "${1:-}")" "$live" "${2:-}" "${3:-}"
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live
+  read_platform_agent_install_state "$namespace" cr-only
+  PLATFORM_AGENT_READS_HELD_FOR=""
+  if [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+    print_info "Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR}). This run leaves the mode where it is either way."
+    return 0
+  fi
+  [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  note_platform_agent_mode_not_applied "$(platform_agent_mode_in_values "${4:-}")" "$live" "${2:-}" "${3:-}"
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -1334,57 +1473,31 @@ require_scope_cluster_triples() {
 # print_warning.
 refuse_apply_over_undeclared_scope() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" mode="${2:-$SCOPE_CHECK_MODE_REFUSE}"
-  local expected_ctx cr_json record_json err_file verdict first_line
+  local expected_ctx cr_json record_json served_json err_file verdict first_line
   expected_ctx="$(gke_context_name)"
-  if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
-    _scope_check_failed "$mode" "the kubeconfig has no context '${expected_ctx}' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})"
+  # The reads stay held for the mode notice each front door calls next
+  # (announce_platform_agent_mode_for_apply), which takes them rather than
+  # asking the cluster the same questions again.
+  read_platform_agent_install_state "$namespace"
+  case "$PLATFORM_AGENT_CR_READ" in
+    "$PLATFORM_AGENT_READ_NO_CONTEXT")
+      _scope_check_failed "$mode" "the kubeconfig has no context '${expected_ctx}' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})"
+      return $?
+      ;;
+    "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+    "$PLATFORM_AGENT_READ_FAILED")
+      _scope_check_failed "$mode" "the PlatformAgent in namespace '${namespace}' could not be read through context '${expected_ctx}': ${PLATFORM_AGENT_READ_ERROR}"
+      return $?
+      ;;
+  esac
+  if [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+    _scope_check_failed "$mode" "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read: ${PLATFORM_AGENT_READ_ERROR}"
     return $?
   fi
+  cr_json="$PLATFORM_AGENT_CR_JSON"
+  record_json="$PLATFORM_AGENT_RECORD_JSON"
+  served_json="$PLATFORM_AGENT_SERVED_JSON"
   err_file="$(mktemp)"
-  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
-  # misses classified below are ordinary answers, not aborts.
-  if ! cr_json="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>"$err_file")"; then
-    if grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN" "$err_file"; then
-      rm -f "$err_file"
-      return 0
-    fi
-    _scope_check_failed "$mode" "the PlatformAgent in namespace '${namespace}' could not be read through context '${expected_ctx}': $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
-    local rc=$?
-    rm -f "$err_file"
-    return $rc
-  fi
-  local served_json="{}" served_rev=""
-  if ! record_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
-    if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
-      record_json="{}"
-    else
-      _scope_check_failed "$mode" "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
-      local rc=$?
-      rm -f "$err_file"
-      return $rc
-    fi
-  else
-    # The last revision that served, and only when the latest did not (a
-    # failed or pending upgrade): its values are what the CR still holds. On a
-    # healthy release the latest revision is the one record, so a hand edit
-    # that happens to restore an earlier scope is still a hand edit. A history
-    # that cannot be read leaves only the latest revision to compare against.
-    served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
-      | python3 -c '
-import json, sys
-statuses = sys.argv[1].split()
-revisions = json.load(sys.stdin) or []
-latest = max(revisions, key=lambda r: r["revision"], default=None)
-served = [] if latest is None or latest.get("status") in statuses else [
-    r["revision"] for r in revisions if r.get("status") in statuses
-]
-print(max(served) if served else "")
-' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
-    if [ -n "$served_rev" ]; then
-      served_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null || echo '{}')"
-    fi
-  fi
   # Normalises L, R and K to sorted lists and rules. Values arrive as argv and
   # on stdin, never interpolated into the program text. stderr goes to the
   # file, not into the verdict: an interpreter that warns at startup and exits

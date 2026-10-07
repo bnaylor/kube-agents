@@ -1888,19 +1888,13 @@ main() {
   # on its own last line before its first mutating command, and
   # UpgradeRunContractTest.test_the_apply_gate_sits_after_every_refusal_in_its_arm
   # pins that placement, which is otherwise unreachable from the test suite.
-  # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
-  # install.env, so a key edited since the last apply switches the install
-  # here, and the run says so first. The retag modes reuse the release's
-  # recorded values, mode included, and say that they leave it where it is.
-  if [ "$PARAM_UPGRADE_MODE" = "full" ]; then
-    announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
-  else
-    note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE"
-  fi
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      # The mode: a retag re-applies the recorded values, mode included, and
+      # says when a full upgrade would move it (from the values just read).
+      note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
@@ -1921,6 +1915,7 @@ main() {
       # calls, not substitutions: a failed read stops the run here, once, with
       # its own message shown.
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
       harness_retag_keys "$RETAG_VALUES_JSON"
       # After the reads, not before them: they are the last things this arm
       # does that can fail without having changed anything.
@@ -1938,6 +1933,10 @@ main() {
       # the live CR, and a scope the CR carries that neither the release
       # record nor the keys account for is refused here rather than replaced.
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
+      # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
+      # install.env, so a key edited since the last apply switches the install
+      # here, and the run says so first, from the reads the scope check made.
+      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
       # project, so a container it cannot bind, or a policy that forbids the
