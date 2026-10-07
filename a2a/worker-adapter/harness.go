@@ -167,7 +167,9 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 	// to EOF, so without a bound Wait blocks until that descendant exits.
 	// Wait reads the field when it runs, and Start consults it only for a
 	// command built with a Context, which this one is not, so setting it once
-	// here covers both reaps: the failed start's below and supervise's.
+	// here covers both reaps: the failed start's below and supervise's. It
+	// bounds Wait's own copying only, which for this command is stderr;
+	// stdout is a pipe the scanner reads to EOF, and nothing here bounds that.
 	cmd.WaitDelay = reapBound
 
 	if err := cmd.Start(); err != nil {

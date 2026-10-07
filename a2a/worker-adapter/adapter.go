@@ -118,6 +118,7 @@ type Config struct {
 	// KillGrace is SIGTERM-to-SIGKILL escalation time. It also bounds how
 	// long any reap waits for the harness's stderr to close once the harness
 	// has exited, which a process it started outside its group can hold open.
+	// It does not bound stdout, which the scanner reads to EOF before the reap.
 	KillGrace time.Duration
 
 	Logger *slog.Logger
@@ -471,9 +472,11 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	waitDone := make(chan reapOutcome, 1)
 	go func() {
 		// The scanner owns the pipe until EOF; Wait tears the pipe down.
-		// cmd.WaitDelay (KillGrace, set in startHarness) bounds the stderr
+		// cmd.WaitDelay (KillGrace, set in startHarness) bounds Wait's stderr
 		// read after the harness exits, so a process it started outside its
-		// group cannot hold this reap, and the task, open forever.
+		// group cannot hold Wait open by holding stderr. It does not bound the
+		// wait for scanDone: a process outside the group that holds stdout
+		// still keeps the scanner, and this goroutine, from finishing.
 		<-proc.scanDone
 		reapStart := time.Now()
 		err := proc.cmd.Wait()
