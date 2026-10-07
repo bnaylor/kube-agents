@@ -90,6 +90,14 @@ class FakeCluster:
         self.restart_returncode = 0
         self.restart_missing = False
         self.job_log_fails = False
+        # How many gateway log reads fail before one answers; -1 is every one.
+        self.gateway_log_failures = 0
+        # The Job is gone: `get job --ignore-not-found` prints nothing.
+        self.job_gone = False
+        # Any exception to raise on the Job's apply, after the namespace is set up.
+        self.job_apply_raises = None
+        # One log per Job, in run order, in place of job_log when set.
+        self.job_logs = []
         # How many `get job` polls fail before one answers; -1 is every one.
         self.get_job_failures = 0
         self.stdin_encodings = []
@@ -105,6 +113,9 @@ class FakeCluster:
         self.stdin_encodings.append(encoding)
         assert cmd[1:3] == ["--context", CONTEXT], cmd
         args = cmd[3:]
+        if args[0] == "logs" and "a2a-gateway" in " ".join(args) and self.gateway_log_failures:
+            self.gateway_log_failures -= 1 if self.gateway_log_failures > 0 else 0
+            return subprocess.CompletedProcess(cmd, 1, "", "Unable to connect to the server: net/http: TLS handshake timeout")
         if args[:2] == ["get", "job"] and self.get_job_failures:
             self.get_job_failures -= 1 if self.get_job_failures > 0 else 0
             return subprocess.CompletedProcess(cmd, 1, "", "Unable to connect to the server: net/http: TLS handshake timeout")
@@ -119,6 +130,8 @@ class FakeCluster:
     def answer(self, args, stdin):
         joined = " ".join(args)
         if args[0] == "apply":
+            if self.job_apply_raises and '"kind": "Job"' in stdin.replace("kind: Job", '"kind": "Job"'):
+                raise self.job_apply_raises
             self.applied.append(stdin)
             for doc in yaml.safe_load_all(stdin):
                 if doc and doc.get("kind") == "Namespace":
@@ -152,12 +165,15 @@ class FakeCluster:
         if args[:3] == ["get", "deployment", AGENT + "-a2a-gateway"]:
             return json.dumps(deployment(args[2], "gateway", self.gateway_env, {"app": AGENT + "-a2a-gateway"}))
         if args[:2] == ["get", "job"]:
+            assert "--ignore-not-found" in args, args
+            if self.job_gone:
+                return ""
             conditions = [{"type": self.job_condition, "status": "True"}] if self.job_condition else []
             return json.dumps({"status": {"conditions": conditions}})
         if args[0] == "logs" and "job/" in joined:
             if self.job_log_fails:
                 raise FakeFailure()
-            return self.job_log
+            return self.job_logs.pop(0) if self.job_logs else self.job_log
         if args[0] == "logs" and "credential-proxy" in joined:
             assert "--tail=-1" in args
             return self.broker_logs
@@ -320,6 +336,33 @@ class JobTest(unittest.TestCase):
         deadline = launch.job_deadline(["--checks", "dm", *BOT_FLAGS], 0) + launch.JOB_WAIT_GRACE_SECONDS
         self.assertGreaterEqual(len(polls), deadline // launch.JOB_POLL_INTERVAL_SECONDS)
 
+    def test_a_job_that_is_gone_ends_the_wait_at_once(self):
+        # `get job --ignore-not-found` exits 0 and prints nothing for a Job that is not
+        # there: deleted by hand, or with its namespace. No deadline-long poll.
+        cluster = FakeCluster()
+        cluster.job_gone = True
+        cluster.job_log_fails = True
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("ended gone with no FAIL line", self.line(out, "FAIL job:"))
+        polls = [c for c in cluster.calls if c[3:5] == ["get", "job"]]
+        self.assertEqual(len(polls), 1, polls)
+        self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
+
+    def test_cleanup_runs_when_the_run_raises_after_setup(self):
+        # The namespace (and the Workload-Identity-bound ServiceAccount in it) is
+        # applied, then something guarded() does not wrap raises: it is still deleted.
+        for exc in (RuntimeError("boom"), launch.LaunchError("kubectl apply exited 1: boom")):
+            with self.subTest(exc=type(exc).__name__):
+                cluster = FakeCluster()
+                cluster.job_apply_raises = exc
+                code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+                self.assertEqual(code, launch.EXIT_SETUP, out)
+                self.assertIn("ERROR", out)
+                self.assertEqual([d["kind"] for d in yaml.safe_load_all(cluster.applied[0])][0], "Namespace")
+                self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
+                self.assertIn("CLEANUP namespace slack-test deleted", out)
+
     def test_job_args_carry_non_bmp_characters_as_utf8(self):
         cluster = FakeCluster()
         run_launch(cluster, "--context", CONTEXT, "--checks", "home", "--",
@@ -464,6 +507,49 @@ class PrincipalTest(unittest.TestCase):
         self.assertIn("FAIL principal: no passing listed turn to look up", out)
 
 
+    def test_principals_are_judged_over_every_job_not_per_job(self):
+        # dm,unlisted,restart without --wait-answer: the launcher splits dm into a Job of
+        # its own, so the unlisted Job carries no listed turn. That is not a FAIL, and
+        # the restart still runs.
+        cluster = FakeCluster()
+        cluster.job_logs = [
+            'PASS dm: answer\nEVIDENCE {"check": "dm", "passed": true, "sent_ts": "1.000101", "author": "U0LISTED1"}\n',
+            'PASS unlisted: refusal notice\nEVIDENCE {"check": "unlisted", "passed": true, "sent_ts": "1.000201", "author": "U0UNLIST1"}\n',
+            'PASS restart: answer\nEVIDENCE {"check": "restart", "passed": true, "sent_ts": "1.000301", "author": "U0LISTED1"}\n',
+        ]
+        cluster.gateway_logs += self.ingress("1.000101", "slack:U0LISTED1") + self.ingress("1.000301", "slack:U0LISTED1")
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,unlisted,restart", "--after-restart",
+                               "--expect-principal", "slack:{listed}")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertNotIn("FAIL", out)
+        self.assertIn("PASS principal-dm: ingress for 1.000101", out)
+        self.assertIn("PASS principal-restart: ingress for 1.000301", out)
+        self.assertIn("RESTART gateway rolled out", out)
+        self.assertEqual(cluster.job_logs, [], "every Job ran")
+
+    def test_principals_for_jobs_before_a_restart_are_read_before_it(self):
+        # The restart replaces the gateway pods, and with them the ingress lines of
+        # the Jobs before it: those are looked up before the restart, in one read.
+        cluster = FakeCluster()
+        cluster.job_logs = [
+            'PASS dm: answer\nEVIDENCE {"check": "dm", "passed": true, "sent_ts": "1.000101", "author": "U0LISTED1"}\n',
+            'PASS mention: answer\nEVIDENCE {"check": "mention", "passed": true, "sent_ts": "1.000201", "author": "U0LISTED1"}\n',
+            'PASS restart: answer\nEVIDENCE {"check": "restart", "passed": true, "sent_ts": "1.000301", "author": "U0LISTED1"}\n',
+        ]
+        cluster.gateway_logs += "".join(self.ingress(ts, "slack:U0LISTED1") for ts in ("1.000101", "1.000201", "1.000301"))
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,mention,restart", "--after-restart",
+                               "--expect-principal", "slack:{listed}")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        lines = out.splitlines()
+        restart_at = next(i for i, ln in enumerate(lines) if ln.startswith("RESTART"))
+        self.assertLess(next(i for i, ln in enumerate(lines) if ln.startswith("PASS principal-dm")), restart_at)
+        self.assertLess(next(i for i, ln in enumerate(lines) if ln.startswith("PASS principal-mention")), restart_at)
+        self.assertGreater(next(i for i, ln in enumerate(lines) if ln.startswith("PASS principal-restart")), restart_at)
+        reads = [c for c in cluster.calls if c[3] == "logs" and "-c" in c and c[c.index("-c") + 1] == "gateway"]
+        # One read before the restart, the poll for 'slack connected', one after.
+        self.assertEqual(len(reads), 3, reads)
+
+
 class RestartTest(unittest.TestCase):
     def test_restart_runs_the_command_without_a_shell_then_a_second_job(self):
         cluster = FakeCluster()
@@ -529,6 +615,28 @@ class RestartTest(unittest.TestCase):
                     self.assertRaises(SystemExit):
                 parse(["--context", CONTEXT, "--checks", "restart", "--restart-cmd", command])
             self.assertIn("--restart-cmd", err.getvalue())
+
+    def test_a_failed_log_read_in_the_connected_poll_is_retried(self):
+        # One TLS timeout among the poll's reads is not the gateway failing to connect.
+        cluster = FakeCluster()
+        cluster.job_log = "PASS restart: answer\nSUMMARY pass=1 fail=0\n"
+        cluster.gateway_log_failures = 2
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "restart", "--after-restart")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("RESTART gateway rolled out and logged 'slack connected'", out)
+        self.assertIn("PASS restart: answer", out)
+
+    def test_log_reads_failing_until_the_deadline_fail_restart_with_the_error(self):
+        cluster = FakeCluster()
+        cluster.gateway_log_failures = -1
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "restart", "--after-restart")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        line = [ln for ln in out.splitlines() if ln.startswith("FAIL restart-cmd:")][0]
+        self.assertIn("did not log 'slack connected'", line)
+        self.assertIn("TLS handshake timeout", line)
+        reads = [c for c in cluster.calls if c[3] == "logs" and any("a2a-gateway" in a for a in c)]
+        self.assertGreaterEqual(len(reads), launch.SLACK_CONNECT_WAIT_SECONDS // launch.JOB_POLL_INTERVAL_SECONDS)
+        self.assertEqual(cluster.applied, [])
 
     def test_restart_fails_when_the_gateway_never_reconnects(self):
         cluster = FakeCluster()

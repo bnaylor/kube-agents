@@ -102,20 +102,27 @@ FAILURE_POST_PATTERN = re.compile(r"❌ failed: .*|❌ the task failed|🛑 canc
 # could not be published. Either one means the turn started no task.
 STEER_ACK_PREFIX = "✏️ steering sent — "
 STEER_FAILED_NOTICE = "⚠️ could not send that to the running task; it is still working on the original instruction"
-# The gateway's warnings (gateway.go, spawn.go) all open with this. Read by prefix
-# only ahead of the status line, where nothing is the agent's.
-WARNING_PREFIX = "⚠️ "
+# The notices the gateway posts in place of startTask for a turn it will not run:
+# refuseAtSessionCap's "🚦 not started: … (cap N)" and "⚠️ not started: can't count…"
+# (spawn.go), the capability mint and retireRefusalNotStarted (gateway.go). Read only
+# ahead of the status line, where nothing is the agent's. Every other notice the
+# gateway can post there (the 🔎 card, ⚠️ warnings, ℹ️/🤷 command answers) is not
+# the reply either: by default the reply is the status line and nothing else.
+NOT_STARTED_PATTERN = re.compile(r"(?:🚦|⚠️) not started: .*", re.DOTALL)
 KIND_REFUSAL = "refusal"
 KIND_TASK_LINE = "task-line"
 KIND_STEER = "steer-ack"
 KIND_FAILURE = "failure"
-KIND_WARNING = "warning"
+KIND_NOT_STARTED = "not-started"
+KIND_NOTICE = "notice"
 KIND_ANSWER = "answer"
-# What wait_for_bot waits for: the first reply (the status line, normally), the
-# answer itself, or the task's end whatever it posted.
+# What wait_for_bot waits for: the turn's status line (by default), the answer
+# itself, or the task's end whatever it posted.
 WAIT_FIRST = "first"
 WAIT_ANSWER = "answer"
 WAIT_SETTLED = "settled"
+# The unlisted checks: any bot message at all is a reply, the gateway's grammar or not.
+WAIT_ANY = "any"
 
 USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
 NON_USER_TOKEN_KINDS = {"xoxb-": "a bot token", "xapp-": "an app-level token"}
@@ -390,8 +397,8 @@ def classify(text: str) -> str:
         return KIND_FAILURE if state in FAILED_STATES else KIND_TASK_LINE
     if FAILURE_POST_PATTERN.fullmatch(stripped):
         return KIND_FAILURE
-    if stripped.startswith(WARNING_PREFIX):
-        return KIND_WARNING
+    if NOT_STARTED_PATTERN.fullmatch(stripped):
+        return KIND_NOT_STARTED
     return KIND_ANSWER
 
 
@@ -399,8 +406,11 @@ def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
     """The bot's reply to one turn, from its messages since the turn, oldest first.
 
     The status line is the first message in its grammar. Everything before it is
-    the gateway's own (a refusal, a steer outcome, a warning), so it is read by its
-    text. Everything after it is read by the status line's state: the deliverable
+    the gateway's own (a refusal, a steer outcome, a not-started notice, a warning,
+    a status card), so it is read by its text: the first three end the turn, and
+    nothing else there is a listed turn's reply (WAIT_ANY, for the unlisted checks,
+    takes the first message whatever it is). Everything after the status line is
+    read by its state: the deliverable
     or the failure notice is posted before the terminal edit, so once the line is
     terminal the last message after it is that post, whatever its first character.
     """
@@ -408,17 +418,16 @@ def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
     before = bot_msgs if status_at is None else bot_msgs[:status_at]
     for msg in before:
         kind = classify(msg.get("text", ""))
-        if kind in (KIND_REFUSAL, KIND_STEER):
+        if kind in (KIND_REFUSAL, KIND_STEER, KIND_NOT_STARTED):
             return msg, kind
+    if mode == WAIT_ANY and before:
+        return before[0], KIND_NOTICE
     if status_at is None:
-        if mode != WAIT_FIRST:
-            return None
-        replies = [m for m in before if classify(m.get("text", "")) != KIND_WARNING]
-        return (replies[0], classify(replies[0].get("text", ""))) if replies else None
+        return None
     status = bot_msgs[status_at]
     state = status_state(status.get("text", ""))
     after = bot_msgs[status_at + 1:]
-    if mode == WAIT_FIRST:
+    if mode in (WAIT_FIRST, WAIT_ANY):
         return status, KIND_FAILURE if state in FAILED_STATES else KIND_TASK_LINE
     if state in FAILED_STATES:
         notices = [m for m in after if FAILURE_POST_PATTERN.fullmatch(m.get("text", "").strip())]
@@ -524,9 +533,13 @@ def judge_listed_reply(session: Session, name: str, channel: str, sent_ts: str, 
     if reply is None:
         if last_seen is not None:
             evidence["last_bot_text"] = truncate(last_seen.get("text", ""))
-            missing = "no answer (--wait-answer)" if session.args.wait_answer else "no reply but a warning"
-            return CheckResult(name, False, f"the bot posted {missing} within {timeout}s", evidence)
+            if session.args.wait_answer:
+                return CheckResult(name, False, f"the bot posted no answer (--wait-answer) within {timeout}s", evidence)
+            return CheckResult(name, False, f"the bot posted no status line within {timeout}s, only: "
+                               f"{evidence['last_bot_text']!r}", evidence)
         return CheckResult(name, False, f"no reply from the bot within {timeout}s", evidence)
+    if kind == KIND_NOT_STARTED:
+        return CheckResult(name, False, f"the gateway did not start a task for the turn: {evidence['reply_text']!r}", evidence)
     if kind == KIND_REFUSAL:
         return CheckResult(name, False, "the listed user got the refusal notice; is the member on allowedUsers, and in the a2a-slack-principal-map Secret where the gateway requires it?", evidence)
     if kind == KIND_STEER:
@@ -609,7 +622,7 @@ def check_unlisted(session: Session) -> list[CheckResult]:
         def fetch():
             return history_after(client, channel, sent_ts)
 
-    reply, kind, _ = wait_for_bot(session, fetch, WAIT_FIRST, session.args.reply_timeout)
+    reply, kind, _ = wait_for_bot(session, fetch, WAIT_ANY, session.args.reply_timeout)
     evidence = reply_evidence(channel, sent_ts, session.unlisted_user_id, reply, kind)
     evidence["via"] = session.args.unlisted_via
     if reply is None:
@@ -651,7 +664,7 @@ def check_unlisted_repeat(session: Session, client: SlackClient, channel: str, t
         def fetch():
             return history_after(client, channel, sent_ts)
 
-    reply, kind, _ = wait_for_bot(session, fetch, WAIT_FIRST, session.args.quiet_window)
+    reply, kind, _ = wait_for_bot(session, fetch, WAIT_ANY, session.args.quiet_window)
     evidence = reply_evidence(channel, sent_ts, session.unlisted_user_id, reply, kind)
     if reply is not None:
         return CheckResult(CHECK_UNLISTED_REPEAT, False, f"the bot replied to the second message ({kind})", evidence)
@@ -798,20 +811,21 @@ def resolve_channel(client: SlackClient, channel: str) -> str:
     raise HarnessError(f"no channel named #{name} visible to the listed user")
 
 
-def parse_checks(value: str) -> list[str]:
+def parse_checks(value: str, allowed: tuple[str, ...] = CHECK_ORDER) -> list[str]:
+    """The checks a comma list names, in allowed's order. The launcher passes its own wider list."""
     requested: list[str] = []
     for item in (part.strip() for part in value.split(",")):
         if not item:
             continue
         if item == CHECKS_ALL_ALIAS:
             requested.extend(CHECKS_ALL)
-        elif item in CHECK_ORDER:
+        elif item in allowed:
             requested.append(item)
         else:
-            raise argparse.ArgumentTypeError(f"unknown check {item!r}; choose from {', '.join(CHECK_ORDER)} or {CHECKS_ALL_ALIAS}")
+            raise argparse.ArgumentTypeError(f"unknown check {item!r}; choose from {', '.join(allowed)} or {CHECKS_ALL_ALIAS}")
     if not requested:
         raise argparse.ArgumentTypeError("no checks selected")
-    return [check for check in CHECK_ORDER if check in requested]
+    return [check for check in allowed if check in requested]
 
 
 def regex(value: str) -> str:

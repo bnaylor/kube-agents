@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import threading
 import unittest
 import urllib.parse
@@ -46,6 +47,17 @@ TEAM_ID = "T0TEAM001"
 REFUSAL = ("⛔ I can't verify who you are on slack (id {id}), so I can't take asks from you yet — "
            "an admin has to add you to the allowed users list and the principal map.")
 ALL_TOKENS = (LISTED_TOKEN, UNLISTED_TOKEN, GCP_ACCESS)
+# The notices the gateway posts in place of startTask for a turn it will not run,
+# rendered as they reach Slack (test_not_started_grammar_matches_the_gateway_source).
+NOT_STARTED_NOTICES = (
+    "🚦 not started: 10 session workers are already running (cap 10). Wait for one to finish or `stop` one you started; "
+    "an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
+    "🚦 not started: 1 session worker is already running (cap 1). Wait for one to finish or `stop` one you started; "
+    "an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
+    "⚠️ not started: can't count the running session workers right now — try again in a moment",
+    "⚠️ not started: could not mint this task's capability",
+    "⚠️ not started: could not close the previous task on the bus; try again in a moment",
+)
 # Far above any timeout a test sets: a poll that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 10_000
 
@@ -505,6 +517,24 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_OK, text)
         self.assertEqual(self.evidence(text, "dm")["reply_text"], "PONG")
 
+    def test_a_status_card_before_the_turn_is_not_the_first_reply(self):
+        # The same card under the default reading, read before the new turn's status
+        # line is visible: it is not the reply, and the turn's reply is its status line.
+        world = self.world
+        original = world.gateway_turn
+
+        def card_then_turn(channel, poster, msg):
+            world.bot_post(channel, "🔎 task `t0` is *completed*", "")
+            world.reply_delay_reads = 2
+            original(channel, poster, msg)
+            world.reply_delay_reads = 0
+
+        world.gateway_turn = card_then_turn
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertEqual(self.evidence(text, "dm")["reply_kind"], harness.KIND_TASK_LINE)
+        self.assertNotIn("🔎", self.evidence(text, "dm")["reply_text"])
+
     def test_wait_answer_waits_for_the_status_line_to_turn_terminal(self):
         # The answer is posted before the status line's terminal edit; until that
         # edit lands the task is still running and nothing after the line is final.
@@ -592,7 +622,7 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("taken as a steer", self.line(text, "FAIL thread"))
 
-    def test_a_warning_is_not_the_reply(self):
+    def test_a_warning_ahead_of_the_status_line_is_not_the_reply(self):
         world = self.world
         original = world.gateway_turn
 
@@ -606,10 +636,53 @@ class ListedChecksTest(HarnessTestCase):
         # The status line, read after the task finished: the same message, edited.
         self.assertEqual(self.evidence(text, "dm")["reply_text"], "✅ *completed*")
         self.assertEqual(self.evidence(text, "dm")["reply_kind"], harness.KIND_TASK_LINE)
-        world.gateway_turn = lambda channel, poster, msg: world.bot_post(channel, "⚠️ not started: could not mint", "")
+
+    def post_instead_of_a_task(self, notice):
+        """The gateway answers the turn with notice and starts no task: no status line follows."""
+        world = self.world
+
+        def notice_only(channel, poster, msg):
+            thread = "" if world.is_dm_with_bot(channel) else msg.get("thread_ts", msg["ts"])
+            world.bot_post(channel, notice, thread)
+
+        world.gateway_turn = notice_only
+
+    def test_a_turn_the_gateway_did_not_start_fails_at_once(self):
+        # refuseAtSessionCap (spawn.go) and the other "not started:" refusals answer the
+        # turn in place of startTask, so no status line ever follows them.
+        for notice in NOT_STARTED_NOTICES:
+            for check, extra in (("dm", ()), ("restart", ()), ("mention", ()), ("dm", ("--wait-answer",))):
+                with self.subTest(notice=notice, check=check, extra=extra):
+                    self.post_instead_of_a_task(notice)
+                    slept = len(self.fake.slept)
+                    code, text = self.run_harness("--checks", check, *extra)
+                    self.assertEqual(code, harness.EXIT_FAIL, text)
+                    line = self.line(text, f"FAIL {check}")
+                    self.assertIn("the gateway did not start a task", line)
+                    self.assertIn(notice[:40], line)
+                    self.assertEqual(self.evidence(text, check)["reply_kind"], harness.KIND_NOT_STARTED)
+                    self.assertEqual(self.fake.slept[slept:], [], "a refusal sat out the reply timeout")
+
+    def test_a_notice_with_no_status_line_after_it_fails_and_quotes_it(self):
+        # Not the status line and not a refusal the harness knows: under the default
+        # reading it is no reply, and the FAIL names what the bot did post.
+        for notice in ("🤷 nothing is running", "ℹ️ this conversation is already a session",
+                       "⚠️ task `t` has produced nothing on its event stream in 5m"):
+            with self.subTest(notice=notice):
+                self.post_instead_of_a_task(notice)
+                code, text = self.run_harness("--checks", "dm")
+                self.assertEqual(code, harness.EXIT_FAIL, text)
+                line = self.line(text, "FAIL dm")
+                self.assertIn("no status line", line)
+                self.assertIn(notice, line)
+                self.assertEqual(self.evidence(text, "dm")["last_bot_text"], notice)
+
+    def test_the_quoted_notice_is_redacted(self):
+        self.post_instead_of_a_task(f"🤷 echoing {LISTED_TOKEN}")
         code, text = self.run_harness("--checks", "dm")
-        self.assertEqual(code, harness.EXIT_FAIL)
-        self.assertIn("no reply but a warning", self.line(text, "FAIL dm"))
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertNotIn(LISTED_TOKEN, text)
+        self.assertIn(harness.REDACTED, self.line(text, "FAIL dm"))
 
     def test_dm_fails_on_a_steer(self):
         world = self.world
@@ -691,6 +764,28 @@ class UnlistedTest(HarnessTestCase):
         code, text = self.run_harness("--checks", "unlisted", "--unlisted-repeat")
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL unlisted-repeat", text)
+
+    def test_unlisted_checks_count_any_bot_message_as_a_reply(self):
+        # The unlisted checks pass on the refusal or on silence, so a notice that is not
+        # the status line must still count as the bot answering the unlisted user.
+        world = self.world
+        original = world.gateway_turn
+
+        def notice_on_the_second(channel, poster, msg):
+            if harness.CHECK_UNLISTED_REPEAT in msg["text"]:
+                world.bot_post(channel, "🤷 nothing is running", "")
+            else:
+                original(channel, poster, msg)
+
+        world.gateway_turn = notice_on_the_second
+        code, text = self.run_harness("--checks", "unlisted", "--unlisted-repeat")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn(f"the bot replied to the second message ({harness.KIND_NOTICE})", self.line(text, "FAIL unlisted-repeat"))
+        world.notified.clear()
+        world.gateway_turn = lambda channel, poster, msg: world.bot_post(channel, "🤷 nothing is running", "")
+        code, text = self.run_harness("--checks", "unlisted")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn(f"answered ({harness.KIND_NOTICE})", self.line(text, "FAIL unlisted"))
 
     def test_unlisted_repeat_by_mention_reaches_the_gateway(self):
         world = self.world
@@ -928,7 +1023,8 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(harness.classify("✅ *completed*"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("⚠️ could not send that to the running task; it is still working on the original instruction"),
                          harness.KIND_STEER)
-        self.assertEqual(harness.classify("⚠️ not started: could not mint this task's capability"), harness.KIND_WARNING)
+        for notice in NOT_STARTED_NOTICES:
+            self.assertEqual(harness.classify(notice), harness.KIND_NOT_STARTED, notice)
         self.assertEqual(harness.classify("✏️ steering sent — the worker picks it up"), harness.KIND_STEER)
         for failure in ("🚫 *rejected*", "❌ *failed* — the pod died", "🛑 *canceled*", "❌ could not reach the bus; try again",
                         "❌ failed: the executor is down", "❌ the task failed", "🛑 canceled",
@@ -955,6 +1051,30 @@ class UnitTest(unittest.TestCase):
         for post in ('"❌ failed: "+reason', '"❌ the task failed"', '"🛑 canceled"', '"🚫 the executor rejected the task: "+reason',
                      '"🚫 the executor rejected the task"'):
             self.assertIn(f"g.post(rec.Key, {post})", relay)
+
+    def test_not_started_grammar_matches_the_gateway_source(self):
+        # Every "not started:" the gateway can post, read off the source, is one the
+        # harness reads as a refusal; and the test's renderings come from those formats.
+        sources = {path.name: path.read_text() for path in (REPO / "a2a" / "gateway").glob("*.go")
+                   if not path.name.endswith("_test.go")}
+        formats = [fmt for src in sources.values() for fmt in re.findall(r'"((?:[^"\\]|\\.)*not started:(?:[^"\\]|\\.)*)"', src)]
+        self.assertGreaterEqual(len(formats), 4, formats)
+        rendered = set()
+        for fmt in formats:
+            self.assertTrue(harness.NOT_STARTED_PATTERN.match(fmt), fmt)
+            literal = re.escape(fmt).replace("%d", "%s").replace("%s", ".+")
+            matching = [n for n in NOT_STARTED_NOTICES if re.fullmatch(literal, n, re.DOTALL)]
+            self.assertTrue(matching, f"no test rendering of {fmt!r}")
+            rendered.update(matching)
+        self.assertEqual(rendered, set(NOT_STARTED_NOTICES))
+        # The session cap's count phrase, both forms.
+        self.assertIn('workers := fmt.Sprintf("%d session workers are", live)', sources["spawn.go"])
+        self.assertIn('workers = "1 session worker is"', sources["spawn.go"])
+        # And each one is posted in place of a task: refuseAtSessionCap returns true
+        # after both, and the retire refusal is the one passed to retireIncarnation.
+        self.assertIn('retireRefusalNotStarted = "⚠️ not started: ', sources["gateway.go"])
+        self.assertIn('g.post(rec.Key, "⚠️ not started: can\'t count the running session workers', sources["spawn.go"])
+        self.assertIn('g.post(rec.Key, "⚠️ not started: could not mint this task\'s capability")', sources["gateway.go"])
 
     def test_redactor_cuts_the_escaped_forms_of_a_registered_value(self):
         redactor = harness.Redactor()

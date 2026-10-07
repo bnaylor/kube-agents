@@ -119,6 +119,8 @@ FORWARDABLE_HARNESS_FLAGS = frozenset({
 })
 WAIT_ANSWER_FLAG = "--wait-answer"
 RESULT_PREFIXES = ("PASS ", "FAIL ")
+# wait_job's answer for a Job that no longer exists.
+JOB_GONE = "gone"
 # delete_namespace's outcomes. KEPT: another run's Job is still running in it.
 CLEANUP_DONE = "done"
 CLEANUP_KEPT = "kept"
@@ -407,7 +409,7 @@ class Launcher:
                 if check not in answered:
                     self.record(check, False, f"no PASS or FAIL line for it in {job_name}'s log (the Job ended {state})")
             for ev in evidence:
-                ev["elapsed_seconds"] = int(self.clock() - started)
+                ev["job_started"] = started
             return evidence
         finally:
             for kind in ("job", "configmap"):
@@ -422,11 +424,21 @@ class Launcher:
             # One failed read (an auth-plugin refresh, a TLS timeout, a 5xx) is not
             # the Job's end, and giving up here would delete a Job mid-check. Read
             # again on the next tick; only reads failing up to the deadline count.
+            # --ignore-not-found: a Job that is not there (deleted by hand, or with
+            # its namespace) exits 0 and prints nothing, which ends the wait now. A
+            # non-zero exit is still a read that failed, and is read again.
             read_error: Optional[LaunchError] = None
             try:
-                job = self.kubectl.get_json(["get", "job", job_name, "-n", self.args.namespace])
+                out = self.kubectl.run(["get", "job", job_name, "-n", self.args.namespace, "--ignore-not-found", "-o", "json"])
             except LaunchError as exc:
-                read_error, job = exc, {}
+                read_error, out = exc, "{}"
+            if not out.strip():
+                say(f"JOB {job_name} is gone: kubectl get job found no such Job in {self.args.namespace}")
+                return JOB_GONE
+            try:
+                job = json.loads(out)
+            except ValueError:
+                read_error, job = LaunchError(f"kubectl get job {job_name} printed no JSON: {harness.truncate(out)!r}"), {}
             for cond in job.get("status", {}).get("conditions", []) or []:
                 if cond.get("type") in ("Complete", "Failed") and cond.get("status") == "True":
                     return cond["type"]
@@ -444,12 +456,9 @@ class Launcher:
 
     # --- reuse hooks --------------------------------------------------------
 
-    def check_principals(self, evidence: list[dict]) -> bool:
-        """--expect-principal: the gateway's ingress line for each listed turn names the expected principal."""
-        turns = [ev for ev in evidence if ev.get("check") in PRINCIPAL_CHECKS and ev.get("passed") and ev.get("sent_ts")]
-        if not turns:
-            return self.record(PRINCIPAL_RESULT, False, "no passing listed turn to look up")
-        since = max(ev.get("elapsed_seconds", 0) for ev in turns) + LOG_SINCE_MARGIN_SECONDS
+    def check_principals(self, turns: list[dict]) -> bool:
+        """--expect-principal: the gateway's ingress line for each listed turn (principal_turns) names the expected principal."""
+        since = int(self.clock() - min(ev.get("job_started", 0) for ev in turns)) + LOG_SINCE_MARGIN_SECONDS
         gateway = self.deployment(GATEWAY_SUFFIX)
         logs = pod_logs(self.kubectl, self.args.agent_namespace, selector_of(gateway), GATEWAY_CONTAINER, since)
         principals = {}
@@ -485,17 +494,27 @@ class Launcher:
         self.kubectl.run(["rollout", "status", f"deployment/{self.agent}{GATEWAY_SUFFIX}", "-n", ns,
                           f"--timeout={ROLLOUT_TIMEOUT_SECONDS}s"])
         gateway = self.deployment(GATEWAY_SUFFIX)
+        read_errors: list[LaunchError] = []
 
         def connected():
             # After a restart this run made, only lines since it count. Under
             # --after-restart the restart's time is unknown; the rollout has
             # finished, so the current pods' whole logs are the new pods'.
             since = 0 if self.args.after_restart else int(self.clock() - started) + LOG_SINCE_MARGIN_SECONDS
-            logs = pod_logs(self.kubectl, ns, selector_of(gateway), GATEWAY_CONTAINER, since)
+            # A failed read (a TLS timeout, an auth-plugin refresh, a 5xx) is read
+            # again on the next tick until the deadline, as wait_job does.
+            try:
+                logs = pod_logs(self.kubectl, ns, selector_of(gateway), GATEWAY_CONTAINER, since)
+            except LaunchError as exc:
+                read_errors.append(exc)
+                return None
+            read_errors.clear()
             return True if any(_json_msg(line) == GATEWAY_SLACK_CONNECTED_MSG for line in logs.splitlines()) else None
 
         if harness.poll(connected, SLACK_CONNECT_WAIT_SECONDS, JOB_POLL_INTERVAL_SECONDS, self.clock, self.sleep) is None:
-            return self.record(RESTART_RESULT, False, f"the gateway did not log 'slack connected' within {SLACK_CONNECT_WAIT_SECONDS}s")
+            last = f"; the last log read failed: {read_errors[-1]}" if read_errors else ""
+            return self.record(RESTART_RESULT, False,
+                               f"the gateway did not log 'slack connected' within {SLACK_CONNECT_WAIT_SECONDS}s{last}")
         say("RESTART gateway rolled out and logged 'slack connected'")
         return True
 
@@ -529,6 +548,17 @@ class Launcher:
             _ = self.agent
         if CHECK_LEGACY_SOCKET in checks:
             self.guarded(CHECK_LEGACY_SOCKET, self.legacy_socket)
+        looked_up = False
+
+        def look_up_principals(evidence: list[dict]) -> None:
+            # Over every listed turn of the Jobs given, at once: a Job the launcher
+            # split off with no listed turn in it is not a FAIL of its own.
+            nonlocal looked_up
+            turns = principal_turns(evidence)
+            if self.args.expect_principal and turns and (keep_going or not failed()):
+                looked_up = True
+                self.guarded(PRINCIPAL_RESULT, self.check_principals, turns)
+
         jobs = [(pod_checks, [])] if pod_checks else []
         if restarting and harness.CHECK_DM in pod_checks and WAIT_ANSWER_FLAG not in self.forwarded:
             # restart DMs the same conversation: a dm task still running then would
@@ -537,22 +567,29 @@ class Launcher:
             say(f"NOTE dm runs in a Job of its own with {WAIT_ANSWER_FLAG}, so its task has finished before the restart")
             rest = [c for c in pod_checks if c != harness.CHECK_DM]
             jobs = [([harness.CHECK_DM], [WAIT_ANSWER_FLAG])] + ([(rest, [])] if rest else [])
+        evidence: list[dict] = []
         for job_checks, extra in jobs:
             if keep_going or not failed():
-                evidence = self.run_job(job_checks, extra)
-                if self.args.expect_principal and (keep_going or not failed()):
-                    self.guarded(PRINCIPAL_RESULT, self.check_principals, evidence)
+                evidence += self.run_job(job_checks, extra)
+        # Before the restart: it replaces the gateway pods, and their logs hold
+        # these Jobs' ingress lines.
+        look_up_principals(evidence)
         if restarting and (keep_going or not failed()):
             if self.guarded(RESTART_RESULT, self.restart):
-                evidence = self.run_job([harness.CHECK_RESTART])
-                if self.args.expect_principal and (keep_going or not failed()):
-                    self.guarded(PRINCIPAL_RESULT, self.check_principals, evidence)
+                look_up_principals(self.run_job([harness.CHECK_RESTART]))
+        if self.args.expect_principal and not looked_up and (keep_going or not failed()):
+            self.record(PRINCIPAL_RESULT, False, "no passing listed turn to look up in any of the run's Jobs")
 
     def summarize(self) -> int:
         passed = [name for name, ok, _ in self.results if ok]
         failed = [name for name, ok, _ in self.results if not ok]
         say(f"OVERALL pass={len(passed)} fail={len(failed)}" + (f" failed={','.join(failed)}" if failed else ""))
         return EXIT_FAIL if failed or not self.results else EXIT_OK
+
+
+def principal_turns(evidence: list[dict]) -> list[dict]:
+    """The passing listed turns in the evidence: the ones with an ingress line to look up."""
+    return [ev for ev in evidence if ev.get("check") in PRINCIPAL_CHECKS and ev.get("passed") and ev.get("sent_ts")]
 
 
 def check_namespace_ownership(kubectl: Kubectl, namespace: str) -> bool:
@@ -629,19 +666,7 @@ def _json_msg(line: str) -> str:
 
 
 def parse_checks(value: str) -> list[str]:
-    requested = []
-    for item in (part.strip() for part in value.split(",")):
-        if not item:
-            continue
-        if item == harness.CHECKS_ALL_ALIAS:
-            requested.extend(harness.CHECKS_ALL)
-        elif item in ALL_CHECKS:
-            requested.append(item)
-        else:
-            raise argparse.ArgumentTypeError(f"unknown check {item!r}; choose from {', '.join(ALL_CHECKS)} or {harness.CHECKS_ALL_ALIAS}")
-    if not requested:
-        raise argparse.ArgumentTypeError("no checks selected")
-    return [c for c in ALL_CHECKS if c in requested]
+    return harness.parse_checks(value, ALL_CHECKS)
 
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
