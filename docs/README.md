@@ -274,6 +274,10 @@ code, first check which era it belongs to:
   what ships.** Each file carries the banner "Specifies the end state, not
   current behaviour." Do not treat mismatches between these specs and the code
   as doc bugs — the delta is the roadmap (`07-implementation-roadmap.md`).
+  One exception: `09-capability-envelope.md` no longer carries the banner, and
+  its §0 ("What shipped, and what did not") records what is built. A mismatch
+  between §0 and `a2a/` is a doc bug, and a change that falsifies it owes the
+  edit.
 - **The site (`docs/site/src/content/docs/`) and component READMEs describe
   what ships today** on `main`. These are the docs that must track code
   changes.

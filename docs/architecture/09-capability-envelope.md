@@ -9,7 +9,7 @@
 > section as either aspirational or done.
 
 > **Written as a north star; the a2a plane arrived under it.** This presumes agents are separate
-> workloads. That is now true of one hop - the chatops gateway spawns a session pod per task, and
+> workloads. That is now true of one hop - the a2a chat gateway (C20) spawns a session pod per task, and
 > the session pod is a separate workload with its own principal - and still false of the
 > multi-agent fan-out the worked example in §3 draws. So the design got a first hop to be real
 > about and no second one. Core invariant #3 used to ban agent-to-agent calls outright and would
@@ -58,8 +58,8 @@ Deployment with the only read on the store; and the executor refusing a verb its
 not permit, as a terminal `rejected` event rather than a log line. The consumer rule in the payload
 spec flipped for `authority.grants` on the strength of it.
 
-**The per-request principal §4 and §5 both demand exists, and it was not new work.** The chatops
-gateway allocates a session pod name and a taskId in the same breath at spawn; one incarnation
+**The per-request principal §4 and §5 both demand exists, and it was not new work.** The a2a chat
+gateway (C20) allocates a session pod name and a taskId in the same breath at spawn; one incarnation
 serves exactly one task; and the bus derives a pod's identity from the API server's attested
 `authentication.kubernetes.io/pod-name` claim rather than from anything the pod says. So the
 per-incarnation principal _is_ the per-request principal, the parent can predict its name because
@@ -455,7 +455,7 @@ pre-created, tier-scoped ServiceAccount per agent. All still true, and all about
 plane does not authorize agents. It authorizes **session pods**, and the shape it already had is
 the shape this section asked for:
 
-- The chatops gateway allocates the session pod's name and the taskId **in the same breath at
+- The a2a chat gateway (C20) allocates the session pod's name and the taskId **in the same breath at
   spawn**, so the parent can predict the delegate's name -- which is precisely the derivability
   this section identified as the real obstacle, rather than the credential existing yet.
 - **One incarnation serves exactly one task.** A session pod is spawned per task and reaped with
