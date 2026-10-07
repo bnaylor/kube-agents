@@ -120,7 +120,9 @@ grant access, or run code the image does not already ship. The list is
 `k8s-operator/internal/controller/platformagent_manifests.go`. `KAGE_SLACK_UX`
 is the nearest case: it switches between Slack code paths the image already
 ships, adds no destination or credential, and writes only to Slack, in the
-channels and threads the gateway already serves; its comment in
+channels and threads the gateway already serves, apart from the title of an
+event alert's thread, which it records on that alert's routing row in the local
+Session KV database; its comment in
 `safeSandboxEnvOverrides` lists each path.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
@@ -219,7 +221,9 @@ answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
 process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
-namespace, where the managed-Prometheus collector runs, and to no other peer.
+namespace, where the managed-Prometheus collector runs, and to the operator's own
+pods, which read the counters into the `PlatformAgent`'s `status.usage`
+([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per

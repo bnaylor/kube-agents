@@ -107,15 +107,16 @@ readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
 readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 
-# ─── Step 0: self-revalidation against this PR's own green history ──────────
+# ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
 # evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
 # here too, first, so a job definition that has not yet hoisted it still
 # saves the eval matrix, and so the next-mode lane that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
-# the rules: a green at this head is reused whatever main has done since
-# (#1202), a green at an earlier head when everything since is inert
-# (#1179), and every doubt is a full run. EVAL_SKIP_REVALIDATION=1 is the
+# the rules: a green at this head, whatever main has done since (#1202),
+# or at an earlier head when everything since is inert (#1179), is reused;
+# failing both, an admin /override of this head; and every doubt is a full
+# run. EVAL_SKIP_REVALIDATION=1 is the
 # escape hatch. Run through bash rather than by mode: a script that lost its
 # executable bit would otherwise exit 126 with no "Step 0: full run:" line
 # and every run would go full in silence.
@@ -2068,11 +2069,12 @@ unit_cost_hint() {
     # record and then waits for the card. 1040-1080s a repetition on a dev
     # install on 2026-10-02.
     autoops-controller-stall-triage) echo 1100 ;;
-    # Tofu too: the plant waits for the cron job to file the sweep and for the
-    # sweep's worker to file its cards and end its run (up to the stack's
-    # run_wait, 900s), and the agent turn is a board read. 340-520s a
-    # repetition on 2026-09-28.
-    bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep, then for
+    # the gate's hand-off to file the ranking card or for the sweep's Cluster
+    # Agent cards to settle (up to the stack's handoff_wait, 1800s), and the
+    # agent turn is a board read. About 960s a repetition on a dev install on
+    # 2026-10-05; 340-520s when it waited only for the fan-out (2026-09-28).
+    bootstrap-discovery-fanout) echo 1000 ;;
     # Tofu too: the plant files one card and waits for its worker to run the
     # prioritization SOP and end its run (up to the stack's run_wait, 900s),
     # and the agent turn is a board read. Unmeasured; priced below the band
