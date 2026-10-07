@@ -40,6 +40,8 @@ BOT_APP_BOT_ID = "B0BOTKAGE"
 CHANNEL_ID = "C0KATEST1"
 CHANNEL_NAME = "ka-test"
 HOME_ID = "C0HOME001"
+PRIVATE_ID = "G0PRIVATE1"
+PRIVATE_NAME = "ka-private"
 TEAM_ID = "T0TEAM001"
 REFUSAL = ("⛔ I can't verify who you are on slack (id {id}), so I can't take asks from you yet — "
            "an admin has to add you to the allowed users list and the principal map.")
@@ -88,6 +90,9 @@ class FakeWorld:
         # next_cursor on every users.list and conversations.list page: a workspace
         # larger than the lookups' page cap.
         self.list_cursor = ""
+        # A token without groups:read: conversations.list refuses private_channel with missing_scope.
+        self.lacks_groups_read = False
+        self.conversation_list_types = []
 
     def next_ts(self):
         self.ts_counter += 1
@@ -180,8 +185,14 @@ class FakeWorld:
         if method == "users.info":
             return {"ok": True, "user": {"id": params["user"], "is_bot": params["user"] in self.bot_ids}}
         if method == "conversations.list":
-            return {"ok": True, "channels": [{"id": CHANNEL_ID, "name": CHANNEL_NAME}, {"id": HOME_ID, "name": "home"}],
-                    "response_metadata": {"next_cursor": self.list_cursor}}
+            types = params.get("types", "public_channel").split(",")
+            self.conversation_list_types.append(params.get("types", ""))
+            if "private_channel" in types and self.lacks_groups_read:
+                return {"ok": False, "error": "missing_scope", "needed": "groups:read"}
+            channels = [{"id": CHANNEL_ID, "name": CHANNEL_NAME}, {"id": HOME_ID, "name": "home"}]
+            if "private_channel" in types:
+                channels.append({"id": PRIVATE_ID, "name": PRIVATE_NAME, "is_private": True})
+            return {"ok": True, "channels": channels, "response_metadata": {"next_cursor": self.list_cursor}}
         if method == "conversations.open":
             return {"ok": True, "channel": {"id": self.dm_for(user, params["users"])}}
         if method == "chat.postMessage":
@@ -310,6 +321,7 @@ class HarnessTestCase(unittest.TestCase):
             "--reply-timeout", "60",
             "--quiet-window", "20",
             "--run-id", "testrun",
+            "--bot-name", "kage",
         ]
         self.fake = FakeClock()
 
@@ -760,6 +772,37 @@ class SetupAndRedactionTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_SETUP)
         self.assertIn("no channel named #nope", text)
 
+    def test_a_private_channel_resolves_by_name_with_groups_read(self):
+        code, text = self.run_harness("--checks", "home", "--channel", PRIVATE_NAME, "--home-channel", PRIVATE_NAME,
+                                      "--home-timeout", "5")
+        self.assertIn(f"channel={PRIVATE_ID}", text)
+        self.assertEqual(self.world.conversation_list_types, ["public_channel,private_channel"] * 2)
+
+    def test_without_groups_read_the_lookup_falls_back_to_public_channels(self):
+        # Live run 2026-10-07: the minted user tokens carry channels:read but not groups:read.
+        self.world.lacks_groups_read = True
+        self.world.bot_post(HOME_ID, "good morning")
+        code, text = self.run_harness("--checks", "home", "--home-channel", "home", "--home-since", "1600000000")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertIn(f"channel={CHANNEL_ID}", text)
+        # --channel, then --home-channel: each tries both types once, then public only.
+        self.assertEqual(self.world.conversation_list_types,
+                         ["public_channel,private_channel", "public_channel"] * 2)
+
+    def test_without_groups_read_a_private_channel_name_says_what_it_needs(self):
+        self.world.lacks_groups_read = True
+        code, text = self.run_harness("--checks", "dm", "--channel", PRIVATE_NAME)
+        self.assertEqual(code, harness.EXIT_SETUP, text)
+        self.assertIn(f"no public channel named #{PRIVATE_NAME} visible to the listed user, and its token lacks groups:read", text)
+        self.assertIn("a private channel needs groups:read on the token or the channel's C or G id", text)
+        self.assertEqual(self.world.conversation_list_types, ["public_channel,private_channel", "public_channel"])
+
+    def test_another_conversations_list_error_is_reported_as_is(self):
+        self.world.slack_error_override["conversations.list"] = "invalid_auth"
+        code, text = self.run_harness("--checks", "dm", "--channel", CHANNEL_NAME)
+        self.assertEqual(code, harness.EXIT_SETUP, text)
+        self.assertIn("Slack conversations.list failed: invalid_auth", text)
+
     def test_a_dm_id_is_refused_for_the_channel(self):
         code, text = self.run_harness("--checks", "dm", "--channel", "D0ABCDEF1")
         self.assertEqual(code, harness.EXIT_SETUP)
@@ -867,7 +910,7 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(out, "a [redacted] b [redacted] c [redacted] d [redacted]")
 
     def test_a_reply_outside_the_expected_thread_fails(self):
-        session = harness.Session(args=harness.parse_args([]), listed=None, listed_user_id=LISTED_ID, bot_user_id=BOT_ID,
+        session = harness.Session(args=harness.parse_args(["--bot-name", "kage"]), listed=None, listed_user_id=LISTED_ID, bot_user_id=BOT_ID,
                                   channel_id=CHANNEL_ID, run_id="r", clock=None, sleep=None)
         reply = {"ts": "1.3", "thread_ts": "1.2", "text": "PONG", "user": BOT_ID}
         result = harness.judge_listed_reply(session, "mention", CHANNEL_ID, "1.1", reply, harness.KIND_ANSWER, reply, expect_thread="1.1")
@@ -948,24 +991,33 @@ class UnitTest(unittest.TestCase):
             harness.parse_args(["--check", "home"])
 
     def test_time_budget_covers_every_wait(self):
-        args = harness.parse_args(["--checks", "all,home", "--home-channel", "c", "--unlisted-repeat"])
+        args = harness.parse_args(["--checks", "all,home", "--home-channel", "c", "--unlisted-repeat", "--bot-name", "kage"])
         self.assertEqual(harness.time_budget(args), 180 + 180 + 360 + 180 + 30 + 300)
 
     def test_an_invalid_home_match_is_refused_at_parse_time(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            harness.parse_args(["--checks", "home", "--home-channel", "c", "--home-match", "("])
+            harness.parse_args(["--checks", "home", "--home-channel", "c", "--home-match", "(", "--bot-name", "kage"])
 
     def test_non_finite_timeouts_are_refused(self):
         for flag in ("--reply-timeout", "--poll-interval", "--quiet-window", "--home-timeout", "--home-since"):
             for value in ("inf", "-inf", "nan", "infinity"):
                 with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()) as err, \
                         self.assertRaises(SystemExit):
-                    harness.parse_args([f"{flag}={value}"])
+                    harness.parse_args([f"{flag}={value}", "--bot-name", "kage"])
                 self.assertIn("finite", err.getvalue())
 
     def test_home_needs_a_channel(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            harness.parse_args(["--checks", "home"])
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            harness.parse_args(["--checks", "home", "--bot-name", "kage"])
+        self.assertIn("the home check needs --home-channel", err.getvalue())
+
+    def test_the_bot_needs_a_name_or_an_id(self):
+        # No default name: one workspace's bot name fails every other workspace.
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            harness.parse_args(["--checks", "dm"])
+        self.assertIn("pass --bot-name <your bot's name> or --bot-user-id <its member id>", err.getvalue())
+        self.assertEqual(harness.parse_args(["--checks", "dm", "--bot-name", "troisbocaux"]).bot_name, "troisbocaux")
+        self.assertEqual(harness.parse_args(["--checks", "dm", "--bot-user-id", BOT_ID]).bot_user_id, BOT_ID)
 
 
 if __name__ == "__main__":

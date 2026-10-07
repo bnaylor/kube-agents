@@ -30,6 +30,23 @@ SANDBOX_IMAGE = "us-docker.pkg.dev/p/kube-agents/agent-sandbox:v1"
 LEAKED = "xoxp-9999-leaked-token-value"
 # Far above any wait the launcher sets: a loop that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 100_000
+# The harness has no default bot name, so every run in these tests names one.
+BOT_FLAGS = ["--bot-name", "kage"]
+
+
+def with_bot(argv):
+    """argv with BOT_FLAGS forwarded to the harness, unless it already names the bot."""
+    argv = list(argv)
+    if "--bot-name" in argv or "--bot-user-id" in argv:
+        return argv
+    if "--" not in argv:
+        return [*argv, "--", *BOT_FLAGS]
+    split = argv.index("--") + 1
+    return [*argv[:split], *BOT_FLAGS, *argv[split:]]
+
+
+def parse(argv):
+    return launch.parse_args(with_bot(argv))
 
 
 def pod_spec(job):
@@ -171,7 +188,7 @@ def run_launch(cluster, *argv):
     out = io.StringIO()
     fake = FakeClock()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-        code = launch.main(list(argv), runner=cluster, clock=fake.clock, sleep=fake.sleep)
+        code = launch.main(with_bot(argv), runner=cluster, clock=fake.clock, sleep=fake.sleep)
     return code, out.getvalue()
 
 
@@ -300,7 +317,7 @@ class JobTest(unittest.TestCase):
         self.assertIn("OVERALL", out)
         self.assertEqual(sorted(kind for kind, _ in cluster.deleted), ["configmap", "job", "namespace"])
         polls = [c for c in cluster.calls if c[3:5] == ["get", "job"]]
-        deadline = launch.job_deadline(["--checks", "dm"], 0) + launch.JOB_WAIT_GRACE_SECONDS
+        deadline = launch.job_deadline(["--checks", "dm", *BOT_FLAGS], 0) + launch.JOB_WAIT_GRACE_SECONDS
         self.assertGreaterEqual(len(polls), deadline // launch.JOB_POLL_INTERVAL_SECONDS)
 
     def test_job_args_carry_non_bmp_characters_as_utf8(self):
@@ -510,7 +527,7 @@ class RestartTest(unittest.TestCase):
         for command in ("kubectl 'unbalanced", "   "):
             with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()) as err, \
                     self.assertRaises(SystemExit):
-                launch.parse_args(["--context", CONTEXT, "--checks", "restart", "--restart-cmd", command])
+                parse(["--context", CONTEXT, "--checks", "restart", "--restart-cmd", command])
             self.assertIn("--restart-cmd", err.getvalue())
 
     def test_restart_fails_when_the_gateway_never_reconnects(self):
@@ -652,7 +669,7 @@ class ModesAndArgsTest(unittest.TestCase):
     def test_owned_flags_after_the_separator_are_refused(self):
         for flag in ("--checks", "--run-id=x", "--project", "--keep-going"):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                launch.parse_args(["--context", CONTEXT, "--", flag, "v"])
+                parse(["--context", CONTEXT, "--", flag, "v"])
 
     def test_endpoint_overrides_after_the_separator_are_refused(self):
         harness_parser = harness.build_parser()
@@ -662,7 +679,7 @@ class ModesAndArgsTest(unittest.TestCase):
         for flag in suppressed:
             for forwarded in ([flag, "https://attacker.example/"], [f"{flag}=https://attacker.example/"]):
                 with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-                    launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *forwarded])
+                    parse(["--context", CONTEXT, "--checks", "dm", "--", *forwarded])
                 self.assertIn("is not a harness flag the launcher forwards", err.getvalue())
 
     def test_forwardable_flags_cover_every_other_harness_flag(self):
@@ -674,23 +691,23 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertTrue(launch.FORWARDABLE_HARNESS_FLAGS <= harness_flags)
         self.assertFalse(launch.FORWARDABLE_HARNESS_FLAGS & (suppressed | owned))
         self.assertEqual(launch.FORWARDABLE_HARNESS_FLAGS | suppressed | owned | {"-h", "--help"}, harness_flags)
-        args, forwarded = launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", "--channel", "ka-test",
+        args, forwarded = parse(["--context", CONTEXT, "--checks", "dm", "--", "--channel", "ka-test",
                                              "--reply-timeout=30", "--wait-answer"])
-        self.assertEqual(forwarded, ["--channel", "ka-test", "--reply-timeout=30", "--wait-answer"])
+        self.assertEqual(forwarded, [*BOT_FLAGS, "--channel", "ka-test", "--reply-timeout=30", "--wait-answer"])
 
     def test_token_source_is_not_forwarded(self):
         for forwarded in (["--token-source", "file"], ["--token-source=file"]):
             with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-                launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *forwarded, "--listed-secret", "/mnt/listed"])
+                parse(["--context", CONTEXT, "--checks", "dm", "--", *forwarded, "--listed-secret", "/mnt/listed"])
             self.assertIn("is not a harness flag the launcher forwards", err.getvalue())
 
     def test_non_finite_timeouts_fail_before_any_cluster_call(self):
         for value in ("inf", "nan"):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", "--reply-timeout", value])
+                parse(["--context", CONTEXT, "--checks", "dm", "--", "--reply-timeout", value])
             with self.subTest(value=value, mode="render"), contextlib.redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit):
-                launch.parse_args(["--render", "--", "--quiet-window", value])
+                parse(["--render", "--", "--quiet-window", value])
 
     def test_an_unexpected_exception_is_an_error_line_not_a_traceback(self):
         def exploding(cmd, **_):
@@ -703,16 +720,16 @@ class ModesAndArgsTest(unittest.TestCase):
 
     def test_an_invalid_home_match_fails_before_any_cluster_call(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            launch.parse_args(["--context", CONTEXT, "--checks", "home", "--", "--home-channel", "c", "--home-match", "("])
+            parse(["--context", CONTEXT, "--checks", "home", "--", "--home-channel", "c", "--home-match", "("])
 
     def test_abbreviations_cannot_slip_past_the_owned_flag_guard(self):
         for forwarded in (["--proj", "other"], ["--check", "home"], ["--keep"]):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *forwarded])
+                parse(["--context", CONTEXT, "--checks", "dm", "--", *forwarded])
 
     def test_bad_harness_flags_fail_before_any_cluster_call(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            launch.parse_args(["--context", CONTEXT, "--checks", "home"])
+            parse(["--context", CONTEXT, "--checks", "home"])
 
     def test_job_deadline_follows_the_checks(self):
         cluster = FakeCluster()
@@ -720,15 +737,28 @@ class ModesAndArgsTest(unittest.TestCase):
         job = yaml.safe_load(cluster.applied[2])
         self.assertEqual(job["spec"]["activeDeadlineSeconds"],
                          300 * 5 + launch.JOB_SETUP_ALLOWANCE_SECONDS + launch.JOB_START_ALLOWANCE_SECONDS)
-        self.assertEqual(launch.job_deadline(["--checks", "dm"], 5000), 5000)
+        self.assertEqual(launch.job_deadline(["--checks", "dm", *BOT_FLAGS], 5000), 5000)
+
+    def test_the_bot_needs_a_name_or_an_id_before_any_cluster_call(self):
+        cluster = FakeCluster()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.assertRaises(SystemExit):
+            launch.main(["--context", CONTEXT, "--checks", "dm"], runner=cluster, clock=FakeClock().clock, sleep=FakeClock().sleep)
+        self.assertIn("pass --bot-name <your bot's name> or --bot-user-id <its member id>", out.getvalue())
+        self.assertEqual(cluster.calls, [])
+        for flags in (["--bot-name", "troisbocaux"], ["--bot-user-id", "U0BOT"]):
+            _, forwarded = launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *flags])
+            self.assertEqual(forwarded, flags)
+        # The launcher's own checks run no harness, so they need no bot.
+        launch.parse_args(["--context", CONTEXT, "--checks", "legacy-socket"])
 
     def test_restart_needs_a_command_or_after_restart(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            launch.parse_args(["--context", CONTEXT, "--checks", "restart"])
+            parse(["--context", CONTEXT, "--checks", "restart"])
 
     def test_context_is_required(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            launch.parse_args(["--checks", "dm"])
+            parse(["--checks", "dm"])
 
     def test_launcher_names_match_the_operator_source(self):
         cp = (REPO / "k8s-operator/internal/controller/credential_proxy_manifests.go").read_text()

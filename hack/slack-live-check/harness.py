@@ -43,7 +43,6 @@ DEFAULT_PROJECT = "bnaylor-kagents-dev"
 DEFAULT_LISTED_SECRET = "slack-test-user-listed"
 DEFAULT_UNLISTED_SECRET = "slack-test-user-unlisted"
 DEFAULT_CHANNEL = "ka-test"
-DEFAULT_BOT_NAME = "kage"
 DEFAULT_PROMPT = "Reply with the single word PONG."
 DEFAULT_FOLLOWUP = "Once more, please: reply with the single word PONG."
 
@@ -59,6 +58,10 @@ HTTP_OK = 200
 HTTP_TOO_MANY_REQUESTS = 429
 LIST_PAGE_LIMIT = 200
 LIST_MAX_PAGES = 25
+# conversations.list types: private channels need groups:read, which a minted test token may lack.
+CHANNEL_TYPES_ALL = "public_channel,private_channel"
+CHANNEL_TYPES_PUBLIC = "public_channel"
+SLACK_MISSING_SCOPE = "missing_scope"
 HISTORY_PAGE_LIMIT = 100
 EVIDENCE_TEXT_LIMIT = 160
 RUN_ID_HEX_CHARS = 8
@@ -752,6 +755,20 @@ def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> str:
     return bot_user_id
 
 
+def find_channel(client: SlackClient, name: str, types: str) -> tuple[str, bool]:
+    """The id of the channel named name among types, or "", and whether the lookup stopped at the page cap."""
+    cursor = None
+    for _ in range(LIST_MAX_PAGES):
+        resp = client.call("conversations.list", types=types, exclude_archived="true", limit=LIST_PAGE_LIMIT, cursor=cursor)
+        for conv in resp.get("channels", []):
+            if conv.get("name") == name:
+                return conv["id"], False
+        cursor = resp.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            return "", False
+    return "", True
+
+
 def resolve_channel(client: SlackClient, channel: str) -> str:
     name = channel.lstrip("#")
     if DM_ID_PATTERN.match(name):
@@ -759,19 +776,25 @@ def resolve_channel(client: SlackClient, channel: str) -> str:
                            "post would start a task; pass a channel name or a C/G channel id")
     if CHANNEL_ID_PATTERN.match(name):
         return name
-    cursor = None
-    for _ in range(LIST_MAX_PAGES):
-        resp = client.call("conversations.list", types="public_channel,private_channel", exclude_archived="true",
-                           limit=LIST_PAGE_LIMIT, cursor=cursor)
-        for conv in resp.get("channels", []):
-            if conv.get("name") == name:
-                return conv["id"]
-        cursor = resp.get("response_metadata", {}).get("next_cursor") or None
-        if not cursor:
-            break
-    if cursor:
+    public_only = False
+    try:
+        found, truncated = find_channel(client, name, CHANNEL_TYPES_ALL)
+    except SlackAPIError as exc:
+        # Listing private channels needs groups:read, which a user token minted
+        # for the check may not carry. Public channels need only channels:read.
+        if exc.error != SLACK_MISSING_SCOPE:
+            raise
+        public_only = True
+        found, truncated = find_channel(client, name, CHANNEL_TYPES_PUBLIC)
+    if found:
+        return found
+    if truncated:
         raise HarnessError(f"no channel named #{name} before the lookup stopped after {LIST_MAX_PAGES} pages of "
                            "conversations.list, so it may be further on; pass the channel's C or G id instead of its name")
+    if public_only:
+        raise HarnessError(f"no public channel named #{name} visible to the listed user, and its token lacks groups:read, "
+                           "so private channels were not searched; a private channel needs groups:read on the token "
+                           "or the channel's C or G id instead of its name")
     raise HarnessError(f"no channel named #{name} visible to the listed user")
 
 
@@ -821,7 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--listed-secret", default=DEFAULT_LISTED_SECRET, help="Secret Manager secret holding the listed user's token")
     parser.add_argument("--unlisted-secret", default=DEFAULT_UNLISTED_SECRET, help="Secret Manager secret holding the unlisted user's token")
     parser.add_argument("--bot-user-id", default="", help="the gateway bot's member id; looked up by --bot-name when unset")
-    parser.add_argument("--bot-name", default=DEFAULT_BOT_NAME)
+    parser.add_argument("--bot-name", default="", help="the gateway bot's name in this workspace; required unless --bot-user-id is given")
     parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="channel name or id for preflight, mention and thread")
     parser.add_argument("--thread-ts", default="", help="thread root for the thread check when mention is not run")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -848,6 +871,10 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not args.bot_user_id and not args.bot_name:
+        # No default: each workspace names its bot, and a default that matches one
+        # workspace fails every other one with "no bot user named".
+        parser.error("pass --bot-name <your bot's name> or --bot-user-id <its member id>; there is no default bot name")
     if CHECK_HOME in args.checks and not args.home_channel:
         parser.error("the home check needs --home-channel")
     return args
