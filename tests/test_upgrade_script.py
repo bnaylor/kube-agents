@@ -17,6 +17,8 @@ import tempfile
 import time
 import unittest
 
+import yaml
+
 from tests.testing.common import (
     INVALID_IMMUTABLE_REFS,
     UPGRADER_HELP_BANNER,
@@ -561,6 +563,28 @@ class UpgradeRunContractTest(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertNotIn("ENABLE_DRIFT_DETECTOR", line)
                 self.assertNotIn("TF_VAR_enable_drift", line)
+
+    def test_the_mode_is_announced_on_a_full_upgrade_and_noted_on_a_retag(self):
+        """A full apply carries PLATFORM_AGENT_MODE from install.env and says when
+        that switches the install; a retag reuses the release record and says
+        when a full upgrade would move the mode. Both run before the first arm,
+        against the same namespace the rest of the run uses."""
+        source = _UPGRADE_SH.read_text()
+        announce = source.index(
+            '    announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"\n  else'
+        )
+        note = source.index(
+            'note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE"'
+        )
+        arms = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
+        generator = source.index('write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"')
+        self.assertLess(generator, announce)
+        self.assertLess(announce, note)
+        self.assertLess(note, arms)
+        self.assertIn('if [ "$PARAM_UPGRADE_MODE" = "full" ]; then', source[announce - 200 : announce])
+        # The plan says it too: it is the preview of the same full apply.
+        plan = source.index('print_step "4. Planning (read-only)"')
+        self.assertIn("announce_platform_agent_mode_for_apply", source[plan : plan + 800])
 
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.
@@ -1584,6 +1608,18 @@ helm_retag operator.image.tag
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
         self.assertEqual(json.loads(self._rendered(proc, "notes")), notes)
         self.assertEqual(json.loads(self._rendered(proc, "keys")), keys)
+
+    def test_a_harness_retag_keeps_the_recorded_mode(self):
+        """The retag modes carry platformAgent.mode on the release's own record:
+        the schema declares the key, so the filter keeps it, and the chart
+        renders it back onto the CR."""
+        recorded = json.loads(json.dumps(self._RECORDED))
+        recorded["platformAgent"]["mode"] = "next"
+        proc = self._retag(recorded, _REPO_ROOT)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
+        crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
+        self.assertEqual([cr["spec"].get("mode") for cr in crs], ["next"])
 
     def test_values_of_a_length_helm_reads_in_whole_buffers_arrive(self):
         """Helm 4 drops an unterminated last line of stdin whose length is a multiple of 4096 bytes."""

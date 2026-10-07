@@ -23,6 +23,7 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | The PlatformAgent's `spec.mode` (`today`); the composition then renders no mode        |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
@@ -46,6 +47,7 @@ their own copies:
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
+| `is_valid_platform_agent_mode <mode>`                                     | Accepted modes, the CRD's `spec.mode` enum: `today`, `next`                            |
 | `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                            |
 | `derive_chat_sub_name [topic] [sub]`                                      | Derive Google Chat Pub/Sub subscription (`<topic>-sub`) when topic is custom           |
 | `tf_state_chat_subscription_name`                                         | The subscription name managed by module.chat_pubsub, or empty                          |
@@ -54,6 +56,7 @@ their own copies:
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
+| `live_platform_agent_mode [namespace]`                                    | The mode the live CR carries, or nothing; a switch is announced against it             |
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -108,8 +111,9 @@ menu, and `common.sh`'s `load_state` for the dev scripts — with `set -a` so th
 reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read the
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
-export of the same name, so a flag is what overrides a recorded value for one run.
-One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
+export of the same name, so a flag is what overrides a recorded value for one run, except
+`--mode`, which is refused when it disagrees with the file (`PLATFORM_AGENT_MODE`, below).
+`NAMESPACE` ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
 `uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
 tooling exports that name and the value now reaches the Helm release's namespace. The file
 and `--agent-namespace` are the two routes in (`common.sh`'s `load_state` clears it the
@@ -175,7 +179,8 @@ folder, organisation or selector member it named and retires those projects' Clu
 reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
 returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared);
 `SCOPED_SA_POOL_ENABLED` absent disarms the scoped service account pool, deleting its accounts
-and putting the broker back on the agent's own identity.
+and putting the broker back on the agent's own identity; `PLATFORM_AGENT_MODE` absent resolves
+to `today`, which switches a `next` install back and retires its A2A stack.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -357,6 +362,26 @@ applies for that run and warns that the next full upgrade regenerates from the f
 switch, or a cap that is not a whole number of at least 1, stops every front door but
 `uninstall.sh`, which exports the switch off and the cap empty before it regenerates, so a typo
 cannot refuse a teardown.
+
+`PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
+([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
+renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
+composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
+takes `--mode` and records it, or the default, on a first install, and from then on the file is
+the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
+shell, and a `--mode` that disagrees with what the file resolves to is refused rather than
+applied for one run, because the next run, and every `upgrade.sh`, which takes no `--mode`,
+would switch the install back. A switch is an edit to the key. Before an apply the front doors
+read the mode the live CR runs and the one the release's last served revision carries, and say
+when the apply moves the CR (`announce_platform_agent_mode_switch`). Helm patches the CR from
+the difference between that revision's render and the new one, and `today` renders no field,
+so the key removes a recorded mode, and sends no change at all when the record already renders
+it; a mode set on the CR by hand then stays, and the front doors name it rather than announce a
+switch. Only full mode applies the key; the `harness` and `operator` retags reuse the recorded
+values and say when a full upgrade would move the mode. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
+before it regenerates. Under `next` the A2A gateway takes Google Chat, and answers it only
+through a hermes-bridge sidecar on the CR, which no install surface declares; `install.sh`
+says so when `next` meets `GOOGLE_CHAT_ENABLED`.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the

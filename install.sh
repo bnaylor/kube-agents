@@ -297,6 +297,11 @@ bootstrap_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
+  # switch the install's component stack for one run, and the next run from a
+  # clean shell would switch it back. --mode is refused for the same reason
+  # when it disagrees with this file (validate_platform_agent_mode).
+  unset PLATFORM_AGENT_MODE
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -506,6 +511,10 @@ PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
+# Empty takes DEFAULT_PLATFORM_AGENT_MODE. Seeded from install.env, so a re-run
+# without --mode keeps the mode the file records.
+PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
+PARAM_PLATFORM_AGENT_MODE_PASSED="false"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
@@ -562,6 +571,12 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
+  --mode=MODE                   The PlatformAgent's spec.mode: today | next. next also
+                                renders the NATS bus and the A2A gateway, a development
+                                stack. Recorded in install.env as PLATFORM_AGENT_MODE on
+                                a first install; on a later run, change that key instead
+                                (a mode switch: docs/designs/spec-mode-switch.md)
+                                (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
@@ -824,6 +839,18 @@ require_scope_flag_value() {
   exit 1
 }
 
+# --mode= given nothing is refused like an empty toggle: it cannot mean "keep
+# the recorded mode" (omitting the flag does that), and read as the default it
+# would switch a next install to today for this run. The value itself is
+# checked in main, against the CRD's enum and against install.env, once the
+# shared helpers are loaded.
+require_mode_flag_value() {
+  [ -n "${1:-}" ] && return 0
+  print_error "--mode= was given an empty value."
+  print_info "Pass --mode=today or --mode=next; to keep the mode install.env records, omit the flag."
+  exit 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -835,6 +862,9 @@ parse_args() {
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
+      --mode=*)
+        PARAM_PLATFORM_AGENT_MODE="${1#*=}"; PARAM_PLATFORM_AGENT_MODE_PASSED="true"
+        require_mode_flag_value "$PARAM_PLATFORM_AGENT_MODE"; shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
@@ -2078,6 +2108,10 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_NAME "${CLUSTER_NAME:-}"
   write_env_var "$tmp" REGION "${REGION:-}"
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
+  # Recorded on every first install, the default included: the file is the one
+  # place a later run, and every upgrade.sh, reads the mode from, and a --mode
+  # that disagrees with it is refused (validate_platform_agent_mode).
+  write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -3816,6 +3850,49 @@ validate_litellm_redaction_ip_action() {
   fi
 }
 
+# --mode, or the PLATFORM_AGENT_MODE install.env records: one of the CRD's
+# spec.mode values, named by whichever carried it. Then, against an existing
+# install.env, --mode must agree with what the file resolves to -- its own key,
+# or the default when it records none. Every other flag that overrides the file
+# applies for one run and is warned about (warn_flag_beats_unrecorded_file_value);
+# this one is refused, because the run after it reads the file again and
+# switches back, and upgrade.sh takes no --mode to stop it: a next install
+# would lose its A2A stack on the next upgrade, a today install gain one for a
+# single run. Switching is an edit to the file, which every later run then
+# keeps, and the apply that carries it says so (announce_platform_agent_mode_switch).
+# Needs installer_common.sh sourced.
+validate_platform_agent_mode() {
+  local value="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  if ! is_valid_platform_agent_mode "$value"; then
+    if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+      print_error "--mode must be today or next, got '${value}'."
+    elif [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+      print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix it in ${INSTALL_ENV_FILE}."
+    else
+      # No file yet: a first install seeds the key from the environment.
+      print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
+    fi
+    return 1
+  fi
+  [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ] || return 0
+  [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ] || return 0
+  local recorded="" source_of_recorded
+  if install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    recorded="$(recorded_install_env_value "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE)"
+  fi
+  if [ -n "$recorded" ]; then
+    source_of_recorded="${INSTALL_ENV_FILE} records PLATFORM_AGENT_MODE=${recorded}"
+  else
+    recorded="$DEFAULT_PLATFORM_AGENT_MODE"
+    source_of_recorded="${INSTALL_ENV_FILE} records no PLATFORM_AGENT_MODE, which is ${recorded}"
+  fi
+  [ "$value" != "$recorded" ] || return 0
+  print_error "--mode=${value} disagrees with the install configuration, so it would hold for this run only: ${source_of_recorded}."
+  print_info "The next run without the flag, and every upgrade.sh, reads the file and goes back to ${recorded}. install.sh records --mode only in an install.env it creates."
+  print_info "Set PLATFORM_AGENT_MODE=${value} in ${INSTALL_ENV_FILE} and re-run without --mode. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}."
+  return 1
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -4472,6 +4549,9 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        # The menu edits no mode key, but an install.env edited by hand since
+        # the last apply reaches the cluster through this apply too.
+        announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
         check_scope_container_access || exit 1
         enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
@@ -4546,6 +4626,13 @@ main() {
     # The menu reloads install.env and reads the scope keys, and the scoped
     # service account pool's switch and cap, from it alone; a flag here would
     # be validated and then dropped without a word.
+    # --mode likewise: the menu applies the mode install.env records, so a
+    # flag here would be dropped and the switch it asked for never announced.
+    if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+      print_error "--menu takes no --mode: it applies the PLATFORM_AGENT_MODE install.env records."
+      print_info "Set PLATFORM_AGENT_MODE in install.env to switch the mode; the menu's apply says it is a mode switch before it applies it."
+      exit 1
+    fi
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
@@ -5099,6 +5186,11 @@ main() {
   if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
     hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
   fi
+  # The mode, checked here for the same reason: a value the CRD refuses, or a
+  # --mode that disagrees with install.env, stops the run before the rest of
+  # the interview.
+  validate_platform_agent_mode || exit 1
+  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
   # cap the module would refuse is named with its key before the interview.
@@ -5737,6 +5829,23 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
+  export PLATFORM_AGENT_MODE="$platform_agent_mode"
+  # The bus's two third-party images are the operator's compiled defaults
+  # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
+  # this installer nor the chart points at a mirror, so a next install that
+  # mirrors its third-party images still pulls those two from Docker Hub.
+  if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
+    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's two images (nats, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
+    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists both)."
+  fi
+  # Under next the A2A gateway takes Google Chat, and it hands each message
+  # to the platform agent's addressee on the bus, which only a hermes-bridge
+  # sidecar on the CR consumes. Neither this installer nor the chart declares
+  # one, so Chat would accept messages and answer none.
+  if [ "$platform_agent_mode" = "next" ] && is_truthy "$google_chat_enabled"; then
+    print_warning "spec.mode next with Google Chat: the A2A gateway takes Chat from the agent, and nothing answers it until a hermes-bridge sidecar is declared on the PlatformAgent, which this installer does not do. Chat messages are accepted and go unanswered."
+    print_info "a2a/docs/hermes-bridge.md says how to declare the bridge; the installer's next install is for bringing the stack up, not for serving Chat."
+  fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
@@ -5860,6 +5969,12 @@ main() {
       --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
   fi
+  # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
+  # it is named before the operator confirms the apply. Outside the gate
+  # above, so --dry-run and --generate-only say it too; the reads need this
+  # cluster's context, which the gate fetched for an applying run, and say
+  # nothing without one (a first install has no CR).
+  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install
@@ -5909,6 +6024,14 @@ main() {
     summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
   fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
+  # Named on every run, a first install included, where no switch notice
+  # fires: next is an unsupported stack, and a copied --mode=next would
+  # otherwise install it without a word before the confirmation.
+  if [ "$platform_agent_mode" = "next" ]; then
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack: the NATS bus and the A2A gateway)"
+  else
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
+  fi
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"

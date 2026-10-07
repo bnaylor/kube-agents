@@ -410,7 +410,7 @@ sizes the `TASKS` consumer reserve from that `BRIDGE_CONCURRENCY` too, and provi
 never edits a stream that exists, so a bus provisioned before the sidecar is declared would
 hold a `TASKS` narrower than the CR then asks for, and the second provision Job would refuse
 it. The deploy therefore sizes the first provision for the sidecar (decided 2026-09-30 on
-gke-labs/kube-agents#2077): its mode patch also sets `spec.harness.tuning.maxSessions` to the
+gke-labs/kube-agents#2077): its mode change also sets `spec.harness.tuning.maxSessions` to the
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first
 run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the reserve and the
 value clamps to 1), computed from four constants the script copies from the operator and
@@ -584,8 +584,9 @@ it, and the wait goes.
 
 `EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
 today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, merge-patches the CR (the mode, and the `maxSessions` sized for the
-sidecar to come), and waits for the generation to move before
+Deployment's generation, sets the mode through the chart's `platformAgent.mode` in a `helm
+upgrade --reuse-values` of its own release (with the `maxSessions` sized for the sidecar to
+come, so the first render sees both), and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
@@ -597,7 +598,7 @@ image overrides) and waits for the door's Service and token Secret; it then decl
 sidecar on the CR through `spec.deployment.sidecars` (the executor paragraph in stage 1 says
 what the sidecar carries), waits for the agent Deployment to roll once more and for the
 provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
-budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
+budget, so the patch re-renders the Job; the mode change carried the `maxSessions` that makes
 that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
 being read past), and ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming

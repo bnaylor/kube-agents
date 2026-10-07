@@ -5,7 +5,7 @@
 the script with the flag unset, so the property most worth pinning is the
 negative one: with the flag unset, the build submits exactly the substitutions
 it submitted before the flag existed, the Helm install gets no extra value, and
-step 6b makes no kubectl call at all. The positive half is pinned by the same
+step 6b makes no kubectl or helm call at all. The positive half is pinned by the same
 lifting technique tests/test_ci_deploy_rc_images.py uses: section 4 run with
 the flag set names the six next-stack images and fills the operator.extraEnv
 values the release expands (the five image overrides and the inject door's
@@ -38,8 +38,9 @@ and a floor of 64, never edits a stream that exists, and refuses a later
 render whose budget the live stream cannot hold. Step 6b declares the sidecar
 only after the bus is up, so the first provision creates TASKS for a CR with
 no sidecar and the sidecar patch re-renders the Job against it. The tests here
-pin the two halves of the tech lead's decision: (b) the first patch carries a
-maxSessions sized so the second budget fits the floor, computed from four
+pin the two halves of the tech lead's decision: (b) the first change, a `helm
+upgrade` that sets platformAgent.mode, carries a maxSessions sized so the
+second budget fits the floor, computed from four
 constants copied from the operator's and pinned against them (the Go side's
 TestCiDeploySizesMaxSessionsToTheTasksFloor pins the same four against the
 functions that derive them), and (c) the step waits for the re-run Job and
@@ -411,6 +412,7 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
                             'export NAMESPACE="kubeagents-system"',
                             'export A2A_BRIDGE_URI=""',
                             'kubectl() { echo "kubectl must not run with the flag unset: $*" >&2; exit 99; }',
+                            'helm() { echo "helm must not run with the flag unset: $*" >&2; exit 99; }',
                             'python3() { echo "python3 must not run with the flag unset: $*" >&2; exit 99; }',
                             flag_line(value),
                             constants_block(),
@@ -675,7 +677,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         )
         markers = [
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
-            'wait_provision_job "the mode patch"',
+            'wait_provision_job "the mode upgrade"',
             'FIRST_PROVISION_JOB="${PROVISION_JOB_NAME}"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
@@ -741,7 +743,7 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_the_generation_is_read_before_each_patch(self) -> None:
         block = lifted(*_MODE_SECTION)
-        self.assertLess(block.index("GEN_BEFORE="), block.index("kubectl patch platformagent"))
+        self.assertLess(block.index("GEN_BEFORE="), block.index(_MODE_UPGRADE_LINE))
         sidecar_patch = block.index('--type merge -p "${SIDECAR_PATCH}"')
         self.assertLess(block.index("SIDECAR_GEN_BEFORE="), sidecar_patch)
         # And the render reads the Deployment after the mode roll, so the
@@ -819,12 +821,14 @@ class TasksBudgetSizingTest(unittest.TestCase):
         default = int(consts["EVAL_TASK_PARALLELISM_DEFAULT"])
         self.assertLessEqual(expected[default] * per_session + fixed + per_worker * default, floor)
 
-    def test_the_first_patch_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
+    def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
         consts = constants()
-        patch = json.loads(consts["MODE_NEXT_PATCH_FORMAT"] % 6)
-        self.assertEqual(patch, {"spec": {"mode": "next", "harness": {"tuning": {"maxSessions": 6}}}})
+        values = json.loads(consts["MODE_NEXT_HELM_VALUES_FORMAT"] % 6)
+        self.assertEqual(values, {"platformAgent": {"mode": "next", "harness": {"tuning": {"maxSessions": 6}}}})
         # The path is the CRD's: PlatformAgentSpec.Harness -> HarnessSpec.Tuning
-        # -> TuningSpec.MaxSessions, as the API package tags them.
+        # -> TuningSpec.MaxSessions, as the API package tags them, and the
+        # chart renders the values under platformAgent at those paths
+        # (tests/test_chart_platform_agent_mode.py, CiDeployDocumentRenderTest).
         api = text(_API_TYPES)
         self.assertIn('Tuning *TuningSpec `json:"tuning,omitempty"`', api)
         self.assertIn('MaxSessions *int `json:"maxSessions,omitempty"`', api)
@@ -837,14 +841,14 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertLess(guard, derivation)
         self.assertLess(derivation, script.index("# ─── 4. Build Container Images"))
         self.assertIn("A2A_RESERVE_PER_WORKER * MODE_NEXT_BRIDGE_CONCURRENCY", script[derivation : derivation + 200])
-        # And in step 6b the log line, the patch's rendering, the patch and
-        # the first Job wait, in that order.
+        # And in step 6b the log line, the document's rendering, the upgrade
+        # and the first Job wait, in that order.
         block = lifted(*_MODE_SECTION)
         markers = [
             'echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge\'s budget',
-            'printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"',
-            'kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"',
-            'wait_provision_job "the mode patch"',
+            'printf -v MODE_NEXT_HELM_VALUES "${MODE_NEXT_HELM_VALUES_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"',
+            _MODE_UPGRADE_LINE,
+            'wait_provision_job "the mode upgrade"',
         ]
         position = 0
         for marker in markers:
@@ -852,8 +856,39 @@ class TasksBudgetSizingTest(unittest.TestCase):
                 found = block.find(marker, position)
                 self.assertGreater(found, -1, f"{marker!r} is missing after offset {position}")
                 position = found + len(marker)
-        # No other patch precedes it: the first render sees the cap.
-        self.assertEqual(block.index("kubectl patch platformagent"), block.index(markers[2]))
+        # Nothing touches the CR before it: the first render sees the cap,
+        # and the one CR patch in the step is the sidecar's, after the bus.
+        self.assertGreater(block.index("kubectl patch platformagent"), block.index(_MODE_UPGRADE_LINE))
+        self.assertEqual(block.count("kubectl patch platformagent"), 1)
+        self.assertEqual(block.count("| helm upgrade "), 1)
+
+
+# The flip's one `helm upgrade`, as step 6b runs it: the document on stdin,
+# step 5's release and chart, its recorded values kept.
+_MODE_UPGRADE_LINE = (
+    'printf \'%s\\n\' "${MODE_NEXT_HELM_VALUES}" | helm upgrade "${HELM_RELEASE_NAME}" ./charts/kube-agents \\\n'
+    '    --namespace "${NAMESPACE}" --reuse-values --values - \\\n'
+    '    --wait --timeout "${MODE_NEXT_HELM_TIMEOUT}"'
+)
+
+
+class ModeUpgradeRendersTheCrTest(unittest.TestCase):
+    """The flip sets spec.mode through the chart value an installer-driven
+    install sets, so the next lane exercises that value. The upgrade is of the
+    release step 5 installed, on the values it recorded; that the document it
+    hands the chart renders spec.mode: next and the cap is
+    tests/test_chart_platform_agent_mode.py's CiDeployDocumentRenderTest."""
+
+    def test_the_upgrade_is_step_5s_release_and_chart_on_its_recorded_values(self) -> None:
+        script = text(_CI_DEPLOY)
+        install = re.search(r'helm upgrade --install "\$\{HELM_RELEASE_NAME\}" (\S+) \\\n\s+--namespace "\$\{NAMESPACE\}"', script)
+        self.assertIsNotNone(install, "step 5's helm upgrade --install is not where this test looks")
+        self.assertIn(_MODE_UPGRADE_LINE, lifted(*_MODE_SECTION))
+        self.assertIn(f'"${{HELM_RELEASE_NAME}}" {install.group(1)} \\', _MODE_UPGRADE_LINE)
+        # Without --reuse-values the upgrade would render the chart's defaults
+        # under the document and drop step 5's images, credentials and the
+        # operator's extraEnv; without --values - the document goes nowhere.
+        self.assertIn("--reuse-values --values -", _MODE_UPGRADE_LINE)
 
 
 def run_provision_wait(*, jobs: str, call: str, observed: str = "", ready: str = "", phase: str = "", status_attempts: int = 1) -> subprocess.CompletedProcess:

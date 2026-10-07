@@ -127,17 +127,24 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides, and
 #     arms the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
-#   - step 6b patches the CR (the mode, and the maxSessions section 2b sized
-#     for the sidecar to come), waits for the agent Deployment to roll, gates
+#   - step 6b sets the mode through the chart's platformAgent.mode, with the
+#     maxSessions section 2b sized for the sidecar to come, in one `helm
+#     upgrade` of the release step 5 installed, waits for the agent Deployment
+#     to roll, gates
 #     on the NATS StatefulSet, the callout Deployment, the provisioning Job
 #     and the agent Deployment, in that order, waits for the inject door's
 #     Service and token Secret, declares the bridge sidecar on the CR, waits
 #     for the provisioning Job's re-run and reads the CR's phase after it,
 #     and waits for the bridge to log that it is consuming `platform` tasks.
 # hack/ci-eval-pr.sh then runs the matrix through the door (AGENT_TRANSPORT=
-# inject) under the same flag. The chart deliberately renders no spec.mode
-# (docs/designs/spec-mode-switch.md), so the flip is a merge patch on the CR
-# the chart created. The names below are what the operator renders for a CR
+# inject) under the same flag. The flip goes through the chart value rather
+# than a patch on the CR so that the next lane exercises the value an
+# installer-driven next install sets (install.sh --mode, the composition's
+# platform_agent_mode), and it is still a second release after the today-mode
+# install has passed step 6 rather than a value on step 5's install, so the
+# order the gates below rely on is the one the patch had. The sidecar is still
+# a patch: the chart renders no spec.deployment.sidecars, and the sidecar copies
+# the agent container the operator renders under next. The names below are what the operator renders for a CR
 # of this name (a2aNATSName, a2aCalloutName, a2aGatewayName, a2aInjectName and
 # the provision Job's component label in
 # k8s-operator/internal/controller/platformagent_a2a_manifests.go; the managed
@@ -165,13 +172,19 @@ readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agen
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
-# The first patch: the mode, and the maxSessions section 2b sizes for the
-# sidecar patch to come, in one merge so the first render -- and so the first
-# provision Job -- sees both. A printf format; %d is MODE_NEXT_MAX_SESSIONS.
-# The field path is the CRD's (HarnessSpec.Tuning.MaxSessions in
-# k8s-operator/api/v1alpha1), which TestCiDeploySizesMaxSessionsToTheTasksFloor
-# holds by decoding this patch into the type.
-readonly MODE_NEXT_PATCH_FORMAT='{"spec":{"mode":"next","harness":{"tuning":{"maxSessions":%d}}}}'
+# The first change: the mode, and the maxSessions section 2b sizes for the
+# sidecar patch to come, as one values document for one `helm upgrade`, so the
+# first render -- and so the first provision Job -- sees both. A printf
+# format; %d is MODE_NEXT_MAX_SESSIONS. The chart renders platformAgent.mode
+# as spec.mode and platformAgent.harness.tuning.maxSessions as
+# spec.harness.tuning.maxSessions, so under platformAgent the document is the
+# CR's own field paths, which TestCiDeploySizesMaxSessionsToTheTasksFloor
+# holds by decoding it into the type and tests/test_ci_deploy_mode_next.py by
+# rendering it through the chart.
+readonly MODE_NEXT_HELM_VALUES_FORMAT='{"platformAgent":{"mode":"next","harness":{"tuning":{"maxSessions":%d}}}}'
+# The flip's own `helm upgrade` waits on the chart's workloads as step 5's
+# does, but changes none of them, so it needs only the rollout budget.
+readonly MODE_NEXT_HELM_TIMEOUT="600s"
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
@@ -1154,14 +1167,16 @@ fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 6b. EVAL_MODE_NEXT: switch to spec.mode: next and gate the bus ──────────
-# Everything above proved the today-mode install. From here the CR is patched
-# and the gates run over what `mode: next` adds, in dependency order: the NATS
+# Everything above proved the today-mode install. From here the mode is set
+# through the chart (a `helm upgrade --reuse-values` of step 5's release with
+# platformAgent.mode, which the chart renders as spec.mode) and the gates run
+# over what `mode: next` adds, in dependency order: the NATS
 # StatefulSet (the bus), the callout Deployment (the Job below cannot
 # authenticate to NATS without it), the provisioning Job (the streams; until
 # it completes there is nothing on the bus), and then the agent Deployment,
 # which the operator rolls when it pins the mode into the managed .env and
 # the config hash moves. The Deployment's generation is recorded before the
-# patch: `rollout status` right after it would answer for the today
+# upgrade: `rollout status` right after it would answer for the today
 # ReplicaSet, before the operator has reconciled anything.
 #
 # Then the door and the executor, which the eval's transport needs and the
@@ -1242,7 +1257,7 @@ gate_mode_next_rollout() {
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
 }
 
 # Waits for the agent Deployment's generation to move past the one given,
@@ -1369,9 +1384,9 @@ wait_provision_job() {
     exit 1
   fi
   if [ "${PROVISION_JOB_RERENDERED}" = "false" ]; then
-    echo "✓ ${what} left the A2A provisioning Job's render unchanged (${PROVISION_JOB_NAME} is still the current run) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+    echo "✓ ${what} left the A2A provisioning Job's render unchanged (${PROVISION_JOB_NAME} is still the current run) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
   else
-    echo "✓ A2A provisioning Job ${PROVISION_JOB_NAME} complete $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+    echo "✓ A2A provisioning Job ${PROVISION_JOB_NAME} complete $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
   fi
 }
 
@@ -1462,19 +1477,25 @@ print(json.dumps({"spec": {"deployment": {"sidecars": [container]}}}))
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next (EVAL_MODE_NEXT=1) ==="
-  # The mode and the session cap in one patch, so the first render -- and the
-  # first provisioning Job -- sees both. Section 2b sized the cap so the TASKS
-  # that Job creates at the floor holds the budget the sidecar patch below
-  # re-renders; the arithmetic is in the log for a reader of the artifact who
-  # finds a non-default maxSessions on the eval CR.
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next through platformAgent.mode (EVAL_MODE_NEXT=1) ==="
+  # The mode and the session cap in one values document, so the first render
+  # -- and the first provisioning Job -- sees both. Section 2b sized the cap so
+  # the TASKS that Job creates at the floor holds the budget the sidecar patch
+  # below re-renders; the arithmetic is in the log for a reader of the artifact
+  # who finds a non-default maxSessions on the eval CR.
   echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge's budget (${MODE_NEXT_MAX_SESSIONS}*${A2A_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY} <= ${A2A_TASKS_FLOOR})"
   # The format is a named constant, which is the point of it (SC2059 wants a literal).
   # shellcheck disable=SC2059
-  printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
+  printf -v MODE_NEXT_HELM_VALUES "${MODE_NEXT_HELM_VALUES_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
   GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
-  kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"
-  wait_agent_generation_past "${GEN_BEFORE}" "the mode patch"
+  # --reuse-values keeps everything step 5 set (the images, the credentials,
+  # the operator's extraEnv) and adds the document on stdin, which is JSON and
+  # so YAML. The newline is not optional: Helm 4 drops an unterminated last
+  # line of a length that is a multiple of 4096 bytes (upgrade.sh, helm_retag).
+  printf '%s\n' "${MODE_NEXT_HELM_VALUES}" | helm upgrade "${HELM_RELEASE_NAME}" ./charts/kube-agents \
+    --namespace "${NAMESPACE}" --reuse-values --values - \
+    --wait --timeout "${MODE_NEXT_HELM_TIMEOUT}"
+  wait_agent_generation_past "${GEN_BEFORE}" "the mode upgrade"
   echo "managed .env now reads:"
   # Whole, not grepped for the mode key: the key is named in exactly two
   # places by design (tests/test_mode_grep.py), and this script is not one.
@@ -1486,7 +1507,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
 
   # The first run, against a bus with no streams; its name is kept so the
   # re-run after the sidecar patch is told from it.
-  wait_provision_job "the mode patch"
+  wait_provision_job "the mode upgrade"
   FIRST_PROVISION_JOB="${PROVISION_JOB_NAME}"
 
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
@@ -1508,7 +1529,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ inject door rendered (${A2A_INJECT_NAME} Service, and token Secret with key ${A2A_INJECT_TOKEN_KEY} for the eval) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  echo "✓ inject door rendered (${A2A_INJECT_NAME} Service, and token Secret with key ${A2A_INJECT_TOKEN_KEY} for the eval) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
 
   # The bridge sidecar, at the concurrency section 2b checked at second zero.
   # The format is a named constant, which is the point of it (SC2059 wants a literal).
@@ -1564,7 +1585,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch: ${BRIDGE_CONSUMING}"
+  echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch: ${BRIDGE_CONSUMING}"
 
   # Last, for the reason in this step's header: the bucket it needs exists by
   # now, and the backoff it may still be in has been running against the two

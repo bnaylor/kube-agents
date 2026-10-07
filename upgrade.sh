@@ -1848,6 +1848,7 @@ main() {
     # a policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -1887,6 +1888,15 @@ main() {
   # on its own last line before its first mutating command, and
   # UpgradeRunContractTest.test_the_apply_gate_sits_after_every_refusal_in_its_arm
   # pins that placement, which is otherwise unreachable from the test suite.
+  # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
+  # install.env, so a key edited since the last apply switches the install
+  # here, and the run says so first. The retag modes reuse the release's
+  # recorded values, mode included, and say that they leave it where it is.
+  if [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  else
+    note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE"
+  fi
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"

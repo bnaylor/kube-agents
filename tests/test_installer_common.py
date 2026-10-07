@@ -238,6 +238,8 @@ class InstallerCommonTest(unittest.TestCase):
                     # pool in every file the cases read.
                     "SCOPED_SA_POOL_ENABLED": "",
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
+                    # And the mode, refused on a value outside the CRD's enum.
+                    "PLATFORM_AGENT_MODE": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -1284,6 +1286,242 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1 out=[]", proc.stdout)
         self.assertIn("LITELLM_REDACTION_RULES is not valid JSON", proc.stderr)
+
+    # ── PLATFORM_AGENT_MODE: the PlatformAgent's spec.mode ──────────────────
+
+    def test_tfvars_carry_the_platform_agent_mode(self):
+        # Written on every run, the default included, so upgrade.sh carries the
+        # recorded mode forward; the composition renders nothing for "today".
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, 'platform_agent_mode = "today"\n'),
+                ({"PLATFORM_AGENT_MODE": "today"}, 'platform_agent_mode = "today"\n'),
+                ({"PLATFORM_AGENT_MODE": "next"}, 'platform_agent_mode = "next"\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_platform_agent_mode_outside_the_crd_enum(self):
+        # upgrade.sh and the menu regenerate from install.env without
+        # install.sh's check: the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("Next", "later", "today "):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"PLATFORM_AGENT_MODE='{value}' is not one of today, next. Fix it in install.env.", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_mode_from_the_file_alone(self):
+        # An inherited PLATFORM_AGENT_MODE would switch the install for one run;
+        # the file's own key still loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_MODE=next\n")
+            for file, expected in ((silent, "MODE=[]"), (recorded, "MODE=[next]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "MODE=[${{PLATFORM_AGENT_MODE:-}}]"',
+                        env={"PLATFORM_AGENT_MODE": "next" if file is silent else "today"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_a_recorded_mode_is_carried_into_the_regenerated_tfvars(self):
+        # upgrade.sh's full path, and the menu's: load install.env, then
+        # regenerate. The recorded mode reaches the tfvars; an exported one
+        # over a file that records none does not.
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_MODE=next\n")
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=test-project\n")
+            for file, exported, expected in (
+                (recorded, "", 'platform_agent_mode = "next"\n'),
+                (recorded, "today", 'platform_agent_mode = "next"\n'),
+                (silent, "next", 'platform_agent_mode = "today"\n'),
+            ):
+                with self.subTest(file=file.name, exported=exported):
+                    proc = self._run(
+                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": exported},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    _CONTEXT_KUBECTL = '#!/usr/bin/env bash\ncase "$*" in *"config get-contexts"*) exit 0 ;; esac\nexit 1\n'
+
+    @staticmethod
+    def _cr_kubectl(listing, exit_code=0):
+        """A kubectl with this cluster's context whose CR read prints `listing`."""
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config get-contexts"*) exit 0 ;;\n'
+            f'  *"get platformagents"*) printf \'%s\' \'{listing}\'; exit {exit_code} ;;\n'
+            "esac\nexit 1\n"
+        )
+
+    # A helm stub: `history` prints the revisions given, `get values` the
+    # values of the revision asked for (or of the only one).
+    @staticmethod
+    def _helm(history, values_by_revision):
+        cases = "".join(
+            f'      *"--revision {rev}"*) printf \'%s\' \'{vals}\' ;;\n' for rev, vals in values_by_revision.items()
+        )
+        return (
+            "helm() {\n"
+            '  case "$1" in\n'
+            f"    history) printf '%s' '{history}' ;;\n"
+            '    get) case "$*" in\n'
+            f"{cases}"
+            '      *) return 1 ;;\n'
+            "    esac ;;\n"
+            "    *) return 1 ;;\n"
+            "  esac\n"
+            "}\n"
+        )
+
+    def test_release_platform_agent_mode_reads_the_served_revision(self):
+        served_today = '[{"revision": 1, "status": "superseded"}, {"revision": 2, "status": "deployed"}]'
+        failed_latest = '[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]'
+        for helm_stub, kubectl, expected in (
+            (self._helm(served_today, {2: '{"platformAgent":{"mode":"next"}}'}), self._CONTEXT_KUBECTL, "[next]"),
+            # A record with no mode rendered none: told apart from no record.
+            (self._helm(served_today, {2: '{"platformAgent":{"name":"platform-agent"}}'}), self._CONTEXT_KUBECTL, "[unset]"),
+            (self._helm(served_today, {2: "null"}), self._CONTEXT_KUBECTL, "[unset]"),
+            # A failed latest revision: Helm patches from the one that served.
+            (self._helm(failed_latest, {1: "{}", 2: '{"platformAgent":{"mode":"next"}}'}), self._CONTEXT_KUBECTL, "[unset]"),
+            # No release, no revision that served, or no context: nothing.
+            ("helm() { echo 'Error: release: not found' >&2; return 1; }\n", self._CONTEXT_KUBECTL, "[]"),
+            (self._helm('[{"revision": 1, "status": "failed"}]', {1: '{"platformAgent":{"mode":"next"}}'}), self._CONTEXT_KUBECTL, "[]"),
+            ("helm() { echo 'helm must not run' >&2; return 99; }\n", None, "[]"),
+        ):
+            with self.subTest(helm_stub=helm_stub, context=kubectl is not None):
+                proc = self._run(
+                    f'{helm_stub}echo "MODE=[$(release_platform_agent_mode kubeagents-system)]"',
+                    kubectl_script=kubectl,
+                )
+                self.assertIn(f"MODE={expected}", proc.stdout, proc.stderr)
+                self.assertNotIn("helm must not run", proc.stderr)
+
+    def test_release_platform_agent_mode_asks_this_clusters_context(self):
+        proc = self._run(
+            'args_file="$(mktemp)"\n'
+            'helm() { echo "$*" >> "$args_file"; case "$1" in history) printf \'[{"revision": 3, "status": "deployed"}]\' ;; *) printf "{}" ;; esac; }\n'
+            'release_platform_agent_mode kubeagents-system >/dev/null; cat "$args_file"; rm -f "$args_file"',
+            kubectl_script=self._CONTEXT_KUBECTL,
+        )
+        ctx = "--kube-context gke_test-project_us-central1_test-cluster"
+        self.assertIn(f"history kube-agents -n kubeagents-system {ctx} -o json", proc.stdout, proc.stderr)
+        self.assertIn(f"get values kube-agents -n kubeagents-system {ctx} --revision 3 -o json", proc.stdout, proc.stderr)
+
+    def test_live_platform_agent_mode_reads_the_cr(self):
+        for kubectl, expected in (
+            (self._cr_kubectl("next|"), "[next]"),
+            (self._cr_kubectl("today|"), "[today]"),
+            # A CR with no mode prints its separator: unset, not unread.
+            (self._cr_kubectl("|"), "[unset]"),
+            # No CR, a failed read, or no context: nothing.
+            (self._cr_kubectl(""), "[]"),
+            (self._cr_kubectl("next|", exit_code=1), "[]"),
+            (None, "[]"),
+        ):
+            with self.subTest(kubectl=kubectl):
+                proc = self._run('echo "MODE=[$(live_platform_agent_mode kubeagents-system)]"', kubectl_script=kubectl)
+                self.assertIn(f"MODE={expected}", proc.stdout, proc.stderr)
+
+    _LOUD_PRINTS = 'print_warning() { echo "WARN: $*"; }\nprint_info() { echo "INFO: $*"; }\n'
+
+    def test_a_mode_switch_is_announced_from_what_the_cr_runs(self):
+        # record, live CR, key -> what the warning says.
+        for args, expect in (
+            # Installed today through the installer; the key now asks for next.
+            ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
+                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
+            # Installed next through the installer; the key now asks for today,
+            # which renders nothing and so removes the recorded field.
+            ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
+                                 "retires the A2A stack", "set PLATFORM_AGENT_MODE=next in install.env")),
+            # A render that drops a recorded today removes the field from a CR
+            # patched to next since.
+            ("today next today", ("WARN: This apply switches the install from spec.mode next to today",)),
+        ):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                for line in expect:
+                    self.assertIn(line, proc.stdout)
+                self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+
+    def test_a_re_apply_and_an_unread_install_are_silent(self):
+        for args in ("unset unset today", "next next next", "unset next next", '"" unset next', 'unset "" next'):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertEqual(proc.stdout, "")
+
+    def test_a_mode_set_by_hand_is_named_rather_than_announced_as_a_switch(self):
+        # The release renders the key already, so Helm sends no change and a
+        # mode set on the CR by hand stays: a CR patched to next under a
+        # record with no mode, and one patched back to today under a record
+        # of next (a rollback round trip's state).
+        for args, running, key in (("unset next today", "next", "today"), ("next today next", "today", "next"), ("next unset next", "today", "next")):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertNotIn("This apply switches", proc.stdout)
+                self.assertIn(
+                    f"WARN: install.env sets PLATFORM_AGENT_MODE={key}, but the PlatformAgent carries spec.mode {running}, set outside this installer",
+                    proc.stdout,
+                )
+
+    def test_a_retag_says_what_a_full_upgrade_would_do(self):
+        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
+        self.assertIn("WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run", proc.stdout)
+        self.assertIn("leaves it at spec.mode today", proc.stdout)
+        self.assertIn("A full upgrade applies the switch to next", proc.stdout)
+        # Quiet where a full upgrade would not move the CR either: the same
+        # mode, a hand-set mode the key cannot reach, or nothing read.
+        for args in ("next next next harness", "unset unset today operator", "unset next today harness", "next today next harness", '"" unset next operator', 'unset "" next operator'):
+            with self.subTest(args=args):
+                quiet = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
+                self.assertEqual(quiet.stdout, "")
+
+    def test_the_front_door_calls_read_the_cr_before_asking_helm(self):
+        # A context whose cluster does not answer: the CR read comes back
+        # empty within its timeout, and helm, which has none, is never asked.
+        for call in ("announce_platform_agent_mode_for_apply kubeagents-system next",
+                     "note_platform_agent_mode_for_retag kubeagents-system next harness"):
+            with self.subTest(call=call):
+                # The readers send helm's stderr to /dev/null, so the stub
+                # leaves a mark in a file rather than on stderr.
+                proc = self._run(
+                    f'{self._LOUD_PRINTS}mark="$(mktemp)"; rm -f "$mark"\n'
+                    f'helm() {{ touch "$mark"; return 99; }}\n{call}\n'
+                    '[ -e "$mark" ] && echo "HELM RAN"; rm -f "$mark"',
+                    kubectl_script=self._cr_kubectl("", exit_code=1),
+                )
+                self.assertEqual(proc.stdout, "", proc.stderr)
+        proc = self._run(
+            self._LOUD_PRINTS
+            + self._helm('[{"revision": 1, "status": "deployed"}]', {1: "{}"})
+            + "announce_platform_agent_mode_for_apply kubeagents-system next",
+            kubectl_script=self._cr_kubectl("|"),
+        )
+        self.assertIn("WARN: This apply switches the install from spec.mode today to next", proc.stdout, proc.stderr)
 
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the

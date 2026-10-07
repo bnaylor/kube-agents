@@ -144,6 +144,13 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
+# The design document a spec.mode switch points the operator at.
+readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
+# What release_platform_agent_mode and live_platform_agent_mode print for a
+# field that is not there: a record that carries no platformAgent.mode, or a
+# CR with no spec.mode. Told apart from printing nothing, which means nothing
+# could be read.
+readonly PLATFORM_AGENT_MODE_UNSET="unset"
 # The composition's two Helm releases, by their Terraform type and name: the
 # front doors ask the state whether it manages one before deciding what a
 # cert-manager or kube-agents release already on the cluster means.
@@ -344,6 +351,155 @@ is_non_negative_integer() {
 # chart's litellm.redaction.ip.action.
 is_valid_redaction_ip_action() {
   [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
+}
+
+# PLATFORM_AGENT_MODE: the PlatformAgent CRD's spec.mode enum, which the
+# chart's platformAgent.mode and the composition's platform_agent_mode take too.
+is_valid_platform_agent_mode() {
+  [[ "${1:-}" =~ ^(today|next)$ ]]
+}
+
+# The platformAgent.mode of the release revision Helm patches the CR from:
+# the latest revision when it served, otherwise the last one that did (a
+# failed upgrade leaves its values as the latest revision while the CR still
+# holds the served one, and Helm diffs the next render against the served
+# one, as refuse_apply_over_undeclared_scope and upgrade.sh's retag_values
+# also read it). PLATFORM_AGENT_MODE_UNSET when that revision has no mode.
+# Prints nothing when nothing can be read -- no context for this cluster, no
+# release, an unreadable record -- because the notice this feeds is a notice,
+# not a gate. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
+# (gke_context_name).
+release_platform_agent_mode() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" expected_ctx revision values
+  expected_ctx="$(gke_context_name)"
+  kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1 || return 0
+  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: a
+  # missing release is an ordinary answer here, not an abort.
+  revision="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
+    | python3 -c '
+import json, sys
+statuses = sys.argv[1].split()
+served = [r["revision"] for r in (json.load(sys.stdin) or []) if r.get("status") in statuses]
+print(max(served) if served else "")
+' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null)" || return 0
+  [ -n "$revision" ] || return 0
+  values="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$revision" -o json 2>/dev/null)" || return 0
+  printf '%s' "$values" | (trap - ERR; python3 -c '
+import json, sys
+values = json.load(sys.stdin) or {}
+mode = (values.get("platformAgent") or {}).get("mode")
+sys.stdout.write(mode or sys.argv[1])
+' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
+}
+
+# The spec.mode the live PlatformAgent carries, or PLATFORM_AGENT_MODE_UNSET
+# when it has none. Prints nothing when there is no context, no CR or no
+# answer within KUBECTL_PROBE_REQUEST_TIMEOUT. The CR, not the record, is the
+# mode the install runs: a mode set by hand with kubectl is on the CR and in
+# no record.
+live_platform_agent_mode() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" expected_ctx modes
+  expected_ctx="$(gke_context_name)"
+  kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1 || return 0
+  # One entry per CR, each its mode and a `|`, so a CR with no mode still
+  # prints its `|` and is told apart from no CR at all.
+  modes="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o jsonpath='{range .items[*]}{.spec.mode}{"|"}{end}' 2>/dev/null)" || return 0
+  [ -n "$modes" ] || return 0
+  modes="${modes%%|*}"
+  printf '%s' "${modes:-$PLATFORM_AGENT_MODE_UNSET}"
+}
+
+# A mode as the operator reads it: an absent one is today.
+effective_platform_agent_mode() {
+  if [ "${1:-}" = "$PLATFORM_AGENT_MODE_UNSET" ]; then
+    printf '%s' "$DEFAULT_PLATFORM_AGENT_MODE"
+  else
+    printf '%s' "${1:-}"
+  fi
+}
+
+# The spec.mode the CR carries after a full apply of PLATFORM_AGENT_MODE: $1
+# the record's (release_platform_agent_mode), $2 the live CR's, $3 the key.
+# The composition renders "next" as mode: next and "today" as no field, and
+# Helm patches a custom resource from the difference between the served
+# render and the new one. So a render that changes the mode sets it, one
+# that drops a recorded mode removes it, and one the record already matches
+# changes nothing, leaving whatever the CR carries, a mode set by hand
+# included.
+platform_agent_mode_after_apply() {
+  local record="${1:-}" live="${2:-}" key="${3:-}" rendered="$PLATFORM_AGENT_MODE_UNSET"
+  [ "$key" = "next" ] && rendered="$key"
+  if [ "$rendered" = "$record" ]; then
+    printf '%s' "$live"
+  else
+    printf '%s' "$rendered"
+  fi
+}
+
+# Says what a full apply does to the install's spec.mode: $1 the record's
+# mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now. A
+# switch is a rollout of a different component stack, not a setting, and the
+# only trace of it in install.env is the one key someone edited, so the run
+# that applies it names it first. A key the apply cannot bring the CR to,
+# because the CR carries a mode set outside this installer, is named too.
+# Silent when either read came back empty (a first install has no CR), and on
+# a re-apply of the same mode. Caller defines print_warning / print_info.
+announce_platform_agent_mode_switch() {
+  local record="${1:-}" live="${2:-}" key="${3:-}" from to
+  [ -n "$record" ] && [ -n "$live" ] || return 0
+  from="$(effective_platform_agent_mode "$live")"
+  to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
+  if [ "$from" = "$to" ]; then
+    if [ "$to" != "$key" ]; then
+      print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but the PlatformAgent carries spec.mode ${to}, set outside this installer, and this apply leaves it there: the release already renders ${key}, so Helm has no change to send."
+      print_info "To switch it, patch spec.mode on the CR, or apply once with PLATFORM_AGENT_MODE=${to} and then with ${key} (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+    fi
+    return 0
+  fi
+  print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
+  if [ "$to" = "next" ]; then
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
+  else
+    print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
+  fi
+  print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
+}
+
+# The retag modes' half: upgrade.sh --upgrade-mode=harness or operator moves
+# image tags on the release's recorded values and applies no tfvars, so the
+# CR keeps the mode it has whatever PLATFORM_AGENT_MODE says. Said when a full
+# upgrade would move it, rather than left for that upgrade to switch the
+# install without a word from this run. $1 the record's mode, $2 the live
+# CR's, $3 the key, $4 the upgrade mode. Silent when either read came back
+# empty.
+note_platform_agent_mode_not_applied() {
+  local record="${1:-}" live="${2:-}" key="${3:-}" upgrade_mode="${4:-}" running full
+  [ -n "$record" ] && [ -n "$live" ] || return 0
+  running="$(effective_platform_agent_mode "$live")"
+  full="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
+  [ "$running" != "$full" ] || return 0
+  print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
+  print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
+}
+
+# The two front-door calls. The live CR is read first, within
+# KUBECTL_PROBE_REQUEST_TIMEOUT, and the release record only when it
+# answered, so a preview against a context whose cluster is gone does not
+# wait on helm, which takes no request timeout of its own. $1 namespace, $2
+# the key, and for the retag, $3 the upgrade mode.
+announce_platform_agent_mode_for_apply() {
+  local live
+  live="$(live_platform_agent_mode "${1:-}")"
+  [ -n "$live" ] || return 0
+  announce_platform_agent_mode_switch "$(release_platform_agent_mode "${1:-}")" "$live" "${2:-}"
+}
+
+note_platform_agent_mode_for_retag() {
+  local live
+  live="$(live_platform_agent_mode "${1:-}")"
+  [ -n "$live" ] || return 0
+  note_platform_agent_mode_not_applied "$(release_platform_agent_mode "${1:-}")" "$live" "${2:-}" "${3:-}"
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -569,6 +725,10 @@ load_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
+  # switch the install's component stack for one run, and the next run from a
+  # clean shell would switch it back and retire the A2A stack.
+  unset PLATFORM_AGENT_MODE
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -3086,6 +3246,15 @@ write_tfvars_from_state() {
     return 1
   fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
+  # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
+  # regenerate from install.env without install.sh's check, and the variable's
+  # validation would otherwise refuse it at plan, naming neither the key nor
+  # the file.
+  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
+    print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
+    return 1
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -3138,6 +3307,10 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    echo ""
+    echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
+    echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
+    echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."
