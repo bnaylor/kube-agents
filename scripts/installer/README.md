@@ -160,7 +160,12 @@ subscription name comes from Terraform state, ahead of both the flag and the fil
 whose key the file does not assign at all is appended to the file with the value the run
 applies, as the last step before the apply or the `--generate-only` handoff, so a run refused,
 declined or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
-then fails has recorded what it was applying. A file the run cannot write is refused up front
+then fails has recorded what it was applying. A toggle recorded `true` brings the settings of
+its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
+`SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
+`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. Otherwise
+an allowlist given at the prompt or as an export would be left out, and the next upgrade would
+render the integration on with an empty allowlist, which admits everyone. A file the run cannot write is refused up front
 when there is a key to record. This is the one write
 `install.sh` makes to a file it did not create, and only of keys the file lacks. A flag that
 agrees changes nothing. The Slack tokens are never appended: their home is the live

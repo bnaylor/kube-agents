@@ -1892,6 +1892,8 @@ warn_flag_beats_unrecorded_file_value() {
 #     one copied from install.env.example with the line commented out) has
 #     nothing to disagree with, and the value the run applies is appended to
 #     the file once the run commits, so upgrade.sh renders what is running;
+#     a toggle recorded true brings the integration's other settings the file
+#     lacks, the allowlist first among them, since an empty one admits everyone;
 #   - a flag that agrees changes nothing.
 #
 # Credentials are the exception to the second rule: a Slack token the file does
@@ -1908,6 +1910,18 @@ warn_flag_beats_unrecorded_file_value() {
 # install (write_tfvars_from_state). The same holds for an
 # install.env rendered for CI from a full set of variables. A rendered file
 # that omits a key gets the key appended, on the runner that owns the file.
+
+# The keys an integration renders beside its toggle, recorded with a toggle
+# recorded true where the file lacks them (record_flags_into_install_env). Not
+# the tokens, whose home is the live Secret, and not CHAT_SUB_NAME, which a
+# running install reads from Terraform state.
+install_env_toggle_companions() {
+  case "${1:-}" in
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
+    *) ;;
+  esac
+}
 
 # A chat flag this run typed, noted for check_flags_against_install_env. Its
 # value is read from the PARAM_* at check time, so a flag given twice is checked
@@ -1938,6 +1952,11 @@ check_flag_against_install_env() {
     esac
     if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
       print_info "${file} assigns no ${key}; a run without --dry-run records the ${key} it applies there, from ${flag}."
+      local companions
+      companions="$(install_env_toggle_companions "$key")"
+      if [ -n "$companions" ]; then
+        print_info "If that is true, it also records the ${companions// /, } it applies, where ${file} assigns none."
+      fi
     fi
     return 0
   fi
@@ -2027,14 +2046,37 @@ check_flags_against_install_env() {
 # that can stop the run, so a run refused, declined or failed before the apply,
 # and a --dry-run, leave the file as it was. An apply that then fails has
 # recorded what it was applying, which is what the next run should retry.
+#
+# A toggle recorded true brings the settings of its integration that the file
+# also lacks (install_env_toggle_companions), with the values this run applied
+# to them. Without them the next upgrade.sh would render the integration on
+# with an empty allowlist, which admits everyone, and with no home channel,
+# when this run applied an allowlist the operator gave at the prompt or as an
+# export. The file install.sh writes on a first install records the toggle and
+# these keys together, and so does the Day-2 menu for Google Chat; the tokens
+# are still never written.
 record_flags_into_install_env() {
-  local file="${INSTALL_ENV_FILE:-}" key value
+  local file="${INSTALL_ENV_FILE:-}" key value companion record_keys=""
   [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  # The whole list before the first write, while the file still reads as the
+  # run found it.
+  for key in $INSTALL_ENV_KEYS_TO_RECORD; do
+    record_keys="${record_keys}${record_keys:+ }${key}"
+    is_truthy "${!key-}" || continue
+    for companion in $(install_env_toggle_companions "$key"); do
+      case " ${record_keys} ${INSTALL_ENV_KEYS_TO_RECORD} " in
+        *" ${companion} "*) continue ;;
+      esac
+      if ! install_env_records_key "$file" "$companion"; then
+        record_keys="${record_keys} ${companion}"
+      fi
+    done
+  done
   # A last line with no newline would run into the appended assignment.
   if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
     printf '\n' >> "$file"
   fi
-  for key in $INSTALL_ENV_KEYS_TO_RECORD; do
+  for key in $record_keys; do
     value="${!key-}"
     write_env_var "$file" "$key" "$value"
     print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}: later runs and upgrade.sh render what this run applied."

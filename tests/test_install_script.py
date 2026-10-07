@@ -5919,6 +5919,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     _CHECK = 'rc=0; check_flags_against_install_env || rc=$?; echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
 
+    # What a toggle recorded true brings with it when the file lacks the
+    # integration's settings and nothing in the test exported them.
+    _EMPTY_COMPANIONS = {
+        "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_MODE=''\n",
+    }
+
     def _check(self, tmp, content, flags, extra_env=None):
         path = self._file(tmp, content)
         proc = self._run(f"parse_args {flags}; {self._CHECK}", path, extra_env)
@@ -6089,7 +6096,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     out = proc.stdout + proc.stderr
                     self.assertIn(f"Recorded {key}={applied} in {path}, which assigned no {key}", out)
                     expected = content if content.endswith("\n") else content + "\n"
-                    self.assertEqual(path.read_text(), expected + f"{key}={applied}\n")
+                    companions = self._EMPTY_COMPANIONS[key] if applied == "true" else ""
+                    self.assertEqual(path.read_text(), expected + f"{key}={applied}\n" + companions)
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                     param = "PARAM_ENABLE_SLACK" if key == "SLACK_ENABLED" else "PARAM_ENABLE_GOOGLE_CHAT"
                     again = self._run(f'echo "SEED=[${param}]"', path)
@@ -6140,9 +6148,83 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     )
                     out = proc.stdout + proc.stderr
                     self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, out)
-                    self.assertEqual(path.read_text(), content + "SLACK_ENABLED=true\n")
+                    self.assertEqual(
+                        path.read_text(), content + "SLACK_ENABLED=true\n" + self._EMPTY_COMPANIONS["SLACK_ENABLED"],
+                    )
                     self.assertNotIn("xoxb-typed", path.read_text())
                     self.assertNotIn("xapp-typed", out)
+
+    def test_a_toggle_recorded_true_brings_the_integration_settings_the_file_lacks(self):
+        # The allowlist typed at the prompt (or exported) is what the run
+        # applied; recorded beside the toggle, the next upgrade renders it
+        # rather than an empty list, which admits everyone.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, applied, expected_lines, absent in (
+                (
+                    "--enable-slack",
+                    "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2 SLACK_HOME_CHANNEL=C1 "
+                    "SLACK_HOME_CHANNEL_NAME='#gke alerts' SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed",
+                    ["SLACK_ENABLED=true", "SLACK_ALLOWED_USERS=U1\\,U2", "SLACK_HOME_CHANNEL=C1",
+                     "SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts"],
+                    ("xoxb-typed", "xapp-typed"),
+                ),
+                (
+                    "--enable-google-chat",
+                    "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
+                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
+                    ["GOOGLE_CHAT_ENABLED=true", "ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
+                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug"],
+                    ("CHAT_SUB_NAME",),
+                ),
+            ):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(path.read_text(), "PROJECT_ID=p\n" + "".join(f"{line}\n" for line in expected_lines), out)
+                    # Neither the tokens nor the state-owned subscription name.
+                    for text in absent:
+                        self.assertNotIn(text, path.read_text())
+                    self.assertNotIn("xoxb-typed", out)
+
+    def test_a_companion_the_file_sets_is_left_and_a_false_toggle_brings_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, applied, appended in (
+                # The file's own allowlist stays as written; only the missing keys come.
+                ("SLACK_ALLOWED_USERS=U0\n", "--enable-slack", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U0 SLACK_HOME_CHANNEL=C1",
+                 "SLACK_ENABLED=true\nSLACK_HOME_CHANNEL=C1\nSLACK_HOME_CHANNEL_NAME=''\n"),
+                # A companion typed as a flag is recorded once, not twice.
+                ("PROJECT_ID=p\n", "--enable-slack --slack-allowed-users=U9", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U9",
+                 "SLACK_ENABLED=true\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ALLOWED_USERS=U9\n"),
+                # Off renders nothing of the integration, so nothing beside it is pinned.
+                ("PROJECT_ID=p\n", "--enable-slack=false", "SLACK_ENABLED=false SLACK_ALLOWED_USERS=U1", "SLACK_ENABLED=false\n"),
+                ("PROJECT_ID=p\n", "--enable-google-chat", "GOOGLE_CHAT_ENABLED=false ALLOWED_USERS=a", "GOOGLE_CHAT_ENABLED=false\n"),
+            ):
+                with self.subTest(content=content, flags=flags, applied=applied):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    self.assertEqual(path.read_text(), content + appended, proc.stdout + proc.stderr)
+
+    def test_upgrade_keeps_the_allowlist_given_at_the_prompt_after_a_recorded_enable_slack(self):
+        # The bot's walk: a hand-written file with section 3 commented out,
+        # --enable-slack, the allowlist typed at the prompt, then upgrade.sh.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "# SLACK_ENABLED=false\n# SLACK_ALLOWED_USERS=\n")
+            proc = self._run(
+                f"parse_args --enable-slack; {self._CHECK}; "
+                "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2; record_flags_into_install_env",
+                path,
+            )
+            self.assertIn("Recorded SLACK_ALLOWED_USERS=U1\\,U2", proc.stdout + proc.stderr)
+            after, _ = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", after)
+            self.assertIn('slack_allowed_users     = ["U1", "U2"]', after)
 
     def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6229,7 +6311,10 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     )
                     if records:
                         self.assertIn("went on", proc.stdout, proc.stderr)
-                        self.assertEqual(path.read_text(), "PROJECT_ID=p\nSLACK_ENABLED=true\n")
+                        self.assertEqual(
+                            path.read_text(),
+                            "PROJECT_ID=p\nSLACK_ENABLED=true\n" + self._EMPTY_COMPANIONS["SLACK_ENABLED"],
+                        )
                     else:
                         self.assertNotIn("went on", proc.stdout, proc.stderr)
                         self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
