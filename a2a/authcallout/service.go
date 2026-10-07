@@ -88,6 +88,11 @@ type Config struct {
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
+	// ReservedAddressees are the fixed-name addressees a narrowed pod may
+	// not be named after (see addressees.go). Required: NewService refuses
+	// an empty list rather than serving a callout that reserves none.
+	ReservedAddressees []string
+
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -101,6 +106,9 @@ type Service struct {
 	grantTTL  time.Duration
 	now       func() time.Time
 	log       *slog.Logger
+
+	// reservedAddressees is the set Config.ReservedAddressees built.
+	reservedAddressees map[string]struct{}
 }
 
 // NewService builds the callout.
@@ -134,6 +142,11 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		return nil, fmt.Errorf("issuer seed: %w", err)
 	}
 
+	reservedAddressees, err := reservedAddresseeSet(cfg.ReservedAddressees)
+	if err != nil {
+		return nil, err
+	}
+
 	svc := &Service{
 		store:     store,
 		validator: validator,
@@ -142,6 +155,7 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		now:       cfg.Now,
 		log:       log,
 	}
+	svc.reservedAddressees = reservedAddressees
 	if svc.grantTTL <= 0 {
 		svc.grantTTL = defaultGrantTTL
 	}
@@ -332,6 +346,15 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
+		}
+		// A narrowed user is named for its pod, and its task subjects are
+		// keyed on that name. A pod named after a fixed-name addressee (the
+		// bridge's `platform`) would be handed that addressee's task events,
+		// its `.in` consumers and its verify subject. Checked after the
+		// switch so every narrowing is covered by one check, whatever
+		// derived the user.
+		if s.reservedAddressee(user) {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of an addressee; its task subjects are that addressee's", att.ServiceAccount, user)
 		}
 	}
 

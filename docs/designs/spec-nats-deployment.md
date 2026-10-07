@@ -611,6 +611,22 @@ whole list - the shared `worker` credential reborn under a new name, and it woul
 correct in review. The callout refuses such an entry at parse. No claim, no grants, no
 connection.
 
+The pod name is also the session's task addressee. The callout keys the events a narrowed
+pod may publish, the consumers it may create over `.in`, and its capability verify and
+reply subjects on that name, so a pod named after another addressee would be handed that
+addressee's task subjects. The gateway never mints such a name, but anyone who can create a
+pod under a narrowed ServiceAccount can, so the callout refuses a narrowed pod whose name is
+a fixed-name addressee. Today that is one name, `platform`: the gateway's default
+addressee, which the operator leaves unset so the gateway keeps its own default, and the
+only addressee the bridge's grants name. The operator renders the list into the callout's
+`A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
+built from, and an operator test holds it to both defaults in the a2a module. The callout
+refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
+labels. Session addressees need no entry, since each is the name of the pod that is that
+addressee. Two kinds are not on the list: the name a `BRIDGE_PROFILE` override sets, which leaves the
+bridge unable to publish its own events because its grants still name `platform`, and
+`AgentProfile` addressees, which come and go with their CRs.
+
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
 10.1 seconds later, the API server's successful-authentication cache being the delay. The

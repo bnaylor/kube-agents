@@ -42,6 +42,11 @@ const (
 	envGrantTTL     = "A2A_GRANT_TTL_SECONDS"
 	envStatusAddr   = "A2A_STATUS_ADDR"
 
+	// envReservedAddressees carries the fixed-name addressees, comma
+	// separated, which the operator renders from the constant the bridge's
+	// grants name. Required: see authcallout.ParseReservedAddressees.
+	envReservedAddressees = "A2A_RESERVED_ADDRESSEES"
+
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
 	defaultMapWait     = 60 * time.Second
@@ -103,6 +108,20 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("%s is required", envIssuerSeed)
 	}
 
+	// Refused rather than defaulted, and before anything else starts. A
+	// callout with no reserved addressees would admit a narrowed pod named
+	// `platform` and hand it the bridge's task subjects. An image newer than
+	// the operator rendering it lands here, which is the safe direction: the
+	// rollout stalls on the new pods and the old ones keep serving.
+	rawAddressees, ok := os.LookupEnv(envReservedAddressees)
+	if !ok {
+		return fmt.Errorf("%s is required; the operator renders it from the bridge's addressee", envReservedAddressees)
+	}
+	reservedAddressees, err := authcallout.ParseReservedAddressees(rawAddressees)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envReservedAddressees, err)
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -131,6 +150,8 @@ func run(log *slog.Logger) error {
 		IssuerSeed: issuerSeed,
 		XKeySeed:   os.Getenv(envXKeySeed),
 		GrantTTL:   grantTTL,
+
+		ReservedAddressees: reservedAddressees,
 	}, log)
 	if err != nil {
 		return err
