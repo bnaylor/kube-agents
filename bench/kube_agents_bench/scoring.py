@@ -1068,7 +1068,23 @@ def classify_rep(
     # provisioning nothing cannot honestly claim; this one is the harness
     # stating what happened, and an unreachable agent endpoint is
     # infrastructure whatever the task's deployer builds.
+    #
+    # The launcher writes the same marker on a record with no scores at all
+    # when it could not start the repetition (record_unit_not_run in
+    # hack/ci-eval-pr.sh: GitHub's token endpoint failing before launch).
+    # Same class, but "the record is scored" and "the harness exhausted its
+    # retries" would both be false of it, so its reason is the record's own
+    # words after the marker, led by the marker for the dashboard.
     if record.error is not None and INFRA_FAILURE_MARKER in str(record.error):
+        if not record.has_scores:
+            errors = record.error if isinstance(record.error, list) else [record.error]
+            stated = next(str(e) for e in errors if INFRA_FAILURE_MARKER in str(e))
+            detail = stated.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
+            return rep(
+                "infra",
+                f"{INFRA_FAILURE_MARKER}: no run was started, so there is "
+                f"nothing to grade ({detail or 'no reason given'})",
+            )
         return rep(
             "infra",
             "the harness exhausted its retries without reaching the agent "

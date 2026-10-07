@@ -1,22 +1,29 @@
 """Tests for the ledger-token mint's retry in hack/ci-eval-pr.sh.
 
 `run_one_unit` mints its own installation token after it has taken its locks
-(task, stream, infra), and a unit that cannot mint releases them and returns. That return costs the
-repetition its run directory, the fan-out records it `MISSING`, and the gate
-grades `MISSING` at rung CHECK_DID_NOT_RUN -- which is blocking, and whose
-reason line reads "a harness or agent crash, not infrastructure". So one
-unreachable api.github.com reds the whole suite and points the reader at the
-agent rather than at the mint.
+(task, stream, infra), and a unit that cannot mint releases them and returns
+without a run. Before #2562 that cost the repetition its run directory, the
+fan-out recorded it `MISSING`, and the gate graded `MISSING` at rung
+CHECK_DID_NOT_RUN -- blocking, with a reason line that reads "a harness or
+agent crash, not infrastructure". Two GitHub incidents on 2026-10-07 made
+every attempt answer HTTP 500 and redded unrelated pull requests that way.
+Now a mint that runs out on a transient failure leaves a record in place of
+the run (`record_unit_not_run`) that the gate excludes as infrastructure;
+`UnitNotRunTest` below runs the real `run_one_unit` to show it, and
+bench/tests/test_unit_not_run.py grades the record through the real gate.
 
-The retry is what stands between those two facts, and neither of them is
-visible from a run where GitHub answers. What has to hold:
+The retry still decides whether the repetition is lost at all, and none of
+this is visible from a run where GitHub answers. What has to hold:
 
 * a failure that another attempt could survive is retried, up to a bound;
 * a credential fault -- the wrong PEM, the wrong installation -- is not, so it
   is reported on the first attempt rather than three sleeps later, by a caller
   that is holding two locks the whole time;
 * an exhausted retry still never falls back to the mounted PAT, which is the
-  behaviour #994 added the App for.
+  behaviour #994 added the App for;
+* an exhausted retry says it was transient (the retryable code, and the mint's
+  last line in LEDGER_MINT_LAST_FAILURE), and a refusal says it was not, because
+  only the first is recorded as infrastructure.
 
 The functions are extracted from the script and executed with the network half
 stubbed out, so these assertions are against the code that ships.
@@ -97,7 +104,8 @@ class LedgerMintRetryTest(unittest.TestCase):
                 '    echo "tok-stub 2026-09-01T12:00:00Z"',
                 "    return 0",
                 "  fi",
-                '  echo "stub failure" >&2',
+                '  echo "stub diagnostic before the last line" >&2',
+                '  echo "stub failure ${n}" >&2',
                 '  return "${outcome}"',
                 "}",
                 # Retrying for real would put the suite's own wall clock inside
@@ -106,6 +114,7 @@ class LedgerMintRetryTest(unittest.TestCase):
                 "sleep() { :; }",
                 'mint_ledger_token "unit-under-test" || echo "MINT_RC=$?"',
                 'echo "TOKEN=${BENCH_GITHUB_TOKEN:-}"',
+                'echo "LAST_FAILURE=${LEDGER_MINT_LAST_FAILURE:-}"',
             ]
         )
         count_file = self.tmp / "count"
@@ -132,6 +141,8 @@ class LedgerMintRetryTest(unittest.TestCase):
         )
         rc_line = [ln for ln in proc.stdout.splitlines() if ln.startswith("MINT_RC=")]
         token_line = [ln for ln in proc.stdout.splitlines() if ln.startswith("TOKEN=")][-1]
+        last_line = [ln for ln in proc.stdout.splitlines() if ln.startswith("LAST_FAILURE=")][-1]
+        self.last_failure = last_line.split("=", 1)[1]
         return (
             int(rc_line[-1].split("=", 1)[1]) if rc_line else 0,
             int(count_file.read_text().strip()),
@@ -155,6 +166,9 @@ class LedgerMintRetryTest(unittest.TestCase):
         self.assertEqual(1, calls)
         self.assertIn("could not mint a ledger read token", err)
         self.assertEqual("the-mounted-pat", token)
+        # Still the mint's own words for the log, which now pass through a file.
+        self.assertIn("stub failure 1", err)
+        self.assertEqual("stub failure 1", self.last_failure)
 
     def test_the_retries_are_bounded(self):
         retryable = _retryable_rc()
@@ -165,15 +179,31 @@ class LedgerMintRetryTest(unittest.TestCase):
         # unit sitting on the task lock and the infra lock for an hour.
         self.assertLessEqual(attempts, 5, "a retrying unit holds both locks the whole time")
         rc, calls, _, _ = self._run([retryable] * (attempts + 3))
-        self.assertEqual(1, rc)
+        self.assertEqual(retryable, rc)
         self.assertEqual(attempts, calls)
+
+    def test_an_exhausted_retry_says_it_was_transient_and_keeps_the_last_line(self):
+        # What run_one_unit records the repetition as infrastructure on: the
+        # retryable code, and the last attempt's diagnostic for the reason.
+        retryable = _retryable_rc()
+        attempts = _attempts()
+        rc, _, _, _ = self._run([retryable] * attempts)
+        self.assertEqual(retryable, rc)
+        self.assertEqual(f"stub failure {attempts}", self.last_failure)
+
+    def test_a_refusal_after_a_transient_failure_is_not_transient(self):
+        # The last answer decides: a 401 on the second attempt is a credential
+        # fault, whatever the first attempt hit.
+        rc, calls, _, _ = self._run([_retryable_rc(), _TERMINAL_RC, None])
+        self.assertEqual(1, rc)
+        self.assertEqual(2, calls)
 
     def test_an_exhausted_retry_does_not_fall_back_to_the_mounted_pat(self):
         # The whole point of #994: a smoke test that passes on the PAT proves
         # nothing about the App credential it was changed to exercise.
         retryable = _retryable_rc()
         rc, _, err, token = self._run([retryable] * _attempts())
-        self.assertEqual(1, rc)
+        self.assertEqual(retryable, rc)
         self.assertEqual("the-mounted-pat", token)
         self.assertIn("not falling back to the mounted PAT", err)
 
@@ -200,6 +230,209 @@ class LedgerMintRetryTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotIn("the mint must not run", proc.stderr)
         self.assertIn("TOKEN=the-mounted-pat", proc.stdout)
+
+
+_SCORING = _REPO_ROOT / "bench" / "kube_agents_bench" / "scoring.py"
+
+
+def _lift_function(name):
+    return _extract(rf"^{name}\(\) \{{.*?^\}}", name)
+
+
+def _lift_line(pattern, what):
+    text = _CI_EVAL_PR.read_text(encoding="utf-8")
+    match = re.search(pattern, text, re.M)
+    assert match, f"could not find {what} in hack/ci-eval-pr.sh"
+    return match.group(0)
+
+
+class UnitNotRunTest(unittest.TestCase):
+    """The real run_one_unit, with everything around the mint stubbed.
+
+    A unit whose mint runs out on a transient failure writes a record in place
+    of the run and counts as a finished repetition; one GitHub refused writes
+    nothing and grades MISSING as before; and one whose mint succeeds but whose
+    devops-bench writes nothing still grades MISSING -- the crash rung 2 is for.
+    The same for the repository reset's mint on a case that requests a pull
+    request. What the gate makes of the record is bench/tests/test_unit_not_run.py's.
+    """
+
+    maxDiff = None
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = pathlib.Path(tmp.name)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.finished = self.tmp / "finished"
+        self.finished.write_text("")
+        self.key = self.tmp / "ledger.pem"
+        self.key.write_text("not a real key -- the mint itself is stubbed\n")
+
+    def _unit(self, rep, grading_mint, reset_mint=None, phase="0", name="case-under-test"):
+        """Run run_one_unit for one repetition.
+
+        grading_mint / reset_mint: "ok", "transient" or "refused" -- what the
+        stubbed mint answers on every attempt for that body.
+        """
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                _lift_line(r"^readonly EVAL_INFRA_FAILURE_MARKER=.*$", "EVAL_INFRA_FAILURE_MARKER"),
+                _lift_line(r"^readonly EVAL_NOT_RUN_DIR=.*$", "EVAL_NOT_RUN_DIR"),
+                _lift_line(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=.*$", "EVAL_INFLIGHT_GRACE_SECONDS"),
+                _lift_line(r"^readonly EVAL_INJECT_LOCAL_PORT_BASE=.*$", "EVAL_INJECT_LOCAL_PORT_BASE"),
+                _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
+                _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
+                _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),
+                _extract(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$", "LEDGER_RESET_MINT_RETRY_DELAY"),
+                _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
+                _extract(r"^AGENT_PULLS_RESET_PERMISSIONS=[^\n]*$", "AGENT_PULLS_RESET_PERMISSIONS"),
+                *(
+                    _lift_function(f)
+                    for f in (
+                        "mint_ledger_token",
+                        "ledger_reset_token",
+                        "reset_agent_pulls",
+                        "record_unit_not_run",
+                        "finished_rep_count",
+                        "skip_unit",
+                        "run_one_unit",
+                    )
+                ),
+                # The mint answers by body: the grading mint's reads, or the
+                # reset's narrowed write. Every attempt the same answer.
+                "_ledger_token_mint() {",
+                '  local want="${RESET_MINT}"',
+                '  [ "${LEDGER_MINT_BODY}" = "${LEDGER_GRADING_MINT_BODY}" ] && want="${GRADING_MINT}"',
+                '  case "${want}" in',
+                '    ok) echo "tok-stub 2026-10-07T18:00:00Z" ;;',
+                '    transient) echo "GitHub answered HTTP 500 (Internal Server Error) minting for App 4739812 installation 157029058" >&2; return "${LEDGER_MINT_RETRYABLE}" ;;',
+                '    *) echo "GitHub answered HTTP 401 (Unauthorized) minting for App 4739812 installation 157029058" >&2; return 1 ;;',
+                "  esac",
+                "}",
+                "sleep() { :; }",
+                "lock_acquire() { return 0; }",
+                "lock_release() { :; }",
+                "ledger_audit_id_for_task() { :; }",
+                "stream_case_count() { echo 1; }",
+                "stream_stack_wait() { echo 0; }",
+                "unit_delegation_timeout() { echo 1; }",
+                'unit_phase() { echo "${UNIT_PHASE}"; }',
+                "unit_task_path() { echo \"$1\"; }",
+                "_now_ms() { echo 1700000000000; }",
+                "_ts_lines() { cat; }",
+                # devops-bench, when it is reached at all, writes nothing:
+                # the crash shape.
+                'uv() { echo "devops-bench reached" >> "${FINISHED_FILE}"; echo "Traceback: crashed"; }',
+                'finish_case() { echo "graded $2" >> "${FINISHED_FILE}"; }',
+                'run_one_unit "${TASK_FILE}" "${CASE_NAME}" "${REP}" "" "" 1',
+            ]
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={
+                    "STATE_DIR": str(self.state),
+                    "ARTIFACT_DIR": str(self.tmp / "artifacts"),
+                    "BENCH_DIR": str(self.tmp),
+                    "FINISHED_FILE": str(self.finished),
+                    "TASK_FILE": str(self.tmp / "task.yaml"),
+                    "CASE_NAME": name,
+                    "REP": str(rep),
+                    "EVAL_REPETITIONS": "3",
+                    "INFRA_LOCK_DEADLINE": "1",
+                    "EVAL_CLUSTER_NAME": "c",
+                    "EVAL_DEFAULT_LOCATION": "l",
+                    "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
+                    "EVAL_LEDGER_APP_ID": "4739812",
+                    "EVAL_LEDGER_INSTALLATION_ID": "157029058",
+                    "EVAL_LEDGER_REPO": "gke-agentic/kube-agents-evals-2-infra",
+                    "PROJECT_ID": "kube-agents-evals-2",
+                    "GRADING_MINT": grading_mint,
+                    "RESET_MINT": reset_mint or "ok",
+                    "UNIT_PHASE": phase,
+                    "TMPDIR": str(self.tmp),
+                },
+            ),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return proc
+
+    def _dir(self, rep, name="case-under-test"):
+        path = self.state / f"{name}.rep{rep}.dir"
+        return path.read_text(encoding="utf-8").strip() if path.exists() else None
+
+    def _record(self, rep):
+        run_dir = self._dir(rep)
+        self.assertTrue(run_dir, "the repetition named no run directory")
+        return json.loads((pathlib.Path(run_dir) / "results.json").read_text(encoding="utf-8"))[0]
+
+    def test_a_transient_mint_failure_is_recorded_as_infrastructure(self):
+        proc = self._unit(2, "transient")
+        record = self._record(2)
+        self.assertEqual(1, len(record["errors"]))
+        error = record["errors"][0]
+        self.assertTrue(error.startswith("KUBE_AGENTS_INFRA_FAILURE: "), error)
+        self.assertIn("ledger read token could not be minted before launch", error)
+        self.assertIn("GitHub answered HTTP 500", error)
+        self.assertEqual([], record["trajectory"])
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+        self.assertIn("could not mint a ledger token", proc.stderr)
+
+    def test_the_last_repetition_not_run_grades_its_case(self):
+        # Reps 1 and 2 ran (state files written, as run_one_unit writes them);
+        # rep 3's mint fails, and its record is the count's third.
+        for rep in (1, 2):
+            for suffix in ("start", "end", "dir"):
+                (self.state / f"case-under-test.rep{rep}.{suffix}").write_text("1\n")
+        self._unit(3, "transient")
+        self.assertIn("graded case-under-test", self.finished.read_text())
+
+    def test_a_refused_mint_stays_missing(self):
+        # A credential fault is not weather: no record, no state, MISSING.
+        self._unit(2, "refused")
+        self.assertIsNone(self._dir(2))
+        self.assertFalse((self.state / "not-run").exists())
+        self.assertEqual("", self.finished.read_text())
+
+    def test_a_crash_after_a_good_mint_stays_missing(self):
+        # The rung-2 shape this must not swallow: devops-bench ran and wrote
+        # no results.json, so the repetition's run directory is empty.
+        self._unit(2, "ok")
+        self.assertIn("devops-bench reached", self.finished.read_text())
+        self.assertEqual("", self._dir(2))
+        self.assertFalse((self.state / "not-run").exists())
+
+    def test_a_transient_reset_mint_failure_is_recorded_as_infrastructure(self):
+        self._unit(1, "ok", reset_mint="transient", phase="1")
+        error = self._record(1)["errors"][0]
+        self.assertTrue(error.startswith("KUBE_AGENTS_INFRA_FAILURE: "), error)
+        self.assertIn("repository reset's token could not be minted before launch", error)
+        self.assertIn("GitHub answered HTTP 500", error)
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+
+    def test_a_refused_reset_mint_stays_missing(self):
+        self._unit(1, "ok", reset_mint="refused", phase="1")
+        self.assertIsNone(self._dir(1))
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+
+
+class InfraMarkerContractTest(unittest.TestCase):
+    def test_the_shell_marker_is_the_scorers(self):
+        """The record is only infrastructure if the gate reads this exact word."""
+        line = _lift_line(r"^readonly EVAL_INFRA_FAILURE_MARKER=.*$", "EVAL_INFRA_FAILURE_MARKER")
+        scorer = re.search(r'^INFRA_FAILURE_MARKER = "([^"]+)"$', _SCORING.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(scorer)
+        self.assertEqual(scorer.group(1), line.split("=", 1)[1].strip('"'))
+
+    def test_the_ladder_was_not_lengthened(self):
+        # The fix for an incident is the record, not a longer wait: a unit
+        # holds its task and stream locks while it retries.
+        self.assertLessEqual(_attempts(), 3)
 
 
 # Installed through PYTHONPATH: python imports sitecustomize at startup, so the
