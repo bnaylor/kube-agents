@@ -75,11 +75,17 @@ REFUSAL_NOTICE_MARKER = "I can't verify who you are on slack"
 # (relay.go applyStatus, "ℹ️ "), and the steer acknowledgement.
 TASK_LINE_PREFIXES = ("⏳", "⚙️", "❓", "✅", "ℹ️")
 STEER_ACK_PREFIX = "✏️"
+# gateway.go steerTask, when the steer could not be published: a steer outcome too.
+STEER_FAILED_MARKER = "could not send that to the running task"
+# The gateway's warnings (gateway.go, spawn.go): never an answer, and not by
+# themselves the reply to a turn; a stalled-task notice is followed by the new turn.
+WARNING_PREFIX = "⚠️"
 FAILURE_PREFIXES = ("❌", "🚫", "🛑")
 KIND_REFUSAL = "refusal"
 KIND_TASK_LINE = "task-line"
 KIND_STEER = "steer-ack"
 KIND_FAILURE = "failure"
+KIND_WARNING = "warning"
 KIND_ANSWER = "answer"
 
 USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
@@ -319,8 +325,10 @@ def classify(text: str) -> str:
     if REFUSAL_NOTICE_MARKER in text:
         return KIND_REFUSAL
     stripped = text.lstrip()
-    if stripped.startswith(STEER_ACK_PREFIX):
+    if stripped.startswith(STEER_ACK_PREFIX) or STEER_FAILED_MARKER in text:
         return KIND_STEER
+    if stripped.startswith(WARNING_PREFIX):
+        return KIND_WARNING
     if stripped.startswith(TASK_LINE_PREFIXES):
         return KIND_TASK_LINE
     if stripped.startswith(FAILURE_PREFIXES):
@@ -395,7 +403,8 @@ def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], wait_answer:
             if kind in (KIND_REFUSAL, KIND_STEER):
                 return msg, kind
         if not wait_answer:
-            return bot_msgs[0], classify(bot_msgs[0].get("text", ""))
+            replies = [m for m in bot_msgs if classify(m.get("text", "")) != KIND_WARNING]
+            return (replies[0], classify(replies[0].get("text", ""))) if replies else None
         for msg in bot_msgs:
             kind = classify(msg.get("text", ""))
             if kind in (KIND_ANSWER, KIND_FAILURE):
@@ -429,7 +438,8 @@ def judge_listed_reply(session: Session, name: str, channel: str, sent_ts: str, 
     if reply is None:
         if last_seen is not None:
             evidence["last_bot_text"] = truncate(last_seen.get("text", ""))
-            return CheckResult(name, False, f"the bot posted but no answer arrived within {timeout}s (--wait-answer)", evidence)
+            missing = "no answer (--wait-answer)" if session.args.wait_answer else "no reply but a warning"
+            return CheckResult(name, False, f"the bot posted {missing} within {timeout}s", evidence)
         return CheckResult(name, False, f"no reply from the bot within {timeout}s", evidence)
     if kind == KIND_REFUSAL:
         return CheckResult(name, False, "the listed user got the refusal notice; is the member on allowedUsers, and in the a2a-slack-principal-map Secret where the gateway requires it?", evidence)

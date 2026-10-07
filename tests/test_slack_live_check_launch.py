@@ -45,6 +45,10 @@ def deployment(name, container, env_names, labels, env_from=None):
                                                  "template": {"spec": {"containers": [c]}}}}
 
 
+class FakeFailure(Exception):
+    pass
+
+
 class FakeCluster:
     def __init__(self):
         self.calls = []
@@ -60,6 +64,8 @@ class FakeCluster:
         self.restart_runs = []
         self.fail_on = None
         self.namespaces = {}
+        self.empty_namespace_output = False
+        self.delete_fails = False
 
     def __call__(self, cmd, input=None, capture_output=True, text=True, check=False):
         if cmd[0] != "kubectl" or "restart" in cmd:
@@ -69,7 +75,10 @@ class FakeCluster:
         self.calls.append(cmd)
         assert cmd[1:3] == ["--context", CONTEXT], cmd
         args = cmd[3:]
-        out = self.answer(args, input)
+        try:
+            out = self.answer(args, input)
+        except FakeFailure:
+            return subprocess.CompletedProcess(cmd, 1, "", "error: timed out waiting for the condition")
         if self.fail_on and self.fail_on in " ".join(args):
             return subprocess.CompletedProcess(cmd, 1, "", "boom")
         return subprocess.CompletedProcess(cmd, 0, out, "")
@@ -83,14 +92,20 @@ class FakeCluster:
                     self.namespaces[doc["metadata"]["name"]] = doc["metadata"].get("labels", {})
             return "applied"
         if args[0] == "delete":
+            if self.delete_fails and args[1] == "namespace":
+                raise FakeFailure()
             self.deleted.append(args[1:3])
             if args[1] == "namespace":
                 self.namespaces.pop(args[2], None)
             return ""
         if args[:2] == ["get", "namespace"]:
+            # Real kubectl: a field selector with no match prints an empty List, but
+            # with --ignore-not-found it prints nothing at all.
             name = [a for a in args if a.startswith("metadata.name=")][0].split("=", 1)[1]
             items = [{"metadata": {"name": name, "labels": self.namespaces[name]}}] if name in self.namespaces else []
-            return json.dumps({"items": items})
+            if not items and ("--ignore-not-found" in args or self.empty_namespace_output):
+                return ""
+            return json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
         if args[:2] == ["get", "platformagents"]:
             return json.dumps({"items": [{"metadata": {"name": AGENT}}]})
         if args[:2] == ["get", "statefulset"]:
@@ -332,6 +347,31 @@ class ModesAndArgsTest(unittest.TestCase):
         code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
+
+    def test_an_empty_namespace_answer_reads_as_absent(self):
+        cluster = FakeCluster()
+        cluster.empty_namespace_output = True
+        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("already gone", out)
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+
+    def test_cleanup_reports_a_failed_delete(self):
+        cluster = FakeCluster()
+        cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
+        cluster.delete_fails = True
+        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
+        self.assertEqual(code, launch.EXIT_SETUP)
+        self.assertIn("not deleted", out)
+
+    def test_restart_after_dm_settles_the_dm_first(self):
+        cluster = FakeCluster()
+        run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart")
+        first = yaml.safe_load(cluster.applied[2])["spec"]["template"]["spec"]["containers"][0]["args"]
+        second = yaml.safe_load(cluster.applied[4])["spec"]["template"]["spec"]["containers"][0]["args"]
+        self.assertIn("--wait-answer", first)
+        self.assertNotIn("--wait-answer", second)
 
     def test_cleanup_validates_no_harness_flags(self):
         cluster = FakeCluster()

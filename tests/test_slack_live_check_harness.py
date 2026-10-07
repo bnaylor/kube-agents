@@ -407,7 +407,7 @@ class ListedChecksTest(HarnessTestCase):
         self.world.mode = "status-only"
         code, text = self.run_harness("--checks", "dm", "--wait-answer")
         self.assertEqual(code, harness.EXIT_FAIL)
-        self.assertIn("no answer arrived", self.line(text, "FAIL dm"))
+        self.assertIn("no answer (--wait-answer)", self.line(text, "FAIL dm"))
         self.assertEqual(self.evidence(text, "dm")["last_bot_text"], "⏳ submitted…")
 
     def test_wait_answer_fails_on_a_failed_task(self):
@@ -485,6 +485,23 @@ class ListedChecksTest(HarnessTestCase):
         code, text = self.run_harness("--checks", "mention,thread", "--wait-answer")
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("taken as a steer", self.line(text, "FAIL thread"))
+
+    def test_a_warning_is_not_the_reply(self):
+        world = self.world
+        original = world.gateway_turn
+
+        def warn_then_turn(channel, poster, msg):
+            world.bot_post(channel, "⚠️ task `t` has produced nothing on its event stream in 5m, so this conversation is released", "")
+            original(channel, poster, msg)
+
+        world.gateway_turn = warn_then_turn
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertEqual(self.evidence(text, "dm")["reply_text"], "⏳ submitted…")
+        world.gateway_turn = lambda channel, poster, msg: world.bot_post(channel, "⚠️ not started: could not mint", "")
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("no reply but a warning", self.line(text, "FAIL dm"))
 
     def test_dm_fails_on_a_steer(self):
         world = self.world
@@ -676,6 +693,9 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(harness.classify("⚙️ *working* — reading"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("✅ *completed*"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("ℹ️ Hermes cannot absorb mid-run input"), harness.KIND_TASK_LINE)
+        self.assertEqual(harness.classify("⚠️ could not send that to the running task; it is still working on the original instruction"),
+                         harness.KIND_STEER)
+        self.assertEqual(harness.classify("⚠️ not started: could not mint this task's capability"), harness.KIND_WARNING)
         self.assertEqual(harness.classify("✏️ steering sent — the worker picks it up"), harness.KIND_STEER)
         self.assertEqual(harness.classify("🚫 rejected"), harness.KIND_FAILURE)
         self.assertEqual(harness.classify("PONG"), harness.KIND_ANSWER)

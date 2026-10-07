@@ -102,6 +102,7 @@ RUN_ID_FLAG = "--run-id"
 KEEP_GOING_FLAG = "--keep-going"
 # Harness flags the launcher sets itself; one after `--` would silently win.
 LAUNCHER_OWNED_HARNESS_FLAGS = (CHECKS_FLAG, RUN_ID_FLAG, PROJECT_FLAG, KEEP_GOING_FLAG)
+WAIT_ANSWER_FLAG = "--wait-answer"
 RESULT_PREFIXES = ("PASS ", "FAIL ")
 EVIDENCE_PREFIX = "EVIDENCE "
 
@@ -133,7 +134,11 @@ class Kubectl:
         return proc.stdout
 
     def get_json(self, args: list[str]) -> dict:
-        return json.loads(self.run([*args, "-o", "json"]))
+        out = self.run([*args, "-o", "json"])
+        try:
+            return json.loads(out)
+        except ValueError:
+            raise LaunchError(f"kubectl {' '.join(args[:3])} printed no JSON: {harness.truncate(out)!r}") from None
 
 
 def render(template_path: str, values: dict) -> str:
@@ -334,9 +339,10 @@ class Launcher:
             self.namespace_applied = True
             say(f"SETUP namespace {self.args.namespace}, ServiceAccount {self.args.service_account} -> {self.args.gsa}")
 
-    def run_job(self, checks: list[str]) -> list[dict]:
+    def run_job(self, checks: list[str], extra: Optional[list[str]] = None) -> list[dict]:
         self.ensure_namespace()
         run_id, hargs = self.harness_args(checks)
+        hargs += extra or []
         image = self.args.image or discover_image(self.kubectl, self.args.agent_namespace, self.agent)
         deadline = job_deadline(hargs, self.args.job_timeout)
         job_name, configmap, job = job_manifests(self.args.namespace, self.args.service_account, image, run_id, hargs,
@@ -455,8 +461,14 @@ class Launcher:
         if CHECK_LEGACY_SOCKET in checks:
             self.legacy_socket()
         pod_checks = [c for c in checks if c in harness.CHECK_ORDER and c != harness.CHECK_RESTART]
+        first_job_extra = []
+        if harness.CHECK_RESTART in checks and harness.CHECK_DM in pod_checks and WAIT_ANSWER_FLAG not in self.forwarded:
+            # restart DMs the same conversation: a dm task still running then would
+            # take the restart's DM as a steer.
+            say(f"NOTE dm runs with {WAIT_ANSWER_FLAG} so its task has finished before the restart")
+            first_job_extra = [WAIT_ANSWER_FLAG]
         if pod_checks and (keep_going or not failed()):
-            evidence = self.run_job(pod_checks)
+            evidence = self.run_job(pod_checks, first_job_extra)
             if self.args.expect_principal and (keep_going or not failed()):
                 self.check_principals(evidence)
         if harness.CHECK_RESTART in checks and (keep_going or not failed()):
@@ -474,8 +486,14 @@ class Launcher:
 
 def check_namespace_ownership(kubectl: Kubectl, namespace: str) -> bool:
     """True if the namespace exists and is this tool's; False if it does not exist. Raises if it is someone else's."""
-    found = kubectl.get_json(["get", "namespace", "--ignore-not-found", "--field-selector", f"metadata.name={namespace}"])
-    items = found.get("items", [])
+    # A field selector, not a name: a List comes back with no items when nothing
+    # matches, where `get namespace <name>` would fail and --ignore-not-found would
+    # print nothing at all.
+    out = kubectl.run(["get", "namespace", "--field-selector", f"metadata.name={namespace}", "-o", "json"])
+    try:
+        items = json.loads(out).get("items", []) if out.strip() else []
+    except ValueError:
+        raise LaunchError(f"kubectl get namespace printed no JSON: {harness.truncate(out)!r}") from None
     if not items:
         return False
     labels = items[0].get("metadata", {}).get("labels", {}) or {}
@@ -485,17 +503,19 @@ def check_namespace_ownership(kubectl: Kubectl, namespace: str) -> bool:
     return True
 
 
-def delete_namespace(kubectl: Kubectl, namespace: str) -> None:
+def delete_namespace(kubectl: Kubectl, namespace: str) -> bool:
     """Deletes the run's namespace, and with it the ServiceAccount, the fence and any Job left behind."""
     try:
         if not check_namespace_ownership(kubectl, namespace):
             say(f"CLEANUP namespace {namespace} is already gone")
-            return
+            return True
         kubectl.run(["delete", "namespace", namespace, "--ignore-not-found", "--wait=true",
                      f"--timeout={NAMESPACE_DELETE_TIMEOUT_SECONDS}s"])
         say(f"CLEANUP namespace {namespace} deleted")
+        return True
     except LaunchError as exc:
         say(f"CLEANUP namespace {namespace} not deleted: {exc}")
+        return False
 
 
 def _json_record(line: str) -> dict:
@@ -597,8 +617,7 @@ def main(argv: Optional[list[str]] = None, runner: Callable = subprocess.run,
         if args.cleanup:
             # Raises on a namespace that is not this tool's, which exits non-zero.
             check_namespace_ownership(kubectl, args.namespace)
-            delete_namespace(kubectl, args.namespace)
-            return EXIT_OK
+            return EXIT_OK if delete_namespace(kubectl, args.namespace) else EXIT_SETUP
         return Launcher(args, forwarded, kubectl, clock, sleep, runner).run(args.checks)
     except (LaunchError, harness.HarnessError) as exc:
         say(f"ERROR {exc}")
