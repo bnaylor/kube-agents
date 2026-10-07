@@ -71,8 +71,9 @@ TURN_SUBTYPES = frozenset({"", "thread_broadcast", "file_share"})
 # sender per gateway process. The text after "on slack" names the sender's id.
 REFUSAL_NOTICE_MARKER = "I can't verify who you are on slack"
 # The gateway's own lines, as opposed to an answer: the rolling status line
-# (relay.go statusLine and terminalLine, edited in place) and the steer acknowledgement.
-TASK_LINE_PREFIXES = ("⏳", "⚙️", "❓", "✅")
+# (relay.go statusLine and terminalLine, edited in place), a non-final status note
+# (relay.go applyStatus, "ℹ️ "), and the steer acknowledgement.
+TASK_LINE_PREFIXES = ("⏳", "⚙️", "❓", "✅", "ℹ️")
 STEER_ACK_PREFIX = "✏️"
 FAILURE_PREFIXES = ("❌", "🚫", "🛑")
 KIND_REFUSAL = "refusal"
@@ -110,6 +111,8 @@ CHECKS_ALL = (CHECK_DM, CHECK_MENTION, CHECK_THREAD, CHECK_UNLISTED)
 LISTED_CHECKS = frozenset({CHECK_DM, CHECK_MENTION, CHECK_THREAD, CHECK_RESTART, CHECK_HOME})
 UNLISTED_VIA_DM = "dm"
 UNLISTED_VIA_MENTION = "mention"
+
+HARNESS_PROG = "harness.py"
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -375,8 +378,10 @@ def replies_after(client: SlackClient, channel: str, root_ts: str, after_ts: str
 def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], wait_answer: bool, timeout: float) -> tuple[Optional[dict], str, Optional[dict]]:
     """Polls fetch for the bot's reply. Returns (reply, kind, last bot message seen).
 
-    A refusal notice returns at once. Otherwise the first bot message is the reply,
-    unless wait_answer, when only an answer or a failure line is.
+    A refusal notice or a steer acknowledgement returns at once: either one means
+    the turn did not start a task, whatever wait_answer says. Otherwise the first
+    bot message is the reply, unless wait_answer, when only an answer or a failure
+    line is.
     """
     seen: dict = {}
 
@@ -386,8 +391,9 @@ def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], wait_answer:
             return None
         seen["last"] = bot_msgs[-1]
         for msg in bot_msgs:
-            if classify(msg.get("text", "")) == KIND_REFUSAL:
-                return msg, KIND_REFUSAL
+            kind = classify(msg.get("text", ""))
+            if kind in (KIND_REFUSAL, KIND_STEER):
+                return msg, kind
         if not wait_answer:
             return bot_msgs[0], classify(bot_msgs[0].get("text", ""))
         for msg in bot_msgs:
@@ -427,6 +433,8 @@ def judge_listed_reply(session: Session, name: str, channel: str, sent_ts: str, 
         return CheckResult(name, False, f"no reply from the bot within {timeout}s", evidence)
     if kind == KIND_REFUSAL:
         return CheckResult(name, False, "the listed user got the refusal notice; is the member on allowedUsers, and in the a2a-slack-principal-map Secret where the gateway requires it?", evidence)
+    if kind == KIND_STEER:
+        return CheckResult(name, False, "the turn was taken as a steer of a task still running, not as a new turn", evidence)
     if kind == KIND_FAILURE:
         return CheckResult(name, False, "the task the turn started failed", evidence)
     if expect_thread and reply.get("thread_ts") != expect_thread:
@@ -484,9 +492,6 @@ def check_thread(session: Session) -> CheckResult:
     result = judge_listed_reply(session, CHECK_THREAD, session.channel_id, sent_ts, reply, kind, last, expect_thread=root)
     result.evidence["thread_ts"] = root
     result.evidence["settled_kind"] = settled_kind
-    if result.passed and kind == KIND_STEER:
-        result.passed = False
-        result.detail = "the follow-up was taken as a steer of a task still running, not as a new turn"
     return result
 
 
@@ -684,7 +689,7 @@ def parse_checks(value: str) -> list[str]:
 
 
 def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).",
+    parser = argparse.ArgumentParser(prog=HARNESS_PROG, description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).",
                                      allow_abbrev=False)
     parser.add_argument("--checks", type=parse_checks, default=list(CHECKS_ALL),
                         help=f"comma list from {', '.join(CHECK_ORDER)}; '{CHECKS_ALL_ALIAS}' is {','.join(CHECKS_ALL)}")

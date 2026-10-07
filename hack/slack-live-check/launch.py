@@ -53,6 +53,9 @@ JOB_NAME_PREFIX = "slack-live-check-"
 # The Job's deadline is the harness's own worst-case wait (harness.time_budget) plus
 # this, for reading the tokens, resolving the bot and channel, and the preflights.
 JOB_SETUP_ALLOWANCE_SECONDS = 180
+# activeDeadlineSeconds counts from the Job's start, so scheduling (a node scale-up
+# on Autopilot) and a cold pull of the agent-sandbox image spend it too.
+JOB_START_ALLOWANCE_SECONDS = 300
 STDERR_TAIL_CHARS = 500
 RUN_ID_TIME_FORMAT = "%Y%m%d%H%M%S"
 RUN_ID_HEX_CHARS = 4
@@ -221,7 +224,7 @@ def job_manifests(namespace: str, service_account: str, image: str, run_id: str,
 
 def job_deadline(harness_args: list[str], floor: int) -> int:
     """activeDeadlineSeconds: the harness's worst-case wait for these arguments plus setup, or floor if larger."""
-    budget = harness.time_budget(harness.parse_args(harness_args)) + JOB_SETUP_ALLOWANCE_SECONDS
+    budget = harness.time_budget(harness.parse_args(harness_args)) + JOB_SETUP_ALLOWANCE_SECONDS + JOB_START_ALLOWANCE_SECONDS
     return max(int(budget), floor)
 
 
@@ -320,8 +323,13 @@ class Launcher:
         return run_id, args + self.forwarded
 
     def ensure_namespace(self) -> None:
-        """Applies the namespace, ServiceAccount and NetworkPolicy; idempotent."""
+        """Applies the namespace, ServiceAccount and NetworkPolicy; idempotent.
+
+        Refuses a namespace that exists without this tool's label: the setup
+        fences every pod in it and the run ends by deleting it.
+        """
         if not self.namespace_applied:
+            check_namespace_ownership(self.kubectl, self.args.namespace)
             self.kubectl.run(["apply", "-f", "-"], stdin=setup_manifest(self.args))
             self.namespace_applied = True
             say(f"SETUP namespace {self.args.namespace}, ServiceAccount {self.args.service_account} -> {self.args.gsa}")
@@ -464,9 +472,25 @@ class Launcher:
         return EXIT_FAIL if failed or not self.results else EXIT_OK
 
 
+def check_namespace_ownership(kubectl: Kubectl, namespace: str) -> bool:
+    """True if the namespace exists and is this tool's; False if it does not exist. Raises if it is someone else's."""
+    found = kubectl.get_json(["get", "namespace", "--ignore-not-found", "--field-selector", f"metadata.name={namespace}"])
+    items = found.get("items", [])
+    if not items:
+        return False
+    labels = items[0].get("metadata", {}).get("labels", {}) or {}
+    if labels.get(APP_LABEL_KEY) != APP_LABEL_VALUE:
+        raise LaunchError(f"namespace {namespace} exists without {APP_LABEL_KEY}={APP_LABEL_VALUE}; "
+                          "it is not this tool's to fence or delete, so pass another --namespace")
+    return True
+
+
 def delete_namespace(kubectl: Kubectl, namespace: str) -> None:
     """Deletes the run's namespace, and with it the ServiceAccount, the fence and any Job left behind."""
     try:
+        if not check_namespace_ownership(kubectl, namespace):
+            say(f"CLEANUP namespace {namespace} is already gone")
+            return
         kubectl.run(["delete", "namespace", namespace, "--ignore-not-found", "--wait=true",
                      f"--timeout={NAMESPACE_DELETE_TIMEOUT_SECONDS}s"])
         say(f"CLEANUP namespace {namespace} deleted")
@@ -539,7 +563,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     if owned:
         parser.error(f"{', '.join(owned)} after -- would override the launcher's own; pass the launcher flag instead")
     pod_checks = [c for c in args.checks if c in harness.CHECK_ORDER]
-    if pod_checks:
+    if pod_checks and not args.cleanup:
         # Fail here, not minutes later in the pod, on a harness flag that is wrong.
         harness.parse_args([CHECKS_FLAG, ",".join(pod_checks), *forwarded])
     if not args.context and not args.render:
@@ -571,6 +595,8 @@ def main(argv: Optional[list[str]] = None, runner: Callable = subprocess.run,
             return EXIT_OK
         kubectl = Kubectl(args.context, runner)
         if args.cleanup:
+            # Raises on a namespace that is not this tool's, which exits non-zero.
+            check_namespace_ownership(kubectl, args.namespace)
             delete_namespace(kubectl, args.namespace)
             return EXIT_OK
         return Launcher(args, forwarded, kubectl, clock, sleep, runner).run(args.checks)

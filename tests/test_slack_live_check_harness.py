@@ -469,6 +469,35 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("taken as a steer", self.line(text, "FAIL thread"))
 
+    def test_thread_fails_on_a_steer_under_wait_answer_too(self):
+        # A steering gateway posts the ack and then the running task's answer; under
+        # --wait-answer the answer must not stand in for a new turn.
+        world = self.world
+        world.steer_thread_replies = True
+        original = world.bot_post
+
+        def ack_then_answer(channel, text, thread_ts=""):
+            original(channel, text, thread_ts)
+            if text.startswith("✏️"):
+                original(channel, "PONG", thread_ts)
+
+        world.bot_post = ack_then_answer
+        code, text = self.run_harness("--checks", "mention,thread", "--wait-answer")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("taken as a steer", self.line(text, "FAIL thread"))
+
+    def test_dm_fails_on_a_steer(self):
+        world = self.world
+
+        def steer(channel, poster, msg):
+            if world.is_dm_with_bot(channel):
+                world.bot_post(channel, "✏️ steering sent — the worker picks it up", "")
+
+        world.gateway_turn = steer
+        code, text = self.run_harness("--checks", "dm", "--wait-answer")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("taken as a steer", self.line(text, "FAIL dm"))
+
     def test_thread_fails_when_the_first_task_never_settles(self):
         self.world.mode = "status-only"
         code, text = self.run_harness("--checks", "mention,thread", "--keep-going")
@@ -646,6 +675,7 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(harness.classify("⏳ submitted…"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("⚙️ *working* — reading"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("✅ *completed*"), harness.KIND_TASK_LINE)
+        self.assertEqual(harness.classify("ℹ️ Hermes cannot absorb mid-run input"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("✏️ steering sent — the worker picks it up"), harness.KIND_STEER)
         self.assertEqual(harness.classify("🚫 rejected"), harness.KIND_FAILURE)
         self.assertEqual(harness.classify("PONG"), harness.KIND_ANSWER)

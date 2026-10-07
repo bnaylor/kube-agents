@@ -59,6 +59,7 @@ class FakeCluster:
         self.job_log = "PASS preflight-listed: ok\nPASS dm: answer\nEVIDENCE {\"check\": \"dm\", \"passed\": true, \"sent_ts\": \"1.000101\", \"author\": \"U0LISTED1\"}\nSUMMARY pass=2 fail=0\n"
         self.restart_runs = []
         self.fail_on = None
+        self.namespaces = {}
 
     def __call__(self, cmd, input=None, capture_output=True, text=True, check=False):
         if cmd[0] != "kubectl" or "restart" in cmd:
@@ -77,10 +78,19 @@ class FakeCluster:
         joined = " ".join(args)
         if args[0] == "apply":
             self.applied.append(stdin)
+            for doc in yaml.safe_load_all(stdin):
+                if doc and doc.get("kind") == "Namespace":
+                    self.namespaces[doc["metadata"]["name"]] = doc["metadata"].get("labels", {})
             return "applied"
         if args[0] == "delete":
             self.deleted.append(args[1:3])
+            if args[1] == "namespace":
+                self.namespaces.pop(args[2], None)
             return ""
+        if args[:2] == ["get", "namespace"]:
+            name = [a for a in args if a.startswith("metadata.name=")][0].split("=", 1)[1]
+            items = [{"metadata": {"name": name, "labels": self.namespaces[name]}}] if name in self.namespaces else []
+            return json.dumps({"items": items})
         if args[:2] == ["get", "platformagents"]:
             return json.dumps({"items": [{"metadata": {"name": AGENT}}]})
         if args[:2] == ["get", "statefulset"]:
@@ -304,8 +314,34 @@ class RestartTest(unittest.TestCase):
 
 
 class ModesAndArgsTest(unittest.TestCase):
+    def test_a_foreign_namespace_is_never_fenced_or_deleted(self):
+        cluster = FakeCluster()
+        cluster.namespaces[AGENT_NS] = {"kubernetes.io/metadata.name": AGENT_NS}
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm", "--namespace", AGENT_NS)
+        self.assertEqual(code, launch.EXIT_SETUP)
+        self.assertIn("is not this tool's", out)
+        self.assertEqual(cluster.applied, [])
+        self.assertEqual(cluster.deleted, [])
+        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup", "--namespace", AGENT_NS)
+        self.assertEqual(code, launch.EXIT_SETUP)
+        self.assertEqual(cluster.deleted, [])
+
+    def test_a_leftover_namespace_of_ours_is_reused_and_deleted(self):
+        cluster = FakeCluster()
+        cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
+
+    def test_cleanup_validates_no_harness_flags(self):
+        cluster = FakeCluster()
+        cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
+        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup", "--checks", "home")
+        self.assertEqual(code, launch.EXIT_OK, out)
+
     def test_cleanup_deletes_the_namespace_alone(self):
         cluster = FakeCluster()
+        cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
         code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertEqual(cluster.deleted, [["namespace", "slack-test"]])
@@ -367,7 +403,8 @@ class ModesAndArgsTest(unittest.TestCase):
         cluster = FakeCluster()
         run_launch(cluster, "--context", CONTEXT, "--checks", "all", "--", "--reply-timeout", "300")
         job = yaml.safe_load(cluster.applied[2])
-        self.assertEqual(job["spec"]["activeDeadlineSeconds"], 300 * 5 + launch.JOB_SETUP_ALLOWANCE_SECONDS)
+        self.assertEqual(job["spec"]["activeDeadlineSeconds"],
+                         300 * 5 + launch.JOB_SETUP_ALLOWANCE_SECONDS + launch.JOB_START_ALLOWANCE_SECONDS)
         self.assertEqual(launch.job_deadline(["--checks", "dm"], 5000), 5000)
 
     def test_restart_needs_a_command_or_after_restart(self):
