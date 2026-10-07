@@ -42,6 +42,7 @@ from kube_agents_bench.gate import main
 from kube_agents_bench.scoring import INFRA_FAILURE_MARKER, MISSING
 
 from conftest import FIXTURE_RUNS, GREEN_RUNS, TASKS
+from test_gate import JUDGE, KEY, baseline_line, graded_case, run_record, store_with
 
 CI_EVAL_PR = Path(__file__).resolve().parents[2] / "hack" / "ci-eval-pr.sh"
 
@@ -141,6 +142,41 @@ def test_one_unminted_repetition_is_infrastructure_and_the_rest_grade(kanban_tas
     assert "HTTP 500" in reason and "could not be minted before launch" in reason
     assert "the record is scored" not in reason
     assert "harness or agent crash" not in reason
+
+
+def test_a_lead_off_unminted_repetition_keeps_the_version_key(kanban_task, tmp_path, monkeypatch):
+    """Repetition 1 lost, 2 and 3 real: the key comes off repetition 2.
+
+    The not-run record is readable but has no manifest, so it carries no
+    version key. Taken as the case's key, it would turn off rung 6's
+    comparison against main and, on a nightly, leave the two real
+    repetitions out of the baseline store. JUDGE_MODEL is set here because
+    without it no record has a key and the test could not tell.
+    """
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    judged = {"OutcomeValidity": {"mean": 1.0, "n": 3}}
+    store = store_with(
+        tmp_path,
+        *[
+            baseline_line("agent-kanban-smoke", runs=3, passes=3, judged=judged, at=f"2026-08-0{i + 1}T00:00:00Z")
+            for i in range(7)
+        ],
+    )
+    lost = not_run(tmp_path / "state", "agent-kanban-smoke", 1)
+    out = tmp_path / "case.json"
+    doc = graded_case(kanban_task, [lost, FIXTURE_RUNS / GREEN_RUNS[0], FIXTURE_RUNS / GREEN_RUNS[1]], out, store)
+    assert [r["outcome"] for r in doc["reps"]] == ["infra", "pass", "pass"]
+    assert doc["version_key"] == KEY
+    # Rung 6 has main's judged mean to compare against.
+    assert doc["baseline_judged"] == {"OutcomeValidity": 1.0}
+    assert doc["baseline_runs"] == 21
+    # And the nightly files the two real repetitions under that key.
+    before = (store / "agent-kanban-smoke.jsonl").read_text(encoding="utf-8").splitlines()
+    assert run_record(store, out, extra=["--recorded-at", "2026-08-09T00:00:00Z"]) == 0
+    after = (store / "agent-kanban-smoke.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(after) == len(before) + 1
+    line = json.loads(after[-1])
+    assert line["key"] == KEY and (line["runs"], line["passes"]) == (2, 2)
 
 
 def test_every_repetition_unminted_excludes_the_case(pdb_task, tmp_path):

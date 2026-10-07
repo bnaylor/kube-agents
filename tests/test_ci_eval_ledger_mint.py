@@ -246,6 +246,22 @@ def _lift_line(pattern, what):
     return match.group(0)
 
 
+# hack/ci_reset_agent_pulls.py as run_one_unit's reset meets it: the exit
+# codes and the ERROR line the real helper prints, by RESET_HELPER.
+RESET_HELPER_STUB = """\
+import os, sys
+mode = os.environ.get("RESET_HELPER", "clean")
+if mode == "transient":
+    print("  GET /repos/x/pulls answered HTTP 500; trying again in 2s", file=sys.stderr)
+    print("ERROR: GitHub answered HTTP 500 Internal Server Error reading gke-agentic/kube-agents-evals-2-infra", file=sys.stderr)
+    sys.exit(int(os.environ.get("AGENT_PULLS_RESET_TRANSIENT_EXIT") or 1))
+if mode == "unclean":
+    print("closed 0 pull request(s) and deleted 0 branch(es); 0 agent pull request(s) and 1 branch(es) remain")
+    sys.exit(1)
+print("closed 0 pull request(s) and deleted 0 branch(es); 0 agent pull request(s) and 0 branch(es) remain")
+"""
+
+
 class UnitNotRunTest(unittest.TestCase):
     """The real run_one_unit, with everything around the mint stubbed.
 
@@ -270,12 +286,19 @@ class UnitNotRunTest(unittest.TestCase):
         self.key = self.tmp / "ledger.pem"
         self.key.write_text("not a real key -- the mint itself is stubbed\n")
 
-    def _unit(self, rep, grading_mint, reset_mint=None, phase="0", name="case-under-test"):
+    def _unit(self, rep, grading_mint, reset_mint=None, phase="0", name="case-under-test", reset_helper="clean"):
         """Run run_one_unit for one repetition.
 
         grading_mint / reset_mint: "ok", "transient" or "refused" -- what the
         stubbed mint answers on every attempt for that body.
+        reset_helper: what the stubbed hack/ci_reset_agent_pulls.py does once
+        the reset's mint is good -- "clean", "transient" (its retries ran out
+        on GitHub's answer, so it exits the code the shell handed it) or
+        "unclean" (it ran and the read-back found a leftover).
         """
+        hack = self.tmp / "hack"
+        hack.mkdir(exist_ok=True)
+        (hack / "ci_reset_agent_pulls.py").write_text(RESET_HELPER_STUB)
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -356,6 +379,8 @@ class UnitNotRunTest(unittest.TestCase):
                     "GRADING_MINT": grading_mint,
                     "RESET_MINT": reset_mint or "ok",
                     "UNIT_PHASE": phase,
+                    "SCRIPT_DIR": str(self.tmp / "hack"),
+                    "RESET_HELPER": reset_helper,
                     "TMPDIR": str(self.tmp),
                 },
             ),
@@ -419,6 +444,28 @@ class UnitNotRunTest(unittest.TestCase):
     def test_a_refused_reset_mint_stays_missing(self):
         self._unit(1, "ok", reset_mint="refused", phase="1")
         self.assertIsNone(self._dir(1))
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+
+    def test_a_clean_reset_launches_the_unit(self):
+        # The stub's happy path, so the two below are about the verdict.
+        self._unit(1, "ok", phase="1")
+        self.assertIn("devops-bench reached", self.finished.read_text())
+
+    def test_a_reset_that_ran_out_on_github_is_recorded_as_infrastructure(self):
+        # #2582 round 2: the mint was good, and the reset's own first read ran
+        # out on GitHub's 500s. The same weather as the mint's.
+        self._unit(1, "ok", phase="1", reset_helper="transient")
+        error = self._record(1)["errors"][0]
+        self.assertTrue(error.startswith("KUBE_AGENTS_INFRA_FAILURE: "), error)
+        self.assertIn("the repository reset ran out on a transient GitHub failure before launch", error)
+        self.assertIn("GitHub answered HTTP 500 Internal Server Error reading gke-agentic/kube-agents-evals-2-infra", error)
+        self.assertNotIn("could not be minted", error)
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+
+    def test_a_reset_that_left_the_repository_unclean_stays_missing(self):
+        self._unit(1, "ok", phase="1", reset_helper="unclean")
+        self.assertIsNone(self._dir(1))
+        self.assertFalse((self.state / "not-run").exists())
         self.assertNotIn("devops-bench reached", self.finished.read_text())
 
 
