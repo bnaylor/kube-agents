@@ -441,7 +441,8 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 // not rendered, so it keeps its own default, and the bridge's grants name
 // a2aBridgeAddressee and nothing else, which is also the bridge's
 // BRIDGE_PROFILE default. TestTheCalloutReservesTheConfiguredAddressees holds
-// this list to both defaults in the a2a module. Session pods are addressees
+// this list to every addressee the bridge's grants name and to both defaults in
+// the a2a module, so widening the grant means adding the name here. Session pods are addressees
 // too, but under gateway-minted names, which are not reserved because each is
 // the name of the pod that is that addressee.
 func a2aReservedAddressees() []string {

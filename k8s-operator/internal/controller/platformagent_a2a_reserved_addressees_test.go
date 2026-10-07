@@ -20,12 +20,12 @@ package controller
 //
 // A narrowed pod named after an addressee is handed that addressee's task
 // subjects. The callout refuses such a pod by name, from A2A_RESERVED_ADDRESSEES,
-// so that list has to be every fixed-name addressee the install routes to. The
-// addressees themselves are configured in two places the operator does not
-// render: the gateway's default (A2A_DEFAULT_ADDRESSEE, left at its default) and
-// the bridge's profile (BRIDGE_PROFILE, left at its default). Those defaults
-// live in the a2a module, which this module cannot import, so the test reads
-// them out of the source. Every extraction fails the test rather than falling
+// so that list has to be every fixed-name addressee the install routes to. Those
+// are read from three places: the subjects the bridge identity's grants name,
+// which the operator renders, and two defaults it does not render, the
+// gateway's (A2A_DEFAULT_ADDRESSEE) and the bridge's profile (BRIDGE_PROFILE).
+// The defaults live in the a2a module, which this module cannot import, so the
+// test reads them out of the source. Every extraction fails the test rather than falling
 // back, so a moved or reshaped default reds here instead of passing vacuously.
 
 import (
@@ -38,8 +38,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	corev1 "k8s.io/api/core/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -135,49 +133,87 @@ func renderedCalloutReservedAddressees(t *testing.T, agent *agentv1alpha1.Platfo
 	return strings.Split(raw, a2aReservedAddresseesSeparator)
 }
 
-// The rendered list is exactly the addressees the gateway and the bridge are
-// configured with on this render: the gateway's default addressee, the
-// bridge's profile, and the addressee the bridge's grants name. Each is read
-// from what the operator renders when it renders the variable, and from the
-// a2a module's default when it does not.
+// bridgeGrantAddressees is every addressee the bridge identity's grants name,
+// read off the subjects themselves rather than off a constant: the `<x>` in
+// `a2a.tasks.<x>.*.in` and `a2a.tasks.<x>.*.events`, in `a2a.cap.verify.<x>`
+// and in `a2a.cap.reply.<x>.>`. Widening the grant to a second addressee adds
+// it here with no test edit. A wildcard in the addressee position fails the
+// test, because no name list can reserve it; so does finding no addressee at
+// all, which would make every check below pass vacuously.
+func bridgeGrantAddressees(t *testing.T) []string {
+	t.Helper()
+	id := bridgeIdentity()
+	var out []string
+	add := func(subject, addressee string) {
+		if addressee == "" || strings.ContainsAny(addressee, "*>") {
+			t.Fatalf("the bridge grant %q names addressee %q; a wildcard addressee cannot be reserved by name", subject, addressee)
+		}
+		out = append(out, addressee)
+	}
+	for _, subject := range slices.Concat(id.publish, id.subscribe) {
+		tokens := strings.Split(subject, ".")
+		switch {
+		case len(tokens) == 5 && tokens[0] == "a2a" && tokens[1] == "tasks" &&
+			(tokens[4] == "in" || tokens[4] == "events"):
+			add(subject, tokens[2])
+		case len(tokens) == 4 && tokens[0] == "a2a" && tokens[1] == "cap" && tokens[2] == "verify":
+			add(subject, tokens[3])
+		case len(tokens) == 5 && tokens[0] == "a2a" && tokens[1] == "cap" && tokens[2] == "reply" && tokens[4] == ">":
+			add(subject, tokens[3])
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("found no addressee in the bridge's grants (publish %v, subscribe %v); the subject shapes this test reads have moved", id.publish, id.subscribe)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// Every fixed-name addressee the install routes to is reserved: each one the
+// bridge's grants name, the gateway's default addressee, and the bridge's
+// profile default. The check is containment, not equality, so the edit
+// a2a/docs/hermes-bridge.md prescribes for an install that overrides
+// BRIDGE_PROFILE (widen bridgeIdentity() and add the addressee to
+// a2aReservedAddressees() in the same change) passes without a test edit, and
+// widening the grant without the reservation reds here.
+//
+// BRIDGE_PROFILE is read from the a2a module's default only. The operator never
+// renders it on the bridge container (it is a CR-declared sidecar env), so
+// there is no rendered value to prefer. An install that overrides it is held
+// through the grant instead: the override only works once the grant names the
+// new addressee, and then the grant check above covers it.
 func TestTheCalloutReservesTheConfiguredAddressees(t *testing.T) {
 	agent := a2aTestAgent()
+	got := renderedCalloutReservedAddressees(t, agent)
+
+	// Today's value, pinned so the derivation below cannot drift to a set
+	// that no longer includes the addressee every stock turn goes to.
+	if !slices.Contains(got, a2aBridgeAddressee) {
+		t.Errorf("%s = %v does not contain %q, the addressee every stock turn is routed to", a2aCalloutReservedAddresseesEnvVar, got, a2aBridgeAddressee)
+	}
 
 	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0]
 	gatewayAddressee, rendered := envValue(gateway, gatewayDefaultAddresseeEnv)
 	if !rendered {
 		gatewayAddressee = envDefaultInSource(t, a2aGatewayConfigSource, gatewayDefaultAddresseeEnv)
 	}
+	bridgeProfile := envDefaultInSource(t, a2aBridgeMainSource, bridgeProfileEnv)
 
-	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
-		Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "example.com/bridge:v1"}},
+	type source struct{ addressee, from string }
+	var want []source
+	for _, a := range bridgeGrantAddressees(t) {
+		want = append(want, source{a, "named by the bridge's grants"})
 	}
-	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
-	var bridge *corev1.Container
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == "hermes-bridge" {
-			bridge = &pod.Spec.Containers[i]
+	want = append(want,
+		source{gatewayAddressee, "the gateway's " + gatewayDefaultAddresseeEnv},
+		source{bridgeProfile, "the bridge's " + bridgeProfileEnv + " default"},
+	)
+	for _, w := range want {
+		if !slices.Contains(got, w.addressee) {
+			t.Errorf("%s = %v does not reserve %q (%s); a narrowed pod named %q would be handed its task subjects. "+
+				"Add it to a2aReservedAddressees() in the same change.",
+				a2aCalloutReservedAddresseesEnvVar, got, w.addressee, w.from, w.addressee)
 		}
-	}
-	if bridge == nil {
-		t.Fatal("the rendered pod has no hermes-bridge container, so the bridge's env cannot be read")
-	}
-	bridgeProfile, rendered := envValue(*bridge, bridgeProfileEnv)
-	if !rendered {
-		bridgeProfile = envDefaultInSource(t, a2aBridgeMainSource, bridgeProfileEnv)
-	}
-
-	want := []string{gatewayAddressee, bridgeProfile, a2aBridgeAddressee}
-	slices.Sort(want)
-	want = slices.Compact(want)
-
-	got := renderedCalloutReservedAddressees(t, agent)
-	sorted := slices.Clone(got)
-	slices.Sort(sorted)
-	if !slices.Equal(sorted, want) {
-		t.Errorf("%s = %v, but the install routes to %v (gateway default %q, bridge profile %q, bridge grants %q); "+
-			"a narrowed pod named after a missing one would be handed its task subjects",
-			a2aCalloutReservedAddresseesEnvVar, got, want, gatewayAddressee, bridgeProfile, a2aBridgeAddressee)
 	}
 }
 
