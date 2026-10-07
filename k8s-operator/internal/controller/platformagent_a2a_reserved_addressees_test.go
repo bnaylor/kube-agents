@@ -50,6 +50,14 @@ const (
 	reservedAddresseesFixturePath = "../../../a2a/authcallout/testdata/rendered-reserved-addressees.txt"
 
 	a2aGatewayConfigSource = "../../../a2a/gateway/config.go"
+	a2aGatewaySpawnSource  = "../../../a2a/gateway/spawn.go"
+
+	// gatewayRouteSessionConst names the A2A_DEFAULT_ADDRESSEE value that
+	// routes each conversation to a session pod of its own. It is a sentinel,
+	// not an addressee: the gateway never publishes to a literal "session"
+	// addressee (it refuses to start with it and no spawner), and each session
+	// pod's task subjects are keyed on its own minted name.
+	gatewayRouteSessionConst = "RouteSession"
 
 	// The env names whose defaults the a2a module holds.
 	gatewayDefaultAddresseeEnv = "A2A_DEFAULT_ADDRESSEE"
@@ -117,6 +125,38 @@ func envDefaultInSource(t *testing.T, path, env string) string {
 	return ""
 }
 
+// stringConstInSource returns the string constant of that name in a Go file.
+// No such constant, or an empty one, fails the test.
+func stringConstInSource(t *testing.T, path, name string) string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v (if it moved, this test's path must move with it)", path, err)
+	}
+	var found []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, id := range spec.Names {
+			if id.Name != name || i >= len(spec.Values) {
+				continue
+			}
+			if lit, ok := spec.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				if v, err := strconv.Unquote(lit.Value); err == nil {
+					found = append(found, v)
+				}
+			}
+		}
+		return true
+	})
+	if len(found) != 1 || found[0] == "" {
+		t.Fatalf("found %d non-empty string constants named %s in %s (%q), want exactly 1", len(found), name, path, found)
+	}
+	return found[0]
+}
+
 func renderedCalloutReservedAddressees(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
 	t.Helper()
 	raw, ok := envValue(calloutContainer(t, agent), a2aCalloutReservedAddresseesEnvVar)
@@ -166,8 +206,9 @@ func bridgeGrantAddressees(t *testing.T) []string {
 }
 
 // Every fixed-name addressee the install routes to is reserved: each one the
-// bridge's grants name, the gateway's default addressee, and the bridge's
-// profile default. The check is containment, not equality, so the edit
+// bridge's grants name, the gateway's default addressee (unless it is the
+// RouteSession sentinel, see configuredAddressees), and the bridge's profile
+// default. The check is containment, not equality, so the edit
 // a2a/docs/hermes-bridge.md prescribes for an install that overrides
 // BRIDGE_PROFILE (widen bridgeIdentity() and add the addressee to
 // a2aReservedAddressees() in the same change) passes without a test edit, and
@@ -195,21 +236,51 @@ func TestTheCalloutReservesTheConfiguredAddressees(t *testing.T) {
 	}
 	bridgeProfile := envDefaultInSource(t, a2aBridgeMainSource, bridgeProfileEnv)
 
-	type source struct{ addressee, from string }
-	var want []source
-	for _, a := range bridgeGrantAddressees(t) {
-		want = append(want, source{a, "named by the bridge's grants"})
-	}
-	want = append(want,
-		source{gatewayAddressee, "the gateway's " + gatewayDefaultAddresseeEnv},
-		source{bridgeProfile, "the bridge's " + bridgeProfileEnv + " default"},
-	)
-	for _, w := range want {
+	for _, w := range configuredAddressees(t, gatewayAddressee, bridgeProfile) {
 		if !slices.Contains(got, w.addressee) {
 			t.Errorf("%s = %v does not reserve %q (%s); a narrowed pod named %q would be handed its task subjects. "+
 				"Add it to a2aReservedAddressees() in the same change.",
 				a2aCalloutReservedAddresseesEnvVar, got, w.addressee, w.from, w.addressee)
 		}
+	}
+}
+
+type configuredAddressee struct{ addressee, from string }
+
+// configuredAddressees is every fixed-name addressee the install routes to:
+// each one the bridge's grants name, the gateway's default addressee and the
+// bridge's profile default. A gateway default of the RouteSession sentinel is
+// left out: it routes to session pods under minted names, not to an addressee.
+func configuredAddressees(t *testing.T, gatewayAddressee, bridgeProfile string) []configuredAddressee {
+	t.Helper()
+	var want []configuredAddressee
+	for _, a := range bridgeGrantAddressees(t) {
+		want = append(want, configuredAddressee{a, "named by the bridge's grants"})
+	}
+	if gatewayAddressee != stringConstInSource(t, a2aGatewaySpawnSource, gatewayRouteSessionConst) {
+		want = append(want, configuredAddressee{gatewayAddressee, "the gateway's " + gatewayDefaultAddresseeEnv})
+	}
+	want = append(want, configuredAddressee{bridgeProfile, "the bridge's " + bridgeProfileEnv + " default"})
+	return want
+}
+
+// The day the gateway's default flips to the session route, the derivation
+// must not demand that the sentinel be reserved: it is not an addressee, and a
+// list that grew to carry it would refuse a pod for a name nothing routes to.
+func TestTheSessionRouteIsNotAConfiguredAddressee(t *testing.T) {
+	routeSession := stringConstInSource(t, a2aGatewaySpawnSource, gatewayRouteSessionConst)
+	bridgeProfile := envDefaultInSource(t, a2aBridgeMainSource, bridgeProfileEnv)
+	var got []string
+	for _, a := range configuredAddressees(t, routeSession, bridgeProfile) {
+		got = append(got, a.addressee)
+	}
+	if slices.Contains(got, routeSession) {
+		t.Errorf("with %s=%q the configured addressees are %v; %q is the session-route sentinel, not an addressee",
+			gatewayDefaultAddresseeEnv, routeSession, got, routeSession)
+	}
+	if !slices.Contains(got, a2aBridgeAddressee) {
+		t.Errorf("with %s=%q the configured addressees are %v and lost %q, which the bridge's grants still name",
+			gatewayDefaultAddresseeEnv, routeSession, got, a2aBridgeAddressee)
 	}
 }
 
