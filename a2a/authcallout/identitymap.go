@@ -251,10 +251,20 @@ func (m *IdentityMap) Users() []string {
 	return users
 }
 
-// servesUser reports whether name is a user this map mints. Only a map built
-// by ParseIdentityMap has the set, and only such a map is ever served: Store
-// installs nothing else.
+// servesUser reports whether name is a user of one of this map's entries.
+// ParseIdentityMap builds the set, and Store.Update installs nothing else, but
+// a map built any other way (a test writing the store directly) has no set; it
+// falls back to scanning the entries rather than reporting no users, so the
+// refusal fails closed.
 func (m *IdentityMap) servesUser(name string) bool {
+	if m.users == nil {
+		for _, id := range m.Identities {
+			if id.User == name {
+				return true
+			}
+		}
+		return false
+	}
 	_, ok := m.users[name]
 	return ok
 }

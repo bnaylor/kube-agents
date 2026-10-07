@@ -253,8 +253,9 @@ func renderedFixtureMap(t *testing.T) string {
 	return string(raw)
 }
 
-// renderedFixtureMapUsers is every user the rendered map serves, which is the
-// set of names the callout mints mapped entries as.
+// renderedFixtureMapUsers is every user the rendered map serves: the names
+// the callout mints its entries that are not narrowed as, plus the narrowed
+// entry's own user.
 func renderedFixtureMapUsers(t *testing.T) []string {
 	t.Helper()
 	m, err := ParseIdentityMap([]byte(renderedFixtureMap(t)))
@@ -393,5 +394,18 @@ func TestAMapReloadMovesTheReservedUsers(t *testing.T) {
 		if _, err := authorizeToken(svc, reservedPodToken(name)); err == nil || !strings.Contains(err.Error(), "the name of a static principal") {
 			t.Errorf("after the reloads, static principal %q is not refused as one: %v", name, err)
 		}
+	}
+}
+
+// A map that did not come through ParseIdentityMap has no cached user set.
+// Its users are still reserved: servesUser scans the entries rather than
+// reporting none, so a map installed some other way cannot fail open.
+func TestAMapWithoutTheCachedSetStillReservesItsUsers(t *testing.T) {
+	m := &IdentityMap{Version: "hand-built", Identities: []Identity{{User: "verifier"}}}
+	if !m.servesUser("verifier") {
+		t.Fatal("a hand-built map does not serve its own user; the map-user refusal would fail open")
+	}
+	if m.servesUser("pod-a") {
+		t.Fatal("a hand-built map serves a user it has no entry for")
 	}
 }

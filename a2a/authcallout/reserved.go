@@ -28,9 +28,12 @@ import (
 //     carries every static user's password, and the callout has no reason to
 //     hold any of them.
 //   - The identity map's own users (provision, agent, verifier, session, and
-//     whatever else the map holds). authorize mints a mapped entry under its
-//     `user`, and that entry's grants carry `_INBOX.<user>.>`, so these are
-//     exactly the names whose inboxes a same-named pod would share. They are
+//     whatever else the map holds). authorize mints each entry that is not
+//     narrowed under its `user`, and that entry's grants carry
+//     `_INBOX.<user>.>`, so these are the names whose inboxes a same-named pod
+//     would share. The narrowed entry's own user (session) is never minted,
+//     since its connections are renamed to their pods; it is reserved with the
+//     rest, harmlessly, because one check covers every map user. They are
 //     read from the map being served, built when the map is parsed (see
 //     IdentityMap.users), so a reload that adds or removes a user moves the
 //     reserved set in the same pointer swap that moves the map.

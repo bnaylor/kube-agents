@@ -625,8 +625,10 @@ set would quietly admit a pod named after the dropped user. The list is fixed fo
 of the process, and that is enough: it changes only when the operator's render does, and a
 changed value changes the pod template, which rolls the callout. The same check also
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
-`agent`, `verifier`, `session`, and any user the map gains), because the callout mints a
-mapped entry under its `user` and that entry's grants carry `_INBOX.<user>.>`. Those names
+`agent`, `verifier`, `session`, and any user the map gains), because the callout mints
+each entry that is not narrowed under its `user` and that entry's grants carry
+`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved
 set in the same step, and a connection is checked against the users of the map its
