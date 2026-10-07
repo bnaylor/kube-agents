@@ -5385,7 +5385,8 @@ class PlatformAgentModeTest(unittest.TestCase):
         # A hand-written install.env, or one copied from install.env.example
         # with the line still commented out, sets no mode: --mode is appended
         # rather than refused, nothing else in the file changes, and the next
-        # run reads it back.
+        # run reads it back. The check writes nothing; the record is made
+        # when main commits (record_platform_agent_mode_flag).
         with tempfile.TemporaryDirectory() as tmp:
             for content, mode in (
                 ("PROJECT_ID=p\n# PLATFORM_AGENT_MODE=today\n", "next"),
@@ -5394,8 +5395,15 @@ class PlatformAgentModeTest(unittest.TestCase):
             ):
                 with self.subTest(content=content, mode=mode):
                     path = self._file(tmp, content)
-                    proc = self._run(
+                    checked = self._run(
                         f'parse_args --mode={mode}; rc=0; validate_platform_agent_mode || rc=$?; echo "rc=$rc"',
+                        install_env=path,
+                    )
+                    self.assertIn("rc=0", checked.stdout, checked.stderr)
+                    self.assertEqual(path.read_text(), content, "the check alone writes nothing")
+                    proc = self._run(
+                        f'parse_args --mode={mode}; rc=0; validate_platform_agent_mode || rc=$?; '
+                        'record_platform_agent_mode_flag; echo "rc=$rc"',
                         install_env=path,
                     )
                     out = proc.stdout + proc.stderr
@@ -5406,6 +5414,75 @@ class PlatformAgentModeTest(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                     again = self._run('echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"', install_env=path)
                     self.assertIn(f"MODE=[{mode}]", again.stdout, again.stderr)
+
+    # main's step-11 confirmation through the record, run as it stands in
+    # main with the prompt and the container preflight stubbed.
+    _CONFIRM_START = '  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then\n    local confirm_choice=""\n'
+    _RECORD_CALL = "\n  record_platform_agent_mode_flag\n"
+
+    def _confirm_block(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CONFIRM_START, main_start)
+        end = text.index(self._RECORD_CALL, start) + len(self._RECORD_CALL)
+        block = text[start:end]
+        # The slice is the prompt, its three arms and the record, nothing
+        # else: a reshaped main fails here rather than testing a fragment.
+        self.assertIn("Provisioning paused by user", block)
+        self.assertIn("check_scope_container_access || exit 1", block)
+        self.assertLess(len(block.splitlines()), 40, block)
+        return block
+
+    def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
+        block = self._confirm_block()
+        stubs = (
+            'prompt_read() { printf -v "$2" "%s" "$ANSWER"; }\n'
+            'check_scope_container_access() { [ "${1:-}" = "warn" ] || return "${SCOPE_RC:-0}"; }\n'
+            "write_json_report() { :; }\n"
+            f"_confirm() {{\n{block}}}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, answer, scope_rc, records in (
+                ("--mode=next", "n", 0, False),  # declined at the prompt
+                ("--mode=next", "y", 1, False),  # refused after the confirmation
+                ("--mode=next", "y", 0, True),
+                ("--mode=next", "g", 0, True),
+                ("--mode=next -y", "", 1, True),  # -y: refused above the summary, not here
+                ("--mode=next --generate-only", "", 0, True),
+            ):
+                with self.subTest(flags=flags, answer=answer, scope_rc=scope_rc):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"{stubs}parse_args {flags}; validate_platform_agent_mode || exit 1\n"
+                        f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
+                        install_env=path,
+                    )
+                    if records:
+                        self.assertIn("went on", proc.stdout, proc.stderr)
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\nPLATFORM_AGENT_MODE=next\n")
+                    else:
+                        self.assertNotIn("went on", proc.stdout, proc.stderr)
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    def test_the_record_follows_every_refusal_and_precedes_the_apply(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        record = text.index(self._RECORD_CALL, main_start)
+        self.assertEqual(text.count(self._RECORD_CALL), 1)
+        for gate in (
+            "validate_platform_agent_mode || exit 1",
+            "check_service_account_ownership || exit 1",
+            'refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n',
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"',
+            'check_existing_cluster_network_policy_preflight "$project_id"',
+            'write_json_report "DRY_RUN_SUCCESS"',
+            'write_json_report "PAUSED"',
+        ):
+            with self.subTest(gate=gate):
+                self.assertLess(text.index(gate, main_start), record)
+        for after in ('print_generate_only_handoff "$repo_dir"', 'run_lifecycle_apply "$repo_dir" "$provisioning_log"'):
+            with self.subTest(after=after):
+                self.assertLess(record, text.index(after, main_start))
 
     def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

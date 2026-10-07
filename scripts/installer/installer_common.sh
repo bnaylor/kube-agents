@@ -386,15 +386,16 @@ is_valid_platform_agent_mode() {
 #                               the latest did not serve (a failed or pending
 #                               upgrade); {} otherwise
 #   PLATFORM_AGENT_SERVED_REVISION  that revision's number, else empty
-#   PLATFORM_AGENT_SERVED_READ  _FAILED when that revision's values could not
-#                               be read, else empty
+#   PLATFORM_AGENT_SERVED_READ  _FAILED when the release history, or that
+#                               revision's values, could not be read, else
+#                               empty
 #   PLATFORM_AGENT_READ_ERROR   the failed read's stderr, on one line
 # A missing type and a missing release are answers, told apart from a read
 # that failed by kubectl's and helm's exit status and their own error text,
 # never by empty output. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
 # (gke_context_name).
 read_platform_agent_install_state() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" scope="${2:-}" expected_ctx err_file served_rev
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" scope="${2:-}" expected_ctx err_file served_rev history_json
   PLATFORM_AGENT_READS_HELD_FOR="$namespace"
   PLATFORM_AGENT_CR_READ="" PLATFORM_AGENT_CR_JSON="" PLATFORM_AGENT_RECORD_READ=""
   PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}" PLATFORM_AGENT_SERVED_READ=""
@@ -435,16 +436,17 @@ read_platform_agent_install_state() {
     rm -f "$err_file"
     return 0
   fi
-  rm -f "$err_file"
   PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_OK"
   # The last revision that served, and only when the latest did not (a
   # failed or pending upgrade): its values are what the CR still holds, and
   # what Helm diffs the next render against. On a healthy release the latest
   # revision is the one record, so a hand edit that happens to restore an
-  # earlier scope is still a hand edit. A history that cannot be read leaves
-  # only the latest revision to compare against.
-  served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
-    | python3 -c '
+  # earlier scope is still a hand edit. A history that cannot be read, or
+  # parsed, is PLATFORM_AGENT_SERVED_READ failed: the scope check compares
+  # against the latest revision alone, but the mode notice, which picks one
+  # record, says it did not run rather than guess the latest served.
+  if ! history_json="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")" \
+    || ! served_rev="$(trap - ERR; printf '%s' "$history_json" | python3 -c '
 import json, sys
 statuses = sys.argv[1].split()
 revisions = json.load(sys.stdin) or []
@@ -453,7 +455,13 @@ served = [] if latest is None or latest.get("status") in statuses else [
     r["revision"] for r in revisions if r.get("status") in statuses
 ]
 print(max(served) if served else "")
-' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
+' "$HELM_SERVED_REVISION_STATUSES" 2>>"$err_file")"; then
+    PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
+    PLATFORM_AGENT_READ_ERROR="the release history did not answer: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    rm -f "$err_file"
+    return 0
+  fi
+  rm -f "$err_file"
   PLATFORM_AGENT_SERVED_REVISION="$served_rev"
   if [ -n "$served_rev" ]; then
     if ! PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null)"; then
@@ -596,11 +604,18 @@ _platform_agent_mode_unread() {
 }
 
 # The front door's call, after the scope check beside it: $1 namespace, $2
-# the key. Quiet where there is nothing to switch (no context to read through,
-# which a first install's dry run has; no PlatformAgent type, no CR, no
-# release), loud where a read failed.
+# the key. Quiet where there is nothing to switch (a cluster the tfvars
+# generator found NOT_FOUND, so TFVARS_CLUSTER_EXISTS=false: nothing is read,
+# since a kubeconfig context left by an earlier install of the same name
+# points at an endpoint that is gone; no context to read through, which a
+# first install's dry run has; no PlatformAgent type, no CR, no release),
+# loud where a read failed.
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
+    PLATFORM_AGENT_READS_HELD_FOR=""
+    return 0
+  fi
   take_platform_agent_install_state "$namespace"
   case "$PLATFORM_AGENT_CR_READ" in
     "$PLATFORM_AGENT_READ_FAILED")

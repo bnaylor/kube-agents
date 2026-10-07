@@ -1398,6 +1398,11 @@ class InstallerCommonTest(unittest.TestCase):
     # Helm's missing-release answer. Each call leaves a line in $HELM_LOG.
     @staticmethod
     def _helm(history, values_by_revision, latest="{}"):
+        history_arm = (
+            "echo 'Error: Kubernetes cluster unreachable' >&2; return 1"
+            if history is None else f"printf '%s' '{history}'"
+        )
+
         def arm(vals):
             if vals is None:
                 return "echo 'Error: Kubernetes cluster unreachable' >&2; return 1"
@@ -1411,7 +1416,7 @@ class InstallerCommonTest(unittest.TestCase):
             "helm() {\n"
             '  [ -n "${HELM_LOG:-}" ] && echo "$*" >> "$HELM_LOG"\n'
             '  case "$1" in\n'
-            f"    history) printf '%s' '{history}' ;;\n"
+            f"    history) {history_arm} ;;\n"
             '    get) case "$*" in\n'
             f"{cases}"
             '      *"--revision"*) return 1 ;;\n'
@@ -1423,6 +1428,13 @@ class InstallerCommonTest(unittest.TestCase):
         )
 
     _HEALTHY = '[{"revision": 1, "status": "superseded"}, {"revision": 2, "status": "deployed"}]'
+
+    @staticmethod
+    def _no_helm(log):
+        """A helm that must not run: each call leaves a line in `log`, which
+        a command substitution cannot swallow the way it swallows stdout, so
+        the case asserts `log` was never created."""
+        return f'helm() {{ echo "$*" >> "{log}"; return 99; }}\n'
     _LOUD_PRINTS = 'print_warning() { echo "WARN: $*"; }\nprint_info() { echo "INFO: $*"; }\n'
 
     def _announce(self, kubectl, helm_stub, key="next", call=None):
@@ -1454,35 +1466,79 @@ class InstallerCommonTest(unittest.TestCase):
     def test_a_first_install_is_quiet(self):
         # Nothing to switch: no context to read through (a first install's
         # dry run), no PlatformAgent type, no CR, or no release.
-        for kubectl, helm_stub in (
-            (None, "helm() { echo 'helm must not run'; return 99; }\n"),
-            (self._cr_kubectl("", exit_code=1, stderr=self._NO_TYPE), "helm() { echo 'helm must not run'; return 99; }\n"),
-            (self._cr_kubectl(self._cr_list(present=False)), self._helm(self._HEALTHY, {}, latest="norelease")),
-            (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="norelease")),
-        ):
-            with self.subTest(kubectl=kubectl, helm_stub=helm_stub):
-                proc = self._announce(kubectl, helm_stub)
-                self.assertEqual(proc.stdout, "", proc.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "helm-must-not-run.log"
+            for kubectl, helm_stub, helm_runs in (
+                (None, self._no_helm(log), False),
+                (self._cr_kubectl("", exit_code=1, stderr=self._NO_TYPE), self._no_helm(log), False),
+                (self._cr_kubectl(self._cr_list(present=False)), self._helm(self._HEALTHY, {}, latest="norelease"), True),
+                (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="norelease"), True),
+            ):
+                with self.subTest(kubectl=kubectl, helm_stub=helm_stub):
+                    log.unlink(missing_ok=True)
+                    proc = self._announce(kubectl, helm_stub)
+                    self.assertEqual(proc.stdout, "", proc.stderr)
+                    if not helm_runs:
+                        self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
+
+    def test_a_cluster_the_generator_found_absent_is_not_read(self):
+        # A reinstall under a name used before: the tfvars generator's describe
+        # said NOT_FOUND (TFVARS_CLUSTER_EXISTS=false), but the kubeconfig
+        # still has the old install's context, whose endpoint is gone. Nothing
+        # is asked and nothing is said; with the cluster there, the same
+        # failed read still says the check did not run.
+        unreachable = self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE)
+        with tempfile.TemporaryDirectory() as tmp:
+            klog = pathlib.Path(tmp) / "kubectl.log"
+            hlog = pathlib.Path(tmp) / "helm.log"
+            proc = self._run(
+                f'export KUBECTL_LOG="{klog}"\n{self._LOUD_PRINTS}{self._no_helm(hlog)}'
+                "TFVARS_CLUSTER_EXISTS=false announce_platform_agent_mode_for_apply kubeagents-system next\n",
+                kubectl_script=unreachable,
+            )
+            self.assertEqual(proc.stdout, "", proc.stderr)
+            self.assertFalse(klog.exists(), "the PlatformAgent was read through a stale context")
+            self.assertFalse(hlog.exists())
+            loud = self._run(
+                f"{self._LOUD_PRINTS}{self._no_helm(hlog)}"
+                "TFVARS_CLUSTER_EXISTS=true announce_platform_agent_mode_for_apply kubeagents-system next\n",
+                kubectl_script=unreachable,
+            )
+            self.assertIn("WARN: The mode-switch check did not run: the PlatformAgent", loud.stdout, loud.stderr)
 
     def test_a_read_that_fails_says_the_check_did_not_run(self):
         # Told apart from no CR by kubectl's and helm's exit status: the apply
         # goes on, so the run says the notice was not weighed.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = pathlib.Path(tmp.name) / "helm-must-not-run.log"
+        failed_next = '{"platformAgent":{"mode":"next"}}'
         for kubectl, helm_stub, what in (
             (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE),
-             "helm() { echo 'helm must not run'; return 99; }\n",
+             self._no_helm(log),
              "the PlatformAgent in namespace 'kubeagents-system' could not be read (Unable to connect to the server"),
             (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest=None),
              "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (Error: Kubernetes cluster unreachable"),
             (self._cr_kubectl(self._cr_list()),
              self._helm('[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]', {1: None}),
              "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (revision 1, the last one that served, did not answer)"),
+            # The history that names the served revision: without it the
+            # notice would model from the latest revision (a failed one that
+            # recorded next) and announce a switch to today that Helm, diffing
+            # the served revision, does not make.
+            (self._cr_kubectl(self._cr_list("next")), self._helm(None, {}, latest=failed_next),
+             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (the release history did not answer: Error: Kubernetes cluster unreachable)"),
+            (self._cr_kubectl(self._cr_list("next")), self._helm("not json", {}, latest=failed_next),
+             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (the release history did not answer: Traceback"),
         ):
             with self.subTest(what=what):
+                log.unlink(missing_ok=True)
                 proc = self._announce(kubectl, helm_stub, key="today")
                 self.assertIn(f"WARN: The mode-switch check did not run: {what}", proc.stdout, proc.stderr)
                 self.assertIn("renders spec.mode from PLATFORM_AGENT_MODE=today in install.env", proc.stdout)
                 self.assertIn("kubectl get platformagents -n kubeagents-system", proc.stdout)
-                self.assertNotIn("helm must not run", proc.stdout)
+                self.assertNotIn("This apply switches", proc.stdout)
+                self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
 
     def test_the_reads_ask_this_clusters_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1592,7 +1648,10 @@ class InstallerCommonTest(unittest.TestCase):
     def test_the_retag_note_reads_the_record_from_the_retag_values(self):
         # The values the retag re-applies are the record a later full upgrade
         # diffs against, so they are passed in and helm is not asked again.
-        no_helm = "helm() { echo 'helm must not run'; return 99; }\n"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = pathlib.Path(tmp.name) / "helm-must-not-run.log"
+        no_helm = self._no_helm(log)
         for kubectl, values, key, expect in (
             (self._cr_kubectl(self._cr_list()), "{}", "next", "WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run"),
             (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "next", None),
@@ -1605,11 +1664,12 @@ class InstallerCommonTest(unittest.TestCase):
              "INFO: Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace 'kubeagents-system' could not be read (Unable to connect"),
         ):
             with self.subTest(values=values, key=key, kubectl=kubectl):
+                log.unlink(missing_ok=True)
                 proc = self._announce(
                     kubectl, no_helm,
                     call=f"note_platform_agent_mode_for_retag kubeagents-system {key} harness '{values}'",
                 )
-                self.assertNotIn("helm must not run", proc.stdout)
+                self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
                 if expect is None:
                     self.assertEqual(proc.stdout, "", proc.stderr)
                 else:
@@ -3381,13 +3441,13 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'response=$(trap - ERR; curl ', 1),
         (_INSTALLER_COMMON, 'image="$(trap - ERR; kubectl get deployment ', 1),
         (_INSTALLER_COMMON, 'status_json="$(trap - ERR; helm status ', 1),
-        (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
+        (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 3),
         (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
         (_INSTALLER_COMMON, 'out="$({ trap - ERR; kubectl get ', 1),
         (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
         (_INSTALLER_COMMON, 'PLATFORM_AGENT_CR_JSON="$(trap - ERR; kubectl --context ', 1),
         (_INSTALLER_COMMON, 'PLATFORM_AGENT_RECORD_JSON="$(trap - ERR; helm get values ', 1),
-        (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; helm history ', 1),
+        (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; printf ', 1),
         (_INSTALLER_COMMON, 'PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values ', 1),
         (_INSTALLER_COMMON, 'verdict="$(trap - ERR; printf ', 1),
     )

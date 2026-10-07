@@ -515,6 +515,9 @@ PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 # without --mode keeps the mode the file records.
 PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
 PARAM_PLATFORM_AGENT_MODE_PASSED="false"
+# The --mode validate_platform_agent_mode found missing from install.env, for
+# record_platform_agent_mode_flag to append once the run commits.
+PLATFORM_AGENT_MODE_TO_RECORD=""
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
@@ -3880,9 +3883,15 @@ validate_platform_agent_mode() {
   # A file that does not assign the key at all (one written by hand, or
   # copied from install.env.example with the line still commented out) has
   # no mode to disagree with, so --mode fills it in, as a first install's
-  # bootstrap would have, and every later run keeps it.
+  # bootstrap would have, and every later run keeps it. Only checked here:
+  # the write waits for record_platform_agent_mode_flag, after the refusal
+  # gates and the confirmation, so a run that stops before then leaves the
+  # file as it was.
   if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
-    record_platform_agent_mode_flag "$value"
+    PLATFORM_AGENT_MODE_TO_RECORD="$value"
+    if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+      print_info "${INSTALL_ENV_FILE} sets no PLATFORM_AGENT_MODE; a run without --dry-run records PLATFORM_AGENT_MODE=${value} there."
+    fi
     return 0
   fi
   local recorded="" source_of_recorded
@@ -3904,14 +3913,15 @@ validate_platform_agent_mode() {
 # the file, the one write install.sh makes to an install.env it did not
 # create, and only of a key the file lacks, so nothing the operator wrote is
 # changed. Without it the flag would hold for this run alone and the next run,
-# or upgrade.sh, would go back to the default. A --dry-run says what it would
-# record and writes nothing. $1 the mode.
+# or upgrade.sh, would go back to the default. main calls it once the run is
+# past its refusal gates and the operator has chosen the apply or the handoff
+# (or -y / --generate-only chose it), so a refused, declined or --dry-run run
+# writes nothing. Records what validate_platform_agent_mode left in
+# PLATFORM_AGENT_MODE_TO_RECORD, if anything.
 record_platform_agent_mode_flag() {
-  local value="${1:?mode}" old_umask
-  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
-    print_info "${INSTALL_ENV_FILE} sets no PLATFORM_AGENT_MODE; a run without --dry-run records PLATFORM_AGENT_MODE=${value} there."
-    return 0
-  fi
+  local value="${PLATFORM_AGENT_MODE_TO_RECORD:-}" old_umask
+  [ -n "$value" ] && [ -f "$INSTALL_ENV_FILE" ] || return 0
+  PLATFORM_AGENT_MODE_TO_RECORD=""
   old_umask="$(umask)"
   umask 077
   # A last line with no newline would run into the appended assignment.
@@ -6213,6 +6223,10 @@ main() {
         ;;
     esac
   fi
+  # Past every refusal and the confirmation: a --mode against an install.env
+  # that set no mode is recorded now, for the apply or the handoff this run
+  # commits to.
+  record_platform_agent_mode_flag
 
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
