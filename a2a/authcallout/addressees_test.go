@@ -109,7 +109,7 @@ func newAddresseeTestService(t *testing.T, tokens map[string]Attested, reserved 
 	if err != nil {
 		t.Fatalf("NewTokenValidator: %v", err)
 	}
-	svc, err := NewService(store, validator, Config{IssuerSeed: string(issuerSeed), ReservedAddressees: reserved}, log)
+	svc, err := NewService(store, validator, Config{IssuerSeed: string(issuerSeed), ReservedPrincipals: renderedFixtureAuthUsers(t), ReservedAddressees: reserved}, log)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -231,8 +231,13 @@ func TestNewServiceRefusesAnEmptyReservedAddresseeSet(t *testing.T) {
 		"malformed": {"platform", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewService(NewStore(log), validator, Config{IssuerSeed: string(issuerSeed), ReservedAddressees: reserved}, log); err == nil {
+			// The principals are well formed, so the refusal is the addressees.
+			_, err := NewService(NewStore(log), validator, Config{IssuerSeed: string(issuerSeed), ReservedPrincipals: renderedFixtureAuthUsers(t), ReservedAddressees: reserved}, log)
+			if err == nil {
 				t.Fatalf("NewService accepted reserved addressees %q", reserved)
+			}
+			if !strings.Contains(err.Error(), "addressee") {
+				t.Fatalf("NewService refused for something other than the addressees: %v", err)
 			}
 		})
 	}

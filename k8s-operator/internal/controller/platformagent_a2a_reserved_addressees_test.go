@@ -119,11 +119,7 @@ func envDefaultInSource(t *testing.T, path, env string) string {
 
 func renderedCalloutReservedAddressees(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
 	t.Helper()
-	dep := buildA2ACalloutDeployment(agent)
-	if len(dep.Spec.Template.Spec.Containers) != 1 {
-		t.Fatalf("the callout Deployment has %d containers, want 1", len(dep.Spec.Template.Spec.Containers))
-	}
-	raw, ok := envValue(dep.Spec.Template.Spec.Containers[0], a2aCalloutReservedAddresseesEnvVar)
+	raw, ok := envValue(calloutContainer(t, agent), a2aCalloutReservedAddresseesEnvVar)
 	if !ok {
 		t.Fatalf("the callout Deployment does not render %s; the callout refuses to start without it", a2aCalloutReservedAddresseesEnvVar)
 	}

@@ -11,7 +11,8 @@ import (
 )
 
 // setEnvBeforeAddressees sets every variable run reads before the reserved
-// addressee list, so the list is the first thing that can refuse.
+// addressee list, the reserved principal list included, so the addressee list
+// is the first thing that can refuse.
 func setEnvBeforeAddressees(t *testing.T) {
 	t.Helper()
 	kp, err := nkeys.CreateAccount()
@@ -23,6 +24,7 @@ func setEnvBeforeAddressees(t *testing.T) {
 	t.Setenv(envAuthMapName, "agent-a2a-authmap")
 	t.Setenv(envAudience, "kube-agents-bus")
 	t.Setenv(envIssuerSeed, string(seed))
+	t.Setenv(envReservedPrincipals, "callout,gateway,bridge,seed,web,console,sys")
 	// Blanked so the in-cluster config fails even when the test itself runs
 	// in a pod; otherwise run would go on to serve and watch.
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
