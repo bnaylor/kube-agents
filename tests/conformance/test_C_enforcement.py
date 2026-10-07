@@ -499,14 +499,24 @@ class C1IsolationIsStructural(unittest.TestCase):
         self.assertTrue(doors, "the fixture renders no door port, so nothing here is fenced")
         self.assertNotIn(metrics[0], doors, "the metrics port is also a door's port")
         collector = {"matchLabels": {"kubernetes.io/metadata.name": "gke-gmp-system"}}
+        # The labels the gateway pod carries, not the Deployment's name: a
+        # fence requiring a label the pod lacks selects nothing, and the API
+        # server reports that as success.
+        pod_labels = ((gateway["spec"].get("template") or {}).get("metadata") or {}).get("labels") or {}
+        self.assertTrue(pod_labels, "the fixture carries no gateway pod labels, so no selector can be checked")
 
         for policy in policies:
             name = policy["metadata"]["name"]
             spec = policy["spec"]
             with self.subTest(policy=name):
+                selector = spec.get("podSelector") or {}
+                required = selector.get("matchLabels") or {}
+                self.assertEqual(set(selector), {"matchLabels"}, "the fence's podSelector is not plain matchLabels")
+                self.assertTrue(required, "the fence's podSelector is empty, so it selects every pod")
                 self.assertEqual(
-                    spec["podSelector"], {"matchLabels": {"app": gateway["metadata"]["name"]}},
-                    "the fence does not select the gateway pod",
+                    required, {key: pod_labels.get(key) for key in required},
+                    "the fence selects labels the gateway pod does not carry, so it fences no pod: "
+                    "fence requires %r, pod carries %r" % (required, pod_labels),
                 )
                 self.assertIn("Ingress", spec.get("policyTypes") or [], "the fence governs no ingress")
                 rules = spec.get("ingress") or []

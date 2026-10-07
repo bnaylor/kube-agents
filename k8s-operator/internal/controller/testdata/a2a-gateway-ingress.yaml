@@ -91,7 +91,14 @@ spec:
   selector: null
   strategy: {}
   template:
-    metadata: {}
+    metadata:
+      labels:
+        app: test-agent-a2a-gateway
+        app.kubernetes.io/instance: test-ns-test-agent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: gateway
     spec:
       containers:
         - name: gateway

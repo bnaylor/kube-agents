@@ -41,7 +41,8 @@ import (
 
 // a2aGatewayIngressFixturePath is the A2A gateway's rendered ingress surface
 // with both doors armed: its three NetworkPolicies (the two doors' and the
-// gateway's own) and the gateway container's declared ports, nothing else. The conformance suite reads it
+// gateway's own), the gateway pod's labels and the gateway container's declared
+// ports, nothing else. The conformance suite reads it
 // (tests/conformance, C1) to hold the policies to "the collector, on the
 // metrics port, and nobody else": the suite cannot run Go, and no golden
 // renders mode next, so this file is the contract between the two.
@@ -186,6 +187,9 @@ func TestRenderedA2AGatewayIngressMatchesTheConformanceFixture(t *testing.T) {
 		TypeMeta:   dep.TypeMeta,
 		ObjectMeta: metav1.ObjectMeta{Name: dep.Name, Namespace: dep.Namespace},
 	}
+	// The pod template's labels are what each fence's podSelector must
+	// match; the Deployment's name is only a proxy for them.
+	trimmed.Spec.Template.Labels = dep.Spec.Template.Labels
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		trimmed.Spec.Template.Spec.Containers = append(trimmed.Spec.Template.Spec.Containers,
 			corev1.Container{Name: c.Name, Ports: c.Ports})

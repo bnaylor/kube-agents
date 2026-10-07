@@ -1278,6 +1278,17 @@ Mutation(
         "door' edit made without the decision the fence's comment asks for",
     ),
     Mutation(
+        "C1-a2a-gateway-fence-selects-a-label-the-pod-lacks",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("  podSelector:\n    matchLabels:\n      app: test-agent-a2a-gateway\n",
+         "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: test-agent-a2a-gateway\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "move the inject fence's selector to an app.kubernetes.io/name key the "
+        "gateway pod carries with another value, the half-done label migration: "
+        "the fence still names the Deployment, selects no pod, and the API "
+        "server reports that as success",
+    ),
+    Mutation(
         "C1-session-pod-gets-a-second-token",
         "a2a/gateway/spawn.go",
         ("AutomountServiceAccountToken: ptr.To(false),",
