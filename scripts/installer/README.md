@@ -164,10 +164,12 @@ empty `--slack-bot-token=` or `--slack-app-token=` is no value, as an empty reco
 is not compared, and the token is recovered from the live Secret. `--chat-sub-name` is not held: on a running install the
 subscription name comes from Terraform state, ahead of both the flag and the file. A flag
 whose key the file does not assign at all is appended to the file with the value the run
-applies, as the last step before the apply or a handoff (`--generate-only`, or `g` or `n` at the
-step-11 confirmation, both of which leave tfvars for the operator to apply by hand), so a run
-refused or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
-then fails has recorded what it was applying. A toggle recorded `true` brings the settings of
+applies, as the last step before the apply or the `--generate-only` (or `g`) handoff, so a run
+refused, declined or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
+then fails has recorded what it was applying. Answering `n` at the step-11 confirmation records
+nothing, since it is as often a decline as a hand-off: it prints the `KEY=value` lines it did not
+record (never a token), for an operator who goes on to run `lifecycle.sh apply` by hand to add
+first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
 its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
 `SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
 `CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The

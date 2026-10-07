@@ -101,6 +101,8 @@ readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOG
 # assign, for record_flags_into_install_env to append once the run commits.
 INSTALL_ENV_FLAGS_TYPED=""
 INSTALL_ENV_KEYS_TO_RECORD=""
+# Those keys with their companions, toggles last (resolve_install_env_record_keys).
+INSTALL_ENV_RECORD_KEYS=""
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -2074,11 +2076,15 @@ check_flags_against_install_env() {
 # makes to an install.env it did not create, and only of keys the file lacks,
 # so nothing the operator wrote changes. main calls it on each route as the last
 # step before the handoff or the apply, past the confirmation and every step
-# that can stop the run, so a run refused or failed before the apply, and a
-# --dry-run, leave the file as it was. Pausing at the step-11 confirmation is a
-# handoff too: the tfvars are written and the operator is told to apply them
-# by hand, so it records before saying so. An apply that then fails has
+# that can stop the run, so a run refused, declined or failed before the apply,
+# and a --dry-run, leave the file as it was. An apply that then fails has
 # recorded what it was applying, which is what the next run should retry.
+#
+# Answering `n` at the step-11 confirmation records nothing. The pause message
+# names a lifecycle.sh apply, but `n` is also the answer of an operator who saw
+# something wrong in the summary and walked away, and a file that then records
+# the integration on would have the next upgrade.sh provision what they
+# declined. warn_install_env_keys_not_recorded names the lines instead.
 #
 # A toggle recorded true brings the settings of its integration that the file
 # also lacks (install_env_toggle_companions), with the values this run applied
@@ -2089,13 +2095,51 @@ check_flags_against_install_env() {
 # these keys together, and so does the Day-2 menu for Google Chat; the tokens
 # are still never written.
 record_flags_into_install_env() {
-  local file="${INSTALL_ENV_FILE:-}" key value companion record_keys="" toggles=""
+  local file="${INSTALL_ENV_FILE:-}" key value
   [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
-  # The whole list before the first write, while the file still reads as the
-  # run found it. The toggles go last: a write that stops partway (Ctrl-C
-  # before the apply, a full disk) then leaves settings with the integration
-  # off, never the integration on with no allowlist, which admits everyone and
-  # which no re-run repairs, since the flag then agrees with the file.
+  resolve_install_env_record_keys "$file"
+  # A last line with no newline would run into the appended assignment.
+  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+    printf '\n' >> "$file"
+  fi
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    value="${!key-}"
+    write_env_var "$file" "$key" "$value"
+    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}: later runs and upgrade.sh render what this run applied."
+  done
+  INSTALL_ENV_KEYS_TO_RECORD=""
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# The step-11 `n`: what record_flags_into_install_env would have appended, as
+# the lines to append, so an operator who does go on to apply the tfvars by
+# hand can make the file match first. Never a token: those are never queued.
+warn_install_env_keys_not_recorded() {
+  local file="${INSTALL_ENV_FILE:-}" key
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  print_warning "${file} assigns no ${INSTALL_ENV_RECORD_KEYS// /, }, and pausing here did not record them: a run abandoned at this prompt leaves the file as it was."
+  print_info "If you go on to run lifecycle.sh apply by hand, first add these lines to ${file}, so a later upgrade.sh renders what you applied:"
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    printf '    %s=%q\n' "$key" "${!key-}"
+  done
+}
+
+# The keys record_flags_into_install_env appends, in INSTALL_ENV_RECORD_KEYS:
+# the queued ones, each toggle queued true followed by the companions the file
+# lacks, and the toggles last. Computed in full before the first write, while
+# the file still reads as the run found it. The toggles go last: a write that
+# stops partway (Ctrl-C before the apply, a full disk) then leaves settings
+# with the integration off, never the integration on with no allowlist, which
+# admits everyone and which no re-run repairs, since the flag then agrees with
+# the file.
+resolve_install_env_record_keys() {
+  local file="$1" key companion record_keys="" toggles=""
+  # Every companion in one read of the file rather than one per key.
+  # shellcheck disable=SC2046
+  read_recorded_install_env_values "$file" $(install_env_toggle_companions SLACK_ENABLED) $(install_env_toggle_companions GOOGLE_CHAT_ENABLED)
   for key in $INSTALL_ENV_KEYS_TO_RECORD; do
     if [ -z "$(install_env_toggle_companions "$key")" ]; then
       record_keys="${record_keys}${record_keys:+ }${key}"
@@ -2112,20 +2156,7 @@ record_flags_into_install_env() {
       fi
     done
   done
-  record_keys="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
-  # A last line with no newline would run into the appended assignment.
-  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
-    printf '\n' >> "$file"
-  fi
-  for key in $record_keys; do
-    value="${!key-}"
-    write_env_var "$file" "$key" "$value"
-    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}: later runs and upgrade.sh render what this run applied."
-  done
-  INSTALL_ENV_KEYS_TO_RECORD=""
-  # The cache read_recorded_install_env_values keeps is keyed by path, and the
-  # file just changed under it.
-  RECORDED_INSTALL_ENV_FILE=""
+  INSTALL_ENV_RECORD_KEYS="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
 }
 
 bootstrap_install_env_file() {
@@ -6378,11 +6409,10 @@ main() {
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
-        # A hand-off like `g`: the tfvars are written and the operator is
-        # told to apply them by hand, so a chat flag whose key the
-        # install.env lacks is recorded first, or that apply would turn on a
-        # key the next upgrade.sh renders back off.
-        record_flags_into_install_env
+        # Not a hand-off like `g`: `n` is also a decline, so nothing is
+        # recorded, and the operator is told which lines a hand-run apply
+        # needs in install.env.
+        warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"

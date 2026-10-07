@@ -6325,21 +6325,26 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertIn("a run without --dry-run records the SLACK_ENABLED it applies there, from --enable-slack", out)
             self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
     def test_a_file_the_run_cannot_write_is_refused_before_anything_when_a_key_would_be_recorded(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._file(tmp, "PROJECT_ID=p\n")
             path.chmod(0o400)
             try:
                 proc = self._run(f"parse_args --enable-slack; {self._CHECK}", path)
-                agreeing = self._file(tmp, "SLACK_ENABLED=true\n", name="agreeing.env")
-                agreeing.chmod(0o400)
-                ok = self._run(f"parse_args --enable-slack; {self._CHECK}", agreeing)
             finally:
                 path.chmod(0o600)
             out = proc.stdout + proc.stderr
             self.assertIn("rc=1", proc.stdout, out)
             self.assertIn(f"{path} assigns no SLACK_ENABLED, which this run would record there, and it is not writable", out)
-            # Nothing to record, nothing to write: a read-only file that agrees is fine.
+
+    def test_a_read_only_file_that_agrees_is_accepted(self):
+        # Nothing to record, nothing to write, so -w is never asked; this half
+        # holds under root too.
+        with tempfile.TemporaryDirectory() as tmp:
+            agreeing = self._file(tmp, "SLACK_ENABLED=true\n", name="agreeing.env")
+            agreeing.chmod(0o400)
+            ok = self._run(f"parse_args --enable-slack; {self._CHECK}", agreeing)
             self.assertIn("rc=0 QUEUED=[]", ok.stdout, ok.stdout + ok.stderr)
 
     def test_the_subscription_name_flag_is_not_held(self):
@@ -6371,9 +6376,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     _CONFIRM_END = "\n    esac\n  fi\n"
     _RECORD_HANDOFF = "\n    record_flags_into_install_env\n"
     _RECORD_APPLY = "\n  record_flags_into_install_env\n"
-    _RECORD_PAUSE = '\n        record_flags_into_install_env\n        print_warning "Provisioning paused by user.'
+    _WARN_PAUSE = '\n        warn_install_env_keys_not_recorded\n        print_warning "Provisioning paused by user.'
 
-    def test_a_refused_run_leaves_the_file_and_a_committed_or_paused_one_records(self):
+    def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
         text = _INSTALL_SH.read_text()
         main_start = text.index("\nmain() {")
         start = text.index(self._CONFIRM_START, main_start)
@@ -6388,10 +6393,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             for flags, answer, scope_rc, records, goes_on in (
-                # `n` pauses and hands off: tfvars are written and the message
-                # says to run lifecycle.sh apply by hand, as `g` does, so the
-                # keys that apply turns on are recorded first.
-                ("--enable-slack", "n", 0, True, False),
+                # `n` is a decline as often as a hand-off: it records nothing,
+                # and names the lines a hand-run apply needs instead.
+                ("--enable-slack", "n", 0, False, False),
                 ("--enable-slack", "y", 1, False, False),  # refused after the confirmation
                 ("--enable-slack", "y", 0, True, True),
                 ("--enable-slack", "g", 0, True, True),
@@ -6402,7 +6406,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     path = self._file(tmp, "PROJECT_ID=p\n")
                     proc = self._run(
                         f"{stubs}parse_args {flags}; check_flags_against_install_env || exit 1\n"
-                        "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1\n"
+                        "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1 SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed\n"
                         f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
                         path,
                     )
@@ -6422,7 +6426,24 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                         self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
                     if answer == "n":
                         self.assertEqual(proc.returncode, 0, out)
-                        self.assertLess(proc.stdout.index("Recorded SLACK_ENABLED=true"), proc.stdout.index("Provisioning paused by user"))
+                        self.assertNotIn("Recorded ", out)
+                        warning = out.index(
+                            f"{path} assigns no SLACK_ALLOWED_USERS, SLACK_HOME_CHANNEL, SLACK_HOME_CHANNEL_NAME, "
+                            "SLACK_ENABLED, and pausing here did not record them: a run abandoned at this prompt "
+                            "leaves the file as it was."
+                        )
+                        self.assertIn(
+                            "If you go on to run lifecycle.sh apply by hand, first add these lines to "
+                            f"{path}, so a later upgrade.sh renders what you applied:\n"
+                            "    SLACK_ALLOWED_USERS=U1\n    SLACK_HOME_CHANNEL=''\n"
+                            "    SLACK_HOME_CHANNEL_NAME=''\n    SLACK_ENABLED=true\n",
+                            out,
+                        )
+                        self.assertLess(warning, out.index("Provisioning paused by user"))
+                        for token in ("xoxb-typed", "xapp-typed", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
+                            self.assertNotIn(token, out)
+                    else:
+                        self.assertNotIn("pausing here did not record", out)
 
     def test_main_checks_before_the_interview_and_records_last_on_each_route(self):
         text = _INSTALL_SH.read_text()
@@ -6451,13 +6472,17 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 with self.subTest(gate=gate, record=record):
                     self.assertLess(text.index(gate, main_start), record)
         self.assertLess(exported, handoff)
-        # The step-11 pause is the third hand-off: its message tells the
-        # operator to apply the tfvars by hand, so it records before saying so.
-        self.assertEqual(text.count(self._RECORD_PAUSE), 1)
-        pause = text.index(self._RECORD_PAUSE, main_start)
+        # The step-11 pause records nothing (it is also a decline) and names
+        # the keys instead, from the values the run exported, before it says
+        # it paused.
+        self.assertEqual(text.count(self._WARN_PAUSE), 1)
+        pause = text.index(self._WARN_PAUSE, main_start)
         self.assertLess(exported, pause)
         self.assertLess(text.index("require_slack_tokens_after_recovery\n", main_start), pause)
-        self.assertLess(pause, text.index('write_json_report "PAUSED"', main_start))
+        paused = text.index('write_json_report "PAUSED"', main_start)
+        self.assertLess(pause, paused)
+        arm = text[text.rindex("\n      *)\n", 0, pause):paused]
+        self.assertNotIn("record_flags_into_install_env", arm)
         self.assertTrue(
             text[handoff + len(self._RECORD_HANDOFF):].startswith('    print_generate_only_handoff "$repo_dir"'),
             text[handoff:handoff + 200],
