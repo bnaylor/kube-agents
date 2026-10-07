@@ -616,16 +616,18 @@ pod may publish, the consumers it may create over `.in`, and its capability veri
 reply subjects on that name, so a pod named after another addressee would be handed that
 addressee's task subjects. The gateway never mints such a name, but anyone who can create a
 pod under a narrowed ServiceAccount can, so the callout refuses a narrowed pod whose name is
-a fixed-name addressee. Today that is one name, `platform`: the gateway's default
-addressee, which the operator leaves unset so the gateway keeps its own default, and the
-only addressee the bridge's grants name. The operator renders the list into the callout's
+a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
+the operator leaves unset so the gateway keeps its own default, and the only addressee the
+bridge's grants name. The operator renders the list into the callout's
 `A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
 labels. Session addressees need no entry, since each is the name of the pod that is that
-addressee. Two kinds are not on the list: the name a `BRIDGE_PROFILE` override sets, which leaves the
-bridge unable to publish its own events because its grants still name `platform`, and
-`AgentProfile` addressees, which come and go with their CRs.
+addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+sets, which leaves the bridge unable to publish its own events because its grants still
+name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
+a narrowed pod named after a profile would be handed that profile's task subjects, so
+profiles need the same refusal, from a set that follows them, when the CRD lands.
 
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
