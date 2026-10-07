@@ -1042,7 +1042,10 @@ func TestARunningGatewayReadsTheSecretTwicePerPass(t *testing.T) {
 
 // TestARunningDoorGatewayPaysNoSecretRead: the door flags answer the backend
 // question from the operator's environment, so asking it on every pass costs
-// a door install nothing.
+// a door install no read of its own. The render still carries the optional
+// discord-bot reference beside the door, so the secret-env digest (#2401)
+// reads that Secret once per pass, found or not; that read is the stamp's,
+// and the gate asking the question too would make it two.
 func TestARunningDoorGatewayPaysNoSecretRead(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	agent := a2aTestAgent()
@@ -1064,7 +1067,8 @@ func TestARunningDoorGatewayPaysNoSecretRead(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	for i := 0; i < 3; i++ {
+	const passes = 3
+	for i := 0; i < passes; i++ {
 		if _, err := r.reconcileA2A(ctx, agent); err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
@@ -1072,8 +1076,8 @@ func TestARunningDoorGatewayPaysNoSecretRead(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
 		t.Fatalf("precondition: the gateway renders on the inject door alone: %v", err)
 	}
-	if secretReads != 0 {
-		t.Errorf("a door install read the discord-bot Secret %d times, want 0: the flag answers the backend question", secretReads)
+	if secretReads != passes {
+		t.Errorf("a door install read the discord-bot Secret %d times in %d passes, want one per pass (the digest's; the flag answers the backend question)", secretReads, passes)
 	}
 }
 
