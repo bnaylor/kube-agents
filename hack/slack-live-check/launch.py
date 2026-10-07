@@ -17,7 +17,9 @@ Workload Identity ServiceAccount and the egress fence), idempotently, and it del
 the namespace when the run ends; --cleanup deletes it alone. The GSA and its grants
 are not the launcher's: --render prints the one binding it relies on, and prints
 every manifest without touching the cluster.
-Everything after `--` goes to harness.py unchanged. Never run in CI; see README.md.
+Flags after `--` go to harness.py unchanged, but only those on FORWARDABLE_HARNESS_FLAGS:
+the ones the launcher sets itself, and the harness's test-only endpoint overrides,
+are refused. Never run in CI; see README.md.
 """
 
 import argparse
@@ -29,7 +31,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Callable, Optional
+from typing import Callable, Collection, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -102,21 +104,32 @@ RUN_ID_FLAG = "--run-id"
 KEEP_GOING_FLAG = "--keep-going"
 # Harness flags the launcher sets itself; one after `--` would silently win.
 LAUNCHER_OWNED_HARNESS_FLAGS = (CHECKS_FLAG, RUN_ID_FLAG, PROJECT_FLAG, KEEP_GOING_FLAG)
+# The only harness flags that may follow `--`. Anything else is refused, the
+# harness's suppressed endpoint overrides above all (--slack-api-base,
+# --metadata-token-url, --secret-manager-base): they would send the user tokens, or
+# the pod's Workload Identity token, to whatever host the workstation names.
+FORWARDABLE_HARNESS_FLAGS = frozenset({
+    "--token-source", "--listed-secret", "--unlisted-secret", "--bot-user-id", "--bot-name", "--channel",
+    "--thread-ts", "--prompt", "--followup", "--wait-answer", "--reply-timeout",
+    "--poll-interval", "--unlisted-via", "--unlisted-repeat", "--quiet-window", "--refusal-silence-ok",
+    "--home-channel", "--home-since", "--home-timeout", "--home-match",
+})
 WAIT_ANSWER_FLAG = "--wait-answer"
 RESULT_PREFIXES = ("PASS ", "FAIL ")
+# delete_namespace's outcomes. KEPT: another run's Job is still running in it.
+CLEANUP_DONE = "done"
+CLEANUP_KEPT = "kept"
+CLEANUP_FAILED = "failed"
 EVIDENCE_PREFIX = "EVIDENCE "
 
-EXIT_OK = 0
-EXIT_FAIL = 1
-EXIT_SETUP = 2
+EXIT_OK = harness.EXIT_OK
+EXIT_FAIL = harness.EXIT_FAIL
+EXIT_SETUP = harness.EXIT_SETUP
+say = harness.say
 
 
 class LaunchError(Exception):
     """The launcher cannot go on: a kubectl call failed, or the install is not what it expects."""
-
-
-def say(line: str) -> None:
-    harness.say(line)
 
 
 class Kubectl:
@@ -263,6 +276,7 @@ class Launcher:
         self.results: list[tuple[str, bool, str]] = []
         self._agent = args.agent_name
         self.namespace_applied = False
+        self.run_ids: set[str] = set()
 
     @property
     def agent(self) -> str:
@@ -322,6 +336,7 @@ class Launcher:
 
     def harness_args(self, checks: list[str]) -> tuple[str, list[str]]:
         run_id = time.strftime(RUN_ID_TIME_FORMAT, time.gmtime()) + "-" + uuid.uuid4().hex[:RUN_ID_HEX_CHARS]
+        self.run_ids.add(run_id)
         args = [CHECKS_FLAG, ",".join(checks), RUN_ID_FLAG, run_id, PROJECT_FLAG, self.args.project]
         if self.args.keep_going:
             args.append(KEEP_GOING_FLAG)
@@ -365,6 +380,12 @@ class Launcher:
             self.results.extend(results)
             if state != "Complete" and not any(not passed for _, passed, _ in results):
                 self.record("job", False, f"{job_name} ended {state} with no FAIL line; see the log above")
+            # Every check this Job was asked for needs a verdict, whatever the Job's
+            # state: an unreadable log, or a harness that stopped early, is no PASS.
+            answered = {name for name, _, _ in results}
+            for check in checks:
+                if check not in answered:
+                    self.record(check, False, f"no PASS or FAIL line for it in {job_name}'s log (the Job ended {state})")
             for ev in evidence:
                 ev["elapsed_seconds"] = int(self.clock() - started)
             return evidence
@@ -445,11 +466,18 @@ class Launcher:
     # --- the run ------------------------------------------------------------
 
     def run(self, checks: list[str]) -> int:
+        cleanup = CLEANUP_DONE
         try:
             self.run_checks(checks)
         finally:
             if self.namespace_applied:
-                delete_namespace(self.kubectl, self.args.namespace)
+                cleanup = delete_namespace(self.kubectl, self.args.namespace, self.run_ids)
+        if cleanup == CLEANUP_FAILED:
+            # The namespace holds the Workload-Identity-bound ServiceAccount: a run
+            # that leaves it behind is not a clean run, whatever the checks said.
+            self.record("cleanup", False, f"namespace {self.args.namespace} was not deleted; run --cleanup")
+            self.summarize()
+            return EXIT_SETUP
         return self.summarize()
 
     def run_checks(self, checks: list[str]) -> None:
@@ -503,19 +531,43 @@ def check_namespace_ownership(kubectl: Kubectl, namespace: str) -> bool:
     return True
 
 
-def delete_namespace(kubectl: Kubectl, namespace: str) -> bool:
-    """Deletes the run's namespace, and with it the ServiceAccount, the fence and any Job left behind."""
+def live_foreign_jobs(kubectl: Kubectl, namespace: str, own_run_ids: Collection[str]) -> list[str]:
+    """This tool's Jobs in the namespace that belong to another run and have not finished."""
+    jobs = kubectl.get_json(["get", "jobs", "-n", namespace, "-l", f"{APP_LABEL_KEY}={APP_LABEL_VALUE}"]).get("items", [])
+    live = []
+    for job in jobs:
+        meta = job.get("metadata", {})
+        if meta.get("deletionTimestamp") or (meta.get("labels", {}) or {}).get(RUN_LABEL_KEY) in own_run_ids:
+            continue
+        conditions = job.get("status", {}).get("conditions", []) or []
+        if any(c.get("type") in ("Complete", "Failed") and c.get("status") == "True" for c in conditions):
+            continue
+        live.append(meta.get("name", "?"))
+    return live
+
+
+def delete_namespace(kubectl: Kubectl, namespace: str, own_run_ids: Collection[str] = frozenset()) -> str:
+    """Deletes the run's namespace, and with it the ServiceAccount, the fence and any Job left behind.
+
+    Not while another run's Job is still running in it (CLEANUP_KEPT): that run is
+    mid-check, and it deletes the namespace itself when it ends.
+    """
     try:
         if not check_namespace_ownership(kubectl, namespace):
             say(f"CLEANUP namespace {namespace} is already gone")
-            return True
+            return CLEANUP_DONE
+        live = live_foreign_jobs(kubectl, namespace, own_run_ids)
+        if live:
+            say(f"CLEANUP namespace {namespace} kept: another run's Job is still running in it "
+                f"({', '.join(live)}); that run deletes it when it ends")
+            return CLEANUP_KEPT
         kubectl.run(["delete", "namespace", namespace, "--ignore-not-found", "--wait=true",
                      f"--timeout={NAMESPACE_DELETE_TIMEOUT_SECONDS}s"])
         say(f"CLEANUP namespace {namespace} deleted")
-        return True
+        return CLEANUP_DONE
     except LaunchError as exc:
         say(f"CLEANUP namespace {namespace} not deleted: {exc}")
-        return False
+        return CLEANUP_FAILED
 
 
 def _json_record(line: str) -> dict:
@@ -582,6 +634,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     owned = [arg for arg in forwarded if arg.split("=", 1)[0] in LAUNCHER_OWNED_HARNESS_FLAGS]
     if owned:
         parser.error(f"{', '.join(owned)} after -- would override the launcher's own; pass the launcher flag instead")
+    refused = [arg for arg in forwarded if arg.startswith("--") and arg.split("=", 1)[0] not in FORWARDABLE_HARNESS_FLAGS]
+    if refused:
+        parser.error(f"{', '.join(refused)} after -- is not a harness flag the launcher forwards; "
+                     f"forwardable: {', '.join(sorted(FORWARDABLE_HARNESS_FLAGS))}")
     pod_checks = [c for c in args.checks if c in harness.CHECK_ORDER]
     if pod_checks and not args.cleanup:
         # Fail here, not minutes later in the pod, on a harness flag that is wrong.
@@ -615,9 +671,8 @@ def main(argv: Optional[list[str]] = None, runner: Callable = subprocess.run,
             return EXIT_OK
         kubectl = Kubectl(args.context, runner)
         if args.cleanup:
-            # Raises on a namespace that is not this tool's, which exits non-zero.
-            check_namespace_ownership(kubectl, args.namespace)
-            return EXIT_OK if delete_namespace(kubectl, args.namespace) else EXIT_SETUP
+            # Not done on a namespace that is not this tool's, or one a live run is using.
+            return EXIT_OK if delete_namespace(kubectl, args.namespace) == CLEANUP_DONE else EXIT_SETUP
         return Launcher(args, forwarded, kubectl, clock, sleep, runner).run(args.checks)
     except (LaunchError, harness.HarnessError) as exc:
         say(f"ERROR {exc}")

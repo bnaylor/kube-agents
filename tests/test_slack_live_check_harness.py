@@ -76,8 +76,13 @@ class FakeWorld:
         self.secret_error_body = None
         self.reply_delay_reads = 0
         self.reads = 0
-        self.calls = []
         self.not_in_channel = set()
+        self.user_post_user_override = ""
+        self.history_hides_latest = False
+        self.refusal = REFUSAL
+        self.extra_members = []
+        self.bot_ids = {BOT_ID}
+        self.metadata_token = GCP_ACCESS
 
     def next_ts(self):
         self.ts_counter += 1
@@ -122,7 +127,7 @@ class FakeWorld:
         if not admitted:
             if poster not in self.notified:
                 self.notified.add(poster)
-                self.bot_post(channel, REFUSAL.format(id=poster), reply_thread)
+                self.bot_post(channel, self.refusal.format(id=poster), reply_thread)
             return
         if self.steer_thread_replies and thread_ts and thread_ts != msg["ts"]:
             self.bot_post(channel, "✏️ steering sent — the worker picks it up at its next turn boundary", reply_thread)
@@ -150,7 +155,6 @@ class FakeWorld:
         return [{k: v for k, v in m.items() if k != "visible_at"} for m in msgs if m.get("visible_at", 0) <= self.reads]
 
     def slack(self, method, user, params):
-        self.calls.append((method, user, dict(params)))
         if method in self.slack_error_override:
             return {"ok": False, "error": self.slack_error_override[method]}
         if method == "auth.test":
@@ -159,9 +163,10 @@ class FakeWorld:
             return {"ok": True, "members": [
                 {"id": LISTED_ID, "name": "listed", "is_bot": False},
                 {"id": BOT_ID, "name": "kage", "is_bot": True, "profile": {"display_name": "kage"}},
+                *self.extra_members,
             ], "response_metadata": {"next_cursor": ""}}
         if method == "users.info":
-            return {"ok": True, "user": {"id": params["user"], "is_bot": params["user"] == BOT_ID}}
+            return {"ok": True, "user": {"id": params["user"], "is_bot": params["user"] in self.bot_ids}}
         if method == "conversations.list":
             return {"ok": True, "channels": [{"id": CHANNEL_ID, "name": CHANNEL_NAME}, {"id": HOME_ID, "name": "home"}],
                     "response_metadata": {"next_cursor": ""}}
@@ -181,6 +186,8 @@ class FakeWorld:
                 msg["subtype"] = self.user_post_subtype
             if self.user_posts_without_user:
                 del msg["user"]
+            if self.user_post_user_override:
+                msg["user"] = self.user_post_user_override
             self.channels[channel].append(msg)
             self.gateway_turn(channel, user, msg)
             return {"ok": True, "channel": channel, "ts": msg["ts"]}
@@ -189,7 +196,7 @@ class FakeWorld:
             self.materialize()
             msgs = [m for m in self.channels[params["channel"]] if not m.get("thread_ts") or m["thread_ts"] == m["ts"]]
             if "latest" in params:
-                msgs = [m for m in msgs if m["ts"] == params["latest"]]
+                msgs = [] if self.history_hides_latest else [m for m in msgs if m["ts"] == params["latest"]]
             elif "oldest" in params:
                 msgs = [m for m in msgs if float(m["ts"]) > float(params["oldest"])]
             return {"ok": True, "messages": list(reversed(self.visible(msgs)))}
@@ -221,7 +228,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/metadata/token"):
             if self.headers.get("Metadata-Flavor") != "Google":
                 return self.reply(403, {"error": "missing flavor"})
-            return self.reply(200, {"access_token": GCP_ACCESS, "expires_in": 3599})
+            return self.reply(200, {"access_token": world.metadata_token, "expires_in": 3599})
         if self.path.startswith("/sm/projects/"):
             if self.headers.get("Authorization") != f"Bearer {GCP_ACCESS}":
                 return self.reply(401, {"error": {"message": "unauthenticated"}})
@@ -249,6 +256,11 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(200, payload)
 
 
+class Unbounded(BaseException):
+    """A poll that outran every timeout. A BaseException, so harness.main's
+    `except Exception` cannot turn it into an ERROR line and an exit code."""
+
+
 class FakeClock:
     def __init__(self):
         self.now = 1000.0
@@ -259,11 +271,11 @@ class FakeClock:
 
     def sleep(self, seconds):
         if seconds <= 0 or len(self.slept) > SLEEP_BUDGET_SECONDS:
-            raise AssertionError(f"a poll slept {seconds}s after {len(self.slept)} sleeps; it is not bounded")
+            raise Unbounded(f"a poll slept {seconds}s after {len(self.slept)} sleeps; it is not bounded")
         self.slept.append(seconds)
         self.now += seconds
         if self.now - 1000.0 > SLEEP_BUDGET_SECONDS:
-            raise AssertionError("a poll kept sleeping past every timeout the test set")
+            raise Unbounded("a poll kept sleeping past every timeout the test set")
 
     def wall(self):
         return 1700000000.0 + (self.now - 1000.0)
@@ -347,6 +359,26 @@ class PreflightTest(HarnessTestCase):
         code, text = self.run_harness("--checks", "dm")
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("it has no user field", self.line(text, "FAIL preflight-listed"))
+
+    def test_preflight_fails_when_the_post_reads_back_under_another_user(self):
+        self.world.user_post_user_override = "U0OTHER01"
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("its user U0OTHER01 is not the token's user U0LISTED1", self.line(text, "FAIL preflight-listed"))
+
+    def test_preflight_fails_when_the_post_cannot_be_read_back(self):
+        self.world.history_hides_latest = True
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("could not be read back", self.line(text, "FAIL preflight-listed"))
+
+    def test_a_slack_error_in_the_preflight_is_its_fail(self):
+        self.world.slack_error_override["conversations.history"] = "internal_error"
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("error: Slack conversations.history failed: internal_error", self.line(text, "FAIL preflight-listed"))
+        self.assertIn("SUMMARY pass=0 fail=1", text)
+        self.assertNotIn("setup failed", text)
 
     def test_preflight_accepts_thread_broadcast(self):
         self.world.user_post_subtype = "thread_broadcast"
@@ -521,6 +553,22 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("did not settle", self.line(text, "FAIL thread"))
 
+    def test_a_slack_error_in_a_check_is_its_fail_and_keep_going_carries_on(self):
+        # The listed user is not in the channel: the preflight falls back to the
+        # self-DM, dm passes, and the mention's post raises not_in_channel.
+        self.world.not_in_channel = {CHANNEL_ID, LISTED_ID}
+        code, text = self.run_harness("--checks", "dm,mention,thread", "--keep-going")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("PASS dm:", text)
+        self.assertIn("error: Slack chat.postMessage failed: not_in_channel", self.line(text, "FAIL mention"))
+        self.assertIn("no thread to reply in", self.line(text, "FAIL thread"))
+        self.assertIn("SUMMARY pass=2 fail=2", text)
+        self.assertNotIn("setup failed", text)
+        code, text = self.run_harness("--checks", "dm,mention,thread")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertNotIn("thread:", text)
+        self.assertIn("SUMMARY pass=2 fail=1", text)
+
     def test_restart_is_a_dm_under_its_own_name(self):
         code, text = self.run_harness("--checks", "restart")
         self.assertEqual(code, harness.EXIT_OK, text)
@@ -581,6 +629,12 @@ class UnlistedTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL unlisted-repeat", text)
 
+    def test_unlisted_fails_when_the_notice_does_not_name_the_sender(self):
+        self.world.refusal = REFUSAL.replace("(id {id})", "(id someone)")
+        code, text = self.run_harness("--checks", "unlisted")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("does not name the unlisted user's member id", self.line(text, "FAIL unlisted"))
+
     def test_same_user_on_both_tokens_is_a_setup_error(self):
         self.world.tokens[UNLISTED_TOKEN] = LISTED_ID
         code, text = self.run_harness("--checks", "unlisted")
@@ -612,6 +666,56 @@ class SetupAndRedactionTest(HarnessTestCase):
         code, text = self.run_harness("--checks", "dm", "--bot-name", "nobody")
         self.assertEqual(code, harness.EXIT_SETUP)
         self.assertIn("no bot user named 'nobody'", text)
+
+    def test_two_bots_with_the_name_are_a_setup_error(self):
+        self.world.extra_members.append({"id": "U0BOTTWO1", "name": "kage", "is_bot": True})
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("more than one bot user is named 'kage' (U0BOTKAGE, U0BOTTWO1)", text)
+
+    def test_the_bot_cannot_be_a_test_user(self):
+        self.world.bot_ids.add(LISTED_ID)
+        code, text = self.run_harness("--checks", "dm", "--bot-user-id", LISTED_ID)
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("the bot user id is one of the test users", text)
+
+    def test_a_token_that_is_not_a_user_token_is_refused(self):
+        self.world.secrets[LISTED_SECRET] = "not-a-slack-token"
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("does not hold a Slack user token (xoxp-)", text)
+
+    def test_a_metadata_answer_without_a_token_is_refused(self):
+        self.world.metadata_token = ""
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("answered without an access token", text)
+
+    def test_an_unknown_channel_name_is_a_setup_error(self):
+        code, text = self.run_harness("--checks", "dm", "--channel", "nope")
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("no channel named #nope", text)
+
+    def test_a_dm_id_is_refused_for_the_channel(self):
+        code, text = self.run_harness("--checks", "dm", "--channel", "D0ABCDEF1")
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("D0ABCDEF1 is a DM, not a channel", text)
+        self.assertNotIn("preflight-listed", text)
+        self.assertEqual(harness.resolve_channel(None, "G0PRIVATE1"), "G0PRIVATE1")
+
+    def test_a_non_object_error_body_keeps_the_status(self):
+        self.world.secret_error_body = ["denied"]
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_SETUP)
+        self.assertIn("Secret Manager refused test-project/slack-test-user-listed (HTTP 403): [\"denied\"]", text)
+        self.assertNotIn("AttributeError", text)
+        self.assertEqual(harness._error_detail(b"null"), "null")
+
+    def test_an_unbounded_poll_is_not_swallowed_by_main(self):
+        self.world.mode = "silent"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Unbounded):
+            harness.main([*self.endpoint_args, "--checks", "dm", "--poll-interval", "0"],
+                         clock=self.fake.clock, sleep=self.fake.sleep, wall=self.fake.wall)
 
     def test_bot_token_in_the_secret_is_refused_without_echoing_it(self):
         self.world.secrets[LISTED_SECRET] = "xoxb-9999-a-bot-token-value"
@@ -668,6 +772,12 @@ class SetupAndRedactionTest(HarnessTestCase):
         self.assertEqual(client.call("auth.test")["user_id"], "U1")
         self.assertEqual(self.fake.slept, [2.0])
 
+    def test_retry_after_is_clamped(self):
+        default = harness.RATE_LIMIT_DEFAULT_WAIT_SECONDS
+        for value, want in (("-3", default), ("nan", default), ("inf", default), ("x", default),
+                            ("100", harness.RATE_LIMIT_MAX_WAIT_SECONDS), ("2", 2.0)):
+            self.assertEqual(harness._retry_after({"Retry-After": value}), want, value)
+
 
 class UnitTest(unittest.TestCase):
     def test_redactor_cuts_registered_and_token_shaped_values(self):
@@ -678,7 +788,7 @@ class UnitTest(unittest.TestCase):
 
     def test_a_reply_outside_the_expected_thread_fails(self):
         session = harness.Session(args=harness.parse_args([]), listed=None, listed_user_id=LISTED_ID, bot_user_id=BOT_ID,
-                                  channel_id=CHANNEL_ID, run_id="r", clock=None, sleep=None, wall=None)
+                                  channel_id=CHANNEL_ID, run_id="r", clock=None, sleep=None)
         reply = {"ts": "1.3", "thread_ts": "1.2", "text": "PONG", "user": BOT_ID}
         result = harness.judge_listed_reply(session, "mention", CHANNEL_ID, "1.1", reply, harness.KIND_ANSWER, reply, expect_thread="1.1")
         self.assertFalse(result.passed)
@@ -731,6 +841,10 @@ class UnitTest(unittest.TestCase):
     def test_time_budget_covers_every_wait(self):
         args = harness.parse_args(["--checks", "all,home", "--home-channel", "c", "--unlisted-repeat"])
         self.assertEqual(harness.time_budget(args), 180 + 180 + 360 + 180 + 30 + 300)
+
+    def test_an_invalid_home_match_is_refused_at_parse_time(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            harness.parse_args(["--checks", "home", "--home-channel", "c", "--home-match", "("])
 
     def test_home_needs_a_channel(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

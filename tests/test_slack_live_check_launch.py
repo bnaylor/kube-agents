@@ -5,20 +5,19 @@ for the pinned --context, and the fake answers from a small model of a next inst
 (the PlatformAgent, the broker and gateway Deployments and their logs, the Job).
 """
 
+import argparse
 import contextlib
 import importlib.util
 import io
 import json
 import pathlib
 import subprocess
-import sys
 import unittest
 
 import yaml
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 LAUNCH_DIR = REPO / "hack" / "slack-live-check"
-sys.path.insert(0, str(LAUNCH_DIR))
 spec = importlib.util.spec_from_file_location("slack_live_check_launch", LAUNCH_DIR / "launch.py")
 launch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launch)
@@ -65,13 +64,20 @@ class FakeCluster:
         self.fail_on = None
         self.namespaces = {}
         self.empty_namespace_output = False
+        self.namespace_output = None
         self.delete_fails = False
+        # This tool's Jobs as `get jobs -l` lists them: another run's, for the concurrency guard.
+        self.jobs = []
+        self.platformagents = [AGENT]
+        self.sandbox_containers = [{"name": "sandbox", "image": SANDBOX_IMAGE}]
+        self.restart_returncode = 0
+        self.job_log_fails = False
 
     def __call__(self, cmd, input=None, capture_output=True, text=True, check=False):
         if cmd[0] != "kubectl" or "restart" in cmd:
             # The operator's --restart-cmd, not the launcher's own kubectl.
             self.restart_runs.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, self.restart_returncode, "", "rollout refused")
         self.calls.append(cmd)
         assert cmd[1:3] == ["--context", CONTEXT], cmd
         args = cmd[3:]
@@ -99,25 +105,31 @@ class FakeCluster:
                 self.namespaces.pop(args[2], None)
             return ""
         if args[:2] == ["get", "namespace"]:
-            # Real kubectl: a field selector with no match prints an empty List, but
-            # with --ignore-not-found it prints nothing at all.
+            # Real kubectl: a field selector with no match prints an empty List.
+            if self.namespace_output is not None:
+                return self.namespace_output
             name = [a for a in args if a.startswith("metadata.name=")][0].split("=", 1)[1]
             items = [{"metadata": {"name": name, "labels": self.namespaces[name]}}] if name in self.namespaces else []
-            if not items and ("--ignore-not-found" in args or self.empty_namespace_output):
+            if not items and self.empty_namespace_output:
                 return ""
             return json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
+        if args[:2] == ["get", "jobs"]:
+            return json.dumps({"items": self.jobs})
         if args[:2] == ["get", "platformagents"]:
-            return json.dumps({"items": [{"metadata": {"name": AGENT}}]})
+            return json.dumps({"items": [{"metadata": {"name": n}} for n in self.platformagents]})
         if args[:2] == ["get", "statefulset"]:
-            return json.dumps({"spec": {"template": {"spec": {"containers": [{"name": "sandbox", "image": SANDBOX_IMAGE}]}}}})
+            return json.dumps({"spec": {"template": {"spec": {"containers": self.sandbox_containers}}}})
         if args[:3] == ["get", "deployment", AGENT + "-credential-proxy"]:
             return json.dumps(deployment(args[2], "envoy-credential-proxy", self.broker_env,
                                          {"app": AGENT + "-credential-proxy"}, self.broker_env_from))
         if args[:3] == ["get", "deployment", AGENT + "-a2a-gateway"]:
             return json.dumps(deployment(args[2], "gateway", self.gateway_env, {"app": AGENT + "-a2a-gateway"}))
         if args[:2] == ["get", "job"]:
-            return json.dumps({"status": {"conditions": [{"type": self.job_condition, "status": "True"}]}})
+            conditions = [{"type": self.job_condition, "status": "True"}] if self.job_condition else []
+            return json.dumps({"status": {"conditions": conditions}})
         if args[0] == "logs" and "job/" in joined:
+            if self.job_log_fails:
+                raise FakeFailure()
             return self.job_log
         if args[0] == "logs" and "credential-proxy" in joined:
             assert "--tail=-1" in args
@@ -216,7 +228,7 @@ class JobTest(unittest.TestCase):
         self.assertEqual(pod_spec(job)["serviceAccountName"], "slack-test-runner")
         self.assertEqual(configmap["kind"], "ConfigMap")
         self.assertEqual(configmap["data"]["harness.py"], (LAUNCH_DIR / "harness.py").read_text())
-        pod = job["spec"]["template"]["spec"]
+        pod = pod_spec(job)
         container = pod["containers"][0]
         self.assertEqual(job["spec"]["backoffLimit"], 0)
         self.assertEqual(container["image"], SANDBOX_IMAGE)
@@ -245,7 +257,7 @@ class JobTest(unittest.TestCase):
 
     def test_cleanup_runs_when_the_wait_raises(self):
         cluster = FakeCluster()
-        cluster.fail_on = "get job"
+        cluster.fail_on = "get job slack-live-check-"
         code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
         self.assertEqual(code, launch.EXIT_SETUP)
         self.assertEqual(sorted(kind for kind, _ in cluster.deleted), ["configmap", "job", "namespace"])
@@ -263,7 +275,77 @@ class JobTest(unittest.TestCase):
         code, _ = run_launch(cluster, "--context", CONTEXT, "--checks", "legacy-socket,dm", "--keep-going")
         self.assertEqual(code, launch.EXIT_FAIL)
         job = yaml.safe_load(cluster.applied[2])
-        self.assertIn("--keep-going", job["spec"]["template"]["spec"]["containers"][0]["args"])
+        self.assertIn("--keep-going", pod_spec(job)["containers"][0]["args"])
+
+
+    def test_a_complete_job_with_an_unreadable_log_is_not_clean(self):
+        cluster = FakeCluster()
+        cluster.job_log_fails = True
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "legacy-socket,dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("PASS legacy-socket", out)
+        self.assertIn("FAIL dm: no PASS or FAIL line for it", out)
+        self.assertIn("OVERALL pass=1 fail=1 failed=dm", out)
+
+    def test_every_requested_check_needs_a_verdict(self):
+        cluster = FakeCluster()
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,mention")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("FAIL mention: no PASS or FAIL line for it", out)
+        self.assertNotIn("FAIL dm", out)
+
+    def test_a_job_that_never_finishes_times_out(self):
+        cluster = FakeCluster()
+        cluster.job_condition = None
+        cluster.job_log = ""
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("did not finish in time; pods:\npod Pending", out)
+        self.assertIn("ended Timeout with no FAIL line", self.line(out, "FAIL job:"))
+
+    def line(self, out, prefix):
+        return [ln for ln in out.splitlines() if ln.startswith(prefix)][0]
+
+    def test_a_failed_namespace_delete_fails_the_run(self):
+        cluster = FakeCluster()
+        cluster.delete_fails = True
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_SETUP, out)
+        self.assertIn("PASS dm: answer", out)
+        self.assertIn("FAIL cleanup: namespace slack-test was not deleted", out)
+        self.assertIn("OVERALL pass=2 fail=1 failed=cleanup", out)
+
+    def test_another_runs_live_job_keeps_the_namespace(self):
+        other = {"metadata": {"name": "slack-live-check-other", "labels": {launch.RUN_LABEL_KEY: "other"}}, "status": {}}
+        cluster = FakeCluster()
+        cluster.jobs = [other]
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("kept: another run's Job is still running in it (slack-live-check-other)", out)
+        self.assertNotIn(["namespace", "slack-test"], cluster.deleted)
+        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
+        self.assertEqual(code, launch.EXIT_SETUP, out)
+        self.assertNotIn(["namespace", "slack-test"], cluster.deleted)
+        other["status"] = {"conditions": [{"type": "Complete", "status": "True"}]}
+        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn(["namespace", "slack-test"], cluster.deleted)
+
+    def test_live_foreign_jobs_skips_own_finished_and_deleting_jobs(self):
+        def job(name, run, status=None, deleting=False):
+            meta = {"name": name, "labels": {launch.RUN_LABEL_KEY: run}}
+            if deleting:
+                meta["deletionTimestamp"] = "t"
+            return {"metadata": meta, "status": status or {}}
+
+        listing = {"items": [
+            job("mine", "r1"),
+            job("done", "r2", {"conditions": [{"type": "Failed", "status": "True"}]}),
+            job("going", "r3", deleting=True),
+            job("theirs", "r4"),
+        ]}
+        kubectl = launch.Kubectl(CONTEXT, lambda cmd, **_: subprocess.CompletedProcess(cmd, 0, json.dumps(listing), ""))
+        self.assertEqual(launch.live_foreign_jobs(kubectl, "slack-test", {"r1"}), ["theirs"])
 
 
 class PrincipalTest(unittest.TestCase):
@@ -288,6 +370,14 @@ class PrincipalTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_FAIL)
         self.assertIn("no ingress log line for backendMessageId=1.000101", out)
 
+    def test_principal_fails_with_no_passing_turn(self):
+        cluster = FakeCluster()
+        cluster.job_log = "FAIL dm: no reply\nSUMMARY pass=0 fail=1\n"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm", "--keep-going",
+                               "--expect-principal", "slack:{listed}")
+        self.assertEqual(code, launch.EXIT_FAIL)
+        self.assertIn("FAIL principal: no passing listed turn to look up", out)
+
 
 class RestartTest(unittest.TestCase):
     def test_restart_runs_the_command_without_a_shell_then_a_second_job(self):
@@ -301,7 +391,7 @@ class RestartTest(unittest.TestCase):
         self.assertTrue(all(any(a.startswith("--since=") for a in c) for c in calls), calls)
         self.assertTrue(any(c[3] == "rollout" and c[4] == "status" for c in cluster.calls))
         job = yaml.safe_load(cluster.applied[2])
-        args = job["spec"]["template"]["spec"]["containers"][0]["args"]
+        args = pod_spec(job)["containers"][0]["args"]
         self.assertEqual(args[args.index("--checks") + 1], "restart")
 
     def gateway_log_calls(self, cluster):
@@ -309,7 +399,7 @@ class RestartTest(unittest.TestCase):
 
     def test_after_restart_skips_the_command_and_reads_whole_logs(self):
         cluster = FakeCluster()
-        cluster.job_log = "PASS restart: answer\n"
+        cluster.job_log = "PASS dm: answer\nPASS restart: answer\n"
         code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart")
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertEqual(cluster.restart_runs, [])
@@ -318,6 +408,15 @@ class RestartTest(unittest.TestCase):
         self.assertFalse(any(a.startswith("--since") for c in calls for a in c), calls)
         self.assertEqual(len(cluster.applied), 5, "the namespace once, then a ConfigMap and Job before the restart and after")
         self.assertEqual([d for d in cluster.deleted if d[0] == "namespace"], [["namespace", "slack-test"]])
+
+    def test_a_failing_restart_command_fails_the_check(self):
+        cluster = FakeCluster()
+        cluster.restart_returncode = 3
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "restart",
+                               "--restart-cmd", f"kubectl --context {CONTEXT} rollout restart deploy/x")
+        self.assertEqual(code, launch.EXIT_FAIL)
+        self.assertIn("FAIL restart-cmd: exited 3: rollout refused", out)
+        self.assertEqual(cluster.applied, [])
 
     def test_restart_fails_when_the_gateway_never_reconnects(self):
         cluster = FakeCluster()
@@ -357,6 +456,29 @@ class ModesAndArgsTest(unittest.TestCase):
         code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
         self.assertEqual(code, launch.EXIT_OK, out)
 
+    def test_one_platformagent_is_required_to_discover_it(self):
+        for agents in ([], [AGENT, "second"]):
+            cluster = FakeCluster()
+            cluster.platformagents = agents
+            code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "legacy-socket")
+            self.assertEqual(code, launch.EXIT_SETUP, out)
+            self.assertIn(f"expected one PlatformAgent in {AGENT_NS}, found {len(agents)}", out)
+
+    def test_a_sandbox_statefulset_without_containers_needs_image(self):
+        cluster = FakeCluster()
+        cluster.sandbox_containers = []
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_SETUP, out)
+        self.assertIn("has no containers; pass --image", out)
+
+    def test_namespace_output_that_is_not_json_is_an_error(self):
+        cluster = FakeCluster()
+        cluster.namespace_output = "garbage"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_SETUP, out)
+        self.assertIn("kubectl get namespace printed no JSON", out)
+        self.assertEqual(cluster.applied, [])
+
     def test_cleanup_reports_a_failed_delete(self):
         cluster = FakeCluster()
         cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
@@ -368,8 +490,8 @@ class ModesAndArgsTest(unittest.TestCase):
     def test_restart_after_dm_settles_the_dm_first(self):
         cluster = FakeCluster()
         run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart")
-        first = yaml.safe_load(cluster.applied[2])["spec"]["template"]["spec"]["containers"][0]["args"]
-        second = yaml.safe_load(cluster.applied[4])["spec"]["template"]["spec"]["containers"][0]["args"]
+        first = pod_spec(yaml.safe_load(cluster.applied[2]))["containers"][0]["args"]
+        second = pod_spec(yaml.safe_load(cluster.applied[4]))["containers"][0]["args"]
         self.assertIn("--wait-answer", first)
         self.assertNotIn("--wait-answer", second)
 
@@ -429,6 +551,34 @@ class ModesAndArgsTest(unittest.TestCase):
         for flag in ("--checks", "--run-id=x", "--project", "--keep-going"):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 launch.parse_args(["--context", CONTEXT, "--", flag, "v"])
+
+    def test_endpoint_overrides_after_the_separator_are_refused(self):
+        harness_parser = harness.build_parser()
+        suppressed = [opt for action in harness_parser._actions if action.help == argparse.SUPPRESS
+                      for opt in action.option_strings]
+        self.assertEqual(sorted(suppressed), ["--metadata-token-url", "--secret-manager-base", "--slack-api-base"])
+        for flag in suppressed:
+            for forwarded in ([flag, "https://attacker.example/"], [f"{flag}=https://attacker.example/"]):
+                with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                    launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *forwarded])
+                self.assertIn("is not a harness flag the launcher forwards", err.getvalue())
+
+    def test_forwardable_flags_cover_every_other_harness_flag(self):
+        # A new harness flag must be classified here: forwarded, owned, or refused as test-only.
+        harness_flags = {opt for action in harness.build_parser()._actions for opt in action.option_strings}
+        suppressed = {opt for action in harness.build_parser()._actions if action.help == argparse.SUPPRESS
+                      for opt in action.option_strings}
+        owned = set(launch.LAUNCHER_OWNED_HARNESS_FLAGS)
+        self.assertTrue(launch.FORWARDABLE_HARNESS_FLAGS <= harness_flags)
+        self.assertFalse(launch.FORWARDABLE_HARNESS_FLAGS & (suppressed | owned))
+        self.assertEqual(launch.FORWARDABLE_HARNESS_FLAGS | suppressed | owned | {"-h", "--help"}, harness_flags)
+        args, forwarded = launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", "--channel", "ka-test",
+                                             "--reply-timeout=30", "--wait-answer"])
+        self.assertEqual(forwarded, ["--channel", "ka-test", "--reply-timeout=30", "--wait-answer"])
+
+    def test_an_invalid_home_match_fails_before_any_cluster_call(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            launch.parse_args(["--context", CONTEXT, "--checks", "home", "--", "--home-channel", "c", "--home-match", "("])
 
     def test_abbreviations_cannot_slip_past_the_owned_flag_guard(self):
         for forwarded in (["--proj", "other"], ["--check", "home"], ["--keep"]):

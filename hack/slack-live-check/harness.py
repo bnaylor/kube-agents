@@ -20,6 +20,7 @@ CI. hack/slack-live-check/README.md has the setup and the run order.
 import argparse
 import base64
 import json
+import math
 import re
 import sys
 import time
@@ -99,7 +100,10 @@ TOKEN_SHAPE_PATTERNS = (
     re.compile(r"ya29\.[A-Za-z0-9._-]+"),
 )
 REDACTED = "[redacted]"
-CHANNEL_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{6,}$")
+# Channel ids only. A D... id is a DM, where every message is a turn (inbound() in
+# a2a/gateway/slack.go), so the preflight post there would start a task.
+CHANNEL_ID_PATTERN = re.compile(r"^[CG][A-Z0-9]{6,}$")
+DM_ID_PATTERN = re.compile(r"^D[A-Z0-9]{6,}$")
 SLACK_NOT_IN_CHANNEL_ERRORS = frozenset({"not_in_channel", "channel_not_found"})
 
 CHECK_DM = "dm"
@@ -114,7 +118,6 @@ CHECK_UNLISTED_REPEAT = "unlisted-repeat"
 CHECK_ORDER = (CHECK_DM, CHECK_MENTION, CHECK_THREAD, CHECK_UNLISTED, CHECK_RESTART, CHECK_HOME)
 CHECKS_ALL_ALIAS = "all"
 CHECKS_ALL = (CHECK_DM, CHECK_MENTION, CHECK_THREAD, CHECK_UNLISTED)
-LISTED_CHECKS = frozenset({CHECK_DM, CHECK_MENTION, CHECK_THREAD, CHECK_RESTART, CHECK_HOME})
 UNLISTED_VIA_DM = "dm"
 UNLISTED_VIA_MENTION = "mention"
 
@@ -134,7 +137,6 @@ class SlackAPIError(HarnessError):
 
     def __init__(self, method: str, error: str) -> None:
         super().__init__(f"Slack {method} failed: {error}")
-        self.method = method
         self.error = error
 
 
@@ -189,7 +191,9 @@ def _error_detail(body: bytes) -> str:
         payload = json.loads(body)
     except ValueError:
         return truncate(body.decode("utf-8", "replace"), ERROR_BODY_LIMIT)
-    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return truncate(body.decode("utf-8", "replace"), ERROR_BODY_LIMIT)
+    err = payload.get("error")
     if isinstance(err, dict):
         return truncate(str(err.get("message") or err.get("status") or ""), ERROR_BODY_LIMIT)
     return truncate(str(err or payload.get("error_description") or ""), ERROR_BODY_LIMIT)
@@ -293,9 +297,13 @@ def _retry_after(headers: dict) -> float:
     for key, value in headers.items():
         if key.lower() == "retry-after":
             try:
-                return min(float(value), RATE_LIMIT_MAX_WAIT_SECONDS)
+                wait = float(value)
             except ValueError:
                 break
+            # A negative or non-finite value would make time.sleep raise.
+            if not math.isfinite(wait) or wait < 0:
+                break
+            return min(wait, RATE_LIMIT_MAX_WAIT_SECONDS)
     return RATE_LIMIT_DEFAULT_WAIT_SECONDS
 
 
@@ -360,7 +368,6 @@ class Session:
     run_id: str
     clock: Callable[[], float]
     sleep: Callable[[float], None]
-    wall: Callable[[], float]
     unlisted: Optional[SlackClient] = None
     unlisted_user_id: str = ""
     mention_root: str = ""
@@ -667,6 +674,9 @@ def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> str:
 
 def resolve_channel(client: SlackClient, channel: str) -> str:
     name = channel.lstrip("#")
+    if DM_ID_PATTERN.match(name):
+        raise HarnessError(f"{name} is a DM, not a channel: in a DM every message is a turn, so the preflight "
+                           "post would start a task; pass a channel name or a C/G channel id")
     if CHANNEL_ID_PATTERN.match(name):
         return name
     cursor = None
@@ -698,7 +708,15 @@ def parse_checks(value: str) -> list[str]:
     return [check for check in CHECK_ORDER if check in requested]
 
 
-def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
+def regex(value: str) -> str:
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise argparse.ArgumentTypeError(f"not a valid regex: {exc}") from None
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=HARNESS_PROG, description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).",
                                      allow_abbrev=False)
     parser.add_argument("--checks", type=parse_checks, default=list(CHECKS_ALL),
@@ -724,12 +742,17 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     parser.add_argument("--home-channel", default="", help="channel the home check watches for a bot post")
     parser.add_argument("--home-since", type=float, default=0.0, help="epoch seconds; default is the run's start")
     parser.add_argument("--home-timeout", type=float, default=DEFAULT_HOME_TIMEOUT_SECONDS)
-    parser.add_argument("--home-match", default="", help="regex the home post's text must match")
+    parser.add_argument("--home-match", type=regex, default="", help="regex the home post's text must match")
     parser.add_argument("--run-id", default="", help="tag for this run's posts; random when unset")
     # Endpoint overrides for the offline tests.
     parser.add_argument("--slack-api-base", default=SLACK_API_BASE, help=argparse.SUPPRESS)
     parser.add_argument("--metadata-token-url", default=METADATA_TOKEN_URL, help=argparse.SUPPRESS)
     parser.add_argument("--secret-manager-base", default=SECRET_MANAGER_BASE, help=argparse.SUPPRESS)
+    return parser
+
+
+def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if CHECK_HOME in args.checks and not args.home_channel:
         parser.error("the home check needs --home-channel")
@@ -772,11 +795,12 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
     if bot_user_id in (listed_auth["user_id"], unlisted_user_id):
         raise HarnessError("the bot user id is one of the test users")
     channel_id = resolve_channel(listed, args.channel)
+    home_channel = resolve_channel(listed, args.home_channel) if CHECK_HOME in args.checks else ""
     say(f"RUN {run_id}: team={listed_auth.get('team_id', '')} listed={listed_auth['user_id']} "
         f"unlisted={unlisted_user_id or '-'} bot={bot_user_id} channel={channel_id} checks={','.join(args.checks)}")
 
     session = Session(args=args, listed=listed, listed_user_id=listed_auth["user_id"], bot_user_id=bot_user_id,
-                      channel_id=channel_id, run_id=run_id, clock=clock, sleep=sleep, wall=wall,
+                      channel_id=channel_id, run_id=run_id, clock=clock, sleep=sleep,
                       unlisted=unlisted, unlisted_user_id=unlisted_user_id)
     results: list[CheckResult] = []
 
@@ -784,33 +808,47 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
     if unlisted is not None:
         preflights.append((unlisted, "unlisted", unlisted_user_id))
     for client, label, user_id in preflights:
-        result = preflight(client, label, user_id, channel_id, run_id)
+        try:
+            result = preflight(client, label, user_id, channel_id, run_id)
+        except Exception as exc:  # noqa: BLE001 -- a check's error is its FAIL; report() redacts it
+            result = errored(f"{CHECK_PREFLIGHT}-{label}", exc)
         report(result)
         results.append(result)
         if not result.passed:
             # Every check after a failed preflight would fail for the preflight's reason.
             return summarize(results)
 
-    home_channel = resolve_channel(listed, args.home_channel) if CHECK_HOME in args.checks else ""
     for check in args.checks:
-        if check == CHECK_DM:
-            outcome = [check_dm(session)]
-        elif check == CHECK_MENTION:
-            outcome = [check_mention(session)]
-        elif check == CHECK_THREAD:
-            outcome = [check_thread(session)]
-        elif check == CHECK_UNLISTED:
-            outcome = check_unlisted(session)
-        elif check == CHECK_RESTART:
-            outcome = [check_dm(session, CHECK_RESTART)]
-        else:
-            outcome = [check_home(session, home_channel, args.home_since or started)]
+        try:
+            outcome = run_check(session, check, home_channel, args.home_since or started)
+        except Exception as exc:  # noqa: BLE001 -- a check's error is its FAIL; report() redacts it
+            outcome = [errored(check, exc)]
         for result in outcome:
             report(result)
             results.append(result)
         if not args.keep_going and not all(r.passed for r in outcome):
             break
     return summarize(results)
+
+
+def errored(name: str, exc: Exception) -> CheckResult:
+    """A check that raised: a Slack error, an unreachable host, anything else. It is that check's FAIL."""
+    what = str(exc) if isinstance(exc, HarnessError) else f"unexpected {type(exc).__name__}: {exc}"
+    return CheckResult(name, False, f"error: {what}", {"error": type(exc).__name__})
+
+
+def run_check(session: Session, check: str, home_channel: str, home_since: float) -> list[CheckResult]:
+    if check == CHECK_DM:
+        return [check_dm(session)]
+    if check == CHECK_MENTION:
+        return [check_mention(session)]
+    if check == CHECK_THREAD:
+        return [check_thread(session)]
+    if check == CHECK_UNLISTED:
+        return check_unlisted(session)
+    if check == CHECK_RESTART:
+        return [check_dm(session, CHECK_RESTART)]
+    return [check_home(session, home_channel, home_since)]
 
 
 def summarize(results: list[CheckResult]) -> int:
