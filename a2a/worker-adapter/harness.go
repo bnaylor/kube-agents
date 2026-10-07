@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -264,12 +265,27 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 		// stdout line, which fails a write blocked on the full pipe. The
 		// scanner records its error before it closes stdin, so it is already
 		// readable here and names the real cause, not just the closed pipe.
+		//
+		// Unlike supervise, this path does not wait for scanDone before Wait,
+		// and cannot: a process outside the group that holds stdout keeps the
+		// scanner reading until it exits, and nothing drains events here, so
+		// the scanner can also be parked on a full channel. Wait then closes
+		// the stdout read end under the scanner, whose Read fails with
+		// os.ErrClosed. That is Wait's teardown, not the harness's output, so
+		// it is dropped rather than relayed as a stdout failure. Wait is the
+		// only thing that closes that descriptor, so the error never means
+		// anything else. Whether the scanner has stored it yet is a race, and
+		// dropping it makes both outcomes read the same.
 		p.kill(0)
 		reapStart := time.Now()
 		waitErr := cmd.Wait()
 		reapTook := time.Since(reapStart)
 		p.reaped()
-		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(p.scanErr()), p.stderrEvidence())
+		serr := p.scanErr()
+		if errors.Is(serr, os.ErrClosed) {
+			serr = nil
+		}
+		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence())
 	}
 	return p, nil
 }

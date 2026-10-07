@@ -11,6 +11,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -131,8 +132,16 @@ printf '\n'
 while read -r _line; do :; done
 `, pidFile, overflowLineBytes))
 	// The stub leads its own process group, so a hung run is cleaned up by
-	// killing the group; startHarness never handed back a proc to kill.
+	// killing the group; startHarness never handed back a proc to kill. Only
+	// a hung run: once startHarness returns, the group has been reaped
+	// (startHarness reaps it on failure, the goroutine below on success), and
+	// its pgid may already belong to some other process, the hazard reaped()
+	// guards against in harness.go.
+	var groupReaped atomic.Bool
 	t.Cleanup(func() {
+		if groupReaped.Load() {
+			return
+		}
 		raw, err := os.ReadFile(pidFile)
 		if err != nil {
 			return
@@ -152,6 +161,7 @@ while read -r _line; do :; done
 			_ = p.cmd.Wait()
 			p.reaped()
 		}
+		groupReaped.Store(true)
 		done <- err
 	}()
 	var err error
@@ -173,6 +183,48 @@ while read -r _line; do :; done
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+// heldStdoutFailedStartRuns is how many failed starts the held-stdout test
+// makes. Whether the scanner records Wait's close before or after the error
+// is built is a race, so one run proves little; each run takes milliseconds.
+const heldStdoutFailedStartRuns = 50
+
+// TestStartHarness_FailedStartIgnoresWaitsStdoutClose: a harness that exits
+// before reading its prompt and leaves a child in another process group
+// holding stdout but not stderr. Wait returns once the harness is reaped and
+// closes the stdout read end under the scanner, which is parked in Read on
+// the pipe the child holds, so the scanner fails with "file already closed".
+// That is Wait's own teardown, not anything the harness did, and the failed
+// start's error must not relay it as a stdout failure.
+func TestStartHarness_FailedStartIgnoresWaitsStdoutClose(t *testing.T) {
+	for i := range heldStdoutFailedStartRuns {
+		pidFile := filepath.Join(t.TempDir(), fmt.Sprintf("escaped-%d.pid", i))
+		harness := stub(t, fmt.Sprintf(`
+set -m
+sleep 120 </dev/null 2>/dev/null &
+echo $! > %q
+echo "stub left a child holding stdout" >&2
+exit 7
+`, pidFile))
+		t.Cleanup(func() {
+			raw, err := os.ReadFile(pidFile)
+			if err != nil {
+				return
+			}
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		})
+		msg := startHarnessWithin(t, harness).Error()
+		requireEscaped(t, pidFile)
+		if !strings.Contains(msg, " - exit status 7") {
+			t.Fatalf("run %d: error missing the exit status:\n%s", i, msg)
+		}
+		if strings.Contains(msg, "stdout: ") {
+			t.Fatalf("run %d: error relays a stdout failure that Wait's own close caused:\n%s", i, msg)
 		}
 	}
 }
