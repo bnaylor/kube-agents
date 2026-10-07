@@ -611,6 +611,20 @@ whole list - the shared `worker` credential reborn under a new name, and it woul
 correct in review. The callout refuses such an entry at parse. No claim, no grants, no
 connection.
 
+A narrowed user is named for its pod, and that name is also its inbox prefix, so a pod
+named after another principal would be granted that principal's `_INBOX.<user>.>` and
+could read or forge the JetStream replies delivered there. The gateway never mints such a
+name, but anyone who can create a pod under a narrowed ServiceAccount can. The callout
+therefore refuses a narrowed pod whose name is one of the static `nats.conf` users: the
+callout's own user and every static identity, the same list `auth_users` is rendered from.
+No identity map carries those names, so the operator renders them into the callout's
+`A2A_RESERVED_PRINCIPALS` environment variable as a comma-separated list. The callout does
+not read `nats.conf`, which carries every static user's password. It refuses to start if
+the variable is missing, empty, or holds anything but dot-free DNS-1123 labels; a smaller
+set would quietly admit a pod named after the dropped user. The list is fixed for the
+life of the process, and that is enough: it changes only when the operator's render does,
+and a changed value changes the pod template, which rolls the callout.
+
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
 10.1 seconds later, the API server's successful-authentication cache being the delay. The
