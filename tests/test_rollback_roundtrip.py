@@ -217,7 +217,8 @@ FAKE_KUBECTL = textwrap.dedent(
                 for key in A2A:
                     o.pop(key, None)
                 o.pop("pod/platform-agent-a2a-nats-0", None)
-                s["jobs"] = []
+                if sc.get("jobs_kept_on") != "today":
+                    s["jobs"] = []
                 s["pods"] = [x for x in s["pods"] if x["metadata"]["labels"].get("app.kubernetes.io/part-of") != "a2a-next"]
         if p["kind"] == "mode" and leg == "next":
             for key in A2A:
@@ -347,7 +348,12 @@ FAKE_KUBECTL = textwrap.dedent(
             args = args[2:]
         verb = args[0]
         out, rc = "", 0
-        if verb == "patch":
+        refused = s["scenario"].get("mode_patch_refused")
+        if verb == "patch" and refused and json.loads(args[args.index("-p") + 1]).get("spec", {}).get("mode") == refused:
+            # An admission webhook, RBAC or the API server says no: the CR
+            # is not changed.
+            sys.stderr.write("Error from server (Forbidden): admission webhook denied the request\n"); rc = 1
+        elif verb == "patch":
             patch = json.loads(args[args.index("-p") + 1])
             s["patches"].append(patch)
             cr = s["cr"]
@@ -375,7 +381,21 @@ FAKE_KUBECTL = textwrap.dedent(
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
             elif kind == "jobs":
+                # A Job that turns Failed after leg 2's provisioning read it
+                # Complete: the second such read under next sees it Failed.
+                flipped_forward = {"spec": {"mode": "next"}} in s["patches"]
+                if (s["scenario"].get("job_fails_after_provisioned") and flipped_forward and s["jobs"]
+                        and s["jobs"][-1]["status"]["conditions"] == [{"type": "Complete", "status": "True"}]):
+                    n = s["counters"].get("complete-reads", 0) + 1
+                    s["counters"]["complete-reads"] = n
+                    if n >= 2:
+                        s["jobs"][-1]["status"]["conditions"] = [{"type": "Failed", "status": "True"}]
                 out = json.dumps({"items": s["jobs"]})
+            elif (kind == "deployment" and name == "platform-agent-gateway" and fmt == "jsonpath={.metadata.generation}"
+                  and s["scenario"].get("generation_unreadable_after_unset") and len(s["patches"]) == 1 and s["pending"] is None):
+                # Once the unset has reconciled, the agent Deployment cannot
+                # be read: the flip to today is never sent.
+                sys.stderr.write("Error from server (ServiceUnavailable): the server is currently unable to handle the request\n"); rc = 1
             elif (kind == "deployment" and name == "platform-agent-gateway" and fmt == "json"
                   and s["scenario"].get("garbled_agent_after_unset") and s["patches"]):
                 out = "not json"
@@ -814,13 +834,31 @@ class FailureTest(RoundTripTest):
         result, _, _ = self.run_sim(healthy_next_state(stuck_pod_on="today", stuck_pod=stuck), ROLLBACK_SETTLE_TIMEOUT="2")
         self.assert_fails_at(result, "leg1.nothing-stuck", "terminating since")
 
-    def test_an_a2a_job_left_under_today(self) -> None:
-        # The teardown that never reaches the Jobs: they stay under today.
+    def test_an_a2a_pod_left_under_today(self) -> None:
+        # The teardown removes the StatefulSet but a pod of the A2A stack is
+        # still there under today.
         state = healthy_next_state()
         state["scenario"]["stuck_pod_on"] = "today"
         state["scenario"]["stuck_pod"] = {"metadata": {"name": "platform-agent-a2a-nats-0", "labels": {"app.kubernetes.io/part-of": "a2a-next"}}, "status": {"phase": "Running"}}
         result, _, _ = self.run_sim(state, ROLLBACK_SETTLE_TIMEOUT="2")
         self.assert_fails_at(result, "leg1.nothing-stuck", "is an A2A pod still present under today")
+
+    def test_an_a2a_job_left_under_today(self) -> None:
+        # The teardown removes every A2A object but never reaches the
+        # provisioning Jobs: they stay under today. leg1.a2a-torn-down passes,
+        # and the settle check names the Job.
+        result, _, _ = self.run_sim(healthy_next_state(jobs_kept_on="today"), ROLLBACK_SETTLE_TIMEOUT="2")
+        self.assert_fails_at(result, "leg1.nothing-stuck")
+        self.assertIn("PASS leg1.a2a-torn-down:", result.stdout)
+        self.assertIn("FAIL leg1.nothing-stuck: still unsettled after 2s: job/provision-0 is an A2A Job still present under today;job/provision-1 is an A2A Job still present under today\n", result.stdout)
+
+    def test_a_job_failed_after_provisioning_passed(self) -> None:
+        # leg2.provisioned read the Job Complete; by the settle check it is
+        # Failed. No sidecars, so no reprovisioning read comes between.
+        result, _, _ = self.run_sim(healthy_next_state(sidecars=[], job_fails_after_provisioned=True), ROLLBACK_SETTLE_TIMEOUT="2")
+        self.assert_fails_at(result, "leg2.nothing-stuck")
+        self.assertIn("PASS leg2.provisioned: provisioning Job provision-1 complete", result.stdout)
+        self.assertIn("FAIL leg2.nothing-stuck: still unsettled after 2s: job/provision-1 Failed\n", result.stdout)
 
     def test_a_failed_provision_job_on_the_flip_back(self) -> None:
         result, _, _ = self.run_sim(healthy_next_state(provision_job="Failed"))
@@ -945,6 +983,24 @@ class FailureTest(RoundTripTest):
         # The unset itself never settles: the CR is still at next.
         result, state, _ = self.run_sim(healthy_next_state(status_stale_on_sidecars=True), ROLLBACK_READY_TIMEOUT="2")
         self.assert_fails_at(result, "leg1.sidecars-unset.ready")
+        self.assertIn("declared them again on the way out", result.stdout)
+        self.assertEqual(state["patches"], [{"spec": {"deployment": {"sidecars": None}}}, {"spec": {"deployment": {"sidecars": [_BRIDGE]}}}])
+
+    def test_a_refused_flip_to_today_declares_them_again(self) -> None:
+        # The API refuses the mode patch: the CR is still at next with the
+        # bus up, and only the sidecars this run unset are missing.
+        result, state, _ = self.run_sim(healthy_next_state(mode_patch_refused="today"))
+        self.assert_fails_at(result, "leg1.mode-today.patched", "kubectl patch was refused")
+        self.assertIn("install left at spec.mode=next during leg1", result.stdout)
+        self.assertIn("declared them again on the way out", result.stdout)
+        self.assertEqual(state["patches"], [{"spec": {"deployment": {"sidecars": None}}}, {"spec": {"deployment": {"sidecars": [_BRIDGE]}}}])
+        self.assertEqual(state["cr"]["spec"]["deployment"]["sidecars"], [_BRIDGE])
+
+    def test_a_flip_to_today_never_sent_declares_them_again(self) -> None:
+        # The agent Deployment cannot be read before the mode patch, so the
+        # patch is never sent: the same install as a refusal.
+        result, state, _ = self.run_sim(healthy_next_state(generation_unreadable_after_unset=True))
+        self.assert_fails_at(result, "leg1.mode-today.patched", "could not be read")
         self.assertIn("declared them again on the way out", result.stdout)
         self.assertEqual(state["patches"], [{"spec": {"deployment": {"sidecars": None}}}, {"spec": {"deployment": {"sidecars": [_BRIDGE]}}}])
 

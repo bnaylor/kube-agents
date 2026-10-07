@@ -218,8 +218,9 @@ CURRENT_LEG="preflight"
 BUS_SIDECARS=""
 SIDECARS_FILE=""
 SIDECAR_NAMES=""
-# Set from the flip to today until leg 2's provisioning passes: the bus is
-# down or not yet back, and the sidecars must not be declared again.
+# Set once the API accepts the flip to today (patch_and_reconcile), until leg
+# 2's provisioning passes: the bus is down or not yet back, and the sidecars
+# must not be declared again.
 BUS_DOWN=""
 PF_PID=""
 PF_LOG=""
@@ -265,8 +266,8 @@ fail() {
 # environment.
 #
 # The sidecars go back on the way out only when the bus is up: the CR at next
-# and BUS_DOWN unset, which is before the flip to today or once leg 2's
-# provisioning has passed. Then the list is what the install ran before the
+# and BUS_DOWN unset, which is until the API accepts the flip to today (a
+# refused flip included) or once leg 2's provisioning has passed. Then the list is what the install ran before the
 # run, so it is patched back once, not awaited. Anywhere else (under today,
 # or at next with the bus still coming back) the list may hold a bus
 # sidecar, and declaring one there is the outage a2a/docs/hermes-bridge.md
@@ -871,11 +872,17 @@ wait_bridges_consuming() {
 }
 
 # Merge-patches the CR and waits for the operator to reconcile it: the agent
-# Deployment's generation moves.
+# Deployment's generation moves. BUS_DOWN is set by the flip to today once
+# the API has accepted it, not before: a flip that is refused, or never sent
+# because the agent could not be read, leaves the CR at next with the bus up,
+# and the way out declares the sidecars again.
 patch_and_reconcile() {
   local leg="$1" what="$2" patch="$3" before
   before="$(agent_generation)" || fail "${leg}.${what}.patched" "deployment/${AGENT_DEPLOYMENT} could not be read"
   k patch platformagent "${CR_NAME}" --type merge -p "${patch}" >/dev/null || fail "${leg}.${what}.patched" "kubectl patch was refused"
+  if [ "${leg}.${what}" = "leg1.mode-today" ]; then
+    BUS_DOWN=1
+  fi
   pass "${leg}.${what}.patched" "merge patch applied"
   wait_generation_past "${leg}.${what}.reconciled" "${before}" "${GENERATION_TIMEOUT}"
 }
@@ -941,7 +948,6 @@ if [ -n "${UNSET_SIDECARS}" ]; then
 else
   skip "leg1.sidecars-unset" "the CR declares no sidecars"
 fi
-BUS_DOWN=1
 patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
 # The teardown ran to its end: the StatefulSet is the last thing cleanupA2A
 # deletes, and the callout keys Secret is one it deletes rather than keeps,
