@@ -38,6 +38,7 @@ func TestTheCalloutRefusesToStartWithoutReservedPrincipals(t *testing.T) {
 	for name, value := range cases {
 		t.Run(name, func(t *testing.T) {
 			setRequiredEnv(t)
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
 			if value == nil {
 				// t.Setenv first so the original value is restored after.
 				t.Setenv(envReservedPrincipals, "")
@@ -58,8 +59,12 @@ func TestTheCalloutRefusesToStartWithoutReservedPrincipals(t *testing.T) {
 // With the list present the guard lets startup carry on, to the in-cluster
 // config a test process does not have. That is the control: the refusals above
 // are the list, not an earlier variable this test forgot to set.
+//
+// The service host is blanked so the in-cluster config fails even when the
+// test itself runs in a pod; otherwise run would go on to serve and watch.
 func TestTheCalloutStartsPastTheGuardWithReservedPrincipals(t *testing.T) {
 	setRequiredEnv(t)
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv(envReservedPrincipals, "callout,gateway,bridge,seed,web,console,sys")
 	err := run(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil {
@@ -67,6 +72,9 @@ func TestTheCalloutStartsPastTheGuardWithReservedPrincipals(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), envReservedPrincipals) {
 		t.Fatalf("a well-formed list was refused: %v", err)
+	}
+	if !strings.Contains(err.Error(), "in-cluster config") {
+		t.Fatalf("run() stopped somewhere other than the in-cluster config: %v", err)
 	}
 }
 

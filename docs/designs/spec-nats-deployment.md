@@ -621,9 +621,15 @@ No identity map carries those names, so the operator renders them into the callo
 `A2A_RESERVED_PRINCIPALS` environment variable as a comma-separated list. The callout does
 not read `nats.conf`, which carries every static user's password. It refuses to start if
 the variable is missing, empty, or holds anything but dot-free DNS-1123 labels; a smaller
-set would quietly admit a pod named after the dropped user. The list is fixed for the
-life of the process, and that is enough: it changes only when the operator's render does,
-and a changed value changes the pod template, which rolls the callout.
+set would quietly admit a pod named after the dropped user. The list is fixed for the life
+of the process, and that is enough: it changes only when the operator's render does, and a
+changed value changes the pod template, which rolls the callout. The users in the
+callout's own identity map share the same exposure and are not on this list: a narrowed
+pod named `verifier` is still admitted with the verifier's inbox. Refusing the identity
+map's users is the other half of the same check and is not yet built. The pod name is also
+the session's task addressee, consumer stem and capability caller, so the same collision
+exists in the addressee namespace: a narrowed pod named `platform`, the bridge's
+addressee, is not refused either.
 
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token

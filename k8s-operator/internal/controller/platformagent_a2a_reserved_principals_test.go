@@ -85,8 +85,8 @@ func TestTheCalloutReservesExactlyTheNATSConfStaticUsers(t *testing.T) {
 		t.Fatalf("the callout Deployment does not render %s; the callout refuses to start without it", a2aCalloutReservedPrincipalsEnvVar)
 	}
 	// Exact, including order and spelling: a bare comma between names is the
-	// format authcallout.ParseReservedPrincipals reads, and an empty element
-	// or stray space is one it refuses.
+	// format the render promises. authcallout.ParseReservedPrincipals trims
+	// spaces around a name but refuses an empty element.
 	if want := strings.Join(authUsers, ","); got != want {
 		t.Errorf("%s = %q, want %q (nats.conf's auth_users); a static user missing here is one a narrowed pod can impersonate",
 			a2aCalloutReservedPrincipalsEnvVar, got, want)

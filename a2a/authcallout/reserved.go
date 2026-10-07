@@ -17,9 +17,11 @@ import (
 // principal; a pod someone created by hand under a narrowed ServiceAccount can
 // be named anything.
 //
-// The static users nats.conf authenticates by password (gateway, bridge, seed,
-// web, console, sys, and the callout's own user) are in no identity map, so the
-// callout cannot learn them from the map it serves. The operator renders them
+// This file covers the static users nats.conf authenticates by password
+// (gateway, bridge, seed, web, console, sys, and the callout's own user). They
+// are in no identity map, so the callout cannot learn them from the map it
+// serves. The identity map's own users have the same exposure and are not
+// refused here; refusing them belongs in the same set, built at load. The operator renders them
 // into the callout's environment instead, from the same list it renders
 // nats.conf's auth_users from, as a comma-separated list. The callout does not
 // read nats.conf: that file carries every static user's password, and the
