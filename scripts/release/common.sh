@@ -773,9 +773,9 @@ required_release_images_in_text() {
 # The candidate's list wins in both directions.
 #
 # When that list cannot be read -- no commit named, a commit this repository
-# does not have, no such file at it, or an array the parse above does not
-# accept -- this checkout's array is printed instead and one line on stderr
-# names the reason. That is the behaviour every rung had before this helper,
+# does not have, no such file at it, a `git show` of it that fails, or an
+# array the parse above does not accept -- this checkout's array is printed
+# instead and one line on stderr names the reason. That is the behaviour every rung had before this helper,
 # so the fallback never refuses or accepts anything the old gate did not; the
 # one shape it never takes is an empty list, which would pass the gate with
 # nothing checked. Always exits 0; a caller that reads nothing back has a

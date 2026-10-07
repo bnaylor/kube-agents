@@ -2403,35 +2403,16 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
         for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
             self.assertNotIn(f"Promoting {img}", proc.stdout, f"{img} is not in the candidate's list")
 
-
-class RequiredReleaseImagesPastThePipeBufferTest(unittest.TestCase):
-    """The candidate's list is read from a common.sh larger than a pipe buffer (#2542).
-
-    The real scripts/release/common.sh is over 64 KiB and lists its images
-    near the top. Piping `git show` into the parse, which stops at the list's
-    closing `)`, killed `git show` with SIGPIPE; under pipefail the read failed
-    on every real commit and every rung fell back to this checkout's list,
-    refusing a candidate published before the list grew (#2304's a2a-console).
-    The small fixtures above fit in the buffer and never saw it.
-    """
+    # #2542: the real scripts/release/common.sh is over 64 KiB and lists its
+    # images near the top. Piping `git show` into the parse, which stops at the
+    # list's closing `)`, killed `git show` with SIGPIPE; under pipefail the read
+    # failed on every real commit and every rung fell back to this checkout's
+    # list, refusing a candidate published before #2304 added a2a-console. The
+    # small fixtures above fit in the buffer and never saw it.
 
     _CHECKOUT_FALLBACK = (
         f"using the {len(MOCK_REQUIRED_RELEASE_IMAGES)} this checkout's {REQUIRED_RELEASE_IMAGES_PATH} lists"
     )
-
-    def _run(self, func_call, cwd, bin_dir=None):
-        return subprocess.run(
-            ["bash", "-c", f'source "{_COMMON_SH}"\n{func_call}'],
-            capture_output=True,
-            text=True,
-            env=get_isolated_test_env(bin_dir=bin_dir),
-            cwd=cwd,
-        )
-
-    def _repo(self):
-        temp_dir, repo_dir, git = create_mock_git_repo()
-        self.addCleanup(temp_dir.cleanup)
-        return temp_dir, repo_dir, git
 
     def _assert_read_at(self, proc, sha, images):
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -2516,17 +2497,6 @@ class RequiredReleaseImagesPastThePipeBufferTest(unittest.TestCase):
 
         proc = self._run(f'required_release_images_at "{candidate}"', cwd=repo_dir, bin_dir=str(bin_dir))
         self._assert_fell_back(proc, f"git show could not read {REQUIRED_RELEASE_IMAGES_PATH} at {candidate[:7]}")
-
-    def test_a_bad_commit_or_a_missing_file_still_falls_back_with_its_reason(self):
-        _, repo_dir, git = self._repo()
-        no_file = git("rev-parse", "HEAD").stdout.strip()
-        cases = [
-            (MOCK_SAMPLE_COMMIT_SHA, f"commit {MOCK_SAMPLE_COMMIT_SHA[:7]} is not in this repository"),
-            (no_file, f"{no_file[:7]} has no {REQUIRED_RELEASE_IMAGES_PATH}"),
-        ]
-        for sha, reason in cases:
-            with self.subTest(sha=sha[:7]):
-                self._assert_fell_back(self._run(f'required_release_images_at "{sha}"', cwd=repo_dir), reason)
 
 
 if __name__ == "__main__":
