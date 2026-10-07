@@ -47,13 +47,54 @@ const (
 // escaped sleep, past the task deadline and the group kill, which do not
 // reach it. Bounded by KillGrace, the task fails promptly with the exit
 // status, the note that the reap ran the full bound, and the stderr tail.
+// After a failed exit Wait cannot tell a held stderr from a slow reap, so the
+// reason must not claim one.
 func TestLifecycle_SuperviseReapIsBounded(t *testing.T) {
+	text := superviseHeldStderrReason(t, "task-reap-1", 7, "stub read its prompt and left a child holding stderr")
+	for _, want := range []string{
+		"reason: stream-ended-without-result - exit status 7 - the reap ran the full 500ms; the stderr tail may stop there",
+		"\nstderr tail:\nstub read its prompt and left a child holding stderr",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("terminal reason missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "kept stderr open") {
+		t.Errorf("terminal reason blames a held stderr after a failed exit:\n%s", text)
+	}
+}
+
+// TestLifecycle_SuperviseReapCleanExitHeldStderr: the same harness exiting 0
+// without a result. Wait then returns Go's exec.ErrWaitDelay rather than an
+// exit status, and the reason must say what that means, as the failed start
+// does (reapEvidence), not relay "exec: WaitDelay expired before I/O
+// complete".
+func TestLifecycle_SuperviseReapCleanExitHeldStderr(t *testing.T) {
+	text := superviseHeldStderrReason(t, "task-reap-2", 0, "stub exited clean and left a child holding stderr")
+	for _, want := range []string{
+		"reason: stream-ended-without-result - harness exited 0; a process the harness started kept stderr open past 500ms; the stderr tail stops there",
+		"\nstderr tail:\nstub exited clean and left a child holding stderr",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("terminal reason missing %q:\n%s", want, text)
+		}
+	}
+}
+
+// superviseHeldStderrReason runs the adapter against a harness that reads its
+// prompt, leaves an escaped child holding stderr, and exits with exitCode,
+// and returns the terminal reason. It fails the test if the run outlasts
+// superviseReapReturnWithin (an unbounded reap), if the child did not escape
+// the group kill (the premise), or if the reason carries Go's WaitDelay text
+// or a deadline-exceeded that would hide which bound ended the run.
+func superviseHeldStderrReason(t *testing.T, taskID string, exitCode int, stderrLine string) string {
+	t.Helper()
 	url := startServer(t)
 	c := testClient(t, url)
-	const session, taskID = "chat-quokka-e1f2", "task-reap-1"
+	const session = "chat-quokka-e1f2"
 	submit(t, c, session, taskID, "read this, then leave")
 
-	harness, pidFile := escapingChildStub(t, "read first || exit 1", 7, "stub read its prompt and left a child holding stderr")
+	harness, pidFile := escapingChildStub(t, "read first || exit 1", exitCode, stderrLine)
 	cfg := adapterConfig(url, taskID, session, harness)
 	cfg.TaskDeadline = superviseReapTaskDeadline
 	started := time.Now()
@@ -65,21 +106,12 @@ func TestLifecycle_SuperviseReapIsBounded(t *testing.T) {
 	}
 	events := replayEvents(t, url, session, taskID)
 	text := statusOf(t, events[len(events)-1]).Status.Message.Parts[0].Text
-	for _, want := range []string{
-		"reason: stream-ended-without-result - exit status 7 - the reap ran the full 500ms; the stderr tail may stop there",
-		"\nstderr tail:\nstub read its prompt and left a child holding stderr",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("terminal reason missing %q:\n%s", want, text)
-		}
-	}
-	// After a failed exit Wait cannot tell a held stderr from a slow reap,
-	// and Go's own WaitDelay message is not evidence about the harness.
-	for _, unwanted := range []string{"kept stderr open", "WaitDelay", "deadline-exceeded"} {
+	for _, unwanted := range []string{"WaitDelay", "deadline-exceeded"} {
 		if strings.Contains(text, unwanted) {
 			t.Errorf("terminal reason carries %q:\n%s", unwanted, text)
 		}
 	}
+	return text
 }
 
 // TestStartHarness_OverflowBeforePromptReadDoesNotDeadlock: a harness that
