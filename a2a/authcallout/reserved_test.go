@@ -355,7 +355,9 @@ func mapWithNewcomer(version string) string {
 
 // The reserved map users follow the map the callout is serving: a reload that
 // adds a user reserves its name on the next connection, and a reload that
-// removes it releases the name. The static names hold across both.
+// removes it releases the name at once, even though connections the removed
+// principal already holds keep its inbox until their GrantTTL expiry (the
+// accepted window documented in reserved.go). The static names hold across both.
 func TestAMapReloadMovesTheReservedUsers(t *testing.T) {
 	static := renderedFixtureAuthUsers(t)
 	tokens := reservedPodTokens(append([]string{reloadNewcomer}, static...))

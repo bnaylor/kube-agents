@@ -36,7 +36,13 @@ import (
 //     rest, harmlessly, because one check covers every map user. They are
 //     read from the map being served, built when the map is parsed (see
 //     IdentityMap.users), so a reload that adds or removes a user moves the
-//     reserved set in the same pointer swap that moves the map.
+//     reserved set in the same pointer swap that moves the map. A removed
+//     user's name is released at once, but the swap revokes nothing:
+//     connections the removed principal already holds keep its inbox until
+//     their user JWT expires, at most GrantTTL (defaultGrantTTL, one hour,
+//     since the operator does not set A2A_GRANT_TTL_SECONDS), and a narrowed
+//     pod named after it can be minted the same inbox inside that window.
+//     Only an operator re-render removes a map user; the window is accepted.
 //
 // A name in both is reported as a static principal. That cannot happen in a
 // rendered config (the operator's contract test keeps the static residue out

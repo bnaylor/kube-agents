@@ -632,7 +632,12 @@ reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved
 set in the same step, and a connection is checked against the users of the map its
-identity was resolved from. The refusal reason says which kind of name the pod copies.
+identity was resolved from. A removed user's name is released at once, but the reload
+revokes nothing: connections the removed principal already holds keep its inbox until
+their user JWT expires, at most the callout's grant lifetime (one hour by default; the
+operator does not set `A2A_GRANT_TTL_SECONDS`), and a narrowed pod named after it can be
+minted the same inbox inside that window. Only an operator re-render removes a map user,
+and the window is accepted. The refusal reason says which kind of name the pod copies.
 The pod name is also the session's task addressee, consumer stem and capability caller,
 so the same collision exists in the addressee namespace: a narrowed pod named `platform`,
 the bridge's addressee, is not refused by this check.
