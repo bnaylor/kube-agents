@@ -554,14 +554,19 @@ wait_provision_complete() {
 }
 
 # Pods and Jobs that are stuck, one per line; nothing when the namespace is
-# settled. Under today, anything left of the A2A stack counts too.
+# settled. Under today, anything left of the A2A stack counts too. The pod
+# list and the Job list come on stdin, one after the other: a namespace's
+# pod list runs past the 128 KiB Linux allows one argument.
 readonly PY_STUCK='
 import json, sys
-pods = json.loads(sys.argv[1]).get("items") or []
-jobs = json.loads(sys.argv[2]).get("items") or []
-mode, part_of, part_of_value = sys.argv[3], sys.argv[4], sys.argv[5]
-stuck_reasons = set(sys.argv[6].split())
-failed_word = sys.argv[7]
+text, decoder = sys.stdin.read().lstrip(), json.JSONDecoder()
+pods_doc, end = decoder.raw_decode(text)
+jobs_doc, _ = decoder.raw_decode(text[end:].lstrip())
+pods = pods_doc.get("items") or []
+jobs = jobs_doc.get("items") or []
+mode, part_of, part_of_value = sys.argv[1], sys.argv[2], sys.argv[3]
+stuck_reasons = set(sys.argv[4].split())
+failed_word = sys.argv[5]
 for pod in pods:
     meta, st = pod.get("metadata") or {}, pod.get("status") or {}
     name = meta.get("name", "?")
@@ -591,7 +596,7 @@ wait_settled() {
   while :; do
     problems="the namespace could not be read"
     if pods="$(k_read get pods -o json)" && jobs="$(provision_jobs)"; then
-      problems="$(python3 -c "${PY_STUCK}" "${pods}" "${jobs}" "${mode}" "${A2A_PART_OF_LABEL}" "${A2A_PART_OF_VALUE}" "${STUCK_WAITING_REASONS}" "${JOB_CONDITION_FAILED}")"
+      problems="$(printf '%s\n%s' "${pods}" "${jobs}" | python3 -c "${PY_STUCK}" "${mode}" "${A2A_PART_OF_LABEL}" "${A2A_PART_OF_VALUE}" "${STUCK_WAITING_REASONS}" "${JOB_CONDITION_FAILED}")"
     fi
     if [ -z "${problems}" ]; then
       pass "${name}" "no pod pending, terminating or backing off, no provisioning Job failed$([ "${mode}" = "${MODE_TODAY}" ] && echo ', and no A2A pod or Job left')"

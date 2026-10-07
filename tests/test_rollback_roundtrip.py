@@ -758,6 +758,33 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertIn("PASS pre.degraded-baseline: no Degraded condition set before the flip", result.stdout)
         self.assertRegex(result.stdout, r"PASS leg1\.not-degraded: .*\(baseline: none\)")
 
+    def test_a_pod_list_past_the_argv_limit_still_settles(self) -> None:
+        # A real install's pod list runs past what one argument may carry
+        # (128 KiB per string on Linux, about 1 MiB in all on macOS): the
+        # settle check that took it in argv died with E2BIG after
+        # leg1.creds-kept on a next-lane run. 1.5 MiB covers both limits.
+        state = healthy_next_state()
+        state["pods"][0]["metadata"]["annotations"] = {"example.com/bulk": "x" * (3 << 19)}
+        result, _, _ = self.run_sim(state)
+        self.assertNotIn("Argument list too long", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+        self.assertEqual(passed(result), _PASSING_ORDER)
+
+
+class KubectlJsonOffArgvTest(unittest.TestCase):
+    """No python3 -c call takes a kubectl document as an argument: it goes
+    on stdin, where no per-string or total argv limit applies."""
+
+    def test_no_python_call_takes_a_kubectl_document_in_argv(self) -> None:
+        source = _SCRIPT.read_text().replace("\\\n", " ")
+        calls = [line.split("python3 -c", 1)[1] for line in source.splitlines() if "python3 -c" in line]
+        # Guard against a vacuous pass: the settle check is one of them.
+        self.assertGreaterEqual(len(calls), 8, calls)
+        self.assertTrue(any('"${PY_STUCK}"' in call for call in calls), calls)
+        for call in calls:
+            for document in ("${pods}", "${jobs}", "${json}"):
+                self.assertNotIn(document, call, f"python3 -c{call}")
+
 
 def free_port() -> int:
     import socket
