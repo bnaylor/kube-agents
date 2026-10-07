@@ -137,7 +137,8 @@ def test_one_unminted_repetition_is_infrastructure_and_the_rest_grade(kanban_tas
     assert doc["passes"] == 2 and doc["scored"] == 2
     reason = doc["reps"][1]["reason"]
     assert reason.startswith(INFRA_FAILURE_MARKER)
-    assert "HTTP 500" in reason and "no run was started" in reason
+    assert "HTTP 500" in reason and "could not be minted before launch" in reason
+    assert "the record is scored" not in reason
     assert "harness or agent crash" not in reason
 
 

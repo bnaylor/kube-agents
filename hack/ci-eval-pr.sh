@@ -2593,8 +2593,10 @@ finish_case() { # <task-path> <task-name>
 # harness's own statement that infrastructure failed (harness.py
 # _infra_failure), which the gate reads as infrastructure whatever the task's
 # deployer and before it asks for scores (classify_rep in
-# bench/kube_agents_bench/scoring.py); the empty trajectory and zero
-# tokens.total are the never-ran signature the same function reads. So the
+# bench/kube_agents_bench/scoring.py). The empty trajectory and zero
+# tokens.total say the same to any other reader of the record; the marker is
+# what the gate classifies on, since a record with no scores map never
+# reaches the never-ran signature check. So the
 # repetition leaves the rate, its case is graded on the rest, a case that
 # loses all of them is excluded, and a suite that loses an admitted case or
 # every case reports not evaluated -- the treatment a repetition lost to the
@@ -2604,8 +2606,9 @@ finish_case() { # <task-path> <task-name>
 # (the wrong key, a missing grant, a malformed body) is a fault someone has to
 # fix, and one a change to the mint could cause, so it stays MISSING and
 # blocks. Written under the caller's task lock, as a run's state files are, so
-# the count after it is serial. Never fails the unit: a record that could not
-# be written leaves the run directory empty, which is the MISSING of before.
+# the count after it is serial. Never fails the unit, which still holds its
+# locks here: every write is guarded, and a record that could not be written
+# leaves the run directory empty, which is the MISSING of before.
 record_unit_not_run() { # <task-name> <rep> <reason>
   local name="$1" rep="$2" reason="$3" dir now
   dir="${STATE_DIR}/${EVAL_NOT_RUN_DIR}/${name}.rep${rep}"
@@ -2617,10 +2620,10 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump([record], fh)
 ' "${dir}/results.json" 2>/dev/null || true
   [ -s "${dir}/results.json" ] || dir=""
-  now="$(_now_ms)"
-  printf '%s\n' "${now}" > "${STATE_DIR}/${name}.rep${rep}.start"
-  printf '%s\n' "${now}" > "${STATE_DIR}/${name}.rep${rep}.end"
-  printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir"
+  now="$(_now_ms)" || now=0
+  printf '%s\n' "${now}" > "${STATE_DIR}/${name}.rep${rep}.start" || true
+  printf '%s\n' "${now}" > "${STATE_DIR}/${name}.rep${rep}.end" || true
+  printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir" || true
   echo "Repetition not run (${name} rep ${rep}): recorded as infrastructure -- ${reason}" >&2
 }
 

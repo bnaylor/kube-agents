@@ -182,6 +182,11 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: redding the case for a pod restart. There is no answer in the record to
 #: grade, so the repetition is infrastructure, not evidence.
 #:
+#: ``hack/ci-eval-pr.sh`` writes the same marker on a record with no scores at
+#: all for a repetition it could not start (``record_unit_not_run``: GitHub's
+#: token endpoint failing before launch), and holds its copy of the literal to
+#: this one in ``tests/test_ci_eval_ledger_mint.py``.
+#:
 #: The literal is duplicated rather than imported because importing the harness
 #: would drag ``devops_bench`` into the scorer, which otherwise reads records as
 #: plain JSON. ``test_scoring.py`` asserts the two strings agree, so the
@@ -999,16 +1004,19 @@ def classify_rep(
     Preserves the presubmit's existing three-way run classification: a missing
     or empty record is INFRA on a task with infrastructure and a blocking
     failure on a ``noop`` task. A record with no ``scores`` map blocks -- the
-    scoring pass crashed -- unless it is devops-bench's provision-failure
-    shape on a task with infrastructure, which is INFRA for the same reason
-    the missing record is: the deployer died before there was a run to score.
+    scoring pass crashed -- unless it carries the infrastructure marker (the
+    launcher's record of a repetition it could not start), or it is
+    devops-bench's provision-failure shape on a task with infrastructure,
+    which is INFRA for the same reason the missing record is: the deployer
+    died before there was a run to score.
 
     On the inject lane (:func:`_inject_lane_view`) the record is first re-read
     with its transport-blind checks set aside; every rung below then grades
     what remains, and a repetition with no objective check left is
     ``not_applicable`` rather than a pass or a fail. Only a record that
-    carries a scores map is re-read: a scoreless one is a crashed scoring
-    pass whatever transport it came through, and blocks below as before.
+    carries a scores map is re-read: a scoreless one without the marker is a
+    crashed scoring pass whatever transport it came through, and blocks below
+    as before.
     """
     record = load_run(run_dir) if run_dir is not None else None
     where = None if run_dir is None or str(run_dir) == MISSING else str(run_dir)
@@ -1074,7 +1082,8 @@ def classify_rep(
     # hack/ci-eval-pr.sh: GitHub's token endpoint failing before launch).
     # Same class, but "the record is scored" and "the harness exhausted its
     # retries" would both be false of it, so its reason is the record's own
-    # words after the marker, led by the marker for the dashboard.
+    # words after the marker, led by the marker as every infra reason the
+    # dashboard counts is.
     if record.error is not None and INFRA_FAILURE_MARKER in str(record.error):
         if not record.has_scores:
             errors = record.error if isinstance(record.error, list) else [record.error]
@@ -1082,8 +1091,8 @@ def classify_rep(
             detail = stated.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
             return rep(
                 "infra",
-                f"{INFRA_FAILURE_MARKER}: no run was started, so there is "
-                f"nothing to grade ({detail or 'no reason given'})",
+                f"{INFRA_FAILURE_MARKER}: the record holds no scored run, so "
+                f"there is nothing to grade ({detail or 'no reason given'})",
             )
         return rep(
             "infra",
