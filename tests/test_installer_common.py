@@ -1536,7 +1536,12 @@ class InstallerCommonTest(unittest.TestCase):
                 proc = self._announce(kubectl, helm_stub, key="today")
                 self.assertIn(f"WARN: The mode-switch check did not run: {what}", proc.stdout, proc.stderr)
                 self.assertIn("renders spec.mode from PLATFORM_AGENT_MODE=today in install.env", proc.stdout)
-                self.assertIn("kubectl get platformagents -n kubeagents-system", proc.stdout)
+                # The by-hand check names the context the reads asked.
+                self.assertIn(
+                    "kubectl get platformagents -n kubeagents-system"
+                    " --context gke_test-project_us-central1_test-cluster -o jsonpath=",
+                    proc.stdout,
+                )
                 self.assertNotIn("This apply switches", proc.stdout)
                 self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
 

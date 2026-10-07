@@ -600,7 +600,7 @@ note_platform_agent_mode_not_applied() {
 # read, $2 the key, $3 namespace.
 _platform_agent_mode_unread() {
   print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
-  print_info "Check before confirming: kubectl get platformagents -n ${3} -o jsonpath='{.items[*].spec.mode}' (empty is today)."
+  print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
 }
 
 # The front door's call, after the scope check beside it: $1 namespace, $2

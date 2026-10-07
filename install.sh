@@ -3884,9 +3884,9 @@ validate_platform_agent_mode() {
   # copied from install.env.example with the line still commented out) has
   # no mode to disagree with, so --mode fills it in, as a first install's
   # bootstrap would have, and every later run keeps it. Only checked here:
-  # the write waits for record_platform_agent_mode_flag, after the refusal
-  # gates and the confirmation, so a run that stops before then leaves the
-  # file as it was.
+  # the write waits for record_platform_agent_mode_flag, just before the
+  # handoff or the apply, so a run that stops before then leaves the file as
+  # it was.
   if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
     PLATFORM_AGENT_MODE_TO_RECORD="$value"
     if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
@@ -3913,10 +3913,10 @@ validate_platform_agent_mode() {
 # the file, the one write install.sh makes to an install.env it did not
 # create, and only of a key the file lacks, so nothing the operator wrote is
 # changed. Without it the flag would hold for this run alone and the next run,
-# or upgrade.sh, would go back to the default. main calls it once the run is
-# past its refusal gates and the operator has chosen the apply or the handoff
-# (or -y / --generate-only chose it), so a refused, declined or --dry-run run
-# writes nothing. Records what validate_platform_agent_mode left in
+# or upgrade.sh, would go back to the default. main calls it on each route as
+# the last step before the handoff or the apply, past the confirmation and
+# every step that can stop the run, so a refused, declined, failed or
+# --dry-run run writes nothing. Records what validate_platform_agent_mode left in
 # PLATFORM_AGENT_MODE_TO_RECORD, if anything.
 record_platform_agent_mode_flag() {
   local value="${PLATFORM_AGENT_MODE_TO_RECORD:-}" old_umask
@@ -6223,14 +6223,13 @@ main() {
         ;;
     esac
   fi
-  # Past every refusal and the confirmation: a --mode against an install.env
-  # that set no mode is recorded now, for the apply or the handoff this run
-  # commits to.
-  record_platform_agent_mode_flag
 
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
+    # Past every gate that can stop this route: a --mode against an
+    # install.env that set no mode is recorded for the handoff.
+    record_platform_agent_mode_flag
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
     exit 0
@@ -6303,6 +6302,10 @@ main() {
   local provisioning_log
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
+  # Past every gate that can stop this route (set -e makes each step above
+  # one): a --mode against an install.env that set no mode is recorded for
+  # the apply.
+  record_platform_agent_mode_flag
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
   # The one post-apply step Terraform cannot carry: the managed-OTel scope

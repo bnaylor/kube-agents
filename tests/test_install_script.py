@@ -5415,23 +5415,28 @@ class PlatformAgentModeTest(unittest.TestCase):
                     again = self._run('echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"', install_env=path)
                     self.assertIn(f"MODE=[{mode}]", again.stdout, again.stderr)
 
-    # main's step-11 confirmation through the record, run as it stands in
-    # main with the prompt and the container preflight stubbed.
+    # main's step-11 confirmation, run as it stands in main with the prompt
+    # and the container preflight stubbed, then the record; the source-order
+    # test below holds the record after it on both routes.
     _CONFIRM_START = '  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then\n    local confirm_choice=""\n'
-    _RECORD_CALL = "\n  record_platform_agent_mode_flag\n"
+    _CONFIRM_END = "\n    esac\n  fi\n"
+    # One call per route: the generate-only one inside its branch, the apply
+    # one at main's top level.
+    _RECORD_HANDOFF = "\n    record_platform_agent_mode_flag\n"
+    _RECORD_APPLY = "\n  record_platform_agent_mode_flag\n"
 
     def _confirm_block(self):
         text = _INSTALL_SH.read_text()
         main_start = text.index("\nmain() {")
         start = text.index(self._CONFIRM_START, main_start)
-        end = text.index(self._RECORD_CALL, start) + len(self._RECORD_CALL)
+        end = text.index(self._CONFIRM_END, start) + len(self._CONFIRM_END)
         block = text[start:end]
-        # The slice is the prompt, its three arms and the record, nothing
-        # else: a reshaped main fails here rather than testing a fragment.
+        # The slice is the prompt and its three arms, nothing else: a
+        # reshaped main fails here rather than testing a fragment.
         self.assertIn("Provisioning paused by user", block)
         self.assertIn("check_scope_container_access || exit 1", block)
         self.assertLess(len(block.splitlines()), 40, block)
-        return block
+        return block + "  record_platform_agent_mode_flag\n"
 
     def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
         block = self._confirm_block()
@@ -5467,22 +5472,60 @@ class PlatformAgentModeTest(unittest.TestCase):
     def test_the_record_follows_every_refusal_and_precedes_the_apply(self):
         text = _INSTALL_SH.read_text()
         main_start = text.index("\nmain() {")
-        record = text.index(self._RECORD_CALL, main_start)
-        self.assertEqual(text.count(self._RECORD_CALL), 1)
+        self.assertEqual(text.count(self._RECORD_HANDOFF), 1)
+        self.assertEqual(text.count(self._RECORD_APPLY), 1)
+        handoff_record = text.index(self._RECORD_HANDOFF, main_start)
+        apply_record = text.index(self._RECORD_APPLY, main_start)
+        # Shared by both routes: everything above the generate-only branch
+        # that can stop the run.
         for gate in (
             "validate_platform_agent_mode || exit 1",
             "check_service_account_ownership || exit 1",
             'refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n',
             'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"',
-            'check_existing_cluster_network_policy_preflight "$project_id"',
             'write_json_report "DRY_RUN_SUCCESS"',
+            'check_existing_cluster_node_pools_preflight "$project_id"',
+            'check_existing_cluster_network_policy_preflight "$project_id"',
             'write_json_report "PAUSED"',
+            "check_scope_container_access || exit 1",
         ):
-            with self.subTest(gate=gate):
-                self.assertLess(text.index(gate, main_start), record)
-        for after in ('print_generate_only_handoff "$repo_dir"', 'run_lifecycle_apply "$repo_dir" "$provisioning_log"'):
-            with self.subTest(after=after):
-                self.assertLess(record, text.index(after, main_start))
+            for record in (handoff_record, apply_record):
+                with self.subTest(gate=gate, record=record):
+                    self.assertLess(text.index(gate, main_start), record)
+        # Generate-only: the org check (which exits 1 on a user account or a
+        # missing org) is the one gate inside the branch; the record follows
+        # it and nothing but the handoff follows the record.
+        generate_only = text.index('  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n    print_info "Generate-only:', main_start)
+        org_check = 'check_github_org_is_organization "${GITOPS_ORG:-}"'
+        self.assertLess(generate_only, text.index(org_check, generate_only))
+        self.assertLess(text.index(org_check, generate_only), handoff_record)
+        self.assertTrue(
+            text[handoff_record + len(self._RECORD_HANDOFF) :].startswith('    print_generate_only_handoff "$repo_dir"'),
+            text[handoff_record : handoff_record + 200],
+        )
+        # Apply: every step from step 12 to the apply exits the run on failure
+        # under set -e; the ones that can refuse or fail are listed, and the
+        # record must follow each and sit directly above the apply.
+        step_12 = text.index('print_step "12. Applying the Install', main_start)
+        for gate in (
+            org_check,
+            'enable_scope_selector_apis "$project_id"',
+            'ensure_existing_cluster_network_policy "$project_id"',
+            'ensure_existing_cluster_workload_identity "$project_id"',
+            'ensure_existing_cluster_cmek "$project_id"',
+            'import_github_pem "$project_id" "$region" || exit 1',
+            'minter_enabled_version="$(kms_key_enabled_version',
+            "or unset GITHUB_APP_ID to install without the minter.\"\n    exit 1\n",
+            'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
+            'apply_crd_upgrades "$repo_dir"',
+        ):
+            with self.subTest(apply_gate=gate):
+                self.assertLess(step_12, text.index(gate, step_12))
+                self.assertLess(text.index(gate, step_12), apply_record)
+        self.assertTrue(
+            text[apply_record + len(self._RECORD_APPLY) :].startswith('  run_lifecycle_apply "$repo_dir" "$provisioning_log"'),
+            text[apply_record : apply_record + 200],
+        )
 
     def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
