@@ -6,6 +6,13 @@ turn, a reply in a thread the bot has answered in is a turn, a listed sender get
 status line and an answer, and anyone else gets the refusal notice once. The harness
 runs end to end through its real urllib transport against it. The clock and sleep
 are fakes, so the bounded polls time out without waiting.
+
+The harness posts nothing: a person types each turn. FakeHuman is that person. The
+harness hands it each turn it prints a TYPE line for, and it types the turn into the
+fake Slack a few reads later, the way Slack renders a typed message (no bot_id, no
+app_id, an @-picked mention as <@U...>), unless a test tells it to get it wrong. A post
+made with a user token through chat.postMessage comes back carrying the app's bot_id
+and app_id, as the live run of 2026-10-07 showed real Slack does.
 """
 
 import base64
@@ -38,6 +45,9 @@ LISTED_ID = "U0LISTED1"
 UNLISTED_ID = "U0UNLIST1"
 BOT_ID = "U0BOTKAGE"
 BOT_APP_BOT_ID = "B0BOTKAGE"
+BOT_NAME = "kage"
+USER_NAMES = {LISTED_ID: "listed", UNLISTED_ID: "unlisted", BOT_ID: BOT_NAME}
+DISPLAY_NAMES = {LISTED_ID: "Lisa Listed", UNLISTED_ID: "Una Unlisted"}
 CHANNEL_ID = "C0KATEST1"
 CHANNEL_NAME = "ka-test"
 HOME_ID = "C0HOME001"
@@ -68,6 +78,7 @@ class FakeWorld:
     def __init__(self):
         self.lock = threading.Lock()
         self.ts_counter = 100
+        self.wall = lambda: 1700000000.0
         self.secrets = {LISTED_SECRET: LISTED_TOKEN, UNLISTED_SECRET: UNLISTED_TOKEN}
         self.tokens = {LISTED_TOKEN: LISTED_ID, UNLISTED_TOKEN: UNLISTED_ID}
         self.listed = {LISTED_ID}
@@ -77,9 +88,14 @@ class FakeWorld:
         self.notified = set()
         # Behaviour switches the tests flip.
         self.mode = "answer"  # answer | silent | refuse-all | answer-everyone | top-level | status-only | fail
-        self.user_posts_carry_bot_id = False
-        self.user_post_subtype = ""
-        self.user_posts_without_user = False
+        # Every Web API method called, in order: the harness must never post.
+        self.methods = []
+        # A user's team, for the preflight's same-workspace check.
+        self.teams = {}
+        # Turns the fake human has typed that land once reads reach their due count.
+        self.pending_typed = []
+        # Conversation reads that fail with a Slack error, by channel.
+        self.channel_errors = {}
         # A task answer that lands this many reads later, with a fresh ts, the way a real
         # answer arrives after the user has moved on.
         self.answer_after_reads = 0
@@ -90,9 +106,6 @@ class FakeWorld:
         self.secret_error_body = None
         self.reply_delay_reads = 0
         self.reads = 0
-        self.not_in_channel = set()
-        self.user_post_user_override = ""
-        self.history_hides_latest = False
         self.refusal = REFUSAL
         self.extra_members = []
         self.bot_ids = {BOT_ID}
@@ -107,8 +120,10 @@ class FakeWorld:
         self.conversation_list_types = []
 
     def next_ts(self):
+        # Slack's ts is its clock at the post: it follows the fake wall clock, so a
+        # message typed late in a test is still inside the harness's lookback.
         self.ts_counter += 1
-        return f"1700000000.{self.ts_counter:06d}"
+        return f"{int(self.wall())}.{self.ts_counter:06d}"
 
     def dm_for(self, a, b):
         key = frozenset({a, b})
@@ -174,7 +189,24 @@ class FakeWorld:
             return
         self.finish(channel, status, self.answer_text, reply_thread, "✅ *completed*")
 
+    def type_message(self, user, channel, text, thread_ts="", extra=None):
+        """A message a person typed in Slack: it reaches the gateway as a turn candidate."""
+        msg = {"type": "message", "user": user, "text": text, "ts": self.next_ts(), **(extra or {})}
+        if extra and extra.get("user") is None and "user" in extra:
+            del msg["user"]
+        if thread_ts:
+            msg["thread_ts"] = thread_ts
+        self.channels[channel].append(msg)
+        # The gateway's own filter (inbound() in a2a/gateway/slack.go): bot traffic is no turn.
+        if not msg.get("bot_id") and msg.get("subtype", "") in harness.TURN_SUBTYPES and msg.get("user"):
+            self.gateway_turn(channel, msg["user"], msg)
+        return msg
+
     def materialize(self):
+        typed = [t for t in self.pending_typed if t[0] <= self.reads]
+        self.pending_typed = [t for t in self.pending_typed if t[0] > self.reads]
+        for _, args in typed:
+            self.type_message(*args)
         due = [d for d in self.deferred if d[0] <= self.reads]
         self.deferred = [d for d in self.deferred if d[0] > self.reads]
         for _, channel, status, thread in due:
@@ -184,10 +216,13 @@ class FakeWorld:
         return [{k: v for k, v in m.items() if k != "visible_at"} for m in msgs if m.get("visible_at", 0) <= self.reads]
 
     def slack(self, method, user, params):
+        self.methods.append(method)
         if method in self.slack_error_override:
             return {"ok": False, "error": self.slack_error_override[method]}
+        if method in ("conversations.history", "conversations.replies") and params.get("channel") in self.channel_errors:
+            return {"ok": False, "error": self.channel_errors[params["channel"]]}
         if method == "auth.test":
-            return {"ok": True, "user_id": user, "team_id": TEAM_ID}
+            return {"ok": True, "user_id": user, "user": USER_NAMES.get(user, user.lower()), "team_id": self.teams.get(user, TEAM_ID)}
         if method == "users.list":
             return {"ok": True, "members": [
                 {"id": LISTED_ID, "name": "listed", "is_bot": False},
@@ -195,7 +230,10 @@ class FakeWorld:
                 *self.extra_members,
             ], "response_metadata": {"next_cursor": self.list_cursor}}
         if method == "users.info":
-            return {"ok": True, "user": {"id": params["user"], "is_bot": params["user"] in self.bot_ids}}
+            uid = params["user"]
+            name = USER_NAMES.get(uid, uid.lower())
+            return {"ok": True, "user": {"id": uid, "name": name, "is_bot": uid in self.bot_ids,
+                                         "profile": {"display_name": DISPLAY_NAMES.get(uid, "")}}}
         if method == "conversations.list":
             types = params.get("types", "public_channel").split(",")
             self.conversation_list_types.append(params.get("types", ""))
@@ -208,31 +246,16 @@ class FakeWorld:
         if method == "conversations.open":
             return {"ok": True, "channel": {"id": self.dm_for(user, params["users"])}}
         if method == "chat.postMessage":
-            channel = params["channel"]
-            if channel in self.not_in_channel and user in self.not_in_channel:
-                return {"ok": False, "error": "not_in_channel"}
-            msg = {"type": "message", "user": user, "text": params["text"], "ts": self.next_ts()}
-            if params.get("thread_ts"):
-                msg["thread_ts"] = params["thread_ts"]
-            if self.user_posts_carry_bot_id:
-                msg["bot_id"] = "B0USERAPP"
-                msg["app_id"] = "A0USERAPP"
-            if self.user_post_subtype:
-                msg["subtype"] = self.user_post_subtype
-            if self.user_posts_without_user:
-                del msg["user"]
-            if self.user_post_user_override:
-                msg["user"] = self.user_post_user_override
-            self.channels[channel].append(msg)
-            self.gateway_turn(channel, user, msg)
-            return {"ok": True, "channel": channel, "ts": msg["ts"]}
+            # Live run 2026-10-07: a user-token post made through an app carries the
+            # app's bot_id and app_id, so the gateway drops it as bot traffic.
+            msg = self.type_message(user, params["channel"], params["text"], params.get("thread_ts", ""),
+                                    {"bot_id": "B0USERAPP", "app_id": "A0USERAPP"})
+            return {"ok": True, "channel": params["channel"], "ts": msg["ts"]}
         if method == "conversations.history":
             self.reads += 1
             self.materialize()
             msgs = [m for m in self.channels[params["channel"]] if not m.get("thread_ts") or m["thread_ts"] == m["ts"]]
-            if "latest" in params:
-                msgs = [] if self.history_hides_latest else [m for m in msgs if m["ts"] == params["latest"]]
-            elif "oldest" in params:
+            if "oldest" in params:
                 msgs = [m for m in msgs if float(m["ts"]) > float(params["oldest"])]
             return {"ok": True, "messages": list(reversed(self.visible(msgs)))}
         if method == "conversations.replies":
@@ -291,6 +314,55 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(200, payload)
 
 
+class FakeHuman:
+    """The person at the keyboard: types each turn the harness asks for, a few reads later.
+
+    The switches make it get the turn wrong the ways a person (or a script) can.
+    """
+
+    def __init__(self, world):
+        self.world = world
+        self.turns = []
+        # Reads after the prompt before the message lands: 1 is the first read.
+        self.delay_reads = 1
+        self.absent = False
+        self.as_user = ""
+        self.via_app = False
+        self.drops_nonce = False
+        self.plain_at = False
+        self.subtype = ""
+        self.no_user = False
+        # When set, the switches apply to this check's turn only; every other turn is typed right.
+        self.only = None
+
+    def __call__(self, turn):
+        self.turns.append(turn)
+        if self.only is not None and turn.check != self.only:
+            user = turn.user_id
+            text = turn.text.replace(f"@{BOT_NAME}", f"<@{BOT_ID}>")
+            with self.world.lock:
+                self.world.pending_typed.append((self.world.reads + 1, (user, turn.channel, text, turn.thread_ts, {})))
+            return
+        if self.absent:
+            return
+        text = turn.text
+        if self.drops_nonce:
+            text = text.replace(turn.nonce, "").strip()
+        if not self.plain_at:
+            # Picking the bot from Slack's @ list renders it as a link to its member id.
+            text = text.replace(f"@{BOT_NAME}", f"<@{BOT_ID}>")
+        extra = {}
+        if self.via_app:
+            extra.update({"bot_id": "B0USERAPP", "app_id": "A0USERAPP"})
+        if self.subtype:
+            extra["subtype"] = self.subtype
+        if self.no_user:
+            extra["user"] = None
+        user = self.as_user or turn.user_id
+        with self.world.lock:
+            self.world.pending_typed.append((self.world.reads + self.delay_reads, (user, turn.channel, text, turn.thread_ts, extra)))
+
+
 class Unbounded(BaseException):
     """A poll that outran every timeout. A BaseException, so harness.main's
     `except Exception` cannot turn it into an ERROR line and an exit code."""
@@ -331,11 +403,14 @@ class HarnessTestCase(unittest.TestCase):
             "--project", PROJECT,
             "--poll-interval", "5",
             "--reply-timeout", "60",
+            "--type-timeout", "60",
             "--quiet-window", "20",
             "--run-id", "testrun",
             "--bot-name", "kage",
         ]
         self.fake = FakeClock()
+        self.world.wall = self.fake.wall
+        self.human = FakeHuman(self.world)
 
     def tearDown(self):
         self.server.shutdown()
@@ -344,7 +419,8 @@ class HarnessTestCase(unittest.TestCase):
     def run_harness(self, *extra):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = harness.main([*self.endpoint_args, *extra], clock=self.fake.clock, sleep=self.fake.sleep, wall=self.fake.wall)
+            code = harness.main([*self.endpoint_args, *extra], clock=self.fake.clock, sleep=self.fake.sleep, wall=self.fake.wall,
+                                typist=self.human)
         text = out.getvalue() + err.getvalue()
         for value in ALL_TOKENS:
             self.assertNotIn(value, text, "a credential reached the output")
@@ -365,72 +441,192 @@ class HarnessTestCase(unittest.TestCase):
 
 
 class PreflightTest(HarnessTestCase):
-    def test_preflight_passes_and_reports_fields(self):
-        code, text = self.run_harness("--checks", "dm")
+    def test_preflight_checks_each_identity_and_posts_nothing(self):
+        code, text = self.run_harness("--checks", "dm,unlisted")
         self.assertEqual(code, harness.EXIT_OK, text)
-        self.assertIn("PASS preflight-listed: user=U0LISTED1, no bot_id", text)
+        self.assertIn("PASS preflight-listed: U0LISTED1 (@Lisa Listed) is a person's account in team T0TEAM001", text)
+        self.assertIn("PASS preflight-unlisted: U0UNLIST1 (@Una Unlisted) is a person's account in team T0TEAM001", text)
         ev = self.evidence(text, "preflight-listed")
-        self.assertEqual(ev["bot_id"], "")
-        self.assertEqual(ev["user"], LISTED_ID)
+        self.assertEqual((ev["user"], ev["team"], ev["is_bot"]), (LISTED_ID, TEAM_ID, False))
+        self.assertNotIn("chat.postMessage", self.world.methods)
 
-    def test_preflight_fails_on_bot_id_and_reports_app_id(self):
-        self.world.user_posts_carry_bot_id = True
-        code, text = self.run_harness("--checks", "dm,mention", "--keep-going")
-        self.assertEqual(code, harness.EXIT_FAIL)
-        fail = self.line(text, "FAIL preflight-listed")
-        self.assertIn("bot_id=B0USERAPP", fail)
-        self.assertIn("app_id=A0USERAPP (the gateway's filter ignores app_id)", fail)
+    def test_preflight_fails_when_a_test_token_belongs_to_a_bot_user(self):
+        self.world.bot_ids.add(UNLISTED_ID)
+        code, text = self.run_harness("--checks", "dm,unlisted", "--keep-going")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("U0UNLIST1 is a bot user", self.line(text, "FAIL preflight-unlisted"))
         # A failed preflight stops the run even under --keep-going.
-        self.assertNotIn(" dm:", text)
-        self.assertIn("SUMMARY pass=0 fail=1", text)
+        self.assertNotIn("TYPE ", text)
+        self.assertIn("SUMMARY pass=1 fail=1", text)
 
-    def test_preflight_fails_on_non_turn_subtype(self):
-        self.world.user_post_subtype = "bot_message"
-        code, text = self.run_harness("--checks", "dm")
-        self.assertEqual(code, harness.EXIT_FAIL)
-        self.assertIn("subtype 'bot_message' is not a turn", self.line(text, "FAIL preflight-listed"))
-
-    def test_preflight_fails_without_a_user_field(self):
-        self.world.user_posts_without_user = True
-        code, text = self.run_harness("--checks", "dm")
-        self.assertEqual(code, harness.EXIT_FAIL)
-        self.assertIn("it has no user field", self.line(text, "FAIL preflight-listed"))
-
-    def test_preflight_fails_when_the_post_reads_back_under_another_user(self):
-        self.world.user_post_user_override = "U0OTHER01"
-        code, text = self.run_harness("--checks", "dm")
-        self.assertEqual(code, harness.EXIT_FAIL)
-        self.assertIn("its user U0OTHER01 is not the token's user U0LISTED1", self.line(text, "FAIL preflight-listed"))
-
-    def test_preflight_fails_when_the_post_cannot_be_read_back(self):
-        self.world.history_hides_latest = True
-        code, text = self.run_harness("--checks", "dm")
-        self.assertEqual(code, harness.EXIT_FAIL)
-        self.assertIn("could not be read back", self.line(text, "FAIL preflight-listed"))
+    def test_preflight_fails_when_the_users_are_in_different_workspaces(self):
+        self.world.teams[UNLISTED_ID] = "T0OTHER01"
+        code, text = self.run_harness("--checks", "unlisted")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("team T0OTHER01, not the listed user's team T0TEAM001", self.line(text, "FAIL preflight-unlisted"))
 
     def test_a_slack_error_in_the_preflight_is_its_fail(self):
-        self.world.slack_error_override["conversations.history"] = "internal_error"
+        original = self.world.slack
+
+        def users_info_fails_for_people(method, user, params):
+            if method == "users.info" and params.get("user") == LISTED_ID:
+                return {"ok": False, "error": "internal_error"}
+            return original(method, user, params)
+
+        self.world.slack = users_info_fails_for_people
         code, text = self.run_harness("--checks", "dm")
         self.assertEqual(code, harness.EXIT_FAIL, text)
-        self.assertIn("error: Slack conversations.history failed: internal_error", self.line(text, "FAIL preflight-listed"))
+        self.assertIn("error: Slack users.info failed: internal_error", self.line(text, "FAIL preflight-listed"))
         self.assertIn("SUMMARY pass=0 fail=1", text)
         self.assertNotIn("setup failed", text)
-
-    def test_preflight_accepts_thread_broadcast(self):
-        self.world.user_post_subtype = "thread_broadcast"
-        code, text = self.run_harness("--checks", "dm")
-        self.assertEqual(code, harness.EXIT_OK, text)
-
-    def test_preflight_falls_back_to_self_dm_outside_the_channel(self):
-        self.world.not_in_channel = {CHANNEL_ID, UNLISTED_ID}
-        code, text = self.run_harness("--checks", "unlisted")
-        self.assertEqual(code, harness.EXIT_OK, text)
-        ev = self.evidence(text, "preflight-unlisted")
-        self.assertTrue(ev["channel"].startswith("D"), ev)
 
     def test_preflight_runs_for_the_unlisted_token_only_when_needed(self):
         _, text = self.run_harness("--checks", "dm")
         self.assertNotIn("preflight-unlisted", text)
+
+
+class TypedTurnTest(HarnessTestCase):
+    """Each user turn is typed by a person: the TYPE line, the wait, and the typed message's checks."""
+
+    TYPED_CHECKS = (("dm", ()), ("mention", ()), ("thread", ()), ("unlisted", ()), ("restart", ()),
+                    ("unlisted", ("--unlisted-via", "mention")))
+
+    def fresh(self, check):
+        """A new fake Slack for one subtest, whose human gets only check's turn wrong."""
+        self.tearDown()
+        self.setUp()
+        self.human.only = check
+
+    def run_check(self, check, *extra):
+        checks = "mention,thread" if check == "thread" else check
+        return self.run_harness("--checks", checks, *extra)
+
+    def type_line(self, text, check):
+        lines = [ln for ln in text.splitlines() if ln.startswith("TYPE ") and f"slc-{check}-" in ln]
+        self.assertEqual(len(lines), 1, text)
+        return lines[0]
+
+    def test_each_check_prints_one_type_line_and_passes_on_the_typed_turn(self):
+        for check, extra in self.TYPED_CHECKS:
+            with self.subTest(check=check, extra=extra):
+                self.fresh(check)
+                code, text = self.run_check(check, *extra)
+                self.assertEqual(code, harness.EXIT_OK, text)
+                turn = self.human.turns[-1]
+                line = self.type_line(text, check)
+                # The exact text, nonce included, ends the line: copy it as is.
+                self.assertTrue(line.endswith(": " + turn.text), line)
+                self.assertIn(turn.nonce, turn.text)
+                who = "@Una Unlisted (U0UNLIST1)" if check == "unlisted" else "@Lisa Listed (U0LISTED1)"
+                self.assertIn(f"TYPE within 60s as {who} in ", line)
+                ev = self.evidence(text, check)
+                self.assertEqual(ev["nonce"], turn.nonce)
+                self.assertEqual(ev["typed_by"], turn.user_id)
+                self.assertIn(f"PASS {check}:", text)
+                self.assertNotIn("chat.postMessage", self.world.methods)
+
+    def test_the_type_lines_say_where_to_type(self):
+        code, text = self.run_harness("--checks", "dm,mention,thread")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        dm, mention, thread = self.human.turns
+        self.assertIn(f"in your DM with @{BOT_NAME} ({dm.channel}): ", self.type_line(text, "dm"))
+        self.assertIn(f"in #{CHANNEL_NAME} ({CHANNEL_ID}), top level, picking @{BOT_NAME} from Slack's list: @{BOT_NAME} ",
+                      self.type_line(text, "mention"))
+        root = self.evidence(text, "mention")["sent_ts"]
+        self.assertEqual(thread.thread_ts, root)
+        self.assertIn(f"in the thread under your mention in #{CHANNEL_NAME} ({CHANNEL_ID}), thread ts={root}, "
+                      "without mentioning the bot: ", self.type_line(text, "thread"))
+        self.assertNotIn(f"@{BOT_NAME}", thread.text)
+
+    def test_the_wait_polls_until_the_typed_message_lands(self):
+        self.human.delay_reads = 4
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertEqual(self.fake.slept, [5, 5, 5])
+
+    def test_a_typed_message_with_a_bot_id_fails(self):
+        for check, extra in self.TYPED_CHECKS:
+            with self.subTest(check=check, extra=extra):
+                self.fresh(check)
+                self.human.via_app = True
+                code, text = self.run_check(check, *extra)
+                self.assertEqual(code, harness.EXIT_FAIL, text)
+                line = self.line(text, f"FAIL {check}")
+                self.assertIn("carries bot_id=B0USERAPP", line)
+                self.assertIn("app_id=A0USERAPP", line)
+                self.assertIn("a message a person types has neither", line)
+                self.assertNotIn("PASS " + check, text)
+                ev = self.evidence(text, check)
+                self.assertEqual((ev["typed_bot_id"], ev["typed_app_id"]), ("B0USERAPP", "A0USERAPP"))
+
+    def test_a_bot_id_fails_at_once_without_waiting_for_the_bot(self):
+        self.human.via_app = True
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertEqual(self.fake.slept, [])
+
+    def test_a_message_from_the_wrong_user_fails(self):
+        for check, extra in self.TYPED_CHECKS:
+            with self.subTest(check=check, extra=extra):
+                self.fresh(check)
+                self.human.as_user = "U0SOMEONE"
+                self.world.listed.add("U0SOMEONE")
+                code, text = self.run_check(check, *extra)
+                self.assertEqual(code, harness.EXIT_FAIL, text)
+                self.assertIn("was typed by U0SOMEONE, not", self.line(text, f"FAIL {check}"))
+
+    def test_a_message_without_the_nonce_times_out(self):
+        for check, extra in self.TYPED_CHECKS:
+            with self.subTest(check=check, extra=extra):
+                self.fresh(check)
+                self.human.drops_nonce = True
+                code, text = self.run_check(check, *extra)
+                self.assertEqual(code, harness.EXIT_FAIL, text)
+                turn = self.human.turns[-1]
+                line = self.line(text, f"FAIL {check}")
+                self.assertIn(f"no message containing {turn.nonce} within 60.0s", line)
+
+    def test_nobody_typing_fails_after_a_bounded_wait(self):
+        self.human.absent = True
+        code, text = self.run_harness("--checks", "dm", "--type-timeout", "45")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        turn = self.human.turns[0]
+        self.assertIn(f"no message containing {turn.nonce} within 45.0s", self.line(text, "FAIL dm"))
+        self.assertIn("TYPE within 45s as", text)
+        self.assertAlmostEqual(sum(self.fake.slept), 45.0)
+
+    def test_a_mention_typed_as_plain_text_fails(self):
+        self.human.plain_at = True
+        code, text = self.run_harness("--checks", "mention")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn(f"does not mention the bot (no <@{BOT_ID}> in its text)", self.line(text, "FAIL mention"))
+
+    def test_a_typed_message_the_gateway_would_not_take_as_a_turn_fails(self):
+        self.human.subtype = "bot_message"
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("its subtype 'bot_message' is not a turn", self.line(text, "FAIL dm"))
+        self.fresh("dm")
+        self.human.no_user = True
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("it has no user field", self.line(text, "FAIL dm"))
+
+    def test_unlisted_repeat_is_a_second_typed_turn(self):
+        code, text = self.run_harness("--checks", "unlisted", "--unlisted-repeat")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertEqual([t.check for t in self.human.turns], ["unlisted", "unlisted-repeat"])
+        self.assertIn("PASS unlisted-repeat: no reply to the second message in 20.0s", text)
+
+    def test_the_type_line_is_redacted(self):
+        code, text = self.run_harness("--checks", "dm", "--prompt", f"say {LISTED_TOKEN}")
+        self.assertIn(harness.REDACTED, self.type_line(text, "dm"))
+
+    def test_type_timeout_is_a_finite_flag_with_a_default(self):
+        self.assertEqual(harness.parse_args(["--bot-name", "kage"]).type_timeout, harness.DEFAULT_TYPE_TIMEOUT_SECONDS)
+        self.assertEqual(harness.DEFAULT_TYPE_TIMEOUT_SECONDS, 300)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            harness.parse_args(["--type-timeout", "inf", "--bot-name", "kage"])
 
 
 class ListedChecksTest(HarnessTestCase):
@@ -703,13 +899,13 @@ class ListedChecksTest(HarnessTestCase):
         self.assertIn("did not settle", self.line(text, "FAIL thread"))
 
     def test_a_slack_error_in_a_check_is_its_fail_and_keep_going_carries_on(self):
-        # The listed user is not in the channel: the preflight falls back to the
-        # self-DM, dm passes, and the mention's post raises not_in_channel.
-        self.world.not_in_channel = {CHANNEL_ID, LISTED_ID}
+        # The listed user cannot read the channel: dm passes, and the mention's wait
+        # for the typed message raises not_in_channel.
+        self.world.channel_errors[CHANNEL_ID] = "not_in_channel"
         code, text = self.run_harness("--checks", "dm,mention,thread", "--keep-going")
         self.assertEqual(code, harness.EXIT_FAIL, text)
         self.assertIn("PASS dm:", text)
-        self.assertIn("error: Slack chat.postMessage failed: not_in_channel", self.line(text, "FAIL mention"))
+        self.assertIn("error: Slack conversations.history failed: not_in_channel", self.line(text, "FAIL mention"))
         self.assertIn("no thread to reply in", self.line(text, "FAIL thread"))
         self.assertIn("SUMMARY pass=2 fail=2", text)
         self.assertNotIn("setup failed", text)
@@ -1112,14 +1308,16 @@ class UnitTest(unittest.TestCase):
 
     def test_time_budget_covers_every_wait(self):
         args = harness.parse_args(["--checks", "all,home", "--home-channel", "c", "--unlisted-repeat", "--bot-name", "kage"])
-        self.assertEqual(harness.time_budget(args), 180 + 180 + 360 + 180 + 30 + 300)
+        # Each typed turn waits up to --type-timeout for the person, then for the bot:
+        # dm, mention, thread (after the mention's task settles), unlisted and its repeat.
+        self.assertEqual(harness.time_budget(args), (300 + 180) + (300 + 180) + (300 + 360) + (300 + 180) + (300 + 30) + 300)
 
     def test_an_invalid_home_match_is_refused_at_parse_time(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             harness.parse_args(["--checks", "home", "--home-channel", "c", "--home-match", "(", "--bot-name", "kage"])
 
     def test_non_finite_timeouts_are_refused(self):
-        for flag in ("--reply-timeout", "--poll-interval", "--quiet-window", "--home-timeout", "--home-since"):
+        for flag in ("--reply-timeout", "--poll-interval", "--quiet-window", "--home-timeout", "--home-since", "--type-timeout"):
             for value in ("inf", "-inf", "nan", "infinity"):
                 with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()) as err, \
                         self.assertRaises(SystemExit):

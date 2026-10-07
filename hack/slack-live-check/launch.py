@@ -2,7 +2,9 @@
 """Workstation launcher for the Slack live check: one Kubernetes Job per run.
 
 It renders manifests/job.yaml.template, ships harness.py in a ConfigMap, applies
-both, waits for the Job, prints the harness's PASS/FAIL lines and deletes both.
+both, and streams the pod's log here while the Job runs, so the harness's TYPE
+lines reach the person who has to type each turn in Slack. Then it reconciles
+the PASS/FAIL lines against the checks asked for and deletes both.
 The checks that need kubectl run here, under the caller's own credentials and
 the --context it pins on every call, never in the pod:
 
@@ -113,7 +115,7 @@ LAUNCHER_OWNED_HARNESS_FLAGS = (CHECKS_FLAG, RUN_ID_FLAG, PROJECT_FLAG, KEEP_GOI
 # the pod's Workload Identity token, to whatever host the workstation names.
 FORWARDABLE_HARNESS_FLAGS = frozenset({
     "--listed-secret", "--unlisted-secret", "--bot-user-id", "--bot-name", "--channel",
-    "--thread-ts", "--prompt", "--followup", "--wait-answer", "--reply-timeout",
+    "--thread-ts", "--prompt", "--followup", "--type-timeout", "--wait-answer", "--reply-timeout",
     "--poll-interval", "--unlisted-via", "--unlisted-repeat", "--quiet-window", "--refusal-silence-ok",
     "--home-channel", "--home-since", "--home-timeout", "--home-match",
 })
@@ -271,6 +273,53 @@ def parse_harness_output(text: str) -> tuple[list[tuple[str, bool, str]], list[d
     return results, evidence
 
 
+class LogStream:
+    """The Job's pod log, printed here line by line while the Job runs.
+
+    poll() reads the whole log and prints the complete lines it has not printed
+    yet; a line without its newline waits for the next read. A read that fails (the
+    pod not started, an API blip) is skipped: the next tick reads again. finish()
+    reads once more after the Job ends and prints the rest.
+    """
+
+    def __init__(self, kubectl: "Kubectl", namespace: str, job_name: str) -> None:
+        self.kubectl = kubectl
+        self.namespace = namespace
+        self.job_name = job_name
+        self.text = ""
+        self.printed = 0
+
+    def _read(self) -> str:
+        return self.kubectl.run(["logs", "-n", self.namespace, f"job/{self.job_name}", "-c", HARNESS_CONTAINER, "--tail=-1"])
+
+    def _emit(self, text: str, final: bool) -> None:
+        # The log only grows; a shorter read (a pod that is not there yet) adds nothing.
+        if len(text) < len(self.text):
+            return
+        self.text = text
+        lines = text.splitlines()
+        if not final and text and not text.endswith("\n"):
+            lines = lines[:-1]
+        for line in lines[self.printed:]:
+            say(line)
+        self.printed = max(self.printed, len(lines))
+
+    def poll(self) -> None:
+        try:
+            self._emit(self._read(), final=False)
+        except LaunchError:
+            return
+
+    def finish(self) -> str:
+        try:
+            self._emit(self._read(), final=True)
+        except LaunchError as exc:
+            if not self.text:
+                say(f"JOB {self.job_name}: no pod log ({exc})")
+            self._emit(self.text, final=True)
+        return self.text
+
+
 class Launcher:
     def __init__(self, args: argparse.Namespace, forwarded: list[str], kubectl: Kubectl,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
@@ -386,18 +435,15 @@ class Launcher:
                                                  deadline)
         ns = self.args.namespace
         say(f"JOB {job_name} in {ns}: checks={','.join(checks)} image={image}")
+        say(f"JOB {job_name}: its log follows as the harness prints it. Type each TYPE line's text in Slack, "
+            "as the user it names and where it says, before its wait runs out")
         started = self.clock()
         try:
             self.kubectl.run(["apply", "-f", "-"], stdin=configmap)
             self.kubectl.run(["apply", "-f", "-"], stdin=job)
-            state = self.wait_job(job_name, deadline)
-            logs = ""
-            try:
-                logs = self.kubectl.run(["logs", "-n", ns, f"job/{job_name}", "-c", HARNESS_CONTAINER, "--tail=-1"])
-            except LaunchError as exc:
-                say(f"JOB {job_name}: no pod log ({exc})")
-            for line in logs.splitlines():
-                say(line)
+            stream = LogStream(self.kubectl, ns, job_name)
+            state = self.wait_job(job_name, deadline, stream.poll)
+            logs = stream.finish()
             results, evidence = parse_harness_output(harness.REDACTOR.redact(logs))
             self.results.extend(results)
             if state != "Complete" and not any(not passed for _, passed, _ in results):
@@ -418,9 +464,12 @@ class Launcher:
                 except LaunchError as exc:
                     say(f"CLEANUP {kind}/{job_name} not deleted: {exc}")
 
-    def wait_job(self, job_name: str, deadline_seconds: int) -> str:
+    def wait_job(self, job_name: str, deadline_seconds: int, on_tick: Optional[Callable[[], None]] = None) -> str:
+        """Polls the Job until it ends; on_tick runs first on every poll (the log stream)."""
         deadline = self.clock() + deadline_seconds + JOB_WAIT_GRACE_SECONDS
         while True:
+            if on_tick is not None:
+                on_tick()
             # One failed read (an auth-plugin refresh, a TLS timeout, a 5xx) is not
             # the Job's end, and giving up here would delete a Job mid-check. Read
             # again on the next tick; only reads failing up to the deadline count.

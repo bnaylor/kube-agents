@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Live checks for the A2A gateway's Slack backend, run inside the cluster as a Job.
 
-Two Slack user accounts drive the gateway's bot the way a person would: one on
+Two Slack user accounts talk to the gateway's bot: one on
 spec.integration.slack.allowedUsers (the "listed" user) and one not on it (the
-"unlisted" user). Each check posts through the Slack Web API with that user's
-token and polls for the bot's reply, then prints one PASS or FAIL line and one
-EVIDENCE line of JSON (timestamps, channel, truncated reply text; never a token).
+"unlisted" user). A person types every user turn in Slack. For each turn the
+harness prints one TYPE line naming the user, the conversation and the exact text
+(with a nonce for this turn), then polls that conversation with the user's token
+(reads only) for the typed message. The message must come from that user and carry
+no bot_id or app_id. Then the harness polls for the bot's reply, and prints one PASS
+or FAIL line and one EVIDENCE line of JSON (timestamps, channel, truncated reply
+text; never a token).
+
+The harness posts nothing itself. Slack attributes a message posted with a user
+token through an app to that app (bot_id and app_id), and the gateway drops any
+message with a bot_id as bot traffic, so no scripted post can be a turn. The live
+run of 2026-10-07 showed this.
 
 The user tokens are read at run time from Secret Manager over the GKE metadata
 server's Workload Identity token. They stay in this process's memory: nothing here puts them in the environment, on disk, or in
@@ -50,6 +59,13 @@ DEFAULT_REPLY_TIMEOUT_SECONDS = 180
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_QUIET_WINDOW_SECONDS = 30
 DEFAULT_HOME_TIMEOUT_SECONDS = 300
+# How long a TYPE line waits for the person to type the turn.
+DEFAULT_TYPE_TIMEOUT_SECONDS = 300
+# The typed message is looked for from this long before its TYPE line, so a pod clock
+# a little ahead of Slack's cannot hide it. The nonce tells it from older messages.
+TYPE_LOOKBACK_SECONDS = 60
+NONCE_HEX_CHARS = 6
+NONCE_PREFIX = "slc"
 HTTP_TIMEOUT_SECONDS = 20
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
@@ -136,10 +152,9 @@ TOKEN_SHAPE_PATTERNS = (
 )
 REDACTED = "[redacted]"
 # Channel ids only. A D... id is a DM, where every message is a turn (inbound() in
-# a2a/gateway/slack.go), so the preflight post there would start a task.
+# a2a/gateway/slack.go), so mention and thread there could not be told from dm.
 CHANNEL_ID_PATTERN = re.compile(r"^[CG][A-Z0-9]{6,}$")
 DM_ID_PATTERN = re.compile(r"^D[A-Z0-9]{6,}$")
-SLACK_NOT_IN_CHANNEL_ERRORS = frozenset({"not_in_channel", "channel_not_found"})
 
 CHECK_DM = "dm"
 CHECK_MENTION = "mention"
@@ -456,6 +471,21 @@ def report(result: CheckResult) -> None:
 
 
 @dataclass
+class TypedTurn:
+    """One user turn a person types: who, where, and the exact text, nonce included."""
+    check: str
+    user_id: str
+    user_label: str
+    channel: str
+    where: str
+    text: str
+    nonce: str
+    thread_ts: str = ""
+    # The text must carry the bot's mention, as Slack renders an @-picked member: <@U...>.
+    mention: bool = False
+
+
+@dataclass
 class Session:
     args: argparse.Namespace
     listed: SlackClient
@@ -468,9 +498,16 @@ class Session:
     unlisted: Optional[SlackClient] = None
     unlisted_user_id: str = ""
     mention_root: str = ""
+    wall: Callable[[], float] = time.time
+    listed_label: str = ""
+    unlisted_label: str = ""
+    bot_label: str = ""
+    channel_label: str = ""
+    # Called with each TypedTurn after its TYPE line: the offline tests' stand-in for the person.
+    typist: Optional[Callable[[TypedTurn], None]] = None
 
-    def tag(self, check: str) -> str:
-        return f"(slack-live-check {self.run_id} {check})"
+    def nonce(self, check: str) -> str:
+        return f"{NONCE_PREFIX}-{check}-{uuid.uuid4().hex[:NONCE_HEX_CHARS]}"
 
 
 def history_after(client: SlackClient, channel: str, after_ts: str) -> list[dict]:
@@ -556,25 +593,107 @@ def open_dm(client: SlackClient, user_id: str) -> str:
     return client.call("conversations.open", users=user_id)["channel"]["id"]
 
 
+def typed_problems(msg: dict, turn: TypedTurn, bot_user_id: str) -> list[str]:
+    """Why the message carrying the turn's nonce is not the turn a person typed, or []."""
+    problems = []
+    if msg.get("bot_id"):
+        problems.append(f"it carries bot_id={msg['bot_id']}")
+    if msg.get("app_id"):
+        problems.append(f"it carries app_id={msg['app_id']}")
+    if problems:
+        # inbound() in a2a/gateway/slack.go drops a message with a bot_id as bot traffic.
+        problems.append("it was posted through a Slack app, which the gateway drops as bot traffic; "
+                        "a message a person types has neither")
+    if msg.get("subtype", "") not in TURN_SUBTYPES:
+        problems.append(f"its subtype {msg['subtype']!r} is not a turn")
+    if not msg.get("user"):
+        problems.append("it has no user field")
+    elif msg["user"] != turn.user_id:
+        problems.append(f"it was typed by {msg['user']}, not {turn.user_label}")
+    if turn.mention and f"<@{bot_user_id}>" not in msg.get("text", ""):
+        problems.append(f"it does not mention the bot (no <@{bot_user_id}> in its text); "
+                        "type @ and pick the bot from Slack's list")
+    return problems
+
+
+def await_typed(session: Session, client: SlackClient, turn: TypedTurn) -> tuple[Optional[dict], Optional[CheckResult]]:
+    """Prints the turn's TYPE line and waits for the person to type it.
+
+    Returns (the typed message, None), or (None, the check's FAIL): nothing carrying
+    the nonce within --type-timeout, or a message carrying it that is not the turn
+    (typed_problems). Polls with the user's token, which only reads.
+    """
+    timeout = session.args.type_timeout
+    oldest = f"{session.wall() - TYPE_LOOKBACK_SECONDS:.6f}"
+    say(f"TYPE within {timeout:g}s as {turn.user_label} in {turn.where}: {turn.text}")
+    if session.typist is not None:
+        session.typist(turn)
+
+    def step():
+        if turn.thread_ts:
+            msgs = replies_after(client, turn.channel, turn.thread_ts, oldest)
+        else:
+            msgs = history_after(client, turn.channel, oldest)
+        return next((m for m in msgs if turn.nonce in m.get("text", "")), None)
+
+    msg = poll(step, timeout, session.args.poll_interval, session.clock, session.sleep)
+    evidence = {"channel": turn.channel, "nonce": turn.nonce, "author": turn.user_id}
+    if turn.thread_ts:
+        evidence["thread_ts"] = turn.thread_ts
+    if msg is None:
+        return None, CheckResult(turn.check, False, f"no message containing {turn.nonce} within {timeout}s from "
+                                 f"{turn.user_label} in {turn.where}; type the TYPE line's text as it is", evidence)
+    problems = typed_problems(msg, turn, session.bot_user_id)
+    if problems:
+        evidence.update({"sent_ts": msg.get("ts", ""), "typed_by": msg.get("user", ""),
+                         "typed_bot_id": msg.get("bot_id", ""), "typed_app_id": msg.get("app_id", ""),
+                         "typed_subtype": msg.get("subtype", "")})
+        return None, CheckResult(turn.check, False, f"the message carrying {turn.nonce} at ts={msg.get('ts')} is not "
+                                 "the turn a person typed: " + "; ".join(problems), evidence)
+    return msg, None
+
+
+def with_typed(result: CheckResult, turn: TypedTurn, typed: dict) -> CheckResult:
+    result.evidence.update({"nonce": turn.nonce, "typed_by": typed.get("user", "")})
+    return result
+
+
+def listed_turn(session: Session, check: str, channel: str, where: str, text: str, thread_ts: str = "",
+                mention: bool = False) -> TypedTurn:
+    nonce = session.nonce(check)
+    return TypedTurn(check, session.listed_user_id, session.listed_label, channel, where, f"{text} {nonce}", nonce,
+                     thread_ts, mention)
+
+
 def check_dm(session: Session, name: str = CHECK_DM) -> CheckResult:
     channel = open_dm(session.listed, session.bot_user_id)
-    sent = session.listed.call("chat.postMessage", channel=channel, text=f"{session.args.prompt} {session.tag(name)}")
-    sent_ts = sent["ts"]
+    turn = listed_turn(session, name, channel, f"your DM with @{session.bot_label} ({channel})", session.args.prompt)
+    typed, failed = await_typed(session, session.listed, turn)
+    if failed is not None:
+        return failed
+    sent_ts = typed["ts"]
     reply, kind, last = wait_for_bot(session, lambda: history_after(session.listed, channel, sent_ts),
                                      answer_mode(session), session.args.reply_timeout)
-    return judge_listed_reply(session, name, channel, sent_ts, reply, kind, last)
+    return with_typed(judge_listed_reply(session, name, channel, sent_ts, reply, kind, last), turn, typed)
+
+
+def mention_where(session: Session) -> str:
+    return f"{session.channel_label}, top level, picking @{session.bot_label} from Slack's list"
 
 
 def check_mention(session: Session) -> CheckResult:
-    text = f"<@{session.bot_user_id}> {session.args.prompt} {session.tag(CHECK_MENTION)}"
-    sent = session.listed.call("chat.postMessage", channel=session.channel_id, text=text)
-    sent_ts = sent["ts"]
+    turn = listed_turn(session, CHECK_MENTION, session.channel_id, mention_where(session),
+                       f"@{session.bot_label} {session.args.prompt}", mention=True)
+    typed, failed = await_typed(session, session.listed, turn)
+    if failed is not None:
+        return failed
+    sent_ts = typed["ts"]
     reply, kind, last = wait_for_bot(session, lambda: replies_after(session.listed, session.channel_id, sent_ts, sent_ts),
                                      answer_mode(session), session.args.reply_timeout)
     result = judge_listed_reply(session, CHECK_MENTION, session.channel_id, sent_ts, reply, kind, last, expect_thread=sent_ts)
     if result.passed:
         session.mention_root = sent_ts
-    return result
+    return with_typed(result, turn, typed)
 
 
 def check_thread(session: Session) -> CheckResult:
@@ -594,15 +713,26 @@ def check_thread(session: Session) -> CheckResult:
             evidence["last_bot_text"] = truncate(last.get("text", ""))
         return CheckResult(CHECK_THREAD, False, f"the thread's first task did not settle within {session.args.reply_timeout}s, "
                            "so a reply now would be a steer", evidence)
-    text = f"{session.args.followup} {session.tag(CHECK_THREAD)}"
-    sent = session.listed.call("chat.postMessage", channel=session.channel_id, thread_ts=root, text=text)
-    sent_ts = sent["ts"]
+    where = f"the thread under your mention in {session.channel_label}, thread ts={root}, without mentioning the bot"
+    turn = listed_turn(session, CHECK_THREAD, session.channel_id, where, session.args.followup, thread_ts=root)
+    typed, failed = await_typed(session, session.listed, turn)
+    if failed is not None:
+        return failed
+    sent_ts = typed["ts"]
     reply, kind, last = wait_for_bot(session, lambda: replies_after(session.listed, session.channel_id, root, sent_ts),
                                      answer_mode(session), session.args.reply_timeout)
     result = judge_listed_reply(session, CHECK_THREAD, session.channel_id, sent_ts, reply, kind, last, expect_thread=root)
     result.evidence["thread_ts"] = root
     result.evidence["settled_kind"] = settled_kind
-    return result
+    return with_typed(result, turn, typed)
+
+
+def unlisted_turn(session: Session, check: str, channel: str, where: str, thread_ts: str = "") -> TypedTurn:
+    via_mention = session.args.unlisted_via == UNLISTED_VIA_MENTION
+    text = f"@{session.bot_label} {session.args.prompt}" if via_mention else session.args.prompt
+    nonce = session.nonce(check)
+    return TypedTurn(check, session.unlisted_user_id, session.unlisted_label, channel, where, f"{text} {nonce}", nonce,
+                     thread_ts, via_mention)
 
 
 def check_unlisted(session: Session) -> list[CheckResult]:
@@ -610,21 +740,26 @@ def check_unlisted(session: Session) -> list[CheckResult]:
     client = session.unlisted
     if session.args.unlisted_via == UNLISTED_VIA_MENTION:
         channel = session.channel_id
-        text = f"<@{session.bot_user_id}> {session.args.prompt} {session.tag(CHECK_UNLISTED)}"
-        sent_ts = client.call("chat.postMessage", channel=channel, text=text)["ts"]
-
+        place = session.channel_label
+        turn = unlisted_turn(session, CHECK_UNLISTED, channel, mention_where(session))
+    else:
+        channel = open_dm(client, session.bot_user_id)
+        place = f"your DM with @{session.bot_label} ({channel})"
+        turn = unlisted_turn(session, CHECK_UNLISTED, channel, place)
+    typed, failed = await_typed(session, client, turn)
+    if failed is not None:
+        return [failed]
+    sent_ts = typed["ts"]
+    if session.args.unlisted_via == UNLISTED_VIA_MENTION:
         def fetch():
             return replies_after(client, channel, sent_ts, sent_ts)
     else:
-        channel = open_dm(client, session.bot_user_id)
-        sent_ts = client.call("chat.postMessage", channel=channel, text=f"{session.args.prompt} {session.tag(CHECK_UNLISTED)}")["ts"]
-
         def fetch():
             return history_after(client, channel, sent_ts)
 
     reply, kind, _ = wait_for_bot(session, fetch, WAIT_ANY, session.args.reply_timeout)
     evidence = reply_evidence(channel, sent_ts, session.unlisted_user_id, reply, kind)
-    evidence["via"] = session.args.unlisted_via
+    evidence.update({"via": session.args.unlisted_via, "nonce": turn.nonce, "typed_by": typed.get("user", "")})
     if reply is None:
         if session.args.refusal_silence_ok:
             result = CheckResult(CHECK_UNLISTED, True,
@@ -642,30 +777,35 @@ def check_unlisted(session: Session) -> list[CheckResult]:
         return [CheckResult(CHECK_UNLISTED, False, "the refusal notice does not name the unlisted user's member id", evidence)]
     results = [CheckResult(CHECK_UNLISTED, True, f"refusal notice at ts={reply.get('ts')} (sent ts={sent_ts})", evidence)]
     if session.args.unlisted_repeat:
-        results.append(check_unlisted_repeat(session, client, channel, reply.get("thread_ts", "") or ""))
+        results.append(check_unlisted_repeat(session, client, channel, reply.get("thread_ts", "") or "", place, turn.where))
     return results
 
 
-def check_unlisted_repeat(session: Session, client: SlackClient, channel: str, thread_ts: str) -> CheckResult:
-    """A second message from the unlisted user draws nothing: the notice is once per sender."""
-    text = f"{session.args.prompt} {session.tag(CHECK_UNLISTED_REPEAT)}"
-    if session.args.unlisted_via == UNLISTED_VIA_MENTION:
-        # Unmentioned, a reply in a thread the gateway never started a task in is
-        # not a turn at all, and would pass here without reaching verifySender.
-        text = f"<@{session.bot_user_id}> {text}"
-    if thread_ts:
-        sent_ts = client.call("chat.postMessage", channel=channel, thread_ts=thread_ts, text=text)["ts"]
+def check_unlisted_repeat(session: Session, client: SlackClient, channel: str, thread_ts: str, place: str,
+                          where: str) -> CheckResult:
+    """A second message the unlisted user types draws nothing: the notice is once per sender.
 
+    With --unlisted-via mention it mentions the bot too: unmentioned, a reply in a
+    thread the gateway never started a task in is not a turn at all, and would pass
+    here without reaching verifySender.
+    """
+    if thread_ts:
+        where = f"the thread under the refusal notice in {place}, thread ts={thread_ts}"
+    turn = unlisted_turn(session, CHECK_UNLISTED_REPEAT, channel, where, thread_ts)
+    typed, failed = await_typed(session, client, turn)
+    if failed is not None:
+        return failed
+    sent_ts = typed["ts"]
+    if thread_ts:
         def fetch():
             return replies_after(client, channel, thread_ts, sent_ts)
     else:
-        sent_ts = client.call("chat.postMessage", channel=channel, text=text)["ts"]
-
         def fetch():
             return history_after(client, channel, sent_ts)
 
     reply, kind, _ = wait_for_bot(session, fetch, WAIT_ANY, session.args.quiet_window)
     evidence = reply_evidence(channel, sent_ts, session.unlisted_user_id, reply, kind)
+    evidence.update({"nonce": turn.nonce, "typed_by": typed.get("user", "")})
     if reply is not None:
         return CheckResult(CHECK_UNLISTED_REPEAT, False, f"the bot replied to the second message ({kind})", evidence)
     return CheckResult(CHECK_UNLISTED_REPEAT, True, f"no reply to the second message in {session.args.quiet_window}s", evidence)
@@ -691,56 +831,42 @@ def check_home(session: Session, home_channel: str, since: float) -> CheckResult
     return CheckResult(CHECK_HOME, True, f"bot post in {home_channel} at ts={msg.get('ts')}", evidence)
 
 
-def preflight(client: SlackClient, label: str, user_id: str, channel_id: str, run_id: str) -> CheckResult:
-    """Posts with a user token and reads the post back: the gateway must see a user turn.
+def display_name(info: dict, fallback: str) -> str:
+    """The name Slack shows for a member: display name, else real name, else handle."""
+    profile = info.get("profile", {}) or {}
+    return profile.get("display_name") or profile.get("real_name") or info.get("real_name") or info.get("name") or fallback
 
-    inbound() in a2a/gateway/slack.go drops any message with a bot_id, a subtype
-    outside slackTurnSubtypes, or no user. A user-token post that came back with
-    any of those would be thrown away as bot traffic and every later check would
-    time out for a reason that has nothing to do with the gateway. The post is not
-    addressed to the bot, so the gateway does not take it as a turn.
+
+def preflight(lookup: SlackClient, label: str, auth: dict, team_id: str) -> tuple[CheckResult, str]:
+    """Checks a test token's identity before any turn is asked for. Returns (result, the user's label).
+
+    The token's user must be a person's account (a bot user's message is bot traffic
+    to the gateway, typed or not) in the listed user's workspace. Nothing is posted:
+    whether a message is one a person typed is checked on each typed turn
+    (typed_problems), since Slack sets bot_id and app_id per message.
     """
     name = f"{CHECK_PREFLIGHT}-{label}"
-    text = f"slack-live-check {run_id} preflight for the {label} user; not addressed to the bot"
-    where = channel_id
-    try:
-        posted = client.call("chat.postMessage", channel=channel_id, text=text)
-    except SlackAPIError as exc:
-        if exc.error not in SLACK_NOT_IN_CHANNEL_ERRORS:
-            raise
-        # Not a member of the test channel: post to the user's own DM instead, which the bot cannot see.
-        where = open_dm(client, user_id)
-        posted = client.call("chat.postMessage", channel=where, text=text)
-    ts = posted["ts"]
-    channel = posted.get("channel", where)
-    resp = client.call("conversations.history", channel=channel, latest=ts, oldest=ts, inclusive="true", limit=1)
-    msg = next((m for m in resp.get("messages", []) if m.get("ts") == ts), None)
-    evidence = {"channel": channel, "sent_ts": ts, "author": user_id}
-    if msg is None:
-        return CheckResult(name, False, f"the post at ts={ts} could not be read back", evidence)
-    evidence.update({
-        "bot_id": msg.get("bot_id", ""),
-        "subtype": msg.get("subtype", ""),
-        "user": msg.get("user", ""),
-        "app_id": msg.get("app_id", ""),
-    })
+    user_id = auth["user_id"]
+    info = lookup.call("users.info", user=user_id)["user"]
+    handle = "@" + display_name(info, auth.get("user", user_id))
+    # How a TYPE line names the user to type as.
+    shown = f"{handle} ({user_id})"
+    team = auth.get("team_id", "")
+    evidence = {"user": user_id, "team": team, "is_bot": bool(info.get("is_bot")), "deleted": bool(info.get("deleted"))}
     problems = []
-    if msg.get("bot_id"):
-        problems.append(f"it carries bot_id={msg['bot_id']}")
-    if msg.get("subtype", "") not in TURN_SUBTYPES:
-        problems.append(f"its subtype {msg['subtype']!r} is not a turn")
-    if not msg.get("user"):
-        problems.append("it has no user field")
-    elif msg["user"] != user_id:
-        problems.append(f"its user {msg['user']} is not the token's user {user_id}")
-    app_note = f"; app_id={msg['app_id']} (the gateway's filter ignores app_id)" if msg.get("app_id") else ""
+    if info.get("is_bot"):
+        problems.append(f"{user_id} is a bot user, and the gateway drops a bot's messages")
+    if info.get("deleted"):
+        problems.append(f"{user_id} is deactivated")
+    if team != team_id:
+        problems.append(f"its token is for team {team}, not the listed user's team {team_id}")
     if problems:
-        return CheckResult(name, False, "the gateway would discard this user-token post as bot traffic: "
-                           + "; ".join(problems) + app_note, evidence)
-    return CheckResult(name, True, f"user={msg['user']}, no bot_id, subtype {msg.get('subtype', '')!r}{app_note}", evidence)
+        return CheckResult(name, False, f"the {label} token cannot type turns: " + "; ".join(problems), evidence), shown
+    return CheckResult(name, True, f"{user_id} ({handle}) is a person's account in team {team}", evidence), shown
 
 
-def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> str:
+def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> tuple[str, str]:
+    """The bot's member id, and the name a person types after @ to mention it."""
     if not bot_user_id:
         matches = []
         cursor = None
@@ -765,7 +891,8 @@ def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> str:
     info = client.call("users.info", user=bot_user_id)["user"]
     if not info.get("is_bot"):
         raise HarnessError(f"{bot_user_id} is not a bot user")
-    return bot_user_id
+    profile = info.get("profile", {}) or {}
+    return bot_user_id, bot_name or profile.get("display_name") or info.get("name") or bot_user_id
 
 
 def find_channel(client: SlackClient, name: str, types: str) -> tuple[str, bool]:
@@ -785,8 +912,8 @@ def find_channel(client: SlackClient, name: str, types: str) -> tuple[str, bool]
 def resolve_channel(client: SlackClient, channel: str) -> str:
     name = channel.lstrip("#")
     if DM_ID_PATTERN.match(name):
-        raise HarnessError(f"{name} is a DM, not a channel: in a DM every message is a turn, so the preflight "
-                           "post would start a task; pass a channel name or a C/G channel id")
+        raise HarnessError(f"{name} is a DM, not a channel: in a DM every message is a turn, so mention and "
+                           "thread could not be told from dm; pass a channel name or a C/G channel id")
     if CHANNEL_ID_PATTERN.match(name):
         return name
     public_only = False
@@ -859,22 +986,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--unlisted-secret", default=DEFAULT_UNLISTED_SECRET, help="Secret Manager secret holding the unlisted user's token")
     parser.add_argument("--bot-user-id", default="", help="the gateway bot's member id; looked up by --bot-name when unset")
     parser.add_argument("--bot-name", default="", help="the gateway bot's name in this workspace; required unless --bot-user-id is given")
-    parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="channel name or id for preflight, mention and thread")
+    parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="channel name or id for mention and thread")
     parser.add_argument("--thread-ts", default="", help="thread root for the thread check when mention is not run")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--followup", default=DEFAULT_FOLLOWUP)
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="the text a TYPE line asks for a first turn, before its nonce")
+    parser.add_argument("--followup", default=DEFAULT_FOLLOWUP, help="the text a TYPE line asks for in the thread check")
+    parser.add_argument("--type-timeout", type=finite_float, default=DEFAULT_TYPE_TIMEOUT_SECONDS,
+                        help="seconds a TYPE line waits for the person to type the turn")
     parser.add_argument("--wait-answer", action="store_true", help="wait past the status line for the answer itself")
     parser.add_argument("--reply-timeout", type=finite_float, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
     parser.add_argument("--poll-interval", type=finite_float, default=DEFAULT_POLL_INTERVAL_SECONDS)
     parser.add_argument("--unlisted-via", choices=(UNLISTED_VIA_DM, UNLISTED_VIA_MENTION), default=UNLISTED_VIA_DM)
-    parser.add_argument("--unlisted-repeat", action="store_true", help="also send a second message and expect no reply")
+    parser.add_argument("--unlisted-repeat", action="store_true",
+                        help="after the notice, ask for a second typed message from the unlisted user and expect no reply")
     parser.add_argument("--quiet-window", type=finite_float, default=DEFAULT_QUIET_WINDOW_SECONDS)
     parser.add_argument("--refusal-silence-ok", action="store_true", help="accept silence for the unlisted check")
     parser.add_argument("--home-channel", default="", help="channel the home check watches for a bot post")
     parser.add_argument("--home-since", type=finite_float, default=0.0, help="epoch seconds; default is the run's start")
     parser.add_argument("--home-timeout", type=finite_float, default=DEFAULT_HOME_TIMEOUT_SECONDS)
     parser.add_argument("--home-match", type=regex, default="", help="regex the home post's text must match")
-    parser.add_argument("--run-id", default="", help="tag for this run's posts; random when unset")
+    parser.add_argument("--run-id", default="", help="names this run in its RUN line; random when unset")
     # Endpoint overrides for the offline tests.
     parser.add_argument("--slack-api-base", default=SLACK_API_BASE, help=argparse.SUPPRESS)
     parser.add_argument("--metadata-token-url", default=METADATA_TOKEN_URL, help=argparse.SUPPRESS)
@@ -896,19 +1026,25 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
 
 def time_budget(args: argparse.Namespace) -> float:
     """The longest the selected checks can wait on Slack, for the Job's deadline."""
+    typed = args.type_timeout
     per_check = {
-        CHECK_DM: args.reply_timeout,
-        CHECK_MENTION: args.reply_timeout,
-        # The mention's task settling, then the reply to the follow-up.
-        CHECK_THREAD: 2 * args.reply_timeout,
-        CHECK_UNLISTED: args.reply_timeout + (args.quiet_window if args.unlisted_repeat else 0),
-        CHECK_RESTART: args.reply_timeout,
+        CHECK_DM: typed + args.reply_timeout,
+        CHECK_MENTION: typed + args.reply_timeout,
+        # The mention's task settling, then the typed follow-up and its reply.
+        CHECK_THREAD: typed + 2 * args.reply_timeout,
+        CHECK_UNLISTED: typed + args.reply_timeout + ((typed + args.quiet_window) if args.unlisted_repeat else 0),
+        CHECK_RESTART: typed + args.reply_timeout,
         CHECK_HOME: args.home_timeout,
     }
     return sum(per_check[check] for check in args.checks)
 
 
-def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
+def channel_label(requested: str, channel_id: str) -> str:
+    name = requested.lstrip("#")
+    return channel_id if name == channel_id else f"#{name} ({channel_id})"
+
+
+def run(args: argparse.Namespace, transport, clock, sleep, wall, typist: Optional[Callable[[TypedTurn], None]] = None) -> int:
     started = wall()
     run_id = args.run_id or uuid.uuid4().hex[:RUN_ID_HEX_CHARS]
     reader = SecretManagerReader(transport, args.project, args.metadata_token_url, args.secret_manager_base)
@@ -918,12 +1054,14 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
     listed_auth = listed.call("auth.test")
     unlisted = None
     unlisted_user_id = ""
+    unlisted_auth: dict = {}
     if needs_unlisted:
         unlisted = SlackClient(load_user_token(reader, args.unlisted_secret, "unlisted"), transport, args.slack_api_base, sleep)
-        unlisted_user_id = unlisted.call("auth.test")["user_id"]
+        unlisted_auth = unlisted.call("auth.test")
+        unlisted_user_id = unlisted_auth["user_id"]
         if unlisted_user_id == listed_auth["user_id"]:
             raise HarnessError("the listed and unlisted tokens belong to the same Slack user")
-    bot_user_id = resolve_bot(listed, args.bot_user_id, args.bot_name)
+    bot_user_id, bot_name = resolve_bot(listed, args.bot_user_id, args.bot_name)
     if bot_user_id in (listed_auth["user_id"], unlisted_user_id):
         raise HarnessError("the bot user id is one of the test users")
     channel_id = resolve_channel(listed, args.channel)
@@ -933,15 +1071,17 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
 
     session = Session(args=args, listed=listed, listed_user_id=listed_auth["user_id"], bot_user_id=bot_user_id,
                       channel_id=channel_id, run_id=run_id, clock=clock, sleep=sleep,
-                      unlisted=unlisted, unlisted_user_id=unlisted_user_id)
+                      unlisted=unlisted, unlisted_user_id=unlisted_user_id, wall=wall,
+                      bot_label=bot_name, channel_label=channel_label(args.channel, channel_id), typist=typist)
     results: list[CheckResult] = []
 
-    preflights = [(listed, "listed", session.listed_user_id)]
+    preflights = [("listed", listed_auth)]
     if unlisted is not None:
-        preflights.append((unlisted, "unlisted", unlisted_user_id))
-    for client, label, user_id in preflights:
+        preflights.append(("unlisted", unlisted_auth))
+    for label, auth in preflights:
+        shown = ""
         try:
-            result = preflight(client, label, user_id, channel_id, run_id)
+            result, shown = preflight(listed, label, auth, listed_auth.get("team_id", ""))
         except Exception as exc:  # noqa: BLE001 -- a check's error is its FAIL; report() redacts it
             result = errored(f"{CHECK_PREFLIGHT}-{label}", exc)
         report(result)
@@ -949,6 +1089,7 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
         if not result.passed:
             # Every check after a failed preflight would fail for the preflight's reason.
             return summarize(results)
+        setattr(session, f"{label}_label", shown)
 
     for check in args.checks:
         try:
@@ -993,10 +1134,11 @@ def summarize(results: list[CheckResult]) -> int:
 
 
 def main(argv: Optional[list[str]] = None, transport=None, clock: Callable[[], float] = time.monotonic,
-         sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time) -> int:
+         sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time,
+         typist: Optional[Callable[[TypedTurn], None]] = None) -> int:
     args = parse_args(argv)
     try:
-        return run(args, transport or UrllibTransport(), clock, sleep, wall)
+        return run(args, transport or UrllibTransport(), clock, sleep, wall, typist)
     except HarnessError as exc:
         say(f"ERROR {exc}")
     except Exception as exc:  # noqa: BLE001 -- the traceback could carry a token; the redacted line is the report

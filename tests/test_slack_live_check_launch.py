@@ -98,6 +98,16 @@ class FakeCluster:
         self.job_apply_raises = None
         # One log per Job, in run order, in place of job_log when set.
         self.job_logs = []
+        # The applied Job's log, chosen from job_logs or job_log when the Job is applied.
+        self.current_job_log = None
+        # The log as successive reads see it while the Job runs (None: the read fails,
+        # as for a pod not started yet); the last entry stands for every later read.
+        self.job_log_progress = []
+        self.job_log_reads = 0
+        # How many `get job` polls see the Job still running before it completes.
+        self.job_running_polls = 0
+        # Called on every `get job` poll: a test's view of what was printed by then.
+        self.on_job_poll = None
         # How many `get job` polls fail before one answers; -1 is every one.
         self.get_job_failures = 0
         self.stdin_encodings = []
@@ -130,8 +140,12 @@ class FakeCluster:
     def answer(self, args, stdin):
         joined = " ".join(args)
         if args[0] == "apply":
-            if self.job_apply_raises and '"kind": "Job"' in stdin.replace("kind: Job", '"kind": "Job"'):
+            is_job = '"kind": "Job"' in stdin.replace("kind: Job", '"kind": "Job"')
+            if self.job_apply_raises and is_job:
                 raise self.job_apply_raises
+            if is_job:
+                self.current_job_log = self.job_logs.pop(0) if self.job_logs else self.job_log
+                self.job_log_reads = 0
             self.applied.append(stdin)
             for doc in yaml.safe_load_all(stdin):
                 if doc and doc.get("kind") == "Namespace":
@@ -168,12 +182,23 @@ class FakeCluster:
             assert "--ignore-not-found" in args, args
             if self.job_gone:
                 return ""
+            if self.on_job_poll is not None:
+                self.on_job_poll()
+            if self.job_running_polls > 0:
+                self.job_running_polls -= 1
+                return json.dumps({"status": {"active": 1}})
             conditions = [{"type": self.job_condition, "status": "True"}] if self.job_condition else []
             return json.dumps({"status": {"conditions": conditions}})
         if args[0] == "logs" and "job/" in joined:
             if self.job_log_fails:
                 raise FakeFailure()
-            return self.job_logs.pop(0) if self.job_logs else self.job_log
+            if self.job_log_progress:
+                seen = self.job_log_progress[min(self.job_log_reads, len(self.job_log_progress) - 1)]
+                self.job_log_reads += 1
+                if seen is None:
+                    raise FakeFailure()
+                return seen
+            return self.current_job_log
         if args[0] == "logs" and "credential-proxy" in joined:
             assert "--tail=-1" in args
             return self.broker_logs
@@ -464,6 +489,77 @@ class JobTest(unittest.TestCase):
         ]}
         kubectl = launch.Kubectl(CONTEXT, lambda cmd, **_: subprocess.CompletedProcess(cmd, 0, json.dumps(listing), ""))
         self.assertEqual(launch.live_foreign_jobs(kubectl, "slack-test", {"r1"}), ["theirs"])
+
+
+class LogStreamTest(unittest.TestCase):
+    TYPE_LINE = "TYPE within 300s as @Lisa Listed (U0LISTED1) in your DM with @kage (D0001): Reply with PONG. slc-dm-abc123"
+
+    def run_streaming(self, cluster, *argv):
+        out = io.StringIO()
+        fake = FakeClock()
+        snapshots = []
+        cluster.on_job_poll = lambda: snapshots.append(out.getvalue())
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = launch.main(with_bot(argv), runner=cluster, clock=fake.clock, sleep=fake.sleep)
+        return code, out.getvalue(), snapshots
+
+    def test_type_lines_reach_the_workstation_while_the_job_runs(self):
+        cluster = FakeCluster()
+        head = f"RUN r: checks=dm\nPASS preflight-listed: ok\n{self.TYPE_LINE}\n"
+        done = head + 'PASS dm: answer\nEVIDENCE {"check": "dm", "passed": true, "sent_ts": "1.000101"}\nSUMMARY pass=2 fail=0\n'
+        # The pod is not up for the first read, then prints up to its TYPE line and waits.
+        cluster.job_log_progress = [None, head, head, done]
+        cluster.job_running_polls = 3
+        code, out, snapshots = self.run_streaming(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        # Printed by the poll after it appeared, while the Job was still running, and once.
+        self.assertNotIn(self.TYPE_LINE, snapshots[0])
+        self.assertIn(self.TYPE_LINE, snapshots[1])
+        self.assertNotIn("PASS dm", snapshots[2])
+        self.assertEqual(out.count(self.TYPE_LINE), 1, out)
+        self.assertEqual(out.count("PASS dm: answer"), 1, out)
+        self.assertIn("OVERALL pass=2 fail=0", out)
+        self.assertIn("Type each TYPE line's text in Slack", out)
+        self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
+
+    def test_a_line_still_being_written_waits_for_its_newline(self):
+        cluster = FakeCluster()
+        partial = "RUN r\nTYPE within 300s as @Lisa"
+        whole = f"RUN r\n{self.TYPE_LINE}\nPASS dm: answer\n"
+        cluster.job_log_progress = [partial, whole]
+        cluster.job_running_polls = 1
+        code, out, snapshots = self.run_streaming(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("RUN r", snapshots[0])
+        self.assertNotIn("TYPE within 300s as @Lisa", snapshots[0])
+        self.assertNotIn("TYPE within 300s as @Lisa\n", out)
+        self.assertEqual(out.count(self.TYPE_LINE), 1, out)
+
+    def test_the_last_line_is_printed_without_its_newline_when_the_job_ends(self):
+        cluster = FakeCluster()
+        cluster.job_log_progress = ["PASS dm: answer\nSUMMARY pass=1 fail=0"]
+        code, out, _ = self.run_streaming(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("SUMMARY pass=1 fail=0", out)
+
+    def test_a_log_unreadable_at_the_end_keeps_what_was_streamed(self):
+        cluster = FakeCluster()
+        cluster.job_log_progress = [f"{self.TYPE_LINE}\nPASS dm: answer\n", None]
+        cluster.job_running_polls = 1
+        code, out, _ = self.run_streaming(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertNotIn("no pod log", out)
+        self.assertIn("OVERALL pass=1 fail=0", out)
+
+    def test_streamed_lines_are_redacted(self):
+        cluster = FakeCluster()
+        cluster.job_log_progress = [f"TYPE within 300s as @x (U1) in here: {LEAKED}\n",
+                                    f"TYPE within 300s as @x (U1) in here: {LEAKED}\nFAIL dm: x\n"]
+        cluster.job_running_polls = 1
+        code, out, _ = self.run_streaming(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertNotIn(LEAKED, out)
+        self.assertIn("in here: [redacted]", out)
 
 
 class PrincipalTest(unittest.TestCase):
@@ -800,8 +896,13 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertFalse(launch.FORWARDABLE_HARNESS_FLAGS & (suppressed | owned))
         self.assertEqual(launch.FORWARDABLE_HARNESS_FLAGS | suppressed | owned | {"-h", "--help"}, harness_flags)
         args, forwarded = parse(["--context", CONTEXT, "--checks", "dm", "--", "--channel", "ka-test",
-                                             "--reply-timeout=30", "--wait-answer"])
-        self.assertEqual(forwarded, [*BOT_FLAGS, "--channel", "ka-test", "--reply-timeout=30", "--wait-answer"])
+                                             "--reply-timeout=30", "--wait-answer", "--type-timeout", "120"])
+        self.assertEqual(forwarded, [*BOT_FLAGS, "--channel", "ka-test", "--reply-timeout=30", "--wait-answer",
+                                     "--type-timeout", "120"])
+        # The person's typing window is the operator's to set; the Job's deadline follows it.
+        self.assertIn("--type-timeout", launch.FORWARDABLE_HARNESS_FLAGS)
+        self.assertEqual(launch.job_deadline(["--checks", "dm", "--type-timeout", "900", *BOT_FLAGS], 0),
+                         900 + 180 + launch.JOB_SETUP_ALLOWANCE_SECONDS + launch.JOB_START_ALLOWANCE_SECONDS)
 
     def test_token_source_is_not_forwarded(self):
         for forwarded in (["--token-source", "file"], ["--token-source=file"]):
@@ -843,8 +944,11 @@ class ModesAndArgsTest(unittest.TestCase):
         cluster = FakeCluster()
         run_launch(cluster, "--context", CONTEXT, "--checks", "all", "--", "--reply-timeout", "300")
         job = yaml.safe_load(cluster.applied[2])
+        # all is dm, mention, thread (two reply waits) and unlisted: four typed turns at the
+        # default --type-timeout, and five reply waits.
         self.assertEqual(job["spec"]["activeDeadlineSeconds"],
-                         300 * 5 + launch.JOB_SETUP_ALLOWANCE_SECONDS + launch.JOB_START_ALLOWANCE_SECONDS)
+                         300 * 5 + harness.DEFAULT_TYPE_TIMEOUT_SECONDS * 4
+                         + launch.JOB_SETUP_ALLOWANCE_SECONDS + launch.JOB_START_ALLOWANCE_SECONDS)
         self.assertEqual(launch.job_deadline(["--checks", "dm", *BOT_FLAGS], 5000), 5000)
 
     def test_the_bot_needs_a_name_or_an_id_before_any_cluster_call(self):

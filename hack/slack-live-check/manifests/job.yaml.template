@@ -10,7 +10,7 @@ metadata:
     app.kubernetes.io/name: slack-live-check
     slack-live-check/run: ${RUN_ID}
 spec:
-  # A retry would post every message again.
+  # A retry would ask for every typed turn again and judge the replies twice.
   backoffLimit: 0
   activeDeadlineSeconds: ${DEADLINE_SECONDS}
   # The launcher deletes the Job; this collects it if the launcher died first.
