@@ -1,7 +1,6 @@
 package workeradapter
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -117,7 +116,8 @@ type Config struct {
 	// enforcer's.
 	TaskDeadline time.Duration
 	// KillGrace is SIGTERM-to-SIGKILL escalation time. It also bounds how
-	// long a failed start waits for the killed harness's stderr to close.
+	// long any reap waits for the harness's stderr to close once the harness
+	// has exited, which a process it started outside its group can hold open.
 	KillGrace time.Duration
 
 	Logger *slog.Logger
@@ -464,13 +464,22 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	deadline := time.NewTimer(a.cfg.TaskDeadline)
 	defer deadline.Stop()
 
-	waitDone := make(chan error, 1)
+	type reapOutcome struct {
+		err  error
+		took time.Duration
+	}
+	waitDone := make(chan reapOutcome, 1)
 	go func() {
 		// The scanner owns the pipe until EOF; Wait tears the pipe down.
+		// cmd.WaitDelay (KillGrace, set in startHarness) bounds the stderr
+		// read after the harness exits, so a process it started outside its
+		// group cannot hold this reap, and the task, open forever.
 		<-proc.scanDone
+		reapStart := time.Now()
 		err := proc.cmd.Wait()
+		took := time.Since(reapStart)
 		proc.reaped()
-		waitDone <- err
+		waitDone <- reapOutcome{err, took}
 	}()
 
 	var (
@@ -479,6 +488,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		sawResult   bool
 		exited      bool
 		waitErr     error
+		reapTook    time.Duration
 		resultText  string
 		resultErr   string // failure subtype from the harness, if any
 		// pendingTurns counts user messages written minus result events
@@ -580,9 +590,9 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished", resultText)
 			return Result{State: state, Evicted: true}, err
 
-		case werr := <-waitDone:
+		case reap := <-waitDone:
 			exited = true
-			waitErr = werr
+			waitErr, reapTook = reap.err, reap.took
 			waitDone = nil
 		}
 	}
@@ -612,24 +622,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		return Result{State: state}, a.finalize(state, "reason: canceled-by-request", "")
 	default:
 		state := lib.StateFailed
-		reason := "reason: stream-ended-without-result" + exitEvidence(waitErr)
-		if serr := proc.scanErr(); serr != nil {
-			// Name the ceiling and its value rather than relaying
-			// "token too long", which says nothing an operator can act on.
-			// The deliverable is refused, never truncated: a silently
-			// shortened answer is worse than a loud failure.
-			if errors.Is(serr, bufio.ErrTooLong) {
-				reason += fmt.Sprintf(
-					" - the harness emitted a single output line over the %d-byte limit"+
-						" (%d MiB, scannerMaxBytes in harness.go); the deliverable was refused"+
-						" rather than truncated. A line this size is usually a file dumped"+
-						" into the answer.",
-					scannerMaxBytes, scannerMaxBytes/(1024*1024))
-			} else {
-				reason += " - stdout: " + serr.Error()
-			}
-		}
-		reason += proc.stderrEvidence()
+		reason := "reason: stream-ended-without-result" +
+			reapEvidence(waitErr, reapTook, proc.cmd.WaitDelay) +
+			scanEvidence(proc.scanErr()) +
+			proc.stderrEvidence()
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
 }
