@@ -984,13 +984,19 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 	}
 }
 
-// TestARunningGatewayReadsTheSecretOncePerPass: the backend question is
+// TestARunningGatewayReadsTheSecretTwicePerPass: the backend question is
 // asked on every pass now, existing gateway or not, or a running gateway
 // would never see its backend leave (#2481). On an install whose only backend
 // is the discord-bot Secret that is one uncached read per render pass. This
 // counts reconcileA2A's reads only; the status writers do not ask the
 // question, they read the render's answer off a2aProvisionState.
-func TestARunningGatewayReadsTheSecretOncePerPass(t *testing.T) {
+//
+// The secret-env digest (#2401) reads the same Secret once per pass too,
+// because the rendered gateway takes DISCORD_TOKEN from it as environment
+// (platformagent_secret_hash.go); that read is the stamp's, the one the agent
+// gateway and the broker pay. So a running Secret-only pass reads it exactly
+// twice, the gate's and the stamp's, and either one asked again makes it three.
+func TestARunningGatewayReadsTheSecretTwicePerPass(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
 	scheme := setupScheme()
@@ -1029,8 +1035,8 @@ func TestARunningGatewayReadsTheSecretOncePerPass(t *testing.T) {
 			t.Fatalf("reconcileA2A %d with the gateway running: %v", i+1, err)
 		}
 	}
-	if secretReads != passes {
-		t.Errorf("a running Secret-only gateway's reconcile read the discord-bot Secret %d times in %d passes, want one per pass", secretReads, passes)
+	if secretReads != 2*passes {
+		t.Errorf("a running Secret-only gateway's reconcile read the discord-bot Secret %d times in %d passes, want two per pass (the gate's and the digest's)", secretReads, passes)
 	}
 }
 
