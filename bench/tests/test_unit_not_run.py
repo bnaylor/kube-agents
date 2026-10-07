@@ -83,6 +83,7 @@ def not_run(state_dir: Path, name: str, rep: int, reason: str = REASON) -> Path:
             "set -euo pipefail",
             _lift(r"^readonly EVAL_INFRA_FAILURE_MARKER=.*$", "EVAL_INFRA_FAILURE_MARKER"),
             _lift(r"^readonly EVAL_NOT_RUN_DIR=.*$", "EVAL_NOT_RUN_DIR"),
+            _lift(r"^readonly EVAL_NOT_RUN_STATUS=.*$", "EVAL_NOT_RUN_STATUS"),
             _lift(r"^record_unit_not_run\(\) \{.*?^\}", "record_unit_not_run", re.S | re.M),
             "_now_ms() { echo 1700000000000; }",
             'record_unit_not_run "$1" "$2" "$3"',

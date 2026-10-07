@@ -77,6 +77,8 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # STATE_DIR, holds one such record per skipped repetition.
 readonly EVAL_INFRA_FAILURE_MARKER="KUBE_AGENTS_INFRA_FAILURE"
 readonly EVAL_NOT_RUN_DIR="not-run"
+# The record's status: what the harness writes for a run that did not succeed.
+readonly EVAL_NOT_RUN_STATUS="failed"
 
 # EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
 # `spec.mode: next` under, in the same job environment. Under it the matrix
@@ -853,9 +855,10 @@ _ledger_token_mint() {
 # test pass while proving nothing about the credential it exercises.
 #
 # Which non-zero says why: LEDGER_MINT_RETRYABLE when the last attempt was a
-# transient failure (a 5xx, a 429, an unreachable api.github.com) and the
-# ladder ran out, 1 for anything else. LEDGER_MINT_LAST_FAILURE is left
-# holding the mint's last diagnostic line either way, for the caller's record.
+# transient failure (a 5xx, a 429, a 403 GitHub marks as its rate limit, an
+# unreachable api.github.com) and the ladder ran out, 1 for anything else.
+# LEDGER_MINT_LAST_FAILURE is left holding the mint's last diagnostic line
+# either way, for the caller's record.
 mint_ledger_token() { # <label>
   if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     return 0
@@ -2613,9 +2616,9 @@ record_unit_not_run() { # <task-name> <rep> <reason>
   local name="$1" rep="$2" reason="$3" dir now
   dir="${STATE_DIR}/${EVAL_NOT_RUN_DIR}/${name}.rep${rep}"
   mkdir -p "${dir}" 2>/dev/null || true
-  EVAL_NOT_RUN_ERROR="${EVAL_INFRA_FAILURE_MARKER}: ${reason}" python3 -c '
+  EVAL_NOT_RUN_RECORD_STATUS="${EVAL_NOT_RUN_STATUS}" EVAL_NOT_RUN_ERROR="${EVAL_INFRA_FAILURE_MARKER}: ${reason}" python3 -c '
 import json, os, sys
-record = dict(status="failed", errors=[os.environ["EVAL_NOT_RUN_ERROR"]], trajectory=[], tokens=dict(total=0), output="")
+record = dict(status=os.environ["EVAL_NOT_RUN_RECORD_STATUS"], errors=[os.environ["EVAL_NOT_RUN_ERROR"]], trajectory=[], tokens=dict(total=0), output="")
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump([record], fh)
 ' "${dir}/results.json" 2>/dev/null || true

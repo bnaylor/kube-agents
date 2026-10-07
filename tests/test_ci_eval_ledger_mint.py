@@ -281,6 +281,7 @@ class UnitNotRunTest(unittest.TestCase):
                 "set -euo pipefail",
                 _lift_line(r"^readonly EVAL_INFRA_FAILURE_MARKER=.*$", "EVAL_INFRA_FAILURE_MARKER"),
                 _lift_line(r"^readonly EVAL_NOT_RUN_DIR=.*$", "EVAL_NOT_RUN_DIR"),
+                _lift_line(r"^readonly EVAL_NOT_RUN_STATUS=.*$", "EVAL_NOT_RUN_STATUS"),
                 _lift_line(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=.*$", "EVAL_INFLIGHT_GRACE_SECONDS"),
                 _lift_line(r"^readonly EVAL_INJECT_LOCAL_PORT_BASE=.*$", "EVAL_INJECT_LOCAL_PORT_BASE"),
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
@@ -597,6 +598,114 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.assertNotEqual(_retryable_rc(), proc.returncode, "an empty body is not a transient fault")
 
 
+# A GitHub that refuses the mint: the HTTPError the test names (status,
+# headers, body) is raised from urlopen, as urllib raises GitHub's own.
+_FAKE_REFUSAL = textwrap.dedent(
+    '''
+    import email.message
+    import io
+    import json
+    import os
+    import urllib.error
+    import urllib.request
+
+
+    def _refusing_urlopen(request, timeout=None):
+        spec = json.loads(os.environ["MINT_FAKE_REFUSAL"])
+        headers = email.message.Message()
+        for name, value in spec.get("headers", {}).items():
+            headers[name] = value
+        raise urllib.error.HTTPError(
+            request.full_url, spec["code"], spec.get("reason", "Forbidden"), headers,
+            io.BytesIO(spec.get("body", "").encode()),
+        )
+
+
+    urllib.request.urlopen = _refusing_urlopen
+    '''
+)
+
+
+class LedgerMintRefusalTest(unittest.TestCase):
+    """hack/ledger_token_mint.py's exit code for each kind of refusal, run for real.
+
+    The code is the whole contract: the retryable one is retried and, run out,
+    recorded as infrastructure; 1 is a refusal and grades MISSING, which blocks.
+    GitHub answers a burst from one installation with a 403 it marks as a
+    secondary rate limit (Retry-After, X-RateLimit-Remaining: 0, or a body
+    naming the limit), which nothing has to fix; an unmarked 403 (a suspended
+    installation) does, and stays terminal. The marks are the ones
+    hack/ci_sweep_agent_pulls.py's is_rate_limited reads.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = pathlib.Path(tmp.name)
+        self.key = self.tmp / "throwaway.pem"
+        try:
+            gen = subprocess.run(
+                ["openssl", "genrsa", "-out", str(self.key), "2048"], capture_output=True, text=True
+            )
+        except FileNotFoundError:  # pragma: no cover - a machine without openssl
+            self.skipTest("openssl is not on PATH, and the mint signs its JWT with it")
+        if gen.returncode != 0:  # pragma: no cover - an openssl that cannot generate a key
+            self.skipTest(f"openssl could not generate a throwaway key: {gen.stderr}")
+        (self.tmp / "sitecustomize.py").write_text(_FAKE_REFUSAL, encoding="utf-8")
+
+    def _rc(self, code, headers=None, body=""):
+        proc = subprocess.run(
+            ["python3", str(_LEDGER_MINT), str(_retryable_rc())],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={
+                    "PYTHONPATH": str(self.tmp),
+                    "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
+                    "LEDGER_MINT_BODY": '{"permissions": {"issues": "read"}}',
+                    "MINT_FAKE_REFUSAL": json.dumps({"code": code, "headers": headers or {}, "body": body}),
+                },
+            ),
+        )
+        self.assertIn("GitHub answered HTTP %d" % code, proc.stderr)
+        self.assertEqual("", proc.stdout, "a refused mint printed a token")
+        return proc.returncode
+
+    def test_a_secondary_rate_limit_body_is_transient(self):
+        body = '{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}'
+        self.assertEqual(_retryable_rc(), self._rc(403, body=body))
+
+    def test_a_403_with_retry_after_is_transient(self):
+        self.assertEqual(_retryable_rc(), self._rc(403, headers={"Retry-After": "60"}))
+
+    def test_a_403_with_no_requests_remaining_is_transient(self):
+        self.assertEqual(_retryable_rc(), self._rc(403, headers={"x-ratelimit-remaining": "0"}))
+
+    def test_an_unmarked_403_is_terminal(self):
+        body = '{"message":"This installation has been suspended"}'
+        self.assertEqual(_TERMINAL_RC, self._rc(403, headers={"x-ratelimit-remaining": "4999"}, body=body))
+
+    def test_a_marked_401_is_still_terminal(self):
+        # The marks free a 403 only: a wrong PEM is a wrong PEM whatever else
+        # the answer carries.
+        self.assertEqual(_TERMINAL_RC, self._rc(401, headers={"Retry-After": "60"}, body="rate limit"))
+
+    def test_a_429_and_a_500_are_transient(self):
+        self.assertEqual(_retryable_rc(), self._rc(429))
+        self.assertEqual(_retryable_rc(), self._rc(500))
+
+    def test_the_marks_are_the_sweepers(self):
+        # Two copies of one discriminator: the mint keeps its own so a
+        # credential path imports nothing else from hack/, and this holds it to
+        # hack/ci_sweep_agent_pulls.py's, which tests/test_ci_sweep_agent_pulls.py covers.
+        sweeper = (_REPO_ROOT / "hack" / "ci_sweep_agent_pulls.py").read_text(encoding="utf-8")
+        mint = _LEDGER_MINT.read_text(encoding="utf-8")
+        for name in ("RATE_LIMIT_BODY_MARKERS", "RETRY_AFTER_HEADER", "RATELIMIT_REMAINING_HEADER"):
+            line = re.search(r"^%s = .*$" % name, sweeper, re.M)
+            self.assertIsNotNone(line, "the sweeper no longer defines %s" % name)
+            self.assertIn(line.group(0), mint, "the mint's %s drifted from the sweeper's" % name)
+
+
 class LedgerMintContractTest(unittest.TestCase):
     """The two halves of the retry live in different languages.
 
@@ -615,9 +724,10 @@ class LedgerMintContractTest(unittest.TestCase):
         body = _LEDGER_MINT.read_text(encoding="utf-8")
         branch = re.search(r"except urllib\.error\.HTTPError.*?^except", body, re.S | re.M)
         self.assertIsNotNone(branch, "could not find the HTTPError branch")
-        # Server-side and rate-limited answers retry; every other status, which
-        # is where 401 and 404 live, exits terminally.
-        self.assertIn("if exc.code >= 500 or exc.code == 429:", branch.group(0))
+        # Server-side and rate-limited answers (a 429, or a 403 marked as the
+        # limit) retry; every other status, which is where 401, 404 and an
+        # unmarked 403 live, exits terminally.
+        self.assertIn("if exc.code >= 500 or exc.code == 429 or rate_limited_403(exc):", branch.group(0))
         self.assertIn("temporary(message)", branch.group(0))
         self.assertIn("sys.exit(message)", branch.group(0))
 

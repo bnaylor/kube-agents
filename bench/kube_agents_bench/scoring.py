@@ -1175,8 +1175,9 @@ def classify_rep(
     # rung 1, for the never-ran signature's reason below: the catastrophic
     # score grades the world outside the record, and a worker that tripped a safeguard while
     # the harness was still waiting on it acted, and must keep blocking.
-    # After the scores test because a scoreless record is a crashed scoring
-    # pass whatever else it carries. The reason leads with the marker so the
+    # After the scores test because a scoreless record without the
+    # infrastructure marker (checked above it) is a crashed scoring pass
+    # whatever else it carries. The reason leads with the marker so the
     # dashboard's collector, which keeps the first characters of a reason,
     # can tell this class from a quota storm.
     errors = record.error if isinstance(record.error, list) else [record.error]
