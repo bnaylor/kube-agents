@@ -1027,6 +1027,12 @@ parse_args() {
       --google-chat-mode=*)
         PARAM_GOOGLE_CHAT_MODE="${1#*=}"
         require_defaulted_flag_value "${1%%=*}" "$PARAM_GOOGLE_CHAT_MODE"
+        # Here and not only at step 6, so the step-2 install.env check never
+        # tells the operator to record a mode step 6 and variables.tf refuse.
+        if [[ ! "$PARAM_GOOGLE_CHAT_MODE" =~ ^(default|debug)$ ]]; then
+          print_error "--google-chat-mode must be either 'default' or 'debug'."
+          exit 1
+        fi
         note_install_env_flag GOOGLE_CHAT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_MODE DEFAULT_GOOGLE_CHAT_MODE
         shift ;;
       --google-chat-home-channel=*)
@@ -1994,9 +2000,12 @@ check_flag_against_install_env() {
       fi
       ;;
     "$INSTALL_ENV_FLAG_KIND_CREDENTIAL")
-      # Empty is not a value: the generator recovers an empty credential from
-      # the live Secret, as it does a missing one.
+      # Empty is not a value, recorded or typed: the generator recovers an
+      # empty credential from the live Secret, as it does a missing one. A
+      # typed empty is a wrapper's unset variable (provision_environment.sh
+      # passes --slack-bot-token="${SLACK_BOT_TOKEN:-}"), not a new token.
       [ -n "$recorded" ] || return 0
+      [ -n "$value" ] || return 0
       [ "$recorded" != "$value" ] || return 0
       print_error "${flag} gives a different ${key} from the one ${file} records, so it would hold for this run only."
       print_info "The next install.sh run without the flag, and every upgrade.sh, renders the ${key} the file records."
@@ -2065,8 +2074,10 @@ check_flags_against_install_env() {
 # makes to an install.env it did not create, and only of keys the file lacks,
 # so nothing the operator wrote changes. main calls it on each route as the last
 # step before the handoff or the apply, past the confirmation and every step
-# that can stop the run, so a run refused, declined or failed before the apply,
-# and a --dry-run, leave the file as it was. An apply that then fails has
+# that can stop the run, so a run refused or failed before the apply, and a
+# --dry-run, leave the file as it was. Pausing at the step-11 confirmation is a
+# handoff too: the tfvars are written and the operator is told to apply them
+# by hand, so it records before saying so. An apply that then fails has
 # recorded what it was applying, which is what the next run should retry.
 #
 # A toggle recorded true brings the settings of its integration that the file
@@ -2078,22 +2089,30 @@ check_flags_against_install_env() {
 # these keys together, and so does the Day-2 menu for Google Chat; the tokens
 # are still never written.
 record_flags_into_install_env() {
-  local file="${INSTALL_ENV_FILE:-}" key value companion record_keys=""
+  local file="${INSTALL_ENV_FILE:-}" key value companion record_keys="" toggles=""
   [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
   # The whole list before the first write, while the file still reads as the
-  # run found it.
+  # run found it. The toggles go last: a write that stops partway (Ctrl-C
+  # before the apply, a full disk) then leaves settings with the integration
+  # off, never the integration on with no allowlist, which admits everyone and
+  # which no re-run repairs, since the flag then agrees with the file.
   for key in $INSTALL_ENV_KEYS_TO_RECORD; do
-    record_keys="${record_keys}${record_keys:+ }${key}"
+    if [ -z "$(install_env_toggle_companions "$key")" ]; then
+      record_keys="${record_keys}${record_keys:+ }${key}"
+      continue
+    fi
+    toggles="${toggles}${toggles:+ }${key}"
     is_truthy "${!key-}" || continue
     for companion in $(install_env_toggle_companions "$key"); do
       case " ${record_keys} ${INSTALL_ENV_KEYS_TO_RECORD} " in
         *" ${companion} "*) continue ;;
       esac
       if ! install_env_records_key "$file" "$companion"; then
-        record_keys="${record_keys} ${companion}"
+        record_keys="${record_keys}${record_keys:+ }${companion}"
       fi
     done
   done
+  record_keys="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
   # A last line with no newline would run into the appended assignment.
   if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
     printf '\n' >> "$file"
@@ -6359,6 +6378,11 @@ main() {
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
+        # A hand-off like `g`: the tfvars are written and the operator is
+        # told to apply them by hand, so a chat flag whose key the
+        # install.env lacks is recorded first, or that apply would turn on a
+        # key the next upgrade.sh renders back off.
+        record_flags_into_install_env
         print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"

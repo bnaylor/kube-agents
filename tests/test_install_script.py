@@ -5672,33 +5672,6 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
 
-    def test_a_non_interactive_chat_flag_that_disagrees_is_refused_not_ignored(self):
-        """The case this test class's non-interactive silence used to cover.
-
-        GOOGLE_CHAT_ENABLED=true in the file and --enable-google-chat=false on
-        a non-interactive run: the warning above still says nothing, and the
-        run stops at check_flags_against_install_env instead of applying it.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            env_file = pathlib.Path(tmp) / "install.env"
-            env_file.write_text("GOOGLE_CHAT_ENABLED=true\n")
-            env_file.chmod(0o600)
-            proc = subprocess.run(
-                ["bash", "-c",
-                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
-                 "source scripts/installer/installer_common.sh\n"
-                 "parse_args -y --enable-google-chat=false\n"
-                 'rc=0; check_flags_against_install_env || rc=$?; echo "rc=$rc"'],
-                capture_output=True, text=True,
-                env=get_isolated_test_env(
-                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}
-                ),
-                cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
-            )
-            self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
-            self.assertIn("records GOOGLE_CHAT_ENABLED=true", proc.stdout + proc.stderr)
-            self.assertEqual(env_file.read_text(), "GOOGLE_CHAT_ENABLED=true\n")
-
     def test_a_key_the_file_does_not_carry_is_not_reported(self):
         """Absent is not drift — the file inherits the default, and warning
         about every unset key would bury the ones that matter."""
@@ -5888,15 +5861,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     @staticmethod
     def _env(overrides):
-        env = get_isolated_test_env(overrides=overrides)
         # A developer's own exports must not answer for the file.
-        for key in ("SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
-                    "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
-                    "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
-                    "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK"):
-            env.pop(key, None)
-        env.update(overrides)
-        return env
+        return get_isolated_test_env(overrides=overrides, absent=(
+            "SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+            "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
+            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
+            "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
+        ))
 
     def _run(self, body, install_env, extra_env=None):
         env = {"KUBE_AGENTS_INSTALL_ENV": str(install_env)}
@@ -5945,6 +5916,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_ENABLED=\n", "--enable-slack", "--enable-slack=true", "records SLACK_ENABLED empty, which is false"),
                 ("GOOGLE_CHAT_ENABLED=false\n", "--enable-google-chat", "--enable-google-chat=true", "records GOOGLE_CHAT_ENABLED=false"),
                 ("GOOGLE_CHAT_ENABLED=true\n", "--google-chat=false", "--google-chat=false", "records GOOGLE_CHAT_ENABLED=true"),
+                # Non-interactive: refused, not applied for one run in silence.
+                ("GOOGLE_CHAT_ENABLED=true\n", "-y --enable-google-chat=false", "--enable-google-chat=false",
+                 "records GOOGLE_CHAT_ENABLED=true"),
             ):
                 with self.subTest(content=content, flags=flags):
                     path, proc, out = self._check(tmp, content, flags)
@@ -6071,6 +6045,41 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         self.assertNotIn("xoxb-recorded", out)
         self.assertNotIn("xoxb-typed", out)
 
+    def test_an_empty_token_flag_is_no_value_not_a_different_token(self):
+        # scripts/release/provision_environment.sh passes
+        # --slack-bot-token="${SLACK_BOT_TOKEN:-}", so an empty token flag is a
+        # wrapper's unset variable, not a new token. It is read the way an
+        # empty recorded token is: nothing to compare, and the generator
+        # recovers the credential from the live Secret.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag, key in (("--slack-bot-token", "SLACK_BOT_TOKEN"), ("--slack-app-token", "SLACK_APP_TOKEN")):
+                with self.subTest(flag=flag):
+                    content = f"PERSIST_SECRETS_ON_DISK=true\n{key}=xoxb-recorded\n"
+                    path, proc, out = self._check(tmp, content, f"{flag}=")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+                    self.assertNotIn("gives a different", out)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_a_chat_mode_outside_the_enum_is_refused_before_the_file_is_consulted(self):
+        # Refused at step 2 by the file check, the remedy would have the
+        # operator write GOOGLE_CHAT_MODE=verbose into install.env, which
+        # step 6 and variables.tf both refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("GOOGLE_CHAT_MODE=default\n", "PROJECT_ID=p\n"):
+                with self.subTest(content=content):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args --google-chat-mode=verbose && {self._CHECK}", path)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn("--google-chat-mode must be either 'default' or 'debug'", out)
+                    self.assertNotIn("GOOGLE_CHAT_MODE=verbose", out)
+                    self.assertNotIn("QUEUED=", out)
+                    self.assertEqual(path.read_text(), content)
+            for mode in ("default", "debug"):
+                with self.subTest(mode=mode):
+                    path, proc, out = self._check(tmp, f"GOOGLE_CHAT_MODE={mode}\n", f"--google-chat-mode={mode}")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
     # ── agreement ───────────────────────────────────────────────────────────
 
     def test_a_flag_that_agrees_with_the_file_changes_nothing(self):
@@ -6148,7 +6157,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     self.assertIn(f"Recorded {key}={applied} in {path}, which assigned no {key}", out)
                     expected = content if content.endswith("\n") else content + "\n"
                     companions = self._EMPTY_COMPANIONS[key] if applied == "true" else ""
-                    self.assertEqual(path.read_text(), expected + f"{key}={applied}\n" + companions)
+                    self.assertEqual(path.read_text(), expected + companions + f"{key}={applied}\n")
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                     param = "PARAM_ENABLE_SLACK" if key == "SLACK_ENABLED" else "PARAM_ENABLE_GOOGLE_CHAT"
                     again = self._run(f'echo "SEED=[${param}]"', path)
@@ -6200,7 +6209,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     out = proc.stdout + proc.stderr
                     self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, out)
                     self.assertEqual(
-                        path.read_text(), content + "SLACK_ENABLED=true\n" + self._EMPTY_COMPANIONS["SLACK_ENABLED"],
+                        path.read_text(), content + self._EMPTY_COMPANIONS["SLACK_ENABLED"] + "SLACK_ENABLED=true\n",
                     )
                     self.assertNotIn("xoxb-typed", path.read_text())
                     self.assertNotIn("xapp-typed", out)
@@ -6215,16 +6224,16 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     "--enable-slack",
                     "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2 SLACK_HOME_CHANNEL=C1 "
                     "SLACK_HOME_CHANNEL_NAME='#gke alerts' SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed",
-                    ["SLACK_ENABLED=true", "SLACK_ALLOWED_USERS=U1\\,U2", "SLACK_HOME_CHANNEL=C1",
-                     "SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts"],
+                    ["SLACK_ALLOWED_USERS=U1\\,U2", "SLACK_HOME_CHANNEL=C1",
+                     "SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts", "SLACK_ENABLED=true"],
                     ("xoxb-typed", "xapp-typed"),
                 ),
                 (
                     "--enable-google-chat",
                     "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
-                    ["GOOGLE_CHAT_ENABLED=true", "ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
-                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug"],
+                    ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
+                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
                     ("CHAT_SUB_NAME",),
                 ),
             ):
@@ -6246,10 +6255,10 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             for content, flags, applied, appended in (
                 # The file's own allowlist stays as written; only the missing keys come.
                 ("SLACK_ALLOWED_USERS=U0\n", "--enable-slack", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U0 SLACK_HOME_CHANNEL=C1",
-                 "SLACK_ENABLED=true\nSLACK_HOME_CHANNEL=C1\nSLACK_HOME_CHANNEL_NAME=''\n"),
+                 "SLACK_HOME_CHANNEL=C1\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ENABLED=true\n"),
                 # A companion typed as a flag is recorded once, not twice.
                 ("PROJECT_ID=p\n", "--enable-slack --slack-allowed-users=U9", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U9",
-                 "SLACK_ENABLED=true\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ALLOWED_USERS=U9\n"),
+                 "SLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ALLOWED_USERS=U9\nSLACK_ENABLED=true\n"),
                 # Off renders nothing of the integration, so nothing beside it is pinned.
                 ("PROJECT_ID=p\n", "--enable-slack=false", "SLACK_ENABLED=false SLACK_ALLOWED_USERS=U1", "SLACK_ENABLED=false\n"),
                 ("PROJECT_ID=p\n", "--enable-google-chat", "GOOGLE_CHAT_ENABLED=false ALLOWED_USERS=a", "GOOGLE_CHAT_ENABLED=false\n"),
@@ -6261,6 +6270,38 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                         path,
                     )
                     self.assertEqual(path.read_text(), content + appended, proc.stdout + proc.stderr)
+
+    def test_the_toggle_is_the_last_line_the_record_appends(self):
+        # A record that stops partway (Ctrl-C before the apply, a full disk)
+        # leaves the settings without the toggle, which the next full run
+        # renders off, never the toggle without its allowlist, which renders
+        # on and admits everyone. And no re-run repairs the second: the flag
+        # then agrees with the file, so nothing is queued.
+        applied = "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1 GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com"
+        toggles = {"SLACK_ENABLED=true", "GOOGLE_CHAT_ENABLED=true"}
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags in ("--enable-slack", "--enable-google-chat", "--enable-slack --enable-google-chat",
+                          "--slack-home-channel=C1 --enable-slack --slack-allowed-users=U1"):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    appended = path.read_text().splitlines()[1:]
+                    typed = sum(1 for toggle in ("--enable-slack", "--enable-google-chat") if toggle in flags)
+                    self.assertGreater(len(appended), typed, proc.stdout + proc.stderr)
+                    self.assertEqual(set(appended[-typed:]), toggles & set(appended), appended)
+                    self.assertFalse(toggles & set(appended[:-typed]), appended)
+            # The interrupted write itself: the first append lands, the second dies.
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            self._run(
+                f"parse_args --enable-slack; {self._CHECK}; export {applied}; "
+                "_writes=0; write_env_var() { _writes=$((_writes + 1)); [ \"$_writes\" -lt 2 ] || exit 130; "
+                "printf '%s=%q\\n' \"$2\" \"$3\" >> \"$1\"; }; record_flags_into_install_env",
+                path,
+            )
+            self.assertEqual(path.read_text(), "PROJECT_ID=p\nSLACK_ALLOWED_USERS=U1\n")
 
     def test_upgrade_keeps_the_allowlist_given_at_the_prompt_after_a_recorded_enable_slack(self):
         # The bot's walk: a hand-written file with section 3 commented out,
@@ -6330,8 +6371,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     _CONFIRM_END = "\n    esac\n  fi\n"
     _RECORD_HANDOFF = "\n    record_flags_into_install_env\n"
     _RECORD_APPLY = "\n  record_flags_into_install_env\n"
+    _RECORD_PAUSE = '\n        record_flags_into_install_env\n        print_warning "Provisioning paused by user.'
 
-    def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
+    def test_a_refused_run_leaves_the_file_and_a_committed_or_paused_one_records(self):
         text = _INSTALL_SH.read_text()
         main_start = text.index("\nmain() {")
         start = text.index(self._CONFIRM_START, main_start)
@@ -6345,31 +6387,42 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             f"_confirm() {{\n{block}  record_flags_into_install_env\n}}\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
-            for flags, answer, scope_rc, records in (
-                ("--enable-slack", "n", 0, False),  # declined at the prompt
-                ("--enable-slack", "y", 1, False),  # refused after the confirmation
-                ("--enable-slack", "y", 0, True),
-                ("--enable-slack", "g", 0, True),
-                ("--enable-slack -y", "", 1, True),  # -y is refused above the summary, not here
-                ("--enable-slack --generate-only", "", 0, True),
+            for flags, answer, scope_rc, records, goes_on in (
+                # `n` pauses and hands off: tfvars are written and the message
+                # says to run lifecycle.sh apply by hand, as `g` does, so the
+                # keys that apply turns on are recorded first.
+                ("--enable-slack", "n", 0, True, False),
+                ("--enable-slack", "y", 1, False, False),  # refused after the confirmation
+                ("--enable-slack", "y", 0, True, True),
+                ("--enable-slack", "g", 0, True, True),
+                ("--enable-slack -y", "", 1, True, True),  # -y is refused above the summary, not here
+                ("--enable-slack --generate-only", "", 0, True, True),
             ):
                 with self.subTest(flags=flags, answer=answer, scope_rc=scope_rc):
                     path = self._file(tmp, "PROJECT_ID=p\n")
                     proc = self._run(
                         f"{stubs}parse_args {flags}; check_flags_against_install_env || exit 1\n"
-                        "export SLACK_ENABLED=true\n"
+                        "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1\n"
                         f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
                         path,
                     )
+                    out = proc.stdout + proc.stderr
+                    if goes_on:
+                        self.assertIn("went on", proc.stdout, out)
+                    else:
+                        self.assertNotIn("went on", proc.stdout, out)
                     if records:
-                        self.assertIn("went on", proc.stdout, proc.stderr)
                         self.assertEqual(
                             path.read_text(),
-                            "PROJECT_ID=p\nSLACK_ENABLED=true\n" + self._EMPTY_COMPANIONS["SLACK_ENABLED"],
+                            "PROJECT_ID=p\nSLACK_ALLOWED_USERS=U1\nSLACK_HOME_CHANNEL=''\n"
+                            "SLACK_HOME_CHANNEL_NAME=''\nSLACK_ENABLED=true\n",
+                            out,
                         )
                     else:
-                        self.assertNotIn("went on", proc.stdout, proc.stderr)
                         self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+                    if answer == "n":
+                        self.assertEqual(proc.returncode, 0, out)
+                        self.assertLess(proc.stdout.index("Recorded SLACK_ENABLED=true"), proc.stdout.index("Provisioning paused by user"))
 
     def test_main_checks_before_the_interview_and_records_last_on_each_route(self):
         text = _INSTALL_SH.read_text()
@@ -6398,6 +6451,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 with self.subTest(gate=gate, record=record):
                     self.assertLess(text.index(gate, main_start), record)
         self.assertLess(exported, handoff)
+        # The step-11 pause is the third hand-off: its message tells the
+        # operator to apply the tfvars by hand, so it records before saying so.
+        self.assertEqual(text.count(self._RECORD_PAUSE), 1)
+        pause = text.index(self._RECORD_PAUSE, main_start)
+        self.assertLess(exported, pause)
+        self.assertLess(text.index("require_slack_tokens_after_recovery\n", main_start), pause)
+        self.assertLess(pause, text.index('write_json_report "PAUSED"', main_start))
         self.assertTrue(
             text[handoff + len(self._RECORD_HANDOFF):].startswith('    print_generate_only_handoff "$repo_dir"'),
             text[handoff:handoff + 200],

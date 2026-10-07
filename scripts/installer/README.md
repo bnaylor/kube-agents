@@ -158,15 +158,21 @@ for `SLACK_ENABLED`, which it turns on without asking for the tokens; to turn Sl
 key and re-run with `--slack-bot-token` and `--slack-app-token`. A key with a default (the toggles, the topic, the Chat mode) that
 the file sets empty counts as that default, and the two allowlists compare as the lists they
 render to, so `a,b` and `a, b` agree. `--chat-topic-name=` and `--google-chat-mode=` given an
-empty value are refused, as an empty toggle is, rather than read as the default. `--chat-sub-name` is not held: on a running install the
+empty value are refused, as an empty toggle is, rather than read as the default, and a
+`--google-chat-mode` other than `default` or `debug` is refused before the file is consulted. An
+empty `--slack-bot-token=` or `--slack-app-token=` is no value, as an empty recorded token is: it
+is not compared, and the token is recovered from the live Secret. `--chat-sub-name` is not held: on a running install the
 subscription name comes from Terraform state, ahead of both the flag and the file. A flag
 whose key the file does not assign at all is appended to the file with the value the run
-applies, as the last step before the apply or the `--generate-only` handoff, so a run refused,
-declined or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
+applies, as the last step before the apply or a handoff (`--generate-only`, or `g` or `n` at the
+step-11 confirmation, both of which leave tfvars for the operator to apply by hand), so a run
+refused or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
 then fails has recorded what it was applying. A toggle recorded `true` brings the settings of
 its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
 `SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
-`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. Otherwise
+`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
+toggle is written after them, so a record cut short leaves the settings with the integration
+off, never the integration on without its allowlist. Otherwise
 an allowlist given at the prompt or as an export would be left out, and the next upgrade would
 render the integration on with an empty allowlist, which admits everyone. A file the run cannot write is refused up front
 when there is a key to record. This is the one write
