@@ -327,6 +327,13 @@ land `completed` first - both orders are legal and the terminal event wins. A pe
 deadline (default 7200s, matching the profile's `activeDeadlineSeconds`) takes the same
 kill path and lands `failed`.
 
+The reap after any exit is bounded by the same grace. A process the subprocess started outside
+its group survives the group kill and can hold stdout or stderr open; the bridge stops waiting
+for the output one grace after the subprocess is reaped. A killed run whose reap ran that long
+adds `; the reap after the kill ran the full <grace>, so a process hermes started may still hold
+its output` to its reason. A run that exited 0 still completes: what it wrote was copied during
+the grace, and only the escaped process's later output is dropped.
+
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable
 delivers serially and acks after the handler, so a cancel already on the task's `…in`
