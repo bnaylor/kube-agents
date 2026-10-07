@@ -4880,13 +4880,17 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// nothing here assumes which backends are Secret-backed.
 	//
 	// The Deployment read goes through the informer rather than a2aReader,
-	// unlike the callout gate below, because the stale directions cost
-	// differently here: a stale NotFound on a dark pass withholds an apply
-	// for one pass (and the requeue comes back), and a stale hit -- the
-	// Deployment deleted inside the informer's lag -- applies it at zero
-	// replicas, which creates a Deployment that runs nothing, and the next
-	// pass sees it as the one that exists. A live read would buy that
-	// corner with one API call per pass on every next install.
+	// unlike the callout gate below, because a backend pass needs no more:
+	// the gate re-reads live when it would hold. A dark pass that finds a
+	// gateway confirms it through a2aReader before the zero apply, because
+	// a stale hit -- the Deployment deleted inside the informer's lag --
+	// would otherwise be a server-side apply that creates it at zero
+	// replicas, and the pass that later scales that object to one replica
+	// asks the callout gate nothing, since the gate never holds a gateway
+	// that exists. So a stale hit takes the absent path and creates
+	// nothing. A stale NotFound withholds the apply for one pass, and the
+	// requeue comes back. The live read is one GET per dark pass that
+	// found a gateway, never on a pass with a backend.
 	liveGateway := &appsv1.Deployment{}
 	getErr := r.Get(ctx, client.ObjectKeyFromObject(dep), liveGateway)
 	if getErr != nil && !errors.IsNotFound(getErr) {
@@ -4900,6 +4904,13 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	if !configured {
 		state.gatewayDark = true
 		state.gatewayDarkReason = why
+		if gatewayExists {
+			err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+			if err != nil && !errors.IsNotFound(err) {
+				return state, err
+			}
+			gatewayExists = err == nil
+		}
 		if gatewayExists {
 			// The callout gate and anything after it are skipped: the
 			// callout gate never holds a gateway that exists, and nothing

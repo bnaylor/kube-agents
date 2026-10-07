@@ -1255,6 +1255,63 @@ func TestAnExistingGatewayScalesToZeroWithoutABackend(t *testing.T) {
 	}
 }
 
+// TestADarkPassOnAStaleGatewayHitCreatesNothing: the dark pass reads the
+// gateway from the informer, and a server-side apply of a Deployment the API
+// server no longer holds creates it. An informer that has not yet seen a
+// deleted gateway go must not lead the zero-replica apply to re-create it:
+// a gateway created that way never passed the callout gate, and the wake
+// that later scales it to one replica asks the gate nothing, because the
+// gate never holds a gateway that exists. The existence the zero apply acts
+// on is confirmed live, through a2aReader.
+//
+// The fake client has read-your-writes, so the informer is staged: r.Client
+// answers the gateway's Get with the copy it held before the delete, while
+// APIReader is the store itself.
+func TestADarkPassOnAStaleGatewayHitCreatesNothing(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	held := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, held); err != nil {
+		t.Fatalf("precondition: the gateway renders with the Secret present: %v", err)
+	}
+
+	if err := cl.Delete(ctx, held.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Delete(ctx, discordBotSecret(agent)); err != nil {
+		t.Fatal(err)
+	}
+	informer := interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if dep, ok := obj.(*appsv1.Deployment); ok && k == key {
+				held.DeepCopyInto(dep)
+				return nil
+			}
+			return c.Get(ctx, k, obj, opts...)
+		},
+	})
+	r.APIReader = cl
+	r.Client = informer
+
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A on the stale gateway hit: %v", err)
+	}
+	if !state.gatewayDark {
+		t.Errorf("a pass with no backend was not reported dark (reason=%q)", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, key, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Fatalf("a dark pass on an informer still holding a deleted gateway re-created it (Get err=%v); want NotFound", err)
+	}
+}
+
 // TestADarkExistingGatewayKeepsTheReconcileRequeuing: the requeue that brings
 // a withheld gateway's Secret into view brings a scaled-to-zero one's too.
 // Measured as TestADarkGatewayKeepsTheReconcileRequeuing is, on a provisioned
