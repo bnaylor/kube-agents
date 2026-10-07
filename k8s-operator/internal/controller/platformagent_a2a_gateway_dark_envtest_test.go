@@ -389,8 +389,15 @@ func TestTheInjectDoorTurnedOffScalesTheGatewayToZeroAndBackEnvtest(t *testing.T
 	if res.RequeueAfter != darkEnvtestRequeue {
 		t.Errorf("door on, no replica ready: requeued after %s, want %s while the condition waits on the replica", res.RequeueAfter, darkEnvtestRequeue)
 	}
-	// Ready: the condition clears.
+	// Ready: the condition clears. First the status writer alone, handed a
+	// render that still said waking (its informer read predates the replica
+	// turning ready): its own read of the ready count wins, so the gateway
+	// counts as ready and no condition text comes back.
 	g.reportGatewayReady(1)
+	if counted, ready, dark := g.splitHasGateway(a2aProvisionState{done: true, gatewayWaking: true}); !counted || ready != 1 || dark != "" {
+		t.Errorf("replica ready, render still waking: Ready's workload list counts the gateway=%v ready=%d with condition text %q, want counted, ready and none",
+			counted, ready, dark)
+	}
 	g.pass()
 	if cond := g.gatewayCondition(); cond != nil {
 		t.Errorf("door on, replica ready: the CR still says the gateway is dark: %+v", cond)
