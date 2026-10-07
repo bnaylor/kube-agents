@@ -7564,7 +7564,7 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 
 	// Without this the test passes vacuously on a list that lost its fences
 	// entirely, which is a worse bug than the one it is written to catch.
-	if want := 6; fences != want {
+	if want := 7; fences != want {
 		t.Fatalf("the teardown walks %d NetworkPolicies, want %d — if a fence was added or removed, "+
 			"re-read the ordering argument above before changing this number", fences, want)
 	}
