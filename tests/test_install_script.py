@@ -5952,7 +5952,16 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     self.assertIn(f"{flag_shown} disagrees with the install configuration, so it would hold for this run only", out)
                     self.assertIn(f"{path} {says}", out)
                     self.assertIn("every upgrade.sh, renders from the file", out)
-                    self.assertIn("or change it with './install.sh --menu'", out)
+                    # The menu edits the Google Chat toggle; it turns Slack on
+                    # without the tokens, so it is not offered for Slack.
+                    if "GOOGLE_CHAT" in content:
+                        self.assertIn("or change it with './install.sh --menu'", out)
+                    else:
+                        self.assertNotIn("--menu", out)
+                    if flag_shown == "--enable-slack=true":
+                        self.assertIn("passing --slack-bot-token and --slack-app-token", out)
+                    else:
+                        self.assertNotIn("passing --slack-bot-token", out)
                     self.assertEqual(path.read_text(), content, "a refusal never touches the file")
 
     def test_a_chat_string_that_disagrees_is_refused(self):
@@ -5983,8 +5992,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, slack_users = self._check(tmp, "SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=U2")
             _, _, chat_users = self._check(tmp, "ALLOWED_USERS=a\n", "--google-chat-allowed-users=b")
+            # Saved by the panel, but not something it lets you change.
+            _, _, topic = self._check(tmp, "CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b")
+            _, _, slack_on = self._check(tmp, "SLACK_ENABLED=false\n", "--enable-slack")
         self.assertNotIn("--menu", slack_users)
         self.assertIn("or change it with './install.sh --menu'", chat_users)
+        self.assertNotIn("--menu", topic)
+        self.assertNotIn("--menu", slack_on)
 
     def test_the_menu_keys_are_the_ones_run_menu_system_saves(self):
         text = _INSTALL_SH.read_text()
@@ -5998,6 +6012,23 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             with self.subTest(not_saved=key):
                 self.assertNotIn(f"save_env_var {key} ", menu)
                 self.assertNotIn(key, listed)
+        # Saving a key is not editing it: each listed key is one the chat
+        # screen asks for or turns on and off.
+        screen = menu[menu.index('prompt_menu "Select Chat Integration:"'):]
+        screen = screen[:screen.index("\n        esac\n")]
+        edits = {
+            "GOOGLE_CHAT_ENABLED": 'google_chat_enabled="true"',
+            "ALLOWED_USERS": "allowed_users \"$allowed_users\"",
+            "GOOGLE_CHAT_HOME_CHANNEL": "google_chat_home_channel \"$google_chat_home_channel\"",
+        }
+        self.assertEqual(sorted(listed), sorted(edits))
+        for key, edit in edits.items():
+            with self.subTest(edited=key):
+                self.assertIn(edit, screen)
+        # Saved as loaded, never asked; and on without the tokens.
+        self.assertIn("save_env_var CHAT_TOPIC_NAME ", menu)
+        self.assertNotIn("chat_topic_name", screen)
+        self.assertIn('2) slack_enabled="true" ;;', screen)
 
     def test_every_disagreement_is_named_before_the_run_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6268,6 +6299,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     out = proc.stdout + proc.stderr
                     self.assertNotIn("MENU RAN", out)
                     self.assertIn("--menu takes no chat flag", out)
+                    self.assertIn("turns Google Chat on or off and edits its allowlist and home channel", out)
                     self.assertNotEqual(proc.returncode, 0)
 
     # ── where main checks and records ───────────────────────────────────────

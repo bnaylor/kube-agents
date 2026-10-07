@@ -560,7 +560,8 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
 
 To add a chat platform later, set `GOOGLE_CHAT_ENABLED=true` or `SLACK_ENABLED=true` in
 `install.env`, re-run `./install.sh` (for Slack, with `--slack-bot-token` and `--slack-app-token`,
-or interactively to be asked for them) or use `./install.sh --menu`, and follow Step 5. The
+or interactively to be asked for them; for Google Chat, `./install.sh --menu` also works), and
+follow Step 5. The
 `install.env` a chat-less install writes records both as `false`, and `install.sh` refuses
 `--enable-google-chat` or `--enable-slack` over a file that records the key the other way
 ([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).

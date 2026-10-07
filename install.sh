@@ -90,10 +90,12 @@ readonly INSTALL_ENV_FLAG_KIND_BOOL="bool"
 readonly INSTALL_ENV_FLAG_KIND_STRING="string"
 readonly INSTALL_ENV_FLAG_KIND_LIST="list"
 readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
-# The keys the Day-2 menu's Save & Apply writes among those, so a refusal
-# names --menu only where the menu can make the edit. Mirrors run_menu_system's
-# save_env_var calls.
-readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED"
+# The keys among those that the Day-2 menu's chat screen edits and its Save &
+# Apply writes, so a refusal names --menu only where the menu can make the
+# edit. Not CHAT_TOPIC_NAME, which the panel saves as loaded and never asks
+# about, and not SLACK_ENABLED: the panel turns Slack on without asking for
+# the tokens, and its apply does not check for them.
+readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
 # The chat flags this run typed, one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
 # noted by parse_args; and the keys among them that install.env does not
 # assign, for record_flags_into_install_env to append once the run commits.
@@ -1999,7 +2001,11 @@ check_flag_against_install_env() {
   case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
     *" ${key} "*) remedy="${remedy}, or change it with './install.sh --menu'" ;;
   esac
-  print_info "${remedy}, and re-run without ${flag}."
+  remedy="${remedy}, and re-run without ${flag}"
+  if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
+    remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
+  fi
+  print_info "${remedy}."
   return 1
 }
 
@@ -4825,7 +4831,7 @@ main() {
     # and edits them on its own screens, so a flag here would be dropped.
     if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
       print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
-      print_info "The menu's chat screen turns Slack and Google Chat on or off and edits the Google Chat allowlist, topic and home channel; set the other keys in install.env, or pass the flags to a plain install.sh run."
+      print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -5331,7 +5337,7 @@ main() {
     # --enable-google-chat or --enable-slack that disagrees with it is refused
     # (check_flag_against_install_env), so the key is the way to turn one on.
     echo -e "  To add a chat platform later, set ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} or ${C_BOLD}SLACK_ENABLED=true${C_RESET} in install.env and"
-    echo -e "  re-run ${C_BOLD}./install.sh${C_RESET} (for Slack, with --slack-bot-token and --slack-app-token), or use ${C_BOLD}./install.sh --menu${C_RESET}."
+    echo -e "  re-run ${C_BOLD}./install.sh${C_RESET} (for Slack, with --slack-bot-token and --slack-app-token); for Google Chat, ${C_BOLD}./install.sh --menu${C_RESET} also works."
     echo -e "  --enable-google-chat and --enable-slack are refused over a file that records the key."
   }
 
