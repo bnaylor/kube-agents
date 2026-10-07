@@ -902,6 +902,22 @@ Mutation(
         "log the hint raw, which is the state the sanitiser was added to fix",
     ),
     Mutation(
+        "D1-gateway-role-reaches-secrets",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('Resources: []string{"pods"},', 'Resources: []string{"pods", "secrets"},'),
+        "test_D1_no_product_role_can_write_the_identity_table",
+        "let the gateway's spawner Role read and write Secrets beside pods, "
+        "which is the shortcut that puts its own identity table in its hands",
+    ),
+    Mutation(
+        "D1-platform-role-reaches-secrets",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        "test_D1_no_product_role_can_write_the_identity_table",
+        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
+        "beside the configmaps it already reads",
+    ),
+    Mutation(
         "D2-workflow-mode",
         "k8s-operator/api/v1alpha1/common_types.go",
         ("type SecuritySpec struct {", "type SecuritySpec struct {\n\tWorkflowMode string `json:\"workflowMode,omitempty\"`"),
@@ -1474,6 +1490,19 @@ Mutation(
         "the conformance suite pins against a2a/lib, and after this edit the "
         "name the operator actually refuses is a literal no test reads. The "
         "next rename moves the constant and leaves the drop behind",
+    ),
+    Mutation(
+        "C1-reserved-principals-env-renamed-on-the-callout-side",
+        "a2a/cmd/authcallout/main.go",
+        ('envReservedPrincipals = "A2A_RESERVED_PRINCIPALS"',
+         'envReservedPrincipals = "A2A_STATIC_PRINCIPALS"'),
+        "test_C1_the_callouts_reserved_principals_env_is_spelled_the_same_in_both_modules",
+        "rename the callout's reserved-principals variable to say what the "
+        "names are, in the module that reads it. a2a builds and its tests set "
+        "the env by the same constant, so they stay green; the operator is not "
+        "rebuilt by this edit and goes on rendering A2A_RESERVED_PRINCIPALS. "
+        "The next callout rollout's pods exit with A2A_STATIC_PRINCIPALS is "
+        "required and never go Ready",
     ),
     Mutation(
         "C1-agent-principal-gets-a-static-password",

@@ -263,6 +263,18 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
+    # D1's identity-table check reads the two Roles the next stack mints that
+    # no golden renders (every golden is `mode: today`): the gateway's and the
+    # callout's. Anchored on the rule each one grants, so the extractor that
+    # reads them cannot return an empty body and pass.
+    "a2a_gateway_role": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
+    ),
+    "a2a_callout_role": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
+    ),
     # The A2A door is the inject door's sibling for an agent caller, gated and
     # resolved the same way; A3 reads the same two seams for it.
     "a2a_door_render": Source(
@@ -398,6 +410,8 @@ SOURCES: dict[str, Source] = {
             "a2aBusTokenAudience",
             "a2aBusTokenPath",
             "a2aBusTokenFile",
+            "a2aCalloutReservedPrincipalsEnvVar = ",
+            "func buildA2ACalloutDeployment(",
             "a2aBusTokenVolume",
             "func a2aBusTokenVolumeSource(",
             "func a2aStripBusTokenMounts(",
@@ -448,6 +462,14 @@ SOURCES: dict[str, Source] = {
     "a2a_cli_main": Source(
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
+    ),
+    # The callout's reader of the static principal list the operator renders
+    # into its Deployment. The operator half is operator_a2a_callout below
+    # (a2aCalloutReservedPrincipalsEnvVar); the two modules cannot import
+    # each other, so C1 compares the two literals.
+    "a2a_callout_main": Source(
+        "a2a/cmd/authcallout/main.go",
+        ("envReservedPrincipals = ", "os.LookupEnv(envReservedPrincipals)", "func run("),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(

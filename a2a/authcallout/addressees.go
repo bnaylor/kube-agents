@@ -22,7 +22,8 @@ import (
 // here: the pod that holds the name is the addressee. The ones that do are
 // addressees with a fixed name that some other principal executes. The
 // operator renders them into the callout's environment as a comma-separated
-// list, from the same constant the bridge's grants are built from.
+// list, from the same constant the bridge's grants are built from. NewService
+// folds them into the one reserved set reservedAs checks (see reserved.go).
 
 const (
 	// reservedAddresseeSeparator splits the operator-rendered list.
@@ -54,29 +55,4 @@ func ParseReservedAddressees(raw string) ([]string, error) {
 		names = append(names, name)
 	}
 	return names, nil
-}
-
-// reservedAddresseeSet builds the lookup the callout refuses against. It
-// refuses an empty input for the same reason ParseReservedAddressees does, so a
-// caller that skipped the parser cannot construct a Service that reserves no
-// addressee.
-func reservedAddresseeSet(names []string) (map[string]struct{}, error) {
-	if len(names) == 0 {
-		return nil, fmt.Errorf("the callout needs the reserved addressee names; with none, a narrowed pod could take any addressee's task subjects")
-	}
-	set := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		if !lib.ValidSubjectToken(n) {
-			return nil, fmt.Errorf("reserved addressee %q is not a dot-free DNS-1123 label, so no pod could be refused for it", n)
-		}
-		set[n] = struct{}{}
-	}
-	return set, nil
-}
-
-// reservedAddressee reports whether a narrowed user name is a reserved
-// addressee's.
-func (s *Service) reservedAddressee(user string) bool {
-	_, ok := s.reservedAddressees[user]
-	return ok
 }
