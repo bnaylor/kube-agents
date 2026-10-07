@@ -96,6 +96,9 @@ PRINCIPAL_LISTED_PLACEHOLDER = "{listed}"
 PRINCIPAL_CHECKS = (harness.CHECK_DM, harness.CHECK_MENTION, harness.CHECK_THREAD, harness.CHECK_RESTART)
 
 CHECK_LEGACY_SOCKET = "legacy-socket"
+# The verdict names of the launcher's other checks.
+RESTART_RESULT = "restart-cmd"
+PRINCIPAL_RESULT = "principal"
 LAUNCHER_ONLY_CHECKS = (CHECK_LEGACY_SOCKET,)
 ALL_CHECKS = harness.CHECK_ORDER + LAUNCHER_ONLY_CHECKS
 PROJECT_FLAG = "--project"
@@ -109,7 +112,7 @@ LAUNCHER_OWNED_HARNESS_FLAGS = (CHECKS_FLAG, RUN_ID_FLAG, PROJECT_FLAG, KEEP_GOI
 # --metadata-token-url, --secret-manager-base): they would send the user tokens, or
 # the pod's Workload Identity token, to whatever host the workstation names.
 FORWARDABLE_HARNESS_FLAGS = frozenset({
-    "--token-source", "--listed-secret", "--unlisted-secret", "--bot-user-id", "--bot-name", "--channel",
+    "--listed-secret", "--unlisted-secret", "--bot-user-id", "--bot-name", "--channel",
     "--thread-ts", "--prompt", "--followup", "--wait-answer", "--reply-timeout",
     "--poll-interval", "--unlisted-via", "--unlisted-repeat", "--quiet-window", "--refusal-silence-ok",
     "--home-channel", "--home-since", "--home-timeout", "--home-match",
@@ -141,7 +144,8 @@ class Kubectl:
 
     def run(self, args: list[str], stdin: Optional[str] = None) -> str:
         cmd = ["kubectl", "--context", self.context, *args]
-        proc = self.runner(cmd, input=stdin, capture_output=True, text=True, check=False)
+        # UTF-8 whatever the locale: a forwarded flag can carry any character into the Job.
+        proc = self.runner(cmd, input=stdin, capture_output=True, text=True, encoding="utf-8", check=False)
         if proc.returncode != 0:
             raise LaunchError(f"{' '.join(cmd[:6])}... exited {proc.returncode}: {proc.stderr.strip()[-STDERR_TAIL_CHARS:]}")
         return proc.stdout
@@ -233,7 +237,9 @@ def job_manifests(namespace: str, service_account: str, image: str, run_id: str,
         "SERVICE_ACCOUNT": service_account,
         "IMAGE": image,
         "CONFIGMAP_NAME": job_name,
-        "ARGS_JSON": json.dumps(harness_args),
+        # Not ensure_ascii: a character above U+FFFF would be a \\ud83d-style surrogate
+        # pair, which JSON allows and kubectl's YAML parser refuses.
+        "ARGS_JSON": json.dumps(harness_args, ensure_ascii=False),
         "DEADLINE_SECONDS": str(deadline_seconds),
         "TTL_SECONDS": str(JOB_TTL_SECONDS),
     })
@@ -275,6 +281,7 @@ class Launcher:
         self.runner = runner
         self.results: list[tuple[str, bool, str]] = []
         self._agent = args.agent_name
+        self._image = args.image
         self.namespace_applied = False
         self.run_ids: set[str] = set()
 
@@ -284,11 +291,24 @@ class Launcher:
             self._agent = discover_agent(self.kubectl, self.args.agent_namespace)
         return self._agent
 
+    @property
+    def image(self) -> str:
+        if not self._image:
+            self._image = discover_image(self.kubectl, self.args.agent_namespace, self.agent)
+        return self._image
+
     def record(self, name: str, passed: bool, detail: str) -> bool:
         line = f"{'PASS' if passed else 'FAIL'} {name}: {detail}"
         say(line)
         self.results.append((name, passed, line))
         return passed
+
+    def guarded(self, name: str, check: Callable[..., bool], *args) -> bool:
+        """Runs one launcher-side check. A kubectl failure inside it is that check's FAIL, not the run's end."""
+        try:
+            return check(*args)
+        except LaunchError as exc:
+            return self.record(name, False, f"error: {exc}")
 
     def deployment(self, suffix: str) -> dict:
         return self.kubectl.get_json(["get", "deployment", self.agent + suffix, "-n", self.args.agent_namespace])
@@ -358,7 +378,7 @@ class Launcher:
         self.ensure_namespace()
         run_id, hargs = self.harness_args(checks)
         hargs += extra or []
-        image = self.args.image or discover_image(self.kubectl, self.args.agent_namespace, self.agent)
+        image = self.image
         deadline = job_deadline(hargs, self.args.job_timeout)
         job_name, configmap, job = job_manifests(self.args.namespace, self.args.service_account, image, run_id, hargs,
                                                  deadline)
@@ -399,12 +419,25 @@ class Launcher:
     def wait_job(self, job_name: str, deadline_seconds: int) -> str:
         deadline = self.clock() + deadline_seconds + JOB_WAIT_GRACE_SECONDS
         while True:
-            job = self.kubectl.get_json(["get", "job", job_name, "-n", self.args.namespace])
+            # One failed read (an auth-plugin refresh, a TLS timeout, a 5xx) is not
+            # the Job's end, and giving up here would delete a Job mid-check. Read
+            # again on the next tick; only reads failing up to the deadline count.
+            read_error: Optional[LaunchError] = None
+            try:
+                job = self.kubectl.get_json(["get", "job", job_name, "-n", self.args.namespace])
+            except LaunchError as exc:
+                read_error, job = exc, {}
             for cond in job.get("status", {}).get("conditions", []) or []:
                 if cond.get("type") in ("Complete", "Failed") and cond.get("status") == "True":
                     return cond["type"]
             if self.clock() >= deadline:
-                pods = self.kubectl.run(["get", "pods", "-n", self.args.namespace, "-l", f"job-name={job_name}", "-o", "wide"])
+                if read_error is not None:
+                    say(f"JOB {job_name}: its status could not be read until the deadline; last error: {read_error}")
+                    return "Unknown"
+                try:
+                    pods = self.kubectl.run(["get", "pods", "-n", self.args.namespace, "-l", f"job-name={job_name}", "-o", "wide"])
+                except LaunchError as exc:
+                    pods = f"(not listed: {exc})"
                 say(f"JOB {job_name} did not finish in time; pods:\n{pods}")
                 return "Timeout"
             self.sleep(JOB_POLL_INTERVAL_SECONDS)
@@ -415,7 +448,7 @@ class Launcher:
         """--expect-principal: the gateway's ingress line for each listed turn names the expected principal."""
         turns = [ev for ev in evidence if ev.get("check") in PRINCIPAL_CHECKS and ev.get("passed") and ev.get("sent_ts")]
         if not turns:
-            return self.record("principal", False, "no passing listed turn to look up")
+            return self.record(PRINCIPAL_RESULT, False, "no passing listed turn to look up")
         since = max(ev.get("elapsed_seconds", 0) for ev in turns) + LOG_SINCE_MARGIN_SECONDS
         gateway = self.deployment(GATEWAY_SUFFIX)
         logs = pod_logs(self.kubectl, self.args.agent_namespace, selector_of(gateway), GATEWAY_CONTAINER, since)
@@ -443,9 +476,12 @@ class Launcher:
         if not self.args.after_restart:
             cmd = shlex.split(self.args.restart_cmd)
             say(f"RESTART running: {' '.join(cmd)}")
-            proc = self.runner(cmd, capture_output=True, text=True, check=False)
+            try:
+                proc = self.runner(cmd, capture_output=True, text=True, check=False)
+            except OSError as exc:
+                return self.record(RESTART_RESULT, False, f"could not run {cmd[0]}: {exc.strerror or exc}")
             if proc.returncode != 0:
-                return self.record("restart-cmd", False, f"exited {proc.returncode}: {proc.stderr.strip()[-STDERR_TAIL_CHARS:]}")
+                return self.record(RESTART_RESULT, False, f"exited {proc.returncode}: {proc.stderr.strip()[-STDERR_TAIL_CHARS:]}")
         self.kubectl.run(["rollout", "status", f"deployment/{self.agent}{GATEWAY_SUFFIX}", "-n", ns,
                           f"--timeout={ROLLOUT_TIMEOUT_SECONDS}s"])
         gateway = self.deployment(GATEWAY_SUFFIX)
@@ -459,7 +495,7 @@ class Launcher:
             return True if any(_json_msg(line) == GATEWAY_SLACK_CONNECTED_MSG for line in logs.splitlines()) else None
 
         if harness.poll(connected, SLACK_CONNECT_WAIT_SECONDS, JOB_POLL_INTERVAL_SECONDS, self.clock, self.sleep) is None:
-            return self.record("restart-cmd", False, f"the gateway did not log 'slack connected' within {SLACK_CONNECT_WAIT_SECONDS}s")
+            return self.record(RESTART_RESULT, False, f"the gateway did not log 'slack connected' within {SLACK_CONNECT_WAIT_SECONDS}s")
         say("RESTART gateway rolled out and logged 'slack connected'")
         return True
 
@@ -486,24 +522,31 @@ class Launcher:
         def failed() -> bool:
             return any(not passed for _, passed, _ in self.results)
 
-        if CHECK_LEGACY_SOCKET in checks:
-            self.legacy_socket()
         pod_checks = [c for c in checks if c in harness.CHECK_ORDER and c != harness.CHECK_RESTART]
-        first_job_extra = []
-        if harness.CHECK_RESTART in checks and harness.CHECK_DM in pod_checks and WAIT_ANSWER_FLAG not in self.forwarded:
+        restarting = harness.CHECK_RESTART in checks
+        if CHECK_LEGACY_SOCKET in checks or restarting or self.args.expect_principal or (pod_checks and not self.args.image):
+            # Finding the PlatformAgent is setup, not any one check's verdict.
+            _ = self.agent
+        if CHECK_LEGACY_SOCKET in checks:
+            self.guarded(CHECK_LEGACY_SOCKET, self.legacy_socket)
+        jobs = [(pod_checks, [])] if pod_checks else []
+        if restarting and harness.CHECK_DM in pod_checks and WAIT_ANSWER_FLAG not in self.forwarded:
             # restart DMs the same conversation: a dm task still running then would
-            # take the restart's DM as a steer.
-            say(f"NOTE dm runs with {WAIT_ANSWER_FLAG} so its task has finished before the restart")
-            first_job_extra = [WAIT_ANSWER_FLAG]
-        if pod_checks and (keep_going or not failed()):
-            evidence = self.run_job(pod_checks, first_job_extra)
-            if self.args.expect_principal and (keep_going or not failed()):
-                self.check_principals(evidence)
-        if harness.CHECK_RESTART in checks and (keep_going or not failed()):
-            if self.restart():
+            # take the restart's DM as a steer. Only dm waits for its answer; the
+            # other checks keep the reading they were asked for.
+            say(f"NOTE dm runs in a Job of its own with {WAIT_ANSWER_FLAG}, so its task has finished before the restart")
+            rest = [c for c in pod_checks if c != harness.CHECK_DM]
+            jobs = [([harness.CHECK_DM], [WAIT_ANSWER_FLAG])] + ([(rest, [])] if rest else [])
+        for job_checks, extra in jobs:
+            if keep_going or not failed():
+                evidence = self.run_job(job_checks, extra)
+                if self.args.expect_principal and (keep_going or not failed()):
+                    self.guarded(PRINCIPAL_RESULT, self.check_principals, evidence)
+        if restarting and (keep_going or not failed()):
+            if self.guarded(RESTART_RESULT, self.restart):
                 evidence = self.run_job([harness.CHECK_RESTART])
                 if self.args.expect_principal and (keep_going or not failed()):
-                    self.check_principals(evidence)
+                    self.guarded(PRINCIPAL_RESULT, self.check_principals, evidence)
 
     def summarize(self) -> int:
         passed = [name for name, ok, _ in self.results if ok]
@@ -646,6 +689,14 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         parser.error("--context is required")
     if harness.CHECK_RESTART in args.checks and not (args.restart_cmd or args.after_restart) and not (args.cleanup or args.render):
         parser.error("the restart check needs --restart-cmd or --after-restart")
+    if args.restart_cmd:
+        # Here, not after the first Job has spent its Slack traffic.
+        try:
+            restart_argv = shlex.split(args.restart_cmd)
+        except ValueError as exc:
+            parser.error(f"--restart-cmd cannot be split into words: {exc}")
+        if not restart_argv:
+            parser.error("--restart-cmd has no command in it")
     args.gsa = args.gsa or GSA_EMAIL_FORMAT.format(name=DEFAULT_GSA_NAME, project=args.project)
     return args, forwarded
 
@@ -674,9 +725,11 @@ def main(argv: Optional[list[str]] = None, runner: Callable = subprocess.run,
             # Not done on a namespace that is not this tool's, or one a live run is using.
             return EXIT_OK if delete_namespace(kubectl, args.namespace) == CLEANUP_DONE else EXIT_SETUP
         return Launcher(args, forwarded, kubectl, clock, sleep, runner).run(args.checks)
-    except (LaunchError, harness.HarnessError) as exc:
+    except LaunchError as exc:
         say(f"ERROR {exc}")
-        return EXIT_SETUP
+    except Exception as exc:  # noqa: BLE001 -- the traceback could carry a token; the redacted line is the report
+        say(f"ERROR unexpected {type(exc).__name__}: {exc}")
+    return EXIT_SETUP
 
 
 if __name__ == "__main__":

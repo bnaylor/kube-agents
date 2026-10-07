@@ -8,8 +8,7 @@ token and polls for the bot's reply, then prints one PASS or FAIL line and one
 EVIDENCE line of JSON (timestamps, channel, truncated reply text; never a token).
 
 The user tokens are read at run time from Secret Manager over the GKE metadata
-server's Workload Identity token, or from files a CSI mount provides. They stay in
-this process's memory: nothing here puts them in the environment, on disk, or in
+server's Workload Identity token. They stay in this process's memory: nothing here puts them in the environment, on disk, or in
 output, and every line printed goes through redact() first.
 
 Standard library only, so it runs in any image that has a python3; the launcher
@@ -24,6 +23,7 @@ import math
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,8 +46,6 @@ DEFAULT_CHANNEL = "ka-test"
 DEFAULT_BOT_NAME = "kage"
 DEFAULT_PROMPT = "Reply with the single word PONG."
 DEFAULT_FOLLOWUP = "Once more, please: reply with the single word PONG."
-TOKEN_SOURCE_SECRET_MANAGER = "secret-manager"
-TOKEN_SOURCE_FILE = "file"
 
 DEFAULT_REPLY_TIMEOUT_SECONDS = 180
 DEFAULT_POLL_INTERVAL_SECONDS = 5
@@ -71,23 +69,50 @@ TURN_SUBTYPES = frozenset({"", "thread_broadcast", "file_share"})
 # a2a/gateway/gateway.go, verifySender: the notice an unverified sender gets, once per
 # sender per gateway process. The text after "on slack" names the sender's id.
 REFUSAL_NOTICE_MARKER = "I can't verify who you are on slack"
-# The gateway's own lines, as opposed to an answer: the rolling status line
-# (relay.go statusLine and terminalLine, edited in place), a non-final status note
-# (relay.go applyStatus, "ℹ️ "), and the steer acknowledgement.
-TASK_LINE_PREFIXES = ("⏳", "⚙️", "❓", "✅", "ℹ️")
-STEER_ACK_PREFIX = "✏️"
-# gateway.go steerTask, when the steer could not be published: a steer outcome too.
-STEER_FAILED_MARKER = "could not send that to the running task"
-# The gateway's warnings (gateway.go, spawn.go): never an answer, and not by
-# themselves the reply to a turn; a stalled-task notice is followed by the new turn.
-WARNING_PREFIX = "⚠️"
-FAILURE_PREFIXES = ("❌", "🚫", "🛑")
+REFUSAL_NOTICE_PREFIX = "⛔ " + REFUSAL_NOTICE_MARKER
+# The gateway's own lines are told from the agent's answer by their whole text,
+# never by a leading emoji: the answer is the agent's result posted verbatim
+# (relay.go relayTerminal), so its first character is the agent's to choose.
+#
+# The rolling status line is one message per task: startTask (gateway.go) posts the
+# placeholder before the task can produce anything, and relay.go edits that same
+# message to statusLine's and then terminalLine's "<icon> **<state>**[ — <progress>]",
+# which reaches Slack as mrkdwn "*<state>*". The deliverable, or the failure notice,
+# is posted as a new message before the terminal edit. So the status line's current
+# state is what says the answer is in; wait_for_bot reads the messages after it by
+# that state, not by their own text.
+STATUS_PLACEHOLDER = "⏳ submitted…"
+# gateway.go startTask: the placeholder's edit when the publish fails.
+STATUS_BUS_FAILURE = "❌ could not reach the bus; try again"
+# relay.go statusLine and terminalLine. statusLine draws an unknown state with ⏳.
+STATUS_ICONS = {
+    "submitted": "⏳", "working": "⚙️", "input-required": "❓",
+    "completed": "✅", "failed": "❌", "canceled": "🛑", "rejected": "🚫",
+}
+STATUS_LINE_PATTERN = re.compile(r"(\S+) \*([a-z-]+)\*(?: — .*)?", re.DOTALL)
+STATE_SUBMITTED = "submitted"
+STATE_COMPLETED = "completed"
+FAILED_STATES = frozenset({"failed", "canceled", "rejected"})
+# relay.go relayTerminal: the notices for a task that did not complete.
+FAILURE_POST_PATTERN = re.compile(r"❌ failed: .*|❌ the task failed|🛑 canceled|🚫 the executor rejected the task(?:: .*)?", re.DOTALL)
+# gateway.go steerTask: the steer acknowledgements, and the notice when the steer
+# could not be published. Either one means the turn started no task.
+STEER_ACK_PREFIX = "✏️ steering sent — "
+STEER_FAILED_NOTICE = "⚠️ could not send that to the running task; it is still working on the original instruction"
+# The gateway's warnings (gateway.go, spawn.go) all open with this. Read by prefix
+# only ahead of the status line, where nothing is the agent's.
+WARNING_PREFIX = "⚠️ "
 KIND_REFUSAL = "refusal"
 KIND_TASK_LINE = "task-line"
 KIND_STEER = "steer-ack"
 KIND_FAILURE = "failure"
 KIND_WARNING = "warning"
 KIND_ANSWER = "answer"
+# What wait_for_bot waits for: the first reply (the status line, normally), the
+# answer itself, or the task's end whatever it posted.
+WAIT_FIRST = "first"
+WAIT_ANSWER = "answer"
+WAIT_SETTLED = "settled"
 
 USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
 NON_USER_TOKEN_KINDS = {"xoxb-": "a bot token", "xapp-": "an app-level token"}
@@ -147,8 +172,19 @@ class Redactor:
         self._values: set[str] = set()
 
     def add(self, secret_payload: str) -> None:
-        if secret_payload:
-            self._values.add(secret_payload)
+        if not secret_payload:
+            return
+        # The value, and the encodings an error message prints it in: repr() of the
+        # str and of its bytes (http.client's "Invalid header value %r"), and URL
+        # quoting. load_user_token refuses a token these differ for; this covers
+        # whatever else is registered.
+        self._values.update({
+            secret_payload,
+            repr(secret_payload)[1:-1],
+            repr(secret_payload.encode("utf-8", "backslashreplace"))[2:-1],
+            urllib.parse.quote(secret_payload, safe=""),
+            urllib.parse.quote_plus(secret_payload, safe=""),
+        })
 
     def redact(self, text: str) -> str:
         # Longest first, so a value that contains another is cut whole.
@@ -235,24 +271,17 @@ class SecretManagerReader:
         return secret_payload
 
 
-class FileReader:
-    """Reads a token from a file, for a Secret Manager CSI mount."""
-
-    def read(self, name: str) -> str:
-        try:
-            with open(name, encoding="utf-8") as handle:
-                secret_payload = handle.read().strip()
-        except OSError as exc:
-            raise HarnessError(f"cannot read the token file {name}: {exc.strerror}") from None
-        REDACTOR.add(secret_payload)
-        return secret_payload
-
-
 def load_user_token(reader, name: str, label: str) -> str:
     """Reads one user token and refuses anything that is not a Slack user token."""
     user_oauth_token = reader.read(name)
     if not user_oauth_token:
         raise HarnessError(f"the {label} token source {name} is empty")
+    # A token is one printable word. One with a newline or a control character inside
+    # it would fail in http.client with an error that prints the value escaped, in a
+    # form the redactor's literal match does not see. Name the secret, never the value.
+    if any(ch.isspace() or unicodedata.category(ch).startswith("C") for ch in user_oauth_token):
+        raise HarnessError(f"the {label} token source {name} holds a whitespace or control character inside the value; "
+                           "store the token alone, on one line")
     for prefix, kind in NON_USER_TOKEN_KINDS.items():
         if user_oauth_token.startswith(prefix):
             raise HarnessError(f"the {label} token source {name} holds {kind}, not a user token (xoxp-)")
@@ -328,20 +357,76 @@ def poll(fetch: Callable[[], Optional[object]], timeout: float, interval: float,
         sleep(min(interval, remaining))
 
 
+def status_state(text: str) -> str:
+    """The task state a status line shows, or "" when text is not in the status line's grammar."""
+    text = text.strip()
+    if text == STATUS_PLACEHOLDER:
+        return STATE_SUBMITTED
+    if text == STATUS_BUS_FAILURE:
+        return "failed"
+    match = STATUS_LINE_PATTERN.fullmatch(text)
+    if not match:
+        return ""
+    icon, state = match.groups()
+    return state if STATUS_ICONS.get(state, STATUS_ICONS[STATE_SUBMITTED]) == icon else ""
+
+
 def classify(text: str) -> str:
-    """What a bot message is: the refusal notice, a task line, a steer ack, a failure, or an answer."""
-    if REFUSAL_NOTICE_MARKER in text:
+    """What a bot message's text is, by the gateway's grammar: anything outside it is an answer.
+
+    Text alone cannot tell a warning or a failure notice from an answer that opens
+    the same way; read_turn decides those by where the message sits.
+    """
+    stripped = text.strip()
+    if stripped.startswith(REFUSAL_NOTICE_PREFIX):
         return KIND_REFUSAL
-    stripped = text.lstrip()
-    if stripped.startswith(STEER_ACK_PREFIX) or STEER_FAILED_MARKER in text:
+    if stripped.startswith(STEER_ACK_PREFIX) or stripped == STEER_FAILED_NOTICE:
         return KIND_STEER
+    state = status_state(stripped)
+    if state:
+        return KIND_FAILURE if state in FAILED_STATES else KIND_TASK_LINE
+    if FAILURE_POST_PATTERN.fullmatch(stripped):
+        return KIND_FAILURE
     if stripped.startswith(WARNING_PREFIX):
         return KIND_WARNING
-    if stripped.startswith(TASK_LINE_PREFIXES):
-        return KIND_TASK_LINE
-    if stripped.startswith(FAILURE_PREFIXES):
-        return KIND_FAILURE
     return KIND_ANSWER
+
+
+def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
+    """The bot's reply to one turn, from its messages since the turn, oldest first.
+
+    The status line is the first message in its grammar. Everything before it is
+    the gateway's own (a refusal, a steer outcome, a warning), so it is read by its
+    text. Everything after it is read by the status line's state: the deliverable
+    or the failure notice is posted before the terminal edit, so once the line is
+    terminal the last message after it is that post, whatever its first character.
+    """
+    status_at = next((i for i, m in enumerate(bot_msgs) if status_state(m.get("text", ""))), None)
+    before = bot_msgs if status_at is None else bot_msgs[:status_at]
+    for msg in before:
+        kind = classify(msg.get("text", ""))
+        if kind in (KIND_REFUSAL, KIND_STEER):
+            return msg, kind
+    if status_at is None:
+        if mode != WAIT_FIRST:
+            return None
+        replies = [m for m in before if classify(m.get("text", "")) != KIND_WARNING]
+        return (replies[0], classify(replies[0].get("text", ""))) if replies else None
+    status = bot_msgs[status_at]
+    state = status_state(status.get("text", ""))
+    after = bot_msgs[status_at + 1:]
+    if mode == WAIT_FIRST:
+        return status, KIND_FAILURE if state in FAILED_STATES else KIND_TASK_LINE
+    if state in FAILED_STATES:
+        notices = [m for m in after if FAILURE_POST_PATTERN.fullmatch(m.get("text", "").strip())]
+        return (notices[-1] if notices else status), KIND_FAILURE
+    if state != STATE_COMPLETED:
+        return None
+    if after:
+        return after[-1], KIND_ANSWER
+    # Completed with nothing posted after the line (a post the gateway failed to
+    # deliver): the task has ended, but there is no answer to show.
+    return (status, KIND_TASK_LINE) if mode == WAIT_SETTLED else None
 
 
 @dataclass
@@ -390,13 +475,15 @@ def replies_after(client: SlackClient, channel: str, root_ts: str, after_ts: str
     return sorted(msgs, key=lambda m: ts_value(m.get("ts", "")))
 
 
-def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], wait_answer: bool, timeout: float) -> tuple[Optional[dict], str, Optional[dict]]:
-    """Polls fetch for the bot's reply. Returns (reply, kind, last bot message seen).
+def answer_mode(session: Session) -> str:
+    return WAIT_ANSWER if session.args.wait_answer else WAIT_FIRST
 
-    A refusal notice or a steer acknowledgement returns at once: either one means
-    the turn did not start a task, whatever wait_answer says. Otherwise the first
-    bot message is the reply, unless wait_answer, when only an answer or a failure
-    line is.
+
+def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], mode: str, timeout: float) -> tuple[Optional[dict], str, Optional[dict]]:
+    """Polls fetch for the bot's reply (read_turn). Returns (reply, kind, last bot message seen).
+
+    A refusal notice or a steer outcome returns at once in every mode: either one
+    means the turn did not start a task.
     """
     seen: dict = {}
 
@@ -405,18 +492,7 @@ def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], wait_answer:
         if not bot_msgs:
             return None
         seen["last"] = bot_msgs[-1]
-        for msg in bot_msgs:
-            kind = classify(msg.get("text", ""))
-            if kind in (KIND_REFUSAL, KIND_STEER):
-                return msg, kind
-        if not wait_answer:
-            replies = [m for m in bot_msgs if classify(m.get("text", "")) != KIND_WARNING]
-            return (replies[0], classify(replies[0].get("text", ""))) if replies else None
-        for msg in bot_msgs:
-            kind = classify(msg.get("text", ""))
-            if kind in (KIND_ANSWER, KIND_FAILURE):
-                return msg, kind
-        return None
+        return read_turn(bot_msgs, mode)
 
     found = poll(step, timeout, session.args.poll_interval, session.clock, session.sleep)
     if found is None:
@@ -469,7 +545,7 @@ def check_dm(session: Session, name: str = CHECK_DM) -> CheckResult:
     sent = session.listed.call("chat.postMessage", channel=channel, text=f"{session.args.prompt} {session.tag(name)}")
     sent_ts = sent["ts"]
     reply, kind, last = wait_for_bot(session, lambda: history_after(session.listed, channel, sent_ts),
-                                     session.args.wait_answer, session.args.reply_timeout)
+                                     answer_mode(session), session.args.reply_timeout)
     return judge_listed_reply(session, name, channel, sent_ts, reply, kind, last)
 
 
@@ -478,7 +554,7 @@ def check_mention(session: Session) -> CheckResult:
     sent = session.listed.call("chat.postMessage", channel=session.channel_id, text=text)
     sent_ts = sent["ts"]
     reply, kind, last = wait_for_bot(session, lambda: replies_after(session.listed, session.channel_id, sent_ts, sent_ts),
-                                     session.args.wait_answer, session.args.reply_timeout)
+                                     answer_mode(session), session.args.reply_timeout)
     result = judge_listed_reply(session, CHECK_MENTION, session.channel_id, sent_ts, reply, kind, last, expect_thread=sent_ts)
     if result.passed:
         session.mention_root = sent_ts
@@ -492,9 +568,10 @@ def check_thread(session: Session) -> CheckResult:
                            {"channel": session.channel_id})
     # Let the task the mention started finish first. Its answer would otherwise
     # land after the follow-up and read as the follow-up's reply, and a reply
-    # sent while it runs is a steer, not a turn.
+    # sent while it runs is a steer, not a turn. Settled is the status line's
+    # terminal state, whatever the answer says.
     settled, settled_kind, last = wait_for_bot(session, lambda: replies_after(session.listed, session.channel_id, root, root),
-                                               True, session.args.reply_timeout)
+                                               WAIT_SETTLED, session.args.reply_timeout)
     if settled is None:
         evidence = {"channel": session.channel_id, "thread_ts": root}
         if last is not None:
@@ -505,7 +582,7 @@ def check_thread(session: Session) -> CheckResult:
     sent = session.listed.call("chat.postMessage", channel=session.channel_id, thread_ts=root, text=text)
     sent_ts = sent["ts"]
     reply, kind, last = wait_for_bot(session, lambda: replies_after(session.listed, session.channel_id, root, sent_ts),
-                                     session.args.wait_answer, session.args.reply_timeout)
+                                     answer_mode(session), session.args.reply_timeout)
     result = judge_listed_reply(session, CHECK_THREAD, session.channel_id, sent_ts, reply, kind, last, expect_thread=root)
     result.evidence["thread_ts"] = root
     result.evidence["settled_kind"] = settled_kind
@@ -529,7 +606,7 @@ def check_unlisted(session: Session) -> list[CheckResult]:
         def fetch():
             return history_after(client, channel, sent_ts)
 
-    reply, kind, _ = wait_for_bot(session, fetch, False, session.args.reply_timeout)
+    reply, kind, _ = wait_for_bot(session, fetch, WAIT_FIRST, session.args.reply_timeout)
     evidence = reply_evidence(channel, sent_ts, session.unlisted_user_id, reply, kind)
     evidence["via"] = session.args.unlisted_via
     if reply is None:
@@ -571,7 +648,7 @@ def check_unlisted_repeat(session: Session, client: SlackClient, channel: str, t
         def fetch():
             return history_after(client, channel, sent_ts)
 
-    reply, kind, _ = wait_for_bot(session, fetch, False, session.args.quiet_window)
+    reply, kind, _ = wait_for_bot(session, fetch, WAIT_FIRST, session.args.quiet_window)
     evidence = reply_evidence(channel, sent_ts, session.unlisted_user_id, reply, kind)
     if reply is not None:
         return CheckResult(CHECK_UNLISTED_REPEAT, False, f"the bot replied to the second message ({kind})", evidence)
@@ -661,6 +738,9 @@ def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> str:
             cursor = resp.get("response_metadata", {}).get("next_cursor") or None
             if not cursor:
                 break
+        if not matches and cursor:
+            raise HarnessError(f"no bot user named {bot_name!r} before the lookup stopped after {LIST_MAX_PAGES} pages of "
+                               "users.list, so the workspace may hold it further on; pass --bot-user-id")
         if not matches:
             raise HarnessError(f"no bot user named {bot_name!r} in the workspace; pass --bot-user-id")
         if len(matches) > 1:
@@ -689,6 +769,9 @@ def resolve_channel(client: SlackClient, channel: str) -> str:
         cursor = resp.get("response_metadata", {}).get("next_cursor") or None
         if not cursor:
             break
+    if cursor:
+        raise HarnessError(f"no channel named #{name} before the lookup stopped after {LIST_MAX_PAGES} pages of "
+                           "conversations.list, so it may be further on; pass the channel's C or G id instead of its name")
     raise HarnessError(f"no channel named #{name} visible to the listed user")
 
 
@@ -716,16 +799,27 @@ def regex(value: str) -> str:
     return value
 
 
+def finite_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    # float() admits inf and nan; neither is a wait, and the launcher's Job deadline
+    # cannot be derived from one.
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds, not {value!r}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=HARNESS_PROG, description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).",
                                      allow_abbrev=False)
     parser.add_argument("--checks", type=parse_checks, default=list(CHECKS_ALL),
                         help=f"comma list from {', '.join(CHECK_ORDER)}; '{CHECKS_ALL_ALIAS}' is {','.join(CHECKS_ALL)}")
     parser.add_argument("--keep-going", action="store_true", help="run every check after a FAIL")
-    parser.add_argument("--token-source", choices=(TOKEN_SOURCE_SECRET_MANAGER, TOKEN_SOURCE_FILE), default=TOKEN_SOURCE_SECRET_MANAGER)
     parser.add_argument("--project", default=DEFAULT_PROJECT, help="Secret Manager project")
-    parser.add_argument("--listed-secret", default=DEFAULT_LISTED_SECRET, help="secret name, or a file path under --token-source file")
-    parser.add_argument("--unlisted-secret", default=DEFAULT_UNLISTED_SECRET, help="secret name, or a file path under --token-source file")
+    parser.add_argument("--listed-secret", default=DEFAULT_LISTED_SECRET, help="Secret Manager secret holding the listed user's token")
+    parser.add_argument("--unlisted-secret", default=DEFAULT_UNLISTED_SECRET, help="Secret Manager secret holding the unlisted user's token")
     parser.add_argument("--bot-user-id", default="", help="the gateway bot's member id; looked up by --bot-name when unset")
     parser.add_argument("--bot-name", default=DEFAULT_BOT_NAME)
     parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="channel name or id for preflight, mention and thread")
@@ -733,15 +827,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--followup", default=DEFAULT_FOLLOWUP)
     parser.add_argument("--wait-answer", action="store_true", help="wait past the status line for the answer itself")
-    parser.add_argument("--reply-timeout", type=float, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
-    parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
+    parser.add_argument("--reply-timeout", type=finite_float, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
+    parser.add_argument("--poll-interval", type=finite_float, default=DEFAULT_POLL_INTERVAL_SECONDS)
     parser.add_argument("--unlisted-via", choices=(UNLISTED_VIA_DM, UNLISTED_VIA_MENTION), default=UNLISTED_VIA_DM)
     parser.add_argument("--unlisted-repeat", action="store_true", help="also send a second message and expect no reply")
-    parser.add_argument("--quiet-window", type=float, default=DEFAULT_QUIET_WINDOW_SECONDS)
+    parser.add_argument("--quiet-window", type=finite_float, default=DEFAULT_QUIET_WINDOW_SECONDS)
     parser.add_argument("--refusal-silence-ok", action="store_true", help="accept silence for the unlisted check")
     parser.add_argument("--home-channel", default="", help="channel the home check watches for a bot post")
-    parser.add_argument("--home-since", type=float, default=0.0, help="epoch seconds; default is the run's start")
-    parser.add_argument("--home-timeout", type=float, default=DEFAULT_HOME_TIMEOUT_SECONDS)
+    parser.add_argument("--home-since", type=finite_float, default=0.0, help="epoch seconds; default is the run's start")
+    parser.add_argument("--home-timeout", type=finite_float, default=DEFAULT_HOME_TIMEOUT_SECONDS)
     parser.add_argument("--home-match", type=regex, default="", help="regex the home post's text must match")
     parser.add_argument("--run-id", default="", help="tag for this run's posts; random when unset")
     # Endpoint overrides for the offline tests.
@@ -776,10 +870,7 @@ def time_budget(args: argparse.Namespace) -> float:
 def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
     started = wall()
     run_id = args.run_id or uuid.uuid4().hex[:RUN_ID_HEX_CHARS]
-    if args.token_source == TOKEN_SOURCE_FILE:
-        reader = FileReader()
-    else:
-        reader = SecretManagerReader(transport, args.project, args.metadata_token_url, args.secret_manager_base)
+    reader = SecretManagerReader(transport, args.project, args.metadata_token_url, args.secret_manager_base)
     needs_unlisted = CHECK_UNLISTED in args.checks
 
     listed = SlackClient(load_user_token(reader, args.listed_secret, "listed"), transport, args.slack_api_base, sleep)

@@ -71,16 +71,26 @@ class FakeCluster:
         self.platformagents = [AGENT]
         self.sandbox_containers = [{"name": "sandbox", "image": SANDBOX_IMAGE}]
         self.restart_returncode = 0
+        self.restart_missing = False
         self.job_log_fails = False
+        # How many `get job` polls fail before one answers; -1 is every one.
+        self.get_job_failures = 0
+        self.stdin_encodings = []
 
-    def __call__(self, cmd, input=None, capture_output=True, text=True, check=False):
+    def __call__(self, cmd, input=None, capture_output=True, text=True, check=False, encoding=None):
         if cmd[0] != "kubectl" or "restart" in cmd:
             # The operator's --restart-cmd, not the launcher's own kubectl.
             self.restart_runs.append(cmd)
+            if self.restart_missing:
+                raise FileNotFoundError(2, "No such file or directory", cmd[0])
             return subprocess.CompletedProcess(cmd, self.restart_returncode, "", "rollout refused")
         self.calls.append(cmd)
+        self.stdin_encodings.append(encoding)
         assert cmd[1:3] == ["--context", CONTEXT], cmd
         args = cmd[3:]
+        if args[:2] == ["get", "job"] and self.get_job_failures:
+            self.get_job_failures -= 1 if self.get_job_failures > 0 else 0
+            return subprocess.CompletedProcess(cmd, 1, "", "Unable to connect to the server: net/http: TLS handshake timeout")
         try:
             out = self.answer(args, input)
         except FakeFailure:
@@ -203,6 +213,22 @@ class LegacySocketTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_FAIL)
         self.assertIn("not a next install", out)
 
+    def test_a_kubectl_error_is_its_fail_and_keep_going_carries_on(self):
+        cluster = FakeCluster()
+        cluster.fail_on = "get deployment platform-agent-a2a-gateway"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "legacy-socket,dm", "--keep-going")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("FAIL legacy-socket: error: kubectl", out)
+        self.assertIn("PASS dm: answer", out)
+        self.assertIn("OVERALL pass=2 fail=1 failed=legacy-socket", out)
+        self.assertNotIn("ERROR", out)
+        cluster = FakeCluster()
+        cluster.fail_on = "get deployment platform-agent-a2a-gateway"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "legacy-socket,dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("OVERALL pass=0 fail=1 failed=legacy-socket", out)
+        self.assertEqual(cluster.applied, [], "the first FAIL stops the run")
+
     def test_fails_when_the_gateway_never_connected(self):
         cluster = FakeCluster()
         cluster.gateway_logs = '{"msg":"slack auth.test: invalid_auth"}\n'
@@ -255,12 +281,44 @@ class JobTest(unittest.TestCase):
         self.assertIn("FAIL job:", out)
         self.assertEqual(len(cluster.deleted), 3)
 
-    def test_cleanup_runs_when_the_wait_raises(self):
+    def test_a_transient_job_read_failure_does_not_end_the_wait(self):
         cluster = FakeCluster()
-        cluster.fail_on = "get job slack-live-check-"
+        cluster.get_job_failures = 3
         code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
-        self.assertEqual(code, launch.EXIT_SETUP)
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("PASS dm: answer", out)
+        self.assertIn("OVERALL pass=2 fail=0", out)
+
+    def test_cleanup_runs_when_job_reads_fail_past_the_deadline(self):
+        cluster = FakeCluster()
+        cluster.get_job_failures = -1
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("could not be read until the deadline", out)
+        self.assertIn("TLS handshake timeout", out)
+        self.assertIn("ended Unknown with no FAIL line", self.line(out, "FAIL job:"))
+        self.assertIn("OVERALL", out)
         self.assertEqual(sorted(kind for kind, _ in cluster.deleted), ["configmap", "job", "namespace"])
+        polls = [c for c in cluster.calls if c[3:5] == ["get", "job"]]
+        deadline = launch.job_deadline(["--checks", "dm"], 0) + launch.JOB_WAIT_GRACE_SECONDS
+        self.assertGreaterEqual(len(polls), deadline // launch.JOB_POLL_INTERVAL_SECONDS)
+
+    def test_job_args_carry_non_bmp_characters_as_utf8(self):
+        cluster = FakeCluster()
+        run_launch(cluster, "--context", CONTEXT, "--checks", "home", "--",
+                   "--home-channel", "ops", "--home-match", "🔎 task")
+        job_text = cluster.applied[2]
+        self.assertNotIn("\\ud83d", job_text)
+        self.assertIn('"🔎 task"', job_text)
+        args = pod_spec(yaml.safe_load(job_text))["containers"][0]["args"]
+        self.assertEqual(args[args.index("--home-match") + 1], "🔎 task")
+        self.assertTrue(cluster.stdin_encodings and set(cluster.stdin_encodings) == {"utf-8"}, cluster.stdin_encodings)
+
+    def test_the_image_is_discovered_once_per_run(self):
+        cluster = FakeCluster()
+        cluster.job_log = "PASS dm: answer\nPASS restart: answer\n"
+        run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart")
+        self.assertEqual(len([c for c in cluster.calls if c[3:5] == ["get", "statefulset"]]), 1)
 
     def test_pod_log_tokens_are_scrubbed(self):
         cluster = FakeCluster()
@@ -370,6 +428,16 @@ class PrincipalTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_FAIL)
         self.assertIn("no ingress log line for backendMessageId=1.000101", out)
 
+    def test_a_kubectl_error_in_the_lookup_is_its_fail(self):
+        cluster = FakeCluster()
+        cluster.fail_on = "-c gateway"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm", "--expect-principal", "slack:{listed}")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("PASS dm: answer", out)
+        self.assertIn("FAIL principal: error: kubectl", out)
+        self.assertIn("OVERALL pass=2 fail=1 failed=principal", out)
+        self.assertNotIn("ERROR", out)
+
     def test_principal_fails_with_no_passing_turn(self):
         cluster = FakeCluster()
         cluster.job_log = "FAIL dm: no reply\nSUMMARY pass=0 fail=1\n"
@@ -417,6 +485,33 @@ class RestartTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_FAIL)
         self.assertIn("FAIL restart-cmd: exited 3: rollout refused", out)
         self.assertEqual(cluster.applied, [])
+
+    def test_a_missing_restart_executable_fails_the_check(self):
+        cluster = FakeCluster()
+        cluster.restart_missing = True
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "restart",
+                               "--restart-cmd", f"kubecl --context {CONTEXT} rollout restart deploy/x")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("FAIL restart-cmd: could not run kubecl: No such file or directory", out)
+        self.assertIn("OVERALL pass=0 fail=1 failed=restart-cmd", out)
+        self.assertEqual(cluster.applied, [])
+
+    def test_a_rollout_that_times_out_is_fail_restart_cmd(self):
+        cluster = FakeCluster()
+        cluster.fail_on = "rollout status"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart", "--keep-going")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        self.assertIn("FAIL restart-cmd: error: kubectl", out)
+        self.assertIn("OVERALL pass=2 fail=1 failed=restart-cmd", out)
+        self.assertNotIn("ERROR", out)
+        self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
+
+    def test_an_unusable_restart_command_is_refused_before_any_cluster_call(self):
+        for command in ("kubectl 'unbalanced", "   "):
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit):
+                launch.parse_args(["--context", CONTEXT, "--checks", "restart", "--restart-cmd", command])
+            self.assertIn("--restart-cmd", err.getvalue())
 
     def test_restart_fails_when_the_gateway_never_reconnects(self):
         cluster = FakeCluster()
@@ -487,13 +582,20 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_SETUP)
         self.assertIn("not deleted", out)
 
-    def test_restart_after_dm_settles_the_dm_first(self):
+    def test_restart_after_dm_settles_the_dm_in_a_job_of_its_own(self):
         cluster = FakeCluster()
-        run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart")
-        first = pod_spec(yaml.safe_load(cluster.applied[2]))["containers"][0]["args"]
-        second = pod_spec(yaml.safe_load(cluster.applied[4]))["containers"][0]["args"]
-        self.assertIn("--wait-answer", first)
-        self.assertNotIn("--wait-answer", second)
+        cluster.job_log = "PASS dm: answer\nPASS mention: status\nPASS thread: status\nPASS restart: answer\n"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,mention,thread,restart", "--after-restart")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        jobs = [pod_spec(yaml.safe_load(doc))["containers"][0]["args"] for doc in cluster.applied[2::2]]
+        self.assertEqual([a[a.index("--checks") + 1] for a in jobs], ["dm", "mention,thread", "restart"])
+        self.assertEqual(["--wait-answer" in a for a in jobs], [True, False, False])
+        # A forwarded --wait-answer applies to every check already: one Job, as before.
+        cluster = FakeCluster()
+        cluster.job_log = "PASS dm: answer\nPASS mention: answer\nPASS restart: answer\n"
+        run_launch(cluster, "--context", CONTEXT, "--checks", "dm,mention,restart", "--after-restart", "--", "--wait-answer")
+        jobs = [pod_spec(yaml.safe_load(doc))["containers"][0]["args"] for doc in cluster.applied[2::2]]
+        self.assertEqual([a[a.index("--checks") + 1] for a in jobs], ["dm,mention", "restart"])
 
     def test_cleanup_validates_no_harness_flags(self):
         cluster = FakeCluster()
@@ -575,6 +677,29 @@ class ModesAndArgsTest(unittest.TestCase):
         args, forwarded = launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", "--channel", "ka-test",
                                              "--reply-timeout=30", "--wait-answer"])
         self.assertEqual(forwarded, ["--channel", "ka-test", "--reply-timeout=30", "--wait-answer"])
+
+    def test_token_source_is_not_forwarded(self):
+        for forwarded in (["--token-source", "file"], ["--token-source=file"]):
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *forwarded, "--listed-secret", "/mnt/listed"])
+            self.assertIn("is not a harness flag the launcher forwards", err.getvalue())
+
+    def test_non_finite_timeouts_fail_before_any_cluster_call(self):
+        for value in ("inf", "nan"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", "--reply-timeout", value])
+            with self.subTest(value=value, mode="render"), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                launch.parse_args(["--render", "--", "--quiet-window", value])
+
+    def test_an_unexpected_exception_is_an_error_line_not_a_traceback(self):
+        def exploding(cmd, **_):
+            raise RuntimeError(f"boom {LEAKED}")
+
+        code, out = run_launch(exploding, "--context", CONTEXT, "--checks", "legacy-socket")
+        self.assertEqual(code, launch.EXIT_SETUP, out)
+        self.assertIn("ERROR unexpected RuntimeError: boom", out)
+        self.assertNotIn(LEAKED, out)
 
     def test_an_invalid_home_match_fails_before_any_cluster_call(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

@@ -83,6 +83,11 @@ class FakeWorld:
         self.extra_members = []
         self.bot_ids = {BOT_ID}
         self.metadata_token = GCP_ACCESS
+        # The deliverable's text: the gateway posts the agent's result verbatim.
+        self.answer_text = "PONG"
+        # next_cursor on every users.list and conversations.list page: a workspace
+        # larger than the lookups' page cap.
+        self.list_cursor = ""
 
     def next_ts(self):
         self.ts_counter += 1
@@ -104,6 +109,12 @@ class FakeWorld:
         if thread_ts:
             msg["thread_ts"] = thread_ts
         self.channels[channel].append(msg)
+        return msg
+
+    def finish(self, channel, status, text, reply_thread, terminal):
+        """relay.go relayTerminal: the deliverable or failure is posted, then the status line is edited."""
+        self.bot_post(channel, text, reply_thread)
+        status["text"] = terminal
 
     def gateway_turn(self, channel, poster, msg):
         if self.mode == "silent":
@@ -134,22 +145,23 @@ class FakeWorld:
             return
         if reply_thread:
             self.session_threads.add((channel, reply_thread))
-        self.bot_post(channel, "⏳ submitted…", reply_thread)
+        status = self.bot_post(channel, "⏳ submitted…", reply_thread)
         if self.mode == "status-only":
             return
+        status["text"] = "⚙️ *working*"
         if self.mode == "fail":
-            self.bot_post(channel, "❌ failed: the executor is down", reply_thread)
+            self.finish(channel, status, "❌ failed: the executor is down", reply_thread, "❌ *failed*")
             return
         if self.answer_after_reads:
-            self.deferred.append((self.reads + self.answer_after_reads, channel, "PONG", reply_thread))
+            self.deferred.append((self.reads + self.answer_after_reads, channel, status, reply_thread))
             return
-        self.bot_post(channel, "PONG", reply_thread)
+        self.finish(channel, status, self.answer_text, reply_thread, "✅ *completed*")
 
     def materialize(self):
         due = [d for d in self.deferred if d[0] <= self.reads]
         self.deferred = [d for d in self.deferred if d[0] > self.reads]
-        for _, channel, text, thread in due:
-            self.bot_post(channel, text, thread)
+        for _, channel, status, thread in due:
+            self.finish(channel, status, self.answer_text, thread, "✅ *completed*")
 
     def visible(self, msgs):
         return [{k: v for k, v in m.items() if k != "visible_at"} for m in msgs if m.get("visible_at", 0) <= self.reads]
@@ -164,12 +176,12 @@ class FakeWorld:
                 {"id": LISTED_ID, "name": "listed", "is_bot": False},
                 {"id": BOT_ID, "name": "kage", "is_bot": True, "profile": {"display_name": "kage"}},
                 *self.extra_members,
-            ], "response_metadata": {"next_cursor": ""}}
+            ], "response_metadata": {"next_cursor": self.list_cursor}}
         if method == "users.info":
             return {"ok": True, "user": {"id": params["user"], "is_bot": params["user"] in self.bot_ids}}
         if method == "conversations.list":
             return {"ok": True, "channels": [{"id": CHANNEL_ID, "name": CHANNEL_NAME}, {"id": HOME_ID, "name": "home"}],
-                    "response_metadata": {"next_cursor": ""}}
+                    "response_metadata": {"next_cursor": self.list_cursor}}
         if method == "conversations.open":
             return {"ok": True, "channel": {"id": self.dm_for(user, params["users"])}}
         if method == "chat.postMessage":
@@ -448,6 +460,55 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("the task the turn started failed", text)
 
+    def test_an_answer_that_opens_with_a_gateway_icon_is_the_answer(self):
+        # The gateway posts the agent's result verbatim, so its first character is the
+        # agent's to choose. Only the status line's state says the answer is in.
+        for answer in ("✅ PONG", "⚠️ PONG, with a caveat", "ℹ️ PONG", "❓ PONG?", "❌ PONG", "🛑 PONG", "⏳ PONG"):
+            with self.subTest(answer=answer):
+                self.world.answer_text = answer
+                code, text = self.run_harness("--checks", "dm,mention,thread", "--wait-answer")
+                self.assertEqual(code, harness.EXIT_OK, text)
+                for check in ("dm", "mention", "thread"):
+                    self.assertEqual(self.evidence(text, check)["reply_text"], answer, check)
+                    self.assertEqual(self.evidence(text, check)["reply_kind"], harness.KIND_ANSWER, check)
+
+    def test_thread_settles_on_the_status_line_whatever_the_answer_says(self):
+        self.world.answer_text = "✅ PONG"
+        code, text = self.run_harness("--checks", "mention,thread")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertEqual(sum(self.fake.slept), 0, "the settle wait sat out a timeout on a finished task")
+
+    def test_a_status_card_before_the_turn_is_not_the_answer(self):
+        # healActiveTask (gateway.go) posts formatTaskStatus's card ahead of the new
+        # turn's status line: it is the gateway's, not the answer.
+        world = self.world
+        original = world.gateway_turn
+
+        def card_then_turn(channel, poster, msg):
+            world.bot_post(channel, "🔎 task `t0` is *completed*", "")
+            original(channel, poster, msg)
+
+        world.gateway_turn = card_then_turn
+        code, text = self.run_harness("--checks", "dm", "--wait-answer")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertEqual(self.evidence(text, "dm")["reply_text"], "PONG")
+
+    def test_wait_answer_waits_for_the_status_line_to_turn_terminal(self):
+        # The answer is posted before the status line's terminal edit; until that
+        # edit lands the task is still running and nothing after the line is final.
+        world = self.world
+        world.mode = "status-only"
+        original = world.gateway_turn
+
+        def answer_without_terminal(channel, poster, msg):
+            original(channel, poster, msg)
+            world.bot_post(channel, "PONG", "")
+
+        world.gateway_turn = answer_without_terminal
+        code, text = self.run_harness("--checks", "dm", "--wait-answer")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("no answer (--wait-answer)", self.line(text, "FAIL dm"))
+
     def test_mention_fails_when_the_reply_is_not_threaded(self):
         self.world.mode = "top-level"
         code, text = self.run_harness("--checks", "mention")
@@ -509,9 +570,10 @@ class ListedChecksTest(HarnessTestCase):
         original = world.bot_post
 
         def ack_then_answer(channel, text, thread_ts=""):
-            original(channel, text, thread_ts)
+            msg = original(channel, text, thread_ts)
             if text.startswith("✏️"):
                 original(channel, "PONG", thread_ts)
+            return msg
 
         world.bot_post = ack_then_answer
         code, text = self.run_harness("--checks", "mention,thread", "--wait-answer")
@@ -529,7 +591,9 @@ class ListedChecksTest(HarnessTestCase):
         world.gateway_turn = warn_then_turn
         code, text = self.run_harness("--checks", "dm")
         self.assertEqual(code, harness.EXIT_OK, text)
-        self.assertEqual(self.evidence(text, "dm")["reply_text"], "⏳ submitted…")
+        # The status line, read after the task finished: the same message, edited.
+        self.assertEqual(self.evidence(text, "dm")["reply_text"], "✅ *completed*")
+        self.assertEqual(self.evidence(text, "dm")["reply_kind"], harness.KIND_TASK_LINE)
         world.gateway_turn = lambda channel, poster, msg: world.bot_post(channel, "⚠️ not started: could not mint", "")
         code, text = self.run_harness("--checks", "dm")
         self.assertEqual(code, harness.EXIT_FAIL)
@@ -750,12 +814,28 @@ class SetupAndRedactionTest(HarnessTestCase):
         self.assertIn("ERROR unexpected ValueError", out.getvalue())
         self.assertNotIn(LISTED_TOKEN, out.getvalue())
 
-    def test_file_token_source(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "listed"
-            path.write_text(LISTED_TOKEN + "\n")
-            code, text = self.run_harness("--checks", "dm", "--token-source", "file", "--listed-secret", str(path))
+    def test_a_token_with_a_control_character_is_refused_by_name(self):
+        for inner in ("\n", "\r", "\t", " ", "\x00", "\u2028"):
+            with self.subTest(inner=repr(inner)):
+                self.world.secrets[LISTED_SECRET] = f"xoxp-1111-head{inner}tail-secret-part"
+                code, text = self.run_harness("--checks", "dm")
+                self.assertEqual(code, harness.EXIT_SETUP, text)
+                self.assertIn("the listed token source slack-test-user-listed holds a whitespace or control character", text)
+                self.assertNotIn("tail-secret-part", text)
+                self.assertNotIn("1111-head", text)
+
+    def test_page_caps_say_the_lookup_was_cut_off(self):
+        self.world.list_cursor = "more"
+        code, text = self.run_harness("--checks", "dm", "--bot-name", "nobody")
+        self.assertEqual(code, harness.EXIT_SETUP, text)
+        self.assertIn(f"stopped after {harness.LIST_MAX_PAGES} pages of users.list", text)
+        self.assertIn("pass --bot-user-id", text)
+        code, text = self.run_harness("--checks", "dm", "--bot-user-id", BOT_ID, "--channel", "nope")
+        self.assertEqual(code, harness.EXIT_SETUP, text)
+        self.assertIn(f"stopped after {harness.LIST_MAX_PAGES} pages of conversations.list", text)
+        self.assertIn("C or G id", text)
+        # A channel found inside the cap still resolves.
+        code, text = self.run_harness("--checks", "dm", "--bot-user-id", BOT_ID)
         self.assertEqual(code, harness.EXIT_OK, text)
 
     def test_rate_limit_is_retried(self):
@@ -801,14 +881,43 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(harness.classify(REFUSAL.format(id="U1")), harness.KIND_REFUSAL)
         self.assertEqual(harness.classify("⏳ submitted…"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("⚙️ *working* — reading"), harness.KIND_TASK_LINE)
+        self.assertEqual(harness.classify("❓ *input-required*"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("✅ *completed*"), harness.KIND_TASK_LINE)
-        self.assertEqual(harness.classify("ℹ️ Hermes cannot absorb mid-run input"), harness.KIND_TASK_LINE)
         self.assertEqual(harness.classify("⚠️ could not send that to the running task; it is still working on the original instruction"),
                          harness.KIND_STEER)
         self.assertEqual(harness.classify("⚠️ not started: could not mint this task's capability"), harness.KIND_WARNING)
         self.assertEqual(harness.classify("✏️ steering sent — the worker picks it up"), harness.KIND_STEER)
-        self.assertEqual(harness.classify("🚫 rejected"), harness.KIND_FAILURE)
-        self.assertEqual(harness.classify("PONG"), harness.KIND_ANSWER)
+        for failure in ("🚫 *rejected*", "❌ *failed* — the pod died", "🛑 *canceled*", "❌ could not reach the bus; try again",
+                        "❌ failed: the executor is down", "❌ the task failed", "🛑 canceled",
+                        "🚫 the executor rejected the task", "🚫 the executor rejected the task: no capability"):
+            self.assertEqual(harness.classify(failure), harness.KIND_FAILURE, failure)
+        # Not the gateway's grammar: the agent's own text, whatever it opens with.
+        for answer in ("PONG", "✅ PONG", "✅ *done*", "⚙️ PONG", "❌ PONG", "🚫 rejected", "✏️ PONG", "🔎 task `t` is *completed*",
+                       "ℹ️ PONG", "x ⛔ I can't verify who you are on slack"):
+            self.assertEqual(harness.classify(answer), harness.KIND_ANSWER, answer)
+
+    def test_status_grammar_matches_the_gateway_source(self):
+        gateway = (REPO / "a2a" / "gateway" / "gateway.go").read_text()
+        relay = (REPO / "a2a" / "gateway" / "relay.go").read_text()
+        self.assertIn(f'g.adapter.Post(rec.Key, "{harness.STATUS_PLACEHOLDER}")', gateway)
+        self.assertIn(f'"{harness.STATUS_BUS_FAILURE}"', gateway)
+        self.assertIn(f'g.post(rec.Key, "{harness.STEER_FAILED_NOTICE}")', gateway)
+        self.assertIn('g.post(rec.Key, "✏️ steering sent — ', gateway)
+        self.assertIn('line := fmt.Sprintf("%s **%s**", icon, label)', relay)
+        self.assertIn('line := fmt.Sprintf("%s **%s**", icon, state)', relay)
+        self.assertEqual(relay.count('line += " — " + progress'), 2)
+        for state, icon in harness.STATUS_ICONS.items():
+            const = "lib.State" + "".join(part.capitalize() for part in state.split("-"))
+            self.assertRegex(relay, rf'{const}:\s+"{icon}",', state)
+        for post in ('"❌ failed: "+reason', '"❌ the task failed"', '"🛑 canceled"', '"🚫 the executor rejected the task: "+reason',
+                     '"🚫 the executor rejected the task"'):
+            self.assertIn(f"g.post(rec.Key, {post})", relay)
+
+    def test_redactor_cuts_the_escaped_forms_of_a_registered_value(self):
+        redactor = harness.Redactor()
+        redactor.add("head\ntail-é")
+        for printed in (repr("head\ntail-é"), repr("head\ntail-é".encode()), "head%0Atail-%C3%A9"):
+            self.assertNotIn("tail", redactor.redact(f"x {printed} y"), printed)
 
     def test_refusal_marker_matches_the_gateway_source(self):
         gateway = (REPO / "a2a" / "gateway" / "gateway.go").read_text()
@@ -845,6 +954,14 @@ class UnitTest(unittest.TestCase):
     def test_an_invalid_home_match_is_refused_at_parse_time(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             harness.parse_args(["--checks", "home", "--home-channel", "c", "--home-match", "("])
+
+    def test_non_finite_timeouts_are_refused(self):
+        for flag in ("--reply-timeout", "--poll-interval", "--quiet-window", "--home-timeout", "--home-since"):
+            for value in ("inf", "-inf", "nan", "infinity"):
+                with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    harness.parse_args([f"{flag}={value}"])
+                self.assertIn("finite", err.getvalue())
 
     def test_home_needs_a_channel(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
