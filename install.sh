@@ -1907,9 +1907,11 @@ note_install_env_flag() {
 
 # One flag against the key an existing install.env records. Returns 1, having
 # said why, when the two disagree; queues the key for
-# record_flags_into_install_env when the file does not assign it. A boolean key
-# the file sets empty resolves to its default, as write_tfvars_from_state reads
-# it, so that is the value compared. Needs installer_common.sh sourced.
+# record_flags_into_install_env when the file does not assign it. A key with a
+# default that the file sets empty resolves to the default, as
+# write_tfvars_from_state reads it, so that is the value compared; the chat
+# strings pass no default, because for them empty is the value rendered.
+# Needs installer_common.sh sourced.
 check_flag_against_install_env() {
   local file="$1" key="$2" flag="$3" kind="$4" value="$5" default="${6:-}"
   [ -n "$file" ] && [ -f "$file" ] || return 0
@@ -1927,12 +1929,12 @@ check_flag_against_install_env() {
   local recorded recorded_shown
   recorded="$(recorded_install_env_value "$file" "$key")"
   recorded_shown="${key}=$(printf '%q' "$recorded")"
+  if [ -z "$recorded" ] && [ -n "$default" ]; then
+    recorded="$default"
+    recorded_shown="${key} empty, which is ${default}"
+  fi
   case "$kind" in
     "$INSTALL_ENV_FLAG_KIND_BOOL")
-      if [ -z "$recorded" ]; then
-        recorded="$default"
-        recorded_shown="${key} empty, which is ${default}"
-      fi
       if is_truthy "$recorded"; then
         if is_truthy "$value"; then return 0; fi
       else
