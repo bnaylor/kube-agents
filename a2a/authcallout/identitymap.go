@@ -21,6 +21,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // mintableAccounts is every NATS account the callout will issue a user into.
@@ -172,6 +174,13 @@ func (id Identity) validate() error {
 	}
 	if id.User == "" {
 		return fmt.Errorf("serviceAccount %q has no user", id.ServiceAccount)
+	}
+	// The user becomes the `_INBOX.<user>.>` prefix, and reservedAs compares
+	// pod names against it byte for byte. A dotted user `a.b` would sit inside
+	// the inbox of a pod named `a` without matching it, so the user must be
+	// the same single lowercase label a pod name is.
+	if !lib.ValidSubjectToken(id.User) {
+		return fmt.Errorf("user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", id.User)
 	}
 	if id.Account == "" {
 		return fmt.Errorf("user %q has no account", id.User)

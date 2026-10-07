@@ -632,7 +632,9 @@ reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved
 set in the same step, and a connection is checked against the users of the map its
-identity was resolved from. A removed user's name is released at once, but the reload
+identity was resolved from. The callout refuses a map whose users are not dot-free DNS-1123
+labels too, because the check compares pod names byte for byte: a map user `a.b` would sit
+inside the `_INBOX.a.>` grant of a pod named `a` without matching it. A removed user's name is released at once, but the reload
 revokes nothing: connections the removed principal already holds keep its inbox until
 their user JWT expires, at most the callout's grant lifetime (one hour by default; the
 operator does not set `A2A_GRANT_TTL_SECONDS`), and a narrowed pod named after it can be

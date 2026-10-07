@@ -64,6 +64,9 @@ const (
 // names are DNS-1123 and so lowercase; a reserved name that is lowercase
 // DNS-1123 too can be compared byte for byte, and a rendered name in any other
 // case is refused here rather than silently never matching a pod.
+// Identity.validate holds map users to the same label, so the comparison is
+// exact for both halves: a dotted map user `a.b` would otherwise sit inside the
+// inbox of a pod named `a` without matching it.
 func ParseReservedPrincipals(raw string) ([]string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, fmt.Errorf("the reserved principal list is empty; a narrowed pod could take any static principal's name and inbox")
