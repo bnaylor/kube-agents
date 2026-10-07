@@ -88,6 +88,11 @@ type Config struct {
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
+	// ReservedPrincipals are the static nats.conf users a narrowed pod may
+	// not be named after (see reserved.go). Required: NewService refuses an
+	// empty list rather than serving a callout that reserves nothing.
+	ReservedPrincipals []string
+
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -99,6 +104,7 @@ type Service struct {
 	issuer    nkeys.KeyPair
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
+	reserved  map[string]struct{}
 	now       func() time.Time
 	log       *slog.Logger
 }
@@ -134,11 +140,17 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		return nil, fmt.Errorf("issuer seed: %w", err)
 	}
 
+	reserved, err := reservedSet(cfg.ReservedPrincipals)
+	if err != nil {
+		return nil, err
+	}
+
 	svc := &Service{
 		store:     store,
 		validator: validator,
 		issuer:    issuer,
 		grantTTL:  cfg.GrantTTL,
+		reserved:  reserved,
 		now:       cfg.Now,
 		log:       log,
 	}
@@ -332,6 +344,15 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
+		}
+		// A narrowed user is named for its pod, and that name is also its
+		// inbox prefix. A pod named after a static principal (the gateway,
+		// the bridge, web, console, seed) would be granted that principal's
+		// inbox, and could read or forge the JetStream replies delivered
+		// there. Checked after the switch so every narrowing is covered by
+		// one check, whatever derived the user.
+		if s.reservedPrincipal(user) {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of a static principal; its inbox is that principal's", att.ServiceAccount, user)
 		}
 	}
 
