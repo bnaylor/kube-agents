@@ -249,13 +249,17 @@ type taskRun struct {
 	origin *lib.Envelope
 	exec   *lib.TaskExecution
 
-	// mu guards state, proc, and killTimers - and is held across the
+	// mu guards state, proc, killTimers and killedAt - and is held across the
 	// finalize publish, so a steer refusal can never land after the final
 	// event: whoever holds the lock sees the true state before publishing.
 	mu         sync.Mutex
 	state      runState
 	proc       *exec.Cmd
 	killTimers []*time.Timer
+	// killedAt is when the first kill reached the process group: the
+	// deadline, a cancel or shutdown. Under mu. Zero for a run that exited
+	// on its own.
+	killedAt time.Time
 	// cancelReq ends the API executor's request (api.go); nil outside one.
 	// Under mu like proc, which it is the counterpart of.
 	cancelReq context.CancelFunc
@@ -492,6 +496,9 @@ func (b *Bridge) shutdownTasks() {
 	for _, r := range runs {
 		r.mu.Lock()
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
+			if r.killedAt.IsZero() {
+				r.killedAt = time.Now()
+			}
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
 		}
 		if r.state == stateRunning && r.cancelReq != nil {
@@ -962,6 +969,15 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	stderr := newTailBuffer(stderrTailBytes)
 	cmd.Stdout = &stdout
 	cmd.Stderr = stderr
+	// WaitDelay bounds the reap. Neither stream is an *os.File, so os/exec
+	// copies each through a pipe and Wait joins the copies, which end at
+	// EOF. A process hermes started outside its group survives the group
+	// kill and can hold either pipe, and without a bound Wait, and the task,
+	// would wait until that process exits, past the deadline, with no
+	// terminal event. KillGrace is the bound, as in the worker adapter's
+	// startHarness. After a clean exit Wait reports a bound that fired as
+	// exec.ErrWaitDelay; after a failed one it returns the exit status alone.
+	cmd.WaitDelay = b.cfg.KillGrace
 	// The activity door's side of this task: a signing key in the child's
 	// environment when the door is open, and the heartbeat either way.
 	act := newActivityState(b.activityLn != nil)
@@ -1013,6 +1029,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		run.mu.Unlock()
 	})
 	err := cmd.Wait()
+	reaped := time.Now()
 	deadline.Stop()
 	// The group is gone; stop any armed grace-period SIGKILLs before the
 	// pgid can be recycled onto an innocent process.
@@ -1021,7 +1038,19 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		t.Stop()
 	}
 	run.killTimers = nil
+	cut := reapCutNote(run.killedAt, reaped, cmd.WaitDelay)
 	run.mu.Unlock()
+
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// Hermes exited 0, and only the copy of output a process it started
+		// still held was cut. Everything hermes wrote was in the pipe before
+		// it exited, and the copy drained it during the bound, so the answer
+		// is whole: completed, like the worker adapter's result arm, which
+		// also ignores this error. The orphan is logged, not reported.
+		b.cfg.Logger.Warn("a process hermes started held its output past the reap bound; the copy was cut",
+			"task", taskID, "bound", cmd.WaitDelay)
+		err = nil
+	}
 
 	switch {
 	case err == nil:
@@ -1031,15 +1060,30 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), nil)
+			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline)+cut, nil)
 	case run.canceled.Load():
-		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
+		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request"+cut, nil)
 	case b.closing.Load():
 		// Killed by shutdownTasks; name the real cause, not the exit code.
-		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		b.finalize(run, lib.StateFailed, shutdownReason+cut, nil)
 	default:
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
+}
+
+// reapCutNote is what a killed run's reason adds when the reap after the
+// kill ran the full bound, or nothing. A failed exit hides whether WaitDelay
+// fired (Wait returns the exit status and drops exec.ErrWaitDelay), so the
+// time from the first kill to the reap stands in for it. It is a hint, not
+// proof: a run that ignores SIGTERM until the SIGKILL a grace later is
+// reaped about one bound after the kill with nothing held, which is why the
+// note says "may". A run that exited non-zero on its own has no kill to
+// time from and gets no note; its reap is still bounded.
+func reapCutNote(killedAt, reaped time.Time, bound time.Duration) string {
+	if killedAt.IsZero() || bound <= 0 || reaped.Sub(killedAt) < bound {
+		return ""
+	}
+	return fmt.Sprintf("; the reap after the kill ran the full %s, so a process hermes started may still hold its output", bound)
 }
 
 // failureReason is the terminal message for a subprocess that exited
@@ -1244,6 +1288,9 @@ func (b *Bridge) publishResult(ctx context.Context, run *taskRun, output string)
 // it once the group is gone - an unstopped timer could SIGKILL a recycled
 // pgid belonging to somebody else.
 func (b *Bridge) killGroup(run *taskRun, pid int) {
+	if run.killedAt.IsZero() {
+		run.killedAt = time.Now()
+	}
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	t := time.AfterFunc(b.cfg.KillGrace, func() {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
