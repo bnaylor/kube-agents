@@ -96,6 +96,9 @@ class FakeWorld:
         self.pending_typed = []
         # Conversation reads that fail with a Slack error, by channel.
         self.channel_errors = {}
+        # HTTP statuses the next conversation reads answer with, one per read. A negative
+        # entry is never used up: every read from then on answers its absolute value.
+        self.read_statuses = []
         # A task answer that lands this many reads later, with a fresh ts, the way a real
         # answer arrives after the user has moved on.
         self.answer_after_reads = 0
@@ -311,8 +314,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, {})
         if user is None:
             return self.reply(200, {"ok": False, "error": "invalid_auth"})
+        method = self.path[len("/api/"):]
         with world.lock:
-            payload = world.slack(self.path[len("/api/"):], user, params)
+            status = 200
+            if method in ("conversations.history", "conversations.replies") and world.read_statuses:
+                status = world.read_statuses[0]
+                if status > 0:
+                    world.read_statuses.pop(0)
+                else:
+                    status = -status
+            if status != 200:
+                return self.reply(status, {"ok": False, "error": "upstream"})
+            payload = world.slack(method, user, params)
         return self.reply(200, payload)
 
 
@@ -952,6 +965,32 @@ class ListedChecksTest(HarnessTestCase):
         self.assertNotIn("thread:", text)
         self.assertIn("SUMMARY pass=2 fail=1", text)
 
+    def test_a_transient_read_error_inside_a_wait_is_read_again(self):
+        # A 502, then a 429 that outlasts the client's own retries, while the person
+        # types the turn: the next tick reads again, and the turn is found.
+        self.world.read_statuses = [502, *([429] * (harness.RATE_LIMIT_MAX_RETRIES + 1))]
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertIn("PASS dm:", text)
+
+    def test_reads_failing_until_the_deadline_fail_naming_the_last_error(self):
+        self.world.read_statuses = [-503]
+        code, text = self.run_harness("--checks", "dm")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("error: nothing within 60s; the last read failed: Slack conversations.history failed: http_503",
+                      self.line(text, "FAIL dm"))
+
+    def test_thread_ts_on_a_thread_the_gateway_never_answered_fails_at_once(self):
+        root = self.world.type_message(LISTED_ID, CHANNEL_ID, "a plain message nobody mentioned the bot in")["ts"]
+        code, text = self.run_harness("--checks", "thread", "--thread-ts", root)
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        line = self.line(text, "FAIL thread")
+        self.assertIn(f"thread {root} holds no gateway status line", line)
+        self.assertIn("takes an unmentioned reply only in a thread it started a task in", line)
+        self.assertNotIn("TYPE ", text)
+        # At once: no settle wait.
+        self.assertEqual(self.fake.slept, [])
+
     def test_restart_is_a_dm_under_its_own_name(self):
         code, text = self.run_harness("--checks", "restart")
         self.assertEqual(code, harness.EXIT_OK, text)
@@ -1033,6 +1072,14 @@ class UnlistedTest(HarnessTestCase):
         code, text = self.run_harness("--checks", "unlisted", "--unlisted-via", "mention", "--unlisted-repeat")
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL unlisted-repeat", text)
+
+    def test_unlisted_repeat_by_mention_says_to_pick_the_bot(self):
+        code, text = self.run_harness("--checks", "unlisted", "--unlisted-via", "mention", "--unlisted-repeat")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        repeat = [ln for ln in text.splitlines() if ln.startswith("TYPE ") and "slc-unlisted-repeat-" in ln]
+        self.assertEqual(len(repeat), 1, text)
+        self.assertIn("thread ts=", repeat[0])
+        self.assertIn(f", picking @{BOT_NAME} from Slack's list: @{BOT_NAME} ", repeat[0])
 
     def test_unlisted_fails_when_the_notice_does_not_name_the_sender(self):
         self.world.refusal = REFUSAL.replace("(id {id})", "(id someone)")
@@ -1333,6 +1380,37 @@ class UnitTest(unittest.TestCase):
         fake = FakeClock()
         self.assertIsNone(harness.poll(lambda: None, 12, 5, fake.clock, fake.sleep))
         self.assertEqual(fake.slept, [5, 5, 2])
+
+    def test_poll_reads_again_after_a_transient_error_until_its_deadline(self):
+        def failing(*errors):
+            answers = iter(errors)
+
+            def fetch():
+                item = next(answers)
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+            return fetch
+
+        transient = (harness.HarnessError("cannot reach slack.com: [Errno 104] Connection reset by peer"),
+                     harness.SlackAPIError("conversations.history", "http_429"),
+                     harness.SlackAPIError("conversations.history", "http_502"),
+                     TimeoutError("The read operation timed out"))
+        for exc in transient:
+            with self.subTest(exc=str(exc)):
+                fake = FakeClock()
+                self.assertEqual(harness.poll(failing(None, exc, "got"), 60, 5, fake.clock, fake.sleep), "got")
+                fake = FakeClock()
+                with self.assertRaisesRegex(harness.HarnessError, "nothing within 12s; the last read failed: "):
+                    harness.poll(failing(None, None, exc, exc), 12, 5, fake.clock, fake.sleep)
+                # A read that recovers before the deadline times out plainly.
+                fake = FakeClock()
+                self.assertIsNone(harness.poll(failing(exc, None, None, None), 12, 5, fake.clock, fake.sleep))
+        # A Slack error that answers the same every time is raised at once.
+        fake = FakeClock()
+        with self.assertRaisesRegex(harness.SlackAPIError, "not_in_channel"):
+            harness.poll(failing(harness.SlackAPIError("conversations.history", "not_in_channel")), 60, 5, fake.clock, fake.sleep)
+        self.assertEqual(fake.slept, [])
 
     def test_parse_checks(self):
         self.assertEqual(harness.parse_checks("thread,dm,mention"), ["dm", "mention", "thread"])

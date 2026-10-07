@@ -38,7 +38,7 @@ spec:
           # -I ignores PYTHON* env and the user site; -B writes no bytecode, -u
           # unbuffers so a deadline kill still leaves the lines printed so far.
           command: ["python3", "-I", "-B", "-u", "/harness/harness.py"]
-          args: ${ARGS_JSON}
+          args:${ARGS_YAML}
           env:
             - name: HOME
               value: /tmp

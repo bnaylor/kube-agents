@@ -383,6 +383,18 @@ class JobTest(unittest.TestCase):
         self.assertEqual(len(polls), 1, polls)
         self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
 
+    def test_a_gone_job_gets_one_final_log_read_that_says_it_is_gone(self):
+        cluster = FakeCluster()
+        cluster.job_gone = True
+        cluster.job_log_progress = ["PASS preflight-listed: ok\n", None]
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_FAIL, out)
+        reads = [c for c in cluster.calls if c[3] == "logs" and any(a.startswith("job/") for a in c)]
+        # One poll read before the wait saw it gone, then one final read: no retry.
+        self.assertEqual(len(reads), 2, reads)
+        self.assertIn("the Job is gone, so its log could not be read again", out)
+        self.assertNotIn("the final log read failed", out)
+
     def test_cleanup_runs_when_the_run_raises_after_setup(self):
         # The namespace (and the Workload-Identity-bound ServiceAccount in it) is
         # applied, then something guarded() does not wrap raises: it is still deleted.
@@ -396,6 +408,19 @@ class JobTest(unittest.TestCase):
                 self.assertEqual([d["kind"] for d in yaml.safe_load_all(cluster.applied[0])][0], "Namespace")
                 self.assertEqual(cluster.deleted[-1], ["namespace", "slack-test"])
                 self.assertIn("CLEANUP namespace slack-test deleted", out)
+
+    def test_job_args_carry_any_character_through_yaml(self):
+        # DEL and a C1 control pass json.dumps raw and YAML's reader refuses them raw;
+        # the rest are YAML's escapes and line breaks, and the quote and backslash.
+        value = 'PONG\x7f \x92 \x85 \u2028 \u2029 \ufeff \ufffe \x00 \t \n " \\ \'s: - [x] #'
+        cluster = FakeCluster()
+        run_launch(cluster, "--context", CONTEXT, "--checks", "dm", "--", "--prompt", value)
+        args = pod_spec(yaml.safe_load(cluster.applied[2]))["containers"][0]["args"]
+        self.assertEqual(args[args.index("--prompt") + 1], value)
+        self.assertEqual(args[:2], ["--checks", "dm"])
+        _, _, rendered = launch.job_manifests("ns", "sa", "img", "r", ["--prompt", value], 60)
+        self.assertNotIn("\x7f", rendered)
+        self.assertNotIn("\x92", rendered)
 
     def test_job_args_carry_non_bmp_characters_as_utf8(self):
         cluster = FakeCluster()
@@ -481,13 +506,20 @@ class JobTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertIn("kept: another run's Job is still running in it (slack-live-check-other)", out)
         self.assertNotIn(["namespace", "slack-test"], cluster.deleted)
-        code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
-        self.assertEqual(code, launch.EXIT_SETUP, out)
-        self.assertNotIn(["namespace", "slack-test"], cluster.deleted)
-        other["status"] = {"conditions": [{"type": "Complete", "status": "True"}]}
+        self.assertNotIn(["job", "slack-live-check-other"], cluster.deleted)
+
+    def test_cleanup_deletes_an_interrupted_runs_job_then_the_namespace(self):
+        # The launcher that owned it died mid-Job: --cleanup says no run is live.
+        orphan = {"metadata": {"name": "slack-live-check-orphan", "labels": {launch.RUN_LABEL_KEY: "dead"}}, "status": {}}
+        cluster = FakeCluster()
+        cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
+        cluster.jobs = [orphan]
         code, out = run_launch(cluster, "--context", CONTEXT, "--cleanup")
         self.assertEqual(code, launch.EXIT_OK, out)
-        self.assertIn(["namespace", "slack-test"], cluster.deleted)
+        self.assertEqual(cluster.deleted, [["job", "slack-live-check-orphan"], ["namespace", "slack-test"]])
+        self.assertIn("CLEANUP deleted this tool's Jobs still running in slack-test (slack-live-check-orphan)", out)
+        self.assertIn("CLEANUP namespace slack-test deleted", out)
+        self.assertNotIn("kept", out)
 
     def test_live_foreign_jobs_skips_own_finished_and_deleting_jobs(self):
         def job(name, run, status=None, deleting=False):

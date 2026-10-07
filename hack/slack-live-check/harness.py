@@ -72,6 +72,8 @@ RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
 RATE_LIMIT_MAX_WAIT_SECONDS = 30
 HTTP_OK = 200
 HTTP_TOO_MANY_REQUESTS = 429
+# SlackAPIError's code for a 5xx answer: poll reads again after one.
+TRANSIENT_HTTP_ERROR_PATTERN = re.compile(r"http_5\d\d")
 LIST_PAGE_LIMIT = 200
 LIST_MAX_PAGES = 25
 # conversations.list types: private channels need groups:read, which a minted test token may lack.
@@ -368,16 +370,39 @@ def ts_value(ts: str) -> Decimal:
         return Decimal(0)
 
 
+def transient(exc: BaseException) -> bool:
+    """A read error the next read may not hit: Slack's 429 or 5xx, an unreachable host, a timed-out read.
+
+    Any other Slack error (not_in_channel, invalid_auth, ...) answers the same way every time.
+    """
+    if isinstance(exc, SlackAPIError):
+        return exc.error == f"http_{HTTP_TOO_MANY_REQUESTS}" or TRANSIENT_HTTP_ERROR_PATTERN.fullmatch(exc.error) is not None
+    return isinstance(exc, (HarnessError, OSError))
+
+
 def poll(fetch: Callable[[], Optional[object]], timeout: float, interval: float,
          clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> Optional[object]:
-    """Calls fetch until it returns something, or until timeout seconds have passed."""
+    """Calls fetch until it returns something, or until timeout seconds have passed.
+
+    A transient read error (transient()) is read again on the next tick, until the
+    deadline; if the last read before it failed, that error is raised, named. Any
+    other error is raised at once.
+    """
     deadline = clock() + timeout
     while True:
-        result = fetch()
+        last_error: Optional[BaseException] = None
+        try:
+            result = fetch()
+        except (HarnessError, OSError) as exc:
+            if not transient(exc):
+                raise
+            last_error, result = exc, None
         if result is not None:
             return result
         remaining = deadline - clock()
         if remaining <= 0:
+            if last_error is not None:
+                raise HarnessError(f"nothing within {timeout:g}s; the last read failed: {last_error}") from None
             return None
         sleep(min(interval, remaining))
 
@@ -702,6 +727,15 @@ def check_thread(session: Session) -> CheckResult:
     if not root:
         return CheckResult(CHECK_THREAD, False, "no thread to reply in: the mention check did not pass in this run and --thread-ts is unset",
                            {"channel": session.channel_id})
+    # inbound() in a2a/gateway/slack.go takes an unmentioned reply only in a thread the
+    # gateway started a task in (isSessionThread), and startTask posts the status line
+    # there. A --thread-ts without one would wait out the settle and blame a steer.
+    if not any(m.get("user") == session.bot_user_id and status_state(m.get("text", ""))
+               for m in replies_after(session.listed, session.channel_id, root, "0")):
+        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no gateway status line, so the gateway never started "
+                           "a task in it, and it takes an unmentioned reply only in a thread it started a task in; "
+                           "run mention in the same run, or pass a --thread-ts the bot answered",
+                           {"channel": session.channel_id, "thread_ts": root})
     # Let the task the mention started finish first. Its answer would otherwise
     # land after the follow-up and read as the follow-up's reply, and a reply
     # sent while it runs is a steer, not a turn. Settled is the status line's
@@ -792,6 +826,8 @@ def check_unlisted_repeat(session: Session, client: SlackClient, channel: str, t
     """
     if thread_ts:
         where = f"the thread under the refusal notice in {place}, thread ts={thread_ts}"
+        if session.args.unlisted_via == UNLISTED_VIA_MENTION:
+            where += f", picking @{session.bot_label} from Slack's list"
     turn = unlisted_turn(session, CHECK_UNLISTED_REPEAT, channel, where, thread_ts)
     typed, failed = await_typed(session, client, turn)
     if failed is not None:

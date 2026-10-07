@@ -127,7 +127,7 @@ WAIT_ANSWER_FLAG = "--wait-answer"
 RESULT_PREFIXES = ("PASS ", "FAIL ")
 # wait_job's answer for a Job that no longer exists.
 JOB_GONE = "gone"
-# delete_namespace's outcomes. KEPT: another run's Job is still running in it.
+# delete_namespace's outcomes. KEPT: another run's Job is still running in it (never under --cleanup).
 CLEANUP_DONE = "done"
 CLEANUP_KEPT = "kept"
 CLEANUP_FAILED = "failed"
@@ -225,6 +225,29 @@ def wi_binding_command(project: str, gsa_email: str, namespace: str, service_acc
     )
 
 
+def yaml_quoted(value: str) -> str:
+    """value as a YAML double-quoted scalar, escaping every character YAML would refuse or fold.
+
+    Printable characters go through as they are. Escaped: the quote and the
+    backslash; everything YAML's reader refuses raw (the C0 controls, DEL, the C1
+    controls, U+FFFE and U+FFFF); and the characters YAML 1.1 folds as line breaks
+    in a quoted scalar (U+0085, U+2028, U+2029), and the BOM.
+    """
+    out = []
+    for ch in value:
+        cp = ord(ch)
+        if ch in ('"', "\\"):
+            out.append("\\" + ch)
+        elif cp not in (0x2028, 0x2029, 0xFEFF) and (
+                0x20 <= cp <= 0x7E or 0xA0 <= cp <= 0xD7FF or 0xE000 <= cp <= 0xFFFD or cp >= 0x10000):
+            out.append(ch)
+        elif cp <= 0xFF:
+            out.append(f"\\x{cp:02x}")
+        else:
+            out.append(f"\\u{cp:04x}")
+    return '"' + "".join(out) + '"'
+
+
 def job_manifests(namespace: str, service_account: str, image: str, run_id: str, harness_args: list[str],
                   deadline_seconds: int) -> tuple[str, str, str]:
     """Returns (job name, ConfigMap JSON, Job YAML)."""
@@ -245,9 +268,9 @@ def job_manifests(namespace: str, service_account: str, image: str, run_id: str,
         "SERVICE_ACCOUNT": service_account,
         "IMAGE": image,
         "CONFIGMAP_NAME": job_name,
-        # Not ensure_ascii: a character above U+FFFF would be a \\ud83d-style surrogate
-        # pair, which JSON allows and kubectl's YAML parser refuses.
-        "ARGS_JSON": json.dumps(harness_args, ensure_ascii=False),
+        # One block-sequence item per arg, each a YAML double-quoted scalar: a JSON
+        # string is not one (a raw DEL or C1 control passes json.dumps and YAML refuses it).
+        "ARGS_YAML": "".join(f"\n            - {yaml_quoted(arg)}" for arg in harness_args),
         "DEADLINE_SECONDS": str(deadline_seconds),
         "TTL_SECONDS": str(JOB_TTL_SECONDS),
     })
@@ -284,7 +307,7 @@ class LogStream:
     yet; a line without its newline waits for the next read. A read that fails (the
     pod not started, an API blip) is skipped: the next tick reads again. finish()
     reads once more after the Job ends, retrying a failed read for a short while, and
-    prints the rest.
+    prints the rest; for a Job wait_job found gone it reads once, since no retry can succeed.
     """
 
     def __init__(self, kubectl: "Kubectl", namespace: str, job_name: str,
@@ -318,17 +341,21 @@ class LogStream:
         except LaunchError:
             return
 
-    def finish(self) -> str:
+    def finish(self, state: str = "") -> str:
+        gone = state == JOB_GONE
         deadline = self.clock() + LOG_FINAL_READ_RETRY_SECONDS
         while True:
             try:
                 self._emit(self._read(), final=True)
                 return self.text
             except LaunchError as exc:
-                if self.clock() < deadline:
+                if not gone and self.clock() < deadline:
                     self.sleep(JOB_POLL_INTERVAL_SECONDS)
                     continue
-                if self.text:
+                if gone:
+                    say(f"JOB {self.job_name}: the Job is gone, so its log could not be read again; "
+                        f"lines after the last good read are missing: {exc}")
+                elif self.text:
                     say(f"JOB {self.job_name}: the final log read failed, so lines after the last good read are missing: {exc}")
                 else:
                     say(f"JOB {self.job_name}: no pod log ({exc})")
@@ -459,7 +486,7 @@ class Launcher:
             self.kubectl.run(["apply", "-f", "-"], stdin=job)
             stream = LogStream(self.kubectl, ns, job_name, self.clock, self.sleep)
             state = self.wait_job(job_name, deadline, stream.poll)
-            logs = stream.finish()
+            logs = stream.finish(state)
             results, evidence = parse_harness_output(harness.REDACTOR.redact(logs))
             self.results.extend(results)
             if state != "Complete" and not any(not passed for _, passed, _ in results):
@@ -691,18 +718,25 @@ def live_foreign_jobs(kubectl: Kubectl, namespace: str, own_run_ids: Collection[
     return live
 
 
-def delete_namespace(kubectl: Kubectl, namespace: str, own_run_ids: Collection[str] = frozenset()) -> str:
+def delete_namespace(kubectl: Kubectl, namespace: str, own_run_ids: Collection[str] = frozenset(),
+                     delete_live_jobs: bool = False) -> str:
     """Deletes the run's namespace, and with it the ServiceAccount, the fence and any Job left behind.
 
     Not while another run's Job is still running in it (CLEANUP_KEPT): that run is
-    mid-check, and it deletes the namespace itself when it ends.
+    mid-check, and it deletes the namespace itself when it ends. delete_live_jobs is
+    --cleanup, the operator saying no run is live: such a Job is an interrupted
+    run's, whose launcher is gone, so it is deleted first and named.
     """
     try:
         if not check_namespace_ownership(kubectl, namespace):
             say(f"CLEANUP namespace {namespace} is already gone")
             return CLEANUP_DONE
         live = live_foreign_jobs(kubectl, namespace, own_run_ids)
-        if live:
+        if live and delete_live_jobs:
+            kubectl.run(["delete", "job", *live, "-n", namespace, "--ignore-not-found", "--wait=false"])
+            say(f"CLEANUP deleted this tool's Jobs still running in {namespace} ({', '.join(live)}): "
+                "under --cleanup no run is live, so they are an interrupted run's")
+        elif live:
             say(f"CLEANUP namespace {namespace} kept: another run's Job is still running in it "
                 f"({', '.join(live)}); that run deletes it when it ends")
             return CLEANUP_KEPT
@@ -761,7 +795,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--expect-principal", default="",
                         help=f"expected ingress principal per listed turn; {PRINCIPAL_LISTED_PLACEHOLDER} is the listed member id")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--cleanup", action="store_true", help="delete the run namespace (a run does this itself on exit) and stop")
+    mode.add_argument("--cleanup", action="store_true",
+                      help="delete the run namespace and this tool's Jobs in it (a run does this itself on exit) and stop")
     mode.add_argument("--render", action="store_true", help="print the manifests and exit; touches nothing")
     args = parser.parse_args(argv)
     owned = [arg for arg in forwarded if arg.split("=", 1)[0] in LAUNCHER_OWNED_HARNESS_FLAGS]
@@ -815,8 +850,9 @@ def main(argv: Optional[list[str]] = None, runner: Callable = subprocess.run,
             return EXIT_OK
         kubectl = Kubectl(args.context, runner)
         if args.cleanup:
-            # Not done on a namespace that is not this tool's, or one a live run is using.
-            return EXIT_OK if delete_namespace(kubectl, args.namespace) == CLEANUP_DONE else EXIT_SETUP
+            # Not done on a namespace that is not this tool's. --cleanup says no run is
+            # live, so this tool's Jobs still running there are deleted first.
+            return EXIT_OK if delete_namespace(kubectl, args.namespace, delete_live_jobs=True) == CLEANUP_DONE else EXIT_SETUP
         return Launcher(args, forwarded, kubectl, clock, sleep, runner).run(args.checks)
     except LaunchError as exc:
         say(f"ERROR {exc}")
