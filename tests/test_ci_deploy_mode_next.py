@@ -1399,11 +1399,21 @@ class TransientUnschedulableGateTest(unittest.TestCase):
         self.assertIn('message = fmt.Sprintf("Pod %s cannot be scheduled onto any available node: %s.", pod.Name, cleanMsg)', controller)
 
 
-# The agent pod _WAITING_FOR_CAPACITY names, as the gate's pod read lists it:
-# unscheduled (no node yet), and bound to a node.
+# The agent pod _WAITING_FOR_CAPACITY names, as the gate's pod read lists it
+# (name, node, phase, deletionTimestamp, tab-separated): unscheduled (no node
+# yet), and bound to a node.
 _AGENT_POD = "platform-agent-gateway-57ddfbc5bf-25f5x"
-_POD_UNSCHEDULED = f"{_AGENT_POD}\t\n"
-_POD_SCHEDULED = f"{_AGENT_POD}\tgk3-autopilot-pool-2-1a2b3c4d-x7k9\n"
+_OTHER_POD = "platform-agent-gateway-57ddfbc5bf-9q8rw"
+_NODE = "gk3-autopilot-pool-2-1a2b3c4d-x7k9"
+_DELETED_AT = "2026-10-06T12:00:00Z"
+
+
+def _pod(name: str, node: str = "", phase: str = "Pending", deleted: str = "") -> str:
+    return f"{name}\t{node}\t{phase}\t{deleted}\n"
+
+
+_POD_UNSCHEDULED = _pod(_AGENT_POD)
+_POD_SCHEDULED = _pod(_AGENT_POD, _NODE)
 
 
 class CapacityWaitReadsThePodTest(unittest.TestCase):
@@ -1422,7 +1432,7 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
     def _count(self, name: str, result: subprocess.CompletedProcess) -> int:
         return int(re.search(rf"(?:^| ){name}=(\d+)", result.stdout, re.MULTILINE).group(1))
 
-    def _handed_off(self, result: subprocess.CompletedProcess, rereads: int) -> None:
+    def _handed_off(self, result: subprocess.CompletedProcess, rereads: int, pod: str = _AGENT_POD) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASSED", result.stdout)
         self.assertRegex(
@@ -1430,8 +1440,8 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
             re.escape(f"✓ the wait for capacity handed off after {rereads} re-reads, ")
             + r"\d+s"
             + re.escape(
-                ": the agent pod was scheduled on gk3-autopilot-pool-2-1a2b3c4d-x7k9"
-                f" ({_AGENT_POD}); the rollout gate decides from here"
+                f": the agent pod was scheduled on {_NODE}"
+                f" ({pod}); the rollout gate decides from here"
                 f" (platform-agent still reads Degraded; Ready condition: {_WAITING_FOR_CAPACITY})\n"
             ),
         )
@@ -1466,12 +1476,77 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
 
     def test_an_unbound_pod_listed_first_does_not_hide_a_bound_one(self) -> None:
         """The scan skips a line with no node rather than stopping on it."""
-        unbound = "platform-agent-gateway-57ddfbc5bf-9q8rw\t\n"
+        unbound = _pod(_OTHER_POD)
         result = run_provision_wait(
             jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, pods=unbound + _POD_SCHEDULED, unschedulable_attempts=5
         )
         self._handed_off(result, 0)
         self.assertEqual(self._count("POD_READS", result), 1)
+
+    def _no_hand_off(self, pods: str | list[str]) -> None:
+        result = run_provision_wait(jobs="", call=self._GATE, phase="Degraded", ready=_WAITING_FOR_CAPACITY, pods=pods, unschedulable_attempts=3)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self._count("POD_READS", result), 4)
+        self.assertIn("the wait for capacity ended after 3 re-reads", result.stdout)
+        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertNotIn("handed off", result.stdout)
+        self.assertNotIn("PASSED", result.stdout)
+
+    def test_a_terminal_bound_pod_beside_the_pending_one_does_not_hand_off(self) -> None:
+        """An evicted or admission-rejected agent pod keeps its node and sits
+        under the label until pod GC; Recreate does not wait for it. It is
+        not the pod the wait is about, so the gate keeps polling."""
+        for phase in ("Failed", "Succeeded"):
+            with self.subTest(f"an old {phase} pod listed first"):
+                self._no_hand_off(_pod(_OTHER_POD, _NODE, phase) + _POD_UNSCHEDULED)
+            with self.subTest(f"the named pod {phase} on its node, its replacement pending"):
+                # The condition still names the pod the kubelet rejected
+                # until the operator's next pass.
+                self._no_hand_off(_pod(_AGENT_POD, _NODE, phase) + _pod(_OTHER_POD))
+
+    def test_a_terminating_bound_pod_does_not_hand_off(self) -> None:
+        for name, pods in {
+            "the named pod, alone": _pod(_AGENT_POD, _NODE, "Running", _DELETED_AT),
+            "the named pod, its replacement pending": _pod(_AGENT_POD, _NODE, "Running", _DELETED_AT) + _pod(_OTHER_POD),
+            "another pod, the named one pending": _pod(_OTHER_POD, _NODE, "Running", _DELETED_AT) + _POD_UNSCHEDULED,
+        }.items():
+            with self.subTest(name):
+                self._no_hand_off(pods)
+
+    def test_the_named_pod_becoming_bound_hands_off_and_the_line_names_it(self) -> None:
+        """The condition names a pod; while it is listed and live, the gate
+        decides on it alone, not on another bound pod listed before it."""
+        other_bound = _pod(_OTHER_POD, _NODE, "Running")
+        result = run_provision_wait(
+            jobs="",
+            call=self._GATE,
+            phase="Degraded",
+            ready=_WAITING_FOR_CAPACITY,
+            pods=[other_bound + _POD_UNSCHEDULED, other_bound + _POD_SCHEDULED],
+            unschedulable_attempts=5,
+        )
+        self._handed_off(result, 1)
+        self.assertEqual(self._count("POD_READS", result), 2)
+        self.assertNotIn(f"({_OTHER_POD})", result.stdout)
+
+    def test_a_named_pod_no_longer_listed_falls_back_to_a_live_bound_pod(self) -> None:
+        result = run_provision_wait(
+            jobs="",
+            call=self._GATE,
+            phase="Degraded",
+            ready=_WAITING_FOR_CAPACITY,
+            pods=_pod(_AGENT_POD, _NODE, "Failed") + _pod(_OTHER_POD, _NODE, "Running"),
+            unschedulable_attempts=5,
+        )
+        self._handed_off(result, 0, pod=_OTHER_POD)
+
+    def test_the_pod_read_is_one_call_with_phase_and_deletion(self) -> None:
+        gate = shell_function("gate_cr_not_degraded")
+        self.assertEqual(gate.count("kubectl get pods"), 1)
+        self.assertIn(
+            """jsonpath='{range .items[*]}{.metadata.name}{"\\t"}{.spec.nodeName}{"\\t"}{.status.phase}{"\\t"}{.metadata.deletionTimestamp}{"\\n"}{end}'""",
+            gate,
+        )
 
     def test_a_pod_never_scheduled_fails_at_the_end_of_the_window_as_before(self) -> None:
         for name, pods in {"unscheduled throughout": _POD_UNSCHEDULED, "no agent pod listed": ""}.items():

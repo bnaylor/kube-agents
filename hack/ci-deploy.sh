@@ -1428,7 +1428,8 @@ wait_provision_job() {
 # any other Degraded does if it is still there at the end or turns into
 # something else. When the condition is about an agent pod, every read that
 # returns it, the first and the last included, also reads the agent's pods,
-# in one read, and a pod bound to a node ends the gate as a hand-off to the
+# in one read, and a live pod bound to a node (the one the condition names,
+# while it is listed) ends the gate as a hand-off to the
 # agent Deployment's rollout gate that follows it, because the condition can
 # outlive the wait it describes (the window's constant says why). A read
 # that returns nothing, the first read included, is one more re-read against
@@ -1439,7 +1440,7 @@ wait_provision_job() {
 # the artifact says what the CR said.
 gate_cr_not_degraded() {
   local what="$1" pair phase="" condition="" rereads=0 answered="" capacity="" unanswered="" gate_start=$SECONDS
-  local agent_pods pod_line pod_node="" pod_name=""
+  local agent_pods pod_line pod_node="" pod_name="" named_pod line_name line_node line_phase line_deleted rest fallback_name fallback_node named_listed
   while :; do
     # One read, so the phase and the condition are one object version's.
     pair="$(cr_phase_and_ready_condition)"
@@ -1479,20 +1480,44 @@ gate_cr_not_degraded() {
         [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
         # The condition may be stale: the operator watches no Pods, so the
         # scheduler binding the agent pod wakes nothing, and the status keeps
-        # the old message until the operator's next pass. So the pod itself,
-        # by the label the operator lists the agent's pods by, in one read a
-        # line per pod. Bound to a node is the end of what this gate forgives;
-        # the agent Deployment's rollout gate, which runs next, decides the
-        # rest. Nothing listed, a pod not yet bound, or a dropped read (the
-        # read swallows the failure) is one more poll like any other here.
-        agent_pods="$(kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}' 2>/dev/null || true)"
+        # the old message until the operator's next pass. So the pods
+        # themselves, by the label the operator lists the agent's pods by, in
+        # one read a line per pod: name, node, phase, deletion timestamp.
+        # Like the operator's scan, a pod being deleted is skipped, and so is
+        # one that is Failed or Succeeded (an evicted or admission-rejected
+        # pod keeps its node until pod GC, and Recreate does not wait for
+        # it). The pod the condition names ("Pod <name> cannot be
+        # scheduled..."), while it is listed and live, decides alone; once it
+        # is not, the first live pod bound to a node does. Bound is the end of
+        # what this gate forgives; the agent Deployment's rollout gate, which
+        # runs next, decides the rest. Nothing listed, no live pod bound, or a
+        # dropped read (the read swallows the failure) is one more poll like
+        # any other here.
+        named_pod="${condition#"${CR_READY_REASON_POD_UNSCHEDULABLE}: Pod "}"
+        named_pod="${named_pod%% *}"
+        pod_name="" pod_node="" fallback_name="" fallback_node="" named_listed=""
+        agent_pods="$(kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}{.status.phase}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true)"
         while IFS= read -r pod_line; do
-          if [[ "${pod_line}" == *$'\t'?* ]]; then
-            pod_name="${pod_line%%$'\t'*}"
-            pod_node="${pod_line#*$'\t'}"
+          [[ "${pod_line}" == *$'\t'*$'\t'*$'\t'* ]] || continue
+          line_name="${pod_line%%$'\t'*}"
+          rest="${pod_line#*$'\t'}"
+          line_node="${rest%%$'\t'*}"
+          rest="${rest#*$'\t'}"
+          line_phase="${rest%%$'\t'*}"
+          line_deleted="${rest#*$'\t'}"
+          [ -n "${line_deleted}" ] && continue
+          case "${line_phase}" in Failed | Succeeded) continue ;; esac
+          if [ "${line_name}" = "${named_pod}" ]; then
+            named_listed="true" pod_name="${line_name}" pod_node="${line_node}"
             break
           fi
+          if [ -n "${line_node}" ] && [ -z "${fallback_node}" ]; then
+            fallback_name="${line_name}" fallback_node="${line_node}"
+          fi
         done <<<"${agent_pods}"
+        if [ -z "${named_listed}" ]; then
+          pod_name="${fallback_name}" pod_node="${fallback_node}"
+        fi
         [ -n "${pod_node}" ] && break
       fi
       if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
