@@ -108,7 +108,8 @@ menu, and `common.sh`'s `load_state` for the dev scripts — with `set -a` so th
 reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read the
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
-export of the same name, so a flag is what overrides a recorded value for one run.
+export of the same name, so a flag is what overrides a recorded value for one run. The chat
+flags are the exception: on an existing file they are held to it, as described below.
 One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
 `uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
 tooling exports that name and the value now reaches the Helm release's namespace. The file
@@ -141,6 +142,29 @@ install, when there is nothing there, and never touches it again; the Day-2 menu
 "Save & Apply" is the one path that edits it, one key at a time, leaving comments and
 ordering intact. That asymmetry is deliberate: a file the documentation tells you to edit
 and the next run overwrites is what made the old `vars.sh` confusing.
+
+The chat flags are held to the file rather than overriding it for one run, because
+`upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
+one-run override would be undone by the next full upgrade without a word. They are
+`--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
+`--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
+`--slack-bot-token` and `--slack-app-token`. Against an existing `install.env`, a flag that
+disagrees with the key the file assigns is refused before anything is applied, naming the
+file and the key: edit the key (or, for the toggles and the Google Chat keys, use the Day-2
+menu) and re-run without the flag. A toggle the file sets empty counts as its default. A flag
+whose key the file does not assign at all is appended to the file with the value the run
+applies, as the last step before the apply or the `--generate-only` handoff, so a refused,
+declined or failed run and a `--dry-run` leave the file as it was. This is the one write
+`install.sh` makes to a file it did not create, and only of keys the file lacks. A flag that
+agrees changes nothing. The Slack tokens are never appended: their home is the live
+`platform-agent-secrets` Secret, which `write_tfvars_from_state` recovers them from on every
+later run, and `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file. A token the file
+does carry is still held to it. A file `install.sh` wrote assigns every one of these keys but
+the tokens, so on it a chat flag is either refused or a no-op. A file CI renders leaves out a
+key whose variable is empty, and the provisioning script derives each chat flag from the same
+variable, so on a runner a flag either agrees with the rendered key or is appended to the
+runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
+edits the keys on its own screens.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.

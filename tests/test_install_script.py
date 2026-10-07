@@ -7,6 +7,7 @@ and that the helpers driving install.sh here detach from the controlling
 terminal, so a prompt auto-selects its default instead of blocking the suite.
 """
 
+import base64
 import json
 import os
 import pathlib
@@ -24,6 +25,7 @@ import time
 import unittest
 from unittest import mock
 
+import tests.test_installer_common as _installer_common_tests
 from tests.testing.common import (
     INSTALLER_HELP_BANNER,
     INVALID_IMMUTABLE_REFS,
@@ -5651,13 +5653,51 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
 
     def test_a_non_interactive_run_says_nothing(self):
-        """It typed nothing: its answers came from flags and this very file."""
+        """A non-interactive run answered no prompt, so this warning stays quiet.
+
+        The old premise, that such a run's answers "came from flags and this
+        very file", was the bug in #2541: a flag that disagrees with the file
+        is exactly the drift the next upgrade.sh reverts. The chat keys are no
+        longer this function's to report: a chat flag that disagrees with the
+        file is refused before the run gets here, and one whose key the file
+        lacks is recorded (ChatFlagsAgreeWithInstallEnvTest). What is left
+        silent is a non-chat key with a flag, MODEL_MAX_TOKENS here, which
+        still applies for one run unwarned on a non-interactive run: the
+        known gap the refusal has not been extended to.
+        """
         proc = self._warn(
-            "GOOGLE_CHAT_ENABLED=true\n", {"GOOGLE_CHAT_ENABLED": "false"},
+            "MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "8192"},
             non_interactive=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
+
+    def test_a_non_interactive_chat_flag_that_disagrees_is_refused_not_ignored(self):
+        """The case this test class's non-interactive silence used to cover.
+
+        GOOGLE_CHAT_ENABLED=true in the file and --enable-google-chat=false on
+        a non-interactive run: the warning above still says nothing, and the
+        run stops at check_flags_against_install_env instead of applying it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("GOOGLE_CHAT_ENABLED=true\n")
+            env_file.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c",
+                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 "source scripts/installer/installer_common.sh\n"
+                 "parse_args -y --enable-google-chat=false\n"
+                 'rc=0; check_flags_against_install_env || rc=$?; echo "rc=$rc"'],
+                capture_output=True, text=True,
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}
+                ),
+                cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn("records GOOGLE_CHAT_ENABLED=true", proc.stdout + proc.stderr)
+            self.assertEqual(env_file.read_text(), "GOOGLE_CHAT_ENABLED=true\n")
 
     def test_a_key_the_file_does_not_carry_is_not_reported(self):
         """Absent is not drift — the file inherits the default, and warning
@@ -5830,6 +5870,465 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         early_return = source.split("bootstrap_install_env_file() {")[1]
         early_return = early_return.split("if [ \"$PARAM_DRY_RUN\"")[0]
         self.assertIn("warn_unrecorded_interview_answers", early_return)
+
+
+class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
+    """The chat flags against an install.env that already exists.
+
+    upgrade.sh renders the chat integrations from install.env alone and takes
+    none of these flags, so a flag that beat the file for one run was undone
+    by the next full upgrade: `--enable-slack` turned the relay on and the
+    next `upgrade.sh --upgrade-mode=full` turned it off again, with nothing
+    said (#2541). Now a flag that disagrees with the key the file assigns is
+    refused before anything is applied; one whose key the file does not assign
+    is appended with the value the run applies, once the run commits; one that
+    agrees changes nothing. Tokens are held to a key the file carries but are
+    never written: their home is the live Secret.
+    """
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        # A developer's own exports must not answer for the file.
+        for key in ("SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+                    "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
+                    "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "PERSIST_SECRETS_ON_DISK"):
+            env.pop(key, None)
+        env.update(overrides)
+        return env
+
+    def _run(self, body, install_env, extra_env=None):
+        env = {"KUBE_AGENTS_INSTALL_ENV": str(install_env)}
+        env.update(extra_env or {})
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "source scripts/installer/installer_common.sh\n"
+            f"{body}\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=self._env(env), cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
+        )
+
+    def _file(self, tmp, content, name="install.env"):
+        path = pathlib.Path(tmp) / name
+        path.write_text(content)
+        path.chmod(0o600)
+        return path
+
+    _CHECK = 'rc=0; check_flags_against_install_env || rc=$?; echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+
+    def _check(self, tmp, content, flags, extra_env=None):
+        path = self._file(tmp, content)
+        proc = self._run(f"parse_args {flags}; {self._CHECK}", path, extra_env)
+        return path, proc, proc.stdout + proc.stderr
+
+    # ── refusal ─────────────────────────────────────────────────────────────
+
+    def test_a_toggle_that_disagrees_with_the_file_is_refused_and_the_file_is_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, flag_shown, says in (
+                # The issue's case: the file install.sh itself wrote says false.
+                ("PROJECT_ID=p\nSLACK_ENABLED=false\n", "-y --enable-slack", "--enable-slack=true", "records SLACK_ENABLED=false"),
+                ("SLACK_ENABLED=true\n", "--enable-slack=false", "--enable-slack=false", "records SLACK_ENABLED=true"),
+                # A hand-written spelling is read the way the generator reads it.
+                ("SLACK_ENABLED=True\n", "--enable-slack=false", "--enable-slack=false", "records SLACK_ENABLED=True"),
+                # Set empty: the generator renders the default, false.
+                ("SLACK_ENABLED=\n", "--enable-slack", "--enable-slack=true", "records SLACK_ENABLED empty, which is false"),
+                ("GOOGLE_CHAT_ENABLED=false\n", "--enable-google-chat", "--enable-google-chat=true", "records GOOGLE_CHAT_ENABLED=false"),
+                ("GOOGLE_CHAT_ENABLED=true\n", "--google-chat=false", "--google-chat=false", "records GOOGLE_CHAT_ENABLED=true"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path, proc, out = self._check(tmp, content, flags)
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(f"{flag_shown} disagrees with the install configuration, so it would hold for this run only", out)
+                    self.assertIn(f"{path} {says}", out)
+                    self.assertIn("every upgrade.sh, renders from the file", out)
+                    self.assertIn("or change it with './install.sh --menu'", out)
+                    self.assertEqual(path.read_text(), content, "a refusal never touches the file")
+
+    def test_a_chat_string_that_disagrees_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, key, shown in (
+                # install.sh writes these empty on a first install, and the
+                # empty value is a value: it is what upgrade.sh renders.
+                ("SLACK_ALLOWED_USERS=''\n", "--slack-allowed-users=U1", "SLACK_ALLOWED_USERS", "--slack-allowed-users=U1"),
+                ("SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=", "SLACK_ALLOWED_USERS", "--slack-allowed-users=''"),
+                ("SLACK_HOME_CHANNEL=C1\n", "--slack-home-channel=C2", "SLACK_HOME_CHANNEL", "--slack-home-channel=C2"),
+                ("SLACK_HOME_CHANNEL_NAME=\\#a\n", "'--slack-home-channel-name=#b'", "SLACK_HOME_CHANNEL_NAME", "--slack-home-channel-name=\\#b"),
+                ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
+                ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path, proc, out = self._check(tmp, content, flags)
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(f"{shown} disagrees with the install configuration", out)
+                    self.assertIn(f"{path} records {key}=", out)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_the_menu_is_offered_only_for_keys_it_saves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, slack_users = self._check(tmp, "SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=U2")
+            _, _, chat_users = self._check(tmp, "ALLOWED_USERS=a\n", "--google-chat-allowed-users=b")
+        self.assertNotIn("--menu", slack_users)
+        self.assertIn("or change it with './install.sh --menu'", chat_users)
+
+    def test_the_menu_keys_are_the_ones_run_menu_system_saves(self):
+        text = _INSTALL_SH.read_text()
+        menu = text[text.index("\nrun_menu_system() {"):text.index("\nrequire_slack_tokens_after_recovery() {")]
+        listed = re.search(r'^readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="([^"]+)"$', text, re.MULTILINE).group(1).split()
+        self.assertTrue(listed)
+        for key in listed:
+            with self.subTest(key=key):
+                self.assertIn(f"save_env_var {key} ", menu)
+        for key in ("SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_BOT_TOKEN"):
+            with self.subTest(not_saved=key):
+                self.assertNotIn(f"save_env_var {key} ", menu)
+                self.assertNotIn(key, listed)
+
+    def test_every_disagreement_is_named_before_the_run_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(
+                tmp,
+                "SLACK_ENABLED=false\nGOOGLE_CHAT_ENABLED=false\nSLACK_ALLOWED_USERS=U1\n",
+                "--enable-slack --enable-google-chat --slack-allowed-users=U2",
+            )
+        self.assertIn("rc=1", proc.stdout, out)
+        for key in ("SLACK_ENABLED=false", "GOOGLE_CHAT_ENABLED=false", "SLACK_ALLOWED_USERS=U1"):
+            self.assertIn(f"records {key}", out)
+
+    def test_a_token_that_disagrees_is_refused_without_printing_either_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(
+                tmp, "SLACK_BOT_TOKEN=xoxb-recorded\n", "--slack-bot-token=xoxb-typed",
+            )
+        self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+        self.assertIn(f"--slack-bot-token gives a different SLACK_BOT_TOKEN from the one {path} records", out)
+        self.assertNotIn("xoxb-recorded", out)
+        self.assertNotIn("xoxb-typed", out)
+
+    # ── agreement ───────────────────────────────────────────────────────────
+
+    def test_a_flag_that_agrees_with_the_file_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags in (
+                ("SLACK_ENABLED=true\n", "--enable-slack"),
+                ("SLACK_ENABLED=True\n", "--enable-slack=true"),
+                ("export SLACK_ENABLED=yes\n", "--enable-slack"),
+                ("SLACK_ENABLED=false\n", "--enable-slack=false"),
+                ("SLACK_ENABLED=\n", "--enable-slack=false"),
+                ("GOOGLE_CHAT_ENABLED=true\n", "--enable-google-chat"),
+                ("GOOGLE_CHAT_ENABLED=false\n", "--google-chat=false"),
+                ("SLACK_ALLOWED_USERS='U1,U2'\n", "--slack-allowed-users=U1,U2"),
+                ("SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts\n", "'--slack-home-channel-name=#gke alerts'"),
+                ("SLACK_BOT_TOKEN=xoxb-1\n", "--slack-bot-token=xoxb-1"),
+                # An empty recorded token is recovered from the Secret, as a
+                # missing one is, so it is nothing to disagree with.
+                ("SLACK_APP_TOKEN=\n", "--slack-app-token=xapp-1"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args {flags}; {self._CHECK}; record_flags_into_install_env", path)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_no_chat_flag_checks_nothing(self):
+        # A re-run that types no chat flag reads the file, as before.
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(tmp, "SLACK_ENABLED=false\n", "-y")
+        self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
+    def test_a_first_install_takes_every_flag(self):
+        # No install.env yet: bootstrap_install_env_file records what the run
+        # applies, so there is nothing to check and nothing to queue.
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = pathlib.Path(tmp) / "absent.install.env"
+            proc = self._run(
+                f'INSTALL_ENV_FILE="{absent}"; parse_args --enable-slack --slack-allowed-users=U1; {self._CHECK}',
+                self._file(tmp, ""),
+            )
+            self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+            self.assertFalse(absent.exists())
+
+    # ── recording a key the file lacks ──────────────────────────────────────
+
+    def test_a_missing_toggle_is_recorded_with_the_value_the_run_applies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, key, applied in (
+                ("PROJECT_ID=p\n# SLACK_ENABLED=false\n", "-y --enable-slack", "SLACK_ENABLED", "true"),
+                ("PROJECT_ID=p", "--enable-slack", "SLACK_ENABLED", "true"),  # no trailing newline
+                ("PROJECT_ID=p\n", "--enable-google-chat", "GOOGLE_CHAT_ENABLED", "true"),
+                ("PROJECT_ID=p\n", "--enable-slack=false", "SLACK_ENABLED", "false"),
+                # An interactive run that typed --enable-slack and then chose
+                # "None" at the chat menu applies false, and false is recorded.
+                ("PROJECT_ID=p\n", "--enable-slack", "SLACK_ENABLED", "false"),
+            ):
+                with self.subTest(content=content, flags=flags, applied=applied):
+                    path = self._file(tmp, content)
+                    checked = self._run(f"parse_args {flags}; {self._CHECK}", path)
+                    self.assertIn(f"rc=0 QUEUED=[{key}]", checked.stdout, checked.stdout + checked.stderr)
+                    self.assertEqual(path.read_text(), content, "the check alone writes nothing")
+                    # main exports what the run applies before either record site.
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {key}={applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn(f"Recorded {key}={applied} in {path}, which assigned no {key}", out)
+                    expected = content if content.endswith("\n") else content + "\n"
+                    self.assertEqual(path.read_text(), expected + f"{key}={applied}\n")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                    param = "PARAM_ENABLE_SLACK" if key == "SLACK_ENABLED" else "PARAM_ENABLE_GOOGLE_CHAT"
+                    again = self._run(f'echo "SEED=[${param}]"', path)
+                    self.assertIn(f"SEED=[{applied}]", again.stdout, again.stderr)
+
+    def test_a_missing_chat_string_is_recorded_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag, key, value in (
+                ("--slack-allowed-users", "SLACK_ALLOWED_USERS", "U1,U2"),
+                ("--slack-home-channel", "SLACK_HOME_CHANNEL", "C0123"),
+                ("--slack-home-channel-name", "SLACK_HOME_CHANNEL_NAME", "#gke alerts"),
+                ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
+                ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
+            ):
+                with self.subTest(key=key):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    quoted = shlex.quote(f"{flag}={value}")
+                    # Checked again in the same shell after the record: the
+                    # recorded-value cache must not still say the key is absent.
+                    proc = self._run(
+                        f"parse_args {quoted}; {self._CHECK}; export {key}={shlex.quote(value)}; record_flags_into_install_env; "
+                        f"{self._CHECK}",
+                        path,
+                    )
+                    self.assertIn(f"rc=0 QUEUED=[{key}]", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+                    again = self._run(f'printf "V=[%s]\\n" "${key}"', path)
+                    self.assertIn(f"V=[{value}]", again.stdout, again.stderr)
+                    # And a re-run repeating the flag now agrees.
+                    rerun = self._run(f"parse_args {quoted}; {self._CHECK}", path)
+                    self.assertIn("rc=0 QUEUED=[]", rerun.stdout, rerun.stdout + rerun.stderr)
+
+    def test_a_token_the_file_lacks_is_never_recorded(self):
+        # The live Secret is the token's home; write_tfvars_from_state
+        # recovers it on every later run. With PERSIST_SECRETS_ON_DISK=false
+        # nothing may write it to a file, and with it true there is no need.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("PROJECT_ID=p\n", "PROJECT_ID=p\nPERSIST_SECRETS_ON_DISK=false\n"):
+                with self.subTest(content=content):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        "parse_args --enable-slack=true --slack-bot-token=xoxb-typed --slack-app-token=xapp-typed; "
+                        f"{self._CHECK}; export SLACK_ENABLED=true SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed; "
+                        "record_flags_into_install_env",
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, out)
+                    self.assertEqual(path.read_text(), content + "SLACK_ENABLED=true\n")
+                    self.assertNotIn("xoxb-typed", path.read_text())
+                    self.assertNotIn("xapp-typed", out)
+
+    def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(tmp, "PROJECT_ID=p\n", "--dry-run --enable-slack")
+            self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, out)
+            self.assertIn("a run without --dry-run records the SLACK_ENABLED it applies there, from --enable-slack", out)
+            self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    def test_the_menu_refuses_a_chat_flag_it_would_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag in ("--enable-slack", "--enable-google-chat=false", "--slack-allowed-users=U1"):
+                with self.subTest(flag=flag):
+                    proc = self._run(
+                        f'run_menu_system() {{ echo "MENU RAN"; }}; print_banner() {{ :; }}; main --menu {flag}',
+                        self._file(tmp, "SLACK_ENABLED=false\n"),
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertNotIn("MENU RAN", out)
+                    self.assertIn("--menu takes no chat flag", out)
+                    self.assertNotEqual(proc.returncode, 0)
+
+    # ── where main checks and records ───────────────────────────────────────
+
+    # main's step-11 confirmation, run as it stands with the prompt and the
+    # container preflight stubbed, then the record.
+    _CONFIRM_START = '  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then\n    local confirm_choice=""\n'
+    _CONFIRM_END = "\n    esac\n  fi\n"
+    _RECORD_HANDOFF = "\n    record_flags_into_install_env\n"
+    _RECORD_APPLY = "\n  record_flags_into_install_env\n"
+
+    def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CONFIRM_START, main_start)
+        block = text[start:text.index(self._CONFIRM_END, start) + len(self._CONFIRM_END)]
+        self.assertIn("Provisioning paused by user", block)
+        self.assertLess(len(block.splitlines()), 40, block)
+        stubs = (
+            'prompt_read() { printf -v "$2" "%s" "$ANSWER"; }\n'
+            'check_scope_container_access() { [ "${1:-}" = "warn" ] || return "${SCOPE_RC:-0}"; }\n'
+            "write_json_report() { :; }\n"
+            f"_confirm() {{\n{block}  record_flags_into_install_env\n}}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, answer, scope_rc, records in (
+                ("--enable-slack", "n", 0, False),  # declined at the prompt
+                ("--enable-slack", "y", 1, False),  # refused after the confirmation
+                ("--enable-slack", "y", 0, True),
+                ("--enable-slack", "g", 0, True),
+                ("--enable-slack -y", "", 1, True),  # -y is refused above the summary, not here
+                ("--enable-slack --generate-only", "", 0, True),
+            ):
+                with self.subTest(flags=flags, answer=answer, scope_rc=scope_rc):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"{stubs}parse_args {flags}; check_flags_against_install_env || exit 1\n"
+                        "export SLACK_ENABLED=true\n"
+                        f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
+                        path,
+                    )
+                    if records:
+                        self.assertIn("went on", proc.stdout, proc.stderr)
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\nSLACK_ENABLED=true\n")
+                    else:
+                        self.assertNotIn("went on", proc.stdout, proc.stderr)
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    def test_main_checks_before_the_interview_and_records_last_on_each_route(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        check = text.index("\n  check_flags_against_install_env || exit 1\n", main_start)
+        # After the helpers that define is_truthy and the defaults, before the
+        # first interview step and the chat step.
+        self.assertLess(text.index("\n  resolve_shared_defaults\n", main_start), check)
+        self.assertLess(check, text.index('print_step "3. Verifying Google Cloud Authentication"', main_start))
+        self.assertLess(check, text.index('print_step "6. Chat & Messaging Integrations Setup"', main_start))
+        self.assertEqual(text.count(self._RECORD_HANDOFF), 1)
+        self.assertEqual(text.count(self._RECORD_APPLY), 1)
+        handoff = text.index(self._RECORD_HANDOFF, main_start)
+        apply_ = text.index(self._RECORD_APPLY, main_start)
+        exported = text.index('export SLACK_ENABLED="$slack_enabled"', main_start)
+        for gate in (
+            'export GOOGLE_CHAT_ENABLED="$google_chat_enabled"',
+            "require_slack_tokens_after_recovery\n",
+            "check_service_account_ownership || exit 1",
+            'write_json_report "DRY_RUN_SUCCESS"',
+            'write_json_report "PAUSED"',
+            "check_scope_container_access || exit 1",
+            'check_github_org_is_organization "${GITOPS_ORG:-}"',
+        ):
+            for record in (handoff, apply_):
+                with self.subTest(gate=gate, record=record):
+                    self.assertLess(text.index(gate, main_start), record)
+        self.assertLess(exported, handoff)
+        self.assertTrue(
+            text[handoff + len(self._RECORD_HANDOFF):].startswith('    print_generate_only_handoff "$repo_dir"'),
+            text[handoff:handoff + 200],
+        )
+        step_12 = text.index('print_step "12. Applying the Install', main_start)
+        for gate in (
+            'import_github_pem "$project_id" "$region" || exit 1',
+            'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
+            'apply_crd_upgrades "$repo_dir"',
+        ):
+            with self.subTest(apply_gate=gate):
+                self.assertLess(step_12, text.index(gate, step_12))
+                self.assertLess(text.index(gate, step_12), apply_)
+        self.assertTrue(
+            text[apply_ + len(self._RECORD_APPLY):].startswith('  run_lifecycle_apply "$repo_dir" "$provisioning_log"'),
+            text[apply_:apply_ + 200],
+        )
+
+    def test_the_no_chat_banner_names_the_keys_not_only_the_flags(self):
+        # The file a first install writes records both toggles as false, so
+        # the flags alone would be refused on the next run.
+        text = _INSTALL_SH.read_text()
+        body = text[text.index("_prompt_no_chat_enabled() {"):]
+        body = body[:body.index("\n  }\n")]
+        self.assertIn("GOOGLE_CHAT_ENABLED=true", body)
+        self.assertIn("SLACK_ENABLED=true", body)
+        self.assertIn("./install.sh --menu", body)
+
+    # ── what upgrade.sh renders afterwards ──────────────────────────────────
+
+    def _upgrade_render(self, install_env, extra_env=None):
+        """upgrade.sh's half: load_install_env, then write_tfvars_from_state,
+        through test_installer_common's hermetic harness, with a live Secret
+        holding both Slack tokens on this install's own kube context."""
+        bot_b64 = base64.b64encode(b"xoxb-live").decode()
+        app_b64 = base64.b64encode(b"xapp-live").decode()
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        dest = install_env.parent / "terraform.tfvars"
+        env = {"API_SERVER_KEY": "k", "SLACK_ENABLED": "", "SLACK_BOT_TOKEN": "", "SLACK_APP_TOKEN": "",
+               "PERSIST_SECRETS_ON_DISK": ""}
+        env.update(extra_env or {})
+        proc = _installer_common_tests.InstallerCommonTest._run(
+            self,
+            f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; '
+            'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
+            env=env,
+            kubectl_script=kubectl_stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+        return dest.read_text(), proc.stdout
+
+    _COORDINATES = "PROJECT_ID=test-project\nCLUSTER_NAME=test-cluster\nREGION=us-central1\n"
+
+    def test_upgrade_keeps_slack_on_after_a_recorded_enable_slack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES)
+            before, _ = self._upgrade_render(path)
+            # The bug, at the render: a file that does not record Slack renders it off.
+            self.assertIn("enable_slack            = false", before)
+            proc = self._run(
+                f"parse_args -y --enable-slack; {self._CHECK}; export SLACK_ENABLED=true; record_flags_into_install_env",
+                path,
+            )
+            self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, proc.stdout + proc.stderr)
+            after, _ = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", after)
+            # The tokens were never written to the file; the generator recovers
+            # them from the live Secret.
+            self.assertNotIn("xoxb-live", path.read_text())
+            self.assertIn('slack_bot_token         = "xoxb-live"', after)
+            self.assertIn('slack_app_token         = "xapp-live"', after)
+
+    def test_upgrade_recovers_the_slack_tokens_from_the_live_secret(self):
+        """Already true on main, and pinned here because #2541 doubted it.
+
+        install.env records Slack on and carries no token (the --enable-slack
+        run never wrote one, and PERSIST_SECRETS_ON_DISK=true still writes
+        tokens only on a first install). write_tfvars_from_state's recovery
+        loop, the one that recovers API_SERVER_KEY and SESSION_KV_*, lists
+        SLACK_BOT_TOKEN and SLACK_APP_TOKEN too.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\n")
+            tfvars, stdout = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", tfvars)
+            self.assertIn('slack_bot_token         = "xoxb-live"', tfvars)
+            self.assertIn('slack_app_token         = "xapp-live"', tfvars)
+            self.assertIn("TFVAR_BOT=[xoxb-live]", stdout)
+
+    def test_with_persist_secrets_off_the_recovered_tokens_stay_off_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "PERSIST_SECRETS_ON_DISK=false\nSLACK_ENABLED=true\n")
+            tfvars, stdout = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", tfvars)
+            self.assertNotIn("xoxb-live", tfvars)
+            self.assertNotIn("xapp-live", tfvars)
+            self.assertNotIn("slack_bot_token", tfvars)
+            self.assertIn("TFVAR_BOT=[xoxb-live]", stdout)
+            self.assertNotIn("xoxb-live", path.read_text())
 
 
 class TfvarsTempFileIsCleanedUpTest(unittest.TestCase):

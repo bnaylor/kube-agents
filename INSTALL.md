@@ -557,8 +557,13 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
 - `kubectl port-forward` is not an alternative here: the agent runs sandboxed under gVisor by
   default and the forward cannot see into the sandbox. `kubectl exec` enters it.
 
-To add a chat platform later, re-run the installer with `--enable-google-chat` or `--enable-slack`
-and follow Step 5.
+To add a chat platform later, set `GOOGLE_CHAT_ENABLED=true` or `SLACK_ENABLED=true` in
+`install.env`, re-run `./install.sh` (or use `./install.sh --menu`), and follow Step 5. The
+`install.env` a first install writes records both as `false`, and `install.sh` refuses
+`--enable-google-chat` or `--enable-slack` over a file that records the key the other way, because
+`upgrade.sh` renders the chat integrations from the file and would undo a one-run flag; the flag
+is recorded only into a file that sets no such key
+([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
 
 ---
 
