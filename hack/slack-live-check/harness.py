@@ -62,6 +62,7 @@ LIST_PAGE_LIMIT = 200
 LIST_MAX_PAGES = 25
 HISTORY_PAGE_LIMIT = 100
 EVIDENCE_TEXT_LIMIT = 160
+RUN_ID_HEX_CHARS = 8
 ERROR_BODY_LIMIT = 200
 
 # a2a/gateway/slack.go, slackTurnSubtypes: the subtypes inbound() takes as a user turn.
@@ -134,9 +135,9 @@ class Redactor:
     def __init__(self) -> None:
         self._values: set[str] = set()
 
-    def add(self, value: str) -> None:
-        if value:
-            self._values.add(value)
+    def add(self, secret_payload: str) -> None:
+        if secret_payload:
+            self._values.add(secret_payload)
 
     def redact(self, text: str) -> str:
         # Longest first, so a value that contains another is cut whole.
@@ -216,9 +217,9 @@ class SecretManagerReader:
         if status != HTTP_OK:
             raise HarnessError(f"Secret Manager refused {self.project}/{name} (HTTP {status}): {_error_detail(body)}")
         data = json.loads(body).get("payload", {}).get("data", "")
-        value = base64.b64decode(data).decode("utf-8").strip()
-        REDACTOR.add(value)
-        return value
+        secret_payload = base64.b64decode(data).decode("utf-8").strip()
+        REDACTOR.add(secret_payload)
+        return secret_payload
 
 
 class FileReader:
@@ -227,24 +228,24 @@ class FileReader:
     def read(self, name: str) -> str:
         try:
             with open(name, encoding="utf-8") as handle:
-                value = handle.read().strip()
+                secret_payload = handle.read().strip()
         except OSError as exc:
             raise HarnessError(f"cannot read the token file {name}: {exc.strerror}") from None
-        REDACTOR.add(value)
-        return value
+        REDACTOR.add(secret_payload)
+        return secret_payload
 
 
 def load_user_token(reader, name: str, label: str) -> str:
     """Reads one user token and refuses anything that is not a Slack user token."""
-    value = reader.read(name)
-    if not value:
+    user_oauth_token = reader.read(name)
+    if not user_oauth_token:
         raise HarnessError(f"the {label} token source {name} is empty")
     for prefix, kind in NON_USER_TOKEN_KINDS.items():
-        if value.startswith(prefix):
+        if user_oauth_token.startswith(prefix):
             raise HarnessError(f"the {label} token source {name} holds {kind}, not a user token (xoxp-)")
-    if not value.startswith(USER_TOKEN_PREFIXES):
+    if not user_oauth_token.startswith(USER_TOKEN_PREFIXES):
         raise HarnessError(f"the {label} token source {name} does not hold a Slack user token (xoxp-)")
-    return value
+    return user_oauth_token
 
 
 class SlackClient:
@@ -425,7 +426,7 @@ def judge_listed_reply(session: Session, name: str, channel: str, sent_ts: str, 
             return CheckResult(name, False, f"the bot posted but no answer arrived within {timeout}s (--wait-answer)", evidence)
         return CheckResult(name, False, f"no reply from the bot within {timeout}s", evidence)
     if kind == KIND_REFUSAL:
-        return CheckResult(name, False, "the listed user got the refusal notice; is the member on allowedUsers (and in the principal map, before #2547)?", evidence)
+        return CheckResult(name, False, "the listed user got the refusal notice; is the member on allowedUsers, and in the a2a-slack-principal-map Secret where the gateway requires it?", evidence)
     if kind == KIND_FAILURE:
         return CheckResult(name, False, "the task the turn started failed", evidence)
     if expect_thread and reply.get("thread_ts") != expect_thread:
@@ -464,6 +465,17 @@ def check_thread(session: Session) -> CheckResult:
     if not root:
         return CheckResult(CHECK_THREAD, False, "no thread to reply in: the mention check did not pass in this run and --thread-ts is unset",
                            {"channel": session.channel_id})
+    # Let the task the mention started finish first. Its answer would otherwise
+    # land after the follow-up and read as the follow-up's reply, and a reply
+    # sent while it runs is a steer, not a turn.
+    settled, settled_kind, last = wait_for_bot(session, lambda: replies_after(session.listed, session.channel_id, root, root),
+                                               True, session.args.reply_timeout)
+    if settled is None:
+        evidence = {"channel": session.channel_id, "thread_ts": root}
+        if last is not None:
+            evidence["last_bot_text"] = truncate(last.get("text", ""))
+        return CheckResult(CHECK_THREAD, False, f"the thread's first task did not settle within {session.args.reply_timeout}s, "
+                           "so a reply now would be a steer", evidence)
     text = f"{session.args.followup} {session.tag(CHECK_THREAD)}"
     sent = session.listed.call("chat.postMessage", channel=session.channel_id, thread_ts=root, text=text)
     sent_ts = sent["ts"]
@@ -471,6 +483,10 @@ def check_thread(session: Session) -> CheckResult:
                                      session.args.wait_answer, session.args.reply_timeout)
     result = judge_listed_reply(session, CHECK_THREAD, session.channel_id, sent_ts, reply, kind, last, expect_thread=root)
     result.evidence["thread_ts"] = root
+    result.evidence["settled_kind"] = settled_kind
+    if result.passed and kind == KIND_STEER:
+        result.passed = False
+        result.detail = "the follow-up was taken as a steer of a task still running, not as a new turn"
     return result
 
 
@@ -518,6 +534,10 @@ def check_unlisted(session: Session) -> list[CheckResult]:
 def check_unlisted_repeat(session: Session, client: SlackClient, channel: str, thread_ts: str) -> CheckResult:
     """A second message from the unlisted user draws nothing: the notice is once per sender."""
     text = f"{session.args.prompt} {session.tag(CHECK_UNLISTED_REPEAT)}"
+    if session.args.unlisted_via == UNLISTED_VIA_MENTION:
+        # Unmentioned, a reply in a thread the gateway never started a task in is
+        # not a turn at all, and would pass here without reaching verifySender.
+        text = f"<@{session.bot_user_id}> {text}"
     if thread_ts:
         sent_ts = client.call("chat.postMessage", channel=channel, thread_ts=thread_ts, text=text)["ts"]
 
@@ -664,7 +684,8 @@ def parse_checks(value: str) -> list[str]:
 
 
 def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).")
+    parser = argparse.ArgumentParser(description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).",
+                                     allow_abbrev=False)
     parser.add_argument("--checks", type=parse_checks, default=list(CHECKS_ALL),
                         help=f"comma list from {', '.join(CHECK_ORDER)}; '{CHECKS_ALL_ALIAS}' is {','.join(CHECKS_ALL)}")
     parser.add_argument("--keep-going", action="store_true", help="run every check after a FAIL")
@@ -700,9 +721,23 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     return args
 
 
+def time_budget(args: argparse.Namespace) -> float:
+    """The longest the selected checks can wait on Slack, for the Job's deadline."""
+    per_check = {
+        CHECK_DM: args.reply_timeout,
+        CHECK_MENTION: args.reply_timeout,
+        # The mention's task settling, then the reply to the follow-up.
+        CHECK_THREAD: 2 * args.reply_timeout,
+        CHECK_UNLISTED: args.reply_timeout + (args.quiet_window if args.unlisted_repeat else 0),
+        CHECK_RESTART: args.reply_timeout,
+        CHECK_HOME: args.home_timeout,
+    }
+    return sum(per_check[check] for check in args.checks)
+
+
 def run(args: argparse.Namespace, transport, clock, sleep, wall) -> int:
     started = wall()
-    run_id = args.run_id or uuid.uuid4().hex[:8]
+    run_id = args.run_id or uuid.uuid4().hex[:RUN_ID_HEX_CHARS]
     if args.token_source == TOKEN_SOURCE_FILE:
         reader = FileReader()
     else:

@@ -66,6 +66,12 @@ class FakeWorld:
         self.user_posts_carry_bot_id = False
         self.user_post_subtype = ""
         self.user_posts_without_user = False
+        # A task answer that lands this many reads later, with a fresh ts, the way a real
+        # answer arrives after the user has moved on.
+        self.answer_after_reads = 0
+        self.deferred = []
+        self.ignore_unmentioned_thread_replies = False
+        self.steer_thread_replies = False
         self.slack_error_override = {}
         self.secret_error_body = None
         self.reply_delay_reads = 0
@@ -102,7 +108,8 @@ class FakeWorld:
         if self.is_dm_with_bot(channel):
             reply_thread = ""
         elif thread_ts and thread_ts != msg["ts"]:
-            if f"<@{BOT_ID}>" not in text and (channel, thread_ts) not in self.session_threads:
+            if f"<@{BOT_ID}>" not in text and (
+                    (channel, thread_ts) not in self.session_threads or self.ignore_unmentioned_thread_replies):
                 return
             reply_thread = thread_ts
         elif f"<@{BOT_ID}>" in text:
@@ -117,6 +124,9 @@ class FakeWorld:
                 self.notified.add(poster)
                 self.bot_post(channel, REFUSAL.format(id=poster), reply_thread)
             return
+        if self.steer_thread_replies and thread_ts and thread_ts != msg["ts"]:
+            self.bot_post(channel, "✏️ steering sent — the worker picks it up at its next turn boundary", reply_thread)
+            return
         if reply_thread:
             self.session_threads.add((channel, reply_thread))
         self.bot_post(channel, "⏳ submitted…", reply_thread)
@@ -125,7 +135,16 @@ class FakeWorld:
         if self.mode == "fail":
             self.bot_post(channel, "❌ failed: the executor is down", reply_thread)
             return
+        if self.answer_after_reads:
+            self.deferred.append((self.reads + self.answer_after_reads, channel, "PONG", reply_thread))
+            return
         self.bot_post(channel, "PONG", reply_thread)
+
+    def materialize(self):
+        due = [d for d in self.deferred if d[0] <= self.reads]
+        self.deferred = [d for d in self.deferred if d[0] > self.reads]
+        for _, channel, text, thread in due:
+            self.bot_post(channel, text, thread)
 
     def visible(self, msgs):
         return [{k: v for k, v in m.items() if k != "visible_at"} for m in msgs if m.get("visible_at", 0) <= self.reads]
@@ -167,6 +186,7 @@ class FakeWorld:
             return {"ok": True, "channel": channel, "ts": msg["ts"]}
         if method == "conversations.history":
             self.reads += 1
+            self.materialize()
             msgs = [m for m in self.channels[params["channel"]] if not m.get("thread_ts") or m["thread_ts"] == m["ts"]]
             if "latest" in params:
                 msgs = [m for m in msgs if m["ts"] == params["latest"]]
@@ -175,6 +195,7 @@ class FakeWorld:
             return {"ok": True, "messages": list(reversed(self.visible(msgs)))}
         if method == "conversations.replies":
             self.reads += 1
+            self.materialize()
             root = params["ts"]
             msgs = [m for m in self.channels[params["channel"]] if m["ts"] == root or m.get("thread_ts") == root]
             return {"ok": True, "messages": self.visible(msgs)}
@@ -423,6 +444,37 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL thread", text)
 
+    def test_thread_is_not_fooled_by_the_mention_answer_landing_late(self):
+        # The mention passes on its status line; its answer arrives later. A gateway
+        # that drops the unmentioned follow-up must fail the thread check, not pass it
+        # on the mention's late answer.
+        self.world.answer_after_reads = 3
+        self.world.ignore_unmentioned_thread_replies = True
+        code, text = self.run_harness("--checks", "mention,thread", "--keep-going")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("PASS mention", text)
+        self.assertIn("no reply from the bot", self.line(text, "FAIL thread"))
+
+    def test_thread_waits_for_the_mention_task_to_settle(self):
+        self.world.answer_after_reads = 3
+        code, text = self.run_harness("--checks", "mention,thread")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        thread = self.evidence(text, "thread")
+        self.assertEqual(thread["settled_kind"], harness.KIND_ANSWER)
+        self.assertGreater(harness.ts_value(thread["reply_ts"]), harness.ts_value(thread["sent_ts"]))
+
+    def test_thread_fails_when_the_follow_up_is_taken_as_a_steer(self):
+        self.world.steer_thread_replies = True
+        code, text = self.run_harness("--checks", "mention,thread")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("taken as a steer", self.line(text, "FAIL thread"))
+
+    def test_thread_fails_when_the_first_task_never_settles(self):
+        self.world.mode = "status-only"
+        code, text = self.run_harness("--checks", "mention,thread", "--keep-going")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("did not settle", self.line(text, "FAIL thread"))
+
     def test_restart_is_a_dm_under_its_own_name(self):
         code, text = self.run_harness("--checks", "restart")
         self.assertEqual(code, harness.EXIT_OK, text)
@@ -467,6 +519,19 @@ class UnlistedTest(HarnessTestCase):
 
         world.gateway_turn = forgetful
         code, text = self.run_harness("--checks", "unlisted", "--unlisted-repeat")
+        self.assertEqual(code, harness.EXIT_FAIL)
+        self.assertIn("FAIL unlisted-repeat", text)
+
+    def test_unlisted_repeat_by_mention_reaches_the_gateway(self):
+        world = self.world
+        original = world.gateway_turn
+
+        def forgetful(channel, poster, msg):
+            world.notified.discard(poster)
+            original(channel, poster, msg)
+
+        world.gateway_turn = forgetful
+        code, text = self.run_harness("--checks", "unlisted", "--unlisted-via", "mention", "--unlisted-repeat")
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL unlisted-repeat", text)
 
@@ -608,6 +673,14 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(harness.parse_checks("all"), list(harness.CHECKS_ALL))
         with self.assertRaises(Exception):
             harness.parse_checks("nope")
+
+    def test_abbreviated_flags_are_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            harness.parse_args(["--check", "home"])
+
+    def test_time_budget_covers_every_wait(self):
+        args = harness.parse_args(["--checks", "all,home", "--home-channel", "c", "--unlisted-repeat"])
+        self.assertEqual(harness.time_budget(args), 180 + 180 + 360 + 180 + 30 + 300)
 
     def test_home_needs_a_channel(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

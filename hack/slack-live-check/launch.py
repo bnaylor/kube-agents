@@ -50,7 +50,14 @@ APP_LABEL_KEY = "app.kubernetes.io/name"
 APP_LABEL_VALUE = "slack-live-check"
 RUN_LABEL_KEY = "slack-live-check/run"
 JOB_NAME_PREFIX = "slack-live-check-"
-DEFAULT_JOB_TIMEOUT_SECONDS = 900
+# The Job's deadline is the harness's own worst-case wait (harness.time_budget) plus
+# this, for reading the tokens, resolving the bot and channel, and the preflights.
+JOB_SETUP_ALLOWANCE_SECONDS = 180
+STDERR_TAIL_CHARS = 500
+RUN_ID_TIME_FORMAT = "%Y%m%d%H%M%S"
+RUN_ID_HEX_CHARS = 4
+# The container name in manifests/job.yaml.template.
+HARNESS_CONTAINER = "harness"
 JOB_TTL_SECONDS = 600
 JOB_POLL_INTERVAL_SECONDS = 5
 JOB_WAIT_GRACE_SECONDS = 60
@@ -119,7 +126,7 @@ class Kubectl:
         cmd = ["kubectl", "--context", self.context, *args]
         proc = self.runner(cmd, input=stdin, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
-            raise LaunchError(f"{' '.join(cmd[:6])}... exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
+            raise LaunchError(f"{' '.join(cmd[:6])}... exited {proc.returncode}: {proc.stderr.strip()[-STDERR_TAIL_CHARS:]}")
         return proc.stdout
 
     def get_json(self, args: list[str]) -> dict:
@@ -212,6 +219,12 @@ def job_manifests(namespace: str, service_account: str, image: str, run_id: str,
     return job_name, json.dumps(configmap), job
 
 
+def job_deadline(harness_args: list[str], floor: int) -> int:
+    """activeDeadlineSeconds: the harness's worst-case wait for these arguments plus setup, or floor if larger."""
+    budget = harness.time_budget(harness.parse_args(harness_args)) + JOB_SETUP_ALLOWANCE_SECONDS
+    return max(int(budget), floor)
+
+
 def parse_harness_output(text: str) -> tuple[list[tuple[str, bool, str]], list[dict]]:
     """The harness's PASS/FAIL lines as (name, passed, line), and its EVIDENCE objects."""
     results = []
@@ -300,7 +313,7 @@ class Launcher:
     # --- the Job ------------------------------------------------------------
 
     def harness_args(self, checks: list[str]) -> tuple[str, list[str]]:
-        run_id = time.strftime("%Y%m%d%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:4]
+        run_id = time.strftime(RUN_ID_TIME_FORMAT, time.gmtime()) + "-" + uuid.uuid4().hex[:RUN_ID_HEX_CHARS]
         args = [CHECKS_FLAG, ",".join(checks), RUN_ID_FLAG, run_id, PROJECT_FLAG, self.args.project]
         if self.args.keep_going:
             args.append(KEEP_GOING_FLAG)
@@ -317,18 +330,19 @@ class Launcher:
         self.ensure_namespace()
         run_id, hargs = self.harness_args(checks)
         image = self.args.image or discover_image(self.kubectl, self.args.agent_namespace, self.agent)
+        deadline = job_deadline(hargs, self.args.job_timeout)
         job_name, configmap, job = job_manifests(self.args.namespace, self.args.service_account, image, run_id, hargs,
-                                                 self.args.job_timeout)
+                                                 deadline)
         ns = self.args.namespace
         say(f"JOB {job_name} in {ns}: checks={','.join(checks)} image={image}")
         started = self.clock()
         try:
             self.kubectl.run(["apply", "-f", "-"], stdin=configmap)
             self.kubectl.run(["apply", "-f", "-"], stdin=job)
-            state = self.wait_job(job_name)
+            state = self.wait_job(job_name, deadline)
             logs = ""
             try:
-                logs = self.kubectl.run(["logs", "-n", ns, f"job/{job_name}", "-c", "harness", "--tail=-1"])
+                logs = self.kubectl.run(["logs", "-n", ns, f"job/{job_name}", "-c", HARNESS_CONTAINER, "--tail=-1"])
             except LaunchError as exc:
                 say(f"JOB {job_name}: no pod log ({exc})")
             for line in logs.splitlines():
@@ -347,8 +361,8 @@ class Launcher:
                 except LaunchError as exc:
                     say(f"CLEANUP {kind}/{job_name} not deleted: {exc}")
 
-    def wait_job(self, job_name: str) -> str:
-        deadline = self.clock() + self.args.job_timeout + JOB_WAIT_GRACE_SECONDS
+    def wait_job(self, job_name: str, deadline_seconds: int) -> str:
+        deadline = self.clock() + deadline_seconds + JOB_WAIT_GRACE_SECONDS
         while True:
             job = self.kubectl.get_json(["get", "job", job_name, "-n", self.args.namespace])
             for cond in job.get("status", {}).get("conditions", []) or []:
@@ -396,13 +410,16 @@ class Launcher:
             say(f"RESTART running: {' '.join(cmd)}")
             proc = self.runner(cmd, capture_output=True, text=True, check=False)
             if proc.returncode != 0:
-                return self.record("restart-cmd", False, f"exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
+                return self.record("restart-cmd", False, f"exited {proc.returncode}: {proc.stderr.strip()[-STDERR_TAIL_CHARS:]}")
         self.kubectl.run(["rollout", "status", f"deployment/{self.agent}{GATEWAY_SUFFIX}", "-n", ns,
                           f"--timeout={ROLLOUT_TIMEOUT_SECONDS}s"])
         gateway = self.deployment(GATEWAY_SUFFIX)
 
         def connected():
-            since = int(self.clock() - started) + LOG_SINCE_MARGIN_SECONDS
+            # After a restart this run made, only lines since it count. Under
+            # --after-restart the restart's time is unknown; the rollout has
+            # finished, so the current pods' whole logs are the new pods'.
+            since = 0 if self.args.after_restart else int(self.clock() - started) + LOG_SINCE_MARGIN_SECONDS
             logs = pod_logs(self.kubectl, ns, selector_of(gateway), GATEWAY_CONTAINER, since)
             return True if any(_json_msg(line) == GATEWAY_SLACK_CONNECTED_MSG for line in logs.splitlines()) else None
 
@@ -494,6 +511,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         split = argv.index("--")
         argv, forwarded = argv[:split], argv[split + 1:]
     parser = argparse.ArgumentParser(description="Run the Slack live check as a Job (hack/slack-live-check/README.md).",
+                                     allow_abbrev=False,
                                      epilog="Arguments after -- go to harness.py.")
     parser.add_argument("--context", default="", help="kubectl context, pinned on every call (required unless --render)")
     parser.add_argument(CHECKS_FLAG, type=parse_checks, default=list(harness.CHECKS_ALL),
@@ -505,7 +523,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--agent-namespace", default=DEFAULT_AGENT_NAMESPACE)
     parser.add_argument("--agent-name", default="", help="the PlatformAgent; discovered when there is one")
     parser.add_argument("--image", default="", help="the Job's image; default is the install's agent-sandbox image")
-    parser.add_argument("--job-timeout", type=int, default=DEFAULT_JOB_TIMEOUT_SECONDS, help="the Job's activeDeadlineSeconds")
+    parser.add_argument("--job-timeout", type=int, default=0,
+                        help="a floor for the Job's activeDeadlineSeconds; by default it is derived from the checks and their timeouts")
     parser.add_argument(KEEP_GOING_FLAG, action="store_true")
     restart = parser.add_mutually_exclusive_group()
     restart.add_argument("--restart-cmd", default="", help="command (no shell) the restart check runs first; pin its --context yourself")
@@ -519,6 +538,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     owned = [arg for arg in forwarded if arg.split("=", 1)[0] in LAUNCHER_OWNED_HARNESS_FLAGS]
     if owned:
         parser.error(f"{', '.join(owned)} after -- would override the launcher's own; pass the launcher flag instead")
+    pod_checks = [c for c in args.checks if c in harness.CHECK_ORDER]
+    if pod_checks:
+        # Fail here, not minutes later in the pod, on a harness flag that is wrong.
+        harness.parse_args([CHECKS_FLAG, ",".join(pod_checks), *forwarded])
     if not args.context and not args.render:
         parser.error("--context is required")
     if harness.CHECK_RESTART in args.checks and not (args.restart_cmd or args.after_restart) and not (args.cleanup or args.render):
@@ -537,12 +560,12 @@ def main(argv: Optional[list[str]] = None, runner: Callable = subprocess.run,
     binding = wi_binding_command(args.project, args.gsa, args.namespace, args.service_account)
     try:
         if args.render:
-            print(setup_manifest(args))
-            _, configmap, job = job_manifests(args.namespace, args.service_account, args.image or "<agent-sandbox image>",
-                                              "render", [CHECKS_FLAG, ",".join(c for c in args.checks if c in harness.CHECK_ORDER)] + forwarded,
-                                              args.job_timeout)
-            print("---")
-            print(job)
+            say(setup_manifest(args))
+            render_args = [CHECKS_FLAG, ",".join(c for c in args.checks if c in harness.CHECK_ORDER) or harness.CHECK_DM] + forwarded
+            _, _, job = job_manifests(args.namespace, args.service_account, args.image or "<agent-sandbox image>",
+                                      "render", render_args, job_deadline(render_args, args.job_timeout))
+            say("---")
+            say(job)
             say("# the ConfigMap carries harness.py verbatim. The Workload Identity binding the run relies on:")
             say("# " + binding)
             return EXIT_OK

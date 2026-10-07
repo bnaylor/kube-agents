@@ -272,17 +272,25 @@ class RestartTest(unittest.TestCase):
                                "--restart-cmd", f"kubectl --context {CONTEXT} -n {AGENT_NS} rollout restart deploy/x")
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertEqual(cluster.restart_runs, [["kubectl", "--context", CONTEXT, "-n", AGENT_NS, "rollout", "restart", "deploy/x"]])
+        calls = self.gateway_log_calls(cluster)
+        self.assertTrue(all(any(a.startswith("--since=") for a in c) for c in calls), calls)
         self.assertTrue(any(c[3] == "rollout" and c[4] == "status" for c in cluster.calls))
         job = yaml.safe_load(cluster.applied[2])
         args = job["spec"]["template"]["spec"]["containers"][0]["args"]
         self.assertEqual(args[args.index("--checks") + 1], "restart")
 
-    def test_after_restart_skips_the_command(self):
+    def gateway_log_calls(self, cluster):
+        return [c for c in cluster.calls if c[3] == "logs" and any("a2a-gateway" in a for a in c)]
+
+    def test_after_restart_skips_the_command_and_reads_whole_logs(self):
         cluster = FakeCluster()
         cluster.job_log = "PASS restart: answer\n"
         code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,restart", "--after-restart")
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertEqual(cluster.restart_runs, [])
+        calls = self.gateway_log_calls(cluster)
+        self.assertTrue(calls)
+        self.assertFalse(any(a.startswith("--since") for c in calls for a in c), calls)
         self.assertEqual(len(cluster.applied), 5, "the namespace once, then a ConfigMap and Job before the restart and after")
         self.assertEqual([d for d in cluster.deleted if d[0] == "namespace"], [["namespace", "slack-test"]])
 
@@ -345,6 +353,22 @@ class ModesAndArgsTest(unittest.TestCase):
         for flag in ("--checks", "--run-id=x", "--project", "--keep-going"):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 launch.parse_args(["--context", CONTEXT, "--", flag, "v"])
+
+    def test_abbreviations_cannot_slip_past_the_owned_flag_guard(self):
+        for forwarded in (["--proj", "other"], ["--check", "home"], ["--keep"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                launch.parse_args(["--context", CONTEXT, "--checks", "dm", "--", *forwarded])
+
+    def test_bad_harness_flags_fail_before_any_cluster_call(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            launch.parse_args(["--context", CONTEXT, "--checks", "home"])
+
+    def test_job_deadline_follows_the_checks(self):
+        cluster = FakeCluster()
+        run_launch(cluster, "--context", CONTEXT, "--checks", "all", "--", "--reply-timeout", "300")
+        job = yaml.safe_load(cluster.applied[2])
+        self.assertEqual(job["spec"]["activeDeadlineSeconds"], 300 * 5 + launch.JOB_SETUP_ALLOWANCE_SECONDS)
+        self.assertEqual(launch.job_deadline(["--checks", "dm"], 5000), 5000)
 
     def test_restart_needs_a_command_or_after_restart(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
