@@ -478,6 +478,7 @@ class _Door(http.server.BaseHTTPRequestHandler):
     """The agent API and the inject door, answering from the simulated state."""
 
     state_path: pathlib.Path
+    cancels_path: pathlib.Path
 
     def log_message(self, *args) -> None:  # noqa: D401 - silence the default access log
         pass
@@ -511,9 +512,22 @@ class _Door(http.server.BaseHTTPRequestHandler):
                 return
             self._reply(200, {"output": [{"role": "assistant", "content": "pong"}]})
             return
+        if self.path.startswith("/conversations/") and self.path.endswith("/cancel"):
+            with self.cancels_path.open("a") as cancels:
+                cancels.write(f"{body.get('taskId', '')}\n")
+            self._reply(200, {"cancelPublished": True})
+            return
         if self.path == "/inject":
             if not self._door_up(state):
                 self._reply(503, {"error": "no gateway"})
+                return
+            busy = self.cancels_path.with_name("door-busy-once")
+            if state["scenario"].get("door_busy_once") and not busy.exists():
+                busy.touch()
+                self._reply(503, {"error": "gateway starting"})
+                return
+            if state["scenario"].get("door_refuses"):
+                self._reply(state["scenario"]["door_refuses"], {"error": "refused"})
                 return
             if auth != f"Bearer {self._door_token(state)}":
                 self._reply(401, {"error": "stale token"})
@@ -532,6 +546,12 @@ class _Door(http.server.BaseHTTPRequestHandler):
             self._reply(200, {"entries": [], "lastSeq": 0})
             return
         leg = "pre" if "pre.bus-task" in conversation else "leg2"
+        if state["scenario"].get("bus_task_lost_on") == leg:
+            self._reply(503, {"error": "gateway restarting"})
+            return
+        if state["scenario"].get("bus_task_hangs_on") == leg:
+            self._reply(200, {"entries": [], "lastSeq": 0})
+            return
         final = "failed" if state["scenario"].get("bus_task_fails_on") == leg else "completed"
         task = re.search(r"task=([^&]+)", self.path).group(1)
         self._reply(200, {"entries": [{"kind": "terminal", "seq": 1, "taskId": task, "state": final}], "lastSeq": 1})
@@ -552,7 +572,9 @@ class Sim:
         kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
         self.results = root / "results.txt"
         self.pf_pids = root / "pf_pids"
-        handler = type("Door", (_Door,), {"state_path": self.state_path})
+        self.cancels = root / "cancels"
+        self.cancels.touch()
+        handler = type("Door", (_Door,), {"state_path": self.state_path, "cancels_path": self.cancels})
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -921,9 +943,45 @@ class FailureTest(RoundTripTest):
         self.assert_fails_at(result, "leg2.bus-task", "terminal failed")
 
     def test_a_bus_task_that_does_not_complete_before_the_flip(self) -> None:
-        result, after, _ = self.run_sim(healthy_next_state(bus_task_fails_on="pre"))
+        result, after, sim = self.run_sim(healthy_next_state(bus_task_fails_on="pre"))
         self.assert_fails_at(result, "pre.bus-task", "terminal failed")
         self.assertEqual(after["patches"], [])
+        self.assertEqual(sim.cancels.read_text(), "", "a task that reached a terminal is not cancelled")
+
+    def test_a_door_that_refuses_the_request_fails_at_once_without_a_fresh_tunnel(self) -> None:
+        # A door that answered 401 or 403 was reached; the same token through
+        # a fresh tunnel gets the same answer, so there is no second attempt.
+        for code, fragment in ((401, "the inject door refused the bearer token"), (403, "HTTP 403")):
+            with self.subTest(code=code):
+                result, _, sim = self.run_sim(healthy_next_state(door_refuses=code), ROLLBACK_BUS_TASK_ATTEMPTS="2")
+                self.assert_fails_at(result, "pre.bus-task", "the door refused the request")
+                self.assertIn(fragment, result.stdout)
+                self.assertNotIn("could not be reached", result.stdout)
+                self.assertNotIn("pre.bus-task: attempt 1/2", result.stdout)
+                self.assertEqual(sim.cancels.read_text(), "", "nothing was started, so nothing is cancelled")
+
+    def test_a_retryable_status_before_submission_still_gets_a_fresh_tunnel(self) -> None:
+        # A 503 is answered too, but retryable: the gateway between pods.
+        result, _, _ = self.run_sim(healthy_next_state(door_busy_once=True), ROLLBACK_BUS_TASK_ATTEMPTS="2")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("pre.bus-task: attempt 1/2: the door could not be reached: HTTP 503", result.stdout)
+
+    def test_a_bus_task_left_active_at_its_deadline_is_cancelled(self) -> None:
+        # Nothing on the stream by the bound: the task is still on the bus,
+        # for a bridge that binds later to run, unless it is cancelled.
+        result, _, sim = self.run_sim(healthy_next_state(bus_task_hangs_on="pre"), ROLLBACK_BUS_TASK_TIMEOUT="2")
+        self.assert_fails_at(result, "pre.bus-task", "cancel published")
+        self.assertEqual(sim.cancels.read_text().split(), ["task-pre.bus-task"])
+
+    def test_a_bus_task_whose_door_is_lost_after_submission_is_cancelled(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(bus_task_lost_on="pre"))
+        self.assert_fails_at(result, "pre.bus-task", "the door was lost while waiting (cancel published)")
+        self.assertEqual(sim.cancels.read_text().split(), ["task-pre.bus-task"])
+
+    def test_a_completed_bus_task_is_not_cancelled(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(sim.cancels.read_text(), "")
 
     def test_a_bridge_that_never_consumes(self) -> None:
         result, _, _ = self.run_sim(healthy_next_state(bridge_silent=True), ROLLBACK_BRIDGE_TIMEOUT="2")
@@ -1216,12 +1274,17 @@ class CiEvalWiringTest(unittest.TestCase):
             {build}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
-            collect_agent_pod_diagnostics() {{ echo COLLECT_DIAG; }}
+            collect_agent_pod_diagnostics() {{
+              [ -z "${{AGENT_DIAG_COLLECTED:-}}" ] || return 0
+              AGENT_DIAG_COLLECTED=1
+              echo "COLLECT_DIAG $* prefix=${{AGENT_DIAG_PREFIX:-}}"
+            }}
             {"" if timeout_on_path else "timeout() { shift 2; \"$@\"; }"}
             {ci_eval_function("job_started_epoch")}
             {ci_eval_function("run_rollback_roundtrip")}
             SUITE_STATUS=1
             run_rollback_roundtrip || true
+            collect_agent_pod_diagnostics
             echo "SUITE_STATUS=${{SUITE_STATUS}}"
             run_rollback_roundtrip
             echo "returned=$?"
@@ -1262,7 +1325,19 @@ class CiEvalWiringTest(unittest.TestCase):
         result, _ = self.run_wiring(mode_next="1")
         out = result.stdout
         self.assertLess(out.index("COLLECT_GATEWAY"), out.index("stub ran"))
-        self.assertLess(out.index("COLLECT_DIAG"), out.index("stub ran"))
+        self.assertLess(out.index("COLLECT_DIAG --keep-watch prefix="), out.index("stub ran"))
+
+    def test_the_watch_runs_through_the_flip_and_the_trap_collects_its_window(self) -> None:
+        # The pre-flip snapshot leaves the watch running, and the collector is
+        # re-armed under a prefix, so the trap's call after the round trip
+        # (here, the call after the function) stops the watch and writes
+        # rollback-* rather than returning at its once-guard.
+        for status in (0, 1):
+            with self.subTest(script_status=status):
+                result, _ = self.run_wiring(mode_next="1", script_status=status)
+                out = result.stdout
+                self.assertIn("COLLECT_DIAG --keep-watch prefix=\n", out)
+                self.assertLess(out.index("stub ran"), out.index("COLLECT_DIAG  prefix=rollback-"))
 
     def test_a_run_too_late_for_its_bound_is_skipped(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", elapsed=16000)
@@ -1351,9 +1426,13 @@ class CiEvalWiringTest(unittest.TestCase):
                 EVAL_MODE_NEXT=1
                 profile_begin() {{ :; }}
                 collect_gateway_log() {{ :; }}
-                collect_agent_pod_diagnostics() {{ :; }}
+                collect_agent_pod_diagnostics() {{
+                  [ -z "${{AGENT_DIAG_COLLECTED:-}}" ] || return 0
+                  AGENT_DIAG_COLLECTED=1
+                  echo "DIAG $* prefix=${{AGENT_DIAG_PREFIX:-}}"
+                }}
                 timeout() {{ shift 2; exec "$@"; }}
-                trap 'echo EXIT TRAP RAN' EXIT
+                trap 'echo EXIT TRAP RAN; collect_agent_pod_diagnostics' EXIT
                 trap 'exit 143' TERM INT
                 {ci_eval_function("job_started_epoch")}
                 {ci_eval_function("run_rollback_roundtrip")}
@@ -1374,6 +1453,8 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertIn("stub interrupted", out)
         self.assertIn("EXIT TRAP RAN", out)
         self.assertNotIn("NOT REACHED", out)
+        # The deadline's exit still takes the round trip's own snapshot.
+        self.assertLess(out.index("stub interrupted"), out.index("DIAG  prefix=rollback-"))
 
     def test_the_function_never_assigns_the_suite_status(self) -> None:
         self.assertNotIn("SUITE_STATUS", ci_eval_function("run_rollback_roundtrip"))

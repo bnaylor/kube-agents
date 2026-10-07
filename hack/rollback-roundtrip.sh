@@ -116,7 +116,8 @@ readonly INJECT_LOCAL_PORT_DEFAULT=29041
 readonly BUS_TASK_PROMPT="Reply with the single word OK. Do not run any tools."
 readonly BUS_TASK_CONVERSATION_PREFIX="rollback-roundtrip"
 # What the client's script exits when the door could not be reached before
-# anything was submitted: worth one fresh tunnel, nothing else is.
+# anything was submitted, or answered with a retryable status: worth one
+# fresh tunnel, nothing else is. A refusal it answered is not.
 readonly BUS_TASK_UNREACHABLE_STATUS=2
 
 # The line the Hermes bridge logs once its durable consumer is bound
@@ -786,17 +787,27 @@ assert_today_turn() {
 # ─── The bus task ────────────────────────────────────────────────────────────
 # Through the lane's own client. Exits 0 on a completed terminal, the
 # unreachable status when nothing could be submitted, 1 otherwise; prints one
-# line saying what happened.
+# line saying what happened. A door that answered and refused (a 401 for a
+# token it does not hold, any other 4xx) was reached, and the same request
+# through a fresh tunnel gets the same answer, so that is 1. Every exit that
+# leaves the task active is followed by a cancel naming it, as the harness
+# does (inject_transport.py, the outcomes' comment): a task nobody took
+# stays on the stream for a bridge that binds later, and one at its deadline
+# keeps running after this script has failed it.
 readonly PY_BUS_TASK='
 import sys, time
 sys.path.insert(0, sys.argv[1])
 from kube_agents_bench import inject_transport as it
 base, token, conversation, prompt, timeout, unreachable = sys.argv[2:8]
+LEAVES_ACTIVE = (it.OUTCOME_DEADLINE, it.OUTCOME_QUEUED, it.OUTCOME_PARKED, it.OUTCOME_NEVER_STARTED, it.OUTCOME_UNCLASSIFIED)
 task = it.InjectTask(base_url=base, conversation=conversation, prompt=prompt, token=token, message_id=conversation)
 try:
     task.preflight()
     task_id = task.submit()
 except it.InjectUnavailable as exc:
+    if exc.answered and not exc.retryable:
+        print("the door refused the request, and a fresh tunnel would not change that: %s" % exc)
+        sys.exit(1)
     print("the door could not be reached: %s" % exc)
     sys.exit(int(unreachable) if not task.task_id else 1)
 if not task_id:
@@ -805,12 +816,18 @@ if not task_id:
 try:
     exchange = task.await_terminal(task_id, deadline=time.monotonic() + float(timeout))
 except it.InjectUnavailable as exc:
-    print("task %s: the door was lost while waiting: %s" % (task_id, exc))
+    task.cancel(task_id, settle=0)
+    print("task %s: the door was lost while waiting (cancel %s): %s" % (
+        task_id, "published" if task.cancel_sent else "not published", exc))
     sys.exit(1)
 fold = exchange.fold
-print("task %s on %s: outcome %s, terminal %s (source %s, reason %s)" % (
+cancel = ""
+if exchange.outcome in LEAVES_ACTIVE:
+    task.cancel(task_id, settle=0)
+    cancel = ", cancel %s" % ("published" if task.cancel_sent else "not published")
+print("task %s on %s: outcome %s, terminal %s (source %s, reason %s)%s" % (
     task_id, exchange.conversation, exchange.outcome, fold.terminal or "none",
-    fold.terminal_source or "none", fold.terminal_reason or "none"))
+    fold.terminal_source or "none", fold.terminal_reason or "none", cancel))
 done = exchange.outcome in (it.OUTCOME_TERMINAL, it.OUTCOME_STREAM_TERMINAL) and fold.terminal == it.STATE_COMPLETED
 sys.exit(0 if done else 1)
 '

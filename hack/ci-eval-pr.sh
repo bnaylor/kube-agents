@@ -2957,7 +2957,11 @@ job_started_epoch() {
 # The flip replaces the agent pod, whose log and diagnostics the EXIT trap
 # collects, so the eval's are taken first; the gateway log collector keeps
 # the first capture of a process, so the trap does not overwrite it with the
-# replacement pod's.
+# replacement pod's. The pod and event watches keep running through the
+# round trip, and the diagnostics collector is re-armed under a prefix
+# before it starts: whatever ends the run after that (a pass, a failure, the
+# deadline's TERM), the EXIT trap stops the watch, whose tails then cover
+# the flip, and writes a rollback-* snapshot beside the eval's.
 #
 # The round trip runs in the background and is waited on, so a SIGTERM (the
 # job's deadline) reaches this script's trap during the wait rather than
@@ -2986,7 +2990,12 @@ run_rollback_roundtrip() {
   fi
   echo "the job started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}); inside the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound" | tee -a "${results}"
   collect_gateway_log
-  collect_agent_pod_diagnostics
+  collect_agent_pod_diagnostics --keep-watch
+  # Both read by collect_agent_pod_diagnostics (hack/ci-env.sh).
+  # shellcheck disable=SC2034
+  AGENT_DIAG_COLLECTED=""
+  # shellcheck disable=SC2034
+  AGENT_DIAG_PREFIX="rollback-"
   if command -v timeout >/dev/null 2>&1; then
     bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
   fi
