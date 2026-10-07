@@ -411,6 +411,7 @@ SOURCES: dict[str, Source] = {
             "a2aBusTokenPath",
             "a2aBusTokenFile",
             "a2aCalloutReservedPrincipalsEnvVar = ",
+            "a2aCalloutReservedAddresseesEnvVar = ",
             "func buildA2ACalloutDeployment(",
             "a2aBusTokenVolume",
             "func a2aBusTokenVolumeSource(",
@@ -463,13 +464,20 @@ SOURCES: dict[str, Source] = {
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
     ),
-    # The callout's reader of the static principal list the operator renders
-    # into its Deployment. The operator half is operator_a2a_callout below
-    # (a2aCalloutReservedPrincipalsEnvVar); the two modules cannot import
-    # each other, so C1 compares the two literals.
+    # The callout's reader of the static principal list and the fixed-name
+    # addressee list the operator renders into its Deployment. The operator
+    # half is operator_a2a_callout above (a2aCalloutReservedPrincipalsEnvVar,
+    # a2aCalloutReservedAddresseesEnvVar); the two modules cannot import each
+    # other, so C1 compares the two literals of each pair.
     "a2a_callout_main": Source(
         "a2a/cmd/authcallout/main.go",
-        ("envReservedPrincipals = ", "os.LookupEnv(envReservedPrincipals)", "func run("),
+        (
+            "envReservedPrincipals = ",
+            "os.LookupEnv(envReservedPrincipals)",
+            "envReservedAddressees = ",
+            "os.LookupEnv(envReservedAddressees)",
+            "func run(",
+        ),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
