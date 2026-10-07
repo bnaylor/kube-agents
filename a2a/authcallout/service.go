@@ -90,7 +90,9 @@ type Config struct {
 
 	// ReservedPrincipals are the static nats.conf users a narrowed pod may
 	// not be named after (see reserved.go). Required: NewService refuses an
-	// empty list rather than serving a callout that reserves nothing.
+	// empty list rather than serving a callout that reserves nothing. The
+	// identity map's own users are reserved too, but come from the map being
+	// served rather than from here.
 	ReservedPrincipals []string
 
 	// Now is injectable for tests.
@@ -104,7 +106,7 @@ type Service struct {
 	issuer    nkeys.KeyPair
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
-	reserved  map[string]struct{}
+	reserved  map[string]reservedKind
 	now       func() time.Time
 	log       *slog.Logger
 }
@@ -347,12 +349,14 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		}
 		// A narrowed user is named for its pod, and that name is also its
 		// inbox prefix. A pod named after a static principal (the gateway,
-		// the bridge, web, console, seed) would be granted that principal's
-		// inbox, and could read or forge the JetStream replies delivered
-		// there. Checked after the switch so every narrowing is covered by
-		// one check, whatever derived the user.
-		if s.reservedPrincipal(user) {
-			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of a static principal; its inbox is that principal's", att.ServiceAccount, user)
+		// the bridge, web, console, seed) or after a user this map mints
+		// (the verifier, the agent, the provisioner) would be granted that
+		// principal's inbox, and could read or forge the JetStream replies
+		// delivered there. Checked after the switch so every narrowing is
+		// covered by one check, whatever derived the user, and against m,
+		// the snapshot the identity was resolved from.
+		if kind, ok := s.reservedAs(m, user); ok {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of %s; its inbox is that principal's", att.ServiceAccount, user, kind)
 		}
 	}
 

@@ -17,15 +17,28 @@ import (
 // principal; a pod someone created by hand under a narrowed ServiceAccount can
 // be named anything.
 //
-// This file covers the static users nats.conf authenticates by password
-// (gateway, bridge, seed, web, console, sys, and the callout's own user). They
-// are in no identity map, so the callout cannot learn them from the map it
-// serves. The identity map's own users have the same exposure and are not
-// refused here; refusing them belongs in the same set, built at load. The operator renders them
-// into the callout's environment instead, from the same list it renders
-// nats.conf's auth_users from, as a comma-separated list. The callout does not
-// read nats.conf: that file carries every static user's password, and the
-// callout has no reason to hold any of them.
+// Two kinds of name are reserved, and one check covers both:
+//
+//   - The static users nats.conf authenticates by password (gateway, bridge,
+//     seed, web, console, sys, and the callout's own user). They are in no
+//     identity map, so the callout cannot learn them from the map it serves.
+//     The operator renders them into the callout's environment instead, from
+//     the same list it renders nats.conf's auth_users from, as a
+//     comma-separated list. The callout does not read nats.conf: that file
+//     carries every static user's password, and the callout has no reason to
+//     hold any of them.
+//   - The identity map's own users (provision, agent, verifier, session, and
+//     whatever else the map holds). authorize mints a mapped entry under its
+//     `user`, and that entry's grants carry `_INBOX.<user>.>`, so these are
+//     exactly the names whose inboxes a same-named pod would share. They are
+//     read from the map being served, built when the map is parsed (see
+//     IdentityMap.users), so a reload that adds or removes a user moves the
+//     reserved set in the same pointer swap that moves the map.
+//
+// A name in both is reported as a static principal. That cannot happen in a
+// rendered config (the operator's contract test keeps the static residue out
+// of the map), and the static wording is the one the refusal has always
+// carried.
 
 const (
 	// reservedPrincipalSeparator splits the operator-rendered list.
@@ -60,26 +73,45 @@ func ParseReservedPrincipals(raw string) ([]string, error) {
 	return names, nil
 }
 
-// reservedSet builds the lookup the callout refuses against. It refuses an
+// reservedKind is what a refused pod name copies, phrased to complete "which is
+// the name of ...". The end state is one name-to-kind map with one check; the
+// static names are held that way here, and the map's users join them in
+// reservedAs because they change with every reload while the static names are
+// fixed for the life of the process.
+type reservedKind string
+
+const (
+	reservedStatic  reservedKind = "a static principal"
+	reservedMapUser reservedKind = "an identity-map user"
+)
+
+// reservedSet builds the static half of the lookup the callout refuses against. It refuses an
 // empty input for the same reason ParseReservedPrincipals does, so a caller
 // that skipped the parser cannot construct a Service that reserves nothing.
-func reservedSet(names []string) (map[string]struct{}, error) {
+func reservedSet(names []string) (map[string]reservedKind, error) {
 	if len(names) == 0 {
 		return nil, fmt.Errorf("the callout needs the static principal names; with none, a narrowed pod could take any of their inboxes")
 	}
-	set := make(map[string]struct{}, len(names))
+	set := make(map[string]reservedKind, len(names))
 	for _, n := range names {
 		if !lib.ValidSubjectToken(n) {
 			return nil, fmt.Errorf("reserved principal %q is not a dot-free DNS-1123 label, so no pod could be refused for it", n)
 		}
-		set[n] = struct{}{}
+		set[n] = reservedStatic
 	}
 	return set, nil
 }
 
-// reservedPrincipal reports whether a narrowed user name belongs to a static
-// principal.
-func (s *Service) reservedPrincipal(user string) bool {
-	_, ok := s.reserved[user]
-	return ok
+// reservedAs reports whether a narrowed user name is reserved, and as which
+// kind. m must be the map the connection's identity was resolved against, so
+// the check and the lookup see one snapshot: a reload landing mid-request
+// cannot pair a new map with an old reserved set or the reverse.
+func (s *Service) reservedAs(m *IdentityMap, user string) (reservedKind, bool) {
+	if kind, ok := s.reserved[user]; ok {
+		return kind, true
+	}
+	if m.servesUser(user) {
+		return reservedMapUser, true
+	}
+	return "", false
 }

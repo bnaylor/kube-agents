@@ -623,13 +623,17 @@ not read `nats.conf`, which carries every static user's password. It refuses to 
 the variable is missing, empty, or holds anything but dot-free DNS-1123 labels; a smaller
 set would quietly admit a pod named after the dropped user. The list is fixed for the life
 of the process, and that is enough: it changes only when the operator's render does, and a
-changed value changes the pod template, which rolls the callout. The users in the
-callout's own identity map share the same exposure and are not on this list: a narrowed
-pod named `verifier` is still admitted with the verifier's inbox. Refusing the identity
-map's users is the other half of the same check and is not yet built. The pod name is also
-the session's task addressee, consumer stem and capability caller, so the same collision
-exists in the addressee namespace: a narrowed pod named `platform`, the bridge's
-addressee, is not refused either.
+changed value changes the pod template, which rolls the callout. The same check also
+refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
+`agent`, `verifier`, `session`, and any user the map gains), because the callout mints a
+mapped entry under its `user` and that entry's grants carry `_INBOX.<user>.>`. Those names
+come from the map being served, not from the variable: they are built when the map is
+parsed and installed with it, so a reload that adds or removes a user moves the reserved
+set in the same step, and a connection is checked against the users of the map its
+identity was resolved from. The refusal reason says which kind of name the pod copies.
+The pod name is also the session's task addressee, consumer stem and capability caller,
+so the same collision exists in the addressee namespace: a narrowed pod named `platform`,
+the bridge's addressee, is not refused by this check.
 
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token

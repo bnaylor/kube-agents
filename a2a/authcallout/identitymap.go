@@ -98,6 +98,13 @@ type Identity struct {
 type IdentityMap struct {
 	Version    string     `json:"version"`
 	Identities []Identity `json:"identities"`
+
+	// users is the set of names Users returns, built by ParseIdentityMap.
+	// It lives on the map rather than beside it so the Store's one pointer
+	// swap installs the map and its reserved names together: a connection
+	// that resolved its identity against this map is checked against this
+	// map's users, never an older map's (see Service.reservedAs).
+	users map[string]struct{}
 }
 
 // ParseIdentityMap decodes a rendered map and rejects one it cannot serve
@@ -114,6 +121,10 @@ func ParseIdentityMap(raw []byte) (*IdentityMap, error) {
 	}
 	if err := m.validate(); err != nil {
 		return nil, err
+	}
+	m.users = make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		m.users[u] = struct{}{}
 	}
 	return &m, nil
 }
@@ -238,4 +249,12 @@ func (m *IdentityMap) Users() []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// servesUser reports whether name is a user this map mints. Only a map built
+// by ParseIdentityMap has the set, and only such a map is ever served: Store
+// installs nothing else.
+func (m *IdentityMap) servesUser(name string) bool {
+	_, ok := m.users[name]
+	return ok
 }

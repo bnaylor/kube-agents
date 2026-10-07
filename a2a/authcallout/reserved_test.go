@@ -236,3 +236,162 @@ func TestNewServiceRefusesAnEmptyReservedSet(t *testing.T) {
 		})
 	}
 }
+
+// The identity map's own users have the same exposure as the static ones: the
+// callout mints a mapped entry as its `user`, and that entry's grants carry
+// `_INBOX.<user>.>`. A narrowed pod named `verifier` would be handed the
+// verifier's inbox. These tests take the names from the operator's rendered
+// map (testdata/rendered-identity-map.json, which the operator's
+// TestRenderedAuthMapMatchesTheCalloutFixture keeps identical to the render).
+
+func renderedFixtureMap(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("reading the operator's rendered identity map: %v", err)
+	}
+	return string(raw)
+}
+
+// renderedFixtureMapUsers is every user the rendered map serves, which is the
+// set of names the callout mints mapped entries as.
+func renderedFixtureMapUsers(t *testing.T) []string {
+	t.Helper()
+	m, err := ParseIdentityMap([]byte(renderedFixtureMap(t)))
+	if err != nil {
+		t.Fatalf("the operator's rendered map does not parse: %v", err)
+	}
+	users := m.Users()
+	if len(users) == 0 {
+		t.Fatal("the rendered identity map serves no users; every test below would pass vacuously")
+	}
+	return users
+}
+
+// Pinned against the names the gap was reported with, for the same reason the
+// static list is: a fixture that lost a user would shrink what the refusal
+// tests iterate, silently.
+func TestTheRenderedMapUsersIncludeEveryPrincipalWithAnInbox(t *testing.T) {
+	got := renderedFixtureMapUsers(t)
+	for _, want := range []string{"verifier", "agent", "provision"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("the rendered map's users %v have no %q; the refusal tests would not cover it", got, want)
+		}
+	}
+}
+
+// One refusal per rendered map user, with the reason the log line carries,
+// against a callout serving the rendered map itself.
+func TestTheRefusalNamesTheIdentityMapUser(t *testing.T) {
+	static := renderedFixtureAuthUsers(t)
+	users := renderedFixtureMapUsers(t)
+	svc := newReservedTestService(t, renderedFixtureMap(t), reservedPodTokens(users), static)
+
+	user, err := authorizeToken(svc, tokenPodA)
+	if err != nil {
+		t.Fatalf("a narrowed pod with an ordinary name was refused: %v", err)
+	}
+	if user != podA {
+		t.Fatalf("the admitted pod was minted as %q, want %q", user, podA)
+	}
+
+	for _, name := range users {
+		t.Run(name, func(t *testing.T) {
+			if slices.Contains(static, name) {
+				t.Fatalf("%q is both a static principal and a map user; the rendered config serves it twice", name)
+			}
+			_, err := authorizeToken(svc, reservedPodToken(name))
+			if err == nil {
+				t.Fatalf("a narrowed pod named %q was authorized; it would hold %s's inbox", name, name)
+			}
+			if !strings.Contains(err.Error(), "the name of an identity-map user") || !strings.Contains(err.Error(), `"`+name+`"`) {
+				t.Errorf("refused for the wrong reason: %v", err)
+			}
+		})
+	}
+}
+
+// Against a real server started from the real render and serving the real
+// map: every map user's name is refused at connect, and an ordinary name is
+// admitted in the same harness.
+func TestANarrowedPodNamedAfterAnIdentityMapUserIsRefusedAtConnect(t *testing.T) {
+	users := renderedFixtureMapUsers(t)
+	h := startHarness(t, renderedFixtureMap(t), reservedPodTokens(users))
+
+	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
+	if err != nil {
+		t.Fatalf("a narrowed pod with an ordinary name was refused: %v", err)
+	}
+	nc.Close()
+
+	for _, name := range users {
+		t.Run(name, func(t *testing.T) {
+			nc, err := nats.Connect(h.url, nats.Token(reservedPodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
+			if err == nil {
+				nc.Close()
+				t.Fatalf("a narrowed pod named %q connected; it would hold %s's inbox", name, name)
+			}
+		})
+	}
+}
+
+// reloadNewcomer is a user the reload test adds to sessionMap and removes again.
+const reloadNewcomer = "newcomer"
+
+func mapWithNewcomer(version string) string {
+	entry := `{
+      "serviceAccount": "system:serviceaccount:kubeagents-system:newcomer",
+      "user": "` + reloadNewcomer + `",
+      "account": "APP",
+      "grants": {"publish": ["_INBOX.` + reloadNewcomer + `.>"], "subscribe": ["_INBOX.` + reloadNewcomer + `.>"]}
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-session",`
+	m := strings.Replace(sessionMap, `{
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-session",`, entry, 1)
+	return strings.Replace(m, `"version": "session-itest-1"`, `"version": "`+version+`"`, 1)
+}
+
+// The reserved map users follow the map the callout is serving: a reload that
+// adds a user reserves its name on the next connection, and a reload that
+// removes it releases the name. The static names hold across both.
+func TestAMapReloadMovesTheReservedUsers(t *testing.T) {
+	static := renderedFixtureAuthUsers(t)
+	tokens := reservedPodTokens(append([]string{reloadNewcomer}, static...))
+	svc := newReservedTestService(t, sessionMap, tokens, static)
+
+	if strings.Contains(sessionMap, `"user": "`+reloadNewcomer+`"`) {
+		t.Fatalf("the starting map already serves %q", reloadNewcomer)
+	}
+	if _, err := authorizeToken(svc, reservedPodToken(reloadNewcomer)); err != nil {
+		t.Fatalf("before the reload, a narrowed pod named %q was refused: %v", reloadNewcomer, err)
+	}
+
+	added := mapWithNewcomer("session-itest-2")
+	if !strings.Contains(added, `"user": "`+reloadNewcomer+`"`) {
+		t.Fatal("the reloaded map does not carry the new user; the fixture splice missed")
+	}
+	if err := svc.store.Update([]byte(added)); err != nil {
+		t.Fatalf("reloading with %q added: %v", reloadNewcomer, err)
+	}
+	_, err := authorizeToken(svc, reservedPodToken(reloadNewcomer))
+	if err == nil {
+		t.Fatalf("after %q joined the map, a narrowed pod with its name was authorized", reloadNewcomer)
+	}
+	if !strings.Contains(err.Error(), "the name of an identity-map user") {
+		t.Errorf("refused for the wrong reason: %v", err)
+	}
+
+	removed := strings.Replace(sessionMap, `"version": "session-itest-1"`, `"version": "session-itest-3"`, 1)
+	if err := svc.store.Update([]byte(removed)); err != nil {
+		t.Fatalf("reloading with %q removed: %v", reloadNewcomer, err)
+	}
+	if _, err := authorizeToken(svc, reservedPodToken(reloadNewcomer)); err != nil {
+		t.Fatalf("after %q left the map, a narrowed pod with its name was still refused: %v", reloadNewcomer, err)
+	}
+	for _, name := range static {
+		if _, err := authorizeToken(svc, reservedPodToken(name)); err == nil || !strings.Contains(err.Error(), "the name of a static principal") {
+			t.Errorf("after the reloads, static principal %q is not refused as one: %v", name, err)
+		}
+	}
+}
