@@ -109,6 +109,8 @@ class FakeWorld:
         self.refusal = REFUSAL
         self.extra_members = []
         self.bot_ids = {BOT_ID}
+        # Accounts users.info answers as deactivated.
+        self.deleted_ids = set()
         self.metadata_token = GCP_ACCESS
         # The deliverable's text: the gateway posts the agent's result verbatim.
         self.answer_text = "PONG"
@@ -156,11 +158,11 @@ class FakeWorld:
         if self.is_dm_with_bot(channel):
             reply_thread = ""
         elif thread_ts and thread_ts != msg["ts"]:
-            if f"<@{BOT_ID}>" not in text and (
+            if not mentions_bot(text) and (
                     (channel, thread_ts) not in self.session_threads or self.ignore_unmentioned_thread_replies):
                 return
             reply_thread = thread_ts
-        elif f"<@{BOT_ID}>" in text:
+        elif mentions_bot(text):
             reply_thread = msg["ts"]
         else:
             return
@@ -233,7 +235,7 @@ class FakeWorld:
             uid = params["user"]
             name = USER_NAMES.get(uid, uid.lower())
             return {"ok": True, "user": {"id": uid, "name": name, "is_bot": uid in self.bot_ids,
-                                         "profile": {"display_name": DISPLAY_NAMES.get(uid, "")}}}
+                                         "deleted": uid in self.deleted_ids, "profile": {"display_name": DISPLAY_NAMES.get(uid, "")}}}
         if method == "conversations.list":
             types = params.get("types", "public_channel").split(",")
             self.conversation_list_types.append(params.get("types", ""))
@@ -314,6 +316,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(200, payload)
 
 
+def mentions_bot(text):
+    """slackMentionsBot in a2a/gateway/slack.go: the marker followed by > or |."""
+    return re.search(rf"<@{BOT_ID}[>|]", text) is not None
+
+
+# A Go interpreted string literal containing "not started:". It cannot hold a raw newline.
+NOT_STARTED_LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*not started:(?:[^"\\\n]|\\.)*)"')
+
+
 class FakeHuman:
     """The person at the keyboard: types each turn the harness asks for, a few reads later.
 
@@ -330,6 +341,8 @@ class FakeHuman:
         self.via_app = False
         self.drops_nonce = False
         self.plain_at = False
+        # Render a picked mention in Slack's older <@U...|display> encoding.
+        self.display_mention = False
         self.subtype = ""
         self.no_user = False
         # When set, the switches apply to this check's turn only; every other turn is typed right.
@@ -350,7 +363,7 @@ class FakeHuman:
             text = text.replace(turn.nonce, "").strip()
         if not self.plain_at:
             # Picking the bot from Slack's @ list renders it as a link to its member id.
-            text = text.replace(f"@{BOT_NAME}", f"<@{BOT_ID}>")
+            text = text.replace(f"@{BOT_NAME}", f"<@{BOT_ID}|{BOT_NAME}>" if self.display_mention else f"<@{BOT_ID}>")
         extra = {}
         if self.via_app:
             extra.update({"bot_id": "B0USERAPP", "app_id": "A0USERAPP"})
@@ -458,6 +471,14 @@ class PreflightTest(HarnessTestCase):
         # A failed preflight stops the run even under --keep-going.
         self.assertNotIn("TYPE ", text)
         self.assertIn("SUMMARY pass=1 fail=1", text)
+
+    def test_preflight_fails_when_a_test_account_is_deactivated(self):
+        self.world.deleted_ids.add(UNLISTED_ID)
+        code, text = self.run_harness("--checks", "dm,unlisted", "--keep-going")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("U0UNLIST1 is deactivated", self.line(text, "FAIL preflight-unlisted"))
+        self.assertTrue(self.evidence(text, "preflight-unlisted")["deleted"])
+        self.assertNotIn("TYPE ", text)
 
     def test_preflight_fails_when_the_users_are_in_different_workspaces(self):
         self.world.teams[UNLISTED_ID] = "T0OTHER01"
@@ -600,6 +621,23 @@ class TypedTurnTest(HarnessTestCase):
         code, text = self.run_harness("--checks", "mention")
         self.assertEqual(code, harness.EXIT_FAIL, text)
         self.assertIn(f"does not mention the bot (no <@{BOT_ID}> in its text)", self.line(text, "FAIL mention"))
+
+    def test_a_mention_in_the_display_encoding_passes(self):
+        # The gateway takes <@U...|display> as a mention (slackMentionsBot), so the check does too.
+        self.human.display_mention = True
+        code, text = self.run_harness("--checks", "mention,thread")
+        self.assertEqual(code, harness.EXIT_OK, text)
+        self.assertIn("PASS mention", text)
+
+    def test_a_bot_name_typed_with_its_at_is_the_bot(self):
+        for extra in ((), ("--bot-user-id", BOT_ID)):
+            with self.subTest(extra=extra):
+                self.tearDown()
+                self.setUp()
+                code, text = self.run_harness("--checks", "mention", "--bot-name", f"@{BOT_NAME}", *extra)
+                self.assertEqual(code, harness.EXIT_OK, text)
+                self.assertNotIn(f"@@{BOT_NAME}", text)
+                self.assertIn(f"picking @{BOT_NAME} from Slack's list", self.type_line(text, "mention"))
 
     def test_a_typed_message_the_gateway_would_not_take_as_a_turn_fails(self):
         self.human.subtype = "bot_message"
@@ -1112,7 +1150,7 @@ class SetupAndRedactionTest(HarnessTestCase):
     def test_an_unbounded_poll_is_not_swallowed_by_main(self):
         self.world.mode = "silent"
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Unbounded):
-            harness.main([*self.endpoint_args, "--checks", "dm", "--poll-interval", "0"],
+            harness.main([*self.endpoint_args, "--checks", "dm", "--type-timeout", "1e9"],
                          clock=self.fake.clock, sleep=self.fake.sleep, wall=self.fake.wall)
 
     def test_bot_token_in_the_secret_is_refused_without_echoing_it(self):
@@ -1253,7 +1291,7 @@ class UnitTest(unittest.TestCase):
         # harness reads as a refusal; and the test's renderings come from those formats.
         sources = {path.name: path.read_text() for path in (REPO / "a2a" / "gateway").glob("*.go")
                    if not path.name.endswith("_test.go")}
-        formats = [fmt for src in sources.values() for fmt in re.findall(r'"((?:[^"\\]|\\.)*not started:(?:[^"\\]|\\.)*)"', src)]
+        formats = [fmt for src in sources.values() for fmt in NOT_STARTED_LITERAL.findall(src)]
         self.assertGreaterEqual(len(formats), 4, formats)
         rendered = set()
         for fmt in formats:
@@ -1323,6 +1361,26 @@ class UnitTest(unittest.TestCase):
                         self.assertRaises(SystemExit):
                     harness.parse_args([f"{flag}={value}", "--bot-name", "kage"])
                 self.assertIn("finite", err.getvalue())
+
+    def test_waits_must_be_positive(self):
+        for flag in ("--reply-timeout", "--poll-interval", "--quiet-window", "--home-timeout", "--type-timeout"):
+            for value in ("0", "-5", "-0.5"):
+                with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    harness.parse_args([f"{flag}={value}", "--bot-name", "kage"])
+                self.assertIn("greater than 0", err.getvalue())
+
+    def test_home_since_may_be_zero_but_not_negative(self):
+        # 0 is its default: the run's start.
+        self.assertEqual(harness.parse_args(["--home-since", "0", "--bot-name", "kage"]).home_since, 0.0)
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            harness.parse_args(["--home-since=-1", "--bot-name", "kage"])
+        self.assertIn("not negative", err.getvalue())
+
+    def test_the_not_started_scanner_stays_inside_one_literal(self):
+        # A comment between two literals is not a literal: the run cannot cross a newline.
+        src = 'x := "a"\n// a turn the cap refuses is not started: to the user\ny := "b"\nz := "not started: %s"\n'
+        self.assertEqual(NOT_STARTED_LITERAL.findall(src), ["not started: %s"])
 
     def test_home_needs_a_channel(self):
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):

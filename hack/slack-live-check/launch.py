@@ -68,6 +68,10 @@ HARNESS_CONTAINER = "harness"
 JOB_TTL_SECONDS = 600
 JOB_POLL_INTERVAL_SECONDS = 5
 JOB_WAIT_GRACE_SECONDS = 60
+# How long the read of the log after the Job ends is retried, as the other waits retry theirs.
+LOG_FINAL_READ_RETRY_SECONDS = 30
+# The bot a --render shows in the Job's args when none is passed after --.
+RENDER_BOT_PLACEHOLDER = "<your bot's member id>"
 NAMESPACE_DELETE_TIMEOUT_SECONDS = 180
 ROLLOUT_TIMEOUT_SECONDS = 600
 SLACK_CONNECT_WAIT_SECONDS = 120
@@ -279,11 +283,15 @@ class LogStream:
     poll() reads the whole log and prints the complete lines it has not printed
     yet; a line without its newline waits for the next read. A read that fails (the
     pod not started, an API blip) is skipped: the next tick reads again. finish()
-    reads once more after the Job ends and prints the rest.
+    reads once more after the Job ends, retrying a failed read for a short while, and
+    prints the rest.
     """
 
-    def __init__(self, kubectl: "Kubectl", namespace: str, job_name: str) -> None:
+    def __init__(self, kubectl: "Kubectl", namespace: str, job_name: str,
+                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
         self.kubectl = kubectl
+        self.clock = clock
+        self.sleep = sleep
         self.namespace = namespace
         self.job_name = job_name
         self.text = ""
@@ -311,13 +319,21 @@ class LogStream:
             return
 
     def finish(self) -> str:
-        try:
-            self._emit(self._read(), final=True)
-        except LaunchError as exc:
-            if not self.text:
-                say(f"JOB {self.job_name}: no pod log ({exc})")
-            self._emit(self.text, final=True)
-        return self.text
+        deadline = self.clock() + LOG_FINAL_READ_RETRY_SECONDS
+        while True:
+            try:
+                self._emit(self._read(), final=True)
+                return self.text
+            except LaunchError as exc:
+                if self.clock() < deadline:
+                    self.sleep(JOB_POLL_INTERVAL_SECONDS)
+                    continue
+                if self.text:
+                    say(f"JOB {self.job_name}: the final log read failed, so lines after the last good read are missing: {exc}")
+                else:
+                    say(f"JOB {self.job_name}: no pod log ({exc})")
+                self._emit(self.text, final=True)
+                return self.text
 
 
 class Launcher:
@@ -441,7 +457,7 @@ class Launcher:
         try:
             self.kubectl.run(["apply", "-f", "-"], stdin=configmap)
             self.kubectl.run(["apply", "-f", "-"], stdin=job)
-            stream = LogStream(self.kubectl, ns, job_name)
+            stream = LogStream(self.kubectl, ns, job_name, self.clock, self.sleep)
             state = self.wait_job(job_name, deadline, stream.poll)
             logs = stream.finish()
             results, evidence = parse_harness_output(harness.REDACTOR.redact(logs))
@@ -755,6 +771,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     if refused:
         parser.error(f"{', '.join(refused)} after -- is not a harness flag the launcher forwards; "
                      f"forwardable: {', '.join(sorted(FORWARDABLE_HARNESS_FLAGS))}")
+    if args.render and not any(arg.split("=", 1)[0] in ("--bot-name", "--bot-user-id") for arg in forwarded):
+        # Rendering runs nothing, so it needs no bot; the Job it prints shows where one goes.
+        forwarded = [*forwarded, "--bot-user-id", RENDER_BOT_PLACEHOLDER]
     pod_checks = [c for c in args.checks if c in harness.CHECK_ORDER]
     if pod_checks and not args.cleanup:
         # Fail here, not minutes later in the pod, on a harness flag that is wrong.

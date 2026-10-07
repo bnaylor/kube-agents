@@ -13,6 +13,7 @@ import json
 import pathlib
 import subprocess
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -35,9 +36,12 @@ BOT_FLAGS = ["--bot-name", "kage"]
 
 
 def with_bot(argv):
-    """argv with BOT_FLAGS forwarded to the harness, unless it already names the bot."""
+    """argv with BOT_FLAGS forwarded to the harness, unless it already names the bot.
+
+    --render is left alone: it runs no check, so it must not need a bot, and adding
+    one here would hide a render that refuses without it."""
     argv = list(argv)
-    if "--bot-name" in argv or "--bot-user-id" in argv:
+    if "--bot-name" in argv or "--bot-user-id" in argv or "--render" in argv:
         return argv
     if "--" not in argv:
         return [*argv, "--", *BOT_FLAGS]
@@ -212,6 +216,11 @@ class FakeCluster:
         raise AssertionError(f"unexpected kubectl {args}")
 
 
+class Unbounded(BaseException):
+    """A wait that outran every timeout. A BaseException, so launch.main's
+    `except Exception` cannot turn it into an ERROR line and an exit code."""
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -221,7 +230,7 @@ class FakeClock:
 
     def sleep(self, seconds):
         if seconds <= 0 or self.now > SLEEP_BUDGET_SECONDS:
-            raise AssertionError(f"a wait slept {seconds}s at t={self.now}; it is not bounded")
+            raise Unbounded(f"a wait slept {seconds}s at t={self.now}; it is not bounded")
         self.now += seconds
 
 
@@ -446,6 +455,12 @@ class JobTest(unittest.TestCase):
         self.assertIn("did not finish in time; pods:\npod Pending", out)
         self.assertIn("ended Timeout with no FAIL line", self.line(out, "FAIL job:"))
 
+    def test_an_unbounded_wait_is_not_swallowed_by_main(self):
+        cluster = FakeCluster()
+        cluster.job_running_polls = 10**9
+        with mock.patch.object(launch, "JOB_WAIT_GRACE_SECONDS", 10**9), self.assertRaises(Unbounded):
+            run_launch(cluster, "--context", CONTEXT, "--checks", "dm")
+
     def line(self, out, prefix):
         return [ln for ln in out.splitlines() if ln.startswith(prefix)][0]
 
@@ -550,6 +565,19 @@ class LogStreamTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_OK, out)
         self.assertNotIn("no pod log", out)
         self.assertIn("OVERALL pass=1 fail=0", out)
+        # Retried to its bound, then said so.
+        failed = [ln for ln in out.splitlines() if ln.startswith("JOB ") and "the final log read failed" in ln]
+        self.assertEqual(len(failed), 1, out)
+
+    def test_a_failed_final_log_read_is_retried(self):
+        # The verdict lands after the last good poll, and the first final read fails.
+        cluster = FakeCluster()
+        cluster.job_log_progress = [f"{self.TYPE_LINE}\n", None, None, f"{self.TYPE_LINE}\nPASS dm: answer\n"]
+        cluster.job_running_polls = 1
+        code, out, _ = self.run_streaming(cluster, "--context", CONTEXT, "--checks", "dm")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("PASS dm: answer", out)
+        self.assertNotIn("final log read failed", out)
 
     def test_streamed_lines_are_redacted(self):
         cluster = FakeCluster()
@@ -869,6 +897,20 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertEqual(code, launch.EXIT_OK)
         self.assertEqual(cluster.calls, [])
         self.assertIn("kind: Job", out)
+
+    def test_render_needs_no_bot_for_any_checks(self):
+        # It runs nothing, so the README's `--render` with no `--` section works.
+        for checks in ((), ("--checks", "legacy-socket")):
+            with self.subTest(checks=checks):
+                cluster = FakeCluster()
+                code, out = run_launch(cluster, "--render", *checks)
+                self.assertEqual(code, launch.EXIT_OK, out)
+                self.assertIn("kind: Job", out)
+                self.assertEqual(cluster.calls, [])
+        # A bot that is passed is the one rendered.
+        code, out = run_launch(FakeCluster(), "--render", "--", "--bot-name", "kage")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("--bot-name", out)
 
     def test_owned_flags_after_the_separator_are_refused(self):
         for flag in ("--checks", "--run-id=x", "--project", "--keep-going"):

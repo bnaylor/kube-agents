@@ -610,7 +610,8 @@ def typed_problems(msg: dict, turn: TypedTurn, bot_user_id: str) -> list[str]:
         problems.append("it has no user field")
     elif msg["user"] != turn.user_id:
         problems.append(f"it was typed by {msg['user']}, not {turn.user_label}")
-    if turn.mention and f"<@{bot_user_id}>" not in msg.get("text", ""):
+    # slackMentionsBot in a2a/gateway/slack.go: <@U123> or <@U123|display>.
+    if turn.mention and not re.search(rf"<@{re.escape(bot_user_id)}[>|]", msg.get("text", "")):
         problems.append(f"it does not mention the bot (no <@{bot_user_id}> in its text); "
                         "type @ and pick the bot from Slack's list")
     return problems
@@ -867,6 +868,7 @@ def preflight(lookup: SlackClient, label: str, auth: dict, team_id: str) -> tupl
 
 def resolve_bot(client: SlackClient, bot_user_id: str, bot_name: str) -> tuple[str, str]:
     """The bot's member id, and the name a person types after @ to mention it."""
+    bot_name = bot_name.lstrip("@")
     if not bot_user_id:
         matches = []
         cursor = None
@@ -975,6 +977,22 @@ def finite_float(value: str) -> float:
     return number
 
 
+def positive_seconds(value: str) -> float:
+    # A wait or interval of 0 or less polls back to back, or crashes in time.sleep.
+    number = finite_float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"must be a number of seconds greater than 0, not {value!r}")
+    return number
+
+
+def epoch_seconds(value: str) -> float:
+    # 0 is --home-since's default, the run's start.
+    number = finite_float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be epoch seconds, not negative: {value!r}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=HARNESS_PROG, description="Live checks for the A2A gateway's Slack backend (run in-cluster by launch.py).",
                                      allow_abbrev=False)
@@ -990,19 +1008,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thread-ts", default="", help="thread root for the thread check when mention is not run")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="the text a TYPE line asks for a first turn, before its nonce")
     parser.add_argument("--followup", default=DEFAULT_FOLLOWUP, help="the text a TYPE line asks for in the thread check")
-    parser.add_argument("--type-timeout", type=finite_float, default=DEFAULT_TYPE_TIMEOUT_SECONDS,
+    parser.add_argument("--type-timeout", type=positive_seconds, default=DEFAULT_TYPE_TIMEOUT_SECONDS,
                         help="seconds a TYPE line waits for the person to type the turn")
     parser.add_argument("--wait-answer", action="store_true", help="wait past the status line for the answer itself")
-    parser.add_argument("--reply-timeout", type=finite_float, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
-    parser.add_argument("--poll-interval", type=finite_float, default=DEFAULT_POLL_INTERVAL_SECONDS)
+    parser.add_argument("--reply-timeout", type=positive_seconds, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
+    parser.add_argument("--poll-interval", type=positive_seconds, default=DEFAULT_POLL_INTERVAL_SECONDS)
     parser.add_argument("--unlisted-via", choices=(UNLISTED_VIA_DM, UNLISTED_VIA_MENTION), default=UNLISTED_VIA_DM)
     parser.add_argument("--unlisted-repeat", action="store_true",
                         help="after the notice, ask for a second typed message from the unlisted user and expect no reply")
-    parser.add_argument("--quiet-window", type=finite_float, default=DEFAULT_QUIET_WINDOW_SECONDS)
+    parser.add_argument("--quiet-window", type=positive_seconds, default=DEFAULT_QUIET_WINDOW_SECONDS)
     parser.add_argument("--refusal-silence-ok", action="store_true", help="accept silence for the unlisted check")
     parser.add_argument("--home-channel", default="", help="channel the home check watches for a bot post")
-    parser.add_argument("--home-since", type=finite_float, default=0.0, help="epoch seconds; default is the run's start")
-    parser.add_argument("--home-timeout", type=finite_float, default=DEFAULT_HOME_TIMEOUT_SECONDS)
+    parser.add_argument("--home-since", type=epoch_seconds, default=0.0, help="epoch seconds; default is the run's start")
+    parser.add_argument("--home-timeout", type=positive_seconds, default=DEFAULT_HOME_TIMEOUT_SECONDS)
     parser.add_argument("--home-match", type=regex, default="", help="regex the home post's text must match")
     parser.add_argument("--run-id", default="", help="names this run in its RUN line; random when unset")
     # Endpoint overrides for the offline tests.
