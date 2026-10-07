@@ -63,7 +63,9 @@ const (
 	// the port cannot spend the gateway's memory one idle connection at a
 	// time. A connection past it waits in the kernel's accept queue until
 	// one closes. metricsMaxRequestsInFlight holds concurrent renders to the
-	// same number; a render past it is answered 503.
+	// same number, so it cannot fire while the listener caps connections at
+	// 16 (each connection serves one request at a time); it is kept so the
+	// handler stays bounded if it is ever served without that listener.
 	metricsMaxConnections      = 16
 	metricsMaxRequestsInFlight = metricsMaxConnections
 	// metricsConnectionDeadline is the broker's

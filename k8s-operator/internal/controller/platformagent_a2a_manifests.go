@@ -4632,7 +4632,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 
-	// All three fences ride reconcileA2ANetworkFences so they appear and
+	// The A2A fences ride reconcileA2ANetworkFences so they appear and
 	// disappear with the stack they fence — including the skew freeze, where a
 	// frozen, running bus keeps its ingress policy and the workers on it keep
 	// their egress one.
@@ -4950,7 +4950,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		// the removal is safe to run now; skipping it would leave a flag
 		// that went off during the hold with the door's objects rendered
 		// until the callout serves. The gateway's own fence goes too: it
-		// fences a pod that does not exist.
+		// fences a pod the API server no longer holds (see
+		// removeA2AGatewayFence for the reap window that leaves).
 		if err := r.removeA2AGatewayFence(ctx, agent); err != nil {
 			return state, err
 		}
@@ -4988,16 +4989,16 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
-	// And the removal AFTER it, which is the other half of the same ordering
-	// argument. The re-render above is what stops the gateway listening; a
-	// fence deleted before it lands leaves the previous pod serving the
-	// inject port with nothing selecting it, reachable on its pod IP by
-	// anything in the cluster for as long as the rollout takes. Deleting
-	// after means the fence outlives the apply, not the rollout: the removal
-	// does not wait for the new pod to be ready, so the previous pod can
-	// serve the port unfenced for the rest of its termination. Narrower than
-	// the other order, not closed; closing it would mean holding the removal
-	// on the Deployment's rollout status.
+	// And the removal AFTER it, the other half of the same ordering
+	// argument. The re-render above is what stops the gateway listening on
+	// the door. Before #2473 this order was what kept the previous pod
+	// fenced, and only through the apply, not the rollout. Now the gateway's
+	// own fence (buildA2AGatewayFencePolicy) selects the same pod and is
+	// written ahead of the Deployment on every pass that reaches here, by
+	// the fences pass or by the render above, and it admits nobody to a
+	// door's port; so dropping a door's fence never leaves the previous pod
+	// unselected. The order stays because a door's fence is still that
+	// door's own object, and costs nothing.
 	if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 		return state, err
 	}
@@ -5010,9 +5011,15 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 
 // removeA2AGatewayFence takes the gateway's own fence away on a pass that
 // withholds or holds the gateway. Both happen only while the Deployment is
-// absent, so nothing is listening and the order the doors' removal needs
-// (after the apply) does not arise. One cached read: NetworkPolicy is an
-// Owns() kind.
+// absent (the withheld path on a cached NotFound, the held path on a live
+// one), so the order the doors' removal needs (after the apply) does not
+// arise. Absent is not the same as no pod listening: a Deployment deleted by
+// hand leaves its ReplicaSet and pod to the garbage collector, and the pod
+// then runs out its termination grace, so for those seconds the old pod can
+// serve its counters on 9096 with nothing selecting it. Counters only, and
+// the same async-reap gap a2aBusTeardown's session-fence comment names;
+// closing it would mean holding the removal until no gateway pod remains.
+// One cached read: NetworkPolicy is an Owns() kind.
 func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
 	if err := r.deleteOwnedA2AObject(ctx, agent, np, r.Client); err != nil {
@@ -5058,14 +5065,14 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // Easy to leave out and expensive to leave out. Unsetting the operator's flag
 // re-renders the gateway without the listener, so the Service would go on
 // pointing at a closed port -- harmless -- but the ConfigMap would go on
-// naming a principal nothing checks, the fence would go on denying ingress to
-// a gateway that no longer needs it, and the Secret would leave a live bearer
+// naming a principal nothing checks, the fence would go on fencing a door
+// that is gone, and the Secret would leave a live bearer
 // token for a door that is gone. The first three are residue on an install
 // that is supposed to look like it never had an eval door; the last is more
 // than residue.
 //
-// Called AFTER the gateway Deployment is applied, which is what makes the
-// fence safe to drop -- see the call site. Four reads on each reconcile of a
+// Called AFTER the gateway Deployment is applied -- see the call site for
+// why the order stays now that the gateway's own fence covers the pod. Four reads on each reconcile of a
 // next install is the standing cost. Three are cached: Service, ConfigMap
 // and NetworkPolicy are Owns() kinds (see SetupWithManager), so their
 // informers exist. The Secret is NOT read through the cache, and this is
