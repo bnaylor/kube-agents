@@ -329,10 +329,13 @@ kill path and lands `failed`.
 
 The reap after any exit is bounded by the same grace. A process the subprocess started outside
 its group survives the group kill and can hold stdout or stderr open; the bridge stops waiting
-for the output one grace after the subprocess is reaped. A killed run whose reap ran that long
-adds `; the reap after the kill ran the full <grace>, so a process hermes started may still hold
-its output` to its reason. A run that exited 0 still completes: what it wrote was copied during
-the grace, and only the escaped process's later output is dropped.
+for the output one grace after the subprocess is reaped. A run killed by the deadline or a cancel
+whose reap ran that long adds `the reap after the kill ran the full <grace>, so a process hermes
+started may still hold its output` to its reason as detail, keeping the token intact:
+`reason: canceled-by-request - the reap after the kill ...`. A run killed by bridge shutdown
+carries the plain `bridge-shutdown` reason, published before the reap ends. A run that exited 0
+still completes: what it wrote was copied during the grace, and only the escaped process's later
+output is dropped.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable

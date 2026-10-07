@@ -256,9 +256,10 @@ type taskRun struct {
 	state      runState
 	proc       *exec.Cmd
 	killTimers []*time.Timer
-	// killedAt is when the first kill reached the process group: the
-	// deadline, a cancel or shutdown. Under mu. Zero for a run that exited
-	// on its own.
+	// killedAt is when killGroup first signalled the process group: the
+	// deadline or a cancel. Under mu. Zero for a run that exited on its own
+	// or was killed by shutdownTasks, whose own finalize wins before the
+	// bounded reap ends, so there is no reason left to note it in.
 	killedAt time.Time
 	// cancelReq ends the API executor's request (api.go); nil outside one.
 	// Under mu like proc, which it is the counterpart of.
@@ -496,9 +497,6 @@ func (b *Bridge) shutdownTasks() {
 	for _, r := range runs {
 		r.mu.Lock()
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
-			if r.killedAt.IsZero() {
-				r.killedAt = time.Now()
-			}
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
 		}
 		if r.state == stateRunning && r.cancelReq != nil {
@@ -1038,7 +1036,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		t.Stop()
 	}
 	run.killTimers = nil
-	cut := reapCutNote(run.killedAt, reaped, cmd.WaitDelay)
+	note := reapCutNote(run.killedAt, reaped, cmd.WaitDelay)
 	run.mu.Unlock()
 
 	if errors.Is(err, exec.ErrWaitDelay) {
@@ -1060,19 +1058,21 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline)+cut, nil)
+			withDetail(fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), note), nil)
 	case run.canceled.Load():
-		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request"+cut, nil)
+		b.finalize(run, lib.StateCanceled, withDetail("reason: canceled-by-request", note), nil)
 	case b.closing.Load():
 		// Killed by shutdownTasks; name the real cause, not the exit code.
-		b.finalize(run, lib.StateFailed, shutdownReason+cut, nil)
+		// No reap note: shutdownTasks finalized this run right after its
+		// kill, so this arm wins only when the reap was quick.
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
 }
 
-// reapCutNote is what a killed run's reason adds when the reap after the
-// kill ran the full bound, or nothing. A failed exit hides whether WaitDelay
+// reapCutNote is the detail a killed run's reason adds when the reap after
+// the kill ran the full bound, or "". withDetail attaches it. A failed exit hides whether WaitDelay
 // fired (Wait returns the exit status and drops exec.ErrWaitDelay), so the
 // time from the first kill to the reap stands in for it. It is a hint, not
 // proof: a run that ignores SIGTERM until the SIGKILL a grace later is
@@ -1083,7 +1083,22 @@ func reapCutNote(killedAt, reaped time.Time, bound time.Duration) string {
 	if killedAt.IsZero() || bound <= 0 || reaped.Sub(killedAt) < bound {
 		return ""
 	}
-	return fmt.Sprintf("; the reap after the kill ran the full %s, so a process hermes started may still hold its output", bound)
+	return fmt.Sprintf("the reap after the kill ran the full %s, so a process hermes started may still hold its output", bound)
+}
+
+// withDetail appends detail to a reason in the executors' grammar,
+// `reason: <token>[ - detail]`: after " - " when the reason is the bare
+// token, after "; " when it already has a detail. Readers take the token as
+// the word after the prefix, so the token must stay followed by a space.
+func withDetail(reason, detail string) string {
+	switch {
+	case detail == "":
+		return reason
+	case strings.Contains(reason, " - "):
+		return reason + "; " + detail
+	default:
+		return reason + " - " + detail
+	}
 }
 
 // failureReason is the terminal message for a subprocess that exited
