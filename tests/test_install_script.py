@@ -5892,7 +5892,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         # A developer's own exports must not answer for the file.
         for key in ("SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
                     "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
-                    "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "PERSIST_SECRETS_ON_DISK"):
+                    "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
+                    "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK"):
             env.pop(key, None)
         env.update(overrides)
         return env
@@ -5958,6 +5959,11 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_HOME_CHANNEL_NAME=\\#a\n", "'--slack-home-channel-name=#b'", "SLACK_HOME_CHANNEL_NAME", "--slack-home-channel-name=\\#b"),
                 ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
                 ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
+                # A topic rename is a destroy and re-create of the Pub/Sub topic.
+                ("CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b", "CHAT_TOPIC_NAME", "--chat-topic-name=topic-b"),
+                ("GOOGLE_CHAT_MODE=default\n", "--google-chat-mode=debug", "GOOGLE_CHAT_MODE", "--google-chat-mode=debug"),
+                # The allowlists compare as lists: a different member is a disagreement.
+                ("ALLOWED_USERS=a@x.com,b@x.com\n", "--google-chat-allowed-users=a@x.com,c@x.com", "ALLOWED_USERS", "--google-chat-allowed-users=a@x.com\\,c@x.com"),
             ):
                 with self.subTest(content=content, flags=flags):
                     path, proc, out = self._check(tmp, content, flags)
@@ -6022,6 +6028,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_ALLOWED_USERS='U1,U2'\n", "--slack-allowed-users=U1,U2"),
                 ("SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts\n", "'--slack-home-channel-name=#gke alerts'"),
                 ("SLACK_BOT_TOKEN=xoxb-1\n", "--slack-bot-token=xoxb-1"),
+                # The allowlists render through hcl_csv_list, so a different
+                # spelling of the same list is the same list.
+                ("ALLOWED_USERS='a@x.com,b@x.com'\n", "'--google-chat-allowed-users=a@x.com, b@x.com'"),
+                ("SLACK_ALLOWED_USERS='U1 U2'\n", "--slack-allowed-users=U1,U2"),
+                # The topic and the mode set empty render their defaults.
+                ("CHAT_TOPIC_NAME=\n", "--chat-topic-name=platform-agent-chat-events"),
+                ("GOOGLE_CHAT_MODE=\n", "--google-chat-mode=default"),
                 # An empty recorded token is recovered from the Secret, as a
                 # missing one is, so it is nothing to disagree with.
                 ("SLACK_APP_TOKEN=\n", "--slack-app-token=xapp-1"),
@@ -6090,6 +6103,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-home-channel-name", "SLACK_HOME_CHANNEL_NAME", "#gke alerts"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
+                ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
+                ("--google-chat-mode", "GOOGLE_CHAT_MODE", "debug"),
             ):
                 with self.subTest(key=key):
                     path = self._file(tmp, "PROJECT_ID=p\n")
@@ -6136,9 +6151,33 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertIn("a run without --dry-run records the SLACK_ENABLED it applies there, from --enable-slack", out)
             self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
 
+    def test_a_file_the_run_cannot_write_is_refused_before_anything_when_a_key_would_be_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            path.chmod(0o400)
+            try:
+                proc = self._run(f"parse_args --enable-slack; {self._CHECK}", path)
+                agreeing = self._file(tmp, "SLACK_ENABLED=true\n", name="agreeing.env")
+                agreeing.chmod(0o400)
+                ok = self._run(f"parse_args --enable-slack; {self._CHECK}", agreeing)
+            finally:
+                path.chmod(0o600)
+            out = proc.stdout + proc.stderr
+            self.assertIn("rc=1", proc.stdout, out)
+            self.assertIn(f"{path} assigns no SLACK_ENABLED, which this run would record there, and it is not writable", out)
+            # Nothing to record, nothing to write: a read-only file that agrees is fine.
+            self.assertIn("rc=0 QUEUED=[]", ok.stdout, ok.stdout + ok.stderr)
+
+    def test_the_subscription_name_flag_is_not_held(self):
+        # On a running install the generator takes the subscription name from
+        # Terraform state, ahead of both the flag and the file.
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(tmp, "CHAT_SUB_NAME=sub-a\n", "--chat-sub-name=sub-b")
+        self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
     def test_the_menu_refuses_a_chat_flag_it_would_drop(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for flag in ("--enable-slack", "--enable-google-chat=false", "--slack-allowed-users=U1"):
+            for flag in ("--enable-slack", "--enable-google-chat=false", "--slack-allowed-users=U1", "--chat-topic-name=t"):
                 with self.subTest(flag=flag):
                     proc = self._run(
                         f'run_menu_system() {{ echo "MENU RAN"; }}; print_banner() {{ :; }}; main --menu {flag}',

@@ -82,16 +82,18 @@ NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
 # How check_flag_against_install_env compares a typed chat flag with the key
-# install.env records: a boolean read through is_truthy, a literal string, or a
-# credential, whose value is never printed and whose home is the live Secret
+# install.env records: a boolean read through is_truthy, a literal string, a
+# list read through hcl_csv_list (the form write_tfvars_from_state renders), or
+# a credential, whose value is never printed and whose home is the live Secret
 # rather than the file.
 readonly INSTALL_ENV_FLAG_KIND_BOOL="bool"
 readonly INSTALL_ENV_FLAG_KIND_STRING="string"
+readonly INSTALL_ENV_FLAG_KIND_LIST="list"
 readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
 # The keys the Day-2 menu's Save & Apply writes among those, so a refusal
 # names --menu only where the menu can make the edit. Mirrors run_menu_system's
 # save_env_var calls.
-readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED"
+readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED"
 # The chat flags this run typed, one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
 # noted by parse_args; and the keys among them that install.env does not
 # assign, for record_flags_into_install_env to append once the run commits.
@@ -210,8 +212,10 @@ unset _install_defaults_dir
 # something each flag has to remember to do and becomes the default path.
 #
 # An input the installer reads and does not rewrite. It creates one at the end
-# of a first install, when there is nothing there, and never touches it again:
-# a file the documentation tells you to edit and the next run overwrites is
+# of a first install, when there is nothing there, and after that changes no
+# line of it; the one thing it adds is a chat key the file lacks, from a chat
+# flag (check_flag_against_install_env). A file the documentation tells you to
+# edit and the next run overwrites is
 # exactly the complaint against vars.sh, whose header said "auto-generated"
 # while INSTALL.md told you to hand-edit it.
 #
@@ -702,10 +706,11 @@ Flags for AI Agents & Automation:
   --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
                                 this requires --slack-bot-token and --slack-app-token.
                                 Against an existing install.env, these two and the
-                                --slack-* and --google-chat-allowed-users /
-                                --google-chat-home-channel flags must agree with the key
-                                the file assigns (a disagreement is refused: edit the key);
-                                a key the file lacks is recorded there, tokens excepted
+                                --slack-*, --google-chat-allowed-users,
+                                --google-chat-home-channel, --google-chat-mode and
+                                --chat-topic-name flags must agree with the key the file
+                                assigns (a disagreement is refused: edit the key); a key
+                                the file lacks is recorded there, tokens excepted
   --enable-pubsub-platform[=true|false]
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
@@ -975,7 +980,7 @@ parse_args() {
         shift ;;
       --google-chat-allowed-users=*)
         PARAM_ALLOWED_USERS="${1#*=}"
-        note_install_env_flag ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_ALLOWED_USERS
+        note_install_env_flag ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_ALLOWED_USERS
         shift ;;
       --slack-bot-token=*)
         PARAM_SLACK_BOT_TOKEN="${1#*=}"
@@ -987,7 +992,7 @@ parse_args() {
         shift ;;
       --slack-allowed-users=*)
         PARAM_SLACK_ALLOWED_USERS="${1#*=}"
-        note_install_env_flag SLACK_ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_ALLOWED_USERS
+        note_install_env_flag SLACK_ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_SLACK_ALLOWED_USERS
         shift ;;
       --slack-home-channel=*)
         PARAM_SLACK_HOME_CHANNEL="${1#*=}"
@@ -997,9 +1002,15 @@ parse_args() {
         PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
         shift ;;
-      --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+      --chat-topic-name=*)
+        PARAM_CHAT_TOPIC_NAME="${1#*=}"
+        note_install_env_flag CHAT_TOPIC_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_CHAT_TOPIC_NAME DEFAULT_CHAT_TOPIC_NAME
+        shift ;;
       --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
-      --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
+      --google-chat-mode=*)
+        PARAM_GOOGLE_CHAT_MODE="${1#*=}"
+        note_install_env_flag GOOGLE_CHAT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_MODE DEFAULT_GOOGLE_CHAT_MODE
+        shift ;;
       --google-chat-home-channel=*)
         PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"
         note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL
@@ -1638,20 +1649,22 @@ install_env_records_key() {
 # differently.
 #
 # install.env is an input: install.sh creates one when there is none and never
-# rewrites it. The interview, though, still runs in full on every interactive
+# rewrites a line of it. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
 # tells them: "Left your install configuration as you wrote it" reads as
 # reassurance, and the Day-2 menu's Save & Apply is the only path that writes a
-# key back.
+# changed key back.
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
 # needs the installer to treat it as read-only. Naming the drift costs nothing
-# and leaves the decision where it belongs.
+# and leaves the decision where it belongs. The one write install.sh does make
+# is narrower: a chat key the file does not assign, appended from a chat flag
+# (check_flag_against_install_env); it never changes a key the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1709,7 +1722,7 @@ warn_unrecorded_interview_answers() {
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never rewrites it."
+  print_info "install.env is an input: install.sh reads it and never changes a key it sets."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1888,9 +1901,11 @@ warn_flag_beats_unrecorded_file_value() {
 # file does carry is still held to it, since the file's copy is the one a later
 # run renders.
 #
-# A file the installer created always assigns the two toggles and the four
-# non-credential Slack and Chat strings, so on such a file nothing is ever
-# appended; only a refusal or a no-op can follow. The same holds for an
+# A file the installer created assigns every one of these keys but the tokens,
+# so on such a file nothing is ever appended; only a refusal or a no-op can
+# follow. --chat-sub-name is left out: the subscription name is read back from
+# Terraform state, which outranks both the flag and the file on a running
+# install (write_tfvars_from_state). The same holds for an
 # install.env rendered for CI from a full set of variables. A rendered file
 # that omits a key gets the key appended, on the runner that owns the file.
 
@@ -1951,6 +1966,9 @@ check_flag_against_install_env() {
       print_info "Replace ${key} in ${file} with the new value and re-run without ${flag}."
       return 1
       ;;
+    "$INSTALL_ENV_FLAG_KIND_LIST")
+      [ "$(hcl_csv_list "$recorded")" != "$(hcl_csv_list "$value")" ] || return 0
+      ;;
     *)
       [ "$recorded" != "$value" ] || return 0
       ;;
@@ -1989,6 +2007,13 @@ check_flags_against_install_env() {
     [ -z "$default_var" ] || default="${!default_var-}"
     check_flag_against_install_env "$file" "$key" "$flag" "$kind" "${!param-}" "$default" || refused="true"
   done
+  # A key to record into a file this run cannot write would fail at the record,
+  # which sits after the existing-cluster changes; say so now instead.
+  if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ ! -w "$file" ]; then
+    print_error "${file} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }, which this run would record there, and it is not writable."
+    print_info "Make it writable, or add the keys to it yourself, and re-run."
+    refused="true"
+  fi
   [ "$refused" = "false" ]
 }
 
@@ -1999,8 +2024,9 @@ check_flags_against_install_env() {
 # makes to an install.env it did not create, and only of keys the file lacks,
 # so nothing the operator wrote changes. main calls it on each route as the last
 # step before the handoff or the apply, past the confirmation and every step
-# that can stop the run, so a refused, declined, failed or --dry-run run leaves
-# the file as it was.
+# that can stop the run, so a run refused, declined or failed before the apply,
+# and a --dry-run, leave the file as it was. An apply that then fails has
+# recorded what it was applying, which is what the next run should retry.
 record_flags_into_install_env() {
   local file="${INSTALL_ENV_FILE:-}" key value
   [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
@@ -2268,7 +2294,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it."
+    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -4756,8 +4782,8 @@ main() {
     # The chat flags likewise: the menu applies the keys install.env records
     # and edits them on its own screens, so a flag here would be dropped.
     if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
-      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel): it applies the chat keys install.env records."
-      print_info "Change Slack or Google Chat on the menu's own screens, set the keys in install.env, or pass the flags to a plain install.sh run."
+      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
+      print_info "The menu's chat screen turns Slack and Google Chat on or off and edits the Google Chat allowlist, topic and home channel; set the other keys in install.env, or pass the flags to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -5263,8 +5289,8 @@ main() {
     # --enable-google-chat or --enable-slack that disagrees with it is refused
     # (check_flag_against_install_env), so the key is the way to turn one on.
     echo -e "  To add a chat platform later, set ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} or ${C_BOLD}SLACK_ENABLED=true${C_RESET} in install.env and"
-    echo -e "  re-run ${C_BOLD}./install.sh${C_RESET}, or use ${C_BOLD}./install.sh --menu${C_RESET}. --enable-google-chat and --enable-slack are refused over"
-    echo -e "  a file that records the key."
+    echo -e "  re-run ${C_BOLD}./install.sh${C_RESET} (for Slack, with --slack-bot-token and --slack-app-token), or use ${C_BOLD}./install.sh --menu${C_RESET}."
+    echo -e "  --enable-google-chat and --enable-slack are refused over a file that records the key."
   }
 
   case "$chat_choice" in

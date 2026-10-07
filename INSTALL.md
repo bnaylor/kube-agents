@@ -267,7 +267,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
 
 A flag left out does not always take the shipped default. A flag wins over an `install.env` from an
 earlier run, which wins over an exported variable — including an exported API key — which wins over
-`install.defaults.env`; see
+`install.defaults.env`. The chat flags are the exception: over an existing `install.env` one that
+disagrees with the file is refused. See
 [`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv).
 
 ---
@@ -558,11 +559,10 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   default and the forward cannot see into the sandbox. `kubectl exec` enters it.
 
 To add a chat platform later, set `GOOGLE_CHAT_ENABLED=true` or `SLACK_ENABLED=true` in
-`install.env`, re-run `./install.sh` (or use `./install.sh --menu`), and follow Step 5. The
-`install.env` a first install writes records both as `false`, and `install.sh` refuses
-`--enable-google-chat` or `--enable-slack` over a file that records the key the other way, because
-`upgrade.sh` renders the chat integrations from the file and would undo a one-run flag; the flag
-is recorded only into a file that sets no such key
+`install.env`, re-run `./install.sh` (for Slack, with `--slack-bot-token` and `--slack-app-token`,
+or interactively to be asked for them) or use `./install.sh --menu`, and follow Step 5. The
+`install.env` a chat-less install writes records both as `false`, and `install.sh` refuses
+`--enable-google-chat` or `--enable-slack` over a file that records the key the other way
 ([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
 
 ---

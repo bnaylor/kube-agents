@@ -138,32 +138,40 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
 `install.sh` reads it and does not rewrite it. It creates one at the end of a first
-install, when there is nothing there, and never touches it again; the Day-2 menu's
-"Save & Apply" is the one path that edits it, one key at a time, leaving comments and
-ordering intact. That asymmetry is deliberate: a file the documentation tells you to edit
-and the next run overwrites is what made the old `vars.sh` confusing.
+install, when there is nothing there, and after that changes no line of it; the one thing
+it adds is a chat key the file lacks, under the rule below. The Day-2 menu's "Save & Apply"
+is the one path that edits a key, one at a time, leaving comments and ordering intact. That
+asymmetry is deliberate: a file the documentation tells you to edit and the next run
+overwrites is what made the old `vars.sh` confusing.
 
 The chat flags are held to the file rather than overriding it for one run, because
 `upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
 one-run override would be undone by the next full upgrade without a word. They are
 `--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
 `--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
-`--slack-bot-token` and `--slack-app-token`. Against an existing `install.env`, a flag that
-disagrees with the key the file assigns is refused before anything is applied, naming the
-file and the key: edit the key (or, for the toggles and the Google Chat keys, use the Day-2
-menu) and re-run without the flag. A toggle the file sets empty counts as its default. A flag
+`--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
+Against an existing `install.env`, a flag that disagrees with the key the file assigns is
+refused before anything is applied, naming the file and the key: edit the key (or, for the
+two toggles and the Google Chat allowlist, topic and home channel, use the Day-2 menu) and
+re-run without the flag. A key with a default (the toggles, the topic, the Chat mode) that
+the file sets empty counts as that default, and the two allowlists compare as the lists they
+render to, so `a,b` and `a, b` agree. `--chat-sub-name` is not held: on a running install the
+subscription name comes from Terraform state, ahead of both the flag and the file. A flag
 whose key the file does not assign at all is appended to the file with the value the run
-applies, as the last step before the apply or the `--generate-only` handoff, so a refused,
-declined or failed run and a `--dry-run` leave the file as it was. This is the one write
+applies, as the last step before the apply or the `--generate-only` handoff, so a run refused,
+declined or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
+then fails has recorded what it was applying. A file the run cannot write is refused up front
+when there is a key to record. This is the one write
 `install.sh` makes to a file it did not create, and only of keys the file lacks. A flag that
 agrees changes nothing. The Slack tokens are never appended: their home is the live
 `platform-agent-secrets` Secret, which `write_tfvars_from_state` recovers them from on every
 later run, and `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file. A token the file
 does carry is still held to it. A file `install.sh` wrote assigns every one of these keys but
 the tokens, so on it a chat flag is either refused or a no-op. A file CI renders leaves out a
-key whose variable is empty, and the provisioning script derives each chat flag from the same
-variable, so on a runner a flag either agrees with the rendered key or is appended to the
-runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
+key whose variable is empty, and the provisioning script derives each chat flag from the
+variable that renders its key (the Google Chat allowlist flag also reads
+`GOOGLE_CHAT_ALLOWED_USERS` first, which no workflow sets), so on a runner a flag either agrees
+with the rendered key or is appended to the runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
 edits the keys on its own screens.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,

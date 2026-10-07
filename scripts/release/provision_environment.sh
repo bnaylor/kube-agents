@@ -234,7 +234,11 @@ INSTALL_ARGS=(
 # sourced with `set -a` and so beats an exported variable of the same name, and
 # these environments render an install.env from their GitHub variables -- so a
 # setting passed only by export is silently overridden by whatever the rendered
-# file happens to say. A flag is the one thing that wins for a single run.
+# file happens to say. A flag is the one thing that wins for a single run, except
+# the chat flags (the Slack and Google Chat ones below): install.sh refuses one
+# that disagrees with a key the rendered file sets, and appends the key when the
+# file lacks it. The install.env deploy-environment.yml renders before calling
+# this script names only the install, so each chat key is appended from its flag.
 if [ -n "${NAMESPACE:-}" ]; then
   INSTALL_ARGS+=(--agent-namespace="${NAMESPACE}")
 fi
