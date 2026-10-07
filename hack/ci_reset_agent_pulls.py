@@ -37,12 +37,6 @@ repository as well. The token arrives in the environment
 (`AGENT_PULLS_RESET_TOKEN`), never on argv. `--record` writes what happened as
 JSON beside the job's artifacts, so every run carries its own proof;
 `--dry-run` lists and writes nothing, for a laptop with a personal token.
-
-Exits 0 when the repository is clean, 1 when it is not or GitHub refused a
-call, 2 for a guard (no token, a repository that is not the project's), and
-the code in AGENT_PULLS_RESET_TRANSIENT_EXIT when a transient GitHub answer
-outlasted the retries before the read-back, so the shell can tell weather
-from a fault.
 """
 
 from __future__ import annotations
@@ -86,17 +80,6 @@ RETRYABLE_STATUS_FLOOR = 500
 # What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
 # http.client's own faults for a response cut short, which urllib passes on.
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
-# The exit for "ran and left the repository unclean", and for any fault that
-# is not weather: the shell does not launch the unit, and it grades MISSING.
-UNCLEAN_EXIT = 1
-# The exit for retries that ran out on an answer another attempt could
-# survive, which the shell records as infrastructure rather than MISSING. The
-# shell hands its own code in (LEDGER_MINT_RETRYABLE in hack/ci-eval-pr.sh),
-# as it does to hack/ledger_token_mint.py, so the two halves cannot drift.
-# Unset or not an exit code, such a fault exits UNCLEAN_EXIT, as it did
-# before: a laptop run sees no new code.
-TRANSIENT_EXIT_ENV = "AGENT_PULLS_RESET_TRANSIENT_EXIT"
-EXIT_CODE_MAX = 255
 RECORD_SCHEMA_VERSION = 1
 ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -108,26 +91,6 @@ def transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= RETRYABLE_STATUS_FLOOR
     return isinstance(exc, (OSError, http.client.HTTPException))
-
-
-def ran_out_on_weather(exc: BaseException) -> bool:
-    """The retries ended on an answer another attempt could survive: a 5xx,
-    a 429, a 403 GitHub marks as its rate limit, or a host that was not
-    reached. The mint's discriminator (hack/ledger_token_mint.py); the limit
-    reading is the sweep's is_rate_limited, which the mint's copy is held to."""
-    if isinstance(exc, urllib.error.HTTPError):
-        return exc.code >= RETRYABLE_STATUS_FLOOR or is_rate_limited(exc)
-    return transient(exc)
-
-
-def fault_exit(exc: BaseException) -> int:
-    """The exit for a fault that stopped the reset before its read-back."""
-    if not ran_out_on_weather(exc):
-        return UNCLEAN_EXIT
-    raw = os.environ.get(TRANSIENT_EXIT_ENV, "").strip()
-    if not raw.isdigit() or not 0 < int(raw) <= EXIT_CODE_MAX:
-        return UNCLEAN_EXIT
-    return int(raw)
 
 
 def call(method: str, path: str, token: str, body: dict | None = None):
@@ -383,13 +346,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except urllib.error.HTTPError as exc:
         record["error"] = f"GitHub answered {describe(exc)} reading {args.repo}"
-        hint = "" if ran_out_on_weather(exc) else "; a 403 or 404 here is the token's reach, not an empty repository"
-        print(f"ERROR: {record['error']}{hint}", file=sys.stderr)
-        return fault_exit(exc)
+        print(
+            f"ERROR: {record['error']}; a 403 or 404 here is the token's reach, not an empty repository",
+            file=sys.stderr,
+        )
+        return 1
     except (OSError, http.client.HTTPException) as exc:
         record["error"] = f"could not reach api.github.com ({type(exc).__name__}: {exc})"
         print(f"ERROR: {record['error']}", file=sys.stderr)
-        return fault_exit(exc)
+        return 1
     finally:
         # On every exit, the faulted ones included: the record is the
         # artifact the shell step names as evidence.

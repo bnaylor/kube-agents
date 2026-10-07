@@ -247,14 +247,14 @@ def _lift_line(pattern, what):
 
 
 # hack/ci_reset_agent_pulls.py as run_one_unit's reset meets it: the exit
-# codes and the ERROR line the real helper prints, by RESET_HELPER.
+# codes and the lines the real helper prints, by RESET_HELPER.
 RESET_HELPER_STUB = """\
 import os, sys
 mode = os.environ.get("RESET_HELPER", "clean")
-if mode == "transient":
+if mode == "github-500":
     print("  GET /repos/x/pulls answered HTTP 500; trying again in 2s", file=sys.stderr)
     print("ERROR: GitHub answered HTTP 500 Internal Server Error reading gke-agentic/kube-agents-evals-2-infra", file=sys.stderr)
-    sys.exit(int(os.environ.get("AGENT_PULLS_RESET_TRANSIENT_EXIT") or 1))
+    sys.exit(1)
 if mode == "unclean":
     print("closed 0 pull request(s) and deleted 0 branch(es); 0 agent pull request(s) and 1 branch(es) remain")
     sys.exit(1)
@@ -292,9 +292,9 @@ class UnitNotRunTest(unittest.TestCase):
         grading_mint / reset_mint: "ok", "transient" or "refused" -- what the
         stubbed mint answers on every attempt for that body.
         reset_helper: what the stubbed hack/ci_reset_agent_pulls.py does once
-        the reset's mint is good -- "clean", "transient" (its retries ran out
-        on GitHub's answer, so it exits the code the shell handed it) or
-        "unclean" (it ran and the read-back found a leftover).
+        the reset's mint is good -- "clean", "github-500" (its retries ran out
+        on GitHub's answer; it exits 1, as the real helper does) or "unclean"
+        (it ran and the read-back found a leftover).
         """
         hack = self.tmp / "hack"
         hack.mkdir(exist_ok=True)
@@ -407,6 +407,8 @@ class UnitNotRunTest(unittest.TestCase):
         self.assertIn("GitHub answered HTTP 500", error)
         self.assertEqual([], record["trajectory"])
         self.assertNotIn("devops-bench reached", self.finished.read_text())
+        # Rep 2 of 3 with no sibling finished: not the case's last, so ungraded.
+        self.assertNotIn("graded case-under-test", self.finished.read_text())
         self.assertIn("could not mint a ledger token", proc.stderr)
 
     def test_the_last_repetition_not_run_grades_its_case(self):
@@ -417,6 +419,17 @@ class UnitNotRunTest(unittest.TestCase):
                 (self.state / f"case-under-test.rep{rep}.{suffix}").write_text("1\n")
         self._unit(3, "transient")
         self.assertIn("graded case-under-test", self.finished.read_text())
+
+    def test_a_repetition_not_run_before_the_last_leaves_the_case_ungraded(self):
+        # Rep 2 of 3 lost to the mint: its record counts, but rep 3 has not
+        # finished, so the case is not graded yet. finish_case is the last
+        # repetition's to call, whichever way that one ends.
+        (self.state / "case-under-test.rep1.start").write_text("1\n")
+        (self.state / "case-under-test.rep1.end").write_text("1\n")
+        (self.state / "case-under-test.rep1.dir").write_text("1\n")
+        self._unit(2, "transient")
+        self.assertTrue(self._record(2)["errors"][0].startswith("KUBE_AGENTS_INFRA_FAILURE: "))
+        self.assertNotIn("graded", self.finished.read_text())
 
     def test_a_refused_mint_stays_missing(self):
         # A credential fault is not weather: no record, no state, MISSING.
@@ -440,6 +453,7 @@ class UnitNotRunTest(unittest.TestCase):
         self.assertIn("repository reset's token could not be minted before launch", error)
         self.assertIn("GitHub answered HTTP 500", error)
         self.assertNotIn("devops-bench reached", self.finished.read_text())
+        self.assertNotIn("graded case-under-test", self.finished.read_text())
 
     def test_a_refused_reset_mint_stays_missing(self):
         self._unit(1, "ok", reset_mint="refused", phase="1")
@@ -451,15 +465,13 @@ class UnitNotRunTest(unittest.TestCase):
         self._unit(1, "ok", phase="1")
         self.assertIn("devops-bench reached", self.finished.read_text())
 
-    def test_a_reset_that_ran_out_on_github_is_recorded_as_infrastructure(self):
-        # #2582 round 2: the mint was good, and the reset's own first read ran
-        # out on GitHub's 500s. The same weather as the mint's.
-        self._unit(1, "ok", phase="1", reset_helper="transient")
-        error = self._record(1)["errors"][0]
-        self.assertTrue(error.startswith("KUBE_AGENTS_INFRA_FAILURE: "), error)
-        self.assertIn("the repository reset ran out on a transient GitHub failure before launch", error)
-        self.assertIn("GitHub answered HTTP 500 Internal Server Error reading gke-agentic/kube-agents-evals-2-infra", error)
-        self.assertNotIn("could not be minted", error)
+    def test_a_reset_that_ran_out_on_github_stays_missing(self):
+        # The mint was good and the reset's own reads ran out on GitHub's
+        # 500s. Out of #2562's scope, which is the mint: this grades MISSING
+        # as on main until the follow-up (#RESETFU) gives it a transient exit.
+        self._unit(1, "ok", phase="1", reset_helper="github-500")
+        self.assertIsNone(self._dir(1))
+        self.assertFalse((self.state / "not-run").exists())
         self.assertNotIn("devops-bench reached", self.finished.read_text())
 
     def test_a_reset_that_left_the_repository_unclean_stays_missing(self):

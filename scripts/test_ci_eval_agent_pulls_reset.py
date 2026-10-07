@@ -53,9 +53,6 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 BUILD = "2102186223282950144"
-# Pinned as a literal: the shell sets it by this name (reset_agent_pulls), so a
-# rename on one side only must fail here rather than follow along.
-TRANSIENT_EXIT_ENV = "AGENT_PULLS_RESET_TRANSIENT_EXIT"
 
 
 def pull(number, branch="fix-payments-api-oom", author=BOT, head_repo=REPO, labels=()):
@@ -432,62 +429,6 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, 1, "an http.client fault is a reported fault, never a traceback")
         self.assertIn("IncompleteRead", err)
 
-    def run_transient(self, fault, code="75"):
-        """main with every call answering `fault` and the shell's transient code set."""
-
-        def answers(method, path, token, body=None):
-            raise fault() if callable(fault) else fault
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "unit.json"
-            env = {TRANSIENT_EXIT_ENV: code} if code is not None else {}
-            with mock.patch.dict(os.environ, env):
-                if code is None:
-                    os.environ.pop(TRANSIENT_EXIT_ENV, None)
-                rc, _, err = self.run_main(answers, "--record", str(path))
-            return rc, err, json.loads(path.read_text())
-
-    def test_retries_that_run_out_on_a_transient_answer_exit_the_shells_code(self):
-        # #2582 round 2: GitHub answering 500 to the reset's own reads is the
-        # same weather as a 500 on its mint, and the shell records it as
-        # infrastructure only if this exit says so.
-        faults = {
-            "a 502": lambda: _http_error(502),
-            "a 429": lambda: _http_error(429),
-            "a 403 marked by Retry-After": lambda: urllib.error.HTTPError("u", 403, "Forbidden", {"Retry-After": "1"}, io.BytesIO(b"")),
-            "a 403 marked in its body": lambda: urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b'{"message":"You have exceeded a secondary rate limit"}')),
-            "an unreachable host": lambda: OSError("connection refused"),
-            "a response cut short": lambda: http.client.IncompleteRead(b""),
-        }
-        for name, fault in faults.items():
-            with self.subTest(name):
-                rc, err, record = self.run_transient(fault)
-                self.assertEqual(rc, 75)
-                self.assertTrue(record["error"], "the record names what GitHub said")
-                self.assertIn("ERROR: ", err)
-                # Not the token's reach, so the line does not say it might be.
-                self.assertNotIn("token's reach", err)
-                self.assertFalse(record["clean"])
-
-    def test_a_refusal_and_an_unclean_repository_stay_one(self):
-        for name, fault in (("an unmarked 403", lambda: _http_error(403)), ("a 404", lambda: _http_error(404)), ("a 422", lambda: _http_error(422))):
-            with self.subTest(name):
-                rc, err, _ = self.run_transient(fault)
-                self.assertEqual(rc, 1)
-                self.assertIn("token's reach", err)
-        # Ran, and left a branch that would not go: not clean, not weather.
-        with mock.patch.dict(os.environ, {TRANSIENT_EXIT_ENV: "75"}):
-            self.assertEqual(self.run_main(FakeGitHub(branches=["b"], stubborn=["b"]))[0], 1)
-            # A close that ran out on a 500 mid-reset is still a repository
-            # left unclean: the read-back is the verdict, as before.
-            self.assertEqual(self.run_main(FakeGitHub(pulls=[pull(1)], fail={("PATCH", 1): _http_error(500)}))[0], 1)
-
-    def test_without_the_shells_code_a_transient_fault_is_one(self):
-        # A laptop run, or a caller that never set it: the old exit.
-        for code in (None, "", "seventy-five", "0", "256"):
-            with self.subTest(code=code):
-                self.assertEqual(self.run_transient(lambda: _http_error(502), code=code)[0], 1)
-
     def test_dry_run_is_zero_whatever_it_finds(self):
         self.assertEqual(self.run_main(FakeGitHub(pulls=[pull(1)]), "--dry-run")[0], 0)
 
@@ -524,11 +465,7 @@ STUB_HELPER = textwrap.dedent(
     import json, os, sys
     print("HELPER argv=" + json.dumps(sys.argv[1:]))
     print("HELPER token=" + os.environ.get("AGENT_PULLS_RESET_TOKEN", ""))
-    print("HELPER transient=" + os.environ.get("AGENT_PULLS_RESET_TRANSIENT_EXIT", ""))
-    rc = int(os.environ.get("HELPER_RC", "0"))
-    if rc:
-        print("ERROR: GitHub answered HTTP 502 Bad Gateway reading gke-agentic/kube-agents-evals-2-infra", file=sys.stderr)
-    sys.exit(rc)
+    sys.exit(int(os.environ.get("HELPER_RC", "0")))
     """
 )
 
@@ -568,7 +505,6 @@ class ResetStepTest(unittest.TestCase):
                 lifted("reset_agent_pulls"),
                 f'reset_agent_pulls "{label}"',
                 'echo "RC=$?"',
-                'echo "LAST=${AGENT_PULLS_RESET_LAST_FAILURE:-}"',
             ]
         )
         return run_bash(body, {"HELPER_RC": str(helper_rc)})
@@ -613,23 +549,6 @@ class ResetStepTest(unittest.TestCase):
     def test_a_helper_that_finds_the_repository_not_clean_fails_closed(self):
         result = self.run_step("lease", helper_rc=1)
         self.assertIn("WARNING: Agent pulls reset (lease): the helper exited 1; the repository is not clean", result.stderr)
-        self.assertIn("RC=1", result.stdout)
-        self.assertIn("LAST=\n", result.stdout + "\n")
-
-    def test_the_helper_is_handed_the_transient_code(self):
-        result = self.run_step("lease")
-        self.assertIn("HELPER transient=75", result.stdout)
-
-    def test_a_helper_that_ran_out_on_github_returns_the_transient_code(self):
-        result = self.run_step("pdb-remediation-pr rep 2", helper_rc=75)
-        self.assertIn("RC=75", result.stdout, result.stderr)
-        self.assertIn("LAST=GitHub answered HTTP 502 Bad Gateway reading gke-agentic/kube-agents-evals-2-infra", result.stdout)
-        self.assertIn("ran out on a transient GitHub failure", result.stderr)
-
-    def test_a_helper_guard_fault_is_still_one(self):
-        # 2 is the helper's own refusal (no token, a repository that is not
-        # the project's): blocking, like an unclean repository.
-        result = self.run_step("lease", helper_rc=2)
         self.assertIn("RC=1", result.stdout)
 
 
