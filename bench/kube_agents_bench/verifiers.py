@@ -3181,8 +3181,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``op: exists`` under ``none``. The inject lane appends exactly that
     entry to every case it runs (``hack/eval/inject-lane-safeguards.yaml``,
     applied by ``hack/ci-eval-pr.sh``), because the cluster safeguards say
-    nothing about GitHub and the platform persona the door addresses opens a
-    pull request where the chat path inlined a manifest (#2037).
+    nothing about GitHub and the platform persona the door's task reaches
+    (directly under the bridge's ``cli`` executor, through a card under the
+    bridge's default ``api``) opens a pull request where the chat path
+    inlined a manifest (#2037).
 
     WHAT IT READS. :func:`kube_agents_bench.github_writes.find_writes` over
     the repository ``BENCH_GITOPS_REPO`` names, from

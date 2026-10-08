@@ -1752,9 +1752,10 @@ esac
 # ─── The inject lane's exclusions (#2039) ────────────────────────────────────
 # Under AGENT_TRANSPORT=inject -- the harness's own switch, which the
 # EVAL_MODE_NEXT=1 block above exports before this point -- the matrix goes
-# through the gateway's inject door, which addresses `platform` directly: a
-# case whose premise needs the chat front door cannot hold there whatever
-# the agent does. hack/eval/inject-lane-exclusions.txt names those cases,
+# through the gateway's inject door, which carries neither a specialist's
+# answer folded back into the chat thread nor a card's wake: a case whose
+# premise needs one cannot hold there whatever the agent does.
+# hack/eval/inject-lane-exclusions.txt names those cases,
 # each with its reason as the comment block above it (the file's header and
 # scripts/test_eval_rosters.py hold every entry to one), and this drops them
 # from TASKS before TASK_NAMES and the fan-out are built from it, so the
@@ -1811,8 +1812,8 @@ fi
 # the inject door the platform persona (directly under the bridge's cli
 # executor, through a card under its default api executor) opens a pull
 # request where the chat path inlined a manifest (#2037): the first matrix run
-# through the door, under cli, left
-# pull requests on the pool repository that no case had asked for.
+# through the door, under cli, left pull requests on the pool repository that
+# no case had asked for.
 # hack/eval/inject-lane-safeguards.yaml holds the entries every case on the
 # lane carries beside its own -- one, a none-wrapped `github_writes` -- and
 # this step appends them to a COPY of each task file under a scratch

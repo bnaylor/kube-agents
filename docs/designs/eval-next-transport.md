@@ -355,8 +355,8 @@ the worker checks
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter: the door addresses `platform`, and
-`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
+the chat profile's `kanban_create` — is a different matter:
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason below, and the
 api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
