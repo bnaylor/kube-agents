@@ -1,8 +1,9 @@
 # The inject lane's exclusions: registered cases that do not run when the
 # matrix goes through the A2A gateway's inject door (the harness's
 # AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
-# EVAL_MODE_NEXT=1), because the case's premise needs the chat front door
-# and the door addresses `platform` directly.
+# EVAL_MODE_NEXT=1), because the case's premise needs something the door
+# does not carry: a specialist's answer folded back into the chat thread, or
+# a card's wake, which the harness replays on the api transport only.
 #
 # One case id per line; `#` starts a comment, blank lines are skipped. The
 # reason is the comment block directly above the id, and it names the issue
@@ -30,36 +31,39 @@
 
 # #2039: grades delegation through the chat front door -- kanban_create by
 # the default profile, then the specialist's answer folded back into the
-# thread. The inject door addresses `platform` directly, so no front door
-# is in the path and the card is never filed by design; the answer alone
-# passes on this lane, which grades a premise the case does not have.
-# Returns to the lane when the door routes through the chat profile, or
-# when the case is rewritten for a transport-neutral premise.
+# thread. Under the bridge's default api executor the default profile
+# answers the door's task and can file the card, but the card's completion
+# never reaches the A2A thread (a2a/docs/hermes-bridge.md, Executors) and
+# the lane's delegation wait reads no card ids, so the answer alone would
+# be graded on a premise the case does not have. Returns to the lane when
+# the delegation wait reads card ids on this path, or when the case is
+# rewritten for a transport-neutral premise.
 agent-kanban-smoke
 
 # #2039: grades the chat front door's reply to the wake a crashed card sends
 # it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
-# only turn). The inject door addresses `platform` directly, so the wake
-# would reach the specialist, which never receives one, and no front door
-# answers it. Returns to the lane when the door routes through the chat
-# profile.
+# only turn). A card-wake replay needs AGENT_TRANSPORT=api and errors on
+# this lane (_execute_card_wake in bench/kube_agents_bench/harness.py),
+# whichever profile answers the door. Returns to the lane when the replay
+# can send its wake through the door.
 chat-voice-retry-says-it-is-retried
 # #2039: the same for the wake a card sends on its last attempt.
 chat-voice-final-attempt-is-not-retried
 
 # #2039: grades the chat front door's reply to the wake a blocked card sends
 # it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
-# only turn). The inject door addresses `platform` directly, so the wake
-# would reach the specialist, which never receives one, and no front door
-# answers it. Returns to the lane when the door routes through the chat
-# profile.
+# only turn). A card-wake replay needs AGENT_TRANSPORT=api and errors on
+# this lane (_execute_card_wake in bench/kube_agents_bench/harness.py),
+# whichever profile answers the door. Returns to the lane when the replay
+# can send its wake through the door.
 chat-voice-failure-leads-with-fact
 
 # #2039: grades the chat front door's silence on the wake a card sends when
 # its question is already posted (bench/kube_agents_bench/card_wake.py
-# replays that wake as the run's first turn). The inject door addresses
-# `platform` directly, so no front door answers the wake. Returns to the
-# lane when the door routes through the chat profile.
+# replays that wake as the run's first turn). A card-wake replay needs
+# AGENT_TRANSPORT=api and errors on this lane (_execute_card_wake in
+# bench/kube_agents_bench/harness.py). Returns to the lane when the replay
+# can send its wake through the door.
 chat-question-wake-stays-silent
 # #2039: the same for a typed answer to that question in a session the wake
 # never reached (session: fresh).

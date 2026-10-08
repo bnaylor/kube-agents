@@ -346,8 +346,8 @@ class SplitLostNothingTest(unittest.TestCase):
 # file edits this set in the same pull request, for the reason the sets above
 # are pinned.
 INJECT_LANE_EXCLUDED = [
-    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door; the inject door addresses platform directly
-    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; the inject door addresses platform directly
+    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door and the specialist's answer folded back, which the door's thread never gets
+    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; a card-wake replay runs on the api transport only
     "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
     "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
     "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door

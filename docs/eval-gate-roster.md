@@ -382,10 +382,12 @@ reporting no loss), whether or not the run made a call; the worker half stays un
 delegation wait for this path and takes those entries out of `worker_blind_checks`.
 
 A premise the transport removes is the lane's exclusion list,
-`hack/eval/inject-lane-exclusions.txt`. The door addresses `platform` directly, so a case that
-grades the chat front door's own behaviour — `agent-kanban-smoke`, whose objective is the
-default profile filing a `kanban_create` before a specialist answers — has no front door in its
-path, and grading its answer alone would pass a premise the case does not have there.
+`hack/eval/inject-lane-exclusions.txt`. `agent-kanban-smoke`'s objective is the default profile
+filing a `kanban_create` and the specialist's answer coming back to the thread. Under the bridge's
+default `api` executor the default profile answers the door's task and can file the card, but the
+card's completion never reaches the A2A thread and the lane's delegation wait reads no card ids,
+so grading the reply alone would pass a premise the case does not have there. The card-wake
+cases replay a wake the harness sends on the api transport only, and error on this lane.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`

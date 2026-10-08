@@ -292,7 +292,11 @@ readonly BRIDGE_EXECUTOR_EXPECTED="api"
 # tests/test_ci_deploy_mode_next.py. The queue behind the workers holds 1024
 # (taskQueueCapacity in a2a/hermes-bridge/bridge.go) before the bridge
 # finalizes an accepted task as `bridge-queue-overflow`; a fan-out of 4 or 8
-# never approaches it, so the bound below catches a typo, not a sizing.
+# never approaches it, so the bound below catches a typo, not a sizing. Under
+# the api executor each worker's turn also counts against the pod's Hermes API
+# server cap, gateway.api_server.max_concurrent_runs (10 by default at the
+# pinned hermes-agent tag), which kanban card-completion wakes share; a turn
+# refused there ends `hermes-rate-limited`, infrastructure, not graded.
 readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it

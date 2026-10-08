@@ -168,8 +168,9 @@ from inside the pod's network namespace, so they are not what keeps the door shu
 bearer token the operator renders into a Secret beside the adapter's env, under the eval flag
 only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today. The door it
 replaces admits key holders, and this one admits the same population rather than everyone
-holding `pods/portforward` in the namespace; that matters because the task it starts runs on the
-platform persona with the install's cluster and GitHub credentials, under an `authority` block
+holding `pods/portforward` in the namespace; that matters because the task it starts reaches the
+platform persona with the install's cluster and GitHub credentials (directly under the bridge's
+`cli` executor, through a card the default profile files under `api`), under an `authority` block
 the gateway mints for a synthetic principal, past the allowed-users gate.
 
 **The adapter cannot assert a real principal (decided 2026-09-17).** The gateway spec's test-backend
@@ -364,8 +365,10 @@ unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from 
 the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
 stock install), so the agent that answers a case on this lane is the one the chat path reaches
 ("What the lane grades" below). That does not return the exclusion's premise: the default
-profile may file the card, but the specialist's answer is never folded back into the thread
-(Completion signals), so the exclusion stays.
+profile may file the card, but the card's completion never reaches the A2A thread
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"), and the graded
+answer gets the card's result only once the rebuilt wait lands (Completion signals), so the
+exclusion stays.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -388,9 +391,9 @@ with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
-publishes `working` only when a worker spawns the subprocess; the presubmit fans units out at
+publishes `working` only when a worker starts the task's turn; the presubmit fans units out at
 `EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
-concurrent units wait in the bridge's queue carrying an executor event and no subprocess, for as
+concurrent units wait in the bridge's queue carrying an executor event and no turn, for as
 long as the two ahead of them run. The eval install's bridge therefore runs
 `BRIDGE_CONCURRENCY` of at least `EVAL_TASK_PARALLELISM`, set through the operator's
 `A2A_BRIDGE_CONCURRENCY`, and the `submitted`-only classification above is the backstop rather than the fix: a queued

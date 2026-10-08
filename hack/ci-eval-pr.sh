@@ -1808,8 +1808,10 @@ fi
 
 # ─── The inject lane's safeguards (#2079) ────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
-# the inject door the platform persona opens a pull request where the chat
-# path inlined a manifest (#2037): the first matrix run through the door left
+# the inject door the platform persona (directly under the bridge's cli
+# executor, through a card under its default api executor) opens a pull
+# request where the chat path inlined a manifest (#2037): the first matrix run
+# through the door, under cli, left
 # pull requests on the pool repository that no case had asked for.
 # hack/eval/inject-lane-safeguards.yaml holds the entries every case on the
 # lane carries beside its own -- one, a none-wrapped `github_writes` -- and
