@@ -175,12 +175,13 @@ DEFAULT_JUDGED_METRICS: tuple[str, ...] = ("OutcomeValidity",)
 DEFAULT_JUDGED_MARGIN = 0.5
 
 #: The marker :mod:`kube_agents_bench.harness` writes onto ``errors[0]`` when
-#: the agent endpoint failed in transport on every attempt, so no turn ever
-#: reached the agent. Such a record IS scored -- the judge grades the empty
-#: output and returns 0.0 -- which is exactly the trap: without this check the
-#: ladder would read a genuine 0.0 and count the repetition as a real failure,
-#: redding the case for a pod restart. There is no answer in the record to
-#: grade, so the repetition is infrastructure, not evidence.
+#: the harness recorded a condition under which no answer can be graded:
+#: transport exhausted, or the server reporting a provider rate limit or billing
+#: stop on the opening turn. Such a record IS scored -- the judge grades the
+#: empty output and returns 0.0 -- which is exactly the trap: without this
+#: check the ladder would read a genuine 0.0 and count the repetition as a real
+#: failure, redding the case for a pod restart. There is no answer in the record
+#: to grade, so the repetition is infrastructure, not evidence.
 #:
 #: ``hack/ci-eval-pr.sh`` writes the same marker on a record with no scores at
 #: all for a repetition it could not start (``record_unit_not_run``: GitHub's
@@ -1096,7 +1097,7 @@ def classify_rep(
             )
         return rep(
             "infra",
-            "the harness exhausted its retries without reaching the agent "
+            "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "
             f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
             "answer in it to grade",
         )
