@@ -322,6 +322,7 @@ class UnitNotRunTest(unittest.TestCase):
                         "reset_agent_pulls",
                         "record_unit_not_run",
                         "finished_rep_count",
+                        "release_streams",
                         "skip_unit",
                         "run_one_unit",
                     )
@@ -343,6 +344,8 @@ class UnitNotRunTest(unittest.TestCase):
                 "ledger_audit_id_for_task() { :; }",
                 "stream_case_count() { echo 1; }",
                 "stream_stack_wait() { echo 0; }",
+                "stream_lock_deadline() { echo 1; }",
+                "wait_platform_runs() { :; }",
                 "unit_delegation_timeout() { echo 1; }",
                 'unit_phase() { echo "${UNIT_PHASE}"; }',
                 "unit_task_path() { echo \"$1\"; }",

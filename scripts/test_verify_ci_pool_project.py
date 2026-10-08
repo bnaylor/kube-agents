@@ -3218,14 +3218,13 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
             r'^  if \[ "\$\{mint_rc\}" -ne 0 \]; then.*?^  fi', self._unit(), re.S | re.M
         )
         self.assertIsNotNone(branch, "could not find the unit's mint-failure branch")
-        self.assertIn('skip_unit "${task}" "${name}" "${rep}" "${audit_id}" "${has_stack}"', branch.group(0))
+        self.assertIn('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"', branch.group(0))
         self.assertIn("return 0", branch.group(0))
         skip = re.search(r"^skip_unit\(\) \{.*?^\}", self.script, re.S | re.M)
         self.assertIsNotNone(skip, "could not find skip_unit in hack/ci-eval-pr.sh")
-        # The task lock, the infra lock and, for a ledger-writing case, the
-        # stream lock.
-        self.assertEqual(3, skip.group(0).count("lock_release"))
-        self.assertIn("lock-stream-", skip.group(0))
+        # The task lock, the infra lock and every stream lock the case holds.
+        self.assertEqual(2, skip.group(0).count("lock_release"))
+        self.assertIn('release_streams "${streams}"', skip.group(0))
 
     def test_every_bench_invocation_is_preceded_by_a_mint(self):
         # #1057 rewrote the serial repetition loop into a fan-out of background
