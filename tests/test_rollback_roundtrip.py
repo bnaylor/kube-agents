@@ -1440,8 +1440,13 @@ class CiEvalWiringTest(unittest.TestCase):
             root = pathlib.Path(tmp)
             (root / "artifacts").mkdir()
             started = root / "started"
+            # The stub's trap marks its own finish in a file, not only on the
+            # pipe: its echo goes through the un-waited `tee`, so only the
+            # marker says when it ran. The sleep makes it finish well after a
+            # parent that did not wait for it would already have exited.
+            done = root / "child-done"
             (root / "rollback-roundtrip.sh").write_text(
-                f"trap 'echo stub interrupted; exit 1' TERM\ntouch {started}\nwhile :; do sleep 1 & wait $!; done\n"
+                f"trap 'sleep 1; touch {done}; echo stub interrupted; exit 1' TERM\ntouch {started}\nwhile :; do sleep 1 & wait $!; done\n"
             )
             script = textwrap.dedent(
                 f"""\
@@ -1463,7 +1468,7 @@ class CiEvalWiringTest(unittest.TestCase):
                   echo "DIAG $* prefix=${{AGENT_DIAG_PREFIX:-}}"
                 }}
                 timeout() {{ shift 2; exec "$@"; }}
-                trap 'echo EXIT TRAP RAN; collect_agent_pod_diagnostics' EXIT
+                trap 'echo EXIT TRAP RAN; if [ -e {done} ]; then echo CHILD DONE BEFORE EXIT=yes; else echo CHILD DONE BEFORE EXIT=no; fi; collect_agent_pod_diagnostics' EXIT
                 trap 'exit 143' TERM INT
                 {ci_eval_function("job_started_epoch")}
                 {ci_eval_function("run_rollback_roundtrip")}
@@ -1484,11 +1489,14 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertIn("stub interrupted", out)
         self.assertIn("EXIT TRAP RAN", out)
         self.assertNotIn("NOT REACHED", out)
-        # The deadline's exit still takes the round trip's own snapshot. Only
-        # its presence is checked: the TERM trap waits for the round trip
-        # before exiting, but the child's output reaches the pipe through the
-        # `tee` process substitution, which nothing waits for, so the two lines
-        # can land in either order (#2626).
+        # The TERM trap waits for the round trip before exiting, so the EXIT
+        # trap runs after the child's own trap has finished. Both this line and
+        # the snapshot below are the parent's, so their order is fixed; the
+        # child's `stub interrupted` reaches the pipe through the `tee` process
+        # substitution, which nothing waits for, so it is checked for presence
+        # only (#2626).
+        self.assertIn("CHILD DONE BEFORE EXIT=yes", out)
+        # The deadline's exit still takes the round trip's own snapshot.
         self.assertIn("DIAG  prefix=rollback-", out)
 
     def test_the_function_never_assigns_the_suite_status(self) -> None:
