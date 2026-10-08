@@ -1480,8 +1480,12 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertIn("stub interrupted", out)
         self.assertIn("EXIT TRAP RAN", out)
         self.assertNotIn("NOT REACHED", out)
-        # The deadline's exit still takes the round trip's own snapshot.
-        self.assertLess(out.index("stub interrupted"), out.index("DIAG  prefix=rollback-"))
+        # The deadline's exit still takes the round trip's own snapshot. Only
+        # its presence is checked: the TERM trap waits for the round trip
+        # before exiting, but the child's output reaches the pipe through the
+        # `tee` process substitution, which nothing waits for, so the two lines
+        # can land in either order (#2626).
+        self.assertIn("DIAG  prefix=rollback-", out)
 
     def test_the_function_never_assigns_the_suite_status(self) -> None:
         self.assertNotIn("SUITE_STATUS", ci_eval_function("run_rollback_roundtrip"))
