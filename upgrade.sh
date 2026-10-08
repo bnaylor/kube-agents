@@ -1867,7 +1867,15 @@ main() {
     # a policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
-    announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+    # Each mode call is guarded: installer_common.sh is the target tree's,
+    # and one from before spec.mode support (this script piped, or run with
+    # --image-tag onto an older release) defines neither the notice nor
+    # DEFAULT_PLATFORM_AGENT_MODE, so the run skips the notice rather than
+    # abort. retag_values' refusal of a dropped `next` lives in this file and
+    # still runs there.
+    if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
+      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -1915,7 +1923,10 @@ main() {
       # a chart that declares platformAgent.mode (retag_values refuses a
       # recorded next the target chart does not declare, rather than drop it),
       # and says when a full upgrade would move it (from the values just read).
-      note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+      # Guarded, as at the plan's notice: an older target's helpers lack it.
+      if declare -F note_platform_agent_mode_for_retag >/dev/null; then
+        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+      fi
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
@@ -1936,7 +1947,10 @@ main() {
       # calls, not substitutions: a failed read stops the run here, once, with
       # its own message shown.
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
-      note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+      # Guarded, as at the plan's notice: an older target's helpers lack it.
+      if declare -F note_platform_agent_mode_for_retag >/dev/null; then
+        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+      fi
       harness_retag_keys "$RETAG_VALUES_JSON"
       # After the reads, not before them: they are the last things this arm
       # does that can fail without having changed anything.
@@ -1958,7 +1972,10 @@ main() {
       # install.env, so a key edited since the last apply switches the install
       # here, and the run says so first, from the reads the scope check made.
       # Nothing asks between here and the apply, so the notice says that.
-      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+      # Guarded, as at the plan's notice: an older target's helpers lack it.
+      if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
+        announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+      fi
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
       # project, so a container it cannot bind, or a policy that forbids the

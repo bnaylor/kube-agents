@@ -592,11 +592,54 @@ class UpgradeRunContractTest(unittest.TestCase):
         # The plan says it too, after the scope check whose reads it takes: it
         # is the preview of the same full apply.
         plan = source.index('print_step "4. Planning (read-only)"')
-        block = source[plan : plan + 800]
+        block = source[plan : plan + 1600]
         self.assertLess(
             block.index('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"'),
             block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
         )
+
+    def test_the_mode_calls_skip_an_older_installer_common(self):
+        """installer_common.sh is the target tree's: piped, or with --image-tag
+        onto a release before spec.mode support, it defines neither notice nor
+        DEFAULT_PLATFORM_AGENT_MODE. Each mode call site in the plan, the full
+        arm and both retag arms, lifted as written (with its guard when it has
+        one), runs under the script's strict shell against a stub
+        installer_common.sh lacking them, and must neither abort nor print
+        "command not found"."""
+        lines = _UPGRADE_SH.read_text().splitlines()
+        blocks = []
+        for index, line in enumerate(lines):
+            for fn in ("announce_platform_agent_mode_for_apply", "note_platform_agent_mode_for_retag"):
+                if line.strip().startswith(f'{fn} "$target_namespace"'):
+                    block = [line]
+                    if lines[index - 1].strip() == f"if declare -F {fn} >/dev/null; then":
+                        block = [lines[index - 1], line, lines[index + 1]]
+                    blocks.append("\n".join(b.strip() for b in block))
+        self.assertEqual(len(blocks), 4, blocks)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / "installer_common.sh"
+            stub.write_text("# An installer_common.sh from before spec.mode support.\nload_install_env() { :; }\n")
+            for block in blocks:
+                with self.subTest(block=block.splitlines()[0]):
+                    script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+source {shlex.quote(str(stub))}
+set -Eeuo pipefail
+trap 'echo "ABORT BANNER" >&2' ERR
+unset PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_NOTICE_UNGATED
+target_namespace=kubeagents-system PARAM_UPGRADE_MODE=harness RETAG_VALUES_JSON='{{}}'
+{block}
+echo "reached the end"
+"""
+                    proc = subprocess.run(
+                        ["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env()
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 0, out)
+                    self.assertIn("reached the end", proc.stdout, out)
+                    self.assertNotIn("command not found", out)
+                    self.assertNotIn("unbound variable", out)
+                    self.assertNotIn("ABORT BANNER", out)
 
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.
