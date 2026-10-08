@@ -746,6 +746,25 @@ sys.stdout.buffer.write(text.encode("utf-8"))
     rm -f "$dropped_file"
     return 0
   fi
+  # A recorded `next` on a chart that predates platformAgent.mode is never
+  # dropped, with the flag or without: the chart would render no mode, Helm
+  # would take spec.mode off the CR, and the operator would retire the A2A
+  # stack on a run that only re-tags images. A recorded `today` drops freely,
+  # since an absent mode is today. Read here, not through installer_common.sh's
+  # helpers: that file is the target tree's, and a target that predates the key
+  # predates them too.
+  if grep -qxF 'platformAgent.mode' "$dropped_file" &&
+    [ "$(printf '%s' "$values" | (trap - ERR; python3 -c '
+import json, sys
+values = json.loads(sys.stdin.buffer.read()) or {}
+sys.stdout.write(str((values.get("platformAgent") or {}).get("mode") or ""))
+' 2>/dev/null) || true)" = "next" ]; then
+    RETAG_VALUES_JSON=""
+    rm -f "$dropped_file"
+    print_error "The release records platformAgent.mode: next, and the chart this run applies predates spec.mode support (its values.schema.json does not declare the key). Dropping it would take spec.mode off the PlatformAgent and switch the install back to today on a re-tag."
+    print_info "Re-tag to a release whose chart declares platformAgent.mode, or, to leave next on purpose, set PLATFORM_AGENT_MODE=today in install.env and run --upgrade-mode=full first, then re-tag."
+    return 1
+  fi
   if [ "$PARAM_DROP_UNDECLARED_VALUES" != "true" ]; then
     RETAG_VALUES_JSON=""
     while IFS= read -r key; do
@@ -1892,8 +1911,10 @@ main() {
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
-      # The mode: a retag re-applies the recorded values, mode included, and
-      # says when a full upgrade would move it (from the values just read).
+      # The mode: a retag re-applies the recorded values, mode included, onto
+      # a chart that declares platformAgent.mode (retag_values refuses a
+      # recorded next the target chart does not declare, rather than drop it),
+      # and says when a full upgrade would move it (from the values just read).
       note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
@@ -1936,7 +1957,8 @@ main() {
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install
       # here, and the run says so first, from the reads the scope check made.
-      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+      # Nothing asks between here and the apply, so the notice says that.
+      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
       # project, so a container it cannot bind, or a policy that forbids the

@@ -5592,7 +5592,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             "check_flags_against_install_env || exit 1",
             "check_service_account_ownership || exit 1",
             'refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n',
-            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"',
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"',
             'write_json_report "DRY_RUN_SUCCESS"',
             'check_existing_cluster_node_pools_preflight "$project_id"',
             'check_existing_cluster_network_policy_preflight "$project_id"',
@@ -5770,7 +5770,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         scope_check = text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n', main_start)
         summary = text.index('print_step "11. Pre-Flight Configuration Summary"', main_start)
         announce = text.index(
-            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"',
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"',
             main_start,
         )
         # Refused before the rest of the interview; exported before the two
@@ -5782,6 +5782,25 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertLess(exported, bootstrap)
         self.assertLess(scope_check, announce)
         self.assertLess(announce, summary)
+
+    def test_the_notice_is_ungated_where_no_confirmation_follows(self):
+        """-y applies without the step-11 prompt and the menu's apply has none,
+        so their notices do not offer "run again"; --dry-run, --generate-only
+        and an interactive run keep the default clause."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        announce = text.index('"$platform_agent_mode" "$mode_notice_route"', main_start)
+        block = text[text.rindex('local mode_notice_route=""', main_start, announce) : announce]
+        self.assertIn(
+            'if [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then\n'
+            '    mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"',
+            block,
+        )
+        self.assertIn(
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
+            "        check_scope_container_access || exit 1\n",
+            text[:main_start],
+        )
 
 
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):

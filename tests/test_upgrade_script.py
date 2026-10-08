@@ -575,8 +575,9 @@ class UpgradeRunContractTest(unittest.TestCase):
         dispatch = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
         self.assertNotIn("platform_agent_mode_for", source[source.index('exit "$plan_status"'):dispatch])
         for mode, after, call in (
+            # Nothing asks between the notice and the apply, so it is the ungated one.
             ("full", 'refuse_apply_over_undeclared_scope "$target_namespace" || exit 1\n',
-             f'announce_platform_agent_mode_for_apply "$target_namespace" {key}\n'),
+             f'announce_platform_agent_mode_for_apply "$target_namespace" {key} "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'),
             ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
              f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
             ("harness", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
@@ -594,7 +595,7 @@ class UpgradeRunContractTest(unittest.TestCase):
         block = source[plan : plan + 800]
         self.assertLess(
             block.index('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"'),
-            block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}"),
+            block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
         )
 
     def test_the_generator_call_asks_for_a_memory_answer(self):
@@ -1631,6 +1632,45 @@ helm_retag operator.image.tag
         self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
         crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
         self.assertEqual([cr["spec"].get("mode") for cr in crs], ["next"])
+
+    def _modeless_chart(self):
+        """This repository's chart less `platformAgent.mode`: a rollback to a release that predates #2524."""
+        repo = self.base / "modeless-repo"
+        chart = repo / "charts" / "kube-agents"
+        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
+        schema_path = chart / "values.schema.json"
+        schema = json.loads(schema_path.read_text())
+        del schema["properties"]["platformAgent"]["properties"]["mode"]
+        schema_path.write_text(json.dumps(schema))
+        return repo
+
+    def _recorded_with_mode(self, mode):
+        recorded = json.loads(json.dumps(self._RECORDED))
+        recorded["platformAgent"]["mode"] = mode
+        return recorded
+
+    def test_a_retag_onto_a_chart_without_mode_refuses_to_drop_next(self):
+        """Dropping a recorded `next` would render no mode, and Helm would take
+        spec.mode off the CR: a switch to today on a retag. Refused, with or
+        without --drop-undeclared-values, before helm upgrade runs."""
+        repo = self._modeless_chart()
+        for drop in (True, False):
+            with self.subTest(drop=drop):
+                proc = self._retag(self._recorded_with_mode("next"), repo, drop=drop)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
+                self.assertIn("records platformAgent.mode: next", proc.stdout)
+                self.assertIn("predates spec.mode support", proc.stdout)
+                self.assertIn("--upgrade-mode=full", proc.stdout)
+                self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
+                self.assertNotIn("ci-cluster", proc.stdout)
+
+    def test_a_retag_onto_a_chart_without_mode_drops_a_recorded_today(self):
+        """`today` is what an absent mode means, so dropping it switches nothing."""
+        proc = self._retag(self._recorded_with_mode("today"), self._modeless_chart())
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertIn("Dropping 'platformAgent.mode'", proc.stdout)
+        crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
+        self.assertEqual([cr["spec"].get("mode") for cr in crs], [None])
 
     def test_values_of_a_length_helm_reads_in_whole_buffers_arrive(self):
         """Helm 4 drops an unterminated last line of stdin whose length is a multiple of 4096 bytes."""

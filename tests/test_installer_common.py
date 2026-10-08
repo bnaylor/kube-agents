@@ -1464,12 +1464,12 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn(expect, proc.stdout, proc.stderr)
 
     def test_a_first_install_is_quiet(self):
-        # Nothing to switch: no context to read through (a first install's
-        # dry run), no PlatformAgent type, no CR, or no release.
+        # Nothing to switch: no PlatformAgent type, no CR, or no release. A
+        # first install's missing cluster is the TFVARS_CLUSTER_EXISTS=false
+        # case below, which reads nothing.
         with tempfile.TemporaryDirectory() as tmp:
             log = pathlib.Path(tmp) / "helm-must-not-run.log"
             for kubectl, helm_stub, helm_runs in (
-                (None, self._no_helm(log), False),
                 (self._cr_kubectl("", exit_code=1, stderr=self._NO_TYPE), self._no_helm(log), False),
                 (self._cr_kubectl(self._cr_list(present=False)), self._helm(self._HEALTHY, {}, latest="norelease"), True),
                 (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="norelease"), True),
@@ -1480,6 +1480,22 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertEqual(proc.stdout, "", proc.stderr)
                     if not helm_runs:
                         self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
+
+    def test_a_cluster_with_no_context_says_the_check_did_not_run(self):
+        # The generator found the cluster, but the kubeconfig has no context
+        # for it (kubectl absent, or a get-credentials that did not land, on
+        # the --dry-run and --generate-only routes the scope check skips). Not
+        # a first install, so the notice says it did not run, with the fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            hlog = pathlib.Path(tmp) / "helm.log"
+            proc = self._run(
+                f"{self._LOUD_PRINTS}{self._no_helm(hlog)}"
+                "TFVARS_CLUSTER_EXISTS=true announce_platform_agent_mode_for_apply kubeagents-system next\n",
+                kubectl_script=None,
+            )
+            self.assertIn("WARN: The mode-switch check did not run: the kubeconfig has no context", proc.stdout, proc.stderr)
+            self.assertIn("gcloud container clusters get-credentials", proc.stdout)
+            self.assertFalse(hlog.exists())
 
     def test_a_cluster_the_generator_found_absent_is_not_read(self):
         # A reinstall under a name used before: the tfvars generator's describe
@@ -1617,6 +1633,29 @@ class InstallerCommonTest(unittest.TestCase):
                 for line in expect:
                     self.assertIn(line, proc.stdout)
                 self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+
+    def test_an_ungated_switch_does_not_offer_run_again(self):
+        # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
+        # no confirmation after the notice: "run again" is not a way out there.
+        for args in ("next next today", "unset unset next"):
+            with self.subTest(args=args):
+                gated = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertIn("in install.env and run again.", gated.stdout)
+                ungated = self._run(
+                    f'{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args} "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"'
+                )
+                self.assertIn("WARN: This apply switches the install", ungated.stdout)
+                self.assertIn("This run applies it without asking first", ungated.stdout)
+                self.assertIn("stop it now (Ctrl-C)", ungated.stdout)
+                self.assertIn("./upgrade.sh --plan previews", ungated.stdout)
+                self.assertNotIn("run again", ungated.stdout)
+        # And through the front door's call, which passes its third argument on.
+        proc = self._announce(
+            self._cr_kubectl(self._cr_list()),
+            self._helm(self._HEALTHY, {}, latest="{}"),
+            call='announce_platform_agent_mode_for_apply kubeagents-system next "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"',
+        )
+        self.assertIn("This run applies it without asking first", proc.stdout, proc.stderr)
 
     def test_a_re_apply_and_an_unread_install_are_silent(self):
         for args in ("unset unset today", "next next next", "unset next next", '"" unset next', 'unset "" next'):

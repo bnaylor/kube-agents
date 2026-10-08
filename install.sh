@@ -4901,8 +4901,9 @@ run_menu_system() {
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
         # The menu edits no mode key, but an install.env edited by hand since
-        # the last apply reaches the cluster through this apply too.
-        announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+        # the last apply reaches the cluster through this apply too, with no
+        # confirmation after the notice.
+        announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
         check_scope_container_access || exit 1
         enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
@@ -6347,9 +6348,15 @@ main() {
   # above, so --dry-run and --generate-only say it too; it takes the reads the
   # scope check in the gate just made, and reads for itself when the gate did
   # not run. The reads need this cluster's context, which the gate fetched for
-  # an applying run, and say nothing without one (a first install has no CR);
-  # a read that fails says the check did not run.
-  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode"
+  # an applying run. A first install reads nothing (the generator found no
+  # cluster); on a cluster that exists, a missing context or a read that fails
+  # says the check did not run.
+  # -y applies without the step-11 prompt, so the notice is the ungated one.
+  local mode_notice_route=""
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then
+    mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+  fi
+  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install

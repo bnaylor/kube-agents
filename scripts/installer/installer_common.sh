@@ -156,6 +156,11 @@ readonly PLATFORM_AGENT_READ_OK="ok"
 readonly PLATFORM_AGENT_READ_NONE="none"
 readonly PLATFORM_AGENT_READ_FAILED="failed"
 readonly PLATFORM_AGENT_READ_NO_CONTEXT="no-context"
+# The front doors pass this to announce_platform_agent_mode_for_apply when
+# no confirmation stands between the notice and the apply (upgrade.sh's full
+# arm, the Day-2 menu's apply, install.sh -y), so the notice does not offer
+# "run again" as a way out of a run that will not wait for one.
+readonly PLATFORM_AGENT_MODE_NOTICE_UNGATED="ungated"
 # The composition's two Helm releases, by their Terraform type and name: the
 # front doors ask the state whether it manages one before deciding what a
 # cert-manager or kube-agents release already on the cluster means.
@@ -546,7 +551,8 @@ platform_agent_mode_extra_values_caveat() {
 }
 
 # Says what a full apply does to the install's spec.mode: $1 the record's
-# mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now. A
+# mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now, $4
+# PLATFORM_AGENT_MODE_NOTICE_UNGATED when no confirmation follows. A
 # switch is a rollout of a different component stack, not a setting, and the
 # only trace of it in install.env is the one key someone edited, so the run
 # that applies it names it first. A key the apply cannot bring the CR to,
@@ -556,7 +562,7 @@ platform_agent_mode_extra_values_caveat() {
 # front-door call says so itself (announce_platform_agent_mode_for_apply).
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" from to
+  local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
   to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
@@ -574,7 +580,11 @@ announce_platform_agent_mode_switch() {
   else
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
-  print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
+  if [ "$route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ]; then
+    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. This run applies it without asking first: to keep spec.mode ${from}, stop it now (Ctrl-C) and set PLATFORM_AGENT_MODE=${from} in install.env. ./upgrade.sh --plan previews an apply without making it."
+  else
+    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
+  fi
   platform_agent_mode_extra_values_caveat
 }
 
@@ -604,12 +614,16 @@ _platform_agent_mode_unread() {
 }
 
 # The front door's call, after the scope check beside it: $1 namespace, $2
-# the key. Quiet where there is nothing to switch (a cluster the tfvars
-# generator found NOT_FOUND, so TFVARS_CLUSTER_EXISTS=false: nothing is read,
-# since a kubeconfig context left by an earlier install of the same name
-# points at an endpoint that is gone; no context to read through, which a
-# first install's dry run has; no PlatformAgent type, no CR, no release),
-# loud where a read failed.
+# the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
+# confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
+# generator found NOT_FOUND, so TFVARS_CLUSTER_EXISTS=false, which is every
+# first install: nothing is read, since a kubeconfig context left by an
+# earlier install of the same name points at an endpoint that is gone; no
+# PlatformAgent type, no CR, no release), loud where a read failed. Past that
+# guard the cluster exists, so a kubeconfig with no context for it (kubectl
+# absent, or a get-credentials that did not land on the --dry-run and
+# --generate-only routes the scope check skips) is a read that did not
+# happen, and is said with the scope check's remedy.
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
@@ -620,6 +634,10 @@ announce_platform_agent_mode_for_apply() {
   case "$PLATFORM_AGENT_CR_READ" in
     "$PLATFORM_AGENT_READ_FAILED")
       _platform_agent_mode_unread "the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
+      return 0
+      ;;
+    "$PLATFORM_AGENT_READ_NO_CONTEXT")
+      _platform_agent_mode_unread "the kubeconfig has no context '$(gke_context_name)' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})" "$key" "$namespace"
       return 0
       ;;
     "$PLATFORM_AGENT_READ_OK") ;;
@@ -637,7 +655,7 @@ announce_platform_agent_mode_for_apply() {
   else
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
-  announce_platform_agent_mode_switch "$record" "$live" "$key"
+  announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
 }
 
 # upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3

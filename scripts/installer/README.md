@@ -430,14 +430,22 @@ read the mode the live CR runs and the one the release's last served revision ca
 when the apply moves the CR (`announce_platform_agent_mode_switch`), from the reads the scope
 check beside it made (`read_platform_agent_install_state`). No cluster (the generator found
 none, so a kubeconfig context an earlier install of that name left is not read), no CR or no
-release is a first install and is quiet; a read that fails says the check did not run. The notice models the
+release is a first install and is quiet; a read that fails, or a kubeconfig with no context for
+a cluster that exists, says the check did not run. Where no confirmation follows the notice
+(`upgrade.sh`'s full arm, the menu's apply, `install.sh -y`) it says the run applies the switch
+without asking, rather than offering "run again". The notice models the
 render from the key alone, so a `platformAgent.mode` in the composition's `extra_helm_values`,
 which wins, is not seen, and every notice says so. Helm patches the CR from
 the difference between that revision's render and the new one, and `today` renders no field,
 so the key removes a recorded mode, and sends no change at all when the record already renders
 it; a mode set on the CR by hand then stays, and the front doors name it rather than announce a
 switch. Only full mode applies the key; the `harness` and `operator` retags reuse the recorded
-values and say when a full upgrade would move the mode. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
+values and say when a full upgrade would move the mode. They keep the mode only onto a chart
+whose schema declares `platformAgent.mode`: onto an older one, this `upgrade.sh` refuses a
+recorded `next` rather than drop it (`--drop-undeclared-values` included), since the chart would
+render no mode and Helm would take `spec.mode` off the CR. An older release's own `upgrade.sh`,
+the release rollback runbook's route, has no such refusal and drops it with its generic
+"Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates. Under `next` the A2A gateway takes Google Chat, and answers it only
 through a hermes-bridge sidecar on the CR, which no install surface declares; `install.sh`
 says so when `next` meets `GOOGLE_CHAT_ENABLED`.
