@@ -714,7 +714,7 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
 #
-# Slack agent view, behind KAGE_SLACK_UX (off by default; off leaves both files
+# Slack agent view, behind KAGE_SLACK_UX (on unless set off; off leaves both files
 # behaving as upstream). With it on, --agent-view describes the app by its
 # --name, and the adapter answers a new thread or DM open with three suggested
 # prompts when platforms.slack.extra.suggested_prompts is unset. The default
@@ -1273,8 +1273,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it when a
 # worker process that had run a command exited normally, cutting any sibling's
 # running command (exit 255, no output). cleanup() now leaves the shared master
-# to ControlPersist, and a foreground ssh exit 255 without the cwd marker carries
-# a hint when upstream attached none. See the module docstring in
+# to ControlPersist, the client argv carries ServerAliveInterval 15 /
+# ServerAliveCountMax 3 so a master whose peer died silently is dropped (the
+# exit used to clear it), and a foreground ssh exit 255 without the cwd marker
+# carries a hint when upstream attached none. See the module docstring in
 # deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
@@ -1314,6 +1316,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'kube-agents patch: quiet_rate_limit_exit' /opt/hermes/cli.py && \
     grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
     grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
+    grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
