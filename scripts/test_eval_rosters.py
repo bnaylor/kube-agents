@@ -353,11 +353,11 @@ INJECT_LANE_EXCLUDED = [
     "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same reason
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
     "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
-    "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack; the inject door addresses platform directly
-    "chat-reset-history-names-the-command",  # the same for the front door's answer to a reset request
+    "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
+    "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
     "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
-    "chat-routing-fleet-question",  # the same for the front door routing a fleet question through kanban_create
-    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting, which platform does not give
+    "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
+    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
 ]
 # The directives a case's prompt opens with to replay a wake into the chat

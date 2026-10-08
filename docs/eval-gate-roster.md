@@ -387,7 +387,9 @@ filing a `kanban_create` and the specialist's answer coming back to the thread. 
 default `api` executor the default profile answers the door's task and can file the card, but the
 card's completion never reaches the A2A thread and the lane's delegation wait reads no card ids,
 so grading the reply alone would pass a premise the case does not have there. The card-wake
-cases replay a wake the harness sends on the api transport only, and error on this lane.
+cases replay a wake the harness sends on the api transport only, and error on this lane. A case
+excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
+listed until a run on `api` grades it.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
