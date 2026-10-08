@@ -103,7 +103,7 @@ func deleteTasksStream(t *testing.T, url string) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	waitFor(t, "the relay durable bound", func() bool {
+	waitFor(t, "the relay durable to bind", func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, err := js.Consumer(ctx, lib.TasksStream, relayDurable)
@@ -113,6 +113,41 @@ func deleteTasksStream(t *testing.T, url string) {
 	defer cancel()
 	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
 		t.Fatalf("delete TASKS: %v", err)
+	}
+}
+
+// The helper holds the delete until the relay's durable exists: a durable
+// created after a delay still binds, because the stream is still there. With
+// the wait gone the stream is deleted at once and the late create fails
+// "stream not found", which is the race #2696 hit from the gateway's side.
+func TestDeleteTasksStreamWaitsForTheRelayDurable(t *testing.T) {
+	s := startServer(t)
+	provision(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	created := make(chan error, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{Durable: relayDurable})
+		created <- err
+	}()
+	deleteTasksStream(t, s.ClientURL())
+	if err := <-created; err != nil {
+		t.Fatalf("the late durable could not bind, so the stream was deleted before it: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.Stream(ctx, lib.TasksStream); !errors.Is(err, jetstream.ErrStreamNotFound) {
+		t.Fatalf("TASKS should be gone after the helper returns, got %v", err)
 	}
 }
 
