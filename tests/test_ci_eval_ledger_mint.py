@@ -318,6 +318,7 @@ class UnitNotRunTest(unittest.TestCase):
                     for f in (
                         "mint_ledger_token",
                         "ledger_reset_token",
+                        "forge_write_token",
                         "reset_agent_pulls",
                         "record_unit_not_run",
                         "finished_rep_count",
