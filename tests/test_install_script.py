@@ -5938,6 +5938,45 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                         self.assertNotIn("passing --slack-bot-token", out)
                     self.assertEqual(path.read_text(), content, "a refusal never touches the file")
 
+    def test_the_toggle_remedy_names_an_empty_or_missing_allowlist(self):
+        # kube-agents-bot round 5 on #2553: the operator refused on
+        # --enable-google-chat edits the file as the remedy says. If it names
+        # the toggle alone, a -y re-run renders the file's empty allowlist,
+        # which admits every user.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, names in (
+                # The file a chat-less install writes: the allowlist recorded empty.
+                ("GOOGLE_CHAT_ENABLED=false\nALLOWED_USERS=''\n", "-y --enable-google-chat",
+                 "Set GOOGLE_CHAT_ENABLED=true and ALLOWED_USERS=<emails> in {path}"),
+                ("SLACK_ENABLED=false\nSLACK_ALLOWED_USERS=''\n", "-y --enable-slack",
+                 "Set SLACK_ENABLED=true and SLACK_ALLOWED_USERS=<user IDs> in {path}"),
+                # A hand-written file that lacks the allowlist, or comments it out.
+                ("SLACK_ENABLED=false\n# SLACK_ALLOWED_USERS=\n", "--enable-slack",
+                 "Set SLACK_ENABLED=true and SLACK_ALLOWED_USERS=<user IDs> in {path}"),
+                ("GOOGLE_CHAT_ENABLED=false\n", "--enable-google-chat",
+                 "Set GOOGLE_CHAT_ENABLED=true and ALLOWED_USERS=<emails> in {path}"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path, proc, out = self._check(tmp, content, flags)
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(names.format(path=path), out)
+                    key = "SLACK_ALLOWED_USERS" if "SLACK" in content else "ALLOWED_USERS"
+                    self.assertIn(f"An empty {key} admits every user.", out)
+                    self.assertEqual(path.read_text(), content)
+            for content, flags, names in (
+                # A recorded list: the toggle alone is the whole remedy.
+                ("GOOGLE_CHAT_ENABLED=false\nALLOWED_USERS=a@example.com\n", "--enable-google-chat",
+                 "Set GOOGLE_CHAT_ENABLED=true in {path}"),
+                ("SLACK_ENABLED=false\nSLACK_ALLOWED_USERS=U1\n", "--enable-slack", "Set SLACK_ENABLED=true in {path}"),
+                # Turning one off: an allowlist has nothing to admit.
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\n", "--enable-slack=false", "Set SLACK_ENABLED=false in {path}"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path, proc, out = self._check(tmp, content, flags)
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(names.format(path=path), out)
+                    self.assertNotIn("admits every user", out)
+
     def test_a_chat_string_that_disagrees_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             for content, flags, key, shown in (
@@ -6410,6 +6449,82 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             after, _ = self._upgrade_render(path)
             self.assertIn('slack_allowed_users     = ["U1", "U2"]', after)
 
+    def test_an_allowlist_answered_where_the_file_lacks_the_key_is_recorded(self):
+        # kube-agents-bot round 5 on #2553: the file install.env.example
+        # invites, the toggle uncommented and the allowlist left commented
+        # out. The allowlist typed at the prompt was applied for one run and
+        # recorded by nothing, so the next upgrade.sh rendered [], which
+        # admits every user. The file assigns no such key, so the answer is
+        # appended, as a flag's missing key is.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, answers, applied, line, rendered in (
+                ("SLACK_ENABLED=true\n# SLACK_ALLOWED_USERS=\n", "false '' true U1,U2",
+                 "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2", "SLACK_ALLOWED_USERS=U1\\,U2",
+                 'slack_allowed_users     = ["U1", "U2"]'),
+                ("GOOGLE_CHAT_ENABLED=true\n# ALLOWED_USERS=\n", "true a@example.com false ''",
+                 "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com", "ALLOWED_USERS=a@example.com",
+                 'google_chat_allowed_users = ["a@example.com"]'),
+                # No allowlist line at all.
+                ("SLACK_ENABLED=True\n", "false '' true U1", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1",
+                 "SLACK_ALLOWED_USERS=U1", 'slack_allowed_users     = ["U1"]'),
+            ):
+                with self.subTest(content=content):
+                    path = self._file(tmp, self._COORDINATES + content)
+                    before, _ = self._upgrade_render(path)
+                    self.assertRegex(before, r"(slack|google_chat)_allowed_users *= \[\]")
+                    proc = self._run(
+                        f"{self._ANSWERS.format(answers)}; export {applied}; record_flags_into_install_env", path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0", out)
+                    self.assertIn(f"Recorded {line} in {path}, which assigned no {line.split('=')[0]}", out)
+                    self.assertEqual(path.read_text(), self._COORDINATES + content + line + "\n")
+                    after, _ = self._upgrade_render(path)
+                    self.assertIn(rendered, after)
+
+    def test_an_empty_answer_or_an_integration_turned_off_records_no_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, answers, applied in (
+                # Enter at the prompt: allow-all, and nothing to record.
+                ("SLACK_ENABLED=true\n# SLACK_ALLOWED_USERS=\n", "false '' true ''", "SLACK_ENABLED=true SLACK_ALLOWED_USERS="),
+                ("GOOGLE_CHAT_ENABLED=true\n", "true '' false ''", "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS="),
+                # None at the chat menu: the run applied the integration off.
+                ("SLACK_ENABLED=true\n", "false '' false ''", "SLACK_ENABLED=false SLACK_ALLOWED_USERS=U1"),
+                # The file records the integration off.
+                ("SLACK_ENABLED=false\n", "false '' true U1", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1"),
+            ):
+                with self.subTest(content=content, answers=answers):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f"{self._ANSWERS.format(answers)}; export {applied}; record_flags_into_install_env", path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0", out)
+                    self.assertNotIn("Recorded ", out)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_a_dry_run_says_it_would_record_the_missing_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "SLACK_ENABLED=true\n")
+            proc = self._run("parse_args --dry-run; " + self._ANSWERS.format("false '' true U1"), path)
+            out = proc.stdout + proc.stderr
+            self.assertIn("rc=0", out)
+            self.assertIn(f"{path} records SLACK_ENABLED on and assigns no SLACK_ALLOWED_USERS; a run without --dry-run records the SLACK_ALLOWED_USERS answered here", out)
+            self.assertEqual(path.read_text(), "SLACK_ENABLED=true\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
+    def test_a_missing_allowlist_answered_over_a_file_the_run_cannot_write_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "GOOGLE_CHAT_ENABLED=true\n")
+            path.chmod(0o400)
+            try:
+                proc = self._run(self._ANSWERS.format("true a@example.com false ''"), path)
+            finally:
+                path.chmod(0o600)
+            out = proc.stdout + proc.stderr
+            self.assertIn("rc=1", proc.stdout, out)
+            self.assertIn(f"{path} records GOOGLE_CHAT_ENABLED on and assigns no ALLOWED_USERS, which this run would record there", out)
+
     def test_main_checks_the_allowlist_answers_after_the_chat_step_and_before_the_next(self):
         text = _INSTALL_SH.read_text()
         main_start = text.index("\nmain() {")
@@ -6548,6 +6663,45 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                             self.assertNotIn(token, out)
                     else:
                         self.assertNotIn("pausing here did not record", out)
+
+    def test_the_pause_records_no_missing_allowlist_and_names_it(self):
+        # The step-11 `n` records nothing, as for a flag's key, and the
+        # warning lists the allowlist line a hand-run apply needs.
+        text = _INSTALL_SH.read_text()
+        start = text.index(self._CONFIRM_START, text.index("\nmain() {"))
+        block = text[start:text.index(self._CONFIRM_END, start) + len(self._CONFIRM_END)]
+        stubs = (
+            'prompt_read() { printf -v "$2" "%s" "$ANSWER"; }\n'
+            "check_scope_container_access() { :; }\n"
+            "write_json_report() { :; }\n"
+            f"_confirm() {{\n{block}  record_flags_into_install_env\n}}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, answers, applied, line in (
+                ("SLACK_ENABLED=true\n# SLACK_ALLOWED_USERS=\n", "false '' true U1",
+                 "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1", "SLACK_ALLOWED_USERS=U1"),
+                ("GOOGLE_CHAT_ENABLED=true\n", "true a@example.com false ''",
+                 "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com", "ALLOWED_USERS=a@example.com"),
+            ):
+                key = line.split("=")[0]
+                for answer in ("n", "y"):
+                    with self.subTest(content=content, answer=answer):
+                        path = self._file(tmp, content)
+                        proc = self._run(
+                            f"{stubs}{self._ANSWERS.format(answers)}; export {applied}\n"
+                            f'ANSWER="{answer}" _confirm; echo "went on"',
+                            path,
+                        )
+                        out = proc.stdout + proc.stderr
+                        if answer == "n":
+                            self.assertEqual(path.read_text(), content)
+                            self.assertNotIn("Recorded ", out)
+                            self.assertNotIn("went on", out)
+                            self.assertIn(f"{path} assigns no {key}, and pausing here did not record them", out)
+                            self.assertIn(f"so a later upgrade.sh renders what you applied:\n    {line}\n", out)
+                        else:
+                            self.assertIn("went on", out)
+                            self.assertEqual(path.read_text(), content + line + "\n")
 
     def test_main_checks_before_the_interview_and_records_last_on_each_route(self):
         text = _INSTALL_SH.read_text()

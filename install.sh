@@ -1953,6 +1953,21 @@ install_env_toggle_companions() {
   esac
 }
 
+# The allowlist beside a chat toggle, and what an operator puts in it.
+install_env_toggle_allowlist() {
+  case "${1:-}" in
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS" ;;
+    *) ;;
+  esac
+}
+install_env_allowlist_placeholder() {
+  case "${1:-}" in
+    SLACK_ALLOWED_USERS) printf '%s' "<user IDs>" ;;
+    *) printf '%s' "<emails>" ;;
+  esac
+}
+
 # A chat flag this run typed, noted for check_flags_against_install_env. Its
 # value is read from the PARAM_* at check time, so a flag given twice is checked
 # at the value that won.
@@ -2027,8 +2042,20 @@ check_flag_against_install_env() {
   esac
   print_error "${flag}=$(printf '%q' "$value") disagrees with the install configuration, so it would hold for this run only: ${file} records ${recorded_shown}."
   print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records a chat flag only where install.env assigns no such key; it does not change a key the file assigns."
-  local remedy
-  remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
+  # A toggle turned on over a file whose allowlist renders [] -- recorded
+  # empty, as a chat-less install writes it, or absent -- names the allowlist
+  # too: set the toggle alone and a -y re-run renders the empty one, which
+  # admits every user.
+  local remedy allowlist="" allowlist_set=""
+  if is_truthy "$value"; then
+    allowlist="$(install_env_toggle_allowlist "$key")"
+  fi
+  if [ -n "$allowlist" ] && [ "$(hcl_csv_list "$(recorded_install_env_value "$file" "$allowlist")")" = "[]" ]; then
+    allowlist_set=" and ${allowlist}=$(install_env_allowlist_placeholder "$allowlist")"
+  else
+    allowlist=""
+  fi
+  remedy="Set ${key}=$(printf '%q' "$value")${allowlist_set} in ${file}"
   case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
     *" ${key} "*) remedy="${remedy}, or change it with './install.sh --menu'" ;;
   esac
@@ -2036,7 +2063,11 @@ check_flag_against_install_env() {
   if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
     remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
   fi
-  print_info "${remedy}."
+  remedy="${remedy}."
+  if [ -n "$allowlist" ]; then
+    remedy="${remedy} An empty ${allowlist} admits every user."
+  fi
+  print_info "${remedy}"
   return 1
 }
 
@@ -2090,9 +2121,12 @@ check_flags_against_install_env() {
 # deliberate allow-all and agrees. A recorded list the answer changes puts the
 # old list back on the next upgrade, not allow-all, and is left to
 # warn_unrecorded_interview_answers. An allowlist the file lacks is appended
-# beside a queued toggle (resolve_install_env_record_keys). Runs after the
-# chat step and before anything is applied. A non-interactive run applies the
-# file's value or a flag already held to it, so this cannot fire there.
+# with the answer, beside a toggle queued or recorded true
+# (resolve_install_env_record_keys), since the file assigns no such key; this
+# says so on a --dry-run and refuses a file the record could not write. Runs
+# after the chat step and before anything is applied. A non-interactive run
+# applies the file's value or a flag already held to it, so the refusal cannot
+# fire there.
 check_chat_allowlist_answers_against_install_env() {
   local file="${INSTALL_ENV_FILE:-}" refused="false"
   [ -n "$file" ] && [ -f "$file" ] || return 0
@@ -2105,7 +2139,22 @@ check_chat_allowlist_answers_against_install_env() {
 check_chat_allowlist_answer_against_install_env() {
   local file="$1" toggle="$2" enabled="$3" key="$4" value="$5"
   is_truthy "$enabled" || return 0
-  install_env_records_key "$file" "$key" || return 0
+  if ! install_env_records_key "$file" "$key"; then
+    # A toggle the file lacks is queued by its flag, and brings this key as a
+    # companion, checked for writability with it. One the file records true
+    # brings the answer through the same record, with no flag to queue it.
+    [ "$(hcl_csv_list "$value")" != "[]" ] || return 0
+    install_env_records_key "$file" "$toggle" || return 0
+    is_truthy "$(recorded_install_env_value "$file" "$toggle")" || return 0
+    if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+      print_info "${file} records ${toggle} on and assigns no ${key}; a run without --dry-run records the ${key} answered here."
+      return 0
+    fi
+    [ ! -w "$file" ] || return 0
+    print_error "${file} records ${toggle} on and assigns no ${key}, which this run would record there from the answer, and it is not writable."
+    print_info "Make it writable, or add ${key}=$(printf '%q' "$value") to it yourself, and re-run."
+    return 1
+  fi
   [ "$(hcl_csv_list "$(recorded_install_env_value "$file" "$key")")" = "[]" ] || return 0
   [ "$(hcl_csv_list "$value")" != "[]" ] || return 0
   if install_env_records_key "$file" "$toggle"; then
@@ -2152,10 +2201,16 @@ check_chat_allowlist_answer_against_install_env() {
 # export. The file install.sh writes on a first install records the toggle and
 # these keys together, and so does the Day-2 menu for Google Chat; the tokens
 # are still never written.
+#
+# A toggle the file already records true brings its allowlist the same way,
+# with no flag typed, where the file lacks the key and this run applied a
+# non-empty one: the answer at the prompt over a hand-written file that
+# uncommented the toggle alone. An empty answer appends nothing.
 record_flags_into_install_env() {
   local file="${INSTALL_ENV_FILE:-}" key value
-  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ -n "$file" ] && [ -f "$file" ] || return 0
   resolve_install_env_record_keys "$file"
+  [ -n "$INSTALL_ENV_RECORD_KEYS" ] || return 0
   # A last line with no newline would run into the appended assignment.
   if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
     printf '\n' >> "$file"
@@ -2176,8 +2231,9 @@ record_flags_into_install_env() {
 # hand can make the file match first. Never a token: those are never queued.
 warn_install_env_keys_not_recorded() {
   local file="${INSTALL_ENV_FILE:-}" key
-  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ -n "$file" ] && [ -f "$file" ] || return 0
   resolve_install_env_record_keys "$file"
+  [ -n "$INSTALL_ENV_RECORD_KEYS" ] || return 0
   print_warning "${file} assigns no ${INSTALL_ENV_RECORD_KEYS// /, }, and pausing here did not record them: a run abandoned at this prompt leaves the file as it was."
   print_info "If you go on to run lifecycle.sh apply by hand, first add these lines to ${file}, so a later upgrade.sh renders what you applied:"
   for key in $INSTALL_ENV_RECORD_KEYS; do
@@ -2192,12 +2248,16 @@ warn_install_env_keys_not_recorded() {
 # stops partway (Ctrl-C before the apply, a full disk) then leaves settings
 # with the integration off, never the integration on with no allowlist, which
 # admits everyone and which no re-run repairs, since the flag then agrees with
-# the file.
+# the file. Then, with no flag needed, the allowlist of a toggle the file
+# records true and this run applied on, where the file lacks the key and the
+# applied list is not empty; the toggle is already in the file, so the
+# setting still lands no later than it.
 resolve_install_env_record_keys() {
-  local file="$1" key companion record_keys="" toggles=""
+  local file="$1" key companion record_keys="" toggles="" allowlist
   # Every companion in one read of the file rather than one per key.
   # shellcheck disable=SC2046
-  read_recorded_install_env_values "$file" $(install_env_toggle_companions SLACK_ENABLED) $(install_env_toggle_companions GOOGLE_CHAT_ENABLED)
+  read_recorded_install_env_values "$file" SLACK_ENABLED GOOGLE_CHAT_ENABLED \
+    $(install_env_toggle_companions SLACK_ENABLED) $(install_env_toggle_companions GOOGLE_CHAT_ENABLED)
   for key in $INSTALL_ENV_KEYS_TO_RECORD; do
     if [ -z "$(install_env_toggle_companions "$key")" ]; then
       record_keys="${record_keys}${record_keys:+ }${key}"
@@ -2213,6 +2273,18 @@ resolve_install_env_record_keys() {
         record_keys="${record_keys}${record_keys:+ }${companion}"
       fi
     done
+  done
+  for key in GOOGLE_CHAT_ENABLED SLACK_ENABLED; do
+    allowlist="$(install_env_toggle_allowlist "$key")"
+    case " ${record_keys} ${INSTALL_ENV_KEYS_TO_RECORD} " in
+      *" ${allowlist} "*) continue ;;
+    esac
+    install_env_records_key "$file" "$key" || continue
+    is_truthy "$(recorded_install_env_value "$file" "$key")" || continue
+    is_truthy "${!key-}" || continue
+    ! install_env_records_key "$file" "$allowlist" || continue
+    [ "$(hcl_csv_list "${!allowlist-}")" != "[]" ] || continue
+    record_keys="${record_keys}${record_keys:+ }${allowlist}"
   done
   INSTALL_ENV_RECORD_KEYS="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
 }
