@@ -111,13 +111,14 @@ func (g *Gateway) fixedRouteBacklog(ctx context.Context, exclude string) (int, e
 	defer cancel()
 	now := time.Now()
 	n := 0
+	tasks := &busyTasksStream{g: g}
 	err := g.reg.eachSessionRecord(ctx, func(rec *SessionRecord) {
 		active := rec.ActiveTask
 		if active == nil || active.TaskID == exclude ||
 			rec.AddresseeFor(active.TaskID) != g.cfg.DefaultAddressee {
 			return
 		}
-		if g.busyTaskLeftOut(ctx, active, g.cfg.DefaultAddressee, now) {
+		if g.busyTaskLeftOut(ctx, tasks, active, g.cfg.DefaultAddressee, now) {
 			return
 		}
 		n++
@@ -170,11 +171,11 @@ func (r *Registry) eachSessionRecord(ctx context.Context, fn func(*SessionRecord
 // as its newest event. Inside the grace it answers false without reading the
 // stream. A read that fails counts the task: a transport failure cannot rule
 // out events, the rule the heal follows.
-func (g *Gateway) busyTaskLeftOut(ctx context.Context, active *ActiveTask, addressee string, now time.Time) bool {
+func (g *Gateway) busyTaskLeftOut(ctx context.Context, tasks *busyTasksStream, active *ActiveTask, addressee string, now time.Time) bool {
 	if active.SubmittedAt.IsZero() || now.Sub(active.SubmittedAt) <= g.cfg.FirstEventGrace {
 		return false
 	}
-	empty, final, err := g.busyReadTaskStream(ctx, addressee, active.TaskID)
+	empty, final, err := tasks.readTask(ctx, addressee, active.TaskID)
 	if err != nil {
 		g.log.Warn("busy count: stream read failed; counting the task",
 			"taskId", active.TaskID, "err", err)
@@ -193,19 +194,40 @@ func busyNeverStarted(active *ActiveTask, streamEmpty bool, grace time.Duration,
 		!active.SubmittedAt.IsZero() && now.Sub(active.SubmittedAt) > grace
 }
 
-// busyReadTaskStream reads the newest message on each of a task's replay
-// subjects (lib.TaskReplaySubjects) with a direct get, and no consumer, so a
-// count over many records opens no ephemeral consumer on TASKS. empty is
-// nothing on either subject in the retention window, the question the replay
-// answers with TaskNotFound; any message at all is a message here, as it is
-// for the replay. final is a terminal status as the newest message on either:
-// the executor writes nothing after its terminal, and the supervisor subject
+// busyTasksStream is one count's handle on the TASKS stream, looked up on the
+// first task that needs a read and reused for the rest, so a count over N
+// stale tasks costs one STREAM.INFO and 2N direct gets rather than 3N round
+// trips inside busyCountTimeout.
+type busyTasksStream struct {
+	g      *Gateway
+	stream jetstream.Stream
+}
+
+func (b *busyTasksStream) handle(ctx context.Context) (jetstream.Stream, error) {
+	if b.stream != nil {
+		return b.stream, nil
+	}
+	stream, err := b.g.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		return nil, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
+	}
+	b.stream = stream
+	return stream, nil
+}
+
+// readTask reads the newest message on each of a task's replay subjects
+// (lib.TaskReplaySubjects) with a direct get, and no consumer, so a count
+// over many records opens no ephemeral consumer on TASKS. empty is nothing on
+// either subject in the retention window, the question the replay answers
+// with TaskNotFound; any message at all is a message here, as it is for the
+// replay. final is a terminal status as the newest message on either: the
+// executor writes nothing after its terminal, and the supervisor subject
 // carries only terminals. An error is the read failing, not the subjects
 // being empty.
-func (g *Gateway) busyReadTaskStream(ctx context.Context, addressee, taskID string) (empty, final bool, err error) {
-	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
+func (b *busyTasksStream) readTask(ctx context.Context, addressee, taskID string) (empty, final bool, err error) {
+	stream, err := b.handle(ctx)
 	if err != nil {
-		return false, false, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
+		return false, false, err
 	}
 	empty = true
 	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
