@@ -1364,11 +1364,14 @@ class CiEvalWiringTest(unittest.TestCase):
                 result, _ = self.run_wiring(mode_next="1", script_status=status)
                 out = result.stdout
                 self.assertIn("COLLECT_DIAG --keep-watch prefix=\n", out)
-                # Presence, not order: the round trip's output reaches stdout
-                # through an un-waited `tee` process substitution, so it can land
-                # after the trap's collect line (the same race as #2626).
+                # The child's line is checked for presence only: it reaches
+                # stdout through an un-waited `tee` process substitution, so it
+                # can land after the collect call (the same race as #2626).
                 self.assertIn("stub ran", out)
-                self.assertIn("COLLECT_DIAG  prefix=rollback-", out)
+                # The snapshot comes after the round trip: the function's own
+                # closing line, printed after its wait, precedes it. Both are
+                # the parent's, so this order is fixed.
+                self.assertLess(out.index("report-only, so the eval verdict"), out.index("COLLECT_DIAG  prefix=rollback-"))
 
     def test_a_run_too_late_for_its_bound_is_skipped(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", elapsed=16000)
@@ -1496,8 +1499,9 @@ class CiEvalWiringTest(unittest.TestCase):
         # substitution, which nothing waits for, so it is checked for presence
         # only (#2626).
         self.assertIn("CHILD DONE BEFORE EXIT=yes", out)
-        # The deadline's exit still takes the round trip's own snapshot.
-        self.assertIn("DIAG  prefix=rollback-", out)
+        # The deadline's exit still takes the round trip's own snapshot, and
+        # takes it in the EXIT trap, after the child is done.
+        self.assertLess(out.index("CHILD DONE BEFORE EXIT=yes"), out.index("DIAG  prefix=rollback-"))
 
     def test_the_function_never_assigns_the_suite_status(self) -> None:
         self.assertNotIn("SUITE_STATUS", ci_eval_function("run_rollback_roundtrip"))
