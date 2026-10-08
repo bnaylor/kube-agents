@@ -176,17 +176,9 @@ its integration the file also lacks, with the values the run applied: `SLACK_ALL
 toggle is written after them, so a record cut short leaves the settings with the integration
 off, never the integration on without its allowlist. Otherwise
 an allowlist given at the prompt or as an export would be left out, and the next upgrade would
-render the integration on with an empty allowlist, which admits everyone. The same hole is open
-from the prompt: an allowlist typed at the chat step over one the file records empty, where the file
-renders that integration on (its toggle recorded `true`, or appended `true` by this run), is refused
-before anything is applied, naming the key to set, since nothing records a key the file assigns
-and the next upgrade would render the empty list. That is the walk a chat-less install invites:
-its file records both allowlists empty, so set the allowlist in the file beside the toggle. Enter
-at the prompt keeps an empty allowlist, which stays a deliberate allow-all. Where the file
-records the toggle `true` and has no allowlist line at all (the toggle uncommented alone, as
-`install.env.example` allows), an allowlist typed at the prompt is recorded beside it with no
-flag needed, at the same last step and under the same `n` and `--dry-run` rules, since the file
-assigns no such key; an empty answer appends nothing. A file the run cannot write is refused up front
+render the integration on with an empty allowlist, which admits everyone. A chat-less install's
+file records both allowlists empty, and `install.sh` does not change a key the file assigns, so to
+turn an integration on later, set its allowlist in the file beside the toggle. A file the run cannot write is refused up front
 when there is a key to record. This is the one write
 `install.sh` makes to a file it did not create, and only of keys the file lacks. A flag that
 agrees changes nothing. The Slack tokens are never appended: their home is the live

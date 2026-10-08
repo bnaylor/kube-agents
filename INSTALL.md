@@ -568,8 +568,8 @@ To add a chat platform later, edit `install.env` and re-run `./install.sh`, then
 
 The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
 empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,
-so `install.sh` refuses an allowlist typed at the prompt over that empty line, and refuses
-`--enable-google-chat` or `--enable-slack` over a file that records the key the other way
+and `install.sh` does not change a key the file assigns, so set the allowlist in the file. It
+refuses `--enable-google-chat` or `--enable-slack` over a file that records the key the other way
 ([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
 
 ---
