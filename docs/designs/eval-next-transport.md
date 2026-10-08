@@ -391,7 +391,7 @@ and the `submitted`-only classification above is the backstop rather than the fi
 repetition that reaches the deadline is infrastructure, not a failed case, but it has still
 spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge,
 and both are the CI flag's (decided 2026-09-18 by the A2A owner on gke-labs/kube-agents#1661,
-with the conditions below). `a2a/Dockerfile.hermes-bridge` sits beside the three A2A
+with the conditions below). `a2a/Dockerfile.hermes-bridge` sits beside the other A2A
 Dockerfiles: the platform-agent image plus the bridge binary, built in the same Cloud Build as
 the A2A images (a step of its own, after the platform image) and tagged per pull request into the
 pool project's registry,
@@ -599,7 +599,11 @@ what the sidecar carries), waits for the agent Deployment to roll once more and 
 provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
 budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
 that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
-being read past), and ends on the
+being read past; the one `Degraded` it waits out, for up to five minutes, is a pod waiting
+for CPU or memory while Autopilot adds a node, in practice the rolled agent pod, #2414; when
+the pod is the agent's, it reads that pod as it waits (or, once that pod is gone or finished, the agent's live pods) and
+hands off to the agent Deployment's rollout gate once the pod is bound to a node, because the operator watches no Pods and the CR keeps the scheduler's
+message until its next pass), and ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
@@ -629,6 +633,19 @@ fan-out the script lists in the job log what the run left on that repository, cl
 With the flag unset both scripts are byte for byte what
 they were, and the presubmit's own tests hold that.
 
+Under the flag the run also checks the rollback path once the suite verdict is computed and
+before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
+and back to `next`, with `spec.deployment.sidecars` unset before the first flip and declared
+again after the second, and asserts that the JetStream PVC and the bus creds Secret keep their
+UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
+afterwards. It is reported, not gated: its own section of the log and two artifacts
+(`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
+on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
+inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
+the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+log and pod diagnostics are collected before it starts, because the flip replaces the pods
+they come from.
+
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
 The next stack still has holes independent of any case (images in a private registry, and
@@ -638,8 +655,9 @@ running it: a scheduled lane on `main` under the flag, with a record of its own,
 presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
 of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
 is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
-presubmit and the periodic on main), and refuses it on any other Prow run, so the flag mis-set
-on the nightly or a postsubmit still stops the deploy before anything is built. The record of its
+presubmit, the periodic on main, and the full-catalog nightly that runs beside a today-mode nightly
+on the same agent model), and refuses it on any other Prow run, so the flag mis-set on the today
+nightly or a postsubmit still stops the deploy before anything is built. The record of its
 own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
 store would be today's once written, and the dashboard has no next lane to file a run under. Until
 both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
