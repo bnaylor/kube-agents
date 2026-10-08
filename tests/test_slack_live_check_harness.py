@@ -1319,9 +1319,13 @@ class UnitTest(unittest.TestCase):
     def test_status_grammar_matches_the_gateway_source(self):
         gateway = (REPO / "a2a" / "gateway" / "gateway.go").read_text()
         relay = (REPO / "a2a" / "gateway" / "relay.go").read_text()
-        self.assertIn(f'g.adapter.Post(rec.Key, "{harness.STATUS_PLACEHOLDER}")', gateway)
+        # Since #2493 the placeholder carries a delegated child's line note;
+        # a typed turn has none, so the live check sees the bare placeholder.
+        self.assertIn(f'g.adapter.Post(rec.Key, withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote))', gateway)
         self.assertIn(f'"{harness.STATUS_BUS_FAILURE}"', gateway)
-        self.assertIn(f'g.post(rec.Key, "{harness.STEER_FAILED_NOTICE}")', gateway)
+        # Main moved the notice into a constant; pin the constant and its use.
+        self.assertIn(f'const noticeSteerNotSent = "{harness.STEER_FAILED_NOTICE}"', gateway)
+        self.assertIn("g.post(rec.Key, noticeSteerNotSent)", gateway)
         self.assertIn('g.post(rec.Key, "✏️ steering sent — ', gateway)
         self.assertIn('line := fmt.Sprintf("%s **%s**", icon, label)', relay)
         self.assertIn('line := fmt.Sprintf("%s **%s**", icon, state)', relay)

@@ -1064,7 +1064,10 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertIn(f's.log.Info("{launch.GATEWAY_SLACK_CONNECTED_MSG}"', gateway)
         ingress = (REPO / "a2a/gateway/gateway.go").read_text()
         self.assertIn(f'g.log.Info("{launch.GATEWAY_INGRESS_MSG}",', ingress)
-        self.assertIn('"backendMessageId", msg.MessageID,', ingress)
+        # The ingress line reads the message ID through taskStart since #2493;
+        # for a typed turn it is still the backend message's own ID.
+        self.assertIn('"backendMessageId", ts.MessageID,', ingress)
+        self.assertIn("MessageID: msg.MessageID,", ingress)
 
 
 if __name__ == "__main__":
