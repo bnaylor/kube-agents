@@ -6318,6 +6318,110 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertIn("enable_slack            = true", after)
             self.assertIn('slack_allowed_users     = ["U1", "U2"]', after)
 
+    # ── an allowlist answered at the prompt ─────────────────────────────────
+
+    _ANSWERS = 'rc=0; check_chat_allowlist_answers_against_install_env {} || rc=$?; echo "rc=$rc"'
+
+    def test_an_allowlist_answered_over_one_the_file_records_empty_is_refused(self):
+        # jayantid on #2553 (2553-F1): the "add a chat platform later" steps
+        # set the toggle and re-run. The file a chat-less install wrote still
+        # records the allowlist empty, nothing appends a key the file assigns,
+        # so the allowlist typed at the prompt held for one run and the next
+        # upgrade.sh rendered [], which admits every user.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, answers, keys, menu in (
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=''\n", "", "false '' true U1,U2",
+                 ["SLACK_ALLOWED_USERS=U1\\,U2"], False),
+                ("GOOGLE_CHAT_ENABLED=true\nALLOWED_USERS=\n", "", "true a@example.com false ''",
+                 ["ALLOWED_USERS=a@example.com"], True),
+                # A hand-written spelling of true, read as the generator reads it.
+                ("SLACK_ENABLED=True\nSLACK_ALLOWED_USERS=\n", "", "false '' true U1", ["SLACK_ALLOWED_USERS=U1"], False),
+                # The record path: --enable-slack over a file that lacks the
+                # toggle appends it, but not the allowlist the file sets empty.
+                ("SLACK_ALLOWED_USERS=''\n", "--enable-slack", "false '' true U1", ["SLACK_ALLOWED_USERS=U1"], False),
+                # Both, named in one run.
+                ("GOOGLE_CHAT_ENABLED=true\nALLOWED_USERS=\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\n", "",
+                 "true a@example.com true U1", ["ALLOWED_USERS=a@example.com", "SLACK_ALLOWED_USERS=U1"], True),
+            ):
+                with self.subTest(content=content, flags=flags, answers=answers):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; {self._ANSWERS.format(answers)}", path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=1", proc.stdout.splitlines()[-1], out)
+                    for shown in keys:
+                        key = shown.split("=", 1)[0]
+                        self.assertIn(f"{path} records {key} empty, which admits every user", out)
+                        self.assertIn(f"Set {shown} in {path}", out)
+                    self.assertEqual("or change it with './install.sh --menu'" in out, menu, out)
+                    self.assertEqual(path.read_text(), content, "a refusal never touches the file")
+
+    def test_a_deliberate_empty_or_a_recorded_list_is_not_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, answers in (
+                # Enter at the prompt keeps the recorded empty: allow-all on purpose.
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=''\n", "", "false '' true ''"),
+                ("GOOGLE_CHAT_ENABLED=true\nALLOWED_USERS=\n", "", "true '' false ''"),
+                # An answer that renders to the empty list is the empty list.
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\n", "", "false '' true ' , '"),
+                # The file's list agrees, in another spelling.
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U1,U2\n", "", "false '' true 'U1, U2'"),
+                # A recorded list the answer changes: the next upgrade puts the
+                # old list back, never allow-all, and the end-of-run warning names it.
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U0\n", "", "false '' true U1"),
+                # The file renders the integration off, so its empty list admits no one.
+                ("SLACK_ENABLED=false\nSLACK_ALLOWED_USERS=\n", "", "false '' true U1"),
+                ("SLACK_ALLOWED_USERS=\n", "", "false '' true U1"),
+                # This run did not turn the integration on.
+                ("SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\n", "", "false '' false U1"),
+                # The file lacks the allowlist: a queued toggle brings it (the record path).
+                ("PROJECT_ID=p\n", "--enable-slack", "false '' true U1"),
+            ):
+                with self.subTest(content=content, flags=flags, answers=answers):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; {self._ANSWERS.format(answers)}", path,
+                    )
+                    self.assertEqual(proc.stdout.splitlines()[-1], "rc=0", proc.stdout + proc.stderr)
+            # No install.env yet: a first install writes what it applies.
+            path = self._file(tmp, "GOOGLE_CHAT_ENABLED=true\nALLOWED_USERS=\n")
+            proc = self._run(f'INSTALL_ENV_FILE="{tmp}/absent.env"; ' + self._ANSWERS.format("true a false ''"), path)
+            self.assertEqual(proc.stdout.splitlines()[-1], "rc=0", proc.stdout + proc.stderr)
+
+    def test_the_documented_walk_to_add_slack_keeps_the_allowlist(self):
+        # The file a chat-less install writes, with the toggle flipped by hand
+        # as the "add a chat platform later" steps say.
+        chatless = self._COORDINATES + (
+            "SLACK_ENABLED=true\nSLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, chatless)
+            # What the next upgrade renders from that file: allow-all, which is
+            # why an allowlist answered at the prompt cannot hold for one run.
+            after, _ = self._upgrade_render(path)
+            self.assertIn("slack_allowed_users     = []", after)
+            proc = self._run(self._ANSWERS.format("false '' true U1,U2"), path)
+            self.assertEqual(proc.stdout.splitlines()[-1], "rc=1", proc.stdout + proc.stderr)
+            # The step as the docs now give it: the allowlist beside the toggle.
+            path = self._file(tmp, chatless.replace("SLACK_ALLOWED_USERS=''", "SLACK_ALLOWED_USERS=U1,U2"))
+            proc = self._run(self._ANSWERS.format("false '' true U1,U2"), path)
+            self.assertEqual(proc.stdout.splitlines()[-1], "rc=0", proc.stdout + proc.stderr)
+            after, _ = self._upgrade_render(path)
+            self.assertIn('slack_allowed_users     = ["U1", "U2"]', after)
+
+    def test_main_checks_the_allowlist_answers_after_the_chat_step_and_before_the_next(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        call = (
+            '\n  check_chat_allowlist_answers_against_install_env "$google_chat_enabled" "$allowed_users" '
+            '"$slack_enabled" "$slack_allowed_users" || exit 1\n'
+        )
+        self.assertEqual(text.count(call), 1)
+        at = text.index(call, main_start)
+        self.assertLess(text.index("\n      _prompt_slack_settings\n      ;;\n    4)\n", main_start), at)
+        self.assertLess(at, text.index('print_step "7. AI Model Provider Credentials"', main_start))
+
     def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, proc, out = self._check(tmp, "PROJECT_ID=p\n", "--dry-run --enable-slack")
@@ -6510,6 +6614,11 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         self.assertIn("GOOGLE_CHAT_ENABLED=true", body)
         self.assertIn("SLACK_ENABLED=true", body)
         self.assertIn("./install.sh --menu", body)
+        # And the allowlist beside each toggle (jayantid, 2553-F1): that file
+        # records both empty, so the next upgrade renders an allowlist typed
+        # only at the prompt as [], which admits every user.
+        self.assertIn("SLACK_ALLOWED_USERS=", body)
+        self.assertRegex(body, r"[^_]ALLOWED_USERS=")
 
     # ── what upgrade.sh renders afterwards ──────────────────────────────────
 

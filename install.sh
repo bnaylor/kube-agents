@@ -1922,6 +1922,10 @@ warn_flag_beats_unrecorded_file_value() {
 #     lacks, the allowlist first among them, since an empty one admits everyone;
 #   - a flag that agrees changes nothing.
 #
+# The allowlists answered at the chat prompt are held to the file too, where
+# the file records the allowlist empty and renders the integration on
+# (check_chat_allowlist_answers_against_install_env).
+#
 # Credentials are the exception to the second rule: a Slack token the file does
 # not carry is never written there, because its home is the live Secret, which
 # write_tfvars_from_state recovers it from on every later run, and
@@ -2067,6 +2071,60 @@ check_flags_against_install_env() {
     refused="true"
   fi
   [ "$refused" = "false" ]
+}
+
+# The step-6 allowlist answers against an existing install.env, held to the
+# file as the flags are, for the one disagreement that opens the integration:
+# the file records the allowlist empty and the operator typed one at the
+# prompt. The run would apply the typed list, and the next upgrade.sh would
+# render the file's empty one, which admits every user. Nothing records the
+# typed list, because the file assigns the key, and install.sh never changes a
+# key the file assigns. This is the "add a chat platform later" walk: a
+# chat-less install writes both toggles false and both allowlists empty, and
+# the operator sets the toggle by hand and re-runs.
+#
+# Only where the file will render the integration on after this run: the
+# toggle recorded true, or queued to be recorded true by a flag the file
+# lacked. A toggle recorded false renders the integration off, so its empty
+# list admits no one. An empty answer (Enter over a recorded empty list) is a
+# deliberate allow-all and agrees. A recorded list the answer changes puts the
+# old list back on the next upgrade, not allow-all, and is left to
+# warn_unrecorded_interview_answers. An allowlist the file lacks is appended
+# beside a queued toggle (resolve_install_env_record_keys). Runs after the
+# chat step and before anything is applied. A non-interactive run applies the
+# file's value or a flag already held to it, so this cannot fire there.
+check_chat_allowlist_answers_against_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" refused="false"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  read_recorded_install_env_values "$file" GOOGLE_CHAT_ENABLED ALLOWED_USERS SLACK_ENABLED SLACK_ALLOWED_USERS
+  check_chat_allowlist_answer_against_install_env "$file" GOOGLE_CHAT_ENABLED "${1:-}" ALLOWED_USERS "${2:-}" || refused="true"
+  check_chat_allowlist_answer_against_install_env "$file" SLACK_ENABLED "${3:-}" SLACK_ALLOWED_USERS "${4:-}" || refused="true"
+  [ "$refused" = "false" ]
+}
+
+check_chat_allowlist_answer_against_install_env() {
+  local file="$1" toggle="$2" enabled="$3" key="$4" value="$5"
+  is_truthy "$enabled" || return 0
+  install_env_records_key "$file" "$key" || return 0
+  [ "$(hcl_csv_list "$(recorded_install_env_value "$file" "$key")")" = "[]" ] || return 0
+  [ "$(hcl_csv_list "$value")" != "[]" ] || return 0
+  if install_env_records_key "$file" "$toggle"; then
+    is_truthy "$(recorded_install_env_value "$file" "$toggle")" || return 0
+  else
+    case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+      *" ${toggle} "*) ;;
+      *) return 0 ;;
+    esac
+  fi
+  print_error "The ${key} answered at the prompt would hold for this run only: ${file} records ${key} empty, which admits every user."
+  print_info "The next install.sh run and every upgrade.sh render ${key} from the file. install.sh does not change a key the file assigns."
+  local remedy
+  remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
+  case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
+    *" ${key} "*) remedy="${remedy}, or change it with './install.sh --menu'" ;;
+  esac
+  print_info "${remedy}, and re-run. To admit every user on purpose, leave it empty and press Enter at the prompt."
+  return 1
 }
 
 # The keys check_flags_against_install_env found install.env not to assign,
@@ -5402,9 +5460,14 @@ main() {
     # The file this install writes records both toggles as false, and a
     # --enable-google-chat or --enable-slack that disagrees with it is refused
     # (check_flag_against_install_env), so the key is the way to turn one on.
-    echo -e "  To add a chat platform later, set ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} or ${C_BOLD}SLACK_ENABLED=true${C_RESET} in install.env and"
-    echo -e "  re-run ${C_BOLD}./install.sh${C_RESET} (for Slack, with --slack-bot-token and --slack-app-token); for Google Chat, ${C_BOLD}./install.sh --menu${C_RESET} also works."
-    echo -e "  --enable-google-chat and --enable-slack are refused over a file that records the key."
+    # It records both allowlists empty too, and an allowlist typed only at the
+    # prompt over that empty line is refused
+    # (check_chat_allowlist_answers_against_install_env), so the allowlist is
+    # set in the file beside the toggle.
+    echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
+    echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key."
   }
 
   case "$chat_choice" in
@@ -5426,6 +5489,10 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
+  # An allowlist typed over one the file records empty, refused here, before
+  # anything is applied, rather than applied for one run and opened to every
+  # user by the next upgrade.sh.
+  check_chat_allowlist_answers_against_install_env "$google_chat_enabled" "$allowed_users" "$slack_enabled" "$slack_allowed_users" || exit 1
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"

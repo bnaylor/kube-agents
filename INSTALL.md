@@ -558,11 +558,17 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
 - `kubectl port-forward` is not an alternative here: the agent runs sandboxed under gVisor by
   default and the forward cannot see into the sandbox. `kubectl exec` enters it.
 
-To add a chat platform later, set `GOOGLE_CHAT_ENABLED=true` or `SLACK_ENABLED=true` in
-`install.env`, re-run `./install.sh` (for Slack, with `--slack-bot-token` and `--slack-app-token`,
-or interactively to be asked for them; for Google Chat, `./install.sh --menu` also works), and
-follow Step 5. The
-`install.env` a chat-less install writes records both as `false`, and `install.sh` refuses
+To add a chat platform later, edit `install.env` and re-run `./install.sh`, then follow Step 5:
+
+- Google Chat: set `GOOGLE_CHAT_ENABLED=true` and `ALLOWED_USERS=` to the comma-separated emails
+  allowed to use the agent. `./install.sh --menu` edits both for you.
+- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated user IDs or
+  emails, and re-run with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked
+  for them.
+
+The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
+empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,
+so `install.sh` refuses an allowlist typed at the prompt over that empty line, and refuses
 `--enable-google-chat` or `--enable-slack` over a file that records the key the other way
 ([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
 
