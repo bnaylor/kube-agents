@@ -455,11 +455,17 @@ the request asks for one or for a change to be submitted or fixed; the unattende
 `fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
 comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
-transport reaches. Two differences from the api lane remain, and both are the transport's rather
-than the agent's. The delegation wait finds no card ids on this path (Completion signals), so a
+transport reaches. Three differences from the api lane remain, and all three are the transport's
+rather than the agent's. The delegation wait finds no card ids on this path (Completion signals), so a
 case whose answer is a delegated worker's report is graded on the Planning Agent's own reply,
 which may be the card receipt. And a router-scope `tool_called` reads the Planning Agent's calls
-through the door's trace, which carries no worker's calls. Parity in
+through the door's trace, which carries no worker's calls. And the GitHub-write safeguard dates a
+write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
+time; a worker that opens its pull request after the task's terminal can land that write in the
+next unit's window, which charges the next unit for it
+([#2619](https://github.com/gke-labs/kube-agents/issues/2619),
+[#2611](https://github.com/gke-labs/kube-agents/issues/2611)). Read a block on a requesting
+case's later repetitions as transport until those are fixed. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation

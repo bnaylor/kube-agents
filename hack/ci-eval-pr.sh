@@ -1792,7 +1792,7 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   for ENTRY in "${TASKS[@]}"; do
     NAME="$(basename "$(dirname "${ENTRY}")")"
     if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
-      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- its premise needs the chat front door (${EVAL_INJECT_LANE_EXCLUSIONS_FILE})"
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- excluded on this lane; the reason is in ${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
       INJECT_LANE_DROPPED="${INJECT_LANE_DROPPED}${NAME}
 "
     else
@@ -2996,6 +2996,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # and the settle plus the serial run of the requesting units (on the
 # presubmit tier, one case's repetitions, which the task lock already ran one
 # at a time, so three settles); the order inside each phase is unchanged.
+# The ordering assumes a unit's writes land before its terminal. Under the
+# bridge's api executor a delegated card's worker can open the pull request
+# after the terminal, inside the next unit's window (#2619, #2611); nothing
+# here waits for that worker.
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-}," in
     *",$1,"*) echo 1 ;;
