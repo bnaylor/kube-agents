@@ -113,8 +113,9 @@ first-install-hello-running
 first-install-hello-done
 
 # #2039: grades the chat front door's ack for a fleet question and the
-# platform worker's fan-out beneath the one card it files. The inject door
-# addresses `platform` directly, so no front door acks and no card for
-# platform is filed. Returns to the lane when the door routes through the
-# chat profile.
+# platform worker's fan-out beneath the one card it files. The same gap as
+# chat-voice-ack-names-target: under the default api executor the front
+# door acks and can file the card, but the worker's rows never reach the A2A
+# thread and the lane's delegation wait reads no card ids. Returns to the
+# lane with agent-kanban-smoke.
 chat-fanout-fleet-restarts-rows
