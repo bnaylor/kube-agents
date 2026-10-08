@@ -138,6 +138,12 @@ func TestDeleteTasksStreamWaitsForTheRelayDurable(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{Durable: relayDurable})
+		if err != nil {
+			// Reported here, at once: a create that fails leaves the helper
+			// waiting out its deadline, and its timeout would otherwise be
+			// the only message, naming the wait rather than the create.
+			t.Errorf("the late durable create failed: %v", err)
+		}
 		created <- err
 	}()
 	deleteTasksStream(t, s.ClientURL())
