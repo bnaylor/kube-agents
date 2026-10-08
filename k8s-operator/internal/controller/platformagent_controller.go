@@ -2526,7 +2526,7 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
-		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			errs = append(errs, err)
 		}
 	}
