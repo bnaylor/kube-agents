@@ -1372,7 +1372,14 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	}
 }
 
+// observeTaskTerminal is also where the task-terminal counter counts
+// (metrics.go), whatever the adapter: it is the funnel every terminal path
+// ends in, once per path -- relayTerminal, the heal (stale terminal or never
+// started) and the publish that never reached the bus -- so the failures the
+// gateway itself declares are counted beside the executor's, and a terminal
+// is counted as often as an adapter is told of it.
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(conversation, taskID, state, source, reason)
 	}

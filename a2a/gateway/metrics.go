@@ -47,9 +47,9 @@ const (
 	labelOutcome = "outcome"
 
 	// metricsLabelOther is the bucket for a value outside a closed list.
-	// relayTerminal sees only final states from executors and the
-	// supervisor today; a state or source added later lands here rather
-	// than minting a series nobody documented.
+	// observeTaskTerminal sees only the four final states and the four
+	// TerminalSources today; a state or source added later lands here
+	// rather than minting a series nobody documented.
 	metricsLabelOther = "other"
 
 	// The gchat pull outcomes: a pull that returned an event, one that
@@ -94,7 +94,7 @@ var (
 	metricsTerminalStates = []lib.TaskState{
 		lib.StateCompleted, lib.StateFailed, lib.StateCanceled, lib.StateRejected,
 	}
-	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor}
+	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 )
 
@@ -119,7 +119,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      taskTerminalsName,
-			Help:      "Task terminals the gateway relayed to a conversation, by final state and by whose word it was (executor or supervisor).",
+			Help:      "Task terminals the gateway delivered to a conversation, by final state and by whose word it was (executor, supervisor, gateway for a task that never reached the bus, gateway-never-started for one no executor took inside the first-event grace).",
 		}, []string{labelState, labelSource}),
 		gchatEventsReceived: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -154,7 +154,8 @@ func (m *Metrics) Handler() http.Handler {
 	})
 }
 
-// taskTerminal counts one relayed terminal.
+// taskTerminal counts one terminal. Its one caller is observeTaskTerminal,
+// which every terminal path reaches once, relayed or declared by the gateway.
 func (m *Metrics) taskTerminal(state lib.TaskState, source TerminalSource) {
 	if m == nil {
 		return

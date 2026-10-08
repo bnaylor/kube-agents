@@ -225,9 +225,6 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
-	// Counted first, on arrival, by state and source alone (metrics.go): a
-	// dashboard reads failure rates here instead of counting log lines.
-	g.metrics.taskTerminal(s.Status.State, source)
 	result := joinTextParts(rs.result)
 	// The console never posts the deliverable (see the StateCompleted arm), so
 	// replaying the stream to recover it would buy nothing. Checking here and

@@ -188,6 +188,85 @@ func TestTaskTerminalsAreCountedByStateAndSource(t *testing.T) {
 	}
 }
 
+// metricsTerminalTotal is every task-terminal series summed.
+func metricsTerminalTotal(t *testing.T, m *Metrics) float64 {
+	t.Helper()
+	var total float64
+	for _, state := range []string{"completed", "failed", "canceled", "rejected", "other"} {
+		for _, source := range []string{"executor", "supervisor", "gateway", "gateway-never-started", "other"} {
+			total += metricsTerminalCount(t, m, state, source)
+		}
+	}
+	return total
+}
+
+// metricsSettle is how long a test waits after a terminal is counted before
+// reading the total again, so a second count for the same terminal -- at the
+// top of relayTerminal and again where it hands the adapter the end -- has
+// time to land and be caught.
+const metricsSettle = 300 * time.Millisecond
+
+// TestRelayedTerminalIsCountedOnce: a terminal the relay delivers is counted
+// once, though it passes through both relayTerminal and observeTaskTerminal.
+func TestRelayedTerminalIsCountedOnce(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	conv := "discord:g1/metrics-relayed-once"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-once", Text: "count me once"}
+	origin := r.awaitTask(t, "platform")
+	publishMetricsTerminal(t, r, origin, TerminalFromExecutor, lib.StateFailed)
+	waitFor(t, "failed/executor counted", func() bool {
+		return metricsTerminalCount(t, m, "failed", "executor") >= 1
+	})
+	time.Sleep(metricsSettle)
+	if got := metricsTerminalTotal(t, m); got != 1 {
+		t.Errorf("one relayed terminal counted %v times, want 1", got)
+	}
+}
+
+// TestBusUnreachableTerminalIsCounted (jayantid's review of #2473): a task
+// whose submission never reached the bus ends in the gateway's own failed
+// terminal, which bypasses the relay. The user reads "could not reach the
+// bus"; the counter must read one failed task, under source gateway, or a
+// NATS outage shows zero failures.
+func TestBusUnreachableTerminalIsCounted(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	deleteTasksStream(t, r.url)
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/metrics-no-bus", Kind: "group", AuthorID: "1001", MessageID: "m-no-bus", Text: "count me"}
+	waitFor(t, "the bus failure posted", func() bool {
+		return strings.Contains(strings.Join(r.adapter.editTexts(), "\n"), "could not reach the bus")
+	})
+	waitFor(t, "failed/gateway counted", func() bool {
+		return metricsTerminalCount(t, m, "failed", string(TerminalFromGateway)) >= 1
+	})
+	time.Sleep(metricsSettle)
+	if got := metricsTerminalTotal(t, m); got != 1 {
+		t.Errorf("one bus-unreachable terminal counted %v times, want 1", got)
+	}
+}
+
+// TestNeverStartedHealIsCounted (jayantid's review of #2473): the heal that
+// releases a task with no first event inside the grace declares a failed
+// terminal that bypasses the relay. It counts once, under
+// gateway-never-started.
+func TestNeverStartedHealIsCounted(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	m := r.g.Metrics()
+	conv := "discord:g1/metrics-never-started"
+	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "m-never", Text: "Delegate: write a haiku about otters"}
+	waitFor(t, "a fresh delegation spawned", func() bool { return len(spawn.calls()) == 1 })
+	waitFor(t, "failed/gateway-never-started counted", func() bool {
+		return metricsTerminalCount(t, m, "failed", string(TerminalNeverStarted)) >= 1
+	})
+	time.Sleep(metricsSettle)
+	if got := metricsTerminalTotal(t, m); got != 1 {
+		t.Errorf("one never-started heal counted %v times, want 1", got)
+	}
+}
+
 // TestTaskTerminalLabelsAreClosed: a state or source outside the closed lists
 // counts under other, and the series set is the same fixed size whatever is
 // counted, so nothing a bus message carries can mint a series.
@@ -196,7 +275,7 @@ func TestTaskTerminalLabelsAreClosed(t *testing.T) {
 	before := seriesCount(t, m, "kubeagents_a2a_gateway_task_terminals_total")
 	m.taskTerminal(lib.StateAuthRequired, TerminalSource("task-1234 conversation discord:g1/x"))
 	m.taskTerminal(lib.TaskState("failed\nlevel=ERROR"), TerminalFromExecutor)
-	m.taskTerminal(lib.StateFailed, TerminalNeverStarted)
+	m.taskTerminal(lib.StateFailed, TerminalSource("reaper"))
 	if got := metricsTerminalCount(t, m, "other", "other"); got != 1 {
 		t.Errorf("other/other = %v, want 1", got)
 	}
@@ -206,8 +285,8 @@ func TestTaskTerminalLabelsAreClosed(t *testing.T) {
 	if got := metricsTerminalCount(t, m, "failed", "other"); got != 1 {
 		t.Errorf("failed/other = %v, want 1", got)
 	}
-	if after := seriesCount(t, m, "kubeagents_a2a_gateway_task_terminals_total"); after != before || before != 15 {
-		t.Errorf("series before=%d after=%d, want 15 both times (5 states x 3 sources)", before, after)
+	if after := seriesCount(t, m, "kubeagents_a2a_gateway_task_terminals_total"); after != before || before != 25 {
+		t.Errorf("series before=%d after=%d, want 25 both times (5 states x 5 sources)", before, after)
 	}
 	// A nil set counts nothing and does not panic: an adapter built without
 	// one, as every gchat test builds it.
