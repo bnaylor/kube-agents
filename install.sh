@@ -767,7 +767,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run. Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags, which must
+  agree with it (see --enable-slack). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -1682,9 +1683,8 @@ install_env_records_key() {
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
-# tells them: "Left your install configuration as you wrote it" reads as
-# reassurance, and the Day-2 menu's Save & Apply is the only path that writes a
-# changed key back.
+# tells them: "Kept your install configuration" reads as reassurance, and the
+# Day-2 menu's Save & Apply is the only path that writes a changed key back.
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
@@ -2107,7 +2107,7 @@ record_flags_into_install_env() {
   for key in $INSTALL_ENV_RECORD_KEYS; do
     value="${!key-}"
     write_env_var "$file" "$key" "$value"
-    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}: later runs and upgrade.sh render what this run applied."
+    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so later runs and upgrade.sh render it."
   done
   INSTALL_ENV_KEYS_TO_RECORD=""
   # The cache read_recorded_install_env_values keeps is keyed by path, and the
@@ -2165,7 +2165,12 @@ bootstrap_install_env_file() {
   local destination="${1:-}" image_tag="${2:-}"
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
-    print_info "Left your install configuration as you wrote it: ${destination}"
+    print_info "Kept your install configuration: ${destination}"
+    # The chat flags check_flags_against_install_env queued: written only once
+    # this run goes on to the apply or the handoff (record_flags_into_install_env).
+    if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
+      print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the flags you passed are recorded there if this run goes on to the apply or the handoff."
+    fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
@@ -6419,7 +6424,7 @@ main() {
         # recorded, and the operator is told which lines a hand-run apply
         # needs in install.env.
         warn_install_env_keys_not_recorded
-        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
         exit 0

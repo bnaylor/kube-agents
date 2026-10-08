@@ -5607,8 +5607,8 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
     `terraform.tfvars` and the cluster. So answering "None" at the chat menu
     destroys the Pub/Sub topic on this apply and the next run puts it back,
     because the file still says the integration is on. The only signal was
-    "Left your install configuration as you wrote it", which reads as
-    reassurance. This warns instead, naming each key and the line to paste.
+    "Kept your install configuration", which reads as reassurance. This
+    warns instead, naming each key and the line to paste.
     """
 
     def _warn(self, recorded, env_overrides, non_interactive=False):
@@ -6461,10 +6461,52 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                             out,
                         )
                         self.assertLess(warning, out.index("Provisioning paused by user"))
+                        # The file is as it was, so nothing says it was saved.
+                        self.assertNotIn("saved", out)
                         for token in ("xoxb-typed", "xapp-typed", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
                             self.assertNotIn(token, out)
                     else:
                         self.assertNotIn("pausing here did not record", out)
+                    if records:
+                        # `g` and --generate-only apply nothing, so the line
+                        # does not say the run applied.
+                        self.assertIn(
+                            f"Recorded SLACK_ENABLED=true in {path}, which assigned no SLACK_ENABLED, "
+                            "so later runs and upgrade.sh render it.",
+                            out,
+                        )
+                        self.assertNotIn("applied", out)
+
+    def test_the_step_10_line_says_what_the_run_will_record(self):
+        # Step 10 runs before the confirmation, so the file has not changed
+        # yet; it is not "as you wrote it" by the end of a run that records.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, says_record in (
+                ("", False),
+                ("--enable-slack", True),
+                ("--enable-slack --dry-run", False),  # a dry run records nothing
+            ):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; check_flags_against_install_env || exit 1\n"
+                        "PARAM_NON_INTERACTIVE=true\n"
+                        f'bootstrap_install_env_file "{path}" ""',
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 0, out)
+                    self.assertIn(f"Kept your install configuration: {path}", out)
+                    self.assertNotIn("as you wrote it", out)
+                    line = (
+                        f"{path} assigns no SLACK_ENABLED: the flags you passed are recorded there "
+                        "if this run goes on to the apply or the handoff."
+                    )
+                    if says_record:
+                        self.assertIn(line, out)
+                    else:
+                        self.assertNotIn("the flags you passed are recorded", out)
+                    self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
 
     def test_main_checks_before_the_interview_and_records_last_on_each_route(self):
         text = _INSTALL_SH.read_text()
@@ -6528,9 +6570,28 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         text = _INSTALL_SH.read_text()
         body = text[text.index("_prompt_no_chat_enabled() {"):]
         body = body[:body.index("\n  }\n")]
-        self.assertIn("GOOGLE_CHAT_ENABLED=true", body)
-        self.assertIn("SLACK_ENABLED=true", body)
-        self.assertIn("./install.sh --menu", body)
+        echoes = [line for line in body.splitlines() if line.lstrip().startswith("echo ")]
+
+        def the_line(marker):
+            found = [line for line in echoes if marker in line]
+            self.assertEqual(len(found), 1, (marker, found))
+            return found[0]
+
+        # Each toggle on its own line, with its allowlist beside it: the file
+        # records both allowlists empty, and an empty one admits everyone.
+        google_chat = the_line("Google Chat: ")
+        slack = the_line("Slack: ")
+        self.assertIn("GOOGLE_CHAT_ENABLED=true", google_chat)
+        self.assertRegex(google_chat, r"[^_]ALLOWED_USERS=")
+        self.assertIn("SLACK_ENABLED=true", slack)
+        self.assertIn("SLACK_ALLOWED_USERS=", slack)
+        # The tokens are never written to the file, so Slack names the flags.
+        self.assertIn("--slack-bot-token", slack)
+        self.assertIn("--slack-app-token", slack)
+        # The Day-2 menu configures Google Chat only.
+        self.assertIn("./install.sh --menu", google_chat)
+        self.assertNotIn("--menu", slack)
+        self.assertIn("An allowlist left empty admits every user.", the_line("admits every user"))
 
     # ── what upgrade.sh renders afterwards ──────────────────────────────────
 
