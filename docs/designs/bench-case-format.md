@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures` and `owner`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -93,10 +93,14 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `oobe_audits_started`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
-finding, because a grep that returns one case for a role has to mean one case uses it.
+finding, because a grep that returns one case for a role has to mean one case uses it. A
+case that depends on a slot's shape rather than on a plant (every seeded cluster is zonal,
+say) names one role per slot it reads and grounds the objective that needs every slot with
+`report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
+slots; the grep then still finds it when a slot's cluster is replaced.
 
 `owner` is who answers for the case when it flakes: a GitHub login written without the at
 sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
@@ -110,6 +114,16 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`audit_streams` is for a case whose stack starts real audit runs without grading their
+ledger: a list of the Platform Agent job ids it starts
+(`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
+lock for the whole unit, beside the stream a `ledger_issue_contains` check names
+(`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
+releases them when devops-bench returns. A run that outlasts the unit is covered by the next
+unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
+run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
+starts. devops-bench ignores the key.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -178,10 +192,31 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Nine read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
-regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express, and its `any_of_patterns` are regular-expression
-alternatives to `any_of_phrases`, for a phrase that must start at a word boundary), `tool_called` (calls in the
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`any_of_patterns` are regular expressions searched against a line-preserving text, with each
+line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
+numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
+negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
+spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
+line break; a phrase that may wrap says `\s+`), for what no substring can
+express: a banned word whose negated uses are legitimate, a phrase that must start at a word
+boundary (`any_of_patterns` are the regex alternatives to `any_of_phrases`, one pool: at least one
+of either must match), and a required claim whose subject and verb an adverb or a tense can
+separate; `{cluster:<slot>}` in either list stands for the
+cluster the runner recorded for that slot, bare or as the last `-` or `/`-joined component of a longer id (a
+kubeconfig context's `_` joins only under `fold_decoration: true`, which makes it a `-`; without the fold the
+underscore is deleted as emphasis and the id has no boundary before the name) and
+optionally followed by its recorded location, bounded on both sides by the expansion itself (so
+`unseeded-a` and `seeded-a-canary` are never slot a, whatever surrounds the placeholder), and
+`{cluster:any}` for every recorded slot, so a case names which cluster rather than what a cluster's
+name looks like; a placeholder naming a slot the runner recorded no cluster for returns
+`status: "error"`, like an unreached `fixture_roles` slot, and because an unreached slot is absent
+from `{cluster:any}` rather than forbidden, a case that forbids through it lists a `fixture_roles`
+entry for every slot it means; its `fixture_roles` names the seeded-fleet
+roles whose clusters the patterns require a line about, each resolved to its slot's own
+credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
+before any role on it is confirmed), and a slot the runner did not reach returns
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
@@ -198,7 +233,7 @@ card-wake replay planted, read before the harness archives it), and `reply_is_si
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule).
 
-Six read the install under test, all from the same file. `bootstrap_fanout` compares the
+Seven read the install under test, six of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -222,7 +257,11 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect.
+grade an edit to them by its effect. `oobe_audits_started`, in its own module
+(`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
+`cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
+of the four first-run audits as marked due and each has a run claimed since the stage marked it
+that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
@@ -368,9 +407,12 @@ The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is reti
 the parking state for a case whose fixture or blocker was not ready, and it was
 indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
 comment, and the validator rejects a case path inside one. The one case that does not go
-in a roster file is one whose fixture does not exist at all: it is a `FIXTURE_NOT_READY`
-entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture, and it
-moves to the nightly file in the pull request that lands the fixture.
+in a roster file is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
+entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture. The
+pull request that lands the fixture leaves it there, because merging puts nothing on a
+cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
+request moves it to the nightly file, citing a reconcile report that visited every pool
+project and a scan that reads the role healthy on all of them.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly
@@ -387,7 +429,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
 as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
-boolean, and a case that is registered nowhere. It
+boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+does not have, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
