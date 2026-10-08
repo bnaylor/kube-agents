@@ -163,7 +163,7 @@ func (g *Gateway) fixedRouteAhead(ctx context.Context, rec *SessionRecord, backe
 // active task was published to DefaultAddressee, read from session-state, so
 // the count is the same after a gateway restart as before it. Past
 // FirstEventGrace a task is read from the stream and left out when nothing is
-// on it (busyNeverStarted: no executor took it) or when its newest event is a
+// on it (noFirstEventPastGrace: no executor took it) or when its newest event is a
 // terminal (the record's clear was lost, the case the heal releases on the
 // conversation's next turn). Either would otherwise hold the number up until
 // someone spoke in that conversation again. Inside the grace a task is
@@ -234,7 +234,7 @@ func (r *Registry) eachSessionRecord(ctx context.Context, fn func(*SessionRecord
 }
 
 // busyTaskLeftOut reports whether an active task is left out of the count:
-// past the grace, with nothing on its stream (busyNeverStarted) or a terminal
+// past the grace, with nothing on its stream (noFirstEventPastGrace, the heal's own test) or a terminal
 // as its newest event. Inside the grace it answers false without reading the
 // stream. A read that fails counts the task: a transport failure cannot rule
 // out events, the rule the heal follows.
@@ -248,17 +248,7 @@ func (g *Gateway) busyTaskLeftOut(ctx context.Context, tasks *busyTasksStream, a
 			"taskId", active.TaskID, "err", err)
 		return false
 	}
-	return final || busyNeverStarted(active, empty, g.cfg.FirstEventGrace, now)
-}
-
-// busyNeverStarted is the never-started test the heal (healActiveTask)
-// applies: nothing on the task's replay subjects, and the task older than the
-// grace. A task with no SubmittedAt has no age and never qualifies. The heal
-// spells the same test inline; this one is a pure function of its arguments
-// so that one helper can serve both, by a rename, once the heal takes it.
-func busyNeverStarted(active *ActiveTask, streamEmpty bool, grace time.Duration, now time.Time) bool {
-	return active != nil && streamEmpty &&
-		!active.SubmittedAt.IsZero() && now.Sub(active.SubmittedAt) > grace
+	return final || noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, now)
 }
 
 // busyTasksStream is one count's handle on the TASKS stream, looked up on the
