@@ -903,12 +903,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			}
 		}
 		// The busy notice: counted once the task is on the bus, leaving the
-		// task itself out, and posted after its placeholder. fixedRouteAhead
-		// answers false off the fixed route. Informational: the turn has
-		// already started either way.
+		// task itself out, and shown on the task's status line (showBusy).
+		// fixedRouteAhead answers false off the fixed route. Informational:
+		// the turn has already started either way.
 		if taskID := g.startTask(ctx, rec, msg, backend, principal, authority); taskID != "" {
 			if ahead, busy := g.fixedRouteAhead(ctx, rec, backend, taskID); busy {
-				g.post(rec.Key, busyNotice(ahead))
+				g.showBusy(rec, taskID, ahead)
 			}
 		}
 	}

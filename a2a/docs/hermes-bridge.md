@@ -70,9 +70,9 @@ The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is
 rendered by the same rule as for a declared bridge ([Executors](#executors)): the operator
 counts a rendered bridge exactly like a declared one. The gateway's busy notice reads the
 same worker count: the operator renders it onto the gateway as `A2A_BUSY_NOTICE_AT`, the
-number of tasks ahead of a turn at which the gateway tells the room it will wait, unless the
-operator's own `A2A_BUSY_NOTICE_AT` is set to a count
-([the gateway spec](../../docs/designs/spec-chatops-gateway.md)).
+number of tasks ahead of a turn at which the gateway edits the turn's status line to a
+queued state saying how many are ahead, unless the operator's own `A2A_BUSY_NOTICE_AT` is
+set to a count ([the gateway spec](../../docs/designs/spec-chatops-gateway.md)).
 
 The rendered default is 10, not the bridge's own 2, because 10 is what the Hermes gateway
 runs agent turns on (its `ThreadPoolExecutor(max_workers=10)`), and the rendered bridge is that

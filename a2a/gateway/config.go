@@ -437,11 +437,12 @@ type Config struct {
 	DelegationDepthMax int
 
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
-	// turn before the gateway tells the room the system is busy
+	// turn before the gateway marks the turn's status line queued
 	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
 	// work, read from session-state (fixedRouteBacklog in busy.go); at or
-	// above this number the turn's task is still submitted, and one extra
-	// line says how many are ahead. Nothing is refused or dropped.
+	// above this number the turn's task is still submitted, and its status
+	// line is edited to a queued state that says how many are ahead
+	// (showBusy). Nothing is refused or dropped.
 	//
 	// Zero means 10, the rendered bridge's default BRIDGE_CONCURRENCY. The
 	// operator renders the bridge's worker count here, so a turn is told it

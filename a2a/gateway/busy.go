@@ -31,14 +31,20 @@ const sessionRecordKeys = "sessions.>"
 // delivered every current record.
 var errSessionWatchClosed = errors.New("session-state watch closed before its initial values were delivered")
 
-// The busy notice, singular and plural. Plain words, no task id: it is for
-// the person who just asked, and what they need is that the request is in and
-// roughly how long the line is. "As soon as there's room" rather than "as
-// soon as one finishes", because the count includes the running tasks, and
-// with more ahead than the executor runs at once more than one has to finish.
+// The busy notice, singular and plural: a state of the turn's status line,
+// rendered the way statusLine renders the relay's states (icon, bold label,
+// a dash, the detail). It replaces the "⏳ submitted…" placeholder rather than
+// following it as a post of its own, so the relay's next edit (working, or
+// the terminal) replaces it in turn and it is never left under a "completed"
+// header, where it read as the output of some earlier command. Plain words,
+// no task id: it is for the person who just asked, and what they need is
+// that the request is in and roughly how long the line is. "As soon as
+// there's room" rather than "as soon as one finishes", because the count
+// includes the running tasks, and with more ahead than the executor runs at
+// once more than one has to finish.
 const (
-	busyNoticeOne  = "🚦 The system is busy. 1 request is ahead of yours; I'll start on it as soon as there's room."
-	busyNoticeMany = "🚦 The system is busy. %d requests are ahead of yours; I'll start on it as soon as there's room."
+	busyNoticeOne  = "⏳ **queued** — 1 request is ahead of yours; I'll start on it as soon as there's room"
+	busyNoticeMany = "⏳ **queued** — %d requests are ahead of yours; I'll start on it as soon as there's room"
 )
 
 // busyNotice renders the notice for ahead tasks in front of a new turn.
@@ -49,12 +55,70 @@ func busyNotice(ahead int) string {
 	return fmt.Sprintf(busyNoticeMany, ahead)
 }
 
+// showBusy puts the busy notice on the status line of the turn that just
+// started taskID on rec: an edit of the placeholder startTaskWith posted, the
+// message the relay's rolling-line edits target, and no post of its own.
+//
+// The line never moves backwards: the edit is made only while
+// lineStillSubmitted holds for the task's relay state, and is skipped
+// otherwise. The caller holds the conversation's session lock (handleInbound,
+// runTurn take it before routeTurn), the lock every relay batch takes before
+// it renders, so the check and the edit are one step against the relay's
+// edits. From routeTurn that lock already keeps the relay out from the
+// placeholder post to here, so the line is always still submitted; the guard
+// is for a caller that does not hold that ordering, since the count runs
+// after the submission and an event can be rendered before it returns. Once
+// the edit lands, relayState.busyShown keeps the relay's own submitted render
+// from replacing it (updateRollingLine); its working and terminal edits
+// replace it as they replace the placeholder.
+//
+// A turn whose placeholder post failed has no line to edit, and gets the
+// notice as a post, the shape before the notice moved onto the line: with no
+// status line there is no "completed" header for it to sit under. An edit
+// that fails is logged and not retried as a post, which would put back the
+// render this replaces.
+func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
+	active := rec.ActiveTask
+	if active == nil || active.TaskID != taskID {
+		return
+	}
+	line := withLineNote(busyNotice(ahead), active.LineNote)
+	if active.StatusMsgID == "" {
+		g.post(rec.Key, line)
+		return
+	}
+	g.mu.Lock()
+	rs := g.relays[taskID]
+	g.mu.Unlock()
+	if !lineStillSubmitted(rs) {
+		g.log.Info("busy notice skipped: the status line is already past submitted",
+			"conversation", rec.Key, "taskId", taskID)
+		return
+	}
+	if g.editLine(rec.Key, active.StatusMsgID, line) {
+		rs.lastLine = line
+		rs.busyShown = true
+	}
+}
+
+// lineStillSubmitted reports whether a task's status line is still in its
+// submitted state: the relay holds render state for it (it drops the state at
+// the terminal) and has seen no state past submitted. An executor's own
+// submitted event (the bridge publishes one when it accepts the task, before
+// it has a worker) is still submitted.
+func lineStillSubmitted(rs *relayState) bool {
+	return rs != nil && (rs.state == "" || rs.state == lib.StateSubmitted)
+}
+
 // busyNoticeBackend reports whether a turn that arrived through backend gets
 // the busy notice: the chat backends and the console do. The inject and A2A
-// doors do not, because their callers are programs that read every
-// unedited post of a task as its output (the eval harness's deliverable, an
-// A2A client's task messages), so the notice would be graded or returned as
-// part of the answer.
+// doors do not, because their callers are programs that read the status line
+// as data. The A2A door takes the line's first edit as the task going to
+// working (A2ADoor.Edit), so a queued edit would report a task no worker has
+// as running; the inject door records every edit as an entry the eval
+// harness reads. The fallback post would be worse again: both read every
+// unedited post of a task as its output, so the notice would be graded or
+// returned as part of the answer.
 func busyNoticeBackend(backend string) bool {
 	return backend != injectBackend && backend != a2aBackend
 }

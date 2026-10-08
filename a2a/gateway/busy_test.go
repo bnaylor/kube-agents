@@ -10,7 +10,10 @@ import (
 )
 
 // busyPrefix is what every busy notice starts with, for asserting absence.
-const busyPrefix = "🚦 The system is busy."
+const busyPrefix = "⏳ **queued**"
+
+// placeholderText is startTaskWith's placeholder, the status line's first text.
+const placeholderText = "⏳ submitted…"
 
 // seedFixedRouteTask writes a session record holding an active task addressed
 // to platform, submitted age ago, with nothing published for it: another
@@ -57,12 +60,65 @@ func publishFirstEvent(t *testing.T, r *rig, rec *SessionRecord) *lib.TaskExecut
 	return exec
 }
 
-// busyTurn runs one human turn in conv through routeTurn, synchronously, so
-// every post it makes is in the fake adapter when it returns.
+// busyTurn runs one human turn in conv through routeTurn, synchronously and
+// under the conversation's session lock as handleInbound runs it, so every
+// post and edit it makes is in the fake adapter when it returns.
 func busyTurn(r *rig, conv, backend, text string) {
+	l := r.g.lockSession(conv)
+	l.Lock()
+	defer l.Unlock()
 	r.g.routeTurn(context.Background(), InboundMessage{
 		Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-" + randHex(4), Text: text,
 	}, backend, "test:bnaylor")
+}
+
+// postsIn returns every post into conv.
+func postsIn(r *rig, conv string) []fakePost {
+	r.adapter.mu.Lock()
+	defer r.adapter.mu.Unlock()
+	var out []fakePost
+	for _, p := range r.adapter.posts {
+		if p.Conversation == conv {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// statusLineID is the message id of conv's status line: its placeholder post.
+func statusLineID(t *testing.T, r *rig, conv string) string {
+	t.Helper()
+	for _, p := range postsIn(r, conv) {
+		if p.Text == placeholderText {
+			return p.MessageID
+		}
+	}
+	t.Fatalf("no placeholder posted into %s: %q", conv, r.adapter.postTexts())
+	return ""
+}
+
+// busyLinesIn returns the busy notices edited onto conv's status line.
+func busyLinesIn(t *testing.T, r *rig, conv string) []string {
+	t.Helper()
+	var out []string
+	for _, e := range r.adapter.editsOf(statusLineID(t, r, conv)) {
+		if strings.HasPrefix(e, busyPrefix) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// assertBusyLine checks that conv's status line was edited to want, once,
+// and that the turn posted nothing beside its placeholder.
+func assertBusyLine(t *testing.T, r *rig, conv, want string) {
+	t.Helper()
+	if got := busyLinesIn(t, r, conv); len(got) != 1 || got[0] != want {
+		t.Fatalf("busy edits of the status line = %q, want exactly %q", got, want)
+	}
+	if got := postsIn(r, conv); len(got) != 1 {
+		t.Fatalf("posts = %+v, want the placeholder alone", got)
+	}
 }
 
 // busyPostsIn returns the busy notices posted into conv.
@@ -95,12 +151,12 @@ func withBusyNoticeAt(n int) func(*Config) {
 }
 
 // TestBusyNoticeWording: one is "request is", anything else "requests are",
-// with the number in the sentence.
+// with the number in the sentence, as a queued state of the status line.
 func TestBusyNoticeWording(t *testing.T) {
 	cases := map[int]string{
-		1:  "🚦 The system is busy. 1 request is ahead of yours; I'll start on it as soon as there's room.",
-		2:  "🚦 The system is busy. 2 requests are ahead of yours; I'll start on it as soon as there's room.",
-		10: "🚦 The system is busy. 10 requests are ahead of yours; I'll start on it as soon as there's room.",
+		1:  "⏳ **queued** — 1 request is ahead of yours; I'll start on it as soon as there's room",
+		2:  "⏳ **queued** — 2 requests are ahead of yours; I'll start on it as soon as there's room",
+		10: "⏳ **queued** — 10 requests are ahead of yours; I'll start on it as soon as there's room",
 	}
 	for n, want := range cases {
 		if got := busyNotice(n); got != want {
@@ -121,14 +177,18 @@ func TestBusyNoticeBelowTheThresholdPostsNothing(t *testing.T) {
 	if got := submittedTexts(t, r); len(got) != 1 || got[0] != "how is the fleet?" {
 		t.Fatalf("submissions = %q, want the one turn", got)
 	}
-	if got := busyPostsIn(r, conv); len(got) != 0 {
+	if got := busyLinesIn(t, r, conv); len(got) != 0 {
 		t.Fatalf("busy notice below the threshold: %q", got)
+	}
+	if got := postsIn(r, conv); len(got) != 1 {
+		t.Fatalf("posts below the threshold = %+v, want the placeholder alone", got)
 	}
 }
 
 // TestBusyNoticeAtTheThresholdSaysHowManyAndStillSubmits: at the threshold
-// and above it, the turn's task is submitted as always, and one line after
-// its placeholder says how many tasks are ahead of it.
+// and above it, the turn's task is submitted as always, and its status line
+// (the placeholder, edited) says how many tasks are ahead of it. Nothing is
+// posted beside the placeholder.
 func TestBusyNoticeAtTheThresholdSaysHowManyAndStillSubmits(t *testing.T) {
 	r := startRigWith(t, withBusyNoticeAt(3))
 	for _, c := range []string{"a", "b", "c"} {
@@ -144,18 +204,16 @@ func TestBusyNoticeAtTheThresholdSaysHowManyAndStillSubmits(t *testing.T) {
 	if err != nil || rec == nil || rec.ActiveTask == nil {
 		t.Fatalf("the busy turn holds no active task: %+v %v", rec, err)
 	}
-	if got := busyPostsIn(r, conv); len(got) != 1 || got[0] != busyNotice(3) {
-		t.Fatalf("busy notices = %q, want exactly %q", got, busyNotice(3))
-	}
-	if i, j := postIndex(r, "⏳ submitted…"), postIndex(r, busyPrefix); i < 0 || j < i {
-		t.Fatalf("posts %q: want the placeholder, then the busy notice", r.adapter.postTexts())
+	assertBusyLine(t, r, conv, busyNotice(3))
+	if got := r.adapter.editsOf(rec.ActiveTask.StatusMsgID); len(got) != 1 || got[0] != busyNotice(3) {
+		t.Fatalf("edits of the active task's status line = %q, want exactly %q", got, busyNotice(3))
 	}
 
 	// Above it: two more, and the next turn is told five.
 	seedFixedRouteTask(t, r, "discord:g1/busy-d", 0)
 	conv2 := "discord:g1/busy-above"
 	busyTurn(r, conv2, discordBackend, "and the other one")
-	if got := busyPostsIn(r, conv2); len(got) != 1 || got[0] != busyNotice(5) {
+	if got := busyLinesIn(t, r, conv2); len(got) != 1 || got[0] != busyNotice(5) {
 		t.Fatalf("busy notices = %q, want exactly %q (three seeded, one more, and the turn before)", got, busyNotice(5))
 	}
 }
@@ -184,9 +242,7 @@ func TestBusyCountLeavesOutTasksThatNeverStarted(t *testing.T) {
 	}
 	conv := "discord:g1/never-started-turn"
 	busyTurn(r, conv, discordBackend, "anything")
-	if got := busyPostsIn(r, conv); len(got) != 1 || got[0] != busyNotice(3) {
-		t.Fatalf("busy notices = %q, want exactly %q", got, busyNotice(3))
-	}
+	assertBusyLine(t, r, conv, busyNotice(3))
 }
 
 // TestBusyCountLeavesOutTasksThatAlreadyEnded: past the grace, a record
@@ -275,14 +331,15 @@ func TestBusyCountIsOnlyTheFixedAddressee(t *testing.T) {
 		conv := "discord:g1/door-" + backend
 		busyTurn(r, conv, backend, "from a program")
 		if got := busyPostsIn(r, conv); len(got) != 0 {
-			t.Fatalf("busy notice through the %s door: %q", backend, got)
+			t.Fatalf("busy notice posted through the %s door: %q", backend, got)
+		}
+		if got := r.adapter.editsOf(statusLineID(t, r, conv)); len(got) != 0 {
+			t.Fatalf("status line edited through the %s door: %q", backend, got)
 		}
 	}
 	conv := "discord:g1/console-like"
 	busyTurn(r, conv, consoleBackend, "from a person")
-	if got := busyPostsIn(r, conv); len(got) != 1 {
-		t.Fatalf("console turn busy notices = %q, want one", got)
-	}
+	assertBusyLine(t, r, conv, busyNotice(3))
 }
 
 // startBusyRig is a rig restartRig can replace, with the busy threshold set.
@@ -306,7 +363,7 @@ func TestBusyCountIsRebuiltFromSessionStateAfterARestart(t *testing.T) {
 	r2, _ := restartRig(t, r)
 	conv := "discord:g1/r-c"
 	busyTurn(r2, conv, discordBackend, "third")
-	if got := busyPostsIn(r2, conv); len(got) != 1 || got[0] != busyNotice(2) {
+	if got := busyLinesIn(t, r2, conv); len(got) != 1 || got[0] != busyNotice(2) {
 		t.Fatalf("busy notices after restart = %q, want exactly %q", got, busyNotice(2))
 	}
 }
@@ -323,7 +380,7 @@ func TestBusyCountFallsWhenATaskEnds(t *testing.T) {
 
 	conv := "discord:g1/e-c"
 	busyTurn(r, conv, discordBackend, "third")
-	if got := busyPostsIn(r, conv); len(got) != 0 {
+	if got := busyLinesIn(t, r, conv); len(got) != 0 {
 		t.Fatalf("busy notice with one task left of a threshold of two: %q", got)
 	}
 }
@@ -346,7 +403,7 @@ func TestBusyCountFallsWithTerminalsPublishedWhileTheGatewayWasDown(t *testing.T
 	}
 	conv := "discord:g1/d-c"
 	busyTurn(r2, conv, discordBackend, "third")
-	if got := busyPostsIn(r2, conv); len(got) != 0 {
+	if got := busyLinesIn(t, r2, conv); len(got) != 0 {
 		t.Fatalf("busy notice from a count the missed terminal should have lowered: %q", got)
 	}
 }
@@ -388,5 +445,149 @@ func TestFromEnvBusyNoticeAt(t *testing.T) {
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_BUSY_NOTICE_AT=%q accepted", bad)
 		}
+	}
+}
+
+// Status-line states the relay renders in the rig, which leaves the display
+// mode at debug.
+const (
+	workingLine   = "⚙️ **working**"
+	completedLine = "✅ **completed**"
+)
+
+// relayStateOf reads a task's relay state under its conversation's session
+// lock, the lock the relay renders under: once it shows a state, every edit
+// the batch that set it makes has landed.
+func relayStateOf(r *rig, conv, taskID string) (lib.TaskState, bool) {
+	l := r.g.lockSession(conv)
+	l.Lock()
+	defer l.Unlock()
+	r.g.mu.Lock()
+	rs := r.g.relays[taskID]
+	r.g.mu.Unlock()
+	if rs == nil {
+		return "", false
+	}
+	return rs.state, true
+}
+
+// showBusyLocked runs showBusy under the conversation's session lock, as
+// routeTurn runs it.
+func showBusyLocked(r *rig, rec *SessionRecord, taskID string, ahead int) {
+	l := r.g.lockSession(rec.Key)
+	l.Lock()
+	defer l.Unlock()
+	r.g.showBusy(rec, taskID, ahead)
+}
+
+// awaitLastEdit waits until the last edit of messageID is want.
+func awaitLastEdit(t *testing.T, r *rig, messageID, want string) {
+	t.Helper()
+	waitFor(t, "the status line to read "+want, func() bool {
+		edits := r.adapter.editsOf(messageID)
+		return len(edits) > 0 && edits[len(edits)-1] == want
+	})
+}
+
+// TestBusyLineIsReplacedByTheRelaysLaterEdits: the queued line holds through
+// the executor's own submitted event (the bridge publishes one on accept,
+// before a worker is free), and the relay's working and terminal edits then
+// replace it, so the finished turn's line reads completed and the notice is
+// nowhere in the thread.
+func TestBusyLineIsReplacedByTheRelaysLaterEdits(t *testing.T) {
+	r := startRigWith(t, withBusyNoticeAt(1))
+	seedFixedRouteTask(t, r, "discord:g1/over-a", 0)
+
+	conv := "discord:g1/over-turn"
+	busyTurn(r, conv, discordBackend, "what is 2 + 2?")
+	line := statusLineID(t, r, conv)
+	assertBusyLine(t, r, conv, busyNotice(1))
+
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the relay to take the submitted event", func() bool {
+		st, ok := relayStateOf(r, conv, origin.TaskID)
+		return ok && st == lib.StateSubmitted
+	})
+	if got := r.adapter.editsOf(line); len(got) != 1 || got[0] != busyNotice(1) {
+		t.Fatalf("edits after the executor's submitted = %q, want the queued line alone", got)
+	}
+
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	awaitLastEdit(t, r, line, workingLine)
+	completeTask(t, exec, "2 + 2 is 4.")
+	awaitLastEdit(t, r, line, completedLine)
+
+	want := []string{busyNotice(1), workingLine, completedLine}
+	if got := r.adapter.editsOf(line); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("status line edits = %q, want %q", got, want)
+	}
+	if got := busyPostsIn(r, conv); len(got) != 0 {
+		t.Fatalf("busy notice posted: %q", got)
+	}
+}
+
+// TestBusyLinePastSubmittedIsLeftAlone: the line never moves backwards. A
+// busy notice that arrives after the relay has rendered working, or the
+// terminal, is skipped, and nothing is posted in its place. From routeTurn
+// the session lock keeps the relay out until the turn ends, so the notice
+// always finds the line submitted there; this drives showBusy directly with
+// the line already past it, the race the guard is for if that ordering ever
+// changes.
+func TestBusyLinePastSubmittedIsLeftAlone(t *testing.T) {
+	r := startRigWith(t, withBusyNoticeAt(100))
+	conv := "discord:g1/race-turn"
+	busyTurn(r, conv, discordBackend, "anything")
+	line := statusLineID(t, r, conv)
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	awaitLastEdit(t, r, line, workingLine)
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID {
+		t.Fatalf("record = %+v, %v; want the turn's task active", rec, err)
+	}
+	showBusyLocked(r, rec, origin.TaskID, 3)
+	if got := r.adapter.editsOf(line); len(got) != 1 || got[0] != workingLine {
+		t.Fatalf("edits after a late busy notice on a working line = %q, want working alone", got)
+	}
+	if got := postsIn(r, conv); len(got) != 1 {
+		t.Fatalf("posts after a late busy notice = %+v, want the placeholder alone", got)
+	}
+
+	// The terminal: rec still names the task active, as a count that began
+	// before the terminal would hold it.
+	completeTask(t, exec, "done")
+	awaitLastEdit(t, r, line, completedLine)
+	posts := len(postsIn(r, conv))
+	showBusyLocked(r, rec, origin.TaskID, 3)
+	if got := r.adapter.editsOf(line); got[len(got)-1] != completedLine || len(busyLinesIn(t, r, conv)) != 0 {
+		t.Fatalf("edits after a late busy notice on a finished line = %q, want completed last and no queued", got)
+	}
+	if got := len(postsIn(r, conv)); got != posts {
+		t.Fatalf("a late busy notice on a finished line posted %d messages", got-posts)
+	}
+}
+
+// TestBusyNoticeWithNoStatusLineIsPosted: a turn whose placeholder post
+// failed has no line to edit, and gets the notice as a post.
+func TestBusyNoticeWithNoStatusLineIsPosted(t *testing.T) {
+	r := startRigWith(t, nil)
+	conv := "discord:g1/no-line"
+	rec := &SessionRecord{Key: conv, ActiveTask: &ActiveTask{TaskID: "task-noline"}}
+	showBusyLocked(r, rec, "task-noline", 2)
+	if got := busyPostsIn(r, conv); len(got) != 1 || got[0] != busyNotice(2) {
+		t.Fatalf("busy posts with no status line = %q, want exactly %q", got, busyNotice(2))
+	}
+	if got := r.adapter.editTexts(); len(got) != 0 {
+		t.Fatalf("edits with no status line: %q", got)
 	}
 }

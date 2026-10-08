@@ -190,9 +190,9 @@ absorbed, which the gateway cannot know. The payload spec's refusal posture - bo
 the fixed-route refusal and the race-window one - is what closes the loop on the
 stream.
 
-**The busy notice.** One more gateway-authored post tells a person when their turn is
-going to wait. Once a fixed-route turn's task is on the bus, the gateway counts the fixed
-addressee's other outstanding work: the session-state records whose active task was
+**The busy notice.** The gateway tells a person when their turn is going to wait, on the
+turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the
+fixed addressee's other outstanding work: the session-state records whose active task was
 published to it, the turn's own task left out. The count is a read of the bucket (one KV
 watch over the session records), not an in-memory counter, so it is the same after a
 gateway restart as before it, and it falls as terminals arrive, because a terminal deletes
@@ -203,14 +203,28 @@ same test the never-started release below uses, or if its newest event is a term
 record whose clear was lost, which the heal would release on that conversation's next
 turn), so neither holds the number up. A detached task is counted while it is still its
 record's active task; a new turn in that conversation replaces it. At or above
-`A2A_BUSY_NOTICE_AT` one line follows the task's placeholder: "🚦 The system is busy. 3
-requests are ahead of yours; I'll start on it as soon as there's room." ("1 request is" for
-one). Nothing is refused, held back, or dropped; the line is information, and a count that
-fails sends none. The operator renders the threshold as the bridge's worker count, 10 by
-default, so the turn told it waits is the first one that finds every worker taken; the
-operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend and the
-console. The inject and A2A doors get none, because their callers read every unedited post
-of a task as its output, and the notice would be graded or returned as part of the answer.
+`A2A_BUSY_NOTICE_AT` the gateway edits the turn's "⏳ submitted…" placeholder, the message
+the relay's rolling-line edits target, to a queued state: "⏳ **queued** — 3 requests are
+ahead of yours; I'll start on it as soon as there's room" ("1 request is" for one). It posts
+nothing of its own. The relay's first edit past submitted (working, or the terminal)
+replaces the queued text as it would the placeholder, so the notice is never left under a
+"completed" header, where a separate post read as the output of some earlier command; the
+executor's own submitted event (the bridge publishes one on accept, before it has a worker)
+does not replace it. The line never moves backwards: the edit is made only while the task's
+line is still in its submitted state, and is skipped otherwise. It is made under the
+conversation's session lock, the same lock every relay batch renders under, which on the
+inbox path keeps the relay out from the placeholder post to the edit, so there the line is
+always still submitted; the check is for any path that loses that ordering. A turn whose placeholder post failed has no line to edit and gets the
+notice as a post. Nothing is refused, held back, or dropped; the notice is information, and
+a count that fails sends none. The operator renders the threshold as the bridge's worker
+count, 10 by default, so the turn told it waits is the first one that finds every worker
+taken; the operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend
+(Google Chat, Slack and Discord all edit the line in place) and the console. The inject and
+A2A doors get none, because their callers read the status line as data: the A2A door takes
+the line's first edit as the task going to `working`, so a queued edit would report a task
+no worker has as running, and the inject door hands every edit to the eval harness. The
+fallback post would be worse again, since both read every unedited post of a task as its
+output.
 
 ## The Delegate flow (added 8/31)
 
