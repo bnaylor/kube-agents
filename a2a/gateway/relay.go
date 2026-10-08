@@ -457,7 +457,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// to (ingress logged that one, not rec.Addressee): every task, a turn
 	// that delegated and a child included, though the observers below hear
 	// only of the chain's end.
-	g.logTaskTerminal(rec.Key, rec.AddresseeFor(taskID), taskID, s.Status.State, source, reason)
+	g.logTaskTerminal(rec, rec.AddresseeFor(taskID), taskID, s.Status.State, source, reason)
 
 	// Under the chain's root, and only for the task whose end is the
 	// chain's (observedAs): a turn that delegated and a child end quietly,

@@ -490,3 +490,75 @@ func TestTaskTerminalLogCoversEachTaskOfADelegationChain(t *testing.T) {
 		}
 	}
 }
+
+// A session turn whose delegate request minted no child ends `completed` on
+// its hand-off line, and toward the adapter and the read route it ends failed
+// with the delegation reason (SessionRecord.handOffEnd). Its "task terminal"
+// line reports that same end, not the raw `completed`, on the relay's path
+// and on the stale heal's, or a count of terminals by state calls every
+// refused turn a success (#2410 review).
+func TestTaskTerminalLogReportsAHandOffsEnd(t *testing.T) {
+	refuse := func(t *testing.T) func(*Config) {
+		return func(c *Config) {
+			armInjectMap(t, c)
+			c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {injectBackend: {"someone-else"}}}
+		}
+	}
+	for _, tc := range []struct {
+		name, conv, text, token string
+		tweak                   func(t *testing.T) func(*Config)
+		heal                    bool
+	}{
+		{"refused, relayed", injectKeyPrefix + "tl-handoff-refused", "x", reasonDelegationRefused, refuse, false},
+		{"not started, relayed", injectKeyPrefix + "tl-handoff-ignored", " ", reasonDelegationNotStarted,
+			func(t *testing.T) func(*Config) { return func(c *Config) { armInjectMap(t, c) } }, false},
+		{"refused, healed", injectKeyPrefix + "tl-handoff-healed", "x", reasonDelegationRefused, refuse, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn, obs := startObservedRig(t, tc.tweak(t))
+			exec, origin, session := sessionTurnVia(t, r, spawn, tc.conv, injectBackend, "do a thing")
+			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, targetPlatform, tc.text)); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "the request handled", loggedContaining(r, "delegation", origin.TaskID))
+			completeTask(t, exec, "delegated to platform")
+			waitFor(t, "the turn's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+			end, _ := obs.terminalFor(origin.TaskID)
+			if end.state != lib.StateFailed || reasonToken(end.text) != tc.token {
+				t.Fatalf("observer's end = %+v, want failed with %s", end, tc.token)
+			}
+			want := []string{"taskId=" + origin.TaskID, "conversation=" + tc.conv, "addressee=" + session,
+				"state=failed", "source=executor", "reason=" + tc.token}
+			lines := 1
+			if tc.heal {
+				waitFor(t, "the turn released", func() bool {
+					rec, _ := r.g.reg.Get(context.Background(), tc.conv)
+					return rec != nil && rec.ActiveTask == nil
+				})
+				// The relay having missed the terminal, as in the stale
+				// heal above: the next turn finds it on the stream.
+				putRecord(t, r, tc.conv, func(rec *SessionRecord) {
+					rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID}
+				})
+				r.adapter.inbox <- InboundMessage{Conversation: tc.conv, Kind: "group", AuthorID: "1001",
+					MessageID: "tl-handoff-next", Text: "next", Backend: injectBackend}
+				waitFor(t, "the heal", loggedContaining(r, "healing stale active task", origin.TaskID))
+				lines = 2
+			}
+			waitFor(t, "the turn's terminal lines", func() bool {
+				return len(textLogLines(r.logs, "task terminal", "taskId="+origin.TaskID)) >= lines
+			})
+			all := textLogLines(r.logs, "task terminal", "taskId="+origin.TaskID)
+			if len(all) != lines {
+				t.Fatalf("%d task terminal lines for the turn, want %d: %v", len(all), lines, all)
+			}
+			for _, line := range all {
+				for _, kv := range want {
+					if !strings.Contains(" "+line+" ", " "+kv+" ") {
+						t.Errorf("task terminal line %q lacks %s: the adapter was told %+v", line, kv, end)
+					}
+				}
+			}
+		})
+	}
+}
