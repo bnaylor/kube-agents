@@ -705,6 +705,17 @@ echo "reached the end"
             "through to multiuser_memory when the cluster could not be asked",
         )
 
+    def test_the_full_arm_refuses_a_dropped_next_before_its_notice(self):
+        """The refusal runs whatever the target's helpers are: after the scope
+        check, ahead of the guarded notice an older target cannot print."""
+        source = _UPGRADE_SH.read_text()
+        arm_at = source.index("\n    full)\n", source.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
+        arm = source[arm_at : source.index("\n      ;;\n", arm_at)]
+        refusal = '\n      refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1\n'
+        self.assertEqual(arm.count(refusal), 1)
+        self.assertLess(arm.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1'), arm.index(refusal))
+        self.assertLess(arm.index(refusal), arm.index("declare -F announce_platform_agent_mode_for_apply"))
+
     def test_the_apply_gate_sits_after_every_refusal_in_its_arm(self):
         """UPGRADE_APPLY_STARTED is what keeps cleanup() from putting an adopted
         checkout back, so a run that raises it and then refuses strands someone
@@ -1706,6 +1717,41 @@ helm_retag operator.image.tag
                 self.assertIn("--upgrade-mode=full", proc.stdout)
                 self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
                 self.assertNotIn("ci-cluster", proc.stdout)
+
+    def _full_refusal(self, repo, mode):
+        schema = repo / "charts" / "kube-agents" / "values.schema.json"
+        assignment = "" if mode is None else f"PLATFORM_AGENT_MODE={shlex.quote(mode)}\n"
+        script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+{assignment}refuse_full_apply_dropping_next {shlex.quote(str(schema))}
+"""
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
+            env=get_isolated_test_env(),
+        )
+
+    def test_a_full_apply_onto_a_chart_without_mode_refuses_next(self):
+        """The full arm's half of the retag refusal: a chart that predates
+        platformAgent.mode renders no mode, so install.env's next would come
+        off the CR. Refused, naming both ways out."""
+        proc = self._full_refusal(self._modeless_chart(), "next")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("sets PLATFORM_AGENT_MODE=next", proc.stdout)
+        self.assertIn("predates spec.mode support", proc.stdout)
+        self.assertIn("PLATFORM_AGENT_MODE=today", proc.stdout)
+
+    def test_a_full_apply_refuses_only_next_onto_a_chart_without_mode(self):
+        """today or no key renders what an absent mode means, and a chart that
+        declares the key keeps next, so none of these refuse."""
+        modeless = self._modeless_chart()
+        for repo, mode in ((modeless, "today"), (modeless, None), (_REPO_ROOT, "next"), (_REPO_ROOT, "today")):
+            with self.subTest(repo=repo.name, mode=mode):
+                proc = self._full_refusal(repo, mode)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("predates spec.mode support", proc.stdout)
 
     def test_a_retag_onto_a_chart_without_mode_drops_a_recorded_today(self):
         """`today` is what an absent mode means, so dropping it switches nothing."""

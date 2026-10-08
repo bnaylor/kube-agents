@@ -443,7 +443,8 @@ switch. Only full mode applies the key; the `harness` and `operator` retags reus
 values and say when a full upgrade would move the mode. They keep the mode only onto a chart
 whose schema declares `platformAgent.mode`: onto an older one, this `upgrade.sh` refuses a
 recorded `next` rather than drop it (`--drop-undeclared-values` included), since the chart would
-render no mode and Helm would take `spec.mode` off the CR. An older release's own `upgrade.sh`,
+render no mode and Helm would take `spec.mode` off the CR. A full upgrade onto such a chart
+refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An older release's own `upgrade.sh`,
 the release rollback runbook's route, has no such refusal and drops it with its generic
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates. Under `next` the A2A gateway takes Google Chat, and answers it only
