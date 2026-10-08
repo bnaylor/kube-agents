@@ -29,6 +29,7 @@ package controller
 // back, so a moved or reshaped default reds here instead of passing vacuously.
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -173,36 +174,114 @@ func renderedCalloutReservedAddressees(t *testing.T, agent *agentv1alpha1.Platfo
 // read off the subjects themselves rather than off a constant: the `<x>` in
 // `a2a.tasks.<x>.*.in` and `a2a.tasks.<x>.*.events`, in `a2a.cap.verify.<x>`
 // and in `a2a.cap.reply.<x>.>`. Widening the grant to a second addressee adds
-// it here with no test edit. A wildcard in the addressee position fails the
-// test, because no name list can reserve it; so does finding no addressee at
-// all, which would make every check below pass vacuously.
+// it here with no test edit. See grantAddressees for what fails the test.
 func bridgeGrantAddressees(t *testing.T) []string {
 	t.Helper()
 	id := bridgeIdentity()
-	var out []string
-	add := func(subject, addressee string) {
-		if addressee == "" || strings.ContainsAny(addressee, "*>") {
-			t.Fatalf("the bridge grant %q names addressee %q; a wildcard addressee cannot be reserved by name", subject, addressee)
-		}
-		out = append(out, addressee)
+	out, err := grantAddressees(slices.Concat(id.publish, id.subscribe))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, subject := range slices.Concat(id.publish, id.subscribe) {
+	return out
+}
+
+// addresseeSubjectFamilies are the subject shapes that carry an addressee:
+// the literal tokens before it, and so its position.
+var addresseeSubjectFamilies = [][]string{
+	{"a2a", "tasks"},
+	{"a2a", "cap", "verify"},
+	{"a2a", "cap", "reply"},
+}
+
+// grantAddressees reads the addressees a list of grant subjects names. A grant
+// that leaves the addressee position open is an error, because no name list
+// can reserve it: any `*` or `>` at or before the addressee position of one of
+// addresseeSubjectFamilies, whatever the subject's token count, so a short
+// `a2a.tasks.>` fails as surely as `a2a.tasks.*.*.in`. Finding no addressee at
+// all is an error too, which would make every check on the result pass
+// vacuously.
+func grantAddressees(subjects []string) ([]string, error) {
+	var out []string
+	for _, subject := range subjects {
 		tokens := strings.Split(subject, ".")
+		for _, family := range addresseeSubjectFamilies {
+			if i := wildcardAtOrBefore(tokens, family); i >= 0 {
+				return nil, fmt.Errorf("the grant %q has a wildcard at token %d, at or before the addressee position of `%s.<addressee>`; "+
+					"a wildcard addressee cannot be reserved by name", subject, i, strings.Join(family, "."))
+			}
+		}
+		var addressee string
 		switch {
 		case len(tokens) == 5 && tokens[0] == "a2a" && tokens[1] == "tasks" &&
 			(tokens[4] == "in" || tokens[4] == "events"):
-			add(subject, tokens[2])
+			addressee = tokens[2]
 		case len(tokens) == 4 && tokens[0] == "a2a" && tokens[1] == "cap" && tokens[2] == "verify":
-			add(subject, tokens[3])
+			addressee = tokens[3]
 		case len(tokens) == 5 && tokens[0] == "a2a" && tokens[1] == "cap" && tokens[2] == "reply" && tokens[4] == ">":
-			add(subject, tokens[3])
+			addressee = tokens[3]
+		default:
+			continue
 		}
+		if addressee == "" || strings.ContainsAny(addressee, "*>") {
+			return nil, fmt.Errorf("the grant %q names addressee %q; a wildcard addressee cannot be reserved by name", subject, addressee)
+		}
+		out = append(out, addressee)
 	}
 	if len(out) == 0 {
-		t.Fatalf("found no addressee in the bridge's grants (publish %v, subscribe %v); the subject shapes this test reads have moved", id.publish, id.subscribe)
+		return nil, fmt.Errorf("found no addressee in the grants %v; the subject shapes this test reads have moved", subjects)
 	}
 	slices.Sort(out)
-	return slices.Compact(out)
+	return slices.Compact(out), nil
+}
+
+// wildcardAtOrBefore returns the index of the first `*` or `>` in tokens at or
+// before the addressee position that follows family's literal prefix, or -1.
+// A literal token that differs from the prefix means the subject is not of
+// that family; a subject that ends before the addressee position, with no
+// wildcard, names no addressee subject at all.
+func wildcardAtOrBefore(tokens, family []string) int {
+	for i := 0; i <= len(family) && i < len(tokens); i++ {
+		if tokens[i] == "*" || tokens[i] == ">" {
+			return i
+		}
+		if i < len(family) && tokens[i] != family[i] {
+			return -1
+		}
+	}
+	return -1
+}
+
+// A grant whose wildcard covers the addressee position fails, whatever its
+// token count: a shorter `>` swallows the addressee as surely as a `*` in it.
+// Each row keeps the bridge's real subjects alongside, so the "no addressee at
+// all" guard cannot be what catches it.
+func TestReservedAddresseesRefuseAWildcardGrant(t *testing.T) {
+	id := bridgeIdentity()
+	real := slices.Concat(id.publish, id.subscribe)
+	for _, wide := range []string{
+		">",
+		"a2a.>",
+		"*.tasks.platform.*.in",
+		"a2a.*.platform.*.in",
+		"a2a.tasks.>",
+		"a2a.tasks.*.>",
+		"a2a.tasks.*.*.in",
+		"a2a.tasks.*.*.events",
+		"a2a.cap.>",
+		"a2a.cap.verify.*",
+		"a2a.cap.verify.>",
+		"a2a.cap.reply.>",
+		"a2a.cap.reply.*.>",
+	} {
+		if got, err := grantAddressees(append(slices.Clone(real), wide)); err == nil {
+			t.Errorf("a grant of %q leaves the addressee open and was read as addressees %v; it must fail", wide, got)
+		}
+	}
+	// The real grants pass, and leave-alone subjects outside the three
+	// addressee-bearing families do not trip the guard.
+	if got, err := grantAddressees(append(slices.Clone(real), "_INBOX.x.>", "$KV.runtime-state.>", "a2a.tasks")); err != nil || !slices.Contains(got, a2aBridgeAddressee) {
+		t.Errorf("grantAddressees(bridge grants) = %v, %v; want %q and no error", got, err, a2aBridgeAddressee)
+	}
 }
 
 // Every fixed-name addressee the install routes to is reserved: each one the
