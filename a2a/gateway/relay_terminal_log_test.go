@@ -125,15 +125,9 @@ func TestTaskTerminalLogsOneLinePerTerminal(t *testing.T) {
 			publishTerminal(t, r, origin, party, subject, tc.state, tc.message)
 
 			waitFor(t, "the terminal log line", func() bool { return len(logRecords(t, logs, "task terminal")) > 0 })
-			// The relay retires the task after logging, so anything later
-			// that logged a second line would have done so by the time the
-			// task index is gone; wait for that, then count.
-			waitFor(t, "the task index retired", func() bool { return r.g.sessionForTask(context.Background(), origin.TaskID) == "" })
+			holdsAt(t, "task terminal lines", 1, func() int { return len(logRecords(t, logs, "task terminal")) })
 
 			got := logRecords(t, logs, "task terminal")
-			if len(got) != 1 {
-				t.Fatalf("want one task terminal line, got %d: %v", len(got), got)
-			}
 			ingress := logRecords(t, logs, "ingress")
 			if len(ingress) != 1 {
 				t.Fatalf("want one ingress line, got %d", len(ingress))
@@ -189,12 +183,9 @@ func TestTaskTerminalLogKeepsOnlyASafeReasonToken(t *testing.T) {
 		return false
 	})
 	waitFor(t, "the terminal log line", func() bool { return len(logRecords(t, logs, "task terminal")) > 0 })
-	waitFor(t, "the task index retired", func() bool { return r.g.sessionForTask(context.Background(), origin.TaskID) == "" })
+	holdsAt(t, "task terminal lines", 1, func() int { return len(logRecords(t, logs, "task terminal")) })
 
 	got := logRecords(t, logs, "task terminal")
-	if len(got) != 1 {
-		t.Fatalf("want one task terminal line, got %d: %v", len(got), got)
-	}
 	if got[0]["reason"] != "spawn-failed" || got[0]["state"] != string(lib.StateFailed) {
 		t.Fatalf("line = %v, want reason spawn-failed and state failed", got[0])
 	}
@@ -278,6 +269,28 @@ func TestTaskTerminalLogNamesTheTasksOwnAddressee(t *testing.T) {
 	}
 }
 
+// terminalSettle is how long a count of "task terminal" lines must hold
+// before a test calls it exact. Waiting on anything else first does not
+// order the count: the relay retires the task route before it logs the
+// line, and writes the session record back only after.
+const terminalSettle = 300 * time.Millisecond
+
+// holdsAt fails unless count() returns want on every poll for terminalSettle,
+// so a second line written just after the first still fails the test.
+func holdsAt(t *testing.T, what string, want int, count func() int) {
+	t.Helper()
+	deadline := time.Now().Add(terminalSettle)
+	for {
+		if n := count(); n != want {
+			t.Fatalf("%s: got %d, want %d", what, n, want)
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // terminalLinesFor is the "task terminal" lines that name taskID.
 func terminalLinesFor(t *testing.T, logs *syncBuffer, taskID string) []map[string]any {
 	t.Helper()
@@ -308,10 +321,10 @@ func assertTerminalLine(t *testing.T, line map[string]any, want map[string]any) 
 
 // The terminals that never reach the relay log the same line: the heal of a
 // terminal the relay missed, the heal of a task no executor took, and a
-// submission that never reached the bus. The line lives in
-// observeTaskTerminal, the one place every terminal is handed to the
-// adapter, so an operator joining "ingress" to "task terminal" on taskId
-// finds an outcome for each of these too (#2406, #2410 review).
+// submission that never reached the bus. Each of those paths calls
+// logTaskTerminal, as the relay does, so an operator joining "ingress" to
+// "task terminal" on taskId finds an outcome for each of these too (#2406,
+// #2410 review).
 
 // The stale-task heal: the relay missed a final the stream holds, and the
 // next turn finds it and delivers it. One line, with the fold's state,
@@ -329,10 +342,14 @@ func TestTaskTerminalLogCoversTheStaleTaskHeal(t *testing.T) {
 	}
 	publishTerminal(t, r, origin, lib.Party{Session: "platform"}, lib.TaskEventsSubject("platform", origin.TaskID),
 		lib.StateFailed, "reason: hermes-exited-nonzero - exit status 1")
-	waitFor(t, "the task index retired", func() bool { return r.g.sessionForTask(ctx, origin.TaskID) == "" })
-	if got := terminalLinesFor(t, logs, origin.TaskID); len(got) != 1 {
-		t.Fatalf("the relayed terminal logged %d lines, want 1: %v", len(got), got)
-	}
+	waitFor(t, "the relayed terminal's line", func() bool { return len(terminalLinesFor(t, logs, origin.TaskID)) >= 1 })
+	// The relay writes the record back after it logs; the edit below must
+	// land after that write, or the relay's would undo it.
+	waitFor(t, "the relayed terminal written back", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	holdsAt(t, "the relayed terminal's lines", 1, func() int { return len(terminalLinesFor(t, logs, origin.TaskID)) })
 
 	// The relay having missed the terminal: the active task restored, the
 	// state a transient KV failure on the final event leaves.
