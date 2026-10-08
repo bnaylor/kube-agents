@@ -49,6 +49,7 @@ for the harness), so devops-bench discovers them without a fork.
 
 from __future__ import annotations
 
+import fnmatch
 import http.client
 import json
 import os
@@ -62,7 +63,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
 from devops_bench.verification.base import (
@@ -74,18 +75,30 @@ from devops_bench.verification.base import (
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
 
-from kube_agents_bench import card_wake, discovery, gateway_silence, github_writes, onboarding, transcript
+from kube_agents_bench import (
+    card_wake,
+    discovery,
+    forges,
+    gateway_silence,
+    github_writes,
+    onboarding,
+    transcript,
+)
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
+    FleetSlotUnreached,
+    recorded_clusters,
     confirmed_subjects,
     kubeconfig_for_role,
+    slot_kubeconfig_for_role,
 )
 
 __all__ = [
     "BootstrapDeliveredVerifier",
     "BootstrapFanoutVerifier",
     "BootstrapFindingsVerifier",
+    "BootstrapHandoffVerifier",
     "BootstrapReportReadVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
@@ -104,6 +117,14 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
+_UNREACHED_SLOT_REASON = (
+    "a seeded cluster this check's patterns require a line about was not reached before the run, "
+    "so a missing line about it is the environment's gap, not the agent's miss"
+)
+_UNRESOLVED_ROLES_REASON = (
+    "this check's fixture_roles could not be resolved to a seeded cluster, so the lines it "
+    "requires cannot be graded"
+)
 _NO_WORKER_CALLS_REASON = (
     "no delegated worker's tool calls are in the trajectory: either no card was "
     "delegated or the worker-trajectory capture did not run, so a check scoped to "
@@ -114,6 +135,46 @@ _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
+
+# `{cluster:<slot>}` in a `forbidden_patterns` or `any_of_patterns` entry
+# stands for the cluster the runner recorded for that slot, as a frame that
+# matches the name bare or as the last `-` or `/`-joined component of a
+# longer id (a project, a resource path; a kubeconfig context's `_` joins
+# only under `fold_decoration: true`, see _NAME_JOINERS), followed by
+# nothing or by `-<location>` as recorded. `{cluster:any}` is every recorded
+# slot. The case then says WHICH cluster, not what a cluster's name looks
+# like, so `seeded-a-us-west1` is slot a only where the runner recorded it.
+_CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
+# Anything that looks like the opener in any case or spacing is a placeholder
+# the author meant, so a near miss is refused rather than compiled literally.
+_CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
+_CLUSTER_ANY = "any"
+# No `_` in either: `_normalize` deletes every underscore as Markdown emphasis,
+# and under the fold `_INNER_UNDERSCORE` has already made an inner one a `-`,
+# so none reaches the frame. A kubeconfig context (`gke_<project>_<location>_
+# <name>`) therefore matches only with `fold_decoration: true`.
+_NAME_CHARS = "[a-z0-9/.-]"
+_NAME_JOINERS = "[-/]"
+# The frame bounds the name itself, so a pattern need not: nothing word-like
+# before it (`unseeded-a` is not `seeded-a`), and after it nothing word-like
+# and no `-` that would make it a longer name (`seeded-a-canary`,
+# `seeded-a-us-west1`); `/`, `.`, a space and punctuation may follow.
+_NAME_LEFT_BOUND = "(?<![a-z0-9])"
+_NAME_RIGHT_BOUND = "(?![a-z0-9-])"
+# Records the spec-load compile check expands a pattern with, in place of the
+# runner's: two slots, so a `{cluster:any}` alternation takes the shape it
+# will have, and every slot the pattern names.
+_PLACEHOLDER_STAND_IN_RECORDS = {"stand-in-1": ("stand-in-1", "stand-in-location"), "stand-in-2": ("stand-in-2", "")}
+_UNRECORDED_SLOT_REASON = (
+    "a pattern names a seeded-fleet slot the runner recorded no cluster for, so the line it "
+    "requires cannot be told from a line about another cluster"
+)
+_NO_RECORDED_SLOT_REASON = (
+    "a pattern names every recorded seeded-fleet slot and the runner recorded none: no seeded "
+    "cluster was reached before the run"
+)
+_PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
+
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -147,14 +208,166 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
-def _normalize_lines(text: str) -> str:
-    """``_normalize`` applied per line, newlines kept.
+# A line's decoration, folded before the pattern clauses see it when the
+# check asks for it (``fold_decoration: true``). The lead is any run of
+# non-word characters (bullets, quotes, pipes, arrows, symbols, a checkbox),
+# list tokens (`1.`, `(1)`, `a)`, `ii.`, a circled digit, a keycap `1️⃣`,
+# `#1`), citation markers (`[1]`) and whitespace, up to the first word
+# character; a Markdown link around a name is kept as its text, and a quote
+# or bracket closing a name goes with the opener the lead took. The trail is
+# a run of the closers and affirming marks `_TRAIL_CLOSERS` names (a stop, a
+# list's comma or semicolon, quotes, pipes, a hard-break backslash, a check
+# mark), a `<br>`, or a footnote marker (`[1]`, `[^note]`, `(1)`, a
+# superscript digit, a linked `[1](url)`); any other trailing symbol stays.
+# A footnote marker before a `;`, `,` or `.` inside the line is folded too,
+# since a declared frame's values are separated by `;`; so is a wrap the
+# agent kept from the prompt's template around a value (`<unavailable>`,
+# `"unaffected"`), whitespace before a `:` or `;` or missing after one, and
+# invisible format characters anywhere. A pattern anchored
+# with ``^...$`` then spells a declared line once rather than once per
+# rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
+# edges. Other interior punctuation is untouched. Opt-in, because a case
+# may forbid the decoration
+# itself (a bulleted capability list, say), and that pattern needs the
+# markers left where they are.
+_LINE_LEAD_DECORATION = re.compile(
+    r"^(?:\[\s*[x ]?\s*\]|\[\^?\d{1,3}\]|\(?\d{1,3}[.)](?=\s)|\(?[ivx]{1,4}[.)](?=\s)|[a-z][.)](?=\s)"
+    r"|#?\d{1,3}(?:\ufe0f?\u20e3)?(?=\s)"
+    r"|[\u2460-\u2473\u24ea-\u24ff\u2776-\u2793]|[^\w\n])+"
+)
+# A footnote marker at the end of a line: `[1]`, `[^1]`, `[^note]` (a named
+# footnote needs the caret, so a bracketed word such as `[mostly]` is a
+# value, not a marker), `(1)`, a superscript digit, or a linked `[1](url)`.
+# The named-footnote alternative excludes what the numbered one already
+# matches, and the repeat is possessive: alternatives that overlap inside
+# `(...)+$` backtrack exponentially on a line that ends in many markers and
+# then a word, and this runs on every line of a report.
+_FOOTNOTE_MARKER = r"(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^(?!\d{1,3}\])[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079])"
+_LINE_TRAIL_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++\s*$")
+# The same markers before a separator inside the line: a citation on a
+# value other than the last one.
+_LINE_INTERIOR_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++(?=\s*[;,.])")
+# What a line may end with and still be the same line: whitespace, closing
+# punctuation, quotes, brackets, pipes, a hard-break backslash, a `<br>`, and
+# the marks that affirm (a check, a thumbs up, a green circle, with the
+# variation selector and joiner emoji carry). The list is the whole of it: a
+# symbol it does not name stays on the line, so a mark that hedges or negates
+# the last word (`?`, `!`, an ellipsis, a cross, a stop sign, a warning sign,
+# a thumbs down, one nobody has thought of) makes a hedged value the wrong
+# value. A denylist of negating marks would turn every mark it forgot into a
+# pass.
+_TRAIL_CLOSERS = (
+    ".,;:\"'`*_~|/\\<>)]}"
+    "\u201c\u201d\u2018\u2019\u00ab\u00bb\u2039\u203a\u2013\u2014"
+    "\u2713\u2714\u2705\u2611\ufe0f\u200d\U0001f44d\U0001f7e2"
+)
+_LINE_TRAIL_DECORATION = re.compile(r"(?:[\s" + re.escape(_TRAIL_CLOSERS) + r"]|<br\s*/?>)+$")
+# The same without a closing bracket, so a closer after a footnote marker
+# ("[1].") is taken without eating the marker's own bracket.
+_LINE_TRAIL_CLOSER = re.compile(
+    r"(?:[\s" + re.escape(_TRAIL_CLOSERS.replace(")", "").replace("]", "")) + r"]|<br\s*/?>)+$"
+)
+_TRAIL_FOLD_PASSES = 3
+# A name the agent quotes or brackets instead of emphasising, with or without
+# a parenthetical inside the quotes: the lead fold has taken the opener, so
+# what is left is the name with its closer stuck to it before the colon or
+# slash that ends the name.
+_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>)}]+(?=[:/\s(])")
+_MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+# A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
+# `"unaffected"`): a wrap that opens after whitespace and closes at the next
+# `;` or the end comes off; at the end the closer may already have gone with
+# the trail. Only a wrap on a whole value, so quotes inside a value stay.
+_VALUE_WRAP = re.compile(
+    r"(?<=\s)[\"'\u201c\u201d\u2018\u2019<]+([^;\n\"'\u201c\u201d\u2018\u2019<>]+?)"
+    r"(?:[\"'\u201c\u201d\u2018\u2019>]+(?=\s*(?:;|$))|(?=\s*$))",
+    re.M,
+)
+# Whitespace the agent put before a frame's separator (`seeded-a :`,
+# `zonal ;`), or left out after it before a word (`seeded-a:control`,
+# `zonal;api`): the separator is the frame's, so the spacing around it is
+# decoration. A `:` before anything but a letter (`12:30`, `https://`) is
+# left alone.
+_SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
+# A letter or digit on both sides, not `\w`, which includes `_` itself and
+# would rewrite the inner underscore of a doubled `__bold__` marker.
+# Case-insensitive because it runs on the raw line, before `_normalize`
+# lowercases: a capital beside the underscore is still a word character.
+_INNER_UNDERSCORE = re.compile(r"(?<=[a-z0-9])_(?=[a-z0-9])", re.IGNORECASE)
+_SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z\"'\u201c\u2018<])")
+# Invisible format characters a model or a pasted document carries (a
+# zero-width space or joiner, a word joiner, a byte-order mark, a variation
+# selector, a soft hyphen), and the five skin-tone modifiers an emoji is
+# rendered with (U+1F3FB to U+1F3FF, which only change how a listed closer
+# looks): not whitespace to Python, not a word character, and not a value.
+# Removed from the raw line in `_normalize_lines`, before `_normalize`
+# collapses whitespace: one flanked by spaces (`is \u200b zonal`) would
+# otherwise leave a double space behind that no later fold closes, and the
+# frames read it as a wrong value. `_fold_line_decoration` strips the class
+# again for a caller that hands it a line directly.
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\ufe0e\ufe0f\u00ad\U0001f3fb-\U0001f3ff]")
 
-    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
-    end on; the whitespace collapse above would otherwise fuse a negated
-    bullet into its unnegated neighbour before the regex runs.
+
+def _fold_trail_markers(line: str) -> str:
+    # Markers and closers interleave ("unaffected [1].", "[1](url),"), so a
+    # closer strip that spares brackets alternates with the marker strip
+    # until the line stops changing. Brackets are spared so a link that is a
+    # value ("[unaffected](url).") keeps its closing parenthesis for the
+    # unwrap that follows.
+    for _ in range(_TRAIL_FOLD_PASSES):
+        folded = _LINE_TRAIL_FOOTNOTE.sub("", _LINE_TRAIL_CLOSER.sub("", line))
+        if folded == line:
+            break
+        line = folded
+    return line
+
+
+def _fold_trail(line: str) -> str:
+    return _LINE_TRAIL_DECORATION.sub("", _fold_trail_markers(line))
+
+
+def _fold_line_decoration(line: str) -> str:
+    # Trailing markers and closers first, whatever order they come in, so a
+    # linked marker is folded as a marker however the line ends; then every
+    # other link is kept as its text, so a linked value stays a value; then
+    # the lead, the quoted name, and the trail once more with the full
+    # closer class.
+    footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(_INVISIBLE.sub("", line)))
+    unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
+    led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
+    unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
+    # The separator's spacing is settled first, so a wrap glued to its
+    # separator (`pods:"unaffected"`) has the whitespace the wrap fold opens
+    # on; the value wrap then comes off before the trail fold (so a closing
+    # quote at the line's end is read as the wrap it is) and again after it
+    # (so a wrap followed by a stop is read once the stop is gone).
+    spaced = _SEPARATOR_NO_SPACE.sub(r"\1 ", _SEPARATOR_SPACE.sub("", unquoted))
+    trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", spaced))
+    return _VALUE_WRAP.sub(r"\1", trailed)
+
+
+def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
+    """``_normalize`` applied per line, newlines kept; with ``fold_decoration``
+    each line's decoration is folded as well.
+
+    ``forbidden_patterns`` and ``any_of_patterns`` need a boundary a Markdown
+    bullet or heading can end on; the whitespace collapse above would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs. The fold, when asked for, means a line-anchored pattern
+    matches the line however the agent listed, linked or quoted it.
     """
-    return "\n".join(_normalize(line) for line in text.splitlines())
+    # `_normalize` deletes underscores as Markdown emphasis; under the fold
+    # an underscore between two word characters becomes a hyphen first, so
+    # a kubeconfig context (`gke_<project>_<location>_<name>`) keeps the
+    # boundary before its cluster name, while `_word_` emphasis, whose
+    # underscores sit at a token's edges, is still deleted.
+    lines = (
+        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", line)) if fold_decoration else line)
+        for line in text.splitlines()
+    )
+    if fold_decoration:
+        lines = (_fold_line_decoration(line) for line in lines)
+    return "\n".join(lines)
 
 
 @VERIFIERS.register("report_contains")
@@ -164,16 +377,19 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the first regex exception, for the shape a
-    substring cannot express: a banned word whose negated uses are
-    legitimate ("no guarantee"). Each is ``re.search``ed against a
+    ``forbidden_patterns`` and ``any_of_patterns`` are the regex exceptions,
+    for the shapes a substring cannot express: a banned word whose negated
+    uses are legitimate ("no guarantee"), a phrase a substring cannot bound
+    ("it stopped" also matches "limit stopped"), and a required claim whose
+    subject and verb an adverb or a tense can separate. Each is ``re.search``ed against a
     line-preserving variant of the same normalization — newlines survive,
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
     otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs. ``any_of_patterns`` are alternatives to ``any_of_phrases``
-    for the phrase a substring cannot bound: "it stopped" also matches
-    "limit stopped". Each is ``re.search``ed against the flat normalization.
+    regex runs. A literal space in a pattern therefore does not cross a
+    line break; a phrase that may wrap says ``\\s+`` where it may.
+    ``any_of_patterns`` and ``any_of_phrases`` are one pool of
+    alternatives: at least one of either has to match.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -201,19 +417,170 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
-    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    # The regex form of any_of_phrases, for a claim a phrase list cannot
+    # carry: a whole declared line, a phrase that must start at a word
+    # boundary, or a subject bound to its verb across an adverb. One pool
+    # with any_of_phrases (at least one of either must match), searched
+    # against the same line-preserving text as forbidden_patterns, so a
+    # pattern may anchor on a newline and should keep it out of its gaps,
+    # and a phrase that may wrap says `\s+` where a space would not cross
+    # the break. `{cluster:<slot>}` in either list stands for the cluster
+    # the runner recorded for that slot (see _CLUSTER_PLACEHOLDER).
+    any_of_patterns: list[str] = Field(default_factory=list)
+    # Fold each line's decoration (bullets, numbers, quotes, links, a trailing
+    # stop or an affirming mark; a mark that hedges or negates the last word
+    # stays) before the pattern clauses run, so a declared line is spelled
+    # once. Off by default: a case may forbid the decoration itself.
+    fold_decoration: bool = False
+    # The seeded-fleet roles whose clusters the patterns require a line
+    # about, one per slot. Each is resolved to its slot's own credential
+    # (``clusters/<slot>.kubeconfig``, which the runner writes for every
+    # seeded cluster it reached, before and apart from confirming the roles
+    # on it); a slot the runner did not reach makes the check an ``error``
+    # for the environment instead of charging the agent with a line about a
+    # cluster it could not see. Whether the role's fixture is planted is not
+    # read here.
+    fixture_roles: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("fixture_roles")
+    @classmethod
+    def _roles_are_names(cls, roles: list[str]) -> list[str]:
+        # The same contract as the fleet verifier's `fixture_role`: the name
+        # reaches the catalogue and a path, so a bad one fails at spec load,
+        # before the run, not as an environment error after it.
+        for role in roles:
+            if not ROLE_PATTERN.fullmatch(role):
+                raise ValueError(
+                    f"fixture_roles entry {role!r} must be a lowercase-hyphen name "
+                    "(it names a catalogue role and a slot's file); see bench/tf/fleet/fixtures.json"
+                )
+        return roles
+
+    @field_validator("required_phrases", "forbidden_phrases", "any_of_phrases")
+    @classmethod
+    def _phrases_carry_no_placeholder(cls, phrases: list[str], info: ValidationInfo) -> list[str]:
+        # A phrase is matched as a substring, as written: a placeholder here
+        # is never expanded, so a forbid built on one never fires and a
+        # requirement fails every run. Refused at spec load, like a pattern
+        # that does not compile.
+        for phrase in phrases:
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(phrase):
+                raise ValueError(
+                    f"{info.field_name} entry {phrase!r} carries a cluster placeholder, which only "
+                    "forbidden_patterns and any_of_patterns expand; as a phrase it is literal text that never matches"
+                )
+        return phrases
 
     @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
-    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
-            re.compile(pattern)
+            # A placeholder the regex does not recognise (`{cluster: a}`,
+            # `{Cluster:a}`) would compile as literal text and never match:
+            # an inert forbid or a miss on every run, with no hint why.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(_CLUSTER_PLACEHOLDER.sub("", pattern)):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a malformed cluster placeholder; the form is "
+                    f"{{cluster:<slot>}} or {{cluster:{_CLUSTER_ANY}}}, lowercase, no spaces"
+                )
+            # A placeholder expands to a frame at verify time, so what has to
+            # compile now is the pattern around a frame, not around a letter:
+            # a lookbehind or a character class that is legal around `x` is
+            # not around a variable-width group.
+            try:
+                re.compile(cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern)))
+            except re.error as exc:
+                # Re-raised as the same type, so a caller that catches re.error
+                # for a pattern that does not compile still does.
+                raise re.error(f"pattern {pattern!r} does not compile once its cluster placeholders are expanded: {exc}") from exc
         return patterns
+
+    @staticmethod
+    def _stand_in_records(pattern: str) -> dict[str, tuple[str, str]]:
+        records = dict(_PLACEHOLDER_STAND_IN_RECORDS)
+        for slot in _CLUSTER_PLACEHOLDER.findall(pattern):
+            if slot != _CLUSTER_ANY:
+                records.setdefault(slot, (slot, ""))
+        return records
+
+    @staticmethod
+    def _cluster_frame(name: str, location: str) -> str:
+        """The regex for one recorded cluster, as one group: its name, bare or
+        as the last `-` or `/`-joined component of a longer id (a `_` join
+        only under the fold, which has made it a `-` by now), then
+        nothing or its recorded location, bounded on both sides by the frame
+        itself (nothing word-like before, nothing word-like and no `-` after),
+        so `unseeded-a`, `seeded-a-canary` and `seeded-a-us-west1` are not
+        slot a wherever the placeholder sits in a pattern."""
+        bare = re.escape(name.lower())
+        frame = f"{_NAME_LEFT_BOUND}(?:(?:(?!{bare}(?![a-z0-9])){_NAME_CHARS})*{_NAME_JOINERS})?{bare}"
+        if location:
+            frame += f"(?:-{re.escape(location.lower())})?"
+        return f"(?:{frame}{_NAME_RIGHT_BOUND})"
+
+    @classmethod
+    def expand_cluster_placeholders(cls, pattern: str, clusters: dict[str, tuple[str, str]]) -> str:
+        """``pattern`` with every ``{cluster:<slot>}`` replaced by the recorded
+        cluster's frame, ``{cluster:any}`` by every recorded slot's.
+
+        Raises:
+            KeyError: the pattern names a slot with no record (the message
+                names it; the caller turns that into ``status: error``).
+            LookupError: ``{cluster:any}`` with no slot recorded at all.
+        """
+        def frame_for(match: re.Match) -> str:
+            slot = match.group(1)
+            if slot == _CLUSTER_ANY:
+                if not clusters:
+                    raise LookupError(_NO_RECORDED_SLOT_REASON)
+                return "(?:" + "|".join(cls._cluster_frame(n, l) for n, l in clusters.values()) + ")"
+            if slot not in clusters:
+                raise KeyError(slot)
+            return cls._cluster_frame(*clusters[slot])
+        return _CLUSTER_PLACEHOLDER.sub(frame_for, pattern)
+
+    def _expanded_patterns(self) -> tuple[list[str], list[str], dict[str, tuple[str, str]] | None]:
+        """The two pattern lists with their cluster placeholders expanded from
+        the runner's record, and the record used (None when no pattern asked,
+        so the record is read only then)."""
+        if not any(_CLUSTER_PLACEHOLDER.search(p) for p in self.forbidden_patterns + self.any_of_patterns):
+            return self.forbidden_patterns, self.any_of_patterns, None
+        clusters = recorded_clusters()
+        return (
+            [self.expand_cluster_placeholders(p, clusters) for p in self.forbidden_patterns],
+            [self.expand_cluster_placeholders(p, clusters) for p in self.any_of_patterns],
+            clusters,
+        )
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
+        for role in self.fixture_roles:
+            try:
+                slot_kubeconfig_for_role(role)
+            except FleetSlotUnreached as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNREACHED_SLOT_REASON}: {exc}"
+                )
+            except FleetRoleUnresolved as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRESOLVED_ROLES_REASON}: {exc}"
+                )
+        try:
+            forbidden_patterns, any_of_patterns, clusters = self._expanded_patterns()
+        except KeyError as exc:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start,
+                reason=f"{_UNRECORDED_SLOT_REASON}: slot {exc.args[0]!r} has no cluster record in the runner's context file",
+            )
+        except (LookupError, FleetRoleUnresolved) as exc:
+            # `{cluster:any}` with nothing recorded, or no runner directory at
+            # all: neither names a slot, and each message already says what
+            # happened, so no slot-shaped prefix is put in front of it.
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=str(exc)
+            )
         snap = transcript.get()
         if snap is None:
             return VerificationResult(
@@ -226,12 +593,19 @@ class ReportContainsVerifier(BaseVerifier):
         text = _normalize(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        pattern_hits = [
-            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
-        ]
+        lines = _normalize_lines(raw, fold_decoration=self.fold_decoration)
+        try:
+            # Reported in the case's own spelling: the expanded frame is not a
+            # thing a reader of results.json can recognise.
+            pattern_hits = [self.forbidden_patterns[i] for i, p in enumerate(forbidden_patterns) if re.search(p, lines)]
+            any_pattern_hit = any(re.search(p, lines) for p in any_of_patterns)
+        except re.error as exc:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_PATTERN_EXPANSION_REASON}: {exc}"
+            )
+        # One pool: a phrase or a pattern satisfies the clause.
         any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
-            any(_normalize(p) in text for p in self.any_of_phrases)
-            or any(re.search(p, text) for p in self.any_of_patterns)
+            any(_normalize(p) in text for p in self.any_of_phrases) or any_pattern_hit
         )
         if missing or present or pattern_hits or any_of_miss:
             parts = []
@@ -244,10 +618,19 @@ class ReportContainsVerifier(BaseVerifier):
                     f"forbidden patterns matched in the report: {pattern_hits}"
                 )
             if any_of_miss:
-                parts.append(
-                    "none of the alternative phrasings present: "
-                    f"{self.any_of_phrases + self.any_of_patterns}"
-                )
+                if self.any_of_phrases:
+                    parts.append(
+                        f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    )
+                if self.any_of_patterns:
+                    parts.append(
+                        f"none of the alternative patterns matched: {self.any_of_patterns}"
+                    )
+            if clusters is not None and (pattern_hits or any_of_miss):
+                # Which name each slot stood for in this project, so a miss
+                # can be read against what the agent wrote.
+                resolved = {slot: f"{name} ({location})" if location else name for slot, (name, location) in sorted(clusters.items())}
+                parts.append(f"cluster placeholders resolved to {resolved}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -268,9 +651,13 @@ class ReportContainsVerifier(BaseVerifier):
                 f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
             )
         if self.any_of_phrases or self.any_of_patterns:
+            kinds = " or ".join(
+                kind
+                for kind, given in (("phrasing(s)", self.any_of_phrases), ("pattern(s)", self.any_of_patterns))
+                if given
+            )
             satisfied.append(
-                "at least one of "
-                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
+                f"at least one of {len(self.any_of_phrases) + len(self.any_of_patterns)} alternative {kinds}"
             )
         return VerificationResult(
             success=True,
@@ -371,6 +758,14 @@ class ToolCalledVerifier(BaseVerifier):
         if pattern is not None:
             if not pattern:
                 raise ValueError("agent selector pattern cannot be empty")
+            # The selector is matched as written against the trajectory's
+            # agent tags; a cluster placeholder is never expanded here, so it
+            # would compile as literal braces that match no tag.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"agent selector pattern {pattern!r} carries a cluster placeholder, which only "
+                    "report_contains's forbidden_patterns and any_of_patterns expand"
+                )
             compiled = re.compile(pattern)
             if compiled.fullmatch(""):
                 raise ValueError(
@@ -491,7 +886,11 @@ LEDGER_AUDIT_IDS = frozenset(
 )
 
 # Environment names carrying the read credential, in precedence order. See
-# LedgerIssueContainsVerifier's docstring for what it has to be.
+# LedgerIssueContainsVerifier's docstring for what it has to be. A literal
+# rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
+# tests/test_gitlab_checks.py): `scripts/verify_ci_pool_project.py` parses
+# this tuple out of the file, without importing bench, to check that CI mints
+# into the name bench reads first.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # When the first unit on the case's audit stream began, in epoch seconds, and
@@ -522,20 +921,9 @@ _RESET_COMMENT_LOOKBACK = timedelta(hours=1)
 _GITHUB_PAGE_SIZE = 100
 _GITHUB_SINCE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
-# github.com only, and issues only: `/pull/<n>` is a remediation pull request,
-# which every audit report also links and which is not the ledger.
-_ISSUE_URL_RE = re.compile(
-    r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)/issues/(\d+)",
-    re.IGNORECASE,
-)
-
-# The other half of the pair above: pull requests only. A remediation case is
-# graded on the PR it opened, and the ledger issue beside it is not that.
-_PULL_URL_RE = re.compile(
-    r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)/pull/(\d+)",
-    re.IGNORECASE,
-)
-
+# Issue and pull-request URLs are read per forge (kube_agents_bench.forges),
+# and apart: every audit report also links its remediation pull request, which
+# is not the ledger.
 # audit_report.py's `_render_footer`, verbatim:
 #     f"Generated by the Platform Agent `{audit_id}` watchdog at "
 #     f"{generated_at.isoformat()}. Findings come from read-only inspection..."
@@ -615,6 +1003,9 @@ _MAX_PR_CANDIDATES = 8
 _PR_COMMITS_PAGE_SIZE = 100
 # `/pulls/{n}/commits` lists at most 250 commits.
 _PR_COMMITS_MAX_PAGES = 3
+# `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
+_PR_FILES_PAGE_SIZE = 100
+_PR_FILES_MAX_PAGES = 30
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -633,6 +1024,114 @@ _NO_TOKEN_REASON = (
     f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
     "the eval GitOps repository, or this check cannot be evaluated"
 )
+
+
+def _no_token_reason(forge: str) -> str:
+    """The reason for an absent grading credential, naming the forge's variables."""
+    if forge == forges.FORGE_GITHUB:
+        return _NO_TOKEN_REASON
+    return (
+        f"no {forge} read credential in the environment: set one of "
+        f"{', '.join(forges.token_env_vars(forge))} to a token that can read the eval "
+        "GitOps repository, or this check cannot be evaluated"
+    )
+
+
+def _forge_label(forge: str) -> str:
+    return "GitLab" if forge == forges.FORGE_GITLAB else "GitHub"
+
+
+def _issue_view(forge: str, payload: dict) -> dict[str, Any]:
+    """The ledger fields of one issue payload, whichever forge served it.
+
+    GitLab calls the body ``description``, lists labels as bare names, says
+    ``opened`` for open and carries no ``state_reason``.
+    """
+    if forge == forges.FORGE_GITLAB:
+        labels = {
+            str(lbl.get("name") or "") if isinstance(lbl, dict) else str(lbl)
+            for lbl in payload.get("labels") or []
+        }
+        state = str(payload.get("state") or "").lower()
+        return {
+            "body": str(payload.get("description") or ""),
+            "labels": labels,
+            "state": "open" if state == "opened" else state,
+            "state_reason": "",
+            "closed_at": _parse_github_time(payload.get("closed_at")),
+        }
+    return {
+        "body": str(payload.get("body") or ""),
+        "labels": {
+            str(lbl.get("name") or "")
+            for lbl in payload.get("labels") or []
+            if isinstance(lbl, dict)
+        },
+        "state": str(payload.get("state") or "").lower(),
+        "state_reason": str(payload.get("state_reason") or ""),
+        "closed_at": _parse_github_time(payload.get("closed_at")),
+    }
+
+
+def _gitlab_project_unseen(repo: str, token: str, budget: float) -> str | None:
+    """Why the token cannot see the GitLab project ``repo``, or None when it can.
+
+    GitLab answers 404, not 403, for a private project the token cannot see,
+    so a 404 on an issue or a merge request does not by itself say the object
+    is missing: the project read tells a misconfigured credential (an error)
+    from a number the agent got wrong (a failed grade).
+
+    Asked only of the project this job is configured for
+    (``_is_configured_gitlab_project``). Any other path in a reply is the
+    agent's own, and a 404 there is graded as absence, as GitHub's
+    ``_resolve`` grades a 404 pair: a mistyped project is the agent's error,
+    not a credential fault to red every repetition with.
+    """
+    status, _ = _http_get_json(
+        forges.gitlab_api_root() + forges.gitlab_project_path(repo), token, budget
+    )
+    if status == 200:
+        return None
+    if status in (401, 403, 404):
+        return (
+            f"GitLab answered {status} for the project {repo} itself: the token behind "
+            f"{forges.GITLAB_TOKEN_ENV_VARS[0]} cannot see it (a private project it is "
+            "not a member of answers 404), so this check could not be evaluated"
+        )
+    return (
+        f"GitLab answered {status} for the project {repo} itself while telling a "
+        "missing object from an unseen project, so this check could not be evaluated"
+    )
+
+
+def _is_configured_gitlab_project(repo: str) -> bool:
+    """Whether ``repo`` is the project this job grades against.
+
+    ``BENCH_GITOPS_REPO``, or the stream's repository when a case sets it:
+    the paths configuration names, as opposed to one an agent wrote.
+    """
+    configured = {
+        _gitlab_path_key(os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "")),
+        _gitlab_path_key(_stream_repo()),
+    } - {""}
+    return _gitlab_path_key(repo) in configured
+
+
+def _gitlab_path_key(value: str) -> str:
+    """A GitLab project path as configuration and replies both spell it.
+
+    Surrounding slashes off, as `GitHubWritesVerifier` takes them off the
+    same variable on GitLab -- a path copied out of a URL often keeps one --
+    and case folded, because GitLab paths compare that way. Only GitLab's
+    callers use it; GitHub reads its repository exactly as given.
+    """
+    return value.strip().strip("/").lower()
+
+
+def _issue_api_url(forge: str, repo: str, number: int) -> str:
+    if forge == forges.FORGE_GITLAB:
+        return f"{forges.gitlab_api_root()}{forges.gitlab_project_path(repo)}/issues/{number}"
+    return f"{forges.GITHUB_API_ROOT}/repos/{repo}/issues/{number}"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -988,12 +1487,13 @@ def _agent_shell(script: str, timeout: float) -> str:
 
 @VERIFIERS.register("bootstrap_fanout")
 class BootstrapFanoutVerifier(BaseVerifier):
-    """Checks the cards the onboarding discovery sweep's worker filed.
+    """Checks the cluster cards filed for the onboarding discovery sweep.
 
-    The sweep card is filed by a cron job rather than by the conversation, so
-    neither the transcript nor the harness's delegation capture sees it; this
-    reads the card, its worker's children and the Cluster Agent roster off the
-    agent's disk (:mod:`kube_agents_bench.discovery`).
+    The onboarding gate, a cron job, files the sweep card and one card per
+    Cluster Agent, so neither the transcript nor the harness's delegation
+    capture sees them; this reads the sweep, the ``bootstrap-inventory-cluster-*``
+    cards created at or after it, and the Cluster Agent roster off the agent's
+    disk (:mod:`kube_agents_bench.discovery`).
 
     ``require``:
 
@@ -1001,20 +1501,15 @@ class BootstrapFanoutVerifier(BaseVerifier):
       finished scaffolding and has a cluster identity got exactly one
       ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
       profile name, and no such card went anywhere else.
-    - ``no_card_waits_on_the_sweep``: no ``bootstrap-inventory-cluster-*``
-      card names the sweep as a parent. A child waiting on the card that waits
-      on it never runs until the sweep has given up on it.
 
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
-    queried, or a sweep card the board does not know is ``status="error"``,
-    and so is an empty roster for ``one_card_per_cluster_agent``.
-    ``no_card_waits_on_the_sweep`` does not read the roster, so an empty one
-    is not an error for it. A ``fail`` from an earlier poll outranks a final
-    read that errors.
+    queried, a sweep card the board does not know, or an empty roster is
+    ``status="error"``. A ``fail`` from an earlier poll outranks a final read
+    that errors.
     """
 
     type: Literal["bootstrap_fanout"]
-    require: Literal["one_card_per_cluster_agent", "no_card_waits_on_the_sweep"]
+    require: Literal["one_card_per_cluster_agent"]
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
@@ -1053,12 +1548,6 @@ class BootstrapFanoutVerifier(BaseVerifier):
             if str(c.get("key") or "").startswith(discovery.CLUSTER_KEY_PREFIX)
         ]
         where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
-        if self.require == "no_card_waits_on_the_sweep":
-            waiting = [c["id"] for c in cards if sweep.get("id") in (c.get("parents") or [])]
-            if waiting:
-                return "fail", f"{where}: cluster card(s) {waiting} name the sweep as a parent", payload
-            return "pass", f"{where}: none of {len(cards)} cluster card(s) waits on the sweep", payload
-
         roster = payload.get("roster") or []
         if not roster:
             unidentified = payload.get("unidentified") or []
@@ -1328,7 +1817,12 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
     def _closed_by_the_reset(
-        self, api_url: str, closed_at: datetime, token: str, budget: float
+        self,
+        api_url: str,
+        closed_at: datetime,
+        token: str,
+        budget: float,
+        forge: str = forges.FORGE_GITHUB,
     ) -> bool | None:
         """Whether the harness's reset marker was posted alongside this close.
 
@@ -1339,22 +1833,24 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         created within ``max_clock_skew_sec`` of ``closed_at`` counts: the
         reset posts its comment and closes seconds later, so a marker that is
         older than that belongs to a reset whose close failed, not to this
-        close.
+        close. GitLab's notes take no ``since``; they are read newest first,
+        one page, and its system notes (a label or description change) are
+        skipped, since the marker is a comment the reset posts.
         """
         closed_at = closed_at.astimezone(timezone.utc)
         since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
+        if forge == forges.FORGE_GITLAB:
+            url = f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"
+        else:
+            url = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}"
         try:
-            status_code, payload = _http_get_json(
-                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}",
-                token,
-                budget,
-            )
+            status_code, payload = _http_get_json(url, token, budget)
         except OSError:
             return None
         if status_code != 200 or not isinstance(payload, list):
             return None
         for comment in payload:
-            if not isinstance(comment, dict):
+            if not isinstance(comment, dict) or comment.get("system"):
                 continue
             if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
                 continue
@@ -1388,23 +1884,23 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             return done(False, _NO_TRANSCRIPT_REASON, status="error")
         if not snap.started_at:
             return done(False, _NO_RUN_CLOCK_REASON, status="error")
-        token = next(
-            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
-        )
+        try:
+            forge = forges.forge_name()
+        except forges.UnknownForge as exc:
+            return done(False, str(exc), status="error")
+        token = forges.read_token(forge)
         if not token:
-            return done(False, _NO_TOKEN_REASON, status="error")
+            return done(False, _no_token_reason(forge), status="error")
+        host = forges.web_host(forge)
+        label = _forge_label(forge)
 
-        seen: list[tuple[str, str, int]] = []
-        for owner, repo, number in _ISSUE_URL_RE.findall(snap.final_message):
-            key = (owner, repo, int(number))
-            if key not in seen:
-                seen.append(key)
+        seen = forges.issue_refs(snap.final_message, forge)
         if not seen:
             queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
             if queued:
                 return done(
                     False,
-                    "the run's report names no github.com issue URL because the worker queued "
+                    f"the run's report names no {host} issue URL because the worker queued "
                     f"the audit for later instead of running it ({queued.group(0).strip()!r}): "
                     "when asked to run an audit following its SOP, the worker must execute "
                     "the audit now via audit_report.py start/finish rather than deferring to cron (#1876)",
@@ -1413,7 +1909,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if clean:
                 return done(
                     False,
-                    "the run's report names no github.com issue URL, but says the "
+                    f"the run's report names no {host} issue URL, but says the "
                     f"ledger was retired as clean ({clean.group(0).strip()!r}): the "
                     "audit closed the stream's ledger over a fleet this case planted "
                     "a finding on, and dropped the pointer to it -- a false clean, "
@@ -1422,7 +1918,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 )
             return done(
                 False,
-                "the run's report names no github.com issue URL, so no ledger "
+                f"the run's report names no {host} issue URL, so no ledger "
                 "was published (or the audit did not report the one it wrote); "
                 "every non-silent fleet-audit report must carry issue_url in full",
             )
@@ -1437,24 +1933,34 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         budget = single_call_timeout(timeout_sec)
         matches: list[dict[str, Any]] = []
         rejected: list[str] = []
-        for owner, repo, number in seen:
-            url = f"https://api.github.com/repos/{owner}/{repo}/issues/{number}"
+        unseen: list[str] = []
+        for repo, number in seen:
+            slug = f"{repo}#{number}"
+            url = _issue_api_url(forge, repo, number)
             try:
                 status_code, payload = _http_get_json(url, token, budget)
             except OSError as exc:
                 return done(
                     False,
-                    f"could not reach the GitHub API for {owner}/{repo}#{number}: "
+                    f"could not reach the {label} API for {slug}: "
                     f"{exc}; this check could not be evaluated",
                     status="error",
                 )
             if status_code == 404:
-                rejected.append(f"{owner}/{repo}#{number}: no such issue (404)")
+                if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    try:
+                        why = _gitlab_project_unseen(repo, token, budget)
+                    except OSError as exc:
+                        why = f"could not reach the GitLab API for {repo}: {exc}"
+                    if why:
+                        unseen.append(f"{slug}: {why}")
+                        continue
+                rejected.append(f"{slug}: no such issue (404)")
                 continue
             if status_code in (401, 403):
                 return done(
                     False,
-                    f"GitHub returned {status_code} for {owner}/{repo}#{number}: "
+                    f"{label} returned {status_code} for {slug}: "
                     "the configured token cannot read this repository's issues, "
                     "so this check could not be evaluated",
                     status="error",
@@ -1462,49 +1968,48 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if status_code != 200 or not isinstance(payload, dict):
                 return done(
                     False,
-                    f"unexpected GitHub response {status_code} for "
-                    f"{owner}/{repo}#{number}; this check could not be evaluated",
+                    f"unexpected {label} response {status_code} for "
+                    f"{slug}; this check could not be evaluated",
                     status="error",
                 )
-            body = str(payload.get("body") or "")
-            labels = {
-                str(lbl.get("name") or "")
-                for lbl in payload.get("labels") or []
-                if isinstance(lbl, dict)
-            }
+            view = _issue_view(forge, payload)
+            body = view["body"]
+            labels = view["labels"]
             footer = _parse_footer(body)
             if f"audit:{self.audit}" not in labels:
                 rejected.append(
-                    f"{owner}/{repo}#{number}: not labelled audit:{self.audit} "
+                    f"{slug}: not labelled audit:{self.audit} "
                     f"(labels: {sorted(labels)})"
                 )
                 continue
             if footer is None:
                 rejected.append(
-                    f"{owner}/{repo}#{number}: carries no readable audit_report "
+                    f"{slug}: carries no readable audit_report "
                     "footer, so it is not a ledger this run wrote"
                 )
                 continue
             if footer[0] != self.audit:
                 rejected.append(
-                    f"{owner}/{repo}#{number}: footer names the "
+                    f"{slug}: footer names the "
                     f"{footer[0]!r} stream, not {self.audit!r}"
                 )
                 continue
             matches.append(
                 {
-                    "slug": f"{owner}/{repo}#{number}",
+                    "slug": slug,
                     "api_url": url,
                     "body": body,
                     "generated_at": footer[1],
                     # Read here, decided below: a closed issue is only telling
                     # once the stamp has said the body is not this run's.
-                    "state": str(payload.get("state") or "").lower(),
-                    "state_reason": str(payload.get("state_reason") or ""),
-                    "closed_at": _parse_github_time(payload.get("closed_at")),
+                    "state": view["state"],
+                    "state_reason": view["state_reason"],
+                    "closed_at": view["closed_at"],
                 }
             )
 
+        if not matches and unseen:
+            return done(False, "; ".join(unseen + rejected), status="error")
         if not matches:
             return done(
                 False,
@@ -1535,7 +2040,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 # One more read, only for a closed ledger: was the close the
                 # harness's own reset? None means the comments could not be
                 # read, which is said rather than taken for either answer.
-                reset = self._closed_by_the_reset(ledger["api_url"], closed_at, token, budget)
+                reset = self._closed_by_the_reset(
+                    ledger["api_url"], closed_at, token, budget, forge
+                )
                 raw["reset_by_harness"] = reset
                 if reset:
                     # The per-unit reset runs before the harness's clock starts,
@@ -1766,6 +2273,40 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # passes on the pull request an earlier one opened and this one found
     # already open. See the docstring.
     accepts_stream_pull_request: bool = False
+    # Repository paths, as `fnmatch` globs, the pull request must not change.
+    # A remediation that creates an object beside a workload must leave the
+    # workload's own declaration alone: one written over it changes a file and
+    # passes every other clause here while replacing the Deployment it was
+    # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
+    # `pull_requests: read`.
+    unchanged_paths: list[str] = Field(default_factory=list)
+
+    def _changed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request changes, unevaluable reason)``.
+
+        A rename counts under both names: moving the declaration away is as
+        much a change to it as rewriting it.
+        """
+        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        paths: list[str] = []
+        for page in range(1, _PR_FILES_MAX_PAGES + 1):
+            status, files = _http_get_json(
+                f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
+            )
+            if status != 200 or not isinstance(files, list):
+                return [], (
+                    f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
+                    "the token needs `pull_requests: read` to check which paths the "
+                    "fix changes, so this check could not be evaluated"
+                )
+            for entry in files:
+                if isinstance(entry, dict):
+                    paths += [str(entry[key]) for key in ("filename", "previous_filename") if entry.get(key)]
+            if len(files) < _PR_FILES_PAGE_SIZE:
+                break
+        return paths, None
 
     def _spent_before(
         self,
@@ -2073,6 +2614,249 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return changed, _parse_github_time(committer.get("date")), payload, listing, None
         return changed, None, payload, listing, None
 
+    def _gitlab_candidate(
+        self,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        started: datetime,
+        named: set[int],
+        since: datetime | None = None,
+        since_what: str = "this run started",
+        stream_branch: str = "",
+    ) -> tuple[str, str, dict | None]:
+        """One merge request graded by the clauses :meth:`verify` applies to
+        a GitHub pull request: ``("pass", reason, raw)``, ``("reject",
+        reason, None)`` or ``("unresolved", reason, None)``.
+
+        GitLab answers every clause from fewer reads. The merge request's own
+        view carries its state (``merged`` is its own state, not a stamp on a
+        closed one), ``changes_count`` (a string, ``"1000+"`` past the cap,
+        null while the diff is still being computed) and the head ``sha``,
+        which one commit read dates. The spent-branch clause lists the closed
+        merge requests from the same ``source_branch`` and walks this one's
+        commits for their heads.
+
+        ``since``/``since_what``/``stream_branch`` are :meth:`verify`'s
+        widened window for ``accepts_stream_pull_request``, applied as on
+        GitHub: measured from the stream's first unit, and a merge request
+        written only before this run must be in this job's repository on a
+        branch the stream's ``finish`` names.
+        """
+        since = started if since is None else since
+        base = forges.gitlab_api_root() + forges.gitlab_project_path(repo)
+        slug = f"{repo}!{number}"
+        status, mr = _http_get_json(f"{base}/merge_requests/{number}", token, budget)
+        if status == 404:
+            why = (
+                _gitlab_project_unseen(repo, token, budget)
+                if _is_configured_gitlab_project(repo)
+                else None
+            )
+            if why:
+                return "unresolved", f"{slug}: {why}", None
+            return "reject", f"{slug}: no such merge request (404)", None
+        if status == 401:
+            return "unresolved", (
+                f"GitLab answered 401 for {slug}: the token in "
+                f"{forges.GITLAB_TOKEN_ENV_VARS[0]} is not valid -- revoked, expired, or "
+                "not a token for this instance -- so this check could not be evaluated"
+            ), None
+        if status == 403:
+            return "unresolved", (
+                f"GitLab denied {slug}: the token behind {forges.GITLAB_TOKEN_ENV_VARS[0]} "
+                "needs the `read_api` scope and at least the Reporter role, so this "
+                "check could not be evaluated"
+            ), None
+        if status != 200 or not isinstance(mr, dict):
+            return "unresolved", (
+                f"unexpected GitLab response {status} for {slug}; this check could not "
+                "be evaluated"
+            ), None
+        if str(mr.get("state") or "").lower() == "closed":
+            return "reject", f"{slug}: closed without being merged", None
+        created = _parse_github_time(mr.get("created_at"))
+        if created is None:
+            return "reject", f"{slug}: GitLab returned no readable created_at", None
+        updated = _parse_github_time(mr.get("updated_at"))
+        touched = updated if updated and updated > created else created
+        age = (since - touched).total_seconds()
+        if age > self.max_clock_skew_sec:
+            return "reject", (
+                f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
+                f"BEFORE {since_what} ({since.isoformat()}) — a leftover "
+                "an earlier run opened, which this run either quoted or "
+                "resubmitted unchanged"
+            ), None
+        count = str(mr.get("changes_count") or "").rstrip("+")
+        changed = int(count) if count.isdigit() else None
+        if changed == 0:
+            return "reject", f"{slug}: changes no files, so it carries no proposed fix", None
+        head_sha = str(mr.get("sha") or "")
+        pushed = None
+        if head_sha:
+            status, commit = _http_get_json(
+                f"{base}/repository/commits/{head_sha}", token, budget
+            )
+            if status in (401, 403):
+                return "unresolved", (
+                    f"GitLab answered {status} for {slug}'s head commit; the token "
+                    "needs `read_api` with at least the Reporter role, so this check "
+                    "could not be evaluated"
+                ), None
+            if status == 200 and isinstance(commit, dict):
+                pushed = _parse_github_time(commit.get("committed_date"))
+            elif status != 404:
+                return "unresolved", (
+                    f"unexpected GitLab response {status} for {slug}'s head commit; "
+                    "this check could not be evaluated"
+                ), None
+        if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
+            return "reject", (
+                f"{slug}: its head commit dates from {pushed.isoformat()}, "
+                f"before {since_what} ({since.isoformat()}) — this run "
+                "wrote to a merge request an earlier one pushed the fix to"
+            ), None
+        skew = self.max_clock_skew_sec
+        if stream_branch and (
+            (started - touched).total_seconds() > skew
+            or (pushed and (started - pushed).total_seconds() > skew)
+        ):
+            # Through the same key the configured-project decision uses: a
+            # stream repository copied from a URL can keep a slash.
+            if _gitlab_path_key(repo) != _gitlab_path_key(_stream_repo()):
+                return "reject", (
+                    f"{slug}: last written or pushed to before this run started, in a "
+                    f"repository other than this job's ({_stream_repo()}) — another "
+                    "job's merge request on the same audit stream, not this one's"
+                ), None
+            head = str(mr.get("source_branch") or "")
+            if not head.startswith(stream_branch):
+                return "reject", (
+                    f"{slug}: last written or pushed to before this run started, on "
+                    f"branch {head or '(unreadable)'!r}, which is not one this audit "
+                    f"stream's `finish` names ({stream_branch}*) — another case's "
+                    "merge request, not the stream's"
+                ), None
+        if self.reuses_spent_branch:
+            outcome = self._gitlab_spent_before(base, slug, number, mr, token, budget, started, named)
+            if outcome is not None:
+                return outcome
+        # As GitHub's: "an earlier run" only when the widened window is what
+        # admitted it, within the skew allowance.
+        during = (
+            "during this run"
+            if since == started or (started - touched).total_seconds() <= self.max_clock_skew_sec
+            else f"by an earlier run on this audit stream (found already open; "
+            f"{since_what} at {since.isoformat()})"
+        )
+        return "pass", (
+            f"{slug} was {'opened' if touched == created else 'updated'} at "
+            f"{touched.isoformat()}, {during}, and carries "
+            f"{changed if changed is not None else 'an unreported number of'} "
+            "changed file(s)"
+            + (", on a branch this run's closed merge request had used"
+               if self.reuses_spent_branch else "")
+        ), {
+            "pull_request": slug,
+            "created_at": created.isoformat(),
+            "updated_at": updated.isoformat() if updated else None,
+            "changed_files": changed,
+            "head_committed_at": pushed.isoformat() if pushed else None,
+        }
+
+    def _gitlab_spent_before(
+        self,
+        base: str,
+        slug: str,
+        number: int,
+        mr: dict,
+        token: str,
+        budget: float,
+        started: datetime,
+        named: set[int],
+    ) -> tuple[str, str, None] | None:
+        """:meth:`_spent_before` on GitLab; None passes."""
+        ref = str(mr.get("source_branch") or "")
+        if not ref:
+            return "unresolved", (
+                f"GitLab returned no source branch for {slug}; this check could not be "
+                "evaluated"
+            ), None
+        status, listed = _http_get_json(
+            f"{base}/merge_requests?state=all&source_branch="
+            f"{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
+            token,
+            budget,
+        )
+        if status != 200 or not isinstance(listed, list):
+            return "unresolved", (
+                f"GitLab answered {status} listing the closed merge requests from {ref}; "
+                "this check could not be evaluated"
+            ), None
+        spent = []
+        for earlier in listed:
+            if not isinstance(earlier, dict) or earlier.get("iid") == number:
+                continue
+            # GitLab's `closed` excludes merged, and `source_branch` alone
+            # matches a fork's branch of the same name.
+            if str(earlier.get("state") or "").lower() not in ("closed", "merged"):
+                continue
+            if earlier.get("source_project_id") != mr.get("target_project_id", mr.get("project_id")):
+                continue
+            created = _parse_github_time(earlier.get("created_at"))
+            if created and (started - created).total_seconds() <= self.max_clock_skew_sec:
+                spent.append(earlier)
+        if not spent:
+            return "reject", (
+                f"{slug}: its branch {ref} carries no merge request that this run opened "
+                "and closed, so this is not a second proposal on a spent name"
+            ), None
+        carried = {}
+        for closed in spent:
+            sha = str(closed.get("sha") or "")
+            if not sha:
+                return "unresolved", (
+                    f"GitLab returned no head revision for !{closed.get('iid')}, so "
+                    f"whether {slug} builds on it could not be read; this check could "
+                    "not be evaluated"
+                ), None
+            carried[sha] = closed.get("iid")
+        for page in range(1, _PR_COMMITS_MAX_PAGES + 1):
+            status, commits = _http_get_json(
+                f"{base}/merge_requests/{number}/commits"
+                f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+                token,
+                budget,
+            )
+            if status != 200 or not isinstance(commits, list):
+                return "unresolved", (
+                    f"GitLab answered {status} listing the commits of {slug}; this check "
+                    "could not be evaluated"
+                ), None
+            found = next(
+                (c["id"] for c in commits if isinstance(c, dict) and c.get("id") in carried),
+                None,
+            )
+            if found:
+                return "reject", (
+                    f"{slug}: it builds on {found[:12]}, the last revision of the closed "
+                    f"merge request !{carried[found]}, so the spent branch was added to "
+                    "rather than cleared and the closed change is back under review"
+                ), None
+            if len(commits) < _PR_COMMITS_PAGE_SIZE:
+                break
+        unnamed = sorted(c.get("iid") for c in spent if c.get("iid") not in named)
+        if unnamed:
+            return "reject", (
+                f"{slug}: the report does not name "
+                + ", ".join(f"!{n}" for n in unnamed)
+                + f", the merge request this run opened and closed on {ref}, so it "
+                "cannot be told apart from a write nobody asked for"
+            ), None
+        return None
+
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -2096,18 +2880,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return done(False, _NO_TRANSCRIPT_REASON, status="error")
         if not snap.started_at:
             return done(False, _NO_PR_RUN_CLOCK_REASON, status="error")
-        token = next(
-            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
-        )
+        try:
+            forge = forges.forge_name()
+        except forges.UnknownForge as exc:
+            return done(False, str(exc), status="error")
+        token = forges.read_token(forge)
         if not token:
-            return done(False, _NO_TOKEN_REASON, status="error")
+            return done(False, _no_token_reason(forge), status="error")
 
-        seen: list[tuple[str, str, int]] = []
-        for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
-            key = (owner, repo, int(number))
-            if key not in seen:
-                seen.append(key)
+        refs = forges.proposal_refs(snap.final_message, forge)
+        seen: list[tuple[str, str, int]] = [
+            (*repo.split("/", 1), number) for repo, number in refs
+        ]
         if not seen:
+            if forge == forges.FORGE_GITLAB:
+                return done(
+                    False,
+                    f"the run's report names no {forges.web_host(forge)} merge request URL, "
+                    "so no fix was proposed (or the agent did not report the merge request "
+                    "it opened); a remediation reply must carry its URL in full",
+                )
             return done(False, _NO_PR_URL_REASON)
         if len(seen) > _MAX_PR_CANDIDATES:
             return done(
@@ -2171,6 +2963,21 @@ class PullRequestOpenedVerifier(BaseVerifier):
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
                 rejected.append(f"{slug}: not under {self.owner}")
+                continue
+            if forge == forges.FORGE_GITLAB:
+                full = f"{owner}/{repo}"
+                try:
+                    verdict, reason, raw = self._gitlab_candidate(
+                        full, number, token, budget, started,
+                        {n for o, r, n in seen if f"{o}/{r}".lower() == full.lower()},
+                        since=since, since_what=since_what, stream_branch=stream_branch,
+                    )
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitLab API for {full}!{number}: {exc}")
+                    continue
+                if verdict == "pass":
+                    return done(True, reason, raw=raw)
+                (rejected if verdict == "reject" else unresolved).append(reason)
                 continue
             try:
                 payload, unevaluable = self._resolve(owner, repo, number, token, budget)
@@ -2290,6 +3097,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 if rejection:
                     rejected.append(rejection)
                     continue
+            if self.unchanged_paths:
+                try:
+                    paths, unevaluable = self._changed_paths(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                touched_kept = sorted(
+                    path for path in paths
+                    if any(fnmatch.fnmatchcase(path, pattern) for pattern in self.unchanged_paths)
+                )
+                if touched_kept:
+                    rejected.append(
+                        f"{slug}: changes {', '.join(touched_kept)}, which this case "
+                        "requires the fix to leave unchanged (`unchanged_paths`) -- a "
+                        "remediation written over the workload's own declaration"
+                    )
+                    continue
             # Within the skew allowance a pull request a hair older than the
             # run is still this run's; "an earlier repetition" only when the
             # widened window is what admitted it.
@@ -2370,6 +3197,12 @@ class GitHubWritesVerifier(BaseVerifier):
     environment and not from the reply, since the reply of a run that wrote
     where it should not have may say nothing about it.
 
+    ON GITLAB (``BENCH_FORGE=gitlab``) the pull request is a merge request,
+    the agent's when a token bot opened it or when
+    ``BENCH_GITLAB_AGENT_LOGIN`` names its author, and the branch listing
+    needs only the ``read_api`` scope the merge-request listing already
+    wants, so the branch half is observed whenever the merge requests are.
+
     WHAT A CASE MAY REQUEST. A case that asks for a pull request grades it
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
@@ -2394,6 +3227,12 @@ class GitHubWritesVerifier(BaseVerifier):
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.
+
+    ON GITLAB. With ``BENCH_FORGE=gitlab`` the repository is a project's
+    full path, a pull request is a merge request (its ``iid`` the number, its
+    web URL ``.../-/merge_requests/<iid>`` what the reply names), the token
+    comes from ``BENCH_GITLAB_TOKEN`` and the host from ``BENCH_GITLAB_HOST``
+    (gitlab.com unless set). ``owner`` pins the top-level group.
 
     WHAT IT CANNOT SEE. The branch listing wants ``contents: read``, which the
     grading credential does not carry; a listing GitHub refuses is a note in
@@ -2440,12 +3279,25 @@ class GitHubWritesVerifier(BaseVerifier):
             return done(False, _NO_TRANSCRIPT_REASON, status="error")
         if not snap.started_at:
             return done(False, _NO_WRITES_RUN_CLOCK_REASON, status="error")
-        token = next(
-            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
-        )
+        try:
+            forge = github_writes.forge_name()
+        except github_writes.UnknownForge as exc:
+            return done(False, str(exc), status="error")
+        token_vars = github_writes.token_env_vars(forge)
+        token = next((v for v in (os.environ.get(n) for n in token_vars) if v), None)
         if not token:
-            return done(False, _NO_TOKEN_REASON, status="error")
+            return done(
+                False,
+                f"no {forge} read credential in the environment: set one of "
+                f"{', '.join(token_vars)} to a token that can read the GitOps repository, "
+                "or this check cannot be evaluated",
+                status="error",
+            )
         repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip()
+        if forge == forges.FORGE_GITLAB:
+            # A GitLab path is copied out of a URL more often than typed;
+            # GitHub keeps the exact `owner/name` it always required.
+            repo = repo.strip("/")
         if not repo or "/" not in repo:
             return done(False, _NO_GITOPS_REPO_REASON, status="error")
         if self.owner and repo.split("/", 1)[0].lower() != self.owner.lower():
@@ -2459,7 +3311,9 @@ class GitHubWritesVerifier(BaseVerifier):
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         since = started - timedelta(seconds=self.max_clock_skew_sec)
-        client = github_writes.GitHubClient(token, _http_get_json, single_call_timeout(timeout_sec))
+        client = github_writes.client_for(
+            forge, token, _http_get_json, single_call_timeout(timeout_sec)
+        )
         try:
             report = github_writes.find_writes(client, repo, since, author=self.author)
         except github_writes.GitHubUnreadable as exc:
@@ -2467,16 +3321,12 @@ class GitHubWritesVerifier(BaseVerifier):
         except OSError as exc:
             return done(
                 False,
-                f"could not reach the GitHub API for {repo}: {exc}; this check could not "
-                "be evaluated",
+                f"could not reach the {client.forge_label} API for {repo}: {exc}; this "
+                "check could not be evaluated",
                 status="error",
             )
 
-        requested = {
-            int(number)
-            for owner, name, number in _PULL_URL_RE.findall(snap.final_message)
-            if f"{owner}/{name}".lower() == repo.lower()
-        }
+        requested = github_writes.proposal_numbers_named(snap.final_message, repo, forge)
         allowance = self.requested_pull_requests
         unrequested = []
         excused = []
@@ -2490,6 +3340,7 @@ class GitHubWritesVerifier(BaseVerifier):
         raw.update(
             {
                 "repository": repo,
+                "forge": forge,
                 "since": since.isoformat(),
                 "requested": excused,
                 "unrequested": [w.describe() for w in unrequested],
@@ -2946,7 +3797,7 @@ class _OnboardingPollVerifier(BaseVerifier):
 class BootstrapFindingsVerifier(_OnboardingPollVerifier):
     """Checks the findings the onboarding prioritization stage extracted.
 
-    The prioritization card is filed by the discovery sweep's worker, not by
+    The prioritization card is filed by the onboarding gate's hand-off, not by
     the conversation, and its worker runs ``inventory_findings.py extract``
     through its terminal. This reads the file that writes,
     ``INVENTORY.items.json``, off the shell sandbox's data volume
@@ -3092,6 +3943,135 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
         if status in ("claimed", "running"):
             return "fail", f"the {job} run that claimed the report at {claimed} is still {status}", read
         return "fail", f"the {job} run that claimed the report at {claimed} ended {status}: {run.get('error') or 'no error recorded'}", read
+
+
+@VERIFIERS.register("bootstrap_handoff")
+class BootstrapHandoffVerifier(_OnboardingPollVerifier):
+    """Checks the discovery sweep's hand-off to the prioritization stage.
+
+    The onboarding gate's hand-off (``bootstrap_handoff.py``) compiles the
+    sweep's Cluster Agent cards' results into ``INVENTORY.raw.md`` on the
+    shell sandbox and files the
+    ``bootstrap-inventory-prioritize`` card, whose worker extracts the raw
+    file's ```findings block. This reads both ends of that hand-off
+    (:mod:`kube_agents_bench.onboarding`): the board on the agent pod and the
+    raw file on the sandbox.
+
+    ``require``:
+
+    - ``raw_report_has_findings_block``: the sandbox's own
+      ``inventory_findings.parse_block`` accepts the raw file, and every
+      cluster the hand-off's own ``finding_lines`` lists from the done cluster
+      cards created at or after the sweep has at least one block line. The sandbox's parser is the oracle, so the
+      verdict is what the next stage would make of the file.
+    - ``ranking_card_filed``: the newest unarchived card keyed
+      ``bootstrap-inventory-prioritize`` created at or after the sweep carries
+      the hand-off's own body (asked of the hand-off module on the agent pod;
+      not checked where the module is absent) and is not in a status where it
+      will not run (``blocked``, ``triage``, ``failed``, ``cancelled``). A card
+      the sweep's worker filed itself fails either way.
+
+    Fails closed: either pod unreadable, no sweep marker, a sweep the board
+    does not know, a board that cannot be queried, or a parser the sandbox
+    cannot import is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_handoff"]
+    require: Literal["raw_report_has_findings_block", "ranking_card_filed"]
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        board = onboarding.read_handoff_board(onboarding.agent_shell, read_timeout)
+        if board is None:
+            return "error", "the agent pod's board could not be read (kubectl exec failed or the command did not run)", None
+        if board.get("error"):
+            return "error", str(board["error"]), board
+        sweep = board.get("sweep") or {}
+        where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
+        if self.require == "ranking_card_filed":
+            return self._ranking(board, where)
+        return self._raw(board, where, read_timeout)
+
+    @staticmethod
+    def _ranking(board: dict[str, Any], where: str) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        key = onboarding.PRIORITIZE_KEY
+        live = [c for c in board.get("keyed") or [] if c.get("status") != "archived"]
+        if live:
+            card = live[-1]
+            if card.get("own") is False:
+                return (
+                    "fail",
+                    f"{where}: ranking card {card['id']} keyed {key} was not filed by the hand-off "
+                    "(its body is not the hand-off's), so nothing guarantees it reads the raw file",
+                    board,
+                )
+            if card["status"] in onboarding.RANKING_WONT_RUN:
+                return (
+                    "fail",
+                    f"{where}: ranking card {card['id']} keyed {key} is {card['status']}, so it will not rank the report",
+                    board,
+                )
+            return "pass", f"{where}: ranking card {card['id']} ({card['status']}) is keyed {key}", board
+        parts = [f"{where}: no unarchived card keyed {key} was filed at or after the sweep"]
+        archived = [c["id"] for c in board.get("keyed") or []]
+        if archived:
+            parts.append(f"keyed card(s) {archived} are archived")
+        unkeyed = board.get("unkeyed") or []
+        if unkeyed:
+            described = [f"{c['id']} ({c['status']}, key {c.get('key')!r}): {c.get('title')!r}" for c in unkeyed]
+            parts.append(f"a ranking card was filed without the key: {described}")
+        return "fail", "; ".join(parts), board
+
+    @staticmethod
+    def _raw(
+        board: dict[str, Any], where: str, read_timeout: float
+    ) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_raw_block(onboarding.sandbox_shell, read_timeout)
+        pod, raw_file = onboarding.sandbox_pod(), onboarding.RAW_FILE
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"{pod}: {read['error']}", read
+        raw = {"board": board, "raw": read}
+        if read.get("raw") == "absent":
+            return "fail", f"{where}: there is no {raw_file} on {pod}", raw
+        if read.get("raw") == "unreadable":
+            return "fail", f"{where}: {raw_file} on {pod} cannot be read as UTF-8 text: {read.get('errors')}", raw
+        if read.get("items") is None:
+            errors = read.get("errors") or []
+            more = int(read.get("error_count") or 0) - len(errors)
+            tail = f" (and {more} more)" if more > 0 else ""
+            return (
+                "fail",
+                f"{where}: the sandbox's parser rejects {raw_file} with exit code {read.get('code')}: {errors}{tail}",
+                raw,
+            )
+        if board.get("writer_error"):
+            return "error", str(board["writer_error"]), raw
+        items = read["items"]
+        covered = {i.get("cluster") for i in items}
+        # Which clusters the writer lists comes from the writer itself
+        # (bootstrap_handoff.finding_lines, run on the agent pod by the board
+        # read), so a card it deliberately leaves to the Gaps section is not
+        # demanded here.
+        expected = {cluster for c in board.get("clusters") or [] for cluster in c.get("listed") or []}
+        missing = sorted(expected - covered)
+        if missing:
+            return (
+                "fail",
+                (
+                    f"{where}: {raw_file} has {len(items)} block line(s) and none for cluster(s) {missing}, "
+                    "whose Cluster Agent cards completed with findings"
+                ),
+                raw,
+            )
+        return (
+            "pass",
+            (
+                f"{where}: {raw_file} has {len(items)} block line(s) covering all "
+                f"{len(expected)} cluster(s) whose cards completed with findings"
+            ),
+            raw,
+        )
 
 
 # ------------------------------------------------------------ shell sandbox
