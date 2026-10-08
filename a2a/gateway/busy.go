@@ -98,6 +98,8 @@ func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 	if g.editLine(rec.Key, active.StatusMsgID, line) {
 		rs.lastLine = line
 		rs.busyShown = true
+		g.log.Info("busy notice shown on the status line",
+			"conversation", rec.Key, "taskId", taskID, "ahead", ahead)
 	}
 }
 
@@ -111,8 +113,9 @@ func lineStillSubmitted(rs *relayState) bool {
 }
 
 // busyNoticeBackend reports whether a turn that arrived through backend gets
-// the busy notice: the chat backends and the console do. The inject and A2A
-// doors do not, because their callers are programs that read the status line
+// the busy notice: the chat backends and the console do. The inject door and
+// both A2A door classes (a2aBackend, and a2aGoogleBackend for Google-verified
+// callers) do not, because their callers are programs that read the status line
 // as data. The A2A door takes the line's first edit as the task going to
 // working (A2ADoor.Edit), so a queued edit would report a task no worker has
 // as running; the inject door records every edit as an entry the eval
@@ -120,7 +123,7 @@ func lineStillSubmitted(rs *relayState) bool {
 // unedited post of a task as its output, so the notice would be graded or
 // returned as part of the answer.
 func busyNoticeBackend(backend string) bool {
-	return backend != injectBackend && backend != a2aBackend
+	return backend != injectBackend && backend != a2aBackend && backend != a2aGoogleBackend
 }
 
 // busyNoticeAt is the configured threshold, or defaultBusyNoticeAt when the

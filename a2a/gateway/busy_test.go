@@ -327,7 +327,7 @@ func TestBusyCountIsOnlyTheFixedAddressee(t *testing.T) {
 	}
 
 	seedFixedRouteTask(t, r, "discord:g1/one-ahead", 0)
-	for _, backend := range []string{injectBackend, a2aBackend} {
+	for _, backend := range []string{injectBackend, a2aBackend, a2aGoogleBackend} {
 		conv := "discord:g1/door-" + backend
 		busyTurn(r, conv, backend, "from a program")
 		if got := busyPostsIn(r, conv); len(got) != 0 {
@@ -337,9 +337,11 @@ func TestBusyCountIsOnlyTheFixedAddressee(t *testing.T) {
 			t.Fatalf("status line edited through the %s door: %q", backend, got)
 		}
 	}
+	// The seeded task and the three door turns are all ahead: the doors get
+	// no notice, but their tasks still count.
 	conv := "discord:g1/console-like"
 	busyTurn(r, conv, consoleBackend, "from a person")
-	assertBusyLine(t, r, conv, busyNotice(3))
+	assertBusyLine(t, r, conv, busyNotice(4))
 }
 
 // startBusyRig is a rig restartRig can replace, with the busy threshold set.
