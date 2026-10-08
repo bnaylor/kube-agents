@@ -289,6 +289,16 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
     ),
+    # The gateway's Slack identity rule: the allowlist gates, the map
+    # overrides, and the member id is the principal otherwise.
+    "a2a_slack_ingress": Source(
+        "a2a/gateway/slack.go",
+        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender(", "func (s *SlackAdapter) otherWorkspace("),
+    ),
+    "a2a_slack_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) slackPrincipal(", "slackMemberPrincipalPrefix"),
+    ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.
     "operator_labels": Source(
@@ -410,6 +420,8 @@ SOURCES: dict[str, Source] = {
             "a2aBusTokenAudience",
             "a2aBusTokenPath",
             "a2aBusTokenFile",
+            "a2aCalloutReservedPrincipalsEnvVar = ",
+            "func buildA2ACalloutDeployment(",
             "a2aBusTokenVolume",
             "func a2aBusTokenVolumeSource(",
             "func a2aStripBusTokenMounts(",
@@ -460,6 +472,14 @@ SOURCES: dict[str, Source] = {
     "a2a_cli_main": Source(
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
+    ),
+    # The callout's reader of the static principal list the operator renders
+    # into its Deployment. The operator half is operator_a2a_callout below
+    # (a2aCalloutReservedPrincipalsEnvVar); the two modules cannot import
+    # each other, so C1 compares the two literals.
+    "a2a_callout_main": Source(
+        "a2a/cmd/authcallout/main.go",
+        ("envReservedPrincipals = ", "os.LookupEnv(envReservedPrincipals)", "func run("),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
