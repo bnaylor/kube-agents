@@ -5982,6 +5982,27 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     self.assertNotIn("disagrees with the install configuration", out)
                     self.assertEqual(path.read_text(), content)
 
+    def test_a_blank_topic_is_refused_as_empty_not_held_to_the_file_or_recorded(self):
+        # A wrapper expanding a variable set to a blank passes
+        # --chat-topic-name=" ". resolve_shared_defaults keeps it (":-" only
+        # replaces the empty string), so the refusal would tell the operator to
+        # adopt a blank topic, and over a file lacking the key the blank would
+        # be queued and appended (review r4214064223 on #2553).
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("CHAT_TOPIC_NAME=my-topic\n", "PROJECT_ID=p\n"):
+                for blank in ("' '", "$'\\t'"):
+                    with self.subTest(content=content, blank=blank):
+                        path = self._file(tmp, content)
+                        proc = self._run(
+                            f"parse_args --chat-topic-name={blank} && resolve_shared_defaults && {self._CHECK}", path,
+                        )
+                        out = proc.stdout + proc.stderr
+                        self.assertNotEqual(proc.returncode, 0, out)
+                        self.assertIn("--chat-topic-name= was given an empty value.", out)
+                        self.assertNotIn("disagrees with the install configuration", out)
+                        self.assertNotIn("QUEUED=", out)
+                        self.assertEqual(path.read_text(), content)
+
     def test_the_menu_is_offered_only_for_keys_it_saves(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, slack_users = self._check(tmp, "SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=U2")

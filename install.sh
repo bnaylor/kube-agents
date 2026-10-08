@@ -828,10 +828,12 @@ validate_bool_flag_value() {
 # another topic or mode the refusal in check_flag_against_install_env would
 # name a value nobody typed and tell the operator to adopt it, and with no file
 # the run would apply the default where a wrapper meant to pass something.
-# Refused, like an empty toggle.
+# Refused, like an empty toggle. A blank value (whitespace only) counts as
+# empty: resolve_shared_defaults would keep it, and a blank topic would be held
+# to the file or recorded into it.
 require_defaulted_flag_value() {
   local flag="$1" value="${2:-}"
-  [ -z "$value" ] || return 0
+  [ -z "${value//[[:space:]]/}" ] || return 0
   print_error "${flag}= was given an empty value."
   print_info "Pass ${flag} with a value, or leave it out to take the one install.env records (or the default)."
   exit 1
