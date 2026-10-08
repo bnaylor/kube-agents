@@ -190,6 +190,28 @@ absorbed, which the gateway cannot know. The payload spec's refusal posture - bo
 the fixed-route refusal and the race-window one - is what closes the loop on the
 stream.
 
+**The busy notice.** One more gateway-authored post tells a person when their turn is
+going to wait. Once a fixed-route turn's task is on the bus, the gateway counts the fixed
+addressee's other outstanding work: the session-state records whose active task was
+published to it, the turn's own task left out. The count is a read of the bucket (one KV
+watch over the session records), not an in-memory counter, so it is the same after a
+gateway restart as before it, and it falls as terminals arrive, because a terminal deletes
+the active task from its record. A terminal published while the gateway was down still
+lowers it: the relay's durable delivers the terminal once the gateway is back. Past the
+first-event grace a task is read from the stream and left out if nothing is on it, by the
+same test the never-started release below uses, or if its newest event is a terminal (a
+record whose clear was lost, which the heal would release on that conversation's next
+turn), so neither holds the number up. A detached task is counted while it is still its
+record's active task; a new turn in that conversation replaces it. At or above
+`A2A_BUSY_NOTICE_AT` one line follows the task's placeholder: "🚦 The system is busy. 3
+requests are ahead of yours; I'll start on it as soon as there's room." ("1 request is" for
+one). Nothing is refused, held back, or dropped; the line is information, and a count that
+fails sends none. The operator renders the threshold as the bridge's worker count, 10 by
+default, so the turn told it waits is the first one that finds every worker taken; the
+operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend and the
+console. The inject and A2A doors get none, because their callers read every unedited post
+of a task as its output, and the notice would be graded or returned as part of the answer.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
