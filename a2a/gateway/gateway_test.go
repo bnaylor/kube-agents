@@ -84,6 +84,14 @@ func provision(t *testing.T, url string) {
 // gateway's submission publish fail for real rather than through a fake. The
 // session-state bucket stays, so everything up to the publish still works:
 // the session is minted, the task is announced and the placeholder posted.
+//
+// Not before the gateway's relay has bound its durable on the stream, though.
+// The rig starts Run on a goroutine, and Run binds the relay before it starts
+// the adapter that reads the inbox; a stream deleted ahead of that bind leaves
+// Run retrying "stream not found" for the whole bind window (lib's
+// subscribeBindWindow, 45s), so no turn is ever read and the test times out
+// waiting for a failure the gateway never got to have. Under a loaded
+// `go test ./...` the goroutine can lose that race.
 func deleteTasksStream(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url)
@@ -95,6 +103,12 @@ func deleteTasksStream(t *testing.T, url string) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
+	waitFor(t, "the relay durable bound", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := js.Consumer(ctx, lib.TasksStream, relayDurable)
+		return err == nil
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
