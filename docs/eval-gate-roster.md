@@ -397,8 +397,10 @@ The file needs the normal approvers, not the eval-crew rule, for the same reason
 `nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
 
 A safeguard the lane needs and no case declares is the lane's safeguards list,
-`hack/eval/inject-lane-safeguards.yaml`. The door addresses the platform persona, whose own rule
-for a change is a pull request, and a case's cluster safeguards see nothing of GitHub; the file
+`hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
+own rule for a change is a pull request (through a card the Planning Agent files, under the
+bridge's default `api` executor the lane runs), and a case's cluster safeguards see nothing of
+GitHub; the file
 holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
 `hack/ci-eval-pr.sh` appends on that lane to a copy of every task file in the matrix before
 devops-bench reads it, so a repetition that wrote a pull request or branch the case did not
