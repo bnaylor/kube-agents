@@ -81,6 +81,29 @@ readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
+# How check_flag_against_install_env compares a typed chat flag or --mode with the key
+# install.env records: a boolean read through is_truthy, a literal string, a
+# list read through hcl_csv_list (the form write_tfvars_from_state renders), or
+# a credential, whose value is never printed and whose home is the live Secret
+# rather than the file.
+readonly INSTALL_ENV_FLAG_KIND_BOOL="bool"
+readonly INSTALL_ENV_FLAG_KIND_STRING="string"
+readonly INSTALL_ENV_FLAG_KIND_LIST="list"
+readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
+# The keys among those that the Day-2 menu's chat screen edits and its Save &
+# Apply writes, so a refusal names --menu only where the menu can make the
+# edit. Not CHAT_TOPIC_NAME, which the panel saves as loaded and never asks
+# about, and not SLACK_ENABLED: the panel turns Slack on without asking for
+# the tokens, and its apply does not check for them.
+readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
+# The flags held to install.env that this run typed (the chat flags and
+# --mode), one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
+# noted by parse_args; and the keys among them that install.env does not
+# assign, for record_flags_into_install_env to append once the run commits.
+INSTALL_ENV_FLAGS_TYPED=""
+INSTALL_ENV_KEYS_TO_RECORD=""
+# Those keys with their companions, toggles last (resolve_install_env_record_keys).
+INSTALL_ENV_RECORD_KEYS=""
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -194,8 +217,11 @@ unset _install_defaults_dir
 # something each flag has to remember to do and becomes the default path.
 #
 # An input the installer reads and does not rewrite. It creates one at the end
-# of a first install, when there is nothing there, and never touches it again:
-# a file the documentation tells you to edit and the next run overwrites is
+# of a first install, when there is nothing there, and after that changes no
+# line of it; the one thing it adds is a chat key the file lacks, from a chat
+# flag, with the settings a toggle recorded true brings
+# (record_flags_into_install_env). A file the documentation tells you to
+# edit and the next run overwrites is
 # exactly the complaint against vars.sh, whose header said "auto-generated"
 # while INSTALL.md told you to hand-edit it.
 #
@@ -300,7 +326,7 @@ bootstrap_install_env() {
   # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
   # switch the install's component stack for one run, and the next run from a
   # clean shell would switch it back. --mode is refused for the same reason
-  # when it disagrees with this file (validate_platform_agent_mode).
+  # when it disagrees with this file (check_flags_against_install_env).
   unset PLATFORM_AGENT_MODE
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
@@ -515,9 +541,6 @@ PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 # without --mode keeps the mode the file records.
 PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
 PARAM_PLATFORM_AGENT_MODE_PASSED="false"
-# The --mode validate_platform_agent_mode found missing from install.env, for
-# record_platform_agent_mode_flag to append once the run commits.
-PLATFORM_AGENT_MODE_TO_RECORD=""
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
@@ -703,7 +726,14 @@ Flags for AI Agents & Automation:
   --enable-google-chat[=true|false]
                                 Enable Google Chat integration
   --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
-                                this requires --slack-bot-token and --slack-app-token
+                                this requires --slack-bot-token and --slack-app-token.
+                                Against an existing install.env, --enable-slack,
+                                --enable-google-chat, --google-chat and the
+                                --slack-*, --google-chat-allowed-users,
+                                --google-chat-home-channel, --google-chat-mode and
+                                --chat-topic-name flags must agree with the key the file
+                                assigns (a disagreement is refused: edit the key); a key
+                                the file lacks is recorded there, tokens excepted
   --enable-pubsub-platform[=true|false]
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
@@ -756,7 +786,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run. Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags and --mode,
+  which must agree with it (see --enable-slack and --mode). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -810,6 +841,22 @@ validate_bool_flag_value() {
     print_error "${flag} must be either true or false."
     exit 1
   fi
+}
+
+# The two chat flags with a default, given nothing. resolve_shared_defaults
+# turns an empty value into the default, so over an install.env recording
+# another topic or mode the refusal in check_flag_against_install_env would
+# name a value nobody typed and tell the operator to adopt it, and with no file
+# the run would apply the default where a wrapper meant to pass something.
+# Refused, like an empty toggle. A blank value (whitespace only) counts as
+# empty: resolve_shared_defaults would keep it, and a blank topic would be held
+# to the file or recorded into it.
+require_defaulted_flag_value() {
+  local flag="$1" value="${2:-}"
+  [ -z "${value//[[:space:]]/}" ] || return 0
+  print_error "${flag}= was given an empty value."
+  print_info "Pass ${flag} with a value, or leave it out to take the one install.env records (or the default)."
+  exit 1
 }
 
 # A scope flag given nothing cannot mean "leave the recorded scope alone" (the
@@ -868,7 +915,11 @@ parse_args() {
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
       --mode=*)
         PARAM_PLATFORM_AGENT_MODE="${1#*=}"; PARAM_PLATFORM_AGENT_MODE_PASSED="true"
-        require_mode_flag_value "$PARAM_PLATFORM_AGENT_MODE"; shift ;;
+        require_mode_flag_value "$PARAM_PLATFORM_AGENT_MODE"
+        # Held to install.env as the chat flags are: the run after a one-run
+        # switch, and every upgrade.sh, would read the file and switch back.
+        note_install_env_flag PLATFORM_AGENT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE
+        shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
@@ -978,20 +1029,59 @@ parse_args() {
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
       --enable-google-chat|--google-chat|--enable-google-chat=*|--google-chat=*)
         PARAM_ENABLE_GOOGLE_CHAT="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"
+        note_install_env_flag GOOGLE_CHAT_ENABLED "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_ENABLE_GOOGLE_CHAT DEFAULT_GOOGLE_CHAT_ENABLED
+        shift ;;
       --enable-slack|--enable-slack=*)
         PARAM_ENABLE_SLACK="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"; shift ;;
-      --google-chat-allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
-      --slack-bot-token=*) PARAM_SLACK_BOT_TOKEN="${1#*=}"; shift ;;
-      --slack-app-token=*) PARAM_SLACK_APP_TOKEN="${1#*=}"; shift ;;
-      --slack-allowed-users=*) PARAM_SLACK_ALLOWED_USERS="${1#*=}"; shift ;;
-      --slack-home-channel=*) PARAM_SLACK_HOME_CHANNEL="${1#*=}"; shift ;;
-      --slack-home-channel-name=*) PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"; shift ;;
-      --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"
+        note_install_env_flag SLACK_ENABLED "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_ENABLE_SLACK DEFAULT_SLACK_ENABLED
+        shift ;;
+      --google-chat-allowed-users=*)
+        PARAM_ALLOWED_USERS="${1#*=}"
+        note_install_env_flag ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_ALLOWED_USERS
+        shift ;;
+      --slack-bot-token=*)
+        PARAM_SLACK_BOT_TOKEN="${1#*=}"
+        note_install_env_flag SLACK_BOT_TOKEN "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" PARAM_SLACK_BOT_TOKEN
+        shift ;;
+      --slack-app-token=*)
+        PARAM_SLACK_APP_TOKEN="${1#*=}"
+        note_install_env_flag SLACK_APP_TOKEN "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" PARAM_SLACK_APP_TOKEN
+        shift ;;
+      --slack-allowed-users=*)
+        PARAM_SLACK_ALLOWED_USERS="${1#*=}"
+        note_install_env_flag SLACK_ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_SLACK_ALLOWED_USERS
+        shift ;;
+      --slack-home-channel=*)
+        PARAM_SLACK_HOME_CHANNEL="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL
+        shift ;;
+      --slack-home-channel-name=*)
+        PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --chat-topic-name=*)
+        PARAM_CHAT_TOPIC_NAME="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_CHAT_TOPIC_NAME"
+        note_install_env_flag CHAT_TOPIC_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_CHAT_TOPIC_NAME DEFAULT_CHAT_TOPIC_NAME
+        shift ;;
       --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
-      --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
-      --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
+      --google-chat-mode=*)
+        PARAM_GOOGLE_CHAT_MODE="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_GOOGLE_CHAT_MODE"
+        # Here and not only at step 6, so the step-2 install.env check never
+        # tells the operator to record a mode step 6 and variables.tf refuse.
+        if [[ ! "$PARAM_GOOGLE_CHAT_MODE" =~ ^(default|debug)$ ]]; then
+          print_error "--google-chat-mode must be either 'default' or 'debug'."
+          exit 1
+        fi
+        note_install_env_flag GOOGLE_CHAT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_MODE DEFAULT_GOOGLE_CHAT_MODE
+        shift ;;
+      --google-chat-home-channel=*)
+        PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"
+        note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL
+        shift ;;
       --migrate-node-pools=*)
         PARAM_MIGRATE_NODE_POOLS="${1#*=}"
         PARAM_MIGRATE_NODE_POOLS_PASSED="true"
@@ -1626,20 +1716,23 @@ install_env_records_key() {
 # differently.
 #
 # install.env is an input: install.sh creates one when there is none and never
-# rewrites it. The interview, though, still runs in full on every interactive
+# rewrites a line of it. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
-# tells them: "Left your install configuration as you wrote it" reads as
-# reassurance, and the Day-2 menu's Save & Apply is the only path that writes a
-# key back.
+# tells them: "Kept your install configuration" reads as reassurance, and the
+# Day-2 menu's Save & Apply is the only path that writes a changed key back.
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
-# needs the installer to treat it as read-only. Naming the drift costs nothing
-# and leaves the decision where it belongs.
+# needs the installer not to rewrite it. Naming the drift costs nothing
+# and leaves the decision where it belongs. The one write install.sh does make
+# is narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
+# appended from a chat flag or --mode, with the settings a chat toggle recorded
+# true brings (record_flags_into_install_env);
+# it never changes a key the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1647,8 +1740,13 @@ install_env_records_key() {
 warn_unrecorded_interview_answers() {
   local file="${1:-}"
   [ -n "$file" ] && [ -f "$file" ] || return 0
-  # A non-interactive run typed nothing; its answers came from flags and this
-  # very file, so there is no drift to report that the operator did not author.
+  # A non-interactive run answered no prompt, so the drift this names (an
+  # answer typed at the interview) cannot happen there. A flag can still beat
+  # the file on such a run: the chat flags are refused, or queued for the
+  # record, before this runs (check_flags_against_install_env), and the other
+  # keys in the list below that have a flag (--model-max-tokens, --memory,
+  # --permission-set and the rest) still apply for one run with no warning on a
+  # non-interactive run.
   [ "$PARAM_NON_INTERACTIVE" != "true" ] || return 0
   has_controlling_tty || return 0
   [ "$PARAM_DRY_RUN" != "true" ] || return 0
@@ -1693,7 +1791,7 @@ warn_unrecorded_interview_answers() {
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never rewrites it."
+  print_info "install.env is an input: install.sh reads it and never changes a key it sets."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1851,11 +1949,274 @@ warn_flag_beats_unrecorded_file_value() {
   print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
+# The chat flags are held to install.env rather than warned about. Each of them
+# configures something upgrade.sh renders from the file alone, and upgrade.sh
+# takes none of them, so one that beat the file for a single run would be undone
+# by the next upgrade with no one told: a Slack relay switched off, a home
+# channel or an allowlist put back. --mode is held the same way, for the same
+# reason (validate_platform_agent_mode); it is not a chat key and brings no
+# companions. So against an existing install.env:
+#
+#   - a flag that disagrees with the key the file assigns is refused before
+#     anything is applied, naming the file and the key;
+#   - a flag whose key the file does not assign at all (a hand-written file, or
+#     one copied from install.env.example with the line commented out) has
+#     nothing to disagree with, and the value the run applies is appended to
+#     the file once the run commits, so upgrade.sh renders what is running;
+#     a toggle recorded true brings the integration's other settings the file
+#     lacks, the allowlist first among them, since an empty one admits everyone;
+#   - a flag that agrees changes nothing.
+#
+# Credentials are the exception to the second rule: a Slack token the file does
+# not carry is never written there, because its home is the live Secret, which
+# write_tfvars_from_state recovers it from on every later run, and
+# PERSIST_SECRETS_ON_DISK=false keeps credentials out of every file. A token the
+# file does carry is still held to it, since the file's copy is the one a later
+# run renders.
+#
+# A file the installer created assigns every one of these keys but the tokens,
+# so on such a file nothing is ever appended; only a refusal or a no-op can
+# follow. --chat-sub-name is left out: the subscription name is read back from
+# Terraform state, which outranks both the flag and the file on a running
+# install (write_tfvars_from_state). The same holds for an
+# install.env rendered for CI from a full set of variables. A rendered file
+# that omits a key gets the key appended, on the runner that owns the file.
+
+# The keys an integration renders beside its toggle, recorded with a toggle
+# recorded true where the file lacks them (record_flags_into_install_env). Not
+# the tokens, whose home is the live Secret, and not CHAT_SUB_NAME, which a
+# running install reads from Terraform state.
+install_env_toggle_companions() {
+  case "${1:-}" in
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
+    *) ;;
+  esac
+}
+
+# A chat flag or --mode this run typed, noted for check_flags_against_install_env. Its
+# value is read from the PARAM_* at check time, so a flag given twice is checked
+# at the value that won.
+note_install_env_flag() {
+  local key="$1" flag="$2" kind="$3" param="$4" default_var="${5:-}"
+  case $'\n'"$INSTALL_ENV_FLAGS_TYPED" in
+    *$'\n'"${key}|"*) return 0 ;;
+  esac
+  INSTALL_ENV_FLAGS_TYPED="${INSTALL_ENV_FLAGS_TYPED}${key}|${flag}|${kind}|${param}|${default_var}"$'\n'
+}
+
+# One flag against the key an existing install.env records. Returns 1, having
+# said why, when the two disagree; queues the key for
+# record_flags_into_install_env when the file does not assign it. A key with a
+# default that the file sets empty resolves to the default, as
+# write_tfvars_from_state reads it, so that is the value compared; the chat
+# strings pass no default, because for them empty is the value rendered.
+# Needs installer_common.sh sourced.
+check_flag_against_install_env() {
+  local file="$1" key="$2" flag="$3" kind="$4" value="$5" default="${6:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  if ! install_env_records_key "$file" "$key"; then
+    [ "$kind" != "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" ] || return 0
+    case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+      *" ${key} "*) ;;
+      *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }${key}" ;;
+    esac
+    if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+      print_info "${file} assigns no ${key}; a run without --dry-run records the ${key} it applies there, from ${flag}."
+      local companions
+      companions="$(install_env_toggle_companions "$key")"
+      if [ -n "$companions" ]; then
+        print_info "If that is true, it also records the ${companions// /, } it applies, where ${file} assigns none."
+      fi
+    fi
+    return 0
+  fi
+  local recorded recorded_shown
+  recorded="$(recorded_install_env_value "$file" "$key")"
+  recorded_shown="${key}=$(printf '%q' "$recorded")"
+  if [ -z "$recorded" ] && [ -n "$default" ]; then
+    recorded="$default"
+    recorded_shown="${key} empty, which is ${default}"
+  fi
+  case "$kind" in
+    "$INSTALL_ENV_FLAG_KIND_BOOL")
+      if is_truthy "$recorded"; then
+        if is_truthy "$value"; then return 0; fi
+      else
+        if ! is_truthy "$value"; then return 0; fi
+      fi
+      ;;
+    "$INSTALL_ENV_FLAG_KIND_CREDENTIAL")
+      # Empty is not a value, recorded or typed: the generator recovers an
+      # empty credential from the live Secret, as it does a missing one. A
+      # typed empty is a wrapper's unset variable (provision_environment.sh
+      # passes --slack-bot-token="${SLACK_BOT_TOKEN:-}"), not a new token.
+      [ -n "$recorded" ] || return 0
+      [ -n "$value" ] || return 0
+      [ "$recorded" != "$value" ] || return 0
+      print_error "${flag} gives a different ${key} from the one ${file} records, so it would hold for this run only."
+      print_info "The next install.sh run without the flag, and every upgrade.sh, renders the ${key} the file records."
+      print_info "Replace ${key} in ${file} with the new value and re-run without ${flag}."
+      return 1
+      ;;
+    "$INSTALL_ENV_FLAG_KIND_LIST")
+      [ "$(hcl_csv_list "$recorded")" != "$(hcl_csv_list "$value")" ] || return 0
+      ;;
+    *)
+      [ "$recorded" != "$value" ] || return 0
+      ;;
+  esac
+  print_error "${flag}=$(printf '%q' "$value") disagrees with the install configuration, so it would hold for this run only: ${file} records ${recorded_shown}."
+  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records ${flag} only where install.env assigns no ${key}; it does not change a key the file assigns."
+  local remedy
+  remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
+  case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
+    *" ${key} "*) remedy="${remedy}, or change it with './install.sh --menu'" ;;
+  esac
+  remedy="${remedy}, and re-run without ${flag}"
+  if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
+    remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
+  fi
+  if [ "$key" = "PLATFORM_AGENT_MODE" ]; then
+    remedy="${remedy}. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}"
+  fi
+  print_info "${remedy}."
+  return 1
+}
+
+# Every chat flag and --mode this run typed, against an existing install.env. Each
+# disagreement is named before the run stops, so one run lists them all.
+check_flags_against_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" entry key flag kind param default_var default refused="false"
+  [ -n "$INSTALL_ENV_FLAGS_TYPED" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  # Read into arrays before anything evaluates the file, which a here-string
+  # still open on stdin would hand to any line of it that reads input.
+  local entries=() keys=()
+  while IFS= read -r entry; do
+    if [ -n "$entry" ]; then
+      entries+=("$entry")
+      keys+=("${entry%%|*}")
+    fi
+  done <<< "$INSTALL_ENV_FLAGS_TYPED"
+  # One evaluation of the file for every key, in this shell, so the reads
+  # below land on the cache.
+  read_recorded_install_env_values "$file" "${keys[@]}"
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r key flag kind param default_var <<< "$entry"
+    default=""
+    [ -z "$default_var" ] || default="${!default_var-}"
+    check_flag_against_install_env "$file" "$key" "$flag" "$kind" "${!param-}" "$default" || refused="true"
+  done
+  # A key to record into a file this run cannot write would fail at the record,
+  # which sits after the existing-cluster changes; say so now instead.
+  if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ ! -w "$file" ]; then
+    print_error "${file} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }, which this run would record there, and it is not writable."
+    print_info "Make it writable, or add the keys to it yourself, and re-run."
+    refused="true"
+  fi
+  [ "$refused" = "false" ]
+}
+
+# The keys check_flags_against_install_env found install.env not to assign,
+# appended with the value this run applies: the exported KEY that
+# write_tfvars_from_state rendered, which on an interactive run is the
+# interview's answer and not necessarily the flag. The one write install.sh
+# makes to an install.env it did not create, and only of keys the file lacks,
+# so nothing the operator wrote changes. main calls it on each route as the last
+# step before the handoff or the apply, past the confirmation and every step
+# that can stop the run, so a run refused, declined or failed before the apply,
+# and a --dry-run, leave the file as it was. An apply that then fails has
+# recorded what it was applying, which is what the next run should retry.
+#
+# Answering `n` at the step-11 confirmation records nothing. The pause message
+# names a lifecycle.sh apply, but `n` is also the answer of an operator who saw
+# something wrong in the summary and walked away, and a file that then records
+# the integration on would have the next upgrade.sh provision what they
+# declined. warn_install_env_keys_not_recorded names the lines instead.
+#
+# A toggle recorded true brings the settings of its integration that the file
+# also lacks (install_env_toggle_companions), with the values this run applied
+# to them. Without them the next upgrade.sh would render the integration on
+# with an empty allowlist, which admits everyone, and with no home channel,
+# when this run applied an allowlist the operator gave at the prompt or as an
+# export. The file install.sh writes on a first install records the toggle and
+# these keys together, and the Day-2 menu saves the Google Chat toggle with its
+# allowlist, topic and home channel; the tokens are still never written.
+record_flags_into_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" key value
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  # A last line with no newline would run into the appended assignment.
+  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+    printf '\n' >> "$file"
+  fi
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    value="${!key-}"
+    write_env_var "$file" "$key" "$value"
+    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so later runs and upgrade.sh render it."
+  done
+  INSTALL_ENV_KEYS_TO_RECORD=""
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# The step-11 `n`: what record_flags_into_install_env would have appended, as
+# the lines to append, so an operator who does go on to apply the tfvars by
+# hand can make the file match first. Never a token: those are never queued.
+warn_install_env_keys_not_recorded() {
+  local file="${INSTALL_ENV_FILE:-}" key
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  print_warning "${file} assigns no ${INSTALL_ENV_RECORD_KEYS// /, }, and pausing here did not record them: a run abandoned at this prompt leaves the file as it was."
+  print_info "If you go on to run lifecycle.sh apply by hand, first add these lines to ${file}, so a later upgrade.sh renders what you applied:"
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    printf '    %s=%q\n' "$key" "${!key-}"
+  done
+}
+
+# The keys record_flags_into_install_env appends, in INSTALL_ENV_RECORD_KEYS:
+# the queued ones, each toggle queued true followed by the companions the file
+# lacks, and the toggles last. Computed in full before the first write, while
+# the file still reads as the run found it. The toggles go last: a write that
+# stops partway (Ctrl-C before the apply, a full disk) then leaves settings
+# with the integration off, never the integration on with no allowlist, which
+# admits everyone and which no re-run repairs, since the flag then agrees with
+# the file.
+resolve_install_env_record_keys() {
+  local file="$1" key companion record_keys="" toggles=""
+  # Every companion in one read of the file rather than one per key.
+  # shellcheck disable=SC2046
+  read_recorded_install_env_values "$file" $(install_env_toggle_companions SLACK_ENABLED) $(install_env_toggle_companions GOOGLE_CHAT_ENABLED)
+  for key in $INSTALL_ENV_KEYS_TO_RECORD; do
+    if [ -z "$(install_env_toggle_companions "$key")" ]; then
+      record_keys="${record_keys}${record_keys:+ }${key}"
+      continue
+    fi
+    toggles="${toggles}${toggles:+ }${key}"
+    is_truthy "${!key-}" || continue
+    for companion in $(install_env_toggle_companions "$key"); do
+      case " ${record_keys} ${INSTALL_ENV_KEYS_TO_RECORD} " in
+        *" ${companion} "*) continue ;;
+      esac
+      if ! install_env_records_key "$file" "$companion"; then
+        record_keys="${record_keys}${record_keys:+ }${companion}"
+      fi
+    done
+  done
+  INSTALL_ENV_RECORD_KEYS="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
+}
+
 bootstrap_install_env_file() {
   local destination="${1:-}" image_tag="${2:-}"
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
-    print_info "Left your install configuration as you wrote it: ${destination}"
+    print_info "Kept your install configuration: ${destination}"
+    # The flags check_flags_against_install_env queued: written only once
+    # this run goes on to the apply or the handoff (record_flags_into_install_env).
+    if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
+      print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
+    fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
@@ -2100,7 +2461,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it."
+    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -2114,7 +2475,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
   # Recorded on every first install, the default included: the file is the one
   # place a later run, and every upgrade.sh, reads the mode from, and a --mode
-  # that disagrees with it is refused (validate_platform_agent_mode).
+  # that disagrees with it is refused (check_flags_against_install_env).
   write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
@@ -3855,82 +4216,32 @@ validate_litellm_redaction_ip_action() {
 }
 
 # --mode, or the PLATFORM_AGENT_MODE install.env records: one of the CRD's
-# spec.mode values, named by whichever carried it. Then, against an existing
-# install.env, --mode must agree with what the file resolves to -- its own key,
-# or the default when it records none. Every other flag that overrides the file
-# applies for one run and is warned about (warn_flag_beats_unrecorded_file_value);
-# this one is refused, because the run after it reads the file again and
-# switches back, and upgrade.sh takes no --mode to stop it: a next install
-# would lose its A2A stack on the next upgrade, a today install gain one for a
-# single run. Switching is an edit to the file, which every later run then
-# keeps, and the apply that carries it says so (announce_platform_agent_mode_switch).
-# Needs installer_common.sh sourced.
+# spec.mode values, named by whichever carried it. Checked before
+# check_flags_against_install_env, so a misspelt --mode is refused as one
+# rather than as a disagreement with the file. Against an existing
+# install.env, --mode is then held to the file like the chat flags
+# (note_install_env_flag in parse_args): every other flag that overrides the
+# file applies for one run and is warned about
+# (warn_flag_beats_unrecorded_file_value); this one is refused, because the
+# run after it reads the file again and switches back, and upgrade.sh takes no
+# --mode to stop it: a next install would lose its A2A stack on the next
+# upgrade, a today install gain one for a single run. Switching is an edit to
+# the file, which every later run then keeps, and the apply that carries it
+# says so (announce_platform_agent_mode_switch). A file that assigns no
+# PLATFORM_AGENT_MODE has the --mode recorded into it when the run commits
+# (record_flags_into_install_env). Needs installer_common.sh sourced.
 validate_platform_agent_mode() {
   local value="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
-  if ! is_valid_platform_agent_mode "$value"; then
-    if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
-      print_error "--mode must be today or next, got '${value}'."
-    elif [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
-      print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix it in ${INSTALL_ENV_FILE}."
-    else
-      # No file yet: a first install seeds the key from the environment.
-      print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
-    fi
-    return 1
-  fi
-  [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ] || return 0
-  [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ] || return 0
-  # A file that does not assign the key at all (one written by hand, or
-  # copied from install.env.example with the line still commented out) has
-  # no mode to disagree with, so --mode fills it in, as a first install's
-  # bootstrap would have, and every later run keeps it. Only checked here:
-  # the write waits for record_platform_agent_mode_flag, just before the
-  # handoff or the apply, so a run that stops before then leaves the file as
-  # it was.
-  if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
-    PLATFORM_AGENT_MODE_TO_RECORD="$value"
-    if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
-      print_info "${INSTALL_ENV_FILE} sets no PLATFORM_AGENT_MODE; a run without --dry-run records PLATFORM_AGENT_MODE=${value} there."
-    fi
-    return 0
-  fi
-  local recorded="" source_of_recorded
-  recorded="$(recorded_install_env_value "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE)"
-  if [ -n "$recorded" ]; then
-    source_of_recorded="${INSTALL_ENV_FILE} records PLATFORM_AGENT_MODE=${recorded}"
+  is_valid_platform_agent_mode "$value" && return 0
+  if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+    print_error "--mode must be today or next, got '${value}'."
+  elif [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix it in ${INSTALL_ENV_FILE}."
   else
-    recorded="$DEFAULT_PLATFORM_AGENT_MODE"
-    source_of_recorded="${INSTALL_ENV_FILE} sets PLATFORM_AGENT_MODE empty, which is ${recorded}"
+    # No file yet: a first install seeds the key from the environment.
+    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
   fi
-  [ "$value" != "$recorded" ] || return 0
-  print_error "--mode=${value} disagrees with the install configuration, so it would hold for this run only: ${source_of_recorded}."
-  print_info "The next run without the flag, and every upgrade.sh, reads the file and goes back to ${recorded}. install.sh fills in --mode only where install.env sets no PLATFORM_AGENT_MODE; it does not change a key the file sets."
-  print_info "Set PLATFORM_AGENT_MODE=${value} in ${INSTALL_ENV_FILE} and re-run without --mode. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}."
   return 1
-}
-
-# --mode against an install.env that sets no PLATFORM_AGENT_MODE: appended to
-# the file, the one write install.sh makes to an install.env it did not
-# create, and only of a key the file lacks, so nothing the operator wrote is
-# changed. Without it the flag would hold for this run alone and the next run,
-# or upgrade.sh, would go back to the default. main calls it on each route as
-# the last step before the handoff or the apply, past the confirmation and
-# every step that can stop the run, so a refused, declined, failed or
-# --dry-run run writes nothing. Records what validate_platform_agent_mode left in
-# PLATFORM_AGENT_MODE_TO_RECORD, if anything.
-record_platform_agent_mode_flag() {
-  local value="${PLATFORM_AGENT_MODE_TO_RECORD:-}" old_umask
-  [ -n "$value" ] && [ -f "$INSTALL_ENV_FILE" ] || return 0
-  PLATFORM_AGENT_MODE_TO_RECORD=""
-  old_umask="$(umask)"
-  umask 077
-  # A last line with no newline would run into the appended assignment.
-  if [ -s "$INSTALL_ENV_FILE" ] && [ -n "$(tail -c 1 "$INSTALL_ENV_FILE")" ]; then
-    printf '\n' >> "$INSTALL_ENV_FILE"
-  fi
-  write_env_var "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE "$value"
-  umask "$old_umask"
-  print_info "Recorded PLATFORM_AGENT_MODE=${value} in ${INSTALL_ENV_FILE}, which set none: later runs and upgrade.sh keep this mode. Change it there, not with --mode (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
 }
 
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
@@ -4678,6 +4989,13 @@ main() {
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
+    # The chat flags likewise: the menu applies the keys install.env records
+    # and edits them on its own screens, so a flag here would be dropped.
+    if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
+      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
+      print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
+      exit 1
+    fi
     run_menu_system
     exit 0
   fi
@@ -4762,6 +5080,14 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
+  # The mode first: a value the CRD refuses is named as that, not as a
+  # disagreement with install.env.
+  validate_platform_agent_mode || exit 1
+  # The chat flags and --mode against an existing install.env, as soon as
+  # is_truthy and the defaults are loaded: a flag that disagrees with the file
+  # stops the run here, before the interview and long before anything is
+  # applied.
+  check_flags_against_install_env || exit 1
 
   # 3. Google Cloud Authentication Check
   print_step "3. Verifying Google Cloud Authentication"
@@ -5173,7 +5499,16 @@ main() {
     echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
     echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
     echo ""
-    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+    # The file this install writes records both toggles as false, and a
+    # --enable-google-chat or --enable-slack that disagrees with it is refused
+    # (check_flag_against_install_env), so the key is the way to turn one on.
+    # It records both allowlists empty too, and install.sh does not change a
+    # key the file assigns, so the allowlist is set in the file beside the
+    # toggle.
+    echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
+    echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
   case "$chat_choice" in
@@ -5226,10 +5561,8 @@ main() {
   if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
     hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
   fi
-  # The mode, checked here for the same reason: a value the CRD refuses, or a
-  # --mode that disagrees with install.env, stops the run before the rest of
-  # the interview.
-  validate_platform_agent_mode || exit 1
+  # The mode was checked at step 2, before check_flags_against_install_env
+  # held --mode to install.env (validate_platform_agent_mode).
   local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
@@ -6216,7 +6549,11 @@ main() {
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
-        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        # Not a hand-off like `g`: `n` is also a decline, so nothing is
+        # recorded, and the operator is told which lines a hand-run apply
+        # needs in install.env.
+        warn_install_env_keys_not_recorded
+        print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
         exit 0
@@ -6227,9 +6564,9 @@ main() {
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
-    # Past every gate that can stop this route: a --mode against an
-    # install.env that set no mode is recorded for the handoff.
-    record_platform_agent_mode_flag
+    # Past every gate that can stop this route: a chat flag or --mode whose
+    # key the install.env lacks is recorded for the handoff.
+    record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
     exit 0
@@ -6303,9 +6640,9 @@ main() {
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
   # Past every gate that can stop this route (set -e makes each step above
-  # one): a --mode against an install.env that set no mode is recorded for
-  # the apply.
-  record_platform_agent_mode_flag
+  # one): a chat flag or --mode whose key the install.env lacks is recorded
+  # for the apply.
+  record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
   # The one post-apply step Terraform cannot carry: the managed-OTel scope

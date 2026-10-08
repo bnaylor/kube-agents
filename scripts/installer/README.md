@@ -111,9 +111,9 @@ menu, and `common.sh`'s `load_state` for the dev scripts — with `set -a` so th
 reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read the
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
-export of the same name, so a flag is what overrides a recorded value for one run, except
-`--mode`, which is refused when it disagrees with the file (`PLATFORM_AGENT_MODE`, below).
-`NAMESPACE` ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
+export of the same name, so a flag is what overrides a recorded value for one run. The chat
+flags and `--mode` are the exception: on an existing file they are held to it, as described below.
+One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
 `uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
 tooling exports that name and the value now reaches the Helm release's namespace. The file
 and `--agent-namespace` are the two routes in (`common.sh`'s `load_state` clears it the
@@ -141,10 +141,61 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
 `install.sh` reads it and does not rewrite it. It creates one at the end of a first
-install, when there is nothing there, and never touches it again; the Day-2 menu's
-"Save & Apply" is the one path that edits it, one key at a time, leaving comments and
-ordering intact. That asymmetry is deliberate: a file the documentation tells you to edit
-and the next run overwrites is what made the old `vars.sh` confusing.
+install, when there is nothing there, and after that changes no line of it; the one thing
+it adds is a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below. The Day-2 menu's "Save & Apply"
+is the one path that edits a key, one at a time, leaving comments and ordering intact. That
+asymmetry is deliberate: a file the documentation tells you to edit and the next run
+overwrites is what made the old `vars.sh` confusing.
+
+The chat flags are held to the file rather than overriding it for one run, because
+`upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
+one-run override would be undone by the next full upgrade without a word. They are
+`--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
+`--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
+`--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
+`--mode` follows the same rule, for the same reason, with `PLATFORM_AGENT_MODE` (below); it
+is not a chat key and brings no other settings with it.
+Against an existing `install.env`, a flag that disagrees with the key the file assigns is
+refused before anything is applied, naming the file and the key: edit the key (or, for
+`GOOGLE_CHAT_ENABLED` and the Google Chat allowlist and home channel, use the Day-2 menu) and
+re-run without the flag. The menu is not offered for the topic, which it does not ask about, or
+for `SLACK_ENABLED`, which it turns on without asking for the tokens; to turn Slack on, set the
+key and re-run with `--slack-bot-token` and `--slack-app-token`. A key with a default (the toggles, the topic, the Chat mode) that
+the file sets empty counts as that default, and the two allowlists compare as the lists they
+render to, so `a,b` and `a, b` agree. `--chat-topic-name=` and `--google-chat-mode=` given an
+empty value are refused, as an empty toggle is, rather than read as the default, and a
+`--google-chat-mode` other than `default` or `debug` is refused before the file is consulted. An
+empty `--slack-bot-token=` or `--slack-app-token=` is no value, as an empty recorded token is: it
+is not compared, and the token is recovered from the live Secret. `--chat-sub-name` is not held: on a running install the
+subscription name comes from Terraform state, ahead of both the flag and the file. A flag
+whose key the file does not assign at all is appended to the file with the value the run
+applies, as the last step before the apply or the `--generate-only` (or `g`) handoff, so a run
+refused, declined or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
+then fails has recorded what it was applying. Answering `n` at the step-11 confirmation records
+nothing, since it is as often a decline as a hand-off: it prints the `KEY=value` lines it did not
+record (never a token), for an operator who goes on to run `lifecycle.sh apply` by hand to add
+first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
+its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
+`SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
+`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
+toggle is written after them, so a record cut short leaves the settings with the integration
+off, never the integration on without its allowlist. Otherwise
+an allowlist given at the prompt or as an export would be left out, and the next upgrade would
+render the integration on with an empty allowlist, which admits everyone. A chat-less install's
+file records both allowlists empty, and `install.sh` does not change a key the file assigns, so to
+turn an integration on later, set its allowlist in the file beside the toggle. A file the run cannot write is refused up front
+when there is a key to record. This is the one write
+`install.sh` makes to a file it did not create, and only of keys the file lacks. A flag that
+agrees changes nothing. The Slack tokens are never appended: their home is the live
+`platform-agent-secrets` Secret, which `write_tfvars_from_state` recovers them from on every
+later run, and `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file. A token the file
+does carry is still held to it. A file `install.sh` wrote assigns every one of these keys but
+the tokens, so on it a chat flag is either refused or a no-op. A file CI renders leaves out a
+key whose variable is empty, and the provisioning script derives each chat flag from the
+variable that renders its key (the Google Chat allowlist flag also reads
+`GOOGLE_CHAT_ALLOWED_USERS` first, which no workflow sets), so on a runner a flag either agrees
+with the rendered key or is appended to the runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
+edits the keys on its own screens.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.
@@ -367,12 +418,14 @@ cannot refuse a teardown.
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
 renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the default, on a first install, appends a `--mode` to an
-`install.env` that sets no `PLATFORM_AGENT_MODE` once the run is past its refusals and confirmed (a
-refused, declined or `--dry-run` run leaves the file as it was), and from then on the file is the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
-shell, and a `--mode` that disagrees with what the file resolves to is refused rather than
-applied for one run, because the next run, and every `upgrade.sh`, which takes no `--mode`,
-would switch the install back. A switch is an edit to the key. Before an apply the front doors
+takes `--mode` and records it, or the default, on a first install. Over an existing
+`install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
+with what the file resolves to (an empty key is `today`) is refused rather than applied for one
+run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the
+install back; one the file does not assign at all is appended at the same points as a chat key
+(a refused, `--dry-run` or failed-before-apply run leaves the file as it was, and `n` at the
+step-11 confirmation prints the `PLATFORM_AGENT_MODE=` line instead of writing it). From then on the file is the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
+shell. A switch is an edit to the key. Before an apply the front doors
 read the mode the live CR runs and the one the release's last served revision carries, and say
 when the apply moves the CR (`announce_platform_agent_mode_switch`), from the reads the scope
 check beside it made (`read_platform_agent_install_state`). No cluster (the generator found
