@@ -1364,7 +1364,11 @@ class CiEvalWiringTest(unittest.TestCase):
                 result, _ = self.run_wiring(mode_next="1", script_status=status)
                 out = result.stdout
                 self.assertIn("COLLECT_DIAG --keep-watch prefix=\n", out)
-                self.assertLess(out.index("stub ran"), out.index("COLLECT_DIAG  prefix=rollback-"))
+                # Presence, not order: the round trip's output reaches stdout
+                # through an un-waited `tee` process substitution, so it can land
+                # after the trap's collect line (the same race as #2626).
+                self.assertIn("stub ran", out)
+                self.assertIn("COLLECT_DIAG  prefix=rollback-", out)
 
     def test_a_run_too_late_for_its_bound_is_skipped(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", elapsed=16000)
