@@ -42,7 +42,7 @@ from kube_agents_bench.gate import main
 from kube_agents_bench.scoring import INFRA_FAILURE_MARKER, MISSING
 
 from conftest import FIXTURE_RUNS, GREEN_RUNS, TASKS
-from test_gate import JUDGE, KEY, baseline_line, graded_case, run_record, store_with
+from test_gate import BASELINES, JUDGE, KEY, baseline_line, graded_case, run_record, store_with
 
 CI_EVAL_PR = Path(__file__).resolve().parents[2] / "hack" / "ci-eval-pr.sh"
 
@@ -104,7 +104,7 @@ def not_run(state_dir: Path, name: str, rep: int, reason: str = REASON) -> Path:
 
 
 def run_case(task: Path, runs, out: Path) -> dict:
-    argv = ["case", "--task", str(task)]
+    argv = ["case", "--task", str(task), "--baseline-dir", str(BASELINES)]
     for r in runs:
         argv += ["--result", str(r)]
     argv += ["--json-out", str(out)]
