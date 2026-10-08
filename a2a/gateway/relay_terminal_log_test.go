@@ -415,3 +415,78 @@ func TestTaskTerminalLogCoversThePublishFailure(t *testing.T) {
 		"state": string(lib.StateFailed), "source": string(TerminalFromGateway), "reason": "",
 	})
 }
+
+// textLogLines is the lines of a rig's text log whose msg is msg and that
+// carry every key=value in kv.
+func textLogLines(logs *lockedBuffer, msg string, kv ...string) []string {
+	var out []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if !strings.Contains(line, "msg="+msg+" ") && !strings.Contains(line, `msg="`+msg+`" `) {
+			continue
+		}
+		fields := strings.Fields(line)
+		all := true
+		for _, want := range kv {
+			found := false
+			for _, f := range fields {
+				if f == want {
+					found = true
+					break
+				}
+			}
+			if !found {
+				all = false
+				break
+			}
+		}
+		if all {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// A delegation chain is three tasks, each with its own ingress line: the
+// turn that delegated, the child minted to platform, and the wake. Each
+// logs its own terminal by its own id and addressee, though the observers
+// hear of the chain only by its root (observedAs), so a join of "ingress"
+// to "task terminal" on taskId finds an outcome for every one.
+func TestTaskTerminalLogCoversEachTaskOfADelegationChain(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-terminal-log-chain"
+	origin, session, child := delegated(t, r, spawn, conv, "")
+	publishFinal(t, r, child, targetPlatform, lib.StateFailed, "reason: quota - exceeded")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	exec := r.execFor(t, wake, wakeSession)
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, exec, "the fleet could not be read")
+	waitFor(t, "the wake's terminal line", func() bool {
+		return len(textLogLines(r.logs, "task terminal", "taskId="+wake.TaskID)) > 0
+	})
+
+	for _, tc := range []struct {
+		name string
+		id   string
+		kv   []string
+	}{
+		{"the delegating turn", origin.TaskID, []string{"addressee=" + session, "state=completed", "source=executor"}},
+		{"the child", child.TaskID, []string{"addressee=" + targetPlatform, "state=failed", "source=executor", "reason=quota"}},
+		{"the wake", wake.TaskID, []string{"addressee=" + wakeSession, "state=completed", "source=executor"}},
+	} {
+		if n := len(textLogLines(r.logs, "ingress", "taskId="+tc.id)); n != 1 {
+			t.Errorf("%s: %d ingress lines, want 1", tc.name, n)
+		}
+		all := textLogLines(r.logs, "task terminal", "taskId="+tc.id)
+		if len(all) != 1 {
+			t.Errorf("%s: %d task terminal lines, want 1: %v", tc.name, len(all), all)
+			continue
+		}
+		if got := textLogLines(r.logs, "task terminal", append([]string{"taskId=" + tc.id, "conversation=" + conv}, tc.kv...)...); len(got) != 1 {
+			t.Errorf("%s: terminal line %q, want %v", tc.name, all[0], tc.kv)
+		}
+	}
+}
