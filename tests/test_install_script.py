@@ -6499,13 +6499,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     self.assertIn(f"Kept your install configuration: {path}", out)
                     self.assertNotIn("as you wrote it", out)
                     line = (
-                        f"{path} assigns no SLACK_ENABLED: the flags you passed are recorded there "
-                        "if this run goes on to the apply or the handoff."
+                        f"{path} assigns no SLACK_ENABLED: the values this run applies to them are "
+                        "recorded there if it goes on to the apply or the handoff."
                     )
                     if says_record:
                         self.assertIn(line, out)
                     else:
-                        self.assertNotIn("the flags you passed are recorded", out)
+                        self.assertNotIn("are recorded there", out)
                     self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
 
     def test_main_checks_before_the_interview_and_records_last_on_each_route(self):

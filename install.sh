@@ -218,7 +218,8 @@ unset _install_defaults_dir
 # An input the installer reads and does not rewrite. It creates one at the end
 # of a first install, when there is nothing there, and after that changes no
 # line of it; the one thing it adds is a chat key the file lacks, from a chat
-# flag (check_flag_against_install_env). A file the documentation tells you to
+# flag, with the settings a toggle recorded true brings
+# (record_flags_into_install_env). A file the documentation tells you to
 # edit and the next run overwrites is
 # exactly the complaint against vars.sh, whose header said "auto-generated"
 # while INSTALL.md told you to hand-edit it.
@@ -709,7 +710,8 @@ Flags for AI Agents & Automation:
                                 Enable Google Chat integration
   --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
                                 this requires --slack-bot-token and --slack-app-token.
-                                Against an existing install.env, these two and the
+                                Against an existing install.env, --enable-slack,
+                                --enable-google-chat, --google-chat and the
                                 --slack-*, --google-chat-allowed-users,
                                 --google-chat-home-channel, --google-chat-mode and
                                 --chat-topic-name flags must agree with the key the file
@@ -1689,10 +1691,11 @@ install_env_records_key() {
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
-# needs the installer to treat it as read-only. Naming the drift costs nothing
+# needs the installer not to rewrite it. Naming the drift costs nothing
 # and leaves the decision where it belongs. The one write install.sh does make
 # is narrower: a chat key the file does not assign, appended from a chat flag
-# (check_flag_against_install_env); it never changes a key the file sets.
+# with the settings a toggle recorded true brings (record_flags_into_install_env);
+# it never changes a key the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1702,10 +1705,11 @@ warn_unrecorded_interview_answers() {
   [ -n "$file" ] && [ -f "$file" ] || return 0
   # A non-interactive run answered no prompt, so the drift this names (an
   # answer typed at the interview) cannot happen there. A flag can still beat
-  # the file on such a run: the chat flags are refused or recorded before this
-  # runs (check_flags_against_install_env), and the other keys in the list
-  # below that have a flag (--model-max-tokens, --memory, --permission-set and
-  # the rest) still apply for one run with no warning on a non-interactive run.
+  # the file on such a run: the chat flags are refused, or queued for the
+  # record, before this runs (check_flags_against_install_env), and the other
+  # keys in the list below that have a flag (--model-max-tokens, --memory,
+  # --permission-set and the rest) still apply for one run with no warning on a
+  # non-interactive run.
   [ "$PARAM_NON_INTERACTIVE" != "true" ] || return 0
   has_controlling_tty || return 0
   [ "$PARAM_DRY_RUN" != "true" ] || return 0
@@ -2094,8 +2098,8 @@ check_flags_against_install_env() {
 # with an empty allowlist, which admits everyone, and with no home channel,
 # when this run applied an allowlist the operator gave at the prompt or as an
 # export. The file install.sh writes on a first install records the toggle and
-# these keys together, and so does the Day-2 menu for Google Chat; the tokens
-# are still never written.
+# these keys together, and the Day-2 menu saves the Google Chat toggle with its
+# allowlist, topic and home channel; the tokens are still never written.
 record_flags_into_install_env() {
   local file="${INSTALL_ENV_FILE:-}" key value
   [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
@@ -2169,7 +2173,7 @@ bootstrap_install_env_file() {
     # The chat flags check_flags_against_install_env queued: written only once
     # this run goes on to the apply or the handoff (record_flags_into_install_env).
     if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
-      print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the flags you passed are recorded there if this run goes on to the apply or the handoff."
+      print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
     fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
@@ -5415,7 +5419,7 @@ main() {
     echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
     echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
-    echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key."
+    echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
   case "$chat_choice" in

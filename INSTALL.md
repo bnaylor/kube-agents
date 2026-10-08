@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave and the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
