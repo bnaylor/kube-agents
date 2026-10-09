@@ -1822,7 +1822,7 @@ func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
 	wakeSession := spawn2.calls()[0].Session
 	wake := r2.awaitTask(t, wakeSession)
 	want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which completed.\nResult from platform (not from the user):\n```\nfleet is green\n```"
-	if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
+	if got := envText(t, wake); got != want+"\n"+wakeReplyGuideFull {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 	if key, err := r2.g.reg.SessionForTask(ctx, child.TaskID); err != nil || key != "" {
@@ -2497,7 +2497,7 @@ func TestAHealedChildsTurnAnswersAllReachTheWake(t *testing.T) {
 	sessionRigTurn(r2, conv, "h-heal-turns", "status")
 	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
 	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
-	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want+"\n"+wakeReplyGuide {
+	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want+"\n"+wakeReplyGuideFull {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 }
@@ -2637,7 +2637,7 @@ func TestAHealedFailedChildsTurnAnswersReachTheWake(t *testing.T) {
 			if turns {
 				want = failedTurnsWake(child.TaskID, "failed", reason)
 			}
-			if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
+			if got := envText(t, wake); got != want+"\n"+wakeReplyGuideFull {
 				t.Fatalf("wake text = %q, want %q", got, want)
 			}
 		})
@@ -2651,7 +2651,7 @@ func TestAHealedFailedChildsTurnAnswersReachTheWake(t *testing.T) {
 func TestTheWakeGuideFollowsWhereTheAnswerGoes(t *testing.T) {
 	chat := wakeText(lib.StateCompleted, "task-1", "how many clusters?", nil, "5", "", false)
 	door := wakeText(lib.StateCompleted, "task-1", "how many clusters?", nil, "5", "", true)
-	if !strings.HasSuffix(chat, "\n"+wakeReplyGuide) || !strings.HasSuffix(door, "\n"+wakeReplyGuideDoor) {
+	if !strings.HasSuffix(chat, "\n"+wakeReplyGuide) || !strings.HasSuffix(door, "\n"+wakeReplyGuideFull) {
 		t.Errorf("chat wake ends %q, door wake ends %q", chat[max(0, len(chat)-60):], door[max(0, len(door)-60):])
 	}
 	for backend, want := range map[string]bool{injectBackend: true, a2aBackend: true, a2aGoogleBackend: true, "slack": false, "discord": false, "gchat": false} {
@@ -2661,5 +2661,30 @@ func TestTheWakeGuideFollowsWhereTheAnswerGoes(t *testing.T) {
 	}
 	if wakeToDoor(&TaskRef{}) {
 		t.Error("a parent with no requester on record reads as a door")
+	}
+}
+
+// The guide is chosen from whether the person asking has seen the child's
+// result: a door caller hasn't (it gets only the wake's reply), and neither
+// has a chat whose child terminal a heal found (its status card carries no
+// result text). Only a chat on the relay path has, and gets the
+// explain-don't-repeat guide.
+func TestAWakeGivesTheFullAnswerWhereTheResultWasntShown(t *testing.T) {
+	chat := &TaskRef{Requester: &TaskRequester{Backend: "slack"}}
+	door := &TaskRef{Requester: &TaskRequester{Backend: injectBackend}}
+	for _, tc := range []struct {
+		name   string
+		parent *TaskRef
+		posted bool
+		want   bool
+	}{
+		{"chat, relayed", chat, true, false},
+		{"chat, healed", chat, false, true},
+		{"door, relayed", door, true, true},
+		{"door, healed", door, false, true},
+	} {
+		if got := wakeNeedsFullAnswer(tc.parent, tc.posted); got != tc.want {
+			t.Errorf("%s: wakeNeedsFullAnswer = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
