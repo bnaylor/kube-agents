@@ -144,7 +144,7 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
-# The design document a spec.mode switch points the operator at.
+# The Upgrade page section a spec.mode switch points the operator at.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode"
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a

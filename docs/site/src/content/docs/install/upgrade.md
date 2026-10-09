@@ -200,7 +200,10 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
   `Slack relay initialization failed; retrying` means no bot token was accepted or the Socket Mode
   connection failed, and the broker tries again every 30 seconds. The pattern leaves out
   `Slack relay operation failed`: the broker logs that when one Slack call the agent makes fails,
-  such as a post to a channel the bot is not in, and it says nothing about the connection.
+  such as a post to a channel the bot is not in, and it says nothing about the connection. If
+  the command prints nothing, either the startup lines have rotated out of the log on a broker
+  that has run for a while, or Slack's tokens were not set and the relay never started: go by the
+  DM test below.
 
 - **`next`**: the A2A gateway.
 
@@ -212,8 +215,10 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
   The last line contains `"msg":"slack connected"` and names the bot user and the workspace
   (`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
   and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
-  connection failed; one with no `slack connected` before it means Slack refused the bot token.
-  The gateway retries either way.
+  connection failed. One with no `slack connected` before it means the gateway's first call to
+  Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
+  (a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
+  way.
 
 Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
 AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
