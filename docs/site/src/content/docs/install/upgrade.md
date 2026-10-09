@@ -345,9 +345,11 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 - **Not the conversations.** Under `next` the agent starts every Slack conversation with no
   history from `today`. In a channel, a reply without a mention in a thread started before the
   switch gets no answer: mention the app.
-- **Not the cards in flight.** Do not count on a card filed before the switch to post its
-  progress or report to its Slack thread. Its buttons stop working, because the gateway does not
-  take button clicks.
+- **Not the cards in flight, outside the home channel.** A card filed before the switch from a
+  DM or from any channel other than the home channel posts nothing after it: the gateway refuses
+  the post and logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
+  in a home-channel thread still posts its progress and report there. Either way its buttons stop
+  working, because the gateway does not take button clicks.
 - **The home channel only from `install.env`**, as in step 2 above.
 
 Slash commands, buttons, cards and the other Slack features that do not carry over are listed in
