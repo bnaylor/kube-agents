@@ -616,12 +616,11 @@ helm upgrade kube-agents ./charts/kube-agents \
 
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
-On an install that came from `install.sh`, put the same value in a `TF_VAR_extra_helm_values` line
-in `install.env` as well, written as `TF_VAR_extra_helm_values='{platformAgent={harness={experimental={shellSandbox={runtimeClassName="gvisor"}}}}}'`.
-The next `upgrade.sh` or `install.sh` run regenerates `terraform.tfvars` from `install.env`, so a
-value set only on the Helm release or only in `terraform.tfvars` is reverted. The quickstart's
-[Operator settings](docs/site/src/content/docs/install/quickstart-gke.mdx) has the rules for that
-line.
+On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead (it
+is the default; `--enable-gvisor=true` on a re-run records the same). The next `upgrade.sh` or
+`install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
+`agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
+set only on the Helm release or only in `terraform.tfvars` is reverted.
 
 Installing the chart directly with `helm install` gives you a sandbox the agent cannot log into: the
 chart cannot generate an `authorized_keys`-form public key, so `platform-agent-shell-authorized-keys`

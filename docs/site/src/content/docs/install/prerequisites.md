@@ -36,6 +36,15 @@ gcloud projects get-iam-policy <PROJECT_ID> --flatten=bindings \
   --filter="bindings.members:user:$(gcloud config get account)" --format='value(bindings.role)'
 ```
 
+That lists only roles bound to your account directly on the project. A role you hold through a Google group, or one inherited from a folder or the organisation, does not show, so empty output does not mean you lack it. The Policy Troubleshooter reads the effective policy, groups and inheritance included, one permission at a time; for example, the first row of the table below:
+
+```bash
+gcloud policy-intelligence troubleshoot-policy iam \
+  //cloudresourcemanager.googleapis.com/projects/<PROJECT_ID> \
+  --principal-email="$(gcloud config get account)" \
+  --permission=resourcemanager.projects.setIamPolicy
+```
+
 `roles/owner` covers a stock install. `roles/editor` does not, because a stock install grants access as well as creating resources, and Editor holds none of the permissions that do it. Each line below is something a stock install does, the permission it needs that Editor lacks, and a predefined role that carries it:
 
 | What the install does                                                                                                                                                                           | Permission Editor lacks                                                                                                                                           | Role that has it                        |
