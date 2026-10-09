@@ -821,6 +821,9 @@ func isTaskNotFound(err error) bool {
 func (g *Gateway) sweepOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, sweepPassTimeout)
 	defer cancel()
+	// The untracked pass runs whatever the orphan list does: it lists for
+	// itself, and an API blip there must not hold up the other.
+	defer g.sweepUntracked(ctx)
 	orphans, err := g.spawner.TerminalOrphans(ctx)
 	if err != nil {
 		g.log.Error("sweep: pod list failed", "err", err)
@@ -858,7 +861,6 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		_ = g.spawner.Delete(ctx, o.PodName)
 		g.releaseIncarnation(ctx, o)
 	}
-	g.sweepUntracked(ctx)
 }
 
 // sweepUntracked deletes live reused pods that their conversation no longer
@@ -886,7 +888,17 @@ func (g *Gateway) sweepUntracked(ctx context.Context) {
 }
 
 // deleteIfUntracked deletes one pod if its conversation's record, read under
-// that conversation's lock, does not name it. It reports whether it did.
+// that conversation's lock, names it neither as its pod nor as its session.
+// It reports whether it did.
+//
+// The session counts as well as the pod because the two reach the store
+// separately: startTaskWith writes the record with the new session and its
+// task before ensureSessionPod spawns, and PodName lands only in the turn's
+// final write. A record whose final write failed names the session, with the
+// task running on that pod, and no PodName; deleting there would kill the
+// task with no terminal. Every path that retires a pod on purpose either
+// moves BusSession on or deletes the pod itself, so a pod still named as the
+// session is not the leak this exists for.
 func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
 	l := g.lockSession(p.SessionKey)
 	if !l.TryLock() {
@@ -894,7 +906,7 @@ func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
 	}
 	defer l.Unlock()
 	rec, err := g.reg.Get(ctx, p.SessionKey)
-	if err != nil || (rec != nil && rec.PodName == p.PodName) {
+	if err != nil || (rec != nil && (rec.PodName == p.PodName || rec.BusSession == p.PodName)) {
 		return false
 	}
 	if err := g.spawner.Delete(ctx, p.PodName); err != nil {

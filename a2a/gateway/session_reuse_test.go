@@ -680,14 +680,44 @@ func TestTheSweepDeletesAnUntrackedReusedPod(t *testing.T) {
 	if err := r.g.reg.Put(ctx, tracked); err != nil {
 		t.Fatal(err)
 	}
+	// A record whose last write lost PodName still names the pod as its
+	// session, with a task running there: that pod is in use.
+	lost := &SessionRecord{Key: "discord:g1/t-lost", ContextID: "ctx-l", Kind: "group",
+		Addressee: "chat-otter-busy", BusSession: "chat-otter-busy", SessionRouted: true,
+		ActiveTask: &ActiveTask{TaskID: "task-l", CorrelationID: "corr-l", SubmittedAt: time.Now()},
+		Tasks:      []TaskRef{{ID: "task-l", Addressee: "chat-otter-busy"}}}
+	held := &SessionRecord{Key: "discord:g1/t-held-sweep", ContextID: "ctx-h", Kind: "group",
+		Addressee: "chat-otter-new", BusSession: "chat-otter-new", PodName: "chat-otter-new", PodReuse: true, SessionRouted: true}
+	for _, rec := range []*SessionRecord{lost, held} {
+		if err := r.g.reg.Put(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
 	spawn.setSessionPods(
 		sessionPod{PodName: "chat-otter-now", SessionKey: tracked.Key, Reuse: true},
 		sessionPod{PodName: "chat-otter-was", SessionKey: tracked.Key, Reuse: true},
 		sessionPod{PodName: "chat-otter-once", SessionKey: tracked.Key},
+		sessionPod{PodName: "chat-otter-busy", SessionKey: lost.Key, Reuse: true},
+		sessionPod{PodName: "chat-otter-old", SessionKey: held.Key, Reuse: true},
 	)
+	// A conversation whose lock is held is mid-turn; its pods wait for the
+	// next pass.
+	l := r.g.lockSession(held.Key)
+	l.Lock()
 	r.g.sweepOnce(ctx)
 	if d := spawn.deleted(); len(d) != 1 || d[0] != "chat-otter-was" {
 		t.Fatalf("sweep deleted %v, want only the untracked reused pod", d)
+	}
+	l.Unlock()
+	r.g.sweepOnce(ctx)
+	d := spawn.deleted()
+	if !slices.Contains(d, "chat-otter-old") {
+		t.Fatalf("sweep deleted %v, want the held conversation's untracked pod once the lock is free", d)
+	}
+	for _, kept := range []string{"chat-otter-now", "chat-otter-once", "chat-otter-busy"} {
+		if slices.Contains(d, kept) {
+			t.Fatalf("sweep deleted %s: %v", kept, d)
+		}
 	}
 }
 
@@ -732,5 +762,23 @@ func TestANeverStartedTaskUnmarksItsPod(t *testing.T) {
 	}
 	if d := spawn.deleted(); !slices.Contains(d, pod) {
 		t.Fatalf("deleted %v, want the never-started pod retired", d)
+	}
+}
+
+// The untracked pass lists pods for itself, so a failed orphan list does not
+// hold it up.
+func TestTheUntrackedSweepRunsWhenTheOrphanListFails(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	rec := &SessionRecord{Key: "discord:g1/t-orphan-err", ContextID: "ctx-oe", Kind: "group",
+		Addressee: "chat-otter-cur", BusSession: "chat-otter-cur", PodName: "chat-otter-cur", PodReuse: true, SessionRouted: true}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	spawn.orphansErr = errors.New("api down")
+	spawn.setSessionPods(sessionPod{PodName: "chat-otter-stale", SessionKey: rec.Key, Reuse: true})
+	r.g.sweepOnce(ctx)
+	if d := spawn.deleted(); len(d) != 1 || d[0] != "chat-otter-stale" {
+		t.Fatalf("deleted %v, want the untracked pod despite the failed orphan list", d)
 	}
 }

@@ -672,9 +672,9 @@ session was paused to make room, and its next message starts fresh with the conv
 Only with no idle pod is the turn refused, with the notice it always had. A conversation running
 anything (a task, a stopped task finishing, a delegated child whose wake will need the pod) is
 never evicted; each candidate is re-checked under its own conversation's lock, and a lock that is
-held means busy. A reused pod that no conversation's record names any more (a retirement whose
-delete failed) never exits on its own, so it goes first, with no notice, and Sweep deletes it
-anyway within a minute.
+held means busy. A reused pod that its conversation's record names neither as its pod nor as its session any
+more (a retirement whose delete failed) never exits on its own, so it goes first, with no notice,
+and Sweep deletes it anyway within a minute.
 
 **One rule for every pod the gateway deletes itself** (stated once here because four
 paths reach it - reap, Sweep, Delegate, and any future one): if the pod is running a

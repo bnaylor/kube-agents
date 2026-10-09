@@ -1087,6 +1087,8 @@ type fakeSpawner struct {
 	reusableErr error
 	// sessionPods is what SessionPods lists, the cap eviction's candidates.
 	sessionPods []sessionPod
+	// orphansErr fails TerminalOrphans, the orphan sweep's list.
+	orphansErr error
 }
 
 func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
@@ -1163,6 +1165,9 @@ func (s *fakeSpawner) deleted() []string {
 func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.orphansErr != nil {
+		return nil, s.orphansErr
+	}
 	return append([]orphanPod(nil), s.orphans...), nil
 }
 
