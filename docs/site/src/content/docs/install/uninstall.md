@@ -60,7 +60,7 @@ kubectl delete platformagent platform-agent -n kubeagents-system --wait --timeou
 helm uninstall <release> -n kubeagents-system
 ```
 
-The finalizer removes the agent's cluster-scoped RBAC, and Kubernetes garbage-collects the namespaced objects the resource owns. The namespace, the CRDs and the shell sandbox's volumes stay, as below.
+The finalizer removes the agent's cluster-scoped RBAC, and Kubernetes garbage-collects the namespaced objects the resource owns. The namespace, the CRDs and the shell sandbox's volumes stay, as below. So does `platform-agent-secrets` when the release did not create it (`platformAgent.credentials.create=false`, the chart default); delete it with the namespace.
 
 An install whose `PlatformAgent` was applied with `kubectl` ([Method 2 in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#method-2-manual-kubernetes-cluster-deployment)) comes apart the same way: delete the `PlatformAgent` and wait, then remove the operator (`make undeploy` and `make uninstall` in `k8s-operator/`). Removing the operator first strands the resource on its finalizer.
 
@@ -80,14 +80,16 @@ A cluster the install created is deleted with everything in it. On a cluster it 
 
 ```bash
 kubectl delete namespace kubeagents-system
-kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io
+kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io
 ```
 
-The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`: its finalizer deletes the JetStream volume, `data-platform-agent-a2a-nats-0`, and the rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps that volume and that Secret, so a later flip to `next` finds the bus where it left it. To drop them on an install that stays on `today`:
+### What `spec.mode: next` leaves behind
+
+The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`: its finalizer deletes the JetStream volume, `data-platform-agent-a2a-nats-0`, and the rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps that volume and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
 
 ```bash
 kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system
-kubectl delete secret platform-agent-a2a-nats-creds -n kubeagents-system
+kubectl delete secret platform-agent-a2a-nats-creds a2a-slack-principal-map -n kubeagents-system --ignore-not-found=true
 ```
 
 ## If deleting the `PlatformAgent` hangs
@@ -99,7 +101,7 @@ kubectl patch platformagent platform-agent -n kubeagents-system \
   --type=merge -p '{"metadata":{"finalizers":null}}'
 ```
 
-The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.mode: next`, the JetStream volume, so a cleared finalizer leaves them behind. A teardown that clears it also deletes the `kubeagents:minimal:…` ClusterRole and binding, but not the others or the volume. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name:
+The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.mode: next`, the JetStream volume, so a cleared finalizer leaves them behind. A teardown that clears it also deletes the `kubeagents:minimal:…` ClusterRole and binding, but not the others or the volume. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name: `kubeagents:minimal:kubeagents-system:platform-agent` and `kubeagents:tokenreview:kubeagents-system:platform-agent`, and under `next` the callout's binding `kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent`. This removes them all:
 
 ```bash
 for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do

@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave and the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave, or the `PLATFORM_AGENT_MODE` a `--mode` gave, that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
@@ -267,8 +267,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
 
 A flag left out does not always take the shipped default. A flag wins over an `install.env` from an
 earlier run, which wins over an exported variable — including an exported API key — which wins over
-`install.defaults.env`. The chat flags are the exception: over an existing `install.env` one that
-disagrees with the file is refused. See
+`install.defaults.env`. The chat flags and `--mode` are the exception: over an existing `install.env`
+one that disagrees with the file is refused. See
 [`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv).
 
 ---
@@ -409,6 +409,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   `--registry-prefix`) covers the four images this project builds, and LiteLLM, fluent-bit, the
   GitHub token minter and Hindsight need `third_party_image_registry` (or
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
+
+- **Component stack (`--mode`)**: `./install.sh --mode=next` installs with `spec.mode: next`, an
+  unsupported development stack; the default is `today`. With an `install.env` you wrote
+  yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
+  sets a different one. Terraform takes `platform_agent_mode`,
+  the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
+  `install.env` and re-run `install.sh` or a full `upgrade.sh`;
+  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
@@ -1114,17 +1122,52 @@ make uninstall
   ```
 - For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).
 
-### 5. The Chat Bot Doesn't Answer
+### 5. Slack Bot Doesn't Answer
+
+When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
+
+- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope and Event Subscriptions (`app_mention`, `message.*`) must be enabled.
+  - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
+  - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
+  - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
+  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Unlisted users are ignored without a reply; an empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
+- **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+
+**Which logs to read:**
+
+- **Default (`mode: today`):**
+  - Check Socket Mode connectivity and token validation in the credential proxy:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
+    ```
+  - Check message reception, allowlist filtering, and agent processing in the gateway pod:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c platform-agent
+    ```
+- **A2A Stack (`spec.mode: next`):**
+  - Check the A2A gateway pod for Socket Mode connection, token errors, and session spawning:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway
+    ```
+  - Check the `PlatformAgent` CR status for gateway enablement:
+    ```bash
+    kubectl get platformagent platform-agent -n kubeagents-system -o yaml
+    ```
+    (The `A2AGateway` condition is present only while the gateway runs nothing: `status: False` with reason `NoChatBackend` when no chat backend is configured, or `WaitingForReplica` while a scaled-up replica comes back. On an install with Slack enabled it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
+
+### 6. Tracing Where a Chat Message Stops
+
+When the checks in the entry above pass and a message still gets no reply, follow it to the component that should answer.
 
 - Find out which component answers chat. An empty result, or `today`, is the default mode; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
   ```
-- **Default mode.** Slack ignores a sender who is not on `SLACK_ALLOWED_USERS` without replying (an empty list admits everyone), so check the list first; it takes Slack member IDs (`U0123ABCD`), not names. Change it in `install.env` and run `./upgrade.sh`. The credential broker holds the Slack connection, and its log says whether the tokens work: `Slack relay enabled workspaces=1` is healthy, `Slack bot token authentication failed` or `Slack relay initialization failed; retrying` is a token or app problem.
+- **Default mode.** The credential broker holds the Slack connection, and its startup lines say whether the tokens work. `Slack relay enabled workspaces=N` means the relay is up with N workspaces. `Slack bot token authentication failed` means Slack's `auth.test` rejected one of the bot tokens in `SLACK_BOT_TOKEN`; the relay still starts on the others. `Slack relay initialization failed; retrying` means no bot token authenticated or the Socket Mode connection with the app token failed, and the broker tries again every 30 seconds. A `Slack relay operation failed` line is something else: one Slack call the agent made failed (its `error` field says why, such as `channel_not_found` or `missing_scope`), not the tokens.
   ```bash
-  kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -i slack
+  kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
   ```
-  The app's Socket Mode, event subscriptions and scopes are covered in [Slack app setup](https://gke-labs.github.io/kube-agents/install/slack-app/#create-the-app).
   On Google Chat, a sender must be on `ALLOWED_USERS` (emails; empty admits everyone), and the Chat app has to publish to the install's Pub/Sub topic ([ChatOps → Google Chat](docs/site/src/content/docs/concepts/chatops.md#google-chat)).
 - **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway (one that already exists is kept at zero replicas), and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
   ```bash
@@ -1132,7 +1175,6 @@ make uninstall
     -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
   kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
   ```
-  With both Google Chat and Slack enabled, Slack is on the default path, not the gateway: use the default-mode check above for it.
 - **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
@@ -1150,7 +1192,7 @@ make uninstall
   kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system
   ```
 
-### 6. A Question Gets No Answer Under `spec.mode: next`
+### 7. A Question Gets No Answer Under `spec.mode: next`
 
 The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
 
