@@ -1112,3 +1112,60 @@ make uninstall
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
   ```
 - For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).
+
+### 5. The Chat Bot Doesn't Answer
+
+- Find out which component answers chat. An empty result, or `today`, is the default mode; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
+  ```
+- **Default mode.** Slack ignores a sender who is not on `SLACK_ALLOWED_USERS` without replying, so check the list first; it takes Slack member IDs (`U0123ABCD`), not names. Change it in `install.env` and run `./upgrade.sh`. The credential broker holds the Slack connection, and its log says whether the tokens work: `Slack relay enabled workspaces=1` is healthy, `Slack bot token authentication failed` or `Slack relay initialization failed; retrying` is a token or app problem.
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -i slack
+  ```
+  The app's Socket Mode, event subscriptions and scopes are covered in [Set up the Slack app](https://gke-labs.github.io/kube-agents/install/slack-app/#scopes-and-events).
+- **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway, and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system \
+    -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
+  kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
+  ```
+  With both Google Chat and Slack enabled, Slack is on the default path, not the gateway: use the default-mode check above for it.
+- **`next`: read the gateway's log.** It starts with `a2a gateway starting` naming the `backend`, a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
+  ```
+  - `dropping message from unverified sender` with the sender's `author`: the allowlist does not admit them, and they were sent the `⛔ I can't verify who you are …` notice once. Add their Slack member ID to `SLACK_ALLOWED_USERS` (their email to `ALLOWED_USERS` for Google Chat) in `install.env` and run `./upgrade.sh`. The allowlist is in [Set up the Slack app](https://gke-labs.github.io/kube-agents/install/slack-app/#allowlist).
+  - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
+  - `slack: ignoring a message from another workspace's member`: a Slack Connect guest. The gateway answers only its own workspace's members.
+  - `gateway exited` with an `err` starting `slack auth.test:`: Slack refused the bot token. Check the token in the install's credentials Secret.
+  - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
+  - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply once the thread has been quiet for 30 minutes, is not a turn. Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+- **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system \
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+  kubectl rollout status deployment/platform-agent-a2a-callout -n kubeagents-system
+  kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system
+  ```
+
+### 6. A Question Gets No Answer Under `spec.mode: next`
+
+The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
+
+- **It stays at `⏳ submitted…`.** Nothing has taken the task. Tasks for the platform agent are run by the `hermes-bridge` container in the agent's pod, which logs `hermes bridge consuming` when it starts and `task accepted` for each task:
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | tail -n 50
+  ```
+  `the bus refused this bridge` means the callout does not admit it (see the bus check in the entry above). After 10 minutes with nothing on the task's stream, your next message in the conversation posts `⚠️ task … has produced nothing on its event stream in 10m0s, so this conversation is released …` and starts over; the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
+  ```bash
+  kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
+  ```
+- **It reads `✅ completed` and no answer posted.** The agent answered by filing a board card, and a card's report does not come back to a gateway conversation: on `next` today that is expected, not a fault you can fix on the install. The agent's log records it as it files the card:
+  ```bash
+  kubectl exec -n kubeagents-system deploy/platform-agent-gateway -c platform-agent -- \
+    sh -c 'grep -rh "kanban event routing" /opt/data/logs /opt/data/profiles/*/logs 2>/dev/null | tail -n 5'
+  ```
+  A line ending `stays addressed to a non-chat origin (no chat route was recorded for it) — a report completed on this card will not reach chat` is this case.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. On Slack, a new top-level mention in a channel starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`🚦 not started: … session workers are already running (cap 10)`.** The conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route and the install's session pods are all in use. Wait, `stop` a task of yours, send `/session off` to go back to the platform agent, or raise `spec.harness.tuning.maxSessions`.
