@@ -462,7 +462,13 @@ so the chain is minted or refused as the relay would have done it. The relay doe
 turn's terminal when the request's own event was lost before it ran (acked, then a gateway crash):
 a session turn's `completed` with neither a child nor a refusal on record runs the request read
 off the stream first. Both outcomes are written to the record when they are made - the child's
-link in the mint's own write, the refusal in its own - so neither path runs a request twice.
+link in the mint's own write, the refusal in its own - so neither path runs a request twice. The wake's text then closes by telling the session the answer is already posted to the user,
+to reply with what it means rather than repeat it, and to say plainly when the answer reports more
+work still running. The wake's pod has no delegate tool (`A2A_DELEGATE_TOOL=off`, set by the
+spawner for a wake turn): a wake that could delegate read an interim answer such as "still
+checking, the results will post here" as a reason to ask again, and each ask woke another pod
+until the depth bound refused, with nothing answered. A new question from the person is a human
+turn and has the tool.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain

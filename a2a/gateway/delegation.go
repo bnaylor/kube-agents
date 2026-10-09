@@ -442,8 +442,16 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else if body = strings.TrimSpace(body); body != "" {
 		text += "\n" + fenceWakeBody("", body)
 	}
-	return text
+	return text + "\n" + wakeReplyGuide
 }
+
+// wakeReplyGuide closes every wake's text. The relay has already posted the
+// child's whole result, so the wake adds what it means rather than repeating
+// it. The wake's pod has no delegate tool (delegateToolFor): an interim
+// answer such as "still checking, the results will post here" is reported
+// as that, not asked again, which is how a wake used to loop to the depth
+// bound with nothing answered.
+const wakeReplyGuide = "That answer has already been posted to the user. Reply in a few sentences with what it means for their question, without repeating it. If it says more is still running or will follow later, say so plainly. You can't delegate on this turn."
 
 // wakeFollowUpMarker opens each follow-up's answer in a wake body that
 // carries a child's turns, numbered from the first follow-up.
@@ -511,8 +519,9 @@ func fenceWakeBody(earlier, last string) string {
 	last = breakBacktickRuns(last, wakeFenceMax-1)
 	body := earlier + last
 	fence := wakeFence(body)
-	// label \n fence \n body \n fence
-	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3
+	// label \n fence \n body \n fence, then \n and the closing guide
+	// (wakeReplyGuide), which wakeText appends after this block.
+	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - len(wakeReplyGuide)
 	if len(body) > budget {
 		if keep := budget - len(last) - len("…") - len(wakeTruncatedNote); earlier != "" && keep >= 0 {
 			body = truncateRunes(earlier, keep) + wakeTruncatedNote + last

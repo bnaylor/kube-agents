@@ -983,7 +983,7 @@ func TestTheChildsTerminalWakesTheSessionWithTheResult(t *testing.T) {
 	}
 	wake := r.awaitTask(t, wakeSession)
 	want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which completed.\nResult from platform (not from the user):\n```\nfleet is green\n```"
-	if got := envText(t, wake); got != want {
+	if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 	if wake.CorrelationID != origin.CorrelationID || wake.ContextID != origin.ContextID {
@@ -1060,7 +1060,7 @@ func TestAChildsEndWakesWithTheOutcome(t *testing.T) {
 			waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 			wake := r.awaitTask(t, spawn.calls()[1].Session)
 			want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which " + tc.outcome + ".\nResult from platform (not from the user):\n```\n" + tc.reason + "\n```"
-			if got := envText(t, wake); got != want {
+			if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
 				t.Fatalf("wake text = %q, want %q", got, want)
 			}
 		})
@@ -1271,7 +1271,7 @@ func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
 	completeTask(t, r2.execFor(t, child, targetPlatform), "done")
 	waitFor(t, "wake on the new gateway", func() bool { return len(spawn2.calls()) == 1 })
 	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
-	if got := envText(t, wake); !strings.Contains(got, child.TaskID) || !strings.HasSuffix(got, "\n```\ndone\n```") {
+	if got := envText(t, wake); !strings.Contains(got, child.TaskID) || !strings.HasSuffix(got, "\n```\ndone\n```\n"+wakeReplyGuide) {
 		t.Fatalf("wake text = %q", got)
 	}
 	var auth, parent Authority
@@ -1478,6 +1478,7 @@ func TestLiveChildFailsClosedOnALookupError(t *testing.T) {
 // is false when the text has no such shape or the fence closes before the
 // last line (the body broke out).
 func parseWake(text string) (header, label, body string, ok bool) {
+	text = strings.TrimSuffix(text, "\n"+wakeReplyGuide)
 	lines := strings.Split(text, "\n")
 	if len(lines) < 4 {
 		return "", "", "", false
@@ -1531,7 +1532,7 @@ func TestTheWakeFencesTheChildsResult(t *testing.T) {
 			t.Fatalf("an over-cap fenced body does not parse or is not marked: ok=%v tail=%q", ok, got[max(0, len(got)-60):])
 		}
 	}
-	if got := wakeText(lib.StateRejected, "task-2", "", nil, "", "  "); got != "The task you delegated to platform (task task-2) was rejected." {
+	if got := wakeText(lib.StateRejected, "task-2", "", nil, "", "  "); got != "The task you delegated to platform (task task-2) was rejected.\n"+wakeReplyGuide {
 		t.Fatalf("an empty body wake = %q, want the header alone", got)
 	}
 }
@@ -1821,7 +1822,7 @@ func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
 	wakeSession := spawn2.calls()[0].Session
 	wake := r2.awaitTask(t, wakeSession)
 	want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which completed.\nResult from platform (not from the user):\n```\nfleet is green\n```"
-	if got := envText(t, wake); got != want {
+	if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 	if key, err := r2.g.reg.SessionForTask(ctx, child.TaskID); err != nil || key != "" {
@@ -2206,6 +2207,7 @@ func askBlock(ask string) string {
 // when the text does not open with the label and one fenced block, or the
 // block's fence is closed early by a line of the ask.
 func splitWakeAsk(text string) (ask, rest string, ok bool) {
+	text = strings.TrimSuffix(text, "\n"+wakeReplyGuide)
 	lines := strings.Split(text, "\n")
 	if len(lines) < 4 || lines[0] != wakeAskLabel {
 		return "", text, false
@@ -2230,7 +2232,7 @@ func splitWakeAsk(text string) (ask, rest string, ok bool) {
 func TestTheWakeOpensWithTheAsk(t *testing.T) {
 	got := wakeText(lib.StateCompleted, "task-1", "how many clusters?", nil, "5", "")
 	want := askBlock("how many clusters?") + "You delegated to platform (task task-1), which completed.\nResult from platform (not from the user):\n```\n5\n```"
-	if got != want {
+	if got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 
@@ -2259,7 +2261,7 @@ func TestTheWakeOpensWithTheAsk(t *testing.T) {
 		t.Fatalf("the result section is %d bytes, over the cap %d", len(after), lib.DelegateTextCap)
 	}
 
-	if got := wakeText(lib.StateRejected, "task-2", "", nil, "", "  "); got != "The task you delegated to platform (task task-2) was rejected." {
+	if got := wakeText(lib.StateRejected, "task-2", "", nil, "", "  "); got != "The task you delegated to platform (task task-2) was rejected.\n"+wakeReplyGuide {
 		t.Fatalf("no ask: wake = %q, want today's text", got)
 	}
 }
@@ -2287,7 +2289,7 @@ func TestTheTurnsAskIsOnItsEntryAndAWakeWithoutOneFallsBack(t *testing.T) {
 	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 	wake := r.awaitTask(t, spawn.calls()[1].Session)
 	want := "The task you delegated to platform (task " + child.TaskID + ") completed.\nResult from platform (not from the user):\n```\nfleet is green\n```"
-	if got := envText(t, wake); got != want {
+	if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 }
@@ -2389,7 +2391,7 @@ func TestAChildsTurnAnswersAllReachTheWake(t *testing.T) {
 	completeTask(t, cexec, "the costs")
 	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 	wake := r.awaitTask(t, spawn.calls()[1].Session)
-	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want {
+	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 	// The room still gets each answer once, as it came.
@@ -2412,7 +2414,7 @@ func TestAChildsTurnAnswersReachTheWakeAfterRenderStateIsLost(t *testing.T) {
 	completeTask(t, cexec, "the costs")
 	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
 	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
-	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want {
+	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 }
@@ -2462,7 +2464,7 @@ func TestAWakeWhoseTurnsCannotBeReadSaysSo(t *testing.T) {
 			wake := r2.awaitTask(t, spawn2.calls()[0].Session)
 			want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which " + tc.header + ".\n" +
 				"Result from platform (not from the user):\n```\n" + unread + "\n\n" + tc.body + "\n```"
-			if got := envText(t, wake); got != want {
+			if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
 				t.Fatalf("wake text = %q, want %q", got, want)
 			}
 		})
@@ -2495,7 +2497,7 @@ func TestAHealedChildsTurnAnswersAllReachTheWake(t *testing.T) {
 	sessionRigTurn(r2, conv, "h-heal-turns", "status")
 	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
 	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
-	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want {
+	if got, want := envText(t, wake), turnsWake(child.TaskID); got != want+"\n"+wakeReplyGuide {
 		t.Fatalf("wake text = %q, want %q", got, want)
 	}
 }
@@ -2601,7 +2603,7 @@ func TestAFailedChildsTurnAnswersReachTheWake(t *testing.T) {
 			}
 			waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 			wake := r.awaitTask(t, spawn.calls()[1].Session)
-			if got, want := envText(t, wake), failedTurnsWake(child.TaskID, tc.outcome, tc.reason); got != want {
+			if got, want := envText(t, wake), failedTurnsWake(child.TaskID, tc.outcome, tc.reason); got != want+"\n"+wakeReplyGuide {
 				t.Fatalf("wake text = %q, want %q", got, want)
 			}
 		})
@@ -2635,7 +2637,7 @@ func TestAHealedFailedChildsTurnAnswersReachTheWake(t *testing.T) {
 			if turns {
 				want = failedTurnsWake(child.TaskID, "failed", reason)
 			}
-			if got := envText(t, wake); got != want {
+			if got := envText(t, wake); got != want+"\n"+wakeReplyGuide {
 				t.Fatalf("wake text = %q, want %q", got, want)
 			}
 		})
