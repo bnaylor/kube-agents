@@ -151,7 +151,10 @@ func TestThePrimerKeepsTheNewestTurnsWhenItMustDropSome(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		turns = append(turns, "\n"+primerFenced("The user said", strings.Repeat("x", 1000)+" turn-"+string(rune('a'+i))))
 	}
-	got := primerFromTurns(turns)
+	got, first := primerFromTurns(turns)
+	if first == 0 {
+		t.Error("primerFromTurns says it kept every turn of a primer past the cap")
+	}
 	if len(got) > primerCap {
 		t.Fatalf("primer is %d bytes, over the %d cap", len(got), primerCap)
 	}
@@ -164,7 +167,7 @@ func TestThePrimerKeepsTheNewestTurnsWhenItMustDropSome(t *testing.T) {
 	if !strings.Contains(got, primerOmitted) {
 		t.Error("the primer doesn't say earlier turns were omitted")
 	}
-	if small := primerFromTurns(turns[:2]); strings.Contains(small, primerOmitted) {
+	if small, _ := primerFromTurns(turns[:2]); strings.Contains(small, primerOmitted) {
 		t.Error("a primer that fits says turns were omitted")
 	}
 }
@@ -251,5 +254,97 @@ func TestThePrimerSaysHowAnUnfinishedTurnEnded(t *testing.T) {
 	}
 	if got := primerTurnEnd(&lib.Task{State: lib.StateCompleted}); got != "" {
 		t.Errorf("completed turn = %q, want nothing", got)
+	}
+}
+
+// A turn dropped to fit the cap is text the pod never reads, so its people
+// don't join the incarnation's set; counting them would overflow the set in
+// a busy conversation and refuse every delegation.
+func TestThePrimerCountsOnlyThePeopleOfTheTurnsItKeeps(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	rec := &SessionRecord{Key: "discord:g1/primer-kept"}
+	for i := 0; i < 12; i++ {
+		who := TaskRequester{Backend: "slack", Subject: "person-" + string(rune('a'+i))}
+		rec.Tasks = append(rec.Tasks, TaskRef{
+			ID: "task-k-" + string(rune('a'+i)), Addressee: "platform",
+			Request: strings.Repeat("x", 1000), Requester: &who,
+		})
+	}
+	primer, authors, _, _ := r.g.buildRehydrationPrimer(ctx, rec, "")
+	if !strings.Contains(primer, primerOmitted) {
+		t.Fatal("fixture assumption broken: the primer fit without dropping turns")
+	}
+	has := func(subject string) bool {
+		for _, a := range authors {
+			if a.Subject == subject {
+				return true
+			}
+		}
+		return false
+	}
+	if has("person-a") {
+		t.Error("the oldest turn was dropped from the primer but its person was counted")
+	}
+	if !has("person-l") {
+		t.Error("the newest turn's person wasn't counted")
+	}
+}
+
+// A turn that asked to delegate ends with the hand-off line, which is never
+// a deliverable: with a child it isn't replayed (the child's answer follows),
+// and refused, the turn says it ended with the gateway's reason. A turn that
+// failed on the stream says so too.
+func TestThePrimerReplaysHandOffsAndFailuresAsTheyEnded(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	someone := TaskRequester{Backend: "discord", Subject: "someone-hash"}
+
+	publish := func(text string, state lib.TaskState, msgID string) *lib.Envelope {
+		t.Helper()
+		r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/primer-ends-" + msgID, Kind: "group", AuthorID: "1001", MessageID: msgID, Text: "ask " + msgID}
+		var origin *lib.Envelope
+		waitFor(t, "the submission for "+msgID, func() bool {
+			for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+				if e.Kind == lib.KindMessage && envText(t, e) == "ask "+msgID {
+					origin = e
+					return true
+				}
+			}
+			return false
+		})
+		exec := r.execFor(t, origin, "platform")
+		if text != "" {
+			if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: text}}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := exec.PublishStatus(ctx, state, true); err != nil {
+			t.Fatal(err)
+		}
+		return origin
+	}
+	minted := publish("delegated to platform", lib.StateCompleted, "d-minted")
+	refused := publish("delegated to platform", lib.StateCompleted, "d-refused")
+	failed := publish("", lib.StateFailed, "d-failed")
+
+	rec := &SessionRecord{Key: "discord:g1/primer-ends", Tasks: []TaskRef{
+		{ID: minted.TaskID, Addressee: "platform", Request: "check the fleet", Requester: &someone, Children: []string{"task-child"}},
+		{ID: refused.TaskID, Addressee: "platform", Request: "check again", Requester: &someone, DelegationEnd: "not allowed to reach platform from here"},
+		{ID: failed.TaskID, Addressee: "platform", Request: "try this", Requester: &someone},
+	}}
+	var primer string
+	waitFor(t, "the three tasks on the stream", func() bool {
+		primer, _, _, _ = r.g.buildRehydrationPrimer(ctx, rec, "")
+		return strings.Contains(primer, "try this") && strings.Contains(primer, "failed")
+	})
+	if strings.Contains(primer, "delegated to platform") {
+		t.Errorf("a hand-off line was replayed as an answer:\n%s", primer)
+	}
+	if !strings.Contains(primer, "failed: not allowed to reach platform from here") {
+		t.Errorf("the refused hand-off doesn't say how it ended:\n%s", primer)
+	}
+	if strings.Count(primer, "That turn ended without finishing") != 2 {
+		t.Errorf("want the refused hand-off and the failed turn marked as ended:\n%s", primer)
 	}
 }

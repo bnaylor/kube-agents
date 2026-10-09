@@ -436,8 +436,9 @@ task's own pod); otherwise the wake is an ordinary session spawn and counts agai
 already relayed, and the room gets the standard cap notice rather than a second one. The wake
 inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod is a fresh
 incarnation that reads the transcript primer like any other, and its text also opens with what the
-human asked, since the primer's copy of the request is capped and cleared at `A2A_ASK_TTL`: the label
-`You were asked:` and the human's message that started the chain, fenced. It is the root turn's
+human asked, so the wake is self-contained: a worker image that doesn't read the primer, during a
+mixed rollout, still has the request and the result. The cost is reading them twice. It opens
+with the label `You were asked:` and the human's message that started the chain, fenced. It is the root turn's
 message, carried down a longer chain, never an intermediate wake's gateway-authored text. Then
 `You delegated to platform (task …), which completed.` (or failed, or was rejected), then the
 result, capped at `lib.DelegateTextCap` and fenced under the label

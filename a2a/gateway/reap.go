@@ -285,6 +285,9 @@ func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
 // the stream is the record.
 func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord, current string) (primer string, authors []TaskRequester, unknown bool, since time.Time) {
 	var turns []string
+	var people [][]TaskRequester // each kept turn's requester and steer authors
+	var started []time.Time
+	var overflow []bool
 	for _, ref := range rec.Tasks {
 		if ref.ID == current {
 			continue
@@ -302,8 +305,15 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
 			said = ref.Request
 		}
-		if task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID); err == nil {
-			if art := task.Artifact(lib.ArtifactResult); art != nil {
+		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
+		if err != nil && !isTaskNotFound(err) {
+			// The stream didn't answer (a transport error, a consumer
+			// refusal, the turn's budget running out): leave the turn out
+			// rather than replay it as asked and never answered.
+			continue
+		}
+		if err == nil {
+			if art := task.Artifact(lib.ArtifactResult); art != nil && len(ref.Children) == 0 {
 				// truncateRunes, not a byte cut: the primer is annotated onto
 				// the next pod and marshalled to JSON on the way, where invalid
 				// UTF-8 becomes U+FFFD rather than an error. spawn.go's outer
@@ -312,18 +322,23 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 				answered = truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
 			}
 			ended = primerTurnEnd(task)
+			// A turn that asked to delegate ended with the hand-off line
+			// ("delegated to <addressee>"), which is never a deliverable.
+			// With a child it is skipped above, and the child's labelled
+			// answer follows; refused, its real end is on the record.
+			if state, reason, handOff := rec.handOffEnd(ref.ID, task.State); handOff {
+				answered = ""
+				ended = string(state) + ": " + truncateRunes(reason, primerTurnEndCap)
+			}
 		}
 		// A task aged out of retention, or one that never produced a
 		// result, still leaves what the user asked.
 		if said == "" && strings.TrimSpace(answered) == "" && ended == "" {
 			continue
 		}
-		authors = append(authors, *ref.Requester)
-		authors = append(authors, ref.SteerAuthors...)
-		unknown = unknown || ref.SteerAuthorsOverflow
-		if !ref.StartedAt.IsZero() && (since.IsZero() || ref.StartedAt.Before(since)) {
-			since = ref.StartedAt
-		}
+		people = append(people, append([]TaskRequester{*ref.Requester}, ref.SteerAuthors...))
+		started = append(started, ref.StartedAt)
+		overflow = append(overflow, ref.SteerAuthorsOverflow)
 		// Each turn's text is fenced the way the wake's is: a user's line
 		// that reads "You: ..." stays inside its own block and cannot pass
 		// for an earlier answer.
@@ -350,7 +365,18 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 	if len(turns) == 0 {
 		return "", nil, false, time.Time{}
 	}
-	return primerFromTurns(turns), authors, unknown, since
+	primer, first := primerFromTurns(turns)
+	// Only the turns the primer carries count: a turn dropped to fit is
+	// text the pod never reads, and counting its people would overflow the
+	// incarnation's set in a busy conversation and refuse every delegation.
+	for i := first; i < len(turns); i++ {
+		authors = append(authors, people[i]...)
+		unknown = unknown || overflow[i]
+		if !started[i].IsZero() && (since.IsZero() || started[i].Before(since)) {
+			since = started[i]
+		}
+	}
+	return primer, authors, unknown, since
 }
 
 // primerHeader and primerOmitted open the primer; the second only when
@@ -363,10 +389,10 @@ const (
 // primerFromTurns joins the turns oldest first, keeping the newest that fit
 // primerCap and dropping whole turns from the front, since a follow-up needs
 // the most recent context most. spawn.go's truncateRunes stays as the
-// backstop for a single turn larger than the cap. The authors returned with
-// the primer still cover every turn read, dropped ones included, which is
-// the stricter side.
-func primerFromTurns(turns []string) string {
+// backstop for a single turn larger than the cap. It returns the primer and
+// the index of the first turn it kept, so the caller counts the people of
+// the kept turns only.
+func primerFromTurns(turns []string) (string, int) {
 	budget := primerCap - len(primerHeader) - len(primerOmitted)
 	start, size := len(turns), 0
 	for start > 0 && size+len(turns[start-1]) <= budget {
@@ -384,7 +410,7 @@ func primerFromTurns(turns []string) string {
 	for _, t := range turns[start:] {
 		b.WriteString(t)
 	}
-	return b.String()
+	return b.String(), start
 }
 
 // primerTurnEnd says how a turn that didn't complete ended (failed,
