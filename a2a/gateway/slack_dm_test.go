@@ -463,3 +463,16 @@ func TestSlackInboundMarksTopLevelDMs(t *testing.T) {
 		}
 	}
 }
+
+// TestSlackDMTopLevelSessionOffPointsAtTheThread: a /session off typed at the
+// top of a DM roots a fresh conversation, so it cannot reach the thread the
+// user routed. It says where the command goes instead of "not on the session
+// route", and a /session off inside a thread keeps the normal reply.
+func TestSlackDMTopLevelSessionOffPointsAtTheThread(t *testing.T) {
+	d := startSlackDMRigWith(t, &fakeSpawner{}, nil)
+	d.adapter.events <- slackMsg("im", "D1", "U1", "/session off", "200.1", "")
+	d.awaitPost(t, "the redirect in the command's own thread", "D1", "200.1", "acts on the thread it")
+
+	d.adapter.events <- slackMsg("im", "D1", "U1", "/session off", "201.1", "200.1")
+	d.awaitPost(t, "the plain reply inside a thread", "D1", "200.1", "not on the session route")
+}

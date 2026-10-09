@@ -1547,6 +1547,13 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
 	if off {
+		// A top-level message in a Slack DM roots a conversation of its own,
+		// so a top-level /session off cannot reach the thread the user routed.
+		// Say where it goes instead of answering for the fresh conversation.
+		if msg.TopLevel && !rec.SessionRouted {
+			g.post(rec.Key, topLevelSessionOffNotice)
+			return true
+		}
 		if !rec.SessionRouted {
 			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
 			return true
@@ -1613,6 +1620,11 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	g.startTask(ctx, rec, msg, backend, principal, authority)
 	return true
 }
+
+// topLevelSessionOffNotice answers a /session off typed at the top of a
+// Slack DM, where it roots a fresh conversation rather than reaching the
+// thread whose session the user means.
+const topLevelSessionOffNotice = "ℹ️ `/session off` acts on the thread it's typed in — reply `/session off` in that question's thread"
 
 // sessionOnAck is the reply to a bare /session. It promises what the backend
 // will deliver: the Slack adapter forwards an unmentioned channel-thread
