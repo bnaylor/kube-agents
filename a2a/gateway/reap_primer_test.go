@@ -55,7 +55,7 @@ func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
 
 	var primer string
 	waitFor(t, "the task's result on the stream", func() bool {
-		primer = r.g.buildRehydrationPrimer(ctx, rec)
+		primer = r.g.buildRehydrationPrimer(ctx, rec, "")
 		return strings.Contains(primer, rune3)
 	})
 
@@ -74,5 +74,64 @@ func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
 	if len(body) < primerTaskResultCap-utf8.UTFMax {
 		t.Errorf("cut task body is %d bytes, further under the %d cap than a rune walk-back explains",
 			len(body), primerTaskResultCap)
+	}
+}
+
+// A fresh pod reads the primer as the conversation so far, so it must carry
+// both sides of each earlier turn: what the user asked (TaskRef.Request) and
+// what came back, labelled by who answered. The turn the pod is being
+// started for is left out, or the new message would be replayed as history,
+// and a turn whose result has aged out still leaves what was asked.
+func TestTheRehydrationPrimerCarriesBothSidesOfEachTurn(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/primer-sides"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group", AuthorID: "1001",
+		MessageID: "d-primer-sides-1", Text: "remember the code word PELICAN",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{
+		Name:  lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "OK, noted."}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &SessionRecord{
+		Key:       conv,
+		ContextID: origin.ContextID,
+		Addressee: "platform",
+		Tasks: []TaskRef{
+			{ID: "task-aged-out", Addressee: "platform", Request: "an older question"},
+			{ID: origin.TaskID, Addressee: "platform", Request: "remember the code word PELICAN"},
+			{ID: origin.TaskID, Addressee: "platform", Role: taskRoleChild},
+			{ID: "task-now", Addressee: "platform", Request: "what was the code word?"},
+		},
+	}
+	var primer string
+	waitFor(t, "the task's result on the stream", func() bool {
+		primer = r.g.buildRehydrationPrimer(ctx, rec, "task-now")
+		return strings.Contains(primer, "OK, noted.")
+	})
+	for _, want := range []string{
+		"User: an older question",
+		"User: remember the code word PELICAN",
+		"You: OK, noted.",
+		"The platform agent, which you delegated to: OK, noted.",
+	} {
+		if !strings.Contains(primer, want) {
+			t.Errorf("primer lacks %q:\n%s", want, primer)
+		}
+	}
+	if strings.Contains(primer, "what was the code word?") {
+		t.Errorf("primer replays the turn being started:\n%s", primer)
+	}
+	if strings.Index(primer, "an older question") > strings.Index(primer, "PELICAN") {
+		t.Errorf("primer is not oldest first:\n%s", primer)
 	}
 }

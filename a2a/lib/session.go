@@ -48,6 +48,12 @@ const (
 	// drifted would leave a pod with the token and the shims but no Bash,
 	// and nothing would say so.
 	EnvClusterView = "A2A_CLUSTER_VIEW"
+	// EnvPrimerFile names the file the spawner mounts the conversation's
+	// transcript primer at (the pod's rehydration-primer annotation, through
+	// the downward API). Every turn is a fresh pod, so this is how one picks
+	// up the conversation it is continuing. Unset, or an empty file, is a
+	// conversation with nothing before this turn.
+	EnvPrimerFile = "A2A_PRIMER_FILE"
 )
 
 const (

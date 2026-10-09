@@ -629,7 +629,10 @@ a new delegation in its conversation (above) until its own terminal, or a heal, 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream - `tasks/get`, which folds each
 task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
-the new pod as its first input. If the harness's own session file
+the new pod as its first input. The primer carries both sides of each earlier turn: what
+the user asked (the copy session-state keeps until `AskTTL`) and each result, labelled by
+who answered. The pod gets it as a downward-API file from its own annotation, and the
+worker puts it ahead of the new message. If the harness's own session file
 happens to survive (it usually won't), `--resume` is a shortcut - correctness never
 depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a

@@ -265,38 +265,60 @@ func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
 	return false
 }
 
-// buildRehydrationPrimer folds the context's tasks from JetStream into a
-// transcript primer for a fresh pod — the next incarnation's first input.
-// Task-stream retention bounds how far back this reaches, deliberately: a
-// three-day-silent thread restarting with fresh context beats a bot that
-// suddenly remembers June. Session files are cache; the stream is the
-// record.
-func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord) string {
+// buildRehydrationPrimer folds the conversation's earlier turns into a
+// transcript primer for a fresh pod, the next incarnation's first input
+// (the worker reads it as lib.EnvPrimerFile and puts it ahead of the new
+// message). Every turn is a fresh pod, so this is all a session knows of the
+// conversation before it. Each human turn contributes what the user asked
+// (TaskRef.Request, the copy session-state keeps until AskTTL) and each task
+// its result from JetStream, labelled by who answered. current is the task
+// the pod is being started for, left out so the new message is not
+// replayed as history. Task-stream retention bounds how far back this
+// reaches, deliberately: a three-day-silent thread restarting with fresh
+// context beats a bot that suddenly remembers June. Session files are cache;
+// the stream is the record.
+func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord, current string) string {
 	var b strings.Builder
-	b.WriteString("Transcript primer, replayed from the task stream for this conversation:\n")
 	found := 0
 	for _, ref := range rec.Tasks {
-		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
-		if err != nil {
-			continue // aged out of retention, or never produced events
+		if ref.ID == current {
+			continue
+		}
+		var said, answered string
+		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
+			said = ref.Request
+		}
+		if task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID); err == nil {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				// truncateRunes, not a byte cut: the primer is annotated onto
+				// the next pod and marshalled to JSON on the way, where invalid
+				// UTF-8 becomes U+FFFD rather than an error. spawn.go's outer
+				// truncateRunes only guards the primer's tail; a byte cut here
+				// lands mid-transcript and survives it.
+				answered = truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
+			}
+		}
+		// A task aged out of retention, or one that never produced a
+		// result, still leaves what the user asked.
+		if said == "" && strings.TrimSpace(answered) == "" {
+			continue
 		}
 		found++
-		fmt.Fprintf(&b, "\n--- task %s (%s)\n", task.ID, task.State)
-		if art := task.Artifact(lib.ArtifactResult); art != nil {
-			// truncateRunes, not a byte cut: the primer is annotated onto
-			// the next pod and marshalled to JSON on the way, where invalid
-			// UTF-8 becomes U+FFFD rather than an error. spawn.go's outer
-			// truncateRunes only guards the primer's tail; a byte cut here
-			// lands mid-transcript and survives it.
-			text := truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
-			b.WriteString(text)
-			b.WriteString("\n")
+		if said != "" {
+			fmt.Fprintf(&b, "\nUser: %s\n", said)
+		}
+		if strings.TrimSpace(answered) != "" {
+			who := "You"
+			if ref.Role == taskRoleChild {
+				who = "The " + ref.Addressee + " agent, which you delegated to"
+			}
+			fmt.Fprintf(&b, "\n%s: %s\n", who, answered)
 		}
 	}
 	if found == 0 {
 		return ""
 	}
-	return b.String()
+	return "Transcript primer, replayed from the task stream for this conversation:\n" + b.String()
 }
 
 // noFirstEventPastGrace is the one test for "this task has produced nothing
