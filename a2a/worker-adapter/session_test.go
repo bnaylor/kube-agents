@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -177,7 +179,10 @@ func TestAReusedPodRoutesSteerAndStopToTheirOwnTask(t *testing.T) {
 if [ "$n" = 2 ]; then echo "$$" > "$dir/pid.2"; exec sleep 60; fi`)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runAdapter(ctx, reuseConfig(url, "task-s-1", session, harness))
+	var logs lockedLog
+	cfg := reuseConfig(url, "task-s-1", session, harness)
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	done := runAdapter(ctx, cfg)
 	waitState(t, c, session, "task-s-1", lib.StateCompleted)
 
 	publishIn(t, c, session, "task-s-1", "a late steer for the first task")
@@ -204,6 +209,32 @@ if [ "$n" = 2 ]; then echo "$$" > "$dir/pid.2"; exec sleep 60; fi`)
 	}
 	cancel()
 	waitOutcome(t, done, 30*time.Second)
+	// Passed over by the watcher itself, not caught one step later by the
+	// respawn check: a steer taken as a task would run it as the request
+	// if the ended task's terminal had not reached the stream.
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "next task taken") && strings.Contains(line, "task=task-s-1 ") {
+			t.Fatalf("the watcher took a late steer or cancel for an ended task as a new task: %s", line)
+		}
+	}
+}
+
+// lockedLog is a log sink the adapter's goroutines and the test can share.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
 
 // SIGTERM in the middle of a later task is that task's eviction, exactly as

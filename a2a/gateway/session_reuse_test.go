@@ -156,6 +156,31 @@ func TestATurnStartsAFreshPodWhenTheLiveOneCannotTakeIt(t *testing.T) {
 	}
 }
 
+// On a conversation marked with a bare /session before the flip, a
+// "/session <text>" turn is an ordinary turn and goes to the live pod the same
+// way.
+func TestASessionCommandTurnGoesToTheLivePod(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, reuseOn)
+	ctx := context.Background()
+	conv := "discord:g1/t-reuse-cmd"
+	_, first, session := sessionTurnVia(t, r, spawn, conv, "", "first question")
+	spawn.setReusable(session)
+	completeTask(t, r.execFor(t, first, session), "first answer")
+	waitIdle(t, r, conv)
+
+	say(r, conv, "m2", "/session second question")
+	second := awaitSubmission(t, r, session, 1)
+	if got := envText(t, second); !strings.Contains(got, "second question") {
+		t.Fatalf("the second submission on %s reads %q", session, got)
+	}
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("%d spawns, want 1: the live pod should have taken the /session turn", n)
+	}
+	if rec, _ := r.g.reg.Get(ctx, conv); rec.BusSession != session {
+		t.Fatalf("busSession = %s, want %s", rec.BusSession, session)
+	}
+}
+
 // A wake into a live pod goes to that pod: the same incarnation, so its
 // author set is the delegating turn's already and nothing is re-seeded, and
 // the wake still carries via, which is what turns its delegate tool off.
@@ -378,6 +403,34 @@ func TestTheSweepClosesTheTaskAReusedPodDiedOn(t *testing.T) {
 	}
 	if d := spawn.deleted(); len(d) != 1 || d[0] != pod {
 		t.Fatalf("deleted %v, want %s", d, pod)
+	}
+
+	// A pod whose conversation has moved on to another pod closes nothing
+	// of the other pod's: the active task there is not this pod's to end.
+	moved := &SessionRecord{
+		Key: "discord:g1/t-sweep-moved", ContextID: "ctx-mv", Kind: "group",
+		Addressee: "chat-heron-new", BusSession: "chat-heron-new", PodName: "chat-heron-new", PodReuse: true,
+		ActiveTask: &ActiveTask{TaskID: "task-mv-2", CorrelationID: "corr-mv-2", SubmittedAt: time.Now()},
+		Tasks:      []TaskRef{{ID: "task-mv-1", Addressee: "chat-heron-old"}, {ID: "task-mv-2", Addressee: "chat-heron-new"}},
+	}
+	if err := r.g.reg.Put(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	old := &lib.Envelope{Kind: lib.KindMessage, TaskID: "task-mv-1", ContextID: "ctx-mv", CorrelationID: "corr-mv-1"}
+	oexec, err := r.bus.NewTaskExecution(old, lib.Party{Session: "chat-heron-old", AgentType: "test-executor"}, "chat-heron-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oexec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	spawn.setOrphans([]orphanPod{{PodName: "chat-heron-old", SessionKey: moved.Key, Addressee: "chat-heron-old",
+		TaskID: "task-mv-1", ContextID: "ctx-mv", CorrelationID: "corr-mv-1"}})
+	r.g.sweepOnce(ctx)
+	for _, addr := range []string{"chat-heron-old", "chat-heron-new"} {
+		if s := supervisorTerminal(t, r, addr, "task-mv-2"); s != nil {
+			t.Fatalf("the old pod's sweep closed the new pod's task on %s: %+v", addr, s)
+		}
 	}
 }
 
