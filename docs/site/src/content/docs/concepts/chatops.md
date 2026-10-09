@@ -117,7 +117,7 @@ With `KAGE_SLACK_UX` on, the harness's own messages stay out of the way on Slack
 
 ## How a chat question is answered under `next`
 
-Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. Two things differ from the default `today` mode: the message reaches the Planning Agent over the message bus, and the card's answer does not come back to the thread. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
+Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from the default `today` mode is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
 
 The commands below assume the default resource names (`platform-agent`) and the `kubeagents-system` namespace. The gateway logs one JSON object per line.
 
@@ -133,7 +133,7 @@ The commands below assume the default resource names (`platform-agent`) and the 
    kubectl logs deployment/platform-agent-gateway -n kubeagents-system -c hermes-bridge | grep -E 'hermes bridge consuming|task accepted'
    ```
 
-   The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread.
+   The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread, and a card it files does not report back to the thread.
 
 3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message and the status line becomes `✅ completed`. The turn has ended; the work has not. The gateway logs the end of the turn:
 
@@ -143,20 +143,20 @@ The commands below assume the default resource names (`platform-agent`) and the 
 
    A message sent while a turn is still running is queued as the next turn in the same session (`✏️ got it, I'll take that next`); the `cli` executor refuses it instead. One sent after the acknowledgement starts a new turn.
 
-4. **The specialist works the card.** The kanban dispatcher in the agent pod starts the specialist against its own profile, with the same identity, permissions and cluster access it has under `today` ([Security and IAM](/kube-agents/reference/security-and-iam/) is canonical). No setting is needed to let it read a cluster. List the cards and read one, including its result once it completes:
+4. **The specialist works the card.** The kanban dispatcher in the agent pod starts the specialist against its own profile, with the same identity, permissions and cluster access it has under `today` ([Security and IAM](/kube-agents/reference/security-and-iam/) is canonical). No setting is needed to let it read a cluster. To inspect the cards and read one:
 
    ```bash
    kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban list
    kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban show <task_id>
    ```
 
-5. **The answer does not reach the thread.** The card's completion is addressed to the bridge's API server session, which has no chat channel, so the result stays on the board and the thread shows nothing after the acknowledgement. This is how `next` behaves today rather than a misconfiguration, and the `cli` executor loses card answers the same way. Under the `api` executor the agent container logs a warning for each such card when it is filed:
+5. **The answer comes back to the thread.** Before each turn the bridge records which conversation its Hermes session answers, so the card is addressed to that conversation. As the specialist works, the gateway posts each progress note into the thread or DM you asked in, and then the card's result. Two things differ from delivery under `today`: each progress note is a message of its own rather than a line added to one message, because the gateway posts but does not edit, and a file the card produced is not attached. If the card blocks or fails, the Planning Agent says so in the same thread. The gateway posts only into a conversation it is still holding, the one whose session record carries the card's context, and refuses anything else. It logs each post it makes:
 
    ```bash
-   kubectl logs deployment/platform-agent-gateway -n kubeagents-system -c platform-agent | grep 'stays addressed to a non-chat origin'
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep -E '"msg":"(chat.notify route armed|notify posted|notify refused)'
    ```
 
-   The line names the session (`a2a-ctx-…`) and ends `a report completed on this card will not reach chat`. Read the result with `hermes kanban show` as in step 4. The Planning Agent is also instructed to answer a question about a card by reading the board, so you can also ask in the same thread what the card found.
+   At startup `chat.notify route armed` should carry `"conversations":true`. Each `notify posted` line names the conversation it posted into in its `thread` field, the same key as the `conversation` field on the question's `ingress` line.
 
 The short-lived session pods that [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) describes are a different path. The gateway starts one only for a message that begins with the word `delegate` (`delegate: check prod-east`), which runs that one task in its own pod, or for a conversation moved onto its session route with the `/session` command. Such a pod reads the cluster only when the operator runs with `A2A_SESSION_CLUSTER_VIEW=true`. Any other message follows the steps above, which that setting does not affect.
 
