@@ -989,6 +989,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			Kind:         "dm",
 			AuthorID:     m.User,
 			MessageID:    m.TimeStamp,
+			TopLevel:     m.ThreadTimeStamp == "",
 			// Decoding also changes what the affordance matchers see. That is
 			// intended, and it is not obvious: normalize (text.go) strips
 			// every non-alphanumeric, so a typed "<stop>" — on the wire as

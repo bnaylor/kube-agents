@@ -25,13 +25,13 @@ const sessionProfile = "chat"
 // surface that carries every message without a mention.
 const sessionKindDM = "dm"
 
-// slackDMNothingRunningNotice answers a "stop" with nothing to stop in a
-// Slack DM conversation that has never run a task. Each DM question is its
-// own conversation in its own thread, so a "stop" typed at the top of the DM
-// is a conversation of its own with no task in it; the notice says where the
-// stop has to go instead. A question's thread whose task has ended gets the
-// plain notice: the user is already in the right place.
-const slackDMNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply `stop` in that question's thread"
+// topLevelNothingRunningNotice answers a "stop" or a status question typed
+// in a message the adapter marked TopLevel: one that roots a conversation of
+// its own (a top-level Slack DM), so nothing is running in it and the task
+// the user means is in another thread. The notice says where to send it. A
+// thread with nothing running, a question refused at the session cap among
+// them, gets the plain reply: the user is already in the right place.
+const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
@@ -838,6 +838,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
+	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text, false):
+		// A status question that roots its own conversation has no task to
+		// report on and must not become one that reads "any update?". Exact
+		// phrases only: with nothing running, a wide match ("how is the
+		// deploy doing") is a real question.
+		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -852,8 +858,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		switch {
 		case active != nil:
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
-		case backend == slackBackend && rec.Kind == sessionKindDM && len(rec.Tasks) == 0:
-			g.post(rec.Key, slackDMNothingRunningNotice)
+		case msg.TopLevel:
+			g.post(rec.Key, topLevelNothingRunningNotice)
 		default:
 			g.post(rec.Key, "🤷 nothing is running")
 		}

@@ -1345,9 +1345,15 @@ edits and answer post in that thread; a DM typed inside a thread is that thread'
 conversation, so it steers the running task or follows up in the same context, as a
 channel thread reply does. Two top-level questions are two conversations. On Slack a
 thread is the session in a DM as in a channel. So `stop`, a status question and
-`/session` act on the thread they are typed in: a `stop` typed at the top of the DM is a
-conversation that has run nothing, and its reply says to send it in the question's
-thread instead; a bare `/session` asks for the next message in its thread.
+`/session` act on the thread they are typed in. A `stop` or a status question typed at
+the top of the DM is a conversation with nothing running in it, so it starts no task
+and its reply says to send it in the question's thread instead; the adapter marks such
+a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
+gateway keys the reply on that mark, not on the conversation's task history, so a
+`stop` in a thread with nothing running (a question refused at the session cap, say)
+gets the plain "nothing is running". A top-level status question matches the exact
+status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
+A bare `/session` asks for the next message in its thread.
 
 The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
 is keyed that way. It is the form a DM record from before DMs threaded carries, so such

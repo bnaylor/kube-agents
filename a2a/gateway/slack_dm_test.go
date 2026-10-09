@@ -70,6 +70,13 @@ type slackDMRig struct {
 // backend behind slackEventAdapter. U1 is listed and mapped; U2 is neither.
 func startSlackDMRig(t *testing.T) *slackDMRig {
 	t.Helper()
+	return startSlackDMRigWith(t, nil, nil)
+}
+
+// startSlackDMRigWith is startSlackDMRig with a spawner (nil: none) and a
+// Config tweak (nil: none), for the session route and its cap.
+func startSlackDMRigWith(t *testing.T, spawn spawner, tweak func(*Config)) *slackDMRig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -106,7 +113,10 @@ func startSlackDMRig(t *testing.T) *slackDMRig {
 		AttributionSalt:   []byte("test-salt"),
 		SlackAllowedUsers: []string{"U1"},
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
+	if tweak != nil {
+		tweak(cfg)
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: slackBackend, Spawner: spawn, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -330,7 +340,7 @@ func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "101.1", "")
-	d.awaitPost(t, "the notice in the stop's own thread", "D1", "101.1", slackDMNothingRunningNotice)
+	d.awaitPost(t, "the notice in the stop's own thread", "D1", "101.1", topLevelNothingRunningNotice)
 	for _, e := range inSubjectEnvelopes(t, d.r.url, "platform") {
 		if e.TaskID == first.TaskID && e.Kind != lib.KindMessage {
 			t.Errorf("a top-level stop sent %s to the question's task", e.Kind)
@@ -349,8 +359,107 @@ func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
 	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "102.1", "100.1")
 	d.awaitPost(t, "the plain notice in the question's thread", "D1", "100.1", "nothing is running")
 	for _, p := range d.posts() {
-		if p.thread == "100.1" && p.text == toMrkdwn(slackDMNothingRunningNotice) {
+		if p.thread == "100.1" && p.text == toMrkdwn(topLevelNothingRunningNotice) {
 			t.Errorf("a stop in the question's own thread was redirected to it: %+v", p)
+		}
+	}
+}
+
+// TestSlackDMTopLevelStatusPointsAtTheThread: a status question typed at the
+// top of the DM is a conversation of its own with nothing running in it. It
+// must not become a task that reads "any update?"; it gets the same
+// redirect a top-level stop gets. The redirect takes the exact status
+// phrases only: a top-level question shaped like the wide match ("how is
+// the deploy doing") is a real ask with nothing to report on, so it starts
+// a task.
+func TestSlackDMTopLevelStatusPointsAtTheThread(t *testing.T) {
+	d := startSlackDMRig(t)
+	ctx := context.Background()
+	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
+	first := d.awaitTasks(t, 1)[0]
+	exec := d.r.execFor(t, first, "platform")
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	d.adapter.events <- slackMsg("im", "D1", "U1", "any update?", "101.1", "")
+	d.awaitPost(t, "the redirect in the status question's own thread", "D1", "101.1", topLevelNothingRunningNotice)
+	waitFor(t, "the gateway to finish the status turn", func() bool {
+		return d.adapter.turnsFinished("slack:dm/D1/101.1") == 1
+	})
+	if got := d.tasks(t); len(got) != 1 {
+		t.Fatalf("a top-level status question started a task: %d task submissions, want 1", len(got))
+	}
+
+	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the deploy doing", "103.1", "")
+	d.awaitTasks(t, 2)
+	for _, p := range d.posts() {
+		if p.thread == "103.1" && p.text == toMrkdwn(topLevelNothingRunningNotice) {
+			t.Errorf("a top-level question was redirected as a status poke: %+v", p)
+		}
+	}
+}
+
+// TestSlackDMStopInARefusedThreadGetsThePlainNotice: a question refused at
+// the session cap leaves a thread conversation with no task in it. A stop
+// typed in that thread is in the right place, so it gets the plain notice,
+// not the redirect to the thread it is already in.
+func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
+	spawn := &fakeSpawner{}
+	spawn.setLive(1)
+	d := startSlackDMRigWith(t, spawn, func(c *Config) {
+		c.DefaultAddressee = RouteSession
+		c.MaxSessions = 1
+	})
+	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
+	d.awaitPost(t, "the cap refusal in the question's thread", "D1", "100.1", "not started")
+	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "102.1", "100.1")
+	d.awaitPost(t, "the plain notice in the refused question's thread", "D1", "100.1", "nothing is running")
+	for _, p := range d.posts() {
+		if p.text == toMrkdwn(topLevelNothingRunningNotice) {
+			t.Errorf("a stop in the question's own thread was redirected: %+v", p)
+		}
+	}
+}
+
+// TestSlackChannelTopLevelControlPhrasesUnchanged: a channel mention roots
+// its own thread too, but the redirect is a DM affordance; a channel
+// mention reading "stop" gets the plain notice and one reading "any
+// update?" is the ordinary turn it always was.
+func TestSlackChannelTopLevelControlPhrasesUnchanged(t *testing.T) {
+	d := startSlackDMRig(t)
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> stop", "400.1", "")
+	d.awaitPost(t, "the plain notice in the mention's thread", "C1", "400.1", "nothing is running")
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> any update?", "401.1", "")
+	d.awaitTasks(t, 1)
+	for _, p := range d.posts() {
+		if p.text == toMrkdwn(topLevelNothingRunningNotice) {
+			t.Errorf("a channel mention got the DM redirect: %+v", p)
+		}
+	}
+}
+
+// TestSlackInboundMarksTopLevelDMs: the adapter is the one party that knows
+// where a message was typed. A top-level DM is marked; a DM thread reply, a
+// channel mention and a channel thread reply are not.
+func TestSlackInboundMarksTopLevelDMs(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.TaskStarted("slack:C1/100.1", "task-0")
+	for _, c := range []struct {
+		name string
+		m    *slackevents.MessageEvent
+		want bool
+	}{
+		{"top-level dm", slackMsg("im", "D1", "U1", "status", "1.0", ""), true},
+		{"dm thread reply", slackMsg("im", "D1", "U1", "status", "1.5", "1.0"), false},
+		{"channel mention", slackMsg("channel", "C1", "U1", "<@UBOT> status", "2.0", ""), false},
+		{"channel thread reply", slackMsg("channel", "C1", "U1", "status", "2.5", "100.1"), false},
+	} {
+		got, ok := a.inbound(context.Background(), c.m)
+		if !ok {
+			t.Fatalf("%s: not delivered", c.name)
+		}
+		if got.TopLevel != c.want {
+			t.Errorf("%s: TopLevel = %v, want %v", c.name, got.TopLevel, c.want)
 		}
 	}
 }
