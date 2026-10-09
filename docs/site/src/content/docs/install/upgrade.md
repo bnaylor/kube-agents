@@ -191,19 +191,16 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
 
   ```bash
   kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
-    | grep -E 'Slack relay (enabled|initialization failed)|Slack bot token'
+    | grep -E 'Slack relay enabled|Slack relay initialization failed|Slack bot token authentication failed'
   ```
 
-  The last line reads `Slack relay enabled workspaces=1`, where the number counts the bot tokens
-  Slack accepted, one per workspace. `Slack bot token authentication failed` means Slack refused
-  one of the bot tokens; it gives the error type and Slack's error, not which token.
-  `Slack relay initialization failed; retrying` means no bot token was accepted or the Socket Mode
-  connection failed, and the broker tries again every 30 seconds. The pattern leaves out
-  `Slack relay operation failed`: the broker logs that when one Slack call the agent makes fails,
-  such as a post to a channel the bot is not in, and it says nothing about the connection. If
-  the command prints nothing, either the startup lines have rotated out of the log on a broker
-  that has run for a while, or Slack's tokens were not set and the relay never started: go by the
-  DM test below.
+  The pattern matches exactly three lines. `Slack relay enabled workspaces=1` as the last line is
+  the healthy reading: the number counts the bot tokens Slack accepted, one per workspace.
+  `Slack bot token authentication failed` means Slack refused one of the bot tokens; it gives the
+  error type and Slack's error, not which token. `Slack relay initialization failed; retrying`
+  means no bot token was accepted or the Socket Mode connection failed, and the broker tries again
+  every 30 seconds. No output has no reading of its own (on a broker that has run for a while the
+  startup lines may have rotated out of the log): go by the DM test below.
 
 - **`next`**: the A2A gateway.
 
@@ -218,7 +215,9 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
   connection failed. One with no `slack connected` before it means the gateway's first call to
   Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
   (a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
-  way.
+  way. No output means the gateway has not tried Slack yet: it first joins the bus, retrying for up
+  to 45 seconds, and exits if that fails. Wait a minute and run the command again. If the pod's
+  restart count is climbing, `kubectl logs ... --previous` shows why the last run exited.
 
 Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
 AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
@@ -244,13 +243,16 @@ as in [Checking the result](#slack), and leave the Slack app as it is.
 2. Check the Slack settings `next` depends on:
    - The bot token is one `xoxb-` token, not a comma-separated list: the A2A gateway takes a
      single workspace's token
-     ([Get the tokens](/kube-agents/install/slack-app/#get-the-tokens)). This prints `0` for a
-     single token, without printing the token:
+     ([Get the tokens](/kube-agents/install/slack-app/#get-the-tokens)). This counts the
+     `xoxb-` tokens in the installer's Secret without printing them, and should print `1`:
 
      ```bash
      kubectl get secret platform-agent-secrets -n kubeagents-system \
-       -o jsonpath='{.data.SLACK_BOT_TOKEN}' | base64 -d | tr -cd ',' | wc -c
+       -o jsonpath='{.data.SLACK_BOT_TOKEN}' | base64 -d | tr ',' '\n' | grep -c '^xoxb-'
      ```
+
+     `0` means nothing was read: check that the `PlatformAgent`'s
+     `spec.integration.slack.botTokenSecretRef`, if set, names this Secret and key.
 
    - `SLACK_ALLOWED_USERS` in `install.env` holds member IDs such as `U0123ABCD`, not emails
      ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
