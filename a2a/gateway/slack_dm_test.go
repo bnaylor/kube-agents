@@ -1,0 +1,282 @@
+package gateway
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/slack-go/slack/slackevents"
+)
+
+// slackEventAdapter is a real SlackAdapter, over the fake Web API, whose Run
+// reads message events from a channel and hands them through the adapter's
+// own inbound filter, so a test drives the gateway with what Slack would
+// deliver rather than with a conversation key it wrote by hand. raw carries
+// an InboundMessage straight to the gateway, for the record a previous
+// version of the adapter would have keyed.
+type slackEventAdapter struct {
+	*SlackAdapter
+	events chan *slackevents.MessageEvent
+	raw    chan InboundMessage
+}
+
+func (s *slackEventAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case m := <-s.events:
+			if msg, ok := s.inbound(ctx, m); ok {
+				handler(msg)
+			}
+		case msg := <-s.raw:
+			handler(msg)
+		}
+	}
+}
+
+type slackDMRig struct {
+	api     *fakeSlackAPI
+	adapter *slackEventAdapter
+	r       *rig
+}
+
+// startSlackDMRig runs a gateway on an embedded server with the Slack
+// backend behind slackEventAdapter. U1 is listed and mapped; U2 is neither.
+func startSlackDMRig(t *testing.T) *slackDMRig {
+	t.Helper()
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U1 test:one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-slack-dm"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	if err != nil {
+		t.Fatalf("executor client: %v", err)
+	}
+	t.Cleanup(bus.Close)
+
+	api := &fakeSlackAPI{members: []string{"U1"}}
+	adapter := &slackEventAdapter{
+		SlackAdapter: newTestSlackAdapter(api),
+		events:       make(chan *slackevents.MessageEvent, 16),
+		raw:          make(chan InboundMessage, 16),
+	}
+	cfg := &Config{
+		NATSURL:           url,
+		PrincipalMapPath:  mapFile,
+		DefaultAddressee:  "platform",
+		IdleTTL:           30 * time.Minute,
+		AttributionSalt:   []byte("test-salt"),
+		SlackAllowedUsers: []string{"U1"},
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = g.Run(ctx) }()
+	return &slackDMRig{api: api, adapter: adapter, r: &rig{g: g, client: client, bus: bus, url: url}}
+}
+
+type slackPost struct{ channel, thread, text string }
+
+func (d *slackDMRig) posts() []slackPost {
+	d.api.mu.Lock()
+	defer d.api.mu.Unlock()
+	out := make([]slackPost, 0, len(d.api.posted))
+	for _, p := range d.api.posted {
+		out = append(out, slackPost{p.channel, p.thread, p.text})
+	}
+	return out
+}
+
+// awaitPost waits for a post into channel/thread whose text contains want
+// ("" matches any post there).
+func (d *slackDMRig) awaitPost(t *testing.T, what, channel, thread, want string) {
+	t.Helper()
+	waitFor(t, what, func() bool {
+		for _, p := range d.posts() {
+			if p.channel == channel && p.thread == thread && strings.Contains(p.text, want) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// tasks returns the task submissions on the platform's in subject, one per
+// task id in first-seen order: a steer reuses its task's id, so it adds no
+// entry here.
+func (d *slackDMRig) tasks(t *testing.T) []*lib.Envelope {
+	t.Helper()
+	seen := map[string]bool{}
+	var out []*lib.Envelope
+	for _, e := range inSubjectEnvelopes(t, d.r.url, "platform") {
+		if e.Kind == lib.KindMessage && !seen[e.TaskID] {
+			seen[e.TaskID] = true
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (d *slackDMRig) awaitTasks(t *testing.T, n int) []*lib.Envelope {
+	t.Helper()
+	var got []*lib.Envelope
+	waitFor(t, "task submissions", func() bool {
+		got = d.tasks(t)
+		return len(got) >= n
+	})
+	return got
+}
+
+// TestSlackDMQuestionsAnswerInTheirOwnThreads is the decided behaviour for
+// a Slack DM on next, matching the Hermes Slack platform's default: each
+// top-level DM question is its own conversation, answered in its own
+// thread, and a reply typed inside that thread is the same conversation --
+// a steer while the task runs, a follow-up in the same context after it --
+// and stays in that thread. A second top-level question is a second
+// conversation with a second thread. Nothing in the DM is posted top-level.
+func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
+	d := startSlackDMRig(t)
+	ctx := context.Background()
+
+	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
+	first := d.awaitTasks(t, 1)[0]
+	d.awaitPost(t, "the placeholder in the question's thread", "D1", "100.1", "")
+
+	exec := d.r.execFor(t, first, "platform")
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// A reply in the thread while the task runs steers that task.
+	d.adapter.events <- slackMsg("im", "D1", "U1", "focus on us-east", "100.5", "100.1")
+	waitFor(t, "the steer envelope", func() bool {
+		return len(inSubjectEnvelopes(t, d.r.url, "platform")) >= 2
+	})
+	envs := inSubjectEnvelopes(t, d.r.url, "platform")
+	if steer := envs[len(envs)-1]; steer.TaskID != first.TaskID {
+		t.Fatalf("a reply in the DM thread minted task %s; it should steer %s", steer.TaskID, first.TaskID)
+	}
+	d.awaitPost(t, "the steer acknowledgement in the thread", "D1", "100.1", "steering sent")
+
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "the fleet is fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	d.awaitPost(t, "the answer in the question's thread", "D1", "100.1", "the fleet is fine")
+
+	// A reply in the thread after the answer is a follow-up: a new task in
+	// the same conversation's context.
+	d.adapter.events <- slackMsg("im", "D1", "U1", "and prod?", "100.9", "100.1")
+	tasks := d.awaitTasks(t, 2)
+	followUp := tasks[1]
+	if followUp.ContextID != first.ContextID {
+		t.Fatalf("the in-thread follow-up ran in context %s, want the thread's %s", followUp.ContextID, first.ContextID)
+	}
+
+	// A second top-level question is a second conversation in its own thread.
+	d.adapter.events <- slackMsg("im", "D1", "U1", "what about the nodes", "200.1", "")
+	tasks = d.awaitTasks(t, 3)
+	second := tasks[2]
+	if second.ContextID == first.ContextID {
+		t.Fatalf("a second top-level DM shares context %s with the first; it should be its own conversation", second.ContextID)
+	}
+	d.awaitPost(t, "the second question's placeholder in its own thread", "D1", "200.1", "")
+
+	for _, p := range d.posts() {
+		if p.channel == "D1" && p.thread == "" {
+			t.Errorf("a post landed top-level in the DM: %+v", p)
+		}
+	}
+}
+
+// TestSlackLegacyDMRecordStillRelaysItsTerminal is the upgrade case. A task
+// started under the thread-less key every DM had before DMs threaded,
+// slack:dm/{channel}, is still relayed: its placeholder and its answer post
+// top-level, where its ask was. A top-level DM sent while it runs is a new
+// question in its own thread, not a steer into the old task.
+func TestSlackLegacyDMRecordStillRelaysItsTerminal(t *testing.T) {
+	d := startSlackDMRig(t)
+	ctx := context.Background()
+
+	d.adapter.raw <- InboundMessage{Conversation: "slack:dm/D1", Kind: "dm", AuthorID: "U1", MessageID: "50.1", Text: "an ask from before the upgrade"}
+	legacy := d.awaitTasks(t, 1)[0]
+	d.awaitPost(t, "the legacy placeholder, top-level", "D1", "", "")
+	exec := d.r.execFor(t, legacy, "platform")
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	d.adapter.events <- slackMsg("im", "D1", "U1", "a new question", "60.1", "")
+	tasks := d.awaitTasks(t, 2)
+	if tasks[1].TaskID == legacy.TaskID || tasks[1].ContextID == legacy.ContextID {
+		t.Fatalf("a top-level DM joined the legacy conversation: task %s context %s", tasks[1].TaskID, tasks[1].ContextID)
+	}
+	d.awaitPost(t, "the new question's placeholder in its thread", "D1", "60.1", "")
+
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "legacy answer"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	d.awaitPost(t, "the legacy task's answer, top-level", "D1", "", "legacy answer")
+}
+
+// TestSlackDMRefusalIsOncePerSenderAcrossThreads: the unverified-sender
+// notice stays keyed by sender, not by conversation, so a refused sender who
+// asks two top-level questions (two conversations now) hears it once, in
+// the first question's thread, and nothing is published.
+func TestSlackDMRefusalIsOncePerSenderAcrossThreads(t *testing.T) {
+	d := startSlackDMRig(t)
+	// One at a time: two top-level DMs are two conversations, whose queue
+	// workers run concurrently, so sent together either could post first.
+	d.adapter.events <- slackMsg("im", "D2", "U2", "drain node 4", "10.1", "")
+	d.awaitPost(t, "the unverified-sender notice in the first thread", "D2", "10.1", "can't verify")
+	d.adapter.events <- slackMsg("im", "D2", "U2", "drain node 5", "11.1", "")
+	time.Sleep(200 * time.Millisecond)
+	var notices []slackPost
+	for _, p := range d.posts() {
+		if p.channel == "D2" {
+			notices = append(notices, p)
+		}
+	}
+	if len(notices) != 1 {
+		t.Fatalf("posts to the refused sender's DM = %+v, want exactly one notice", notices)
+	}
+	if got := len(inSubjectEnvelopes(t, d.r.url, "platform")); got != 0 {
+		t.Errorf("%d task envelopes published for an unlisted sender", got)
+	}
+}
+
+// TestSlackChannelMentionStillThreadsOnTheMention: the channel path is
+// unchanged by DM threading -- a mention roots its session on its own ts and
+// the placeholder posts in that thread.
+func TestSlackChannelMentionStillThreadsOnTheMention(t *testing.T) {
+	d := startSlackDMRig(t)
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet", "300.1", "")
+	d.awaitTasks(t, 1)
+	d.awaitPost(t, "the placeholder in the mention's thread", "C1", "300.1", "")
+}

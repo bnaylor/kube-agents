@@ -46,7 +46,8 @@ pod at a time.** Concretely:
 
 - The session key is the backend-qualified conversation id - a DM, or a thread in a
   group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
-  space is not a session; a conversation in it is.
+  space is not a session; a conversation in it is. A Slack DM is threaded like a
+  channel, so there a thread in the DM is the session (the Slack adapter section).
 - `contextId` is minted at first contact with a conversation and persists across pod
   incarnations for the lifetime of the session record (until pruned after `A2A_SESSION_TTL`
   of inactivity). It is the durable name of the conversation on the bus. Minting MUST be create-only (a KV
@@ -1333,13 +1334,26 @@ frozen gateway goes quiet instead, because it reaches Chat only through the brok
 relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
 behaviour documented (2026-10-06).
 
-**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
-threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
-channel mention binds the session to the mention message's own ts as thread root, with
-no thread-creation failure mode to handle. Session semantics are unchanged: the whole
-DM is one conversation, a channel is not a session, a thread in it is.
+**Conversation keys.** `slack:{channel}/{thread_ts}` for a channel thread and
+`slack:dm/{channel}/{thread_ts}` for a DM thread. Slack threads are implicit - replying
+with a `thread_ts` creates one - so a channel mention binds the session to the mention
+message's own ts as thread root, with no thread-creation failure mode to handle. A DM is
+keyed the same way, to match the Hermes Slack platform on `today` (2026-10-08): a
+top-level DM is a new conversation rooted on its own ts, and its placeholder, status
+edits and answer post in that thread; a DM typed inside a thread is that thread's
+conversation, so it steers the running task or follows up in the same context, as a
+channel thread reply does. Two top-level questions are two conversations. A channel is
+not a session, a thread in it is, and the same now holds for a DM.
 
-**Which messages become turns.** DMs carry every message. A channel message must
+The thread-less `slack:dm/{channel}` is what every DM was keyed as before DMs threaded.
+It still parses and posts top-level, so a record minted under it relays its task's
+terminal into the DM where the ask was; nothing new is keyed that way, so a message sent
+after the upgrade starts its own thread rather than steering that task. It is also what
+`OpenDirect` returns, which makes a post the user did not ask for a new top-level
+message; a reply under it roots its own conversation.
+
+**Which messages become turns.** DMs carry every message, in a thread or not; a DM
+thread needs no task started in it to carry a reply. A channel message must
 mention the bot, and the ask's own ts is the thread the session will live in. A thread
 reply is a turn when it mentions the bot or the thread is a session thread - one the
 gateway has started a task in. That is what lets a session thread carry every message
