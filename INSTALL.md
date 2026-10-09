@@ -1162,8 +1162,8 @@ The gateway posts a status line for every task ([what a task looks like](docs/si
   ```bash
   kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
   ```
-- **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. On Google Chat the gateway posts it into the conversation you asked in; on Slack it does not, so this is expected there. On Google Chat, check each hop:
-  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `conversations=true`. `chat.notify route not armed` with an `err` means `spec.integration.googleChat.homeChannel` is set but is not a space name (`spaces/<id>`): correct or remove it. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
+- **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. The gateway posts a card's report into the conversation you asked in, on Slack and Google Chat alike. Check each hop:
+  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `conversations=true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations and logs `chat.notify home posts not armed: … conversation posts are`. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
