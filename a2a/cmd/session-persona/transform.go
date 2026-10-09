@@ -86,20 +86,37 @@ var (
 	headingRE = regexp.MustCompile(`^(#{1,6})\s`)
 	// shellLangs are the info strings whose blocks hold commands.
 	shellLangs = map[string]bool{"bash": true, "sh": true, "shell": true, "console": true, "zsh": true}
-	// kubectlReadVerbs are the kubectl subcommands that only read. The
-	// classifier is an allowlist: a verb not named here is treated as a
-	// write, so a new skill step fails toward "propose" rather than "run".
-	kubectlReadVerbs = map[string]bool{
-		"get": true, "describe": true, "logs": true, "top": true, "explain": true,
-		"api-resources": true, "api-versions": true, "version": true, "cluster-info": true,
-		"events": true, "auth": true, "config": true,
+	// The read tables below have to be a subset of what the credential
+	// broker lets a session run: agents/platform/scripts/command_policy.py
+	// (KUBECTL_READ_VERBS, KUBECTL_REFUSED_SUBCOMMANDS, GCLOUD_READ_COMMANDS),
+	// narrowed for the session role by credential_proxy.py
+	// (SESSION_KUBECTL_REFUSED_VERBS). A block left unmarked is one the
+	// preamble tells the model to run, so a read here that the broker refuses
+	// is a refusal the model walks into. TestReadTablesAreASubsetOfTheBroker
+	// reads those tables from the Python source and fails on drift.
+	//
+	// kubectlReadCommands are the kubectl verbs, and verb-subverb pairs, that
+	// only read. The classifier is an allowlist: a verb not named here is
+	// treated as a write, so a new skill step fails toward "propose" rather
+	// than "run". A group verb with a writing member (`auth reconcile`,
+	// `config use-context`, `rollout restart`) is listed only by its reading
+	// pairs. `config view` is not one: the broker refuses it because
+	// `--flatten` prints the token. `wait` and `rollout status` are reads the
+	// broker refuses a session, because both hold a broker slot until they
+	// finish.
+	kubectlReadCommands = map[string]bool{
+		"api-resources": true, "api-versions": true, "cluster-info": true, "describe": true,
+		"events": true, "explain": true, "get": true, "logs": true, "top": true, "version": true,
+		"auth can-i": true, "auth whoami": true,
+		"config current-context": true, "config get-contexts": true,
+		"rollout history": true,
 	}
-	// kubectlReadSubverbs narrows the verbs above that are command groups
-	// with a writing member: `auth reconcile` writes RBAC, and `config`
-	// rewrites the kubeconfig every read depends on.
-	kubectlReadSubverbs = map[string]map[string]bool{
-		"auth":   {"can-i": true, "whoami": true},
-		"config": {"view": true, "current-context": true, "get-contexts": true, "get-clusters": true},
+	// kubectlRefusedSubcommands are pairs whose verb reads on its own but
+	// whose subcommand does not: `cluster-info dump --output-directory`
+	// writes files wherever it is told. Matched against any later word, so a
+	// flag between the two does not hide it.
+	kubectlRefusedSubcommands = map[string]bool{
+		"cluster-info dump": true,
 	}
 	// kubectlValueFlags are the global flags that can precede the verb with
 	// their value as a separate word. Any other flag in that position makes
@@ -108,12 +125,77 @@ var (
 		"-n": true, "--namespace": true, "--context": true, "--kubeconfig": true,
 		"--cluster": true, "--user": true,
 	}
-	// gcloudReadVerbs are the gcloud command-group leaves that only read.
-	// get-credentials writes a local kubeconfig, which is how every other
-	// read here reaches the cluster; the credential broker serves it.
-	gcloudReadVerbs = map[string]bool{
-		"describe": true, "list": true, "read": true, "get-credentials": true,
-		"get-iam-policy": true, "get-server-config": true, "info": true, "version": true,
+	// gcloudReadCommands are the gcloud command paths that only read,
+	// matched as a prefix of the command's leading words the way the broker
+	// matches them, so positional arguments after the path are allowed. A
+	// release track (`beta`) is a word like any other: each track's path is
+	// listed on its own. get-credentials writes a local kubeconfig, which is
+	// how every other read here reaches the cluster; the broker serves it.
+	gcloudReadCommands = map[string]bool{
+		"artifacts docker images describe":             true,
+		"artifacts repositories describe":              true,
+		"artifacts repositories list":                  true,
+		"asset search-all-resources":                   true,
+		"auth list":                                    true,
+		"beta compute advice calendar-mode":            true,
+		"beta compute advice capacity":                 true,
+		"beta compute advice capacity-history":         true,
+		"beta monitoring metrics-scopes describe":      true,
+		"billing budgets list":                         true,
+		"compute addresses describe":                   true,
+		"compute addresses list":                       true,
+		"compute backend-services list":                true,
+		"compute disks describe":                       true,
+		"compute disks list":                           true,
+		"compute firewall-rules describe":              true,
+		"compute firewall-rules list":                  true,
+		"compute forwarding-rules describe":            true,
+		"compute forwarding-rules list":                true,
+		"compute instance-groups managed describe":     true,
+		"compute instance-groups managed list":         true,
+		"compute instances describe":                   true,
+		"compute instances get-serial-port-output":     true,
+		"compute instances list":                       true,
+		"compute machine-types list":                   true,
+		"compute networks describe":                    true,
+		"compute networks list":                        true,
+		"compute networks subnets describe":            true,
+		"compute networks subnets list":                true,
+		"compute networks subnets list-usable":         true,
+		"compute project-info describe":                true,
+		"compute regions describe":                     true,
+		"compute regions list":                         true,
+		"compute reservations list":                    true,
+		"compute routers describe":                     true,
+		"compute routers get-nat-mapping-info":         true,
+		"compute routers get-status":                   true,
+		"compute routers list":                         true,
+		"compute security-policies list":               true,
+		"compute shared-vpc list-associated-resources": true,
+		"compute snapshots describe":                   true,
+		"compute snapshots list":                       true,
+		"compute sole-tenancy node-groups list":        true,
+		"compute sole-tenancy node-groups list-nodes":  true,
+		"compute target-pools list":                    true,
+		"config get":                                   true,
+		"config get-value":                             true,
+		"config list":                                  true,
+		"container ai profiles list":                   true,
+		"container ai profiles manifests create":       true,
+		"container ai profiles models list":            true,
+		"container clusters describe":                  true,
+		"container clusters get-credentials":           true,
+		"container clusters list":                      true,
+		"container get-server-config":                  true,
+		"container node-pools describe":                true,
+		"container node-pools list":                    true,
+		"container operations list":                    true,
+		"info":                                         true,
+		"logging read":                                 true,
+		"projects describe":                            true,
+		"projects get-iam-policy":                      true,
+		"projects list":                                true,
+		"version":                                      true,
 	}
 )
 
@@ -349,7 +431,9 @@ func classifyBlock(lang string, body []string) blockClass {
 
 // splitShell splits a command line on pipes and command separators that sit
 // outside quotes. The first segment is the command; a later one is either a
-// pipe target or a second command, and both are classified.
+// pipe target or a second command, and both are classified. A backslash
+// escapes the next character outside single quotes, as in the shell, so an
+// escaped quote inside a double-quoted filter does not end it.
 func splitShell(line string) []string {
 	var segs []string
 	var cur strings.Builder
@@ -358,6 +442,10 @@ func splitShell(line string) []string {
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		switch {
+		case r == '\\' && quote != '\'' && i+1 < len(runes):
+			cur.WriteRune(r)
+			i++
+			cur.WriteRune(runes[i])
 		case quote != 0:
 			if r == quote {
 				quote = 0
@@ -387,6 +475,14 @@ func classifyCommand(cmd string) blockClass {
 	if len(fields) == 0 {
 		return blockInert
 	}
+	switch fields[0] {
+	case "kubectl":
+		// Judged on its own verb first, so `kubectl exec|debug|run ...
+		// -- kubectl ...` is the write its verb makes it, whatever it wraps.
+		return classifyKubectl(fields[1:])
+	case "gcloud":
+		return classifyGcloud(fields[1:])
+	}
 	// A kubectl or gcloud behind a wrapper (env, timeout, xargs) is judged
 	// as itself, so a write keeps its propose note; the wrapper is still a
 	// program the session can't run.
@@ -398,39 +494,51 @@ func classifyCommand(cmd string) blockClass {
 			return blockUnavailable
 		}
 	}
-	switch fields[0] {
-	case "kubectl":
-		args := fields[1:]
-		for i := 0; i < len(args); i++ {
-			f := args[i]
-			if kubectlValueFlags[f] {
-				i++ // the flag's value, not the verb
-				continue
-			}
-			if strings.HasPrefix(f, "-") {
-				continue
-			}
-			if !kubectlReadVerbs[f] {
+	return blockUnavailable
+}
+
+// classifyKubectl judges kubectl's arguments by the verb and the bare word
+// after it, against kubectlReadCommands and kubectlRefusedSubcommands.
+func classifyKubectl(args []string) blockClass {
+	for i := 0; i < len(args); i++ {
+		f := args[i]
+		if kubectlValueFlags[f] {
+			i++ // the flag's value, not the verb
+			continue
+		}
+		if strings.HasPrefix(f, "-") {
+			continue
+		}
+		rest := args[i+1:]
+		for _, w := range rest {
+			if kubectlRefusedSubcommands[f+" "+w] {
 				return blockWrite
 			}
-			if subs, grouped := kubectlReadSubverbs[f]; grouped && (i+1 >= len(args) || !subs[args[i+1]]) {
-				return blockWrite
-			}
+		}
+		if (len(rest) > 0 && kubectlReadCommands[f+" "+rest[0]]) || kubectlReadCommands[f] {
 			return blockRead
 		}
 		return blockWrite
-	case "gcloud":
-		for _, f := range fields[1:] {
-			if strings.HasPrefix(f, "-") || strings.HasPrefix(f, placeholderOpen) || strings.HasPrefix(f, quoteChar) {
-				break
-			}
-			if gcloudReadVerbs[f] {
-				return blockRead
-			}
-		}
-		return blockWrite
 	}
-	return blockUnavailable
+	return blockWrite
+}
+
+// classifyGcloud judges gcloud's arguments by their leading bare words,
+// which have to start with a path in gcloudReadCommands. The words stop at
+// the first flag, placeholder or quoted argument: a flag's arity is not
+// known here, so a path that only appears after one is a write.
+func classifyGcloud(args []string) blockClass {
+	var path []string
+	for _, f := range args {
+		if strings.HasPrefix(f, "-") || strings.HasPrefix(f, placeholderOpen) || strings.HasPrefix(f, quoteChar) {
+			break
+		}
+		path = append(path, f)
+		if gcloudReadCommands[strings.Join(path, " ")] {
+			return blockRead
+		}
+	}
+	return blockWrite
 }
 
 // insertPreamble places sessionPreamble after the first H1, or at the top of

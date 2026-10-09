@@ -27,7 +27,7 @@ const (
 // denylist, written independently of the transform's allowlists, so the two
 // have to agree for the read-only test to pass.
 var writeCommandRE = regexp.MustCompile(
-	`\bkubectl\s+(apply|create|delete|patch|edit|replace|scale|autoscale|annotate|label|set|rollout|cordon|uncordon|drain|taint|expose|run|cp|exec)\b` +
+	`\bkubectl\s+(apply|create|delete|patch|edit|replace|scale|autoscale|annotate|label|set|rollout\s+(?:restart|undo|pause|resume)|cordon|uncordon|drain|taint|expose|run|cp|exec|debug|attach)\b` +
 		`|\bgcloud\b[^\n` + "`" + `]*\s(create|delete|update|upgrade|resize|add-iam-policy-binding|remove-iam-policy-binding|set-iam-policy|enable|disable|deploy)\b`)
 
 // otherProgramRE finds a command line that runs a program the worker image
@@ -330,7 +330,32 @@ func TestClassifyBlock(t *testing.T) {
 		{"", "plain output", blockInert},
 		{"bash", "kubectl auth can-i list pods", blockRead},
 		{"bash", "kubectl auth reconcile -f rbac.yaml", blockWrite},
-		{"bash", "kubectl config view", blockRead},
+		{"bash", "kubectl config view", blockWrite},
+		{"bash", "kubectl config get-clusters", blockWrite},
+		{"bash", "kubectl config current-context", blockRead},
+		{"bash", "kubectl cluster-info", blockRead},
+		{"bash", "kubectl cluster-info dump", blockWrite},
+		{"bash", "kubectl cluster-info --output-directory=/tmp/x dump", blockWrite},
+		{"bash", "kubectl rollout history deploy/x", blockRead},
+		{"bash", "kubectl rollout status deploy/x", blockWrite},
+		{"bash", "kubectl wait --for=condition=Ready pod/p", blockWrite},
+		{"bash", "gcloud iam service-accounts describe sa@p.iam.gserviceaccount.com", blockWrite},
+		{"bash", "gcloud sql instances list", blockWrite},
+		{"bash", "gcloud run services describe s", blockWrite},
+		{"bash", "gcloud container clusters get-credentials c --region r", blockRead},
+		{"bash", "gcloud container clusters list", blockRead},
+		{"bash", "gcloud beta compute advice capacity --region r", blockRead},
+		{"bash", "gcloud compute advice capacity --region r", blockWrite},
+		{"bash", "gcloud --project p container clusters list", blockWrite},
+		// A kubectl write verb that wraps another kubectl or gcloud is the
+		// write its own verb makes it, not a wrapper.
+		{"bash", "kubectl exec p -- gcloud auth list", blockWrite},
+		{"bash", "kubectl debug node/n -it --image=busybox -- kubectl get pods", blockWrite},
+		{"bash", "kubectl run tmp --image=bitnami/kubectl -- kubectl version", blockWrite},
+		// An escaped quote inside a double-quoted filter does not end it,
+		// so a pipe later in the filter is not a pipe.
+		{"bash", `gcloud logging read "resource.labels.pod_name=\"p\" AND textPayload=~\"a|b\"" --project p`, blockRead},
+		{"bash", `gcloud logging read "x=\"y\"" | head`, blockPipe},
 		{"bash", "kubectl config use-context other", blockWrite},
 		{"bash", "env FOO=1 kubectl delete pod p", blockWrite},
 		{"bash", "kubectl get pods -o name | xargs kubectl delete", blockWrite},
