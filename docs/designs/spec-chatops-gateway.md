@@ -559,7 +559,7 @@ pod has no Workload Identity. **Amended 9/8:** it does now carry a ServiceAccoun
 bus credential of its own. The static `worker` password is gone from the pod entirely; in
 its place is a projected ServiceAccount token, audience-bound to the bus and bound by the
 kubelet to this pod, which the auth callout resolves into grants derived from the attested
-pod name - this task's events, this session's three consumers, this session's inbox. The
+pod name - this incarnation's events (every task it serves), this session's three consumers, this session's inbox. The
 harness can still read that credential, because it runs at the same UID in the same pod;
 what changed is that reading it buys the authority the harness already had (gke-labs#1270).
 The deployment spec owns the reasoning. Direct Vertex via WI
@@ -567,20 +567,22 @@ stays the target, and arming it is a policy change as well as an IAM one: the se
 egress fence encodes the shipped path (no 443, no metadata route), which is where a
 piecemeal flip fails loudly instead of silently widening. Cold start is 5-10s; the
 adapter posts a placeholder to the conversation while the pod comes up, which the demo
-already does. **Amended for #2825:** the pod is the conversation's, not the turn's. It is
+already does. **Amended 10/9 (#2825):** the pod is the conversation's, not the turn's. It is
 spawned with `A2A_SESSION_REUSE=true` and the annotation `a2a.kubeagents.dev/session-reuse`,
 and the conversation's later turns go to it (Stream, below). The gateway spawns again only when
 no pod can take the turn: none is live (the first turn, after a reap or an eviction, after the pod
-died), the pod was spawned without the flag (an older gateway's, which exits after one task), or a
-stopped task is still finishing on it, which retires the pod as before. `A2A_SESSION_REUSE=false`
-on the gateway turns reuse off, for running pods too, and every turn spawns.
+died), the pod was spawned without the flag (an older gateway's, which exits after one task, or a
+one-shot Delegate's off the session route), a stopped task is still finishing on it, its last task
+never started, its lifetime has no room left for a whole task, or the read that checks all this
+fails. The old pod is retired as before. `A2A_SESSION_REUSE=false` on the gateway turns reuse off,
+for running pods too, and every turn spawns.
 
 **Stream.** The shim consumes envelopes addressed to its session, feeds them to the
 harness, and maps the stream-json output to `status-update` and `artifact-update` events.
 The gateway relays events to the conversation. The gateway never parses harness output;
 that translation lives in the shim, next to the process it translates for.
 
-A later turn is a new task on the same session (#2825). The gateway keeps the bus session name
+A later turn is a new task on the same session. The gateway keeps the bus session name
 and publishes the submission on `a2a.tasks.<session>.<task>.in` once a pod `get` says the pod is
 running, its worker has not exited, it is not being deleted, it carries the reuse annotation, and
 its lifetime has room for a whole task; a failed read spawns fresh instead. The task's capability
@@ -602,7 +604,7 @@ next turn starts cold with the primer.
 
 **Reap.** Idle TTL since the last user message (30 minutes, config-backed). The record's
 `lastUserMessage` is the clock: every verified turn moves it, and the answer to that turn does
-not (#2825). Reaping is deleting the pod. Nothing is saved first, because
+not. Reaping is deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
 The KV entry stays while active, holding the `contextId`. To bound bucket growth, an
 idle session whose pod has been reaped and whose last activity is older than `A2A_SESSION_TTL`
@@ -625,7 +627,7 @@ serves one task the spawner sets the pod-level `activeDeadlineSeconds` above tha
 adapter's deadline plus a fixed grace for the image pull), so a wedged adapter also lands in
 Sweep's domain instead of holding its bus credential indefinitely. A pod that serves its
 conversation cannot have that bound, so its `activeDeadlineSeconds` is the session's maximum
-lifetime (`A2A_SESSION_MAX_LIFETIME`, 4 hours by default, never below the task deadline plus
+lifetime (`A2A_SESSION_MAX_LIFETIME`, 4 hours by default; the gateway refuses to start below the task deadline plus
 twice the grace), and the reap scan holds each of its tasks to the old bound instead: a running
 task older than the task deadline plus the same grace is closed by the gateway as its supervisor
 (`failed`, on the `…supervisor` subject, unless a final is already on the stream) and the pod is
@@ -670,7 +672,9 @@ session was paused to make room, and its next message starts fresh with the conv
 Only with no idle pod is the turn refused, with the notice it always had. A conversation running
 anything (a task, a stopped task finishing, a delegated child whose wake will need the pod) is
 never evicted; each candidate is re-checked under its own conversation's lock, and a lock that is
-held means busy.
+held means busy. A reused pod that no conversation's record names any more (a retirement whose
+delete failed) never exits on its own, so it goes first, with no notice, and Sweep deletes it
+anyway within a minute.
 
 **One rule for every pod the gateway deletes itself** (stated once here because four
 paths reach it - reap, Sweep, Delegate, and any future one): if the pod is running a

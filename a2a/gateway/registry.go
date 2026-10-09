@@ -88,8 +88,8 @@ type SessionRecord struct {
 	// terminal, ended in this session. It is what the Slack adapter's
 	// session-thread rule bounds on (Gateway.hasSession), separately from
 	// LastActivity, which every verified turn moves: a "@bot stop" with
-	// nothing running is activity for the reap but must not re-admit a
-	// thread whose last task ended hours ago. Zero on records written before
+	// nothing running is activity (and, for the reap, a user message) but
+	// must not re-admit a thread whose last task ended hours ago. Zero on records written before
 	// the field existed, which reads as "no task activity": such a thread
 	// needs a fresh mention after the upgrade, once.
 	LastTaskActivity time.Time   `json:"lastTaskActivity,omitempty"`

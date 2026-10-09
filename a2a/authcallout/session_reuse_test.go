@@ -30,7 +30,9 @@ const (
 	// seconds, so a turn whose capability check lands in one of those
 	// reconnects is rejected as "the verifier could not be reached". That is
 	// the fixture's churn, not the pod's: what the test needs from every
-	// turn is that the pod took it.
+	// turn is that the pod took it. So it does not show that a turn landing
+	// inside the pod's own reconnect is never rejected; that is for the live
+	// run past the real hour.
 	reuseAttempts = 5
 	// reuseRunTimeout bounds each whole test.
 	reuseRunTimeout = 120 * time.Second

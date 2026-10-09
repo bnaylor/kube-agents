@@ -185,10 +185,14 @@ type spawner interface {
 	SessionPods(ctx context.Context) ([]sessionPod, error)
 }
 
-// sessionPod is one live session pod as the cap eviction sees it.
+// sessionPod is one live session pod as the cap eviction and the untracked
+// sweep see it.
 type sessionPod struct {
 	PodName    string
 	SessionKey string
+	// Reuse is the pod's own reuse annotation: it serves every turn, and so
+	// never exits on its own.
+	Reuse bool
 }
 
 type orphanPod struct {
@@ -359,7 +363,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			// its bound is the session's maximum lifetime instead
 			// (podLifetime), with the reap scan's overdue check bounding
 			// each task inside it.
-			ActiveDeadlineSeconds: ptr.To(int64(podLifetime(s.cfg) / time.Second)),
+			ActiveDeadlineSeconds: ptr.To(int64(podLifetime(s.cfg, s.cfg.reusePod(rec)) / time.Second)),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot:   ptr.To(true),
 				RunAsUser:      ptr.To(int64(workerRunAsUser)),
@@ -497,7 +501,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 	}
-	if s.cfg.SessionReuse {
+	if s.cfg.reusePod(rec) {
 		pod.Annotations[annoReuse] = reuseValue
 		c := &pod.Spec.Containers[0]
 		c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvSessionReuse, Value: reuseValue})
@@ -563,13 +567,23 @@ func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// reusePod reports whether a pod spawned for rec serves every turn of its
+// conversation: reuse is on and the conversation is on the session route.
+// A one-shot Delegate from a fixed-route conversation is not: the next plain
+// ask goes back to the fixed addressee, nothing would ever route to the pod
+// again, and a pod that did not exit after its task would idle until the
+// reap.
+func (c *Config) reusePod(rec *SessionRecord) bool {
+	return c.SessionReuse && rec.SessionRouted
+}
+
 // podLifetime is a session pod's activeDeadlineSeconds: the task deadline
 // plus its grace for a pod that serves one task, and the session's maximum
 // lifetime for one that serves its conversation (never less than a task's
 // own bound, whatever the config says).
-func podLifetime(cfg *Config) time.Duration {
+func podLifetime(cfg *Config, reuse bool) time.Duration {
 	one := cfg.TaskDeadline + podDeadlineGrace
-	if !cfg.SessionReuse {
+	if !reuse {
 		return one
 	}
 	lifetime := cfg.SessionMaxLifetime
@@ -585,7 +599,7 @@ func podLifetime(cfg *Config) time.Duration {
 // turns it off for each task that is a wake, from the submission's own
 // authority block (workeradapter.delegateOffForTask): the wake's `via`.
 func (s *podSpawner) delegateToolEnv(rec *SessionRecord, taskID string) string {
-	if s.cfg.SessionReuse {
+	if s.cfg.reusePod(rec) {
 		return delegateToolOn
 	}
 	return delegateToolFor(rec, taskID)
@@ -645,7 +659,7 @@ func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
 			continue
 		}
-		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo]})
+		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo], Reuse: p.Annotations[annoReuse] == reuseValue})
 	}
 	return out, nil
 }
@@ -766,7 +780,7 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 		return
 	}
 	rec.PodName = podName
-	rec.PodReuse = g.cfg.SessionReuse
+	rec.PodReuse = g.cfg.reusePod(rec)
 	g.log.Info("spawned session pod", "session", rec.Key, "pod", podName, "task", taskID, "reuse", rec.PodReuse)
 }
 
@@ -844,6 +858,51 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		_ = g.spawner.Delete(ctx, o.PodName)
 		g.releaseIncarnation(ctx, o)
 	}
+	g.sweepUntracked(ctx)
+}
+
+// sweepUntracked deletes live reused pods that their conversation no longer
+// names. A retirement whose delete failed clears the record's PodName anyway
+// (retireIncarnation), and before reuse the pod it left exited after its task
+// and reached the terminal phase the sweep above watches. A reused pod waits
+// for its next task instead, so nothing would route to it, reap it or sweep
+// it, and it would hold its credential and a cap slot until its lifetime
+// ends. The check runs under the conversation's lock, only tried, the way the
+// cap eviction does it (evictSession): every spawn and record write for that
+// conversation holds the lock, so a pod its record does not name there is
+// untracked rather than one whose spawn is still being written down.
+func (g *Gateway) sweepUntracked(ctx context.Context) {
+	pods, err := g.spawner.SessionPods(ctx)
+	if err != nil {
+		g.log.Error("sweep: live pod list failed", "err", err)
+		return
+	}
+	for _, p := range pods {
+		if !p.Reuse || p.SessionKey == "" {
+			continue
+		}
+		g.deleteIfUntracked(ctx, p)
+	}
+}
+
+// deleteIfUntracked deletes one pod if its conversation's record, read under
+// that conversation's lock, does not name it. It reports whether it did.
+func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
+	l := g.lockSession(p.SessionKey)
+	if !l.TryLock() {
+		return false
+	}
+	defer l.Unlock()
+	rec, err := g.reg.Get(ctx, p.SessionKey)
+	if err != nil || (rec != nil && rec.PodName == p.PodName) {
+		return false
+	}
+	if err := g.spawner.Delete(ctx, p.PodName); err != nil {
+		g.log.Error("untracked session pod delete failed", "pod", p.PodName, "err", err)
+		return false
+	}
+	g.log.Info("deleted an untracked session pod", "conversation", p.SessionKey, "pod", p.PodName)
+	return true
 }
 
 // sweptTask is one task a dead pod may owe a terminal for.

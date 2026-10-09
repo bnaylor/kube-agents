@@ -9601,9 +9601,10 @@ spec:
                             preemption.
 
                             The number lands in three places that deliberately differ. The gateway's
-                            A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
-                            delegation is refused with a chat reply naming the numbers, never queued,
-                            never dropped. The namespace ResourceQuota is rendered a fixed headroom
+                            A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
+                            gateway first evicts the longest-idle session pod (its conversation is
+                            told); only with none idle is a new turn refused with a chat reply naming
+                            the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
                             ABOVE it as the enforcement control: a compromised or buggy gateway
                             ignores its own cap and cannot ignore the quota, and keeping the quota
                             above the cap is what makes users hit the honest refusal rather than an

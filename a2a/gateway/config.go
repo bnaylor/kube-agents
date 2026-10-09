@@ -281,7 +281,7 @@ type Config struct {
 	// SessionReuse keeps one pod per conversation across turns
 	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
 	// idle goes to it, and only a conversation with no live pod gets a new
-	// one. Off, every turn is a fresh pod, as before #2825, and the pods
+	// one. Off, every turn is a fresh pod, as before 10/9, and the pods
 	// spawned are never handed a second task. Either way the gateway only
 	// reuses pods spawned with the flag, so turning it on never reaches a
 	// pod an older gateway spawned.
@@ -320,9 +320,11 @@ type Config struct {
 	// pod-level activeDeadlineSeconds it sizes above it, and two knobs for
 	// one contract would drift. Unset means 1800s, the adapter's own
 	// default. The adapter kills the harness and publishes the terminal at
-	// this deadline; the pod deadline (this plus a fixed grace) is the
-	// backstop that hands a wedged ADAPTER to Sweep instead of letting it
-	// hold its bus credential indefinitely. Raising it buys longer tasks at
+	// this deadline; for a pod that serves one task, the pod deadline (this
+	// plus a fixed grace) is the backstop that hands a wedged ADAPTER to
+	// Sweep instead of letting it hold its bus credential indefinitely. A
+	// reused pod's backstop is SessionMaxLifetime plus the reap scan's
+	// overdue check at the same bound (Gateway.taskOverdue). Raising it buys longer tasks at
 	// the price of how long a wedged worker can hold a cap slot; lowering
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration

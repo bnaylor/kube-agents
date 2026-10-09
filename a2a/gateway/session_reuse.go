@@ -130,22 +130,18 @@ func (g *Gateway) evictSession(ctx context.Context, p sessionPod) bool {
 	if !l.TryLock() {
 		return false
 	}
-	defer l.Unlock()
 	rec, err := g.reg.Get(ctx, p.SessionKey)
 	if err != nil {
+		l.Unlock()
 		return false
 	}
-	// Re-read under the lock, which every spawn and every record write for
-	// that conversation holds: a pod its record does not name here is
-	// untracked, not one whose spawn is still being written down.
 	if rec == nil || rec.PodName != p.PodName {
-		if err := g.spawner.Delete(ctx, p.PodName); err != nil {
-			g.log.Error("session cap: untracked pod delete failed", "pod", p.PodName, "err", err)
-			return false
-		}
-		g.log.Info("session cap: deleted an untracked session pod", "conversation", p.SessionKey, "pod", p.PodName)
-		return true
+		// Untracked (deleteIfUntracked says why that is safe to judge
+		// here); it takes the lock itself.
+		l.Unlock()
+		return g.deleteIfUntracked(ctx, p)
 	}
+	defer l.Unlock()
 	if rec.ActiveTask != nil {
 		return false
 	}

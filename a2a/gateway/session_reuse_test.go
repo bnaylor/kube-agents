@@ -455,7 +455,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 			}
 		}
 		spawn.live = 2
-		spawn.setSessionPods(sessionPod{"chat-vole-new", newer.Key}, sessionPod{"chat-vole-old", older.Key})
+		spawn.setSessionPods(sessionPod{PodName: "chat-vole-new", SessionKey: newer.Key, Reuse: true}, sessionPod{PodName: "chat-vole-old", SessionKey: older.Key, Reuse: true})
 		say(r, "discord:g1/t-third", "m1", "a third conversation")
 		waitFor(t, "the third conversation's spawn", func() bool { return len(spawn.calls()) == 1 })
 		if d := spawn.deleted(); len(d) != 1 || d[0] != "chat-vole-old" {
@@ -482,7 +482,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		spawn.live = 2
 		// The moved conversation's record names a later pod; its old one
 		// lingers after a failed delete.
-		spawn.setSessionPods(sessionPod{"chat-vole-old2", older.Key}, sessionPod{"chat-vole-gone", moved.Key})
+		spawn.setSessionPods(sessionPod{PodName: "chat-vole-old2", SessionKey: older.Key, Reuse: true}, sessionPod{PodName: "chat-vole-gone", SessionKey: moved.Key, Reuse: true})
 		say(r, "discord:g1/t-third2", "m1", "a third conversation")
 		waitFor(t, "the third conversation's spawn", func() bool { return len(spawn.calls()) == 1 })
 		if d := spawn.deleted(); len(d) != 1 || d[0] != "chat-vole-gone" {
@@ -490,6 +490,26 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		}
 		if posts := r.adapter.postTextsFor(moved.Key); slices.Contains(posts, noticeSessionPaused) {
 			t.Fatalf("a conversation whose pod was untracked was told it was paused: %v", posts)
+		}
+	})
+	t.Run("a conversation whose lock is held is busy", func(t *testing.T) {
+		r, spawn := startRigWithSpawnerCap(t, RouteSession, 1, reuseOn)
+		ctx := context.Background()
+		held := idle("discord:g1/t-held", "chat-vole-held", time.Hour)
+		if err := r.g.reg.Put(ctx, held); err != nil {
+			t.Fatal(err)
+		}
+		// A turn in flight there holds this lock while it decides; an
+		// eviction must not wait on it, or decide around it.
+		l := r.g.lockSession(held.Key)
+		l.Lock()
+		defer l.Unlock()
+		spawn.live = 1
+		spawn.setSessionPods(sessionPod{PodName: "chat-vole-held", SessionKey: held.Key, Reuse: true})
+		say(r, "discord:g1/t-blocked", "m1", "anyone home?")
+		waitFor(t, "the cap refusal", postedContaining(r, "not started"))
+		if d := spawn.deleted(); len(d) != 0 {
+			t.Fatalf("evicted %v from a conversation whose lock was held", d)
 		}
 	})
 	t.Run("a busy pod is never evicted", func(t *testing.T) {
@@ -501,7 +521,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 			t.Fatal(err)
 		}
 		spawn.live = 1
-		spawn.setSessionPods(sessionPod{"chat-vole-busy", busy.Key})
+		spawn.setSessionPods(sessionPod{PodName: "chat-vole-busy", SessionKey: busy.Key, Reuse: true})
 		say(r, "discord:g1/t-refused", "m1", "anyone home?")
 		waitFor(t, "the cap refusal", postedContaining(r, "not started"))
 		if d := spawn.deleted(); len(d) != 0 {
@@ -519,15 +539,17 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 // turns it off per task, for a wake.
 func TestAReusedPodIsSpawnedWithTheFlagTheLifetimeAndThePerTaskTool(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		reuse    bool
-		lifetime time.Duration
-		deadline time.Duration
-		tool     string
+		name       string
+		reuse      bool
+		fixedRoute bool
+		lifetime   time.Duration
+		deadline   time.Duration
+		tool       string
 	}{
 		{name: "reuse on", reuse: true, lifetime: 4 * time.Hour, deadline: 4 * time.Hour, tool: "on"},
 		{name: "reuse on, lifetime unset", reuse: true, deadline: defaultSessionMaxLifetime, tool: "on"},
 		{name: "reuse off", deadline: 15*time.Minute + podDeadlineGrace, tool: "off"},
+		{name: "a one-shot Delegate off the session route", reuse: true, fixedRoute: true, deadline: 15*time.Minute + podDeadlineGrace, tool: "off"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := k8sfake.NewSimpleClientset()
@@ -535,7 +557,7 @@ func TestAReusedPodIsSpawnedWithTheFlagTheLifetimeAndThePerTaskTool(t *testing.T
 				TaskDeadline: 15 * time.Minute, SessionReuse: tc.reuse, SessionMaxLifetime: tc.lifetime}
 			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-wake", Addressee: "chat-otter-wake",
-				Tasks: []TaskRef{{ID: "task-w", Role: taskRoleWake}}}
+				SessionRouted: !tc.fixedRoute, Tasks: []TaskRef{{ID: "task-w", Role: taskRoleWake}}}
 			if _, err := s.Spawn(context.Background(), rec, "task-w", "", 1); err != nil {
 				t.Fatal(err)
 			}
@@ -553,9 +575,10 @@ func TestAReusedPodIsSpawnedWithTheFlagTheLifetimeAndThePerTaskTool(t *testing.T
 			if got := env[lib.EnvDelegateTool]; got != tc.tool {
 				t.Errorf("%s = %q, want %q", lib.EnvDelegateTool, got, tc.tool)
 			}
+			want := tc.reuse && !tc.fixedRoute
 			flag, anno := env[lib.EnvSessionReuse] == "true", pod.Annotations[annoReuse] == "true"
-			if flag != tc.reuse || anno != tc.reuse {
-				t.Errorf("reuse env=%v annotation=%v, want both %v", flag, anno, tc.reuse)
+			if flag != want || anno != want {
+				t.Errorf("reuse env=%v annotation=%v, want both %v", flag, anno, want)
 			}
 		})
 	}
@@ -643,5 +666,71 @@ func TestSessionPodsListsTheLiveOnes(t *testing.T) {
 	slices.Sort(got)
 	if want := []string{"live=conv-live", "pending=conv-pending"}; !slices.Equal(got, want) {
 		t.Fatalf("SessionPods = %v, want %v", got, want)
+	}
+}
+
+// A reused pod that its conversation no longer names (a retirement whose
+// delete failed) never exits on its own; the sweep deletes it. A pod its
+// record still names, and a one-task pod, are left alone.
+func TestTheSweepDeletesAnUntrackedReusedPod(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	tracked := &SessionRecord{Key: "discord:g1/t-tracked", ContextID: "ctx-t", Kind: "group",
+		Addressee: "chat-otter-now", BusSession: "chat-otter-now", PodName: "chat-otter-now", PodReuse: true, SessionRouted: true}
+	if err := r.g.reg.Put(ctx, tracked); err != nil {
+		t.Fatal(err)
+	}
+	spawn.setSessionPods(
+		sessionPod{PodName: "chat-otter-now", SessionKey: tracked.Key, Reuse: true},
+		sessionPod{PodName: "chat-otter-was", SessionKey: tracked.Key, Reuse: true},
+		sessionPod{PodName: "chat-otter-once", SessionKey: tracked.Key},
+	)
+	r.g.sweepOnce(ctx)
+	if d := spawn.deleted(); len(d) != 1 || d[0] != "chat-otter-was" {
+		t.Fatalf("sweep deleted %v, want only the untracked reused pod", d)
+	}
+}
+
+// A one-shot Delegate from a fixed-route conversation spawns a pod that serves
+// that task only: the next plain ask goes back to the fixed addressee, and a
+// pod waiting for a turn that never comes would idle.
+func TestADelegateOffTheSessionRouteIsNotReused(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, reuseOn)
+	conv := "discord:g1/t-delegate-once"
+	say(r, conv, "m1", "Delegate: check the fleet")
+	waitFor(t, "the delegate spawn", func() bool { return len(spawn.calls()) == 1 })
+	waitFor(t, "the pod on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.PodName != ""
+	})
+	if rec, _ := r.g.reg.Get(context.Background(), conv); rec.PodReuse {
+		t.Fatal("a fixed-route conversation's Delegate pod was marked for reuse")
+	}
+}
+
+// A pod that never started its task is not handed the next one: the heal
+// unmarks it, and the next turn retires it and spawns fresh.
+func TestANeverStartedTaskUnmarksItsPod(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, RouteSession, 0, func(c *Config) {
+		c.SessionReuse = true
+		c.FirstEventGrace = time.Second
+	})
+	ctx := context.Background()
+	pod := "chat-puffin-ns"
+	rec := &SessionRecord{Key: "discord:g1/t-never", ContextID: "ctx-ns", Kind: "group",
+		Addressee: pod, BusSession: pod, PodName: pod, PodReuse: true, SessionRouted: true, Profile: "chat",
+		ActiveTask: &ActiveTask{TaskID: "task-ns", CorrelationID: "corr-ns", SubmittedAt: time.Now().Add(-time.Minute)},
+		Tasks:      []TaskRef{{ID: "task-ns", Addressee: pod}}}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	spawn.setReusable(pod)
+	say(r, rec.Key, "m1", "hello?")
+	waitFor(t, "a fresh spawn", func() bool { return len(spawn.calls()) == 1 })
+	if s := spawn.calls()[0].Session; s == pod {
+		t.Fatalf("the next turn went to the pod that never started its task")
+	}
+	if d := spawn.deleted(); !slices.Contains(d, pod) {
+		t.Fatalf("deleted %v, want the never-started pod retired", d)
 	}
 }
