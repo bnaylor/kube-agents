@@ -477,6 +477,14 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorAPI"), go_constant(_BRIDGE_API_GO, "ExecutorAPI"))
         self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')
+        # The product default stays api: unset, the bridge picks api when it
+        # carries the pod's API server key, and the rendered bridge must not drop
+        # it. These pin the names the Go test relies on, across the two modules.
+        self.assertEqual(go_constant(_BRIDGE_MAIN, "apiServerKeyEnv"), go_constant(_A2A_MANIFESTS, "a2aBridgeAPIServerKeyEnvVar"))
+        dropped = text(_A2A_BRIDGE)
+        dropped = dropped[dropped.index("var a2aBridgeDroppedAgentEnv") :]
+        dropped = dropped[: dropped.index("\n}\n")]
+        self.assertNotIn("a2aBridgeAPIServerKeyEnvVar", dropped, "the rendered bridge must keep the agent's API_SERVER_KEY")
         self.assertIn(
             '| grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | grep -F "${BRIDGE_CONSUMING_LOG_EXECUTOR}" |',
             text(_CI_DEPLOY),
