@@ -289,7 +289,16 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		if ref.ID == current {
 			continue
 		}
-		var said, answered string
+		// A turn whose people are no longer on record (cleared by the ask
+		// bound, with its Request, or written before the fields existed)
+		// is left out whole. The pod must not read text whose authors the
+		// delegation check can't count; counting them as unknown instead
+		// would refuse every delegation in any conversation older than
+		// A2A_ASK_TTL, for good.
+		if ref.Requester == nil {
+			continue
+		}
+		var said, answered, ended string
 		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
 			said = ref.Request
 		}
@@ -302,17 +311,14 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 				// lands mid-transcript and survives it.
 				answered = truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
 			}
+			ended = primerTurnEnd(task)
 		}
 		// A task aged out of retention, or one that never produced a
 		// result, still leaves what the user asked.
-		if said == "" && strings.TrimSpace(answered) == "" {
+		if said == "" && strings.TrimSpace(answered) == "" && ended == "" {
 			continue
 		}
-		if ref.Requester == nil {
-			unknown = true // cleared by the ask bound, or written before it existed
-		} else {
-			authors = append(authors, *ref.Requester)
-		}
+		authors = append(authors, *ref.Requester)
 		authors = append(authors, ref.SteerAuthors...)
 		unknown = unknown || ref.SteerAuthorsOverflow
 		if !ref.StartedAt.IsZero() && (since.IsZero() || ref.StartedAt.Before(since)) {
@@ -335,6 +341,9 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 				who = "The " + targetPlatform + " agent answered"
 			}
 			turn.WriteString("\n" + primerFenced(who, answered))
+		}
+		if ended != "" {
+			turn.WriteString("\n" + primerFenced("That turn ended without finishing", ended))
 		}
 		turns = append(turns, turn.String())
 	}
@@ -377,6 +386,29 @@ func primerFromTurns(turns []string) string {
 	}
 	return b.String()
 }
+
+// primerTurnEnd says how a turn that didn't complete ended (failed,
+// canceled or rejected), with the executor's reason when the terminal
+// carried one, so a follow-up such as "did that work?" can be answered. A
+// completed or still-open task says nothing.
+func primerTurnEnd(task *lib.Task) string {
+	switch task.State {
+	case lib.StateFailed, lib.StateCanceled, lib.StateRejected:
+	default:
+		return ""
+	}
+	end := string(task.State)
+	if task.FinalMessage != nil {
+		if reason := strings.TrimSpace(joinTextParts(task.FinalMessage.Parts)); reason != "" {
+			end += ": " + truncateRunes(reason, primerTurnEndCap)
+		}
+	}
+	return end
+}
+
+// primerTurnEndCap bounds the reason quoted for a turn that didn't finish:
+// enough for the executor's reason token and a line of detail.
+const primerTurnEndCap = 300
 
 // primerFenced is one turn of the primer: its label, then the text in a
 // fence longer than any backtick run in it, so no line of the text can close

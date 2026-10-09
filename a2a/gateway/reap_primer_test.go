@@ -50,7 +50,7 @@ func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
 		Key:       conv,
 		ContextID: origin.ContextID,
 		Addressee: "platform",
-		Tasks:     []TaskRef{{ID: origin.TaskID, Addressee: "platform"}},
+		Tasks:     []TaskRef{{ID: origin.TaskID, Addressee: "platform", Requester: &TaskRequester{Backend: "discord", Subject: "s"}}},
 	}
 
 	var primer string
@@ -105,15 +105,17 @@ func TestTheRehydrationPrimerCarriesBothSidesOfEachTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	someone := TaskRequester{Backend: "discord", Subject: "someone-hash"}
 	rec := &SessionRecord{
 		Key:       conv,
 		ContextID: origin.ContextID,
 		Addressee: "platform",
 		Tasks: []TaskRef{
-			{ID: "task-aged-out", Addressee: "platform", Request: "an older question"},
-			{ID: origin.TaskID, Addressee: "platform", Request: "remember the code word PELICAN"},
-			{ID: origin.TaskID, Addressee: "platform", Role: taskRoleChild},
-			{ID: "task-now", Addressee: "platform", Request: "what was the code word?"},
+			{ID: "task-aged-out", Addressee: "platform", Request: "an older question", Requester: &someone},
+			{ID: "task-past-ask-ttl", Addressee: "platform", Request: "", Requester: nil},
+			{ID: origin.TaskID, Addressee: "platform", Request: "remember the code word PELICAN", Requester: &someone},
+			{ID: origin.TaskID, Addressee: "platform", Role: taskRoleChild, Requester: &someone},
+			{ID: "task-now", Addressee: "platform", Request: "what was the code word?", Requester: &someone},
 		},
 	}
 	var primer string
@@ -180,7 +182,10 @@ func TestThePrimerReturnsThePeopleBehindTheTurnsItReplays(t *testing.T) {
 		{ID: "task-old-2", Addressee: "platform", Request: "an ask whose requester aged out"},
 		{ID: "task-now", Addressee: "platform", Request: "hello", Requester: &TaskRequester{Backend: "slack", Subject: "bob-hash"}},
 	}}
-	_, authors, unknown, _ := r.g.buildRehydrationPrimer(ctx, rec, "task-now")
+	primer, authors, unknown, _ := r.g.buildRehydrationPrimer(ctx, rec, "task-now")
+	if strings.Contains(primer, "an ask whose requester aged out") {
+		t.Errorf("a turn with no requester on record reached the primer:\n%s", primer)
+	}
 	has := func(a TaskRequester) bool {
 		for _, x := range authors {
 			if x == a {
@@ -192,8 +197,11 @@ func TestThePrimerReturnsThePeopleBehindTheTurnsItReplays(t *testing.T) {
 	if !has(alice) || !has(carol) {
 		t.Errorf("authors = %v, want the earlier turn's requester and steer author", authors)
 	}
-	if !unknown {
-		t.Error("a replayed turn with no requester on record didn't mark the set unknown")
+	// A turn whose requester was cleared at A2A_ASK_TTL is left out whole,
+	// so it neither reaches the pod nor marks the set: marking it would
+	// refuse every delegation in a conversation older than the bound.
+	if unknown {
+		t.Error("a turn past the ask bound marked the set unknown; it should be left out")
 	}
 	for _, a := range authors {
 		if a.Subject == "bob-hash" {
@@ -227,5 +235,21 @@ func TestASessionPodStartsWithThePeopleItsPrimerReplays(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("session authors after spawn = %v, want the earlier turn's requester", authors)
+	}
+}
+
+// A turn that failed, was stopped or was rejected says so, with the
+// executor's reason, so a follow-up such as "did that work?" can be answered.
+// A completed turn says nothing extra.
+func TestThePrimerSaysHowAnUnfinishedTurnEnded(t *testing.T) {
+	failed := &lib.Task{State: lib.StateFailed, FinalMessage: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: "reason: error_max_turns"}}}}
+	if got := primerTurnEnd(failed); got != "failed: reason: error_max_turns" {
+		t.Errorf("failed turn = %q", got)
+	}
+	if got := primerTurnEnd(&lib.Task{State: lib.StateCanceled}); got != "canceled" {
+		t.Errorf("canceled turn = %q", got)
+	}
+	if got := primerTurnEnd(&lib.Task{State: lib.StateCompleted}); got != "" {
+		t.Errorf("completed turn = %q, want nothing", got)
 	}
 }

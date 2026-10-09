@@ -372,9 +372,10 @@ sixteen and cleared with the requester copy at `A2A_ASK_TTL` - a cleared or over
 rather than admits. That third check is load-bearing: each turn gets a fresh one-task
 incarnation, but the incarnation reads the transcript primer (below, "Rehydrate"), which carries
 every earlier turn the stream still holds. So when the pod is started, the requesters and steer
-authors of every turn the primer replays join the set, and a replayed turn whose requester is no
-longer on record (cleared at `A2A_ASK_TTL`) marks it, which refuses. The bound is the conversation
-as the primer carries it, not one incarnation. What else a session carries across incarnations is
+authors of every turn the primer replays join the set. A turn whose requester is no longer on
+record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
+reads text whose authors the check can't count. The bound is the conversation as the primer
+carries it, not one incarnation. What else a session carries across incarnations is
 #2370. One live child per conversation, a detached-but-still-running one counting as live:
 the delegating turn's own repeat is ignored and logged, while a later turn's request reaching the
 gateway while that child still runs is refused with a notice naming the running task
@@ -636,7 +637,9 @@ gateway replays the context's tasks from JetStream - `tasks/get`, which folds ea
 task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
 the new pod as its first input. The primer carries both sides of each earlier turn: what
 the user asked (the copy session-state keeps until `AskTTL`) and each result, labelled by
-who answered, each fenced so a user's text can't pass for an earlier answer. It keeps the
+who answered, and how a turn that didn't finish ended (failed, stopped or rejected, with the
+executor's reason), each fenced so a user's text can't pass for an earlier answer. A turn past
+`A2A_ASK_TTL` is left out. It keeps the
 newest turns that fit 8 KiB and says when earlier ones were dropped. The pod gets it as a
 downward-API file from its own annotation, and the worker puts it ahead of the new message,
 framed as history rather than instructions. The annotation is readable by anyone who can get
