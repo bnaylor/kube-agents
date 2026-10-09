@@ -470,8 +470,9 @@ answer. Either way it says to state plainly when the child failed or reports mor
 running. The wake's pod has no delegate tool (`A2A_DELEGATE_TOOL=off`, set by the
 spawner for a wake turn): a wake that could delegate read an interim answer such as "still
 checking, the results will post here" as a reason to ask again, and each ask woke another pod
-until the depth bound refused, with nothing answered. A new question from the person is a human
-turn and has the tool.
+until the depth bound refused, with nothing answered. A message the person sends while the wake
+runs steers the wake like any other running turn, so it is answered without the tool as well. A
+question sent after the wake answers is a new human turn and has the tool.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain

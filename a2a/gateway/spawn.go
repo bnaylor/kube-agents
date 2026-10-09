@@ -820,8 +820,9 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 // delegation came back with. Given the tool, a wake that reads an interim
 // answer ("still checking, the results will post here") asks again, each
 // ask wakes another pod, and the chain ends at the depth bound with nothing
-// answered. Without it the wake can only answer; the person can still ask a
-// new question, which is a human turn and has the tool.
+// answered. Without it the wake can only answer. A message the person sends
+// while the wake runs is a steer into the wake, so it is answered without
+// the tool too; one sent after the wake ends is a new human turn and has it.
 func delegateToolFor(rec *SessionRecord, taskID string) string {
 	for _, ref := range rec.Tasks {
 		if ref.ID == taskID && ref.Role == taskRoleWake {
