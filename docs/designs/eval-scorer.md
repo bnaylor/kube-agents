@@ -1026,8 +1026,8 @@ reproduced here — a copy in a second repository is a copy that goes stale, and
 the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
-the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the job overrides the script's default — with their
-comments, and nothing removed. That is a
+the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
+job overrides the script's default — with their comments, and nothing removed. That is a
 deliberate choice over factoring: the two jobs must agree on how a single run is produced, and a
 copy that is obviously a copy fails loudly under `diff` where a subtly different harness does not.
 It duplicates ~140 lines of Boskos lease, heartbeat and cleanup logic, and the right fix is to move
