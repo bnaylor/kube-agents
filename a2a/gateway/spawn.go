@@ -351,6 +351,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
 					{Name: lib.EnvPrimerFile, Value: primerMountPath + "/" + primerFileName},
+					{Name: lib.EnvDelegateTool, Value: delegateToolFor(rec, taskID)},
 					// The pod's own name, from the kubelet rather than from
 					// us. It equals A2A_SESSION by construction above, and
 					// the adapter checks that rather than trusting either:
@@ -836,4 +837,20 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 		return err
 	}
 	return g.client.Publish(ctx, lib.TaskSupervisorSubject(addressee, taskID), env)
+}
+
+// delegateToolFor is the session's delegate tool setting for the task a pod
+// is started for: off on a wake turn, on otherwise. A wake reports what a
+// delegation came back with. Given the tool, a wake that reads an interim
+// answer ("still checking, the results will post here") asks again, each
+// ask wakes another pod, and the chain ends at the depth bound with nothing
+// answered. Without it the wake can only answer; the person can still ask a
+// new question, which is a human turn and has the tool.
+func delegateToolFor(rec *SessionRecord, taskID string) string {
+	for _, ref := range rec.Tasks {
+		if ref.ID == taskID && ref.Role == taskRoleWake {
+			return "off"
+		}
+	}
+	return "on"
 }

@@ -63,6 +63,12 @@ const (
 	// up the conversation it is continuing. Unset, or an empty file, is a
 	// conversation with nothing before this turn.
 	EnvPrimerFile = "A2A_PRIMER_FILE"
+	// EnvDelegateTool turns the session's delegate tool off when it is
+	// "off". The spawner sets it on a wake turn's pod: the wake exists to
+	// report a delegation's outcome, and a wake that delegates again on an
+	// interim answer ("still running, results will post here") loops until
+	// the depth bound refuses, with nothing answered.
+	EnvDelegateTool = "A2A_DELEGATE_TOOL"
 )
 
 const (
