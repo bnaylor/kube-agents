@@ -838,11 +838,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text):
 		g.answerStatusByReplay(ctx, rec)
-	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text, false):
+	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text):
 		// A status question that roots its own conversation has no task to
-		// report on and must not become one that reads "any update?". Exact
-		// phrases only: with nothing running, a wide match ("how is the
-		// deploy doing") is a real question.
+		// report on and must not become one that reads "any update?".
+		// isStatusQuery is a phrase set (text.go), so a real question such
+		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
