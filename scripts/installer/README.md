@@ -447,9 +447,7 @@ render no mode and Helm would take `spec.mode` off the CR. A full upgrade onto s
 refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An older release's own `upgrade.sh`,
 the release rollback runbook's route, has no such refusal and drops it with its generic
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
-before it regenerates. Under `next` the A2A gateway takes Google Chat, and answers it only
-through a hermes-bridge sidecar on the CR, which no install surface declares; `install.sh`
-says so when `next` meets `GOOGLE_CHAT_ENABLED`.
+before it regenerates.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the

@@ -5750,13 +5750,12 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("Fix the PLATFORM_AGENT_MODE this shell exports.", out)
         self.assertNotIn("Fix it in", out)
 
-    def test_next_with_google_chat_says_nothing_answers_it(self):
+    def test_next_with_google_chat_does_not_warn_that_nothing_answers(self):
+        """The operator renders the hermes-bridge under next (#2603), so Chat is
+        answered there and the installer must not say it goes unanswered."""
         text = _INSTALL_SH.read_text()
-        main_start = text.index("\nmain() {")
-        warning = text.index('if [ "$platform_agent_mode" = "next" ] && is_truthy "$google_chat_enabled"; then', main_start)
-        self.assertLess(text.index('local google_chat_enabled=', main_start), warning)
-        self.assertLess(warning, text.index('print_step "11. Pre-Flight Configuration Summary"', main_start))
-        self.assertIn("nothing answers it until a hermes-bridge sidecar is declared", text[warning : warning + 900])
+        self.assertNotIn("nothing answers it until a hermes-bridge sidecar", text)
+        self.assertNotIn('if [ "$platform_agent_mode" = "next" ] && is_truthy "$google_chat_enabled"; then', text)
 
     def test_main_validates_exports_and_announces_in_order(self):
         text = _INSTALL_SH.read_text()

@@ -6621,14 +6621,6 @@ main() {
     print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's two images (nats, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
     print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists both)."
   fi
-  # Under next the A2A gateway takes Google Chat, and it hands each message
-  # to the platform agent's addressee on the bus, which only a hermes-bridge
-  # sidecar on the CR consumes. Neither this installer nor the chart declares
-  # one, so Chat would accept messages and answer none.
-  if [ "$platform_agent_mode" = "next" ] && is_truthy "$google_chat_enabled"; then
-    print_warning "spec.mode next with Google Chat: the A2A gateway takes Chat from the agent, and nothing answers it until a hermes-bridge sidecar is declared on the PlatformAgent, which this installer does not do. Chat messages are accepted and go unanswered."
-    print_info "a2a/docs/hermes-bridge.md says how to declare the bridge; the installer's next install is for bringing the stack up, not for serving Chat."
-  fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
