@@ -480,7 +480,8 @@ with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <tex
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there, and
-the ack says so. The way back is answered even on an install whose spawner has since been disarmed, so a
+the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
+adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
@@ -1342,18 +1343,18 @@ keyed the same way, to match the Hermes Slack platform on `today` (2026-10-08): 
 top-level DM is a new conversation rooted on its own ts, and its placeholder, status
 edits and answer post in that thread; a DM typed inside a thread is that thread's
 conversation, so it steers the running task or follows up in the same context, as a
-channel thread reply does. Two top-level questions are two conversations. A channel is
-not a session, a thread in it is, and the same now holds for a DM. So `stop`, a status
-question and `/session` act on the thread they are typed in: a `stop` typed at the top
-of the DM is a conversation with nothing running, and its reply says to send it in the
-question's thread instead; a bare `/session` asks for the next message in its thread.
+channel thread reply does. Two top-level questions are two conversations. On Slack a
+thread is the session in a DM as in a channel. So `stop`, a status question and
+`/session` act on the thread they are typed in: a `stop` typed at the top of the DM is a
+conversation that has run nothing, and its reply says to send it in the question's
+thread instead; a bare `/session` asks for the next message in its thread.
 
-The thread-less `slack:dm/{channel}` is what every DM was keyed as before DMs threaded.
-It still parses and posts top-level, so a record minted under it relays its task's
-terminal into the DM where the ask was; no inbound message is keyed that way any more,
-so a message sent after the upgrade starts its own thread rather than steering or
-stopping that task. It is also what `openDirect` returns, which makes a post the user
-did not ask for a new top-level message; a reply under it roots its own conversation.
+The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
+is keyed that way. It is the form a DM record from before DMs threaded carries, so such
+a record relays its task's terminal into the DM where the ask was, and a message sent
+since starts its own thread rather than steering or stopping that task. It is also what
+`openDirect` returns, which makes a post the user did not ask for a new top-level
+message; a reply under it roots its own conversation.
 
 **Which messages become turns.** DMs carry every message, in a thread or not; a DM
 thread needs no task started in it to carry a reply. A channel message must

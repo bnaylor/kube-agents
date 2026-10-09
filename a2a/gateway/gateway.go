@@ -26,9 +26,11 @@ const sessionProfile = "chat"
 const sessionKindDM = "dm"
 
 // slackDMNothingRunningNotice answers a "stop" with nothing to stop in a
-// Slack DM. Each DM question is its own conversation in its own thread, so a
-// "stop" typed at the top of the DM is a conversation of its own with no
-// task in it; the notice says where the stop has to go instead.
+// Slack DM conversation that has never run a task. Each DM question is its
+// own conversation in its own thread, so a "stop" typed at the top of the DM
+// is a conversation of its own with no task in it; the notice says where the
+// stop has to go instead. A question's thread whose task has ended gets the
+// plain notice: the user is already in the right place.
 const slackDMNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply `stop` in that question's thread"
 
 // What retireIncarnation posts when the previous task cannot be closed on
@@ -850,7 +852,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		switch {
 		case active != nil:
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
-		case backend == slackBackend && rec.Kind == sessionKindDM:
+		case backend == slackBackend && rec.Kind == sessionKindDM && len(rec.Tasks) == 0:
 			g.post(rec.Key, slackDMNothingRunningNotice)
 		default:
 			g.post(rec.Key, "🤷 nothing is running")

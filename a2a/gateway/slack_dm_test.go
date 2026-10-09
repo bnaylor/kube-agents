@@ -336,4 +336,21 @@ func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
 			t.Errorf("a top-level stop sent %s to the question's task", e.Kind)
 		}
 	}
+
+	// Inside the question's thread, once its task has ended, a stop is
+	// already in the right place: the plain notice, not the redirect.
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "the fleet is fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	d.awaitPost(t, "the answer in the question's thread", "D1", "100.1", "the fleet is fine")
+	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "102.1", "100.1")
+	d.awaitPost(t, "the plain notice in the question's thread", "D1", "100.1", "nothing is running")
+	for _, p := range d.posts() {
+		if p.thread == "100.1" && p.text == toMrkdwn(slackDMNothingRunningNotice) {
+			t.Errorf("a stop in the question's own thread was redirected to it: %+v", p)
+		}
+	}
 }
