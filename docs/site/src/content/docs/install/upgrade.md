@@ -191,13 +191,16 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
 
   ```bash
   kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
-    | grep -E 'Slack relay|Slack bot token'
+    | grep -E 'Slack relay (enabled|initialization failed)|Slack bot token'
   ```
 
   The last line reads `Slack relay enabled workspaces=1`, where the number counts the bot tokens
-  Slack accepted, one per workspace. `Slack bot token authentication failed` names a token Slack
-  refused, and `Slack relay initialization failed; retrying` means the broker could not connect
-  with the tokens.
+  Slack accepted, one per workspace. `Slack bot token authentication failed` means Slack refused
+  one of the bot tokens; it gives the error type and Slack's error, not which token.
+  `Slack relay initialization failed; retrying` means no bot token was accepted or the Socket Mode
+  connection failed, and the broker tries again every 30 seconds. The pattern leaves out
+  `Slack relay operation failed`: the broker logs that when one Slack call the agent makes fails,
+  such as a post to a channel the bot is not in, and it says nothing about the connection.
 
 - **`next`**: the A2A gateway.
 
@@ -252,7 +255,7 @@ as in [Checking the result](#slack), and leave the Slack app as it is.
      channel only. A home channel set from Slack with `/sethome` is kept in the Planning Agent's
      profile, not in `install.env`, so it does not carry over. A DM ID (`D…`) or a channel name
      turns off the gateway's notify route, and with it the reports of board cards
-     ([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel-1)).
+     ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)).
 
 3. Check the board for cards in flight:
 
@@ -329,7 +332,7 @@ done
 It prints `connected` once the gateway has logged `slack connected`; then check Slack as in
 [Checking the result](#slack). If it prints nothing, the `Ready` condition's message names what the
 operator is waiting on, and
-[Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#5-the-chat-bot-doesnt-answer)
+[Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops)
 has the checks for the bus and the gateway. Slack stays unanswered until the gateway connects or
 you [switch back](#switching-back-to-today).
 
@@ -382,7 +385,7 @@ acknowledge them.
 2. The operator restarts the credential broker with the Slack tokens and deletes the A2A stack,
    the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
    connection, and a message the stopping gateway takes gets no answer. The bus volume and its
-   credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-a-teardown-leaves)
+   credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
    says how to remove them. Wait for the broker, for up to 5 minutes:
 
    ```bash

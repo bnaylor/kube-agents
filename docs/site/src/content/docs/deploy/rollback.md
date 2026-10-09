@@ -68,14 +68,15 @@ export KUBE_AGENTS_INSTALL_ENV=/path/to/your/install/install.env
 Read `N`'s release notes before you go. Everything they list is something `N-1` does not know
 about, and the next two sections say what happens to each kind of thing.
 
-On an install running `spec.mode: next`, switch it to `today` first
-([Upgrade → Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)) and
-check that Slack answers. An `N-1` whose chart predates `platformAgent.mode` cannot keep the mode.
-From 0.8.0 its operator and harness steps stop on the recorded `platformAgent.mode`, and with
-`--drop-undeclared-values` drop it in a generic `Dropping` line; an older one drops it without a
-word. Dropping it takes `spec.mode` off the `PlatformAgent`, so the install goes back to `today`,
-and the run does not say so. Slack then moves back to the credential broker, and an app changed for
-`next` has no slash commands or interactivity until you restore them as that section says.
+On an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
+`today`](/kube-agents/install/upgrade/#switching-back-to-today)) and check that Slack answers. No
+chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode: the
+recorded key is a value `N-1` does not declare, refused, dropped or ignored as [The
+rollback](#the-rollback) and [When a rollback is refused](#when-a-rollback-is-refused) say, and
+without it the install is back on `today` with nothing in the run to say so. Switching first moves
+Slack back to the credential broker, and the Slack app back to its `today` settings, with the checks
+that section gives, instead of leaving you to find the app without its slash commands after the
+rollback.
 
 ## The rollback
 
