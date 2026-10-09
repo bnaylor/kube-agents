@@ -68,6 +68,13 @@ export KUBE_AGENTS_INSTALL_ENV=/path/to/your/install/install.env
 Read `N`'s release notes before you go. Everything they list is something `N-1` does not know
 about, and the next two sections say what happens to each kind of thing.
 
+On an install running `spec.mode: next`, switch it to `today` first
+([Upgrade → Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)) and
+check that Slack answers. An `N-1` whose installer predates `PLATFORM_AGENT_MODE` does not carry the
+mode, so rolling back to it while on `next` takes `spec.mode` off the `PlatformAgent`. The install
+then goes back to `today` without the Slack app's slash commands and interactivity, and the run
+does not say that it switched modes.
+
 ## The rollback
 
 From the `N-1` checkout, a dry run, then operator and harness back to back:
