@@ -1343,14 +1343,17 @@ top-level DM is a new conversation rooted on its own ts, and its placeholder, st
 edits and answer post in that thread; a DM typed inside a thread is that thread's
 conversation, so it steers the running task or follows up in the same context, as a
 channel thread reply does. Two top-level questions are two conversations. A channel is
-not a session, a thread in it is, and the same now holds for a DM.
+not a session, a thread in it is, and the same now holds for a DM. So `stop`, a status
+question and `/session` act on the thread they are typed in: a `stop` typed at the top
+of the DM is a conversation with nothing running, and its reply says to send it in the
+question's thread instead; a bare `/session` asks for the next message in its thread.
 
 The thread-less `slack:dm/{channel}` is what every DM was keyed as before DMs threaded.
 It still parses and posts top-level, so a record minted under it relays its task's
-terminal into the DM where the ask was; nothing new is keyed that way, so a message sent
-after the upgrade starts its own thread rather than steering that task. It is also what
-`OpenDirect` returns, which makes a post the user did not ask for a new top-level
-message; a reply under it roots its own conversation.
+terminal into the DM where the ask was; no inbound message is keyed that way any more,
+so a message sent after the upgrade starts its own thread rather than steering or
+stopping that task. It is also what `openDirect` returns, which makes a post the user
+did not ask for a new top-level message; a reply under it roots its own conversation.
 
 **Which messages become turns.** DMs carry every message, in a thread or not; a DM
 thread needs no task started in it to carry a reply. A channel message must

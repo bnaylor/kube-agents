@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,11 +19,30 @@ import (
 // own inbound filter, so a test drives the gateway with what Slack would
 // deliver rather than with a conversation key it wrote by hand. raw carries
 // an InboundMessage straight to the gateway, for the record a previous
-// version of the adapter would have keyed.
+// version of the adapter would have keyed. It counts finished turns per
+// conversation (InboundObserver), so a test can wait for the gateway to be
+// done with a turn rather than sleep and hope.
 type slackEventAdapter struct {
 	*SlackAdapter
 	events chan *slackevents.MessageEvent
 	raw    chan InboundMessage
+
+	finishedMu sync.Mutex
+	finished   map[string]int
+}
+
+func (s *slackEventAdapter) MessageDropped(string, string) {}
+
+func (s *slackEventAdapter) TurnFinished(conversation string) {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+	s.finished[conversation]++
+}
+
+func (s *slackEventAdapter) turnsFinished(conversation string) int {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+	return s.finished[conversation]
 }
 
 func (s *slackEventAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
@@ -76,6 +96,7 @@ func startSlackDMRig(t *testing.T) *slackDMRig {
 		SlackAdapter: newTestSlackAdapter(api),
 		events:       make(chan *slackevents.MessageEvent, 16),
 		raw:          make(chan InboundMessage, 16),
+		finished:     map[string]int{},
 	}
 	cfg := &Config{
 		NATSURL:           url,
@@ -168,7 +189,19 @@ func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A reply in the thread while the task runs steers that task.
+	// A reply in the thread while the task runs steers that task, and its
+	// acknowledgement posts in the thread. The ack's wording is the route's
+	// business, so only where it lands is asserted.
+	inThread := func() int {
+		n := 0
+		for _, p := range d.posts() {
+			if p.channel == "D1" && p.thread == "100.1" {
+				n++
+			}
+		}
+		return n
+	}
+	before := inThread()
 	d.adapter.events <- slackMsg("im", "D1", "U1", "focus on us-east", "100.5", "100.1")
 	waitFor(t, "the steer envelope", func() bool {
 		return len(inSubjectEnvelopes(t, d.r.url, "platform")) >= 2
@@ -177,7 +210,7 @@ func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
 	if steer := envs[len(envs)-1]; steer.TaskID != first.TaskID {
 		t.Fatalf("a reply in the DM thread minted task %s; it should steer %s", steer.TaskID, first.TaskID)
 	}
-	d.awaitPost(t, "the steer acknowledgement in the thread", "D1", "100.1", "steering sent")
+	waitFor(t, "the steer acknowledgement in the thread", func() bool { return inThread() > before })
 
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "the fleet is fine"}}}); err != nil {
 		t.Fatal(err)
@@ -256,7 +289,9 @@ func TestSlackDMRefusalIsOncePerSenderAcrossThreads(t *testing.T) {
 	d.adapter.events <- slackMsg("im", "D2", "U2", "drain node 4", "10.1", "")
 	d.awaitPost(t, "the unverified-sender notice in the first thread", "D2", "10.1", "can't verify")
 	d.adapter.events <- slackMsg("im", "D2", "U2", "drain node 5", "11.1", "")
-	time.Sleep(200 * time.Millisecond)
+	waitFor(t, "the gateway to finish the second refused turn", func() bool {
+		return d.adapter.turnsFinished("slack:dm/D2/11.1") == 1
+	})
 	var notices []slackPost
 	for _, p := range d.posts() {
 		if p.channel == "D2" {
@@ -279,4 +314,26 @@ func TestSlackChannelMentionStillThreadsOnTheMention(t *testing.T) {
 	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet", "300.1", "")
 	d.awaitTasks(t, 1)
 	d.awaitPost(t, "the placeholder in the mention's thread", "C1", "300.1", "")
+}
+
+// TestSlackDMTopLevelStopPointsAtTheThread: a "stop" typed at the top of the
+// DM is a conversation of its own, so it cannot reach a question's task; it
+// must not claim the DM is idle, and it must say where the stop goes. The
+// question's task is not cancelled.
+func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
+	d := startSlackDMRig(t)
+	ctx := context.Background()
+	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
+	first := d.awaitTasks(t, 1)[0]
+	exec := d.r.execFor(t, first, "platform")
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "101.1", "")
+	d.awaitPost(t, "the notice in the stop's own thread", "D1", "101.1", slackDMNothingRunningNotice)
+	for _, e := range inSubjectEnvelopes(t, d.r.url, "platform") {
+		if e.TaskID == first.TaskID && e.Kind != lib.KindMessage {
+			t.Errorf("a top-level stop sent %s to the question's task", e.Kind)
+		}
+	}
 }

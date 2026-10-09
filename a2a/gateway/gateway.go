@@ -25,6 +25,12 @@ const sessionProfile = "chat"
 // surface that carries every message without a mention.
 const sessionKindDM = "dm"
 
+// slackDMNothingRunningNotice answers a "stop" with nothing to stop in a
+// Slack DM. Each DM question is its own conversation in its own thread, so a
+// "stop" typed at the top of the DM is a conversation of its own with no
+// task in it; the notice says where the stop has to go instead.
+const slackDMNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply `stop` in that question's thread"
+
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
 // one leaves the route, and the user needs to hear which did not happen.
@@ -841,9 +847,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// task that literally reads "stop": the impatient second "stop"
 		// (cancel sent, terminal pending) and a bare "stop" with nothing
 		// running both land here, answered deterministically.
-		if active != nil {
+		switch {
+		case active != nil:
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
-		} else {
+		case backend == slackBackend && rec.Kind == sessionKindDM:
+			g.post(rec.Key, slackDMNothingRunningNotice)
+		default:
 			g.post(rec.Key, "🤷 nothing is running")
 		}
 	case active != nil && !active.Detached:
@@ -1601,10 +1610,15 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 // will deliver: the Slack adapter forwards an unmentioned channel-thread
 // reply only once the gateway has started a task in that thread, and a
 // /session binding starts none, so in a Slack channel the next message needs
-// the mention. DMs carry every message; the other backends route the next
+// the mention. A Slack DM carries every message, but each top-level DM is a
+// conversation of its own, so the binding holds only for replies in the
+// thread the /session was typed in. The other backends route the next
 // message on their own rules.
 func sessionOnAck(backend, kind, defaultAddressee string) string {
-	if backend == slackBackend && kind != sessionKindDM {
+	if backend == slackBackend && kind == sessionKindDM {
+		return "🧵 session route on — reply in this thread to open a session pod; `/session off` returns to `" + defaultAddressee + "`"
+	}
+	if backend == slackBackend {
 		return "🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); `/session off` returns to `" + defaultAddressee + "`"
 	}
 	return "🧵 session route on — your next message opens a session pod; `/session off` returns to `" + defaultAddressee + "`"
