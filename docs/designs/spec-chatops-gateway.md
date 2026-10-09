@@ -971,7 +971,10 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
+  and the progress artifact's latest line (`progress`); plus the conversation's A2A `contextId`
+  from its record (absent when there is no record; the bridge's `api` executor names its Hermes
+  session after it, which is how the harness finds the kanban cards a turn filed), the
+  conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed
@@ -1340,7 +1343,18 @@ half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
 the gateway arms the route on), and send to every other platform through `hermes send` as
-before.
+before. The Hermes kanban notifier, which posts a card's events into the thread the card
+subscribes to and wakes its creator when a card blocks or fails, reaches the same route
+through a send-only stand-in adapter that exists only inside the notifier
+(`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
+the platform as connected. Only the subscription's thread is forwarded, so the home-space
+rule applies: a thread of another space is refused, and a subscription with no thread is not
+delivered. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+notifier when the route is unavailable (the gateway restarting), and it holds deliveries
+unclaimed then; only a send that meets the outage before the next probe spends one unit of
+the subscription's failure budget. Once, when routed delivery first goes live on an install,
+events that are already more than six hours old are advanced past without posting: they are
+the backlog nothing could deliver before.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
