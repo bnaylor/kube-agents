@@ -17,6 +17,15 @@ const (
 	// shellPrompt marks a command line inside an untagged block, as in a
 	// worked example that shows a command and its output together.
 	shellPrompt = "$ "
+	// shellComment, lineContinuation, placeholderOpen and quoteChar are the
+	// shell syntax the classifier reads: a comment line, a backslash that
+	// joins the next line, a <placeholder> argument, and a quoted argument.
+	shellComment     = "#"
+	lineContinuation = "\\"
+	placeholderOpen  = "<"
+	quoteChar        = "\""
+	// titlePrefix opens a skill's H1 title, which the preamble follows.
+	titlePrefix = "# "
 	// maxSkillNameLen and maxSkillDescriptionLen are the Agent Skills limits
 	// on the two frontmatter fields Claude Code reads to list a skill.
 	maxSkillNameLen        = 64
@@ -30,9 +39,10 @@ const (
 	// project. The session's broker refuses writes anyway; the note is what
 	// keeps the model from trying, and from presenting the step as done.
 	proposeOnlyNote = "> **Propose this to the operator; do not run it.** It changes a cluster or a project, and this session is read-only. Write it out as a proposal, or delegate it to `platform` if the person wants it done."
-	// unavailableNote precedes a code block that runs a program the worker
-	// image does not ship (a script, python3, git, jq).
-	unavailableNote = "> **Not available in this session.** This runs a program this pod doesn't have. With the cluster view, make the same reads with single `kubectl` or `gcloud` commands; otherwise say what you couldn't check."
+	// unavailableNote precedes a code block that runs a program the
+	// session can't: Bash is limited to kubectl and gcloud, and the scripts
+	// the skills name are not shipped.
+	unavailableNote = "> **Not available in this session.** This runs a program this session can't run. With the cluster view, make the same reads with single `kubectl` or `gcloud` commands; otherwise say what you couldn't check."
 	// pipeNote precedes a read-only block whose commands pipe into another
 	// program, which the cluster view's Bash rule does not allow.
 	pipeNote = "> Run each `kubectl` or `gcloud` command on its own, one per call, with no pipe, and read the output yourself."
@@ -40,17 +50,35 @@ const (
 	// carry out, keeping its heading so the skill's cross-references still land.
 	sessionReportNote = "_In a session this step is your answer: give the root cause, the evidence that grounds it, and any proposed patch in your reply. The cluster agent's reporting tools don't exist here._"
 
+	// shippedFileProse and shippedFileArg replace a reference to one of the
+	// cluster agent's scripts, example files or settings, in prose and in a
+	// command respectively. Only SKILL.md ships, and Claude Code hands the
+	// model the skill's directory with its text, so a relative link left in
+	// place would be an invitation to go looking for a file that isn't there.
+	shippedFileProse = "the cluster agent's file (not in this session)"
+	shippedFileArg   = "<file not in this session>"
+	// filePathPattern is a relative scripts/ or assets/ path, an absolute
+	// script path, or the cluster agent's settings file.
+	filePathPattern = `(\./)?(assets|scripts)/[\w./-]+|/opt/data/[\w./-]+|SETTINGS\.md`
+
 	// sessionPreamble follows each skill's title. It says, once, what the
 	// per-block notes say locally, and covers what they can't mark: prose
 	// that names files, tools and scripts this pod doesn't have.
 	sessionPreamble = `> **Using this skill in a kube-agents session.** It was written for the cluster agent.
 >
 > - Run its ` + "`kubectl`" + ` and ` + "`gcloud`" + ` commands only when your system prompt gives you the read-only cluster view, one command per call. Without the view, use the steps to judge what the person showed you, or to say what ` + "`platform`" + ` should check when you delegate.
-> - A step that changes a cluster or a project is a proposal, never something you run. Steps that do are marked.
-> - Scripts, asset files, settings files and tools the skill names (kanban, MCP servers, web search) are not in this session. Don't look for them; where a step describes a script's checks, make the same checks by reading the objects yourself.`
+> - A step that changes a cluster or a project is a proposal, never something you run. Code blocks that do are marked; a step written as prose ("edit", "apply", "enable") is a proposal too.
+> - Scripts, example files, settings files, git and tools the skill names (kanban, MCP servers, web search) are not in this session. Don't look for them; where a step describes a script's checks, make the same checks by reading the objects yourself.`
 )
 
 var (
+	// fileLinkRE is a Markdown link to a relative scripts/ or assets/
+	// path; filePathRE is filePathPattern on its own.
+	fileLinkRE = regexp.MustCompile(`\[[^\]]*\]\((\./)?(assets|scripts)/[^)]*\)`)
+	filePathRE = regexp.MustCompile(filePathPattern)
+	// quotedFilePathRE is the same path as inline code in prose, replaced
+	// with its backticks so the replacement reads as prose.
+	quotedFilePathRE = regexp.MustCompile("`(" + filePathPattern + ")`")
 	// skillNameRE is the Agent Skills name rule: lowercase letters, digits
 	// and hyphens.
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -65,6 +93,13 @@ var (
 		"get": true, "describe": true, "logs": true, "top": true, "explain": true,
 		"api-resources": true, "api-versions": true, "version": true, "cluster-info": true,
 		"events": true, "auth": true, "config": true,
+	}
+	// kubectlReadSubverbs narrows the verbs above that are command groups
+	// with a writing member: `auth reconcile` writes RBAC, and `config`
+	// rewrites the kubeconfig every read depends on.
+	kubectlReadSubverbs = map[string]map[string]bool{
+		"auth":   {"can-i": true, "whoami": true},
+		"config": {"view": true, "current-context": true, "get-contexts": true, "get-clusters": true},
 	}
 	// kubectlValueFlags are the global flags that can precede the verb with
 	// their value as a separate word. Any other flag in that position makes
@@ -133,6 +168,7 @@ func transformSkill(dirName string, src []byte) ([]byte, error) {
 	lines := strings.Split(string(body), "\n")
 	lines = replaceClusterAgentSections(lines)
 	lines = annotateBlocks(lines)
+	lines = replaceFileReferences(lines)
 	lines = insertPreamble(lines)
 
 	var b bytes.Buffer
@@ -171,7 +207,7 @@ func splitFrontmatter(src []byte) (fm, body []byte, err error) {
 	if end < 0 {
 		return nil, nil, fmt.Errorf("frontmatter is not closed")
 	}
-	return []byte(rest[:end]), []byte(rest[end+len(frontmatterFence)+2:]), nil
+	return []byte(rest[:end]), []byte(rest[end+len("\n"+frontmatterFence+"\n"):]), nil
 }
 
 // replaceClusterAgentSections swaps each section whose own text calls a
@@ -281,11 +317,11 @@ func classifyBlock(lang string, body []string) blockClass {
 			}
 			l = strings.TrimPrefix(l, shellPrompt)
 		}
-		if cur.Len() == 0 && (l == "" || strings.HasPrefix(l, "#")) {
+		if cur.Len() == 0 && (l == "" || strings.HasPrefix(l, shellComment)) {
 			continue
 		}
-		if strings.HasSuffix(l, "\\") {
-			cur.WriteString(strings.TrimSuffix(l, "\\") + " ")
+		if strings.HasSuffix(l, lineContinuation) {
+			cur.WriteString(strings.TrimSuffix(l, lineContinuation) + " ")
 			continue
 		}
 		cur.WriteString(l)
@@ -351,6 +387,17 @@ func classifyCommand(cmd string) blockClass {
 	if len(fields) == 0 {
 		return blockInert
 	}
+	// A kubectl or gcloud behind a wrapper (env, timeout, xargs) is judged
+	// as itself, so a write keeps its propose note; the wrapper is still a
+	// program the session can't run.
+	for i, f := range fields[1:] {
+		if f == "kubectl" || f == "gcloud" {
+			if classifyCommand(strings.Join(fields[i+1:], " ")) == blockWrite {
+				return blockWrite
+			}
+			return blockUnavailable
+		}
+	}
 	switch fields[0] {
 	case "kubectl":
 		args := fields[1:]
@@ -363,15 +410,18 @@ func classifyCommand(cmd string) blockClass {
 			if strings.HasPrefix(f, "-") {
 				continue
 			}
-			if kubectlReadVerbs[f] {
-				return blockRead
+			if !kubectlReadVerbs[f] {
+				return blockWrite
 			}
-			return blockWrite
+			if subs, grouped := kubectlReadSubverbs[f]; grouped && (i+1 >= len(args) || !subs[args[i+1]]) {
+				return blockWrite
+			}
+			return blockRead
 		}
 		return blockWrite
 	case "gcloud":
 		for _, f := range fields[1:] {
-			if strings.HasPrefix(f, "-") || strings.HasPrefix(f, "<") || strings.HasPrefix(f, "\"") {
+			if strings.HasPrefix(f, "-") || strings.HasPrefix(f, placeholderOpen) || strings.HasPrefix(f, quoteChar) {
 				break
 			}
 			if gcloudReadVerbs[f] {
@@ -391,11 +441,34 @@ func insertPreamble(lines []string) []string {
 		if strings.HasPrefix(strings.TrimSpace(l), codeFence) {
 			inFence = !inFence
 		}
-		if !inFence && strings.HasPrefix(l, "# ") {
+		if !inFence && strings.HasPrefix(l, titlePrefix) {
 			out := append([]string{}, lines[:i+1]...)
 			out = append(out, "", sessionPreamble)
 			return append(out, lines[i+1:]...)
 		}
 	}
 	return append([]string{sessionPreamble, ""}, lines...)
+}
+
+// replaceFileReferences rewrites every reference to a file that is not
+// shipped: a Markdown link or path in prose becomes shippedFileProse, and a
+// path inside a code block becomes shippedFileArg.
+func replaceFileReferences(lines []string) []string {
+	out := make([]string, len(lines))
+	inFence := false
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), codeFence) {
+			inFence = !inFence
+			out[i] = l
+			continue
+		}
+		if inFence {
+			out[i] = filePathRE.ReplaceAllLiteralString(l, shippedFileArg)
+			continue
+		}
+		l = fileLinkRE.ReplaceAllString(l, shippedFileProse)
+		l = quotedFilePathRE.ReplaceAllLiteralString(l, shippedFileProse)
+		out[i] = filePathRE.ReplaceAllLiteralString(l, shippedFileProse)
+	}
+	return out
 }

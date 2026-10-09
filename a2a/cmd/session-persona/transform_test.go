@@ -102,6 +102,13 @@ func TestShippedTreeIsLoadableByClaudeCode(t *testing.T) {
 		if meta["description"] != srcMeta.Description || srcMeta.Description == "" {
 			t.Errorf("%s: description changed in the build: %q", name, meta["description"])
 		}
+		// Only SKILL.md ships, and Claude Code gives the model the skill's
+		// directory with its text: a path left in would send it looking.
+		for _, ref := range []string{"assets/", "scripts/", "/opt/data/", "SETTINGS.md"} {
+			if strings.Contains(string(rest), ref) {
+				t.Errorf("%s: still points at %q, which is not shipped", name, ref)
+			}
+		}
 		if !strings.Contains(string(rest), sessionPreamble) {
 			t.Errorf("%s: no session preamble", name)
 		}
@@ -227,9 +234,48 @@ func TestWorkerImageShipsTheTreeWhereTheHarnessReadsIt(t *testing.T) {
 			t.Errorf("Dockerfile lacks %q", want)
 		}
 	}
-	// After the chown, so the copies stay root-owned.
-	if strings.Index(df, "chown -R node:node /home/node") > strings.Index(df, "COPY --from=build "+run[1]) {
+	// After the chown, so the copies stay root-owned, and nothing after
+	// them hands the tree back to the harness's user.
+	chown := strings.Index(df, "chown -R node:node /home/node")
+	copied := strings.Index(df, "COPY --from=build "+run[1])
+	if chown < 0 || copied < 0 {
+		t.Fatalf("chown at %d, persona COPY at %d; both must exist", chown, copied)
+	}
+	if chown > copied {
 		t.Error("the persona is copied before the chown, so the harness would own it")
+	}
+	for _, l := range strings.Split(df[copied:], "\n") {
+		if regexp.MustCompile(`chown|chmod`).MatchString(l) && regexp.MustCompile(`/home/node|\.claude|--chown`).MatchString(l) {
+			t.Errorf("after the persona COPY, %q changes who can write the harness home", strings.TrimSpace(l))
+		}
+	}
+}
+
+// The tree is built group- and world-unwritable. COPY --from keeps these
+// modes, so this plus root ownership is what stops the harness (uid 1000)
+// rewriting a skill or adding one.
+func TestShippedTreeIsNotWritableByOthers(t *testing.T) {
+	out := buildShipped(t)
+	n := 0
+	err := filepath.Walk(out, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		n++
+		want := os.FileMode(fileMode)
+		if info.IsDir() {
+			want = dirMode
+		}
+		if info.Mode().Perm()&0o022 != 0 || info.Mode().Perm() != want {
+			t.Errorf("%s is mode %o, want %o; group or others must not write it", path, info.Mode().Perm(), want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < len(sessionSkills)+2 {
+		t.Fatalf("walked %d entries; the tree is not there", n)
 	}
 }
 
@@ -282,6 +328,13 @@ func TestClassifyBlock(t *testing.T) {
 		{"yaml", "kind: Pod", blockInert},
 		{"", "$ python3 x.py\nOBJECT ROW", blockUnavailable},
 		{"", "plain output", blockInert},
+		{"bash", "kubectl auth can-i list pods", blockRead},
+		{"bash", "kubectl auth reconcile -f rbac.yaml", blockWrite},
+		{"bash", "kubectl config view", blockRead},
+		{"bash", "kubectl config use-context other", blockWrite},
+		{"bash", "env FOO=1 kubectl delete pod p", blockWrite},
+		{"bash", "kubectl get pods -o name | xargs kubectl delete", blockWrite},
+		{"bash", "timeout 5 kubectl get pods", blockUnavailable},
 	} {
 		if got := classifyBlock(tc.lang, strings.Split(tc.body, "\n")); got != tc.want {
 			t.Errorf("classifyBlock(%q, %q) = %d, want %d", tc.lang, tc.body, got, tc.want)

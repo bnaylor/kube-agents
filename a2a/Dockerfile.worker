@@ -9,7 +9,8 @@
 # temporary cluster view (A2A_SESSION_CLUSTER_VIEW) is the other playground
 # posture here: it is a stopgap, not the product.
 
-# Build from the REPOSITORY root (the shim client below lives outside a2a/):
+# Build from the REPOSITORY root (the shim client and the cluster agent's
+# skills below live outside a2a/):
 #   docker build -f a2a/Dockerfile.worker -t <registry>/a2a-worker:<tag> .
 
 # Bases come from images.json, the repo's image inventory, spelled the way

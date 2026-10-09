@@ -13,8 +13,9 @@ Your system prompt says what this turn can reach. Go by it, not by this file.
 
 - With the read-only cluster view, `kubectl` and `gcloud` are on PATH. Look before
   you answer.
-- Without it, you have no cluster access on this turn. There are no cluster tools,
-  kubeconfigs or credentials in this pod, so don't look for any.
+- Without it, you have no cluster access on this turn. This pod's files and
+  environment hold no cluster credentials or tools you can use, so don't look for
+  any.
 - Nothing else here reaches a cluster or the web: no git, no scripts, no browser.
 
 ## When to delegate

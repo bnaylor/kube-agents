@@ -71,19 +71,25 @@ onto the PVC to make the reader work, the install is not actually running
 
 A `/session` pod runs Claude Code in the `a2a-worker` image. `session/persona.md`
 is its persona, and the image ships it as the harness's user-level `CLAUDE.md`
-beside seven of the cluster agent's skills from `agents/cluster/skills/`, which
-stay their only source. `a2a/cmd/session-persona` builds that tree at image
-build time: it copies each skill's name and description and nothing else from
-its frontmatter, puts a short note on using the skill in a session after the
-title, marks every code block that writes as a proposal and every one that runs
-a program the image lacks as unavailable, and replaces the cluster agent's
-kanban reporting steps with "give it in your answer". Scripts and assets are not
-shipped. The Dockerfile copies the result into `CLAUDE_CONFIG_DIR`
-(`/home/node/.claude`), owned by root.
+beside the cluster agent's skills that `sessionSkills` in
+`a2a/cmd/session-persona` names, taken from `agents/cluster/skills/`, which
+stays their only source. That tool builds the tree at image build time: it
+copies each skill's name and description and nothing else from its
+frontmatter, puts a short note on using the skill in a session after the title,
+marks every code block that writes as a proposal, every one that runs a program
+the session can't run as unavailable, and every piped read as one command per
+call, replaces the cluster agent's kanban reporting steps with "give it in your
+answer", and rewrites references to its scripts, example files and settings as
+not in this session. Only `SKILL.md` ships. The Dockerfile copies the result
+into `CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root.
+
+Editing a skill in `sessionSkills` now also feeds the worker image: its build
+fails if the skill's frontmatter stops parsing, its `name` stops matching its
+directory, or its description is empty or over 1024 characters.
 
 The persona adds no tools and no authority: the tool surface is still the one
 `a2a/cmd/worker-adapter` passes on `--allowedTools`, and that list does not
 name the Skill tool. Claude Code runs a skill whose frontmatter carries only a
 name and description without a permission rule, and a skill that asks for more
-(`allowed-tools`, `hooks`) is refused. Its tests in `a2a/cmd/session-persona`
+(`allowed-tools`, `hooks`) is refused in a headless run. Its tests in `a2a/cmd/session-persona`
 build the tree from the real sources and fail if a write is left unmarked.

@@ -69,10 +69,10 @@ func build(skillsSrc, personaSrc, out string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(out, dirMode); err != nil {
+	if err := mkdir(out); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(out, personaFile), persona, fileMode); err != nil {
+	if err := writeFile(filepath.Join(out, personaFile), persona); err != nil {
 		return err
 	}
 	for _, name := range sessionSkills {
@@ -85,12 +85,31 @@ func build(skillsSrc, personaSrc, out string) error {
 			return err
 		}
 		dir := filepath.Join(out, skillsDir, name)
-		if err := os.MkdirAll(dir, dirMode); err != nil {
+		if err := mkdir(filepath.Join(out, skillsDir)); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(dir, skillFile), adapted, fileMode); err != nil {
+		if err := mkdir(dir); err != nil {
+			return err
+		}
+		if err := writeFile(filepath.Join(dir, skillFile), adapted); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// mkdir and writeFile set the mode explicitly after creating, so the shipped
+// modes don't depend on the build's umask.
+func mkdir(dir string) error {
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		return err
+	}
+	return os.Chmod(dir, dirMode)
+}
+
+func writeFile(path string, data []byte) error {
+	if err := os.WriteFile(path, data, fileMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, fileMode)
 }
