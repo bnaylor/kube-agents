@@ -361,7 +361,10 @@ api lane's roster is untouched. The lane pins that executor: `hack/ci-deploy.sh`
 operator's `A2A_BRIDGE_EXECUTOR=cli`, which the rendered bridge takes as `BRIDGE_EXECUTOR`, and its start-line wait requires `"executor":"cli"`. The
 bridge's default `api` executor runs the turn under the pod's API server, whose profile is the
 chat path's own (`default` on a stock install), so it changes which agent answers every case on
-the lane; the pin, and the exclusion, stay until cases have been graded on that executor.
+the lane; the pin, and the exclusion, stay until cases have been graded on that executor. That
+is a stopgap: under `api` a delegated case is graded on the Planning Agent's acknowledgement
+rather than the card's answer, and the pin comes out once the delegation wait waits for the
+card's worker (gke-labs/kube-agents#2619 gap 1).
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -418,11 +421,12 @@ run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the rese
 value clamps to 1), computed from four constants the script copies from the operator and
 pins against it. The mode patch is the only patch, so no later render re-measures the budget
 against the stream the Job created. The rendered bridge carries the agent container's own
-environment, mounts, security context and resources, copied by the operator from the agent
-container it renders: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+environment, mounts and security context, copied by the operator from the agent
+container it renders (its resources are sized for the executor it runs, gke-labs/kube-agents#2748: on the lane's `cli` pin, with `A2A_BRIDGE_RESOURCES` unset, it keeps the agent container's): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
-default `api` executor the same copy is what carries `API_SERVER_KEY` into the bridge, which is
-why the deploy pins `A2A_BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
+default `api` executor the operator sets `API_SERVER_KEY` on the bridge itself (the loopback
+bearer, not a copy, gke-labs/kube-agents#2753), which is why the deploy pins
+`A2A_BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
 operator adds `A2A_ACTIVITY_SECRET` from the creds Secret's `bridge-activity-key` itself. The one
 mount not carried is the projected bus token, the agent principal's credential. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that

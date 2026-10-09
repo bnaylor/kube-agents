@@ -278,12 +278,12 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # it must not mount are the operator's, not this script's. The script names
 # the container only to read its log (a2aBridgeContainerName).
 readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
-# The lane pins the bridge's subprocess executor. The rendered bridge copies
-# the agent container's API_SERVER_KEY, so left unset the bridge would pick
-# its api executor, whose turns the pod's API server answers with its own
-# profile rather than the platform persona the lane's cases were graded
-# against. The pin holds until cases have been graded on api
-# (docs/designs/eval-next-transport.md).
+# The lane pins the bridge's subprocess executor, a stopgap until the inject
+# harness can grade a delegated answer (gke-labs/kube-agents#2619 gap 1). The
+# operator sets API_SERVER_KEY on the rendered bridge, so left unset the bridge
+# would pick its api executor, under which a delegated case is graded on the
+# Planning Agent's acknowledgement rather than the card's answer
+# (docs/designs/eval-next-transport.md). The pin goes once that gap closes.
 readonly BRIDGE_EXECUTOR_PINNED="cli"
 # BRIDGE_CONCURRENCY is sized against the matrix's fan-out: hack/ci-eval-pr.sh
 # runs EVAL_TASK_PARALLELISM units at once from the same job environment,
@@ -410,11 +410,14 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-# The rendered bridge's three operator settings (a2aBridgeImageEnvVar,
+# Three of the rendered bridge's four operator settings (a2aBridgeImageEnvVar,
 # a2aBridgeConcurrencyOperatorEnvVar and a2aBridgeExecutorOperatorEnvVar in
 # platformagent_a2a_bridge.go): its image, its BRIDGE_CONCURRENCY and its
 # BRIDGE_EXECUTOR. The operator reads them from its own environment, as it
-# does the overrides above; no CR field carries them.
+# does the overrides above; no CR field carries them. The third,
+# A2A_BRIDGE_EXECUTOR, is pinned to cli (BRIDGE_EXECUTOR_PINNED says why); the
+# fourth, A2A_BRIDGE_RESOURCES, is left unset, so a cli bridge keeps the agent
+# container's resources.
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"
 readonly A2A_BRIDGE_EXECUTOR_ENV_VAR="A2A_BRIDGE_EXECUTOR"
