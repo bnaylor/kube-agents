@@ -31,7 +31,7 @@ spec:
   mode: today # unsupported dev toggle for the A2A stack (optional)
 ```
 
-`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, `spec.networkPolicy`, and `spec.scope` are optional. `spec.mode` is an optional enum (`today`/`next`, absent means `today`) and, like `experimental.platformFrontDoor`, **unsupported**: it is the dev toggle from `docs/designs/spec-mode-switch.md` that keeps the A2A `next` stack dark. The chart sets it from `platformAgent.mode`, the Terraform composition from `platform_agent_mode` and `install.sh` from `--mode` (recorded in `install.env` as `PLATFORM_AGENT_MODE`). Their defaults (the chart's `null`, the other two's `today`) render no field at all, so a mode set on the CR by hand is left alone. Changing it on a running install is a mode switch rather than a setting: the operator rolls the agent and renders or retires the A2A stack. Under `next` the operator additionally renders the stage-1 A2A playground stack — the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, a session-pod ResourceQuota, the A2A gateway Deployment, once a chat backend is configured (see the `A2AGateway` condition), with session-pod spawning armed, the capability verifier Deployment (two replicas, with its own ServiceAccount and a NetworkPolicy fencing it to DNS and the bus — it is the only bus principal permitted to read the `cap` KV bucket, and it needs nothing else; it also carries a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread, because a submission arriving while no verifier is ready is refused terminally, so a node drain must not take both replicas at once, and the spread is `ScheduleAnyway` so a single-node install still comes up), and the auth callout that authenticates bus clients (its Deployment, Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMap `<agent>-a2a-authmap`, and the keys Secret `<agent>-a2a-callout-keys`; its two replicas also carry a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread, because while no callout is ready the bus refuses every new connection, so a node drain evicts one callout at a time and waits for its replacement to be ready before taking the other (on a cluster with no other schedulable node, such as a single-node install, that wait lasts until the node is uncordoned or the drain overrides the budget), and the spread is `ScheduleAnyway` so a single-node install still comes up), the console server that serves the A2A console page and proxies its websocket to the bus (its Deployment and Service, `<agent>-a2a-console`, and a deny-all ingress NetworkPolicy, `<agent>-a2a-console-netpol`, so it is reachable only through `kubectl port-forward`, and that port-forward is also what hands out the console credential), plus ServiceAccounts for the provisioning Job and for the spawned session pods, so the callout has an identity to resolve each by. When that chat backend is Google Chat, the A2A gateway consumes the install's Chat subscription in place of the Planning Agent, whose Google Chat platform is then not rendered: `spec.integration.googleChat.homeChannel` has no Chat target on such an install, so proactive messages the agent addresses to it are not delivered, and disabling Google Chat afterwards, with no other backend configured, scales the existing gateway to zero replicas until a backend returns (see the `A2AGateway` condition). Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVC. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest.
+`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, `spec.networkPolicy`, and `spec.scope` are optional. `spec.mode` is an optional enum (`today`/`next`, absent means `today`) and, like `experimental.platformFrontDoor`, **unsupported**: it is the dev toggle from `docs/designs/spec-mode-switch.md` that keeps the A2A `next` stack dark. The chart sets it from `platformAgent.mode`, the Terraform composition from `platform_agent_mode` and `install.sh` from `--mode` (recorded in `install.env` as `PLATFORM_AGENT_MODE`). Their defaults (the chart's `null`, the other two's `today`) render no field at all, so a mode set on the CR by hand is left alone. Changing it on a running install is a mode switch rather than a setting: the operator rolls the agent and renders or retires the A2A stack. Under `next` the operator additionally renders the stage-1 A2A playground stack — the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, a session-pod ResourceQuota, the A2A gateway Deployment, once a chat backend is configured (see the `A2AGateway` condition), with session-pod spawning armed, the capability verifier Deployment (two replicas, with its own ServiceAccount and a NetworkPolicy fencing it to DNS and the bus — it is the only bus principal permitted to read the `cap` KV bucket, and it needs nothing else; it also carries a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread, because a submission arriving while no verifier is ready is refused terminally, so a node drain must not take both replicas at once, and the spread is `ScheduleAnyway` so a single-node install still comes up), and the auth callout that authenticates bus clients (its Deployment, Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMap `<agent>-a2a-authmap`, and the keys Secret `<agent>-a2a-callout-keys`; its two replicas also carry a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread, because while no callout is ready the bus refuses every new connection, so a node drain evicts one callout at a time and waits for its replacement to be ready before taking the other (on a cluster with no other schedulable node, such as a single-node install, that wait lasts until the node is uncordoned or the drain overrides the budget), and the spread is `ScheduleAnyway` so a single-node install still comes up), the console server that serves the A2A console page and proxies its websocket to the bus (its Deployment and Service, `<agent>-a2a-console`, and a deny-all ingress NetworkPolicy, `<agent>-a2a-console-netpol`, so it is reachable only through `kubectl port-forward`, and that port-forward is also what hands out the console credential), plus ServiceAccounts for the provisioning Job and for the spawned session pods, so the callout has an identity to resolve each by. When that chat backend is Google Chat, the A2A gateway consumes the install's Chat subscription in place of the Planning Agent, whose Google Chat platform is then not rendered: the gateway also carries `spec.integration.googleChat.homeChannel`, and the agent's proactive messages reach that space through the gateway, which posts them as new threads there or as replies on its threads and nowhere else (with `homeChannel` unset, or not a `spaces/<id>` name, the agent posts nothing to Google Chat unprompted). Disabling Google Chat afterwards, with no other backend configured, scales the existing gateway to zero replicas until a backend returns (see the `A2AGateway` condition). Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVC. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest.
 
 Under `next` the A2A gateway serves Prometheus counters on a metrics-only port, 9096 (container port `a2a-metrics`, set by `A2A_METRICS_PORT`), which the chart's `<name>-a2a-gateway-monitoring` `PodMonitoring` scrapes behind `platformAgent.podMonitoring`; the metrics are listed on [Observability](/kube-agents/concepts/observability/). The gateway's NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway does, eval door or no door, and stays while the gateway is scaled to zero replicas for want of a backend; it admits the `gke-gmp-system` namespace to that port and nothing else.
 
@@ -63,7 +63,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                                        |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
 | `tuning.maxSessions`                           | int    | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
 | `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
 
@@ -169,7 +169,7 @@ Three consequences before you press it:
 - **It stops the inflow only.** Kanban cards and sessions created from events already delivered keep
   running and still have to be dealt with on the board. It reclaims nothing either: the watcher's
   kubeconfig, token projection, and mounts stay in place, and the sidecar keeps the memory request
-  sized for the informer and dedup caches it is no longer running.
+  sized for the caches it is no longer running.
 - **Nothing turns it back on.** An install left with the watcher off has no incident detection at
   all, and the container stays Ready throughout — the readiness probe covers the credential proxy,
   not the watcher. Two things say otherwise: a line in the sidecar log naming the consequence, and
@@ -282,15 +282,17 @@ execution limit of their own — Hermes' defaults apply there, 3 retries and 90 
 `tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
 removing it restores the image's value rather than Hermes'.
 
-**`maxInProgress` is not.** Unset renders `2`, because the untuned case is the one that cannot
+**`maxInProgress` is not.** Unset renders `6`, because the untuned case is the one that cannot
 absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)
-below. Set it on the CR to raise or lower that.
+below. Set it on the CR to raise or lower that. Either way the value is pinned in the managed scope
+at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
+field puts the default back.
 
 ```yaml
 spec:
   harness:
     tuning:
-      maxInProgress: 4 # board-wide; raises the operator's default of 2
+      maxInProgress: 8 # board-wide; raises the operator's default of 6
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -352,11 +354,89 @@ only trace is `pid not alive` in the kanban ledger. The dispatcher's retry budge
 is stranded rather than re-dispatched, and the work it stood for is never done — a triage report
 that simply never arrives, with nothing anywhere reporting a failure.
 
-`2` is a floor for a deployment that has not measured itself, not a recommendation. It is chosen to
-hold on the smallest pod anyone runs, and because the cost of being wrong is asymmetric: too low
-delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
-and your model quota — that quota is the other shared resource, and for most deployments it binds
-before memory does.
+`6` is a floor for a deployment that has not measured itself, not a recommendation. It assumes the
+operator's default 8Gi memory limit on the agent container, and the cost of being wrong is
+asymmetric: too low delays a delegated task, too high loses it silently. An install that lowered the
+agent's memory limit through `spec.deployment.resources` (which replaces the defaults as a block)
+should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the pod holds idle, so
+a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
+that quota is the other shared resource, and for most deployments it binds before memory does.
+
+The cap comes from the operator, not from the image or the agent's own `config.yaml`. The operator
+pins `kanban.max_in_progress` in the managed scope at `/etc/hermes`: the CR's value, or `6` when it
+says nothing. Hermes applies that file over the agent's config on every load, so a value an existing
+volume was first seeded with, a removed override, or an edit the agent made to its own file has no
+effect. An install upgraded onto an operator that changes the default takes the new number on its
+first reconcile and the pod roll that follows; the dispatcher logs
+`kanban dispatcher: max_in_progress=<n>` at startup (Hermes' `_positive_int_setting` in
+`gateway/kanban_watchers_common.py`, which logs each configured kanban cap as it reads it). The `max_in_progress` line in
+`agents/chat/config.yaml` applies only to an image run without the operator.
+
+One slot is guaranteed to each class of card. A card is classed when an agent files it with
+`kanban_create`: one filed from an event-triage or cron-relay session is background, and one filed
+in a chat turn or through the inject and A2A doors is a user card. A card filed by hand, with
+`hermes kanban create` or from the dashboard, never passes through that step and is background
+unless it is given priority 100 or more (`--priority 100`); the dashboard can change a card's
+priority afterwards. So are the children Hermes' auto-decompose files for a card created with
+`triage: true`: they are written at priority 0, so a user card filed that way runs its decomposed
+work as background.
+
+At a cap of 2 or more, background cards may hold every slot but one, so a question asked in chat
+starts at once even while triage is running, and user cards may hold every slot but one, so a
+door's fan-out cannot silence alerts. The slots between go to whoever is first, and user cards
+sort first. At the default of 6 that is one slot for each class and four shared. The price is that
+a burst of alerts drains more slowly than it would with every slot open to it, and a burst of user
+work likewise. At a cap of 2 each class gets exactly one. At a cap of 1 nothing is held: a user
+card still goes ahead of waiting triage, but it waits for the running card to finish. A top-level
+user card that waits, because every slot is busy or the only free one is triage's, gets one line in
+its thread: `⏳ Queued: the system is busy. Your request will start when a worker frees up.` A card
+filed as part of a request already running (a worker's child, or a card with a parent link) waits
+without one.
+
+A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
+logs, at most every five minutes:
+
+```text
+kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], t_cd34 @cluster-prod 9m [k8s-evt-]); 1 user card(s) and 2 background card(s) waiting
+```
+
+The card list is shortened here. The real line names up to five cards that hold slots, oldest first
+within each board, boards in turn; a coordinator only waiting on its own children is left out,
+because it is not counted as running.
+The line gets `; N background card(s) held back because one slot is reserved for user cards` or
+`; N user card(s) held back because one slot is reserved for background triage` added when a held
+slot is what stopped them. When the only free slot is the one held for the other class, the line
+starts `kanban dispatcher holding background cards:` or `kanban dispatcher holding user cards:`
+instead. That line is load, not a fault. The older
+`kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
+and still nothing started.
+
+The arithmetic behind `6`:
+
+- **Gateway memory.** One worker measured about 430 MiB on a live install: `hermes chat` 207 MiB,
+  two Node MCP proxies about 100 MiB each, a supervisor and an ssh. Six of them are about 2.6 GiB
+  over the gateway's 1.8 GiB idle set, about 4.4 GiB under the container's 8Gi limit. A coordinator
+  waiting on its own children gives its slot back but stays resident, so the process count can sit
+  above six; the 8Gi limit leaves room for about fourteen workers at that size.
+- **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
+  request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
+  fixed reserves. At its default 2Gi limit that is 9 at once
+  (`credentialProxyAdmittedRequests` in
+  `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
+  the old 1Gi it was 4. The 8 slots are shared: the stall watch and the cluster-agent reconcile
+  each list four projects at a time through them. With neither listing, all 8 are free for the six
+  workers; while one lists, 4 are; while both list at once, none, and a worker command waits up to
+  60 s for a slot and is then refused busy.
+- **Model quota.** Per-install model rate limits are not measured. A small quota may see 429s at 6;
+  if worker logs show them, lower `maxInProgress`.
+
+If you raise `maxInProgress`, check your model quota, and know where the credential proxy stops it.
+The proxy's default 2Gi already admits more than its slot cap of 8, so up to about eight workers'
+worth of commands fit, fewer while a listing runs. Past that the slot cap binds, and the operator
+owns it: no CR field moves it, so raising the proxy's memory in
+`spec.deployment.credentialProxy.resources` does not help, and a command beyond eight waits up to
+60 s for a slot and is then refused busy. Keep that limit at 2Gi or more, because below it the
+memory budget binds first.
 
 The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
 waiting on work it fanned out is discounted, or it would hold the slot its own children need
@@ -390,10 +470,10 @@ Three things change while it is on:
 - `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
   carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
   `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
-  machine-global, so `platforms.*` and `display.platforms` already land on this profile. `kanban`
+  machine-global, so `platforms.*`, `display.platforms` and the board's worker cap
+  ([`tuning.maxInProgress`](#specharnesstuning)) already land on this profile. The rest of `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
-  process and read their settings from its own home; that is what keeps
-  [`tuning.maxInProgress`](#specharnesstuning) applying. The board itself does not move — Hermes
+  process and read their settings from its own home. The board itself does not move — Hermes
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
   dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
@@ -458,7 +538,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   an already-onboarded install and promise a report nothing can deliver. The operator therefore
   leaves that plugin off the front door deliberately. Bring an install up with the flag off, let
   onboarding finish, then turn it on.
-- **A home channel set with `/sethome` stays on the profile it was set on.** The operator renders no
+- **A home channel set with `/sethome`, or by the first chat message, stays on the profile it was set on.** The operator renders no
   `home_channel` of its own, so on an install that did not populate the CR's Google Chat or Slack
   `homeChannel` the value lives only in the config file the gateway last wrote. Flipping the flag
   changes which file that is, and nothing carries it across. The Platform Agent's own `deliver: all`
@@ -508,7 +588,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it ([#610](https://github.com/gke-labs/kube-agents/issues/610)). The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
 - `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
-- `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory` keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state and `/tmp` emptyDirs (size limits 5Gi and 2Gi) follow that limit when it is raised above their defaults, so the kubelet does not evict the pod at the smaller figure. The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares. The operator refuses a memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only. It warns too for each of `cpu` and `memory` set under `limits` without the same key under `requests`, unless the limit equals the request it would be replaced by: Autopilot without bursting sets the limits equal to the requests, so a CR that sets only `limits.memory: 2Gi` runs at the 512Mi request there. Set the request to the same value, or enable bursting, under which the declared limits stand.
+- `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory` keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state and `/tmp` emptyDirs (size limits 5Gi and 2Gi) follow that limit when it is raised above their defaults, so the kubelet does not evict the pod at the smaller figure. The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares. The operator refuses a memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only. It warns too for each of `cpu` and `memory` set under `limits` without the same key under `requests`, unless the limit equals the request it would be replaced by: Autopilot without bursting sets the limits equal to the requests, so a CR that sets only `limits.memory: 3Gi` runs at the 512Mi request there. Set the request to the same value, or enable bursting, under which the declared limits stand.
 - `initContainers` / `sidecars` — standard init and sidecar containers. A `volumeMounts` entry naming a reserved volume is refused at admission, the same as `extraVolumeMounts`. That is the route that needs no user-authored volume at all, and so the one the name reservation exists for; see [Reconcile behavior](#reconcile-behavior). Under the unsupported `spec.mode: next` dev toggle the render also writes two environment variables onto every `sidecars` entry — `POD_NAMESPACE` (downward API) and `A2A_CAPABILITY_REQUIRED` — with different precedence: the operator's `A2A_CAPABILITY_REQUIRED` wins, so a value set for that name in the CR is discarded on every reconcile, while `POD_NAMESPACE` is supplied only as a default and a CR value for it survives. Both are inputs to the A2A capability check the sidecar executor performs, not container configuration; nothing else in the container is rewritten.
 - `extraVolumes` — custom volumes for the main container. Both halves of the reservation apply: a reserved name, and a source that would carry the A2A bus credential, are each refused at admission; see [Reconcile behavior](#reconcile-behavior).
 - `extraVolumeMounts` — custom mounts for the main container. A mount has no source, so only the name half applies: an entry naming a reserved volume is refused at admission.
@@ -901,7 +981,8 @@ is _not_ a security sandbox — see the
 **What is pinned is narrow, on purpose.** `/etc/hermes` is machine-global — one file for every
 profile in the pod, not just `default` — so it carries only what is identical for every profile
 _and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode`,
-`display.platforms`, `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
+`display.platforms`, `kanban.max_in_progress` (the board is shared by every profile, and a burst of
+workers past it is lost to the OOM killer without a restart or an event), `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
 profile), when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
 corrupted database is found only after the sessions in it are unreadable) and, when the A2A bridge is in the
 Pod, rendered by the operator or declared, and runs the `api` executor, one `hooks.outbound` entry that posts tool calls to the bridge's loopback trace endpoint (one endpoint per
@@ -912,7 +993,7 @@ talked into fixing.
 
 Everything else the operator owns for the front door goes in `profile-default.overlay.yaml`
 instead: `plugins.enabled` for AgentPlugins with no `targetProfile`, those plugins' non-gateway
-config subtrees, and `spec.harness.tuning`'s `default` limits and `maxInProgress`. Those are
+config subtrees, and `spec.harness.tuning`'s `default` limits. Those are
 profile-shaped — pinning them machine-globally would hand the front door's settings to every
 specialist — and they are all recoverable by an agent that can still talk and still reason.
 Nothing the operator renders appears on both routes. What appears on neither, and so stays the
