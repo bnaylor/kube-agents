@@ -190,12 +190,14 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
 - **Empty or `today`**, or `next` with Google Chat also enabled: the credential broker.
 
   ```bash
-  kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system | grep 'Slack relay'
+  kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
+    | grep -E 'Slack relay|Slack bot token'
   ```
 
-  The last line reads `Slack relay enabled workspaces=1`, where the number is how many workspaces
-  the bot token covers. `Slack relay initialization failed; retrying` means the broker could not
-  connect to Slack with the tokens.
+  The last line reads `Slack relay enabled workspaces=1`, where the number counts the bot tokens
+  Slack accepted, one per workspace. `Slack bot token authentication failed` names a token Slack
+  refused, and `Slack relay initialization failed; retrying` means the broker could not connect
+  with the tokens.
 
 - **`next`**: the A2A gateway.
 
@@ -205,37 +207,53 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
   ```
 
   The last line contains `"msg":"slack connected"` and names the bot user and the workspace
-  (`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token. A
-  `chat backend stopped` line after it means the Slack connection failed and the gateway is
-  retrying.
+  (`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
+  and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
+  connection failed; one with no `slack connected` before it means Slack refused the bot token.
+  The gateway retries either way.
 
-Either way, DM the app a question such as `what clusters can you see?` and wait for the answer: the
-log line does not prove that messages reach the agent. If nothing comes back,
-[Slack app setup → Verify](/kube-agents/install/slack-app/#verify) has the next checks.
+Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
+AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
+nothing comes back, [Slack app setup → Verify](/kube-agents/install/slack-app/#verify) has the next
+checks.
 
 ## Switching `spec.mode`
 
 `PLATFORM_AGENT_MODE` in `install.env` sets the install's `spec.mode`: `today`, or `next`, an
-unsupported development stack. A file with no such line means `today`. Only a full upgrade applies
-the key, and only the `install.sh` and `upgrade.sh` of releases after 0.9.0 read it, so upgrade to
-such a release first.
+unsupported development stack. A file with no such line means `today`. Of `upgrade.sh`'s modes only
+full applies the key; a re-run of `install.sh` applies it too. Only the `install.sh` and
+`upgrade.sh` of releases after 0.9.0 read it, so upgrade to such a release first.
 [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
 has the rules for the key. This section covers what a switch does to Slack, in order.
+
+With Google Chat also enabled, Google Chat takes the A2A gateway and Slack stays on the credential
+broker under `next`, as under `today`. Then none of the Slack steps below apply: switch, check Slack
+as in [Checking the result](#slack), and leave the Slack app as it is.
 
 ### Before the switch
 
 1. Check that Slack answers now, as in [Checking the result](#slack).
-2. Check the Slack keys in `install.env`, because `next` reads them more strictly:
-   - `SLACK_BOT_TOKEN` is one `xoxb-` token, not a comma-separated list. The A2A gateway takes
-     a single workspace's token ([Get the tokens](/kube-agents/install/slack-app/#get-the-tokens)).
-   - `SLACK_ALLOWED_USERS` holds member IDs such as `U0123ABCD`, not emails
+2. Check the Slack settings `next` depends on:
+   - The bot token is one `xoxb-` token, not a comma-separated list: the A2A gateway takes a
+     single workspace's token
+     ([Get the tokens](/kube-agents/install/slack-app/#get-the-tokens)). This prints `0` for a
+     single token, without printing the token:
+
+     ```bash
+     kubectl get secret platform-agent-secrets -n kubeagents-system \
+       -o jsonpath='{.data.SLACK_BOT_TOKEN}' | base64 -d | tr -cd ',' | wc -c
+     ```
+
+   - `SLACK_ALLOWED_USERS` in `install.env` holds member IDs such as `U0123ABCD`, not emails
      ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
-   - `SLACK_HOME_CHANNEL` is the ID of the channel for alerts and scheduled reports: `C…` for a
-     public channel, `G…` for a private one. In Slack, the ID is at the bottom of the channel's
-     details. Under `next` the gateway posts the agent's proactive messages to this channel
-     only. A home channel set from Slack with `/sethome` is kept in the Planning Agent's
+   - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
+     reports: `C…`, or `G…` for some private channels. In Slack, the ID is at the bottom of the
+     channel's details. Under `next` the gateway posts the agent's proactive messages to this
+     channel only. A home channel set from Slack with `/sethome` is kept in the Planning Agent's
      profile, not in `install.env`, so it does not carry over. A DM ID (`D…`) or a channel name
-     turns off the gateway's notify route, and with it the reports of board cards.
+     turns off the gateway's notify route, and with it the reports of board cards
+     ([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel-1)).
+
 3. Check the board for cards in flight:
 
    ```bash
@@ -245,9 +263,9 @@ has the rules for the key. This section covers what a switch does to Slack, in o
      hermes kanban ls --status blocked
    ```
 
-   Wait until neither command lists a card: answer each blocked card, and let running ones
-   finish. Do not count on a card filed before the switch to report back to its Slack thread
-   after it.
+   Wait until neither command lists a card: answer each blocked card in its Slack thread, and let
+   running ones finish ([What carries over](#what-carries-over) says why). If scheduled jobs keep
+   filing cards, switch between their runs.
 
 4. Switch when nobody is using the agent, and tell its users that Slack will not answer for a
    while.
@@ -261,12 +279,14 @@ looks). Set the key, adding the line if the file has none:
 PLATFORM_AGENT_MODE=next
 ```
 
-Run the upgrade again at the release the install runs, in the default full mode: pass no
-`--upgrade-mode`. Before it applies anything, the run warns:
+[Run the upgrade](#run-the-upgrade) again at the release the install runs, in the default full
+mode: pass no `--upgrade-mode`. Before it applies anything, the run warns:
 
 ```text
 This apply switches the install from spec.mode today to next (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.
 ```
+
+It does not stop to ask. To stay on `today`, press Ctrl-C at that warning and set the key back.
 
 `--upgrade-mode=harness` and `--upgrade-mode=operator` leave the mode as it is and say that a full
 upgrade would switch it. If the run says instead that the `PlatformAgent` carries a `spec.mode` set
@@ -289,20 +309,26 @@ The operator moves Slack in three steps:
    replica is ready, which needs the bus to be running. The provisioning Job, started at the same
    point, creates the bus's streams.
 3. The gateway joins the bus, retrying for up to 45 seconds while the streams do not exist and
-   restarting after that. It then opens the Slack connection and logs `slack connected`.
+   restarting after that. It then checks the bot token with Slack, logs `slack connected`, and
+   opens the Socket Mode connection.
 
-The broker's connection is gone before the gateway exists, so the two never answer the same
-message. How long Slack goes unanswered depends on how fast the cluster schedules and pulls the
-new pods. A message sent in that gap finds no connection, and nothing in kube-agents fetches it
-later: treat it as lost, and ask its sender to send it again. Wait for the gateway:
+The broker's connection stops when the switch starts, and the gateway exists only once the bus is
+up, so in practice the two never take the same message. How long Slack goes unanswered depends on
+how fast the cluster schedules and pulls the new pods. Slack has no connection to deliver a message
+sent in that gap to, and nothing in kube-agents fetches it later: treat it as lost, and ask its
+sender to send it again. Wait for the gateway, for up to 15 minutes:
 
 ```bash
-until kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system 2>/dev/null \
-  | grep -q 'slack connected'; do sleep 10; done
+for i in $(seq 90); do
+  kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system 2>/dev/null \
+    | grep -q 'slack connected' && { echo connected; break; }
+  sleep 10
+done
 ```
 
-If that does not return, the `Ready` condition's message names what the operator is waiting on,
-and
+It prints `connected` once the gateway has logged `slack connected`; then check Slack as in
+[Checking the result](#slack). If it prints nothing, the `Ready` condition's message names what the
+operator is waiting on, and
 [Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#5-the-chat-bot-doesnt-answer)
 has the checks for the bus and the gateway. Slack stays unanswered until the gateway connects or
 you [switch back](#switching-back-to-today).
@@ -355,12 +381,18 @@ acknowledge them.
    the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
    connection, and a message the stopping gateway takes gets no answer. The bus volume and its
    credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-a-teardown-leaves)
-   says how to remove them. Wait for the broker:
+   says how to remove them. Wait for the broker, for up to 5 minutes:
 
    ```bash
-   until kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system 2>/dev/null \
-     | grep -q 'Slack relay enabled'; do sleep 10; done
+   for i in $(seq 30); do
+     kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system 2>/dev/null \
+       | grep -q 'Slack relay enabled' && { echo connected; break; }
+     sleep 10
+   done
    ```
+
+   It prints `connected` once the broker has connected to Slack. If it prints nothing, read the
+   broker's log as in [Checking the result](#slack).
 
 3. Put the slash commands and interactivity back. Print the `today` manifest:
 

@@ -119,8 +119,8 @@ run rather than writing that ref into the composition.
 ## After the Upgrade, and Switching `spec.mode`
 
 - On an install with Slack, check that Slack answers before reporting success: the log line and
-  the DM test in the Upgrade page's
+  the DM test (ask a person to send it) in the Upgrade page's
   [Checking the result → Slack](../../../docs/site/src/content/docs/install/upgrade.md#slack).
 - To switch `spec.mode` (`PLATFORM_AGENT_MODE`), follow the Upgrade page's
   [Switching `spec.mode`](../../../docs/site/src/content/docs/install/upgrade.md#switching-specmode)
-  step by step. Only a full upgrade applies the key.
+  step by step. Of `upgrade.sh`'s modes only `--upgrade-mode=full` applies the key.
