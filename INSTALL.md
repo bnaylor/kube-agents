@@ -1073,9 +1073,10 @@ or the install was made by a release that predates this engine — re-run it wit
 
 ### Manual Local Uninstall
 
-To uninstall the operator controller and CRDs manually:
+To uninstall the operator controller and CRDs manually, delete the `PlatformAgent` first and wait, so the operator is still running to clear its finalizer:
 
 ```bash
+kubectl delete platformagent platform-agent -n kubeagents-system --wait --timeout=180s
 cd k8s-operator
 make undeploy
 make uninstall
@@ -1119,29 +1120,28 @@ make uninstall
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
   ```
-- **Default mode.** Slack ignores a sender who is not on `SLACK_ALLOWED_USERS` without replying, so check the list first; it takes Slack member IDs (`U0123ABCD`), not names. Change it in `install.env` and run `./upgrade.sh`. The credential broker holds the Slack connection, and its log says whether the tokens work: `Slack relay enabled workspaces=1` is healthy, `Slack bot token authentication failed` or `Slack relay initialization failed; retrying` is a token or app problem.
+- **Default mode.** Slack ignores a sender who is not on `SLACK_ALLOWED_USERS` without replying (an empty list admits everyone), so check the list first; it takes Slack member IDs (`U0123ABCD`), not names. Change it in `install.env` and run `./upgrade.sh`. The credential broker holds the Slack connection, and its log says whether the tokens work: `Slack relay enabled workspaces=1` is healthy, `Slack bot token authentication failed` or `Slack relay initialization failed; retrying` is a token or app problem.
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -i slack
   ```
   The app's Socket Mode, event subscriptions and scopes are covered in [Slack app setup](https://gke-labs.github.io/kube-agents/install/slack-app/#create-the-app).
   On Google Chat, a sender must be on `ALLOWED_USERS` (emails; empty admits everyone), and the Chat app has to publish to the install's Pub/Sub topic ([ChatOps → Google Chat](docs/site/src/content/docs/concepts/chatops.md#google-chat)).
-- **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway, and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
+- **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway (one that already exists is kept at zero replicas), and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \
     -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
   kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
   ```
   With both Google Chat and Slack enabled, Slack is on the default path, not the gateway: use the default-mode check above for it.
-- **`next`: read the gateway's log.** It starts with `a2a gateway starting` naming the `backend`, a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
   ```
-  - `dropping message from unverified sender` with the sender's `author`: the allowlist does not admit them, and they were sent the `⛔ I can't verify who you are …` notice once. Add their Slack member ID to `SLACK_ALLOWED_USERS` (their email to `ALLOWED_USERS` for Google Chat) in `install.env` and run `./upgrade.sh`. The allowlist is in [Slack app setup](https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users).
+  - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
   - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
-  - `slack: ignoring a message from another workspace's member`: a Slack Connect guest. The gateway answers only its own workspace's members.
-  - `chat backend stopped; restarting it, the console stays up` with an `err` containing `slack auth.test:`: Slack refused the bot token, and the gateway keeps retrying. `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`). Check both in the install's credentials Secret.
+  - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
   - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
-  - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply once the thread has been quiet for 30 minutes, is not a turn. Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+  - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn. Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
 - **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \
@@ -1158,16 +1158,16 @@ The gateway posts a status line for every task ([what a task looks like](docs/si
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | tail -n 50
   ```
-  `the bus refused this bridge` means the callout does not admit it (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
+  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
   ```bash
   kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
   ```
 - **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. On Google Chat the gateway posts it into the conversation you asked in; on Slack it does not, so this is expected there. On Google Chat, check each hop:
   1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `conversations=true`. `chat.notify route not armed` with an `err` means `spec.integration.googleChat.homeChannel` is set but is not a space name (`spaces/<id>`): correct or remove it. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
      ```bash
-     kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify refused'
+     kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
-     `notify refused` with `not a live conversation with that context` means the report named a conversation the gateway has no live session record for.
+     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record could not be read (logged first as `notify: session record unreadable`).
   2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'
@@ -1175,8 +1175,8 @@ The gateway posts a status line for every task ([what a task looks like](docs/si
   3. The card was addressed to that route. The agent logs a line ending `— a report completed on this card will not reach chat` when it was not:
      ```bash
      kubectl exec -n kubeagents-system deploy/platform-agent-gateway -c platform-agent -- \
-       sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs 2>/dev/null | tail -n 20'
+       sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
      ```
      `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
-- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
 - **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.
