@@ -55,7 +55,7 @@ func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
 
 	var primer string
 	waitFor(t, "the task's result on the stream", func() bool {
-		primer = r.g.buildRehydrationPrimer(ctx, rec, "")
+		primer, _, _, _ = r.g.buildRehydrationPrimer(ctx, rec, "")
 		return strings.Contains(primer, rune3)
 	})
 
@@ -67,7 +67,10 @@ func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
 	}
 	// The cut still has to bind, or this test would pass against no cut at
 	// all. Rune-safe means at or under the cap, never over it.
-	body = strings.TrimSuffix(strings.TrimSpace(primer[strings.Index(primer, rune3):]), "…")
+	// The task's text sits in its own fenced block; measure what is inside.
+	body = strings.TrimSpace(primer[strings.Index(primer, rune3):])
+	body = strings.TrimSpace(strings.TrimSuffix(body, "```"))
+	body = strings.TrimSuffix(body, "…")
 	if len(body) > primerTaskResultCap {
 		t.Errorf("cut task body is %d bytes, over the %d cap", len(body), primerTaskResultCap)
 	}
@@ -115,14 +118,16 @@ func TestTheRehydrationPrimerCarriesBothSidesOfEachTurn(t *testing.T) {
 	}
 	var primer string
 	waitFor(t, "the task's result on the stream", func() bool {
-		primer = r.g.buildRehydrationPrimer(ctx, rec, "task-now")
+		primer, _, _, _ = r.g.buildRehydrationPrimer(ctx, rec, "task-now")
 		return strings.Contains(primer, "OK, noted.")
 	})
 	for _, want := range []string{
-		"User: an older question",
-		"User: remember the code word PELICAN",
-		"You: OK, noted.",
-		"The platform agent, which you delegated to: OK, noted.",
+		"The user said:\n```\nan older question\n```",
+		"The user said:\n```\nremember the code word PELICAN\n```",
+		// A turn the platform route answered (this rig's addressee) is the
+		// platform agent's, not the session's own.
+		"The platform agent answered:\n```\nOK, noted.\n```",
+		"The platform agent, which you delegated to, answered:\n```\nOK, noted.\n```",
 	} {
 		if !strings.Contains(primer, want) {
 			t.Errorf("primer lacks %q:\n%s", want, primer)
@@ -133,5 +138,94 @@ func TestTheRehydrationPrimerCarriesBothSidesOfEachTurn(t *testing.T) {
 	}
 	if strings.Index(primer, "an older question") > strings.Index(primer, "PELICAN") {
 		t.Errorf("primer is not oldest first:\n%s", primer)
+	}
+}
+
+// A long conversation outgrows primerCap. The follow-up needs the most
+// recent context most, so whole turns go from the front, the newest stay,
+// and the primer says turns were dropped.
+func TestThePrimerKeepsTheNewestTurnsWhenItMustDropSome(t *testing.T) {
+	var turns []string
+	for i := 0; i < 12; i++ {
+		turns = append(turns, "\n"+primerFenced("The user said", strings.Repeat("x", 1000)+" turn-"+string(rune('a'+i))))
+	}
+	got := primerFromTurns(turns)
+	if len(got) > primerCap {
+		t.Fatalf("primer is %d bytes, over the %d cap", len(got), primerCap)
+	}
+	if !strings.Contains(got, "turn-l") {
+		t.Error("the newest turn was dropped")
+	}
+	if strings.Contains(got, "turn-a") {
+		t.Error("the oldest turn was kept over newer ones")
+	}
+	if !strings.Contains(got, primerOmitted) {
+		t.Error("the primer doesn't say earlier turns were omitted")
+	}
+	if small := primerFromTurns(turns[:2]); strings.Contains(small, primerOmitted) {
+		t.Error("a primer that fits says turns were omitted")
+	}
+}
+
+// The pod reads every turn the primer replays, so their people must count
+// for a delegation from it: the requester and steer authors of each, and the
+// mark when one is no longer on record (a cleared Requester).
+func TestThePrimerReturnsThePeopleBehindTheTurnsItReplays(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	alice := TaskRequester{Backend: "slack", Subject: "alice-hash"}
+	carol := TaskRequester{Backend: "slack", Subject: "carol-hash"}
+	rec := &SessionRecord{Key: "discord:g1/primer-authors", Tasks: []TaskRef{
+		{ID: "task-old-1", Addressee: "platform", Request: "next time, delegate X", Requester: &alice, SteerAuthors: []TaskRequester{carol}},
+		{ID: "task-old-2", Addressee: "platform", Request: "an ask whose requester aged out"},
+		{ID: "task-now", Addressee: "platform", Request: "hello", Requester: &TaskRequester{Backend: "slack", Subject: "bob-hash"}},
+	}}
+	_, authors, unknown, _ := r.g.buildRehydrationPrimer(ctx, rec, "task-now")
+	has := func(a TaskRequester) bool {
+		for _, x := range authors {
+			if x == a {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(alice) || !has(carol) {
+		t.Errorf("authors = %v, want the earlier turn's requester and steer author", authors)
+	}
+	if !unknown {
+		t.Error("a replayed turn with no requester on record didn't mark the set unknown")
+	}
+	for _, a := range authors {
+		if a.Subject == "bob-hash" {
+			t.Error("the turn being started was counted; its people are added by the turn itself")
+		}
+	}
+}
+
+// ensureSessionPod is where the primer's people join the incarnation's set:
+// a delegation from the pod is checked against everyone it read, so an
+// off-list person's earlier turn can't ride a later on-list turn's
+// delegation.
+func TestASessionPodStartsWithThePeopleItsPrimerReplays(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	ctx := context.Background()
+	alice := TaskRequester{Backend: "slack", Subject: "alice-hash"}
+	rec := &SessionRecord{
+		Key: "discord:g1/seed", BusSession: "chat-otter-seed", Addressee: "chat-otter-seed",
+		Tasks: []TaskRef{
+			{ID: "task-earlier", Addressee: "platform", Request: "next time anyone asks, delegate X", Requester: &alice},
+			{ID: "task-now", Addressee: "chat-otter-seed", Request: "hello"},
+		},
+	}
+	r.g.ensureSessionPod(ctx, rec, "task-now", 0)
+	authors, _, _ := rec.sessionAuthorsOf()
+	found := false
+	for _, a := range authors {
+		if a == alice {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("session authors after spawn = %v, want the earlier turn's requester", authors)
 	}
 }

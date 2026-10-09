@@ -608,7 +608,10 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	if rec.PodName != "" {
 		return
 	}
-	primer := g.buildRehydrationPrimer(ctx, rec, taskID)
+	primer, authors, unknown, since := g.buildRehydrationPrimer(ctx, rec, taskID)
+	// The pod reads the earlier turns, so their people count for a
+	// delegation from it, as the delegating turn's own do.
+	rec.seedSessionAuthors(authors, unknown, since)
 	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer, originSeq)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)

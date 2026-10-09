@@ -31,3 +31,23 @@ func TestReadPrimer(t *testing.T) {
 		t.Errorf("present: %q", got)
 	}
 }
+
+// configFromEnv is where the worker's config is built; the primer has to
+// make it into Config, or readPrimer is dead code.
+func TestConfigFromEnvCarriesThePrimer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "primer")
+	if err := os.WriteFile(path, []byte("The user said: hi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(lib.EnvPrimerFile, path)
+	t.Setenv("TASK_ID", "task-env-contract")
+	t.Setenv("PROFILE", "chat")
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	cfg, ok := configFromEnv(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !ok {
+		t.Fatal("configFromEnv refused the minimal env")
+	}
+	if cfg.Primer != "The user said: hi\n" {
+		t.Errorf("cfg.Primer = %q", cfg.Primer)
+	}
+}

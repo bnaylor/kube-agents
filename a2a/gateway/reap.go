@@ -273,13 +273,18 @@ func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
 // (TaskRef.Request, the copy session-state keeps until AskTTL) and each task
 // its result from JetStream, labelled by who answered. current is the task
 // the pod is being started for, left out so the new message is not
-// replayed as history. Task-stream retention bounds how far back this
+// replayed as history.
+//
+// It also returns the people behind every turn it replays (each turn's
+// requester and steer authors), the mark when one of them is no longer on
+// record, and the oldest turn's start. The pod reads what they said, so a
+// delegation from it is checked against them too (seedSessionAuthors, in
+// ensureSessionPod), exactly as a wake carries its parent's set. Task-stream retention bounds how far back this
 // reaches, deliberately: a three-day-silent thread restarting with fresh
 // context beats a bot that suddenly remembers June. Session files are cache;
 // the stream is the record.
-func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord, current string) string {
-	var b strings.Builder
-	found := 0
+func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord, current string) (primer string, authors []TaskRequester, unknown bool, since time.Time) {
+	var turns []string
 	for _, ref := range rec.Tasks {
 		if ref.ID == current {
 			continue
@@ -303,22 +308,83 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		if said == "" && strings.TrimSpace(answered) == "" {
 			continue
 		}
-		found++
+		if ref.Requester == nil {
+			unknown = true // cleared by the ask bound, or written before it existed
+		} else {
+			authors = append(authors, *ref.Requester)
+		}
+		authors = append(authors, ref.SteerAuthors...)
+		unknown = unknown || ref.SteerAuthorsOverflow
+		if !ref.StartedAt.IsZero() && (since.IsZero() || ref.StartedAt.Before(since)) {
+			since = ref.StartedAt
+		}
+		// Each turn's text is fenced the way the wake's is: a user's line
+		// that reads "You: ..." stays inside its own block and cannot pass
+		// for an earlier answer.
+		var turn strings.Builder
 		if said != "" {
-			fmt.Fprintf(&b, "\nUser: %s\n", said)
+			turn.WriteString("\n" + primerFenced("The user said", said))
 		}
 		if strings.TrimSpace(answered) != "" {
-			who := "You"
-			if ref.Role == taskRoleChild {
-				who = "The " + ref.Addressee + " agent, which you delegated to"
+			who := "You answered"
+			switch {
+			case ref.Role == taskRoleChild:
+				who = "The " + ref.Addressee + " agent, which you delegated to, answered"
+			case ref.Addressee == targetPlatform:
+				// A turn from before /session routed this conversation.
+				who = "The " + targetPlatform + " agent answered"
 			}
-			fmt.Fprintf(&b, "\n%s: %s\n", who, answered)
+			turn.WriteString("\n" + primerFenced(who, answered))
 		}
+		turns = append(turns, turn.String())
 	}
-	if found == 0 {
-		return ""
+	if len(turns) == 0 {
+		return "", nil, false, time.Time{}
 	}
-	return "Transcript primer, replayed from the task stream for this conversation:\n" + b.String()
+	return primerFromTurns(turns), authors, unknown, since
+}
+
+// primerHeader and primerOmitted open the primer; the second only when
+// earlier turns were dropped to fit.
+const (
+	primerHeader  = "Transcript primer, replayed from the task stream for this conversation:\n"
+	primerOmitted = "\n(Earlier turns are omitted to fit.)\n"
+)
+
+// primerFromTurns joins the turns oldest first, keeping the newest that fit
+// primerCap and dropping whole turns from the front, since a follow-up needs
+// the most recent context most. spawn.go's truncateRunes stays as the
+// backstop for a single turn larger than the cap. The authors returned with
+// the primer still cover every turn read, dropped ones included, which is
+// the stricter side.
+func primerFromTurns(turns []string) string {
+	budget := primerCap - len(primerHeader) - len(primerOmitted)
+	start, size := len(turns), 0
+	for start > 0 && size+len(turns[start-1]) <= budget {
+		start--
+		size += len(turns[start])
+	}
+	if start == len(turns) {
+		start = len(turns) - 1 // one turn alone past the cap: the backstop cuts it
+	}
+	var b strings.Builder
+	b.WriteString(primerHeader)
+	if start > 0 {
+		b.WriteString(primerOmitted)
+	}
+	for _, t := range turns[start:] {
+		b.WriteString(t)
+	}
+	return b.String()
+}
+
+// primerFenced is one turn of the primer: its label, then the text in a
+// fence longer than any backtick run in it, so no line of the text can close
+// the block (the wake's fencing, wakeFence and breakBacktickRuns).
+func primerFenced(label, text string) string {
+	text = breakBacktickRuns(strings.TrimSpace(text), wakeFenceMax-1)
+	fence := wakeFence(text)
+	return label + ":\n" + fence + "\n" + text + "\n" + fence + "\n"
 }
 
 // noFirstEventPastGrace is the one test for "this task has produced nothing
