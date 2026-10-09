@@ -87,6 +87,10 @@ const (
 // 1800s), restated here because the two halves of one contract must agree.
 const defaultTaskDeadline = 30 * time.Minute
 
+// defaultSessionMaxLifetime is what SessionMaxLifetime means when unset; the
+// field's comment carries the rationale.
+const defaultSessionMaxLifetime = 4 * time.Hour
+
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
@@ -266,10 +270,32 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the session's last activity: a
-	// verified turn, or an executor ending a live task (decided 8/24: 30
-	// minutes, config-backed; the task's end counts since 2026-09-30).
+	// IdleTTL is the reap threshold since the session's last user message
+	// (decided 8/24: 30 minutes, config-backed; spec-chatops-gateway.md,
+	// Session lifecycle). The answer to that message does not move it: with
+	// one pod serving every turn, the pod is the conversation's, and a
+	// conversation nobody has spoken in for the TTL is idle however recently
+	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
+
+	// SessionReuse keeps one pod per conversation across turns
+	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
+	// idle goes to it, and only a conversation with no live pod gets a new
+	// one. Off, every turn is a fresh pod, as before #2825, and the pods
+	// spawned are never handed a second task. Either way the gateway only
+	// reuses pods spawned with the flag, so turning it on never reaches a
+	// pod an older gateway spawned.
+	SessionReuse bool
+
+	// SessionMaxLifetime bounds a reused session pod's whole life
+	// (A2A_SESSION_MAX_LIFETIME, 4h by default), as its activeDeadlineSeconds.
+	// A one-task pod's deadline is TaskDeadline plus a grace, which a pod
+	// serving many turns cannot have; this is the backstop in its place, and
+	// a per-task overdue check in the reap scan bounds a wedged task inside
+	// it (Gateway.taskOverdue). A pod near the end of its lifetime is not
+	// handed another task. Never below TaskDeadline plus twice the grace, so
+	// the pod deadline and the overdue check cannot fire together.
+	SessionMaxLifetime time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
 	// salt is SESSION_KV_SALT, the one the install already provisions into
@@ -714,6 +740,17 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_TASK_DEADLINE_SECONDS %q: need an integer >= 60; a sub-minute deadline kills pods mid-cold-start", deadlineSecs)
 	}
 	cfg.TaskDeadline = time.Duration(secs) * time.Second
+
+	cfg.SessionReuse = os.Getenv("A2A_SESSION_REUSE") != "false"
+	lifetime := envOr("A2A_SESSION_MAX_LIFETIME", defaultSessionMaxLifetime.String())
+	lt, err := time.ParseDuration(lifetime)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q: %w", lifetime, err)
+	}
+	if floor := cfg.TaskDeadline + 2*podDeadlineGrace; lt < floor {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q is under %v, A2A_TASK_DEADLINE_SECONDS plus twice the pod deadline grace; a pod that cannot outlive one task cannot serve a conversation", lifetime, floor)
+	}
+	cfg.SessionMaxLifetime = lt
 
 	askTTL := envOr("A2A_ASK_TTL", defaultAskTTL.String())
 	at, err := time.ParseDuration(askTTL)

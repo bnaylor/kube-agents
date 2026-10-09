@@ -1080,6 +1080,43 @@ type fakeSpawner struct {
 	// tests use it to assert the terminal was already on the stream when
 	// the pod went, which "terminal exists and pod deleted" alone cannot.
 	onDelete func(podName string)
+	// reusable names the pods Reusable vouches for; reusableErr fails the
+	// read. Empty, no pod is reusable, which is every pre-#2825 test's
+	// world: each turn a fresh pod.
+	reusable    map[string]bool
+	reusableErr error
+	// sessionPods is what SessionPods lists, the cap eviction's candidates.
+	sessionPods []sessionPod
+}
+
+func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reusableErr != nil {
+		return false, s.reusableErr
+	}
+	return s.reusable[podName], nil
+}
+
+func (s *fakeSpawner) setReusable(pods ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reusable = map[string]bool{}
+	for _, p := range pods {
+		s.reusable[p] = true
+	}
+}
+
+func (s *fakeSpawner) SessionPods(context.Context) ([]sessionPod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sessionPod(nil), s.sessionPods...), nil
+}
+
+func (s *fakeSpawner) setSessionPods(p ...sessionPod) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionPods = p
 }
 
 type fakeSpawn struct {
