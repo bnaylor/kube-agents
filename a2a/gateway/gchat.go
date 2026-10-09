@@ -942,8 +942,9 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	// message typed inside an existing thread (threadReply) is a side
 	// thread with its own conversation, answered in that thread; top-level
 	// DMs share the space's one conversation and are answered top-level.
-	// This is today's Hermes Google Chat rule (main flow versus side
-	// thread), read from Chat's own flag rather than an inbound count.
+	// This is the default-mode Hermes Google Chat rule (main flow versus
+	// side thread), read from Chat's own flag rather than an inbound count
+	// (spec-chatops-gateway.md, "The Google Chat adapter").
 	if kind == "dm" && !ev.Message.ThreadReply {
 		thread = ""
 	}
