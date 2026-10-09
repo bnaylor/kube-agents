@@ -220,7 +220,10 @@ uses Workload Identity (below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
+needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+drops `temperature`, `top_p` and `top_k` from every request
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)).
+Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -397,9 +400,14 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation and request metrics from its metrics-only port 8766. The
-operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
-on those ports either way; the value only decides whether a scrape is configured.
+tool-invocation and request metrics from its metrics-only port 8766, and the A2A
+gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
+terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
+that one selects no pod). The operator's policies on all three pods admit the
+collector's namespace, `gke-gmp-system`, on those ports either way, and on the
+first two they admit the operator's own pods as well; the value only decides
+whether a scrape is configured, and the operator's own read of the two counters
+into `status.usage` does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
@@ -477,8 +485,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` defaults to `github`, the only one
-  registered today, and `credentialsRef` is ignored for it. A GitHub forge's
+  read-only reference). `provider` is `github` (the default) or `gitlab`. `credentialsRef` is
+  ignored for `github` and required for `gitlab`: a Secret holding the access
+  token under the key `token`, mounted into the credential broker only. A
+  `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
+  never a GitHub name, and one `gitlab` forge per host. With a `gitlab` forge
+  declared beside GitHub, a bare `owner/name` still works for a GitHub
+  repository that the install registered by URL. Name a GitLab repository, or
+  a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
+  to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` must be a GitHub spelling (`github.com`, `www.github.com`,
   `ssh.github.com`), and a repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
@@ -495,6 +510,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   declared and none is GitHub fails the render, since minty issues GitHub App
   tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
+  `platformAgent.integration.repositories[].baseBranch`, on a gitops or
+  managed repository, names the branch every pull request onto it must
+  target, enforced by the credential broker; unset means the repository's
+  own default branch. A context repository may not set it. The alias has no
+  place for it, so a repository that sets one renders as the lists, and on a
+  live install the render fails unless the installed CRD has the field. A
+  repository registered only in the ConfigMap is not pinned. The
+  [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)
+  describes what the broker does with it.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
@@ -513,6 +537,31 @@ field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
+
+`platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
+container, the broker that runs every credentialed command in a pod of its own.
+It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
+key is set, and the operator merges it over its defaults per key, so
+`limits: {memory: 3Gi}` raises the memory limit and keeps the rest. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+is canonical for the defaults, what the operator refuses and how it reports it,
+and the Autopilot warnings;
+[the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
+has the arithmetic behind the memory floor. The chart fails the render on an
+override the operator would refuse, on a quantity it cannot read, and on any key
+under `resources` other than `requests`, `limits` and `claims` (`limit:` for
+`limits:`), which the CRD would prune silently. A quantity with more than 15
+significant digits is refused at render as well: the chart compares quantities as
+float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
+comparison matches the operator's for every decimal value within the cap. A
+binary-suffixed value within float64 rounding (about one part in 10^16) of a
+decimal one can compare equal to it; the operator decides that pair. The quota
+preflight sums the
+override merged over the operator's defaults. On an existing install, apply the
+chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
+does): against a CRD that predates `spec.deployment.credentialProxy`, the API
+server would prune the value silently while the release record kept it, so the
+chart looks up the installed CRD and fails the upgrade instead.
 
 #### PlatformAgent annotations
 
@@ -698,7 +747,12 @@ have no replica count to multiply, and the pre-delete cleanup hook Job (one pod,
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
-it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
+merged over its footprint entry per key, as the operator renders it, so a raised limit is
+summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+as a request of that size too, because the operator renders no ephemeral-storage request and
+the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
+outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to

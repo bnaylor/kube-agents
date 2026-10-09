@@ -236,7 +236,14 @@ posture: non-root, scratch on an emptyDir, no secrets. Two deltas from the demo:
   still nil for the default profile (a KSA with no RoleBindings has a name and nothing
   else). Automount stays off; the projected volume is explicit.
 
-Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`, and `A2A_ORIGIN_SEQ`. Everything else -
+Env is minimal, and this list is the design's intent rather than the rendered set --
+`a2a/gateway/spawn.go` is what the spawner actually writes: `TASK_ID`, `PROFILE`,
+`NATS_URL`, and `A2A_ORIGIN_SEQ`, plus (9/9, with the capability envelope)
+`A2A_AUTHORITY_SCOPE` and `A2A_CAPABILITY_REQUIRED`. Those two are rendered from the
+gateway's own resolved settings rather than passed through from its environment,
+because the scope the executor checks a capability at has to be the scope the gateway
+minted it under, and because a mixed-version install has to relax both halves together
+or the gateway mints nothing while the executor insists on a capability. Everything else -
 prompt, correlation, context - is in the task message, which the adapter fetches by the
 stream sequence `A2A_ORIGIN_SEQ` names rather than by scanning the subject. The spawner
 knows that sequence because it publishes the submission before it spawns the pod, and the
@@ -288,14 +295,16 @@ notes. Prefixes are not a protocol. Instead:
 `input-required`, and one terminal event with `final: true`. Not progress, not tool
 chatter.
 
-**`artifact-update` carries the streams, as named artifacts.** Four reserved names:
+**`artifact-update` carries the streams, as named artifacts.** Six reserved names:
 
-| Artifact name | Content                                                    | Producer                                       | Default consumer                                                                 |
-| ------------- | ---------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------- |
-| `result`      | The deliverable, chunked per A2A chunking rules            | harness output                                 | posted to the requester verbatim, as `kanban_complete`'s `result` field is today |
-| `thinking`    | Thinking/reasoning deltas                                  | adapter, from the harness stream               | debug views only                                                                 |
-| `activity`    | Tool-call trace: one entry per tool invocation             | adapter                                        | debug views; always in the audit replay                                          |
-| `progress`    | Agent-authored milestones - the heartbeat-note replacement | an explicit progress tool exposed to the agent | rendered to chat at zero model cost                                              |
+| Artifact name | Content                                                                            | Producer                                               | Default consumer                                                                              |
+| ------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `result`      | The deliverable, chunked per A2A chunking rules                                    | harness output                                         | posted to the requester verbatim, as `kanban_complete`'s `result` field is today              |
+| `thinking`    | Thinking/reasoning deltas                                                          | adapter, from the harness stream                       | debug views only                                                                              |
+| `activity`    | Tool-call trace: one entry per tool invocation                                     | adapter                                                | debug views; always in the audit replay                                                       |
+| `progress`    | Agent-authored milestones - the heartbeat-note replacement                         | an explicit progress tool exposed to the agent         | rendered to chat at zero model cost                                                           |
+| `delegate`    | A session's request to hand a task on: one data part (`lib.DelegateRequest`)       | adapter, from the harness's delegate tool              | the gateway, which mints the child or refuses; never rendered to chat                         |
+| `turn`        | One finished turn's answer on a task with more turns queued, chunked like `result` | an executor that queues follow-ups (the hermes-bridge) | renderers post it as it completes; never the deliverable - the last turn's answer is `result` |
 
 This maps one-to-one onto what exists. Kanban heartbeat notes become `progress` updates:
 the gateway's notifier can render them into a rolling chat line without waking any model,
@@ -306,7 +315,7 @@ debug mode adds `activity` and `thinking` - the same split the Google Chat `mode
 draws today (`platformagent_manifests.go:1348-1371`).
 
 Artifact names are data, so the set can grow without touching the envelope or the payload
-spec. These four are reserved so that renderers and the audit tooling can rely on them.
+spec. These six are reserved so that renderers and the audit tooling can rely on them.
 
 Deviation, recorded 8/31: the worker adapter as first built (ahead of its stage 3
 slot, for the gateway's session workers) produces `progress` from the model's own
@@ -353,7 +362,10 @@ grace period, and the adapter MUST trap it: flush the pending output buffer, pub
 terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure
 eviction distinguishable from an agent crash in the audit trail and in the breaker's
 failure classes - the same infra-vs-agent distinction the kanban board's forgiveness
-classes draw today.
+classes draw today. The one exception is a turn that has already delegated: its
+deliverable is decided (the one-line "delegated to" result), and the gateway retiring its
+pod for the wake is expected, so the adapter publishes `completed` with that result
+and exits 0 instead.
 
 **Orphaned.** A worker can die without a terminal event - OOM, node loss, image bug.
 The dispatcher doubles as the janitor: it watches the Jobs it created, and when a Job
@@ -604,6 +616,11 @@ Three small items to fold back into the payload spec rather than fork here (fold
   the iteration friction proves real.
 - ~~**Per-task bus credentials.**~~ Decided 8/24: lands with the authority work - it is
   the same attenuation machinery, and that stream owns it. Stays reserved as a named
-  tightening; stage 3 ships profile-level credentials.
+  tightening; stage 3 ships profile-level credentials. **Amended 9/9:** the authority
+  work has landed as the capability envelope and did not bring this with it. The
+  attenuation machinery exists (`Attenuate`, the hop chain) but has no production
+  caller, and bus credentials are still per-principal. It is a named tightening
+  against built machinery now rather than against a plan, which is a better position
+  to be in, but it is not done.
 - ~~**Worker session naming.**~~ Decided 8/24: the animals stay - `<profile>-<animal>`
   per run, with `from.profile` carrying the structure.

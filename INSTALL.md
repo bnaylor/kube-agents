@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave and the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
@@ -267,7 +267,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
 
 A flag left out does not always take the shipped default. A flag wins over an `install.env` from an
 earlier run, which wins over an exported variable — including an exported API key — which wins over
-`install.defaults.env`; see
+`install.defaults.env`. The chat flags are the exception: over an existing `install.env` one that
+disagrees with the file is refused. See
 [`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv).
 
 ---
@@ -510,7 +511,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
    - The `*:history` scopes are the ones a hand-built app most often lacks. `im:read` grants the conversation metadata; the text of a DM arrives on `message.im`, which needs `im:history`, and `groups:history` and `mpim:history` do the same for private and group channels. A bot without them connects normally and is never sent the message; the only symptom is a DM that goes unanswered.
    - `files:write` is the one that is easy to miss, because omitting it looks like nothing is wrong. A card whose answer is text is delivered normally; a card that produces a **file** has its upload rejected with `missing_scope`, which the artifact delivery path catches and logs as a warning. The user is told the task completed and never sees the artifact. Add the scope and reinstall the app.
-   - `reactions:write` fails more quietly still. The agent puts 👀 on a message when it picks the work up and adds ✅ or ❌ beside it when the turn ends; without the scope Slack rejects each of those with `missing_scope`, the adapter logs it at debug and carries on, and the answer still arrives. The only symptom is that no reaction ever appears; with `KAGE_SLACK_UX=true` only the ❌ is ever added, so there the symptom is a failed ask left unmarked. Add the scope and reinstall.
+   - `reactions:write` fails more quietly still. The agent adds a reaction for the kind of ask when it picks the work up, ⏸️ while work waits on you, and ❌ on failure (with `KAGE_SLACK_UX=false` it puts 👀 on a message when it picks the work up and adds ✅ or ❌ beside it when the turn ends); without the scope Slack rejects each of those with `missing_scope`, the adapter logs it at debug and carries on, and the answer still arrives. The only symptom is that no reaction ever appears. Add the scope and reinstall.
 2. **Test Bot Connection**:
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
 3. **Approve Pairing Code (Optional / First-time setup)**:
@@ -557,8 +558,19 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
 - `kubectl port-forward` is not an alternative here: the agent runs sandboxed under gVisor by
   default and the forward cannot see into the sandbox. `kubectl exec` enters it.
 
-To add a chat platform later, re-run the installer with `--enable-google-chat` or `--enable-slack`
-and follow Step 5.
+To add a chat platform later, edit `install.env` and re-run `./install.sh`, then follow Step 5:
+
+- Google Chat: set `GOOGLE_CHAT_ENABLED=true` and `ALLOWED_USERS=` to the comma-separated emails
+  allowed to use the agent. `./install.sh --menu` edits both for you.
+- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated user IDs or
+  emails, and re-run with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked
+  for them.
+
+The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
+empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,
+and `install.sh` does not change a key the file assigns, so set the allowlist in the file. It
+refuses `--enable-google-chat` or `--enable-slack` over a file that records the key the other way
+([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
 
 ---
 
@@ -978,7 +990,9 @@ section describes each stage.
 ### Each morning: the scheduled audits
 
 The Platform Agent runs its fleet audits on a cron schedule in UTC, some daily and some on
-Mondays only. To list every job with its next and last run:
+Mondays only. On a new install with a GitOps repository, four of them (security, reliability, cost
+and capacity) also run once as soon as the first inventory scan finishes, or at a fallback of 90 minutes or more
+after it started if it has not, so their first results do not wait for the schedule. To list every job with its next and last run:
 
 ```bash
 kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agent -- \

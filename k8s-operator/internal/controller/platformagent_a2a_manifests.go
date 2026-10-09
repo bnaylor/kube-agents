@@ -200,11 +200,12 @@ const (
 
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
 	// The first-party next-stack images the operator renders — this one, the
-	// worker below, the auth callout (platformagent_a2a_callout.go) and the
-	// capability verifier (platformagent_a2a_verifier.go) — are
-	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
-	// beside the other first-party images, images.json carries them (as
-	// a2a-gateway, a2a-worker, a2a-authcallout and a2a-verifier), and
+	// worker below, the auth callout (platformagent_a2a_callout.go), the
+	// capability verifier (platformagent_a2a_verifier.go) and the console
+	// server (platformagent_a2a_console.go) — are release surface:
+	// .github/workflows/docker-publish-ghcr.yml builds them beside the other
+	// first-party images, images.json carries them (as a2a-gateway,
+	// a2a-worker, a2a-authcallout, a2a-verifier and a2a-console), and
 	// hack/check-image-inventory.sh holds these names to the inventory's
 	// entries (the name, and the repository as that name under the agent
 	// image's registry). Bare names, like shellSandboxRepositoryName: the
@@ -258,6 +259,12 @@ const (
 	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
 	// what widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
+	// The platform agent's trusted-human allowlists, handed to the gateway
+	// so a session's request to delegate to the platform agent is checked
+	// against the same lists the agent's own adapters enforce. Spelled the
+	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
+	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
+	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
@@ -497,6 +504,32 @@ const (
 	a2aDiscordBotSecretName = "discord-bot"
 	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
 
+	// The Slack backend the operator renders under mode: next when
+	// spec.integration.slack is enabled (a2aSlackArmed): the pair is read
+	// through the CR's botTokenSecretRef and appTokenSecretRef, which the
+	// CRD requires once Slack is enabled. The env names are the gateway's;
+	// docs/README.md says this file must agree with a2a/gateway/config.go.
+	a2aSlackBotTokenEnvVar = "SLACK_BOT_TOKEN" // #nosec G101 -- Environment variable name, not a credential
+	a2aSlackAppTokenEnvVar = "SLACK_APP_TOKEN" // #nosec G101 -- Environment variable name, not a credential
+	// The Slack allowlist the gateway gates a sender on before the map,
+	// carried the way Chat's is (a2aGchatAllowedUsersEnvVar).
+	a2aSlackAllowedUsersEnvVar  = "A2A_SLACK_ALLOWED_USERS"
+	a2aSlackAllowAllUsersEnvVar = "A2A_SLACK_ALLOW_ALL_USERS"
+	// The principal map the gateway resolves Discord and Slack senders
+	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
+	// out), one volume, and one source in it, the armed backend's table
+	// (a2aPrincipalMapVolumeSource): the admin-owned a2a-slack-principal-map
+	// Secret of spec-chatops-gateway.md, "The Slack adapter", when Slack is
+	// armed, and otherwise the hand-made principal-map ConfigMap that is
+	// Discord's test table. Optional either way, which is the gateway's own
+	// rule for a missing map: it runs, Discord senders drop at verification,
+	// and listed Slack senders are attributed by member id.
+	a2aPrincipalMapEnvVar          = "A2A_PRINCIPAL_MAP"
+	a2aPrincipalMapDir             = "/etc/a2a/principal-map"
+	a2aPrincipalMapVolume          = "principal-map"
+	a2aPrincipalMapConfigMapName   = "principal-map"
+	a2aSlackPrincipalMapSecretName = "a2a-slack-principal-map" // #nosec G101 -- Secret name, not a credential
+
 	// The Google Chat backend the operator renders under mode: next when
 	// spec.integration.googleChat is enabled (a2aChatArmed). Names are the
 	// gateway's (a2a/gateway/config.go, FromEnv) and the broker's
@@ -525,12 +558,22 @@ const (
 	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
 
 	// The condition the status writers publish while a next install's gateway
-	// is withheld for want of a backend (#1660, option 1). Informational rather
-	// than Degraded: the install did nothing wrong, it configured no chat
-	// backend, and the rest of the stack is up. The message names what would
-	// render it.
+	// runs nothing for want of a backend: withheld (#1660, option 1), or an
+	// existing Deployment at zero replicas (#2481). Informational rather than
+	// Degraded: the install did nothing wrong, it configured no chat backend,
+	// and the rest of the stack is up. The message names what would run it.
 	a2aGatewayConditionType = "A2AGateway"
 	a2aGatewayDarkReason    = "NoChatBackend"
+	// The same condition on the way back: a backend returned for a gateway
+	// that was at zero, the Deployment asks for one replica again, and none
+	// is ready yet. Its own reason and message, because by then the dark
+	// pass's remedy is wrong -- the backend it asks for exists -- and a
+	// replica that never comes up (an unpullable image, a bad token) would
+	// otherwise leave the CR asking for it indefinitely. What is wrong with
+	// the replica is the Ready condition's to say, from the pod scan.
+	a2aGatewayWakingReason  = "WaitingForReplica"
+	a2aGatewayWakingMessage = "a chat backend is configured again and the A2A gateway, which ran at zero replicas without one, " +
+		"is back at one replica with none ready yet; the Ready condition says what it is waiting on"
 
 	// The condition that records the bus having been provisioned once: written
 	// the first pass that sees the provisioning Job complete, whichever phase
@@ -907,10 +950,11 @@ const (
 	// the refusal and the status message offer only then: declare the
 	// sidecar with fewer workers, which re-renders the Job the way a
 	// maxSessions edit does. A literal above a2aBridgeConcurrencyMax (below)
-	// counts as the cap, and both surfaces say so. The mode-next step of
-	// hack/ci-deploy.sh is such an install: it declares the sidecar after
-	// the bus is up, so its second provision Job refuses against the first
-	// one's stream.
+	// counts as the cap, and both surfaces say so. A bridge the operator
+	// renders (platformagent_a2a_bridge.go) is counted from the first render,
+	// so its arrival does not take this path; raising the operator's
+	// A2A_BRIDGE_CONCURRENCY on a live install still can, as can a sidecar
+	// declared after the bus is up.
 	a2aTasksStandingDurables     = 2
 	a2aTasksAuditDurableHeadroom = 1
 	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
@@ -991,6 +1035,20 @@ const (
 	a2aTasksMaxMsgsPerSubject = 4096
 )
 
+// a2aGatewayMetricsPort is the A2A gateway's metrics-only listener
+// (a2a/gateway/metrics.go), the gateway's copy of credentialProxyMetricsPort:
+// its own port, so the managed-Prometheus collector is admitted to a listener
+// that serves counters and nothing else, and the doors keep their loopback
+// listeners. One constant for the container port, the value of
+// A2A_METRICS_PORT the gateway binds, and the collector's ingress rule in
+// buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
+// number, held to this one by tests/test_chart_platform_agent_monitoring.py.
+const (
+	a2aGatewayMetricsPort       int32 = 9096
+	a2aGatewayMetricsPortName         = "a2a-metrics"
+	a2aGatewayMetricsPortEnvVar       = "A2A_METRICS_PORT"
+)
+
 func a2aNATSImage() string {
 	if override := os.Getenv(a2aNATSImageEnvVar); override != "" {
 		return override
@@ -1017,8 +1075,9 @@ func a2aWorkerImage() string {
 // override if set; else the image name swapped into OPERATOR_IMAGE when it
 // carries a tag (a digest-only operator reference falls through),
 // the rung resolveShellSandboxImage uses and for the same reason - the
-// gateway, the callout and the worker consume what the operator renders (the
-// identity map, the env, the spawn spec), so their version contract is with
+// gateway, the callout, the worker and the console consume what the operator
+// renders (the identity map, the env, the spawn spec, the console's bus
+// login), so their version contract is with
 // the operator, and OPERATOR_IMAGE is set once per install by whoever
 // installed it: the chart sets it, and main.go discovers it from the pod
 // spec only when PLATFORM_AGENT_IMAGE is unset too, so a kustomize install
@@ -1031,7 +1090,7 @@ func a2aWorkerImage() string {
 // the matching build of each, and a mirror that carries the operator or the
 // agent image carries these under the same prefix. Never a CR's
 // spec.deployment.image: a custom agent image is that agent's choice, and the
-// bus components are not. The three env vars stay the override for an
+// bus components are not. The four env vars stay the override for an
 // install that pins one apart.
 func a2aReleaseImage(envVar, name string) string {
 	if override := os.Getenv(envVar); override != "" {
@@ -1075,6 +1134,41 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
+// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
+// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
+// renders nothing: the gateway reads no var as "all authenticated users",
+// which is what the CR field promises. Any other list renders, even one that
+// is blank after trimming: the gateway reads a set-but-empty var as a list
+// with no members, so a list of blanks admits nobody, the rule #2207 set for
+// the Chat ingress list, rather than widening to everyone.
+func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	integ := agent.Spec.Integration
+	if integ == nil {
+		return nil
+	}
+	join := func(ids []string, lower bool) string {
+		var out []string
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id == "" {
+				continue
+			}
+			if lower {
+				id = strings.ToLower(id)
+			}
+			out = append(out, id)
+		}
+		return strings.Join(out, ",")
+	}
+	var env []corev1.EnvVar
+	if integ.GoogleChat != nil && !allowAllUsers(integ.GoogleChat.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersGchatEnvVar, Value: join(integ.GoogleChat.AllowedUsers, true)})
+	}
+	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
+	}
+	return env
+}
+
 // a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
 // door flag, read the same way and failing shut the same way.
 func a2aAgentDoorEnabled() bool {
@@ -1110,6 +1204,50 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 	return googleChatEnabled(agent) && !a2aChatArmed(agent)
 }
 
+// a2aSlackArmed reports whether this install's Slack is consumed by the next
+// stack: the gateway's Slack backend, on the token pair the CR's
+// spec.integration.slack refs name. It is a2aChatArmed's rule for the same
+// reason: a Slack app's events are spread across every Socket Mode
+// connection it has open, so two consumers on one app split its messages,
+// and the legacy path already opens one (the credential broker's SlackRelay,
+// armed by the same refs). Exactly one consumer holds the app and the mode
+// chooses.
+//
+// One exception, because the gateway runs one real backend per process
+// (a2a/gateway/config.go, FromEnv): when Chat is armed it holds the gateway,
+// as it holds it over the discord-bot Secret, and Slack stays on the legacy
+// consumer rather than reaching nobody. renderMode fails closed, so skew
+// reads as today here too. Unlike Chat, that double-consumes: the frozen
+// gateway holds the pair itself and stays connected beside the re-rendered
+// legacy relay. Accepted and documented in the spec (2026-10-06).
+//
+// The CR alone decides, by decision (2026-10-06): the token Secret is not
+// read, so a multi-workspace bot token (the broker's comma-separated list,
+// which the gateway cannot use) is armed anyway. Such installs must stay on
+// today; the spec's Slack section and the CRD page say so.
+func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	return renderMode(agent, "gateway") == ModeNext && slackEnabled(agent) && !a2aChatArmed(agent)
+}
+
+// legacySlackConsumer is the complement: the broker's Slack relay pair, the
+// Hermes slack platform and its relay env render exactly when Slack is
+// enabled and the next stack is not taking it. Every legacy Slack render
+// site asks this rather than the enabled flag, so the two Socket Mode
+// consumers cannot both render.
+func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
+	return slackEnabled(agent) && !a2aSlackArmed(agent)
+}
+
+// slackEnabled is the enabled test the Slack render sites make, in one place.
+// The status interfaces list still spells it inline, as it does Chat's.
+func slackEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Integration == nil {
+		return false
+	}
+	slack := agent.Spec.Integration.Slack
+	return slack != nil && slack.Enabled != nil && *slack.Enabled
+}
+
 // googleChatEnabled is the enabled test the Chat render sites make, in one
 // place; the status interfaces list (resolveActiveInterfaces in
 // manifest_helpers.go) still spells it inline, since it is about the install
@@ -1122,15 +1260,15 @@ func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return gchat != nil && gchat.Enabled != nil && *gchat.Enabled
 }
 
-// a2aGchatAllowlist reads the CR's allowed-users list the way the gateway's
-// FromEnv reads the env it becomes, with the gateway's own grammar: the
+// a2aAllowlist reads a CR allowed-users list (Chat's or Slack's) the way the
+// gateway's FromEnv reads the env it becomes, with the gateway's own grammar: the
 // entries joined on commas and split again, each piece trimmed, the empty
 // ones dropped - so the list the gateway sees is the one it would have
 // parsed, and an entry carrying a comma is the two entries it would read.
 // The allow-all decision is NOT made on the result: it is the legacy rule on
 // the raw list (allowAllUsers), so a degenerate list restricts to nobody in
 // both modes instead of widening to everyone in one of them.
-func a2aGchatAllowlist(users []string) []string {
+func a2aAllowlist(users []string) []string {
 	var out []string
 	for _, u := range strings.Split(strings.Join(users, ","), ",") {
 		if u = strings.TrimSpace(u); u != "" {
@@ -1195,6 +1333,13 @@ func a2aInjectName(agent *agentv1alpha1.PlatformAgent) string { return agent.Nam
 // a2aDoorName is the same four for the A2A door. Its own name, not the inject
 // door's, so each door's objects come and go with its own flag.
 func a2aDoorName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-door" }
+
+// a2aGatewayNetpolName is the gateway's own fence, the one no door flag
+// decides: it comes and goes with the gateway Deployment
+// (buildA2AGatewayFencePolicy).
+func a2aGatewayNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-gateway-netpol"
+}
 
 // a2aVerifierName is the capability verifier's Deployment, ServiceAccount and
 // pod-selector name, all one string like the callout's. The verifier is the
@@ -1812,41 +1957,38 @@ http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 # reads as the bus refusing a workload rather than as a size limit.
 max_control_line: 65536
 
-# Websocket listener for the web user (the read-only web rail reads the bus
-# over this).
+# Websocket listener for the console page and the read-only web user.
 #
 # Plain ws IS the playground posture, stated rather than implied, and stated
-# accurately: the CONNECT frame carries the web password in cleartext across
-# the pod network. The Service is ClusterIP, so nothing OUTSIDE the cluster
-# reaches this listener — and an ingress NetworkPolicy fences the pod network
-# too: 4222 from the enumerated bus clients only, and NO pod-network peer for
-# 8222 or 9222. The port-forward the demo uses and the kubelet's readiness
-# probe both enter from the node, which the policy does not govern, so the ws
-# surface is reachable through kubectl and through nothing else. Production
-# still terminates TLS in front of the bus, which is not a toggle that exists
-# yet.
+# accurately: the CONNECT frame carries a password in cleartext across the
+# pod network. The Service is ClusterIP, so nothing OUTSIDE the cluster
+# reaches this listener. An ingress NetworkPolicy fences the pod network too:
+# 4222 from the enumerated bus clients, 9222 from the console server alone,
+# and no pod-network peer for 8222. The console server is admitted because it
+# is the page's proxy. A browser reaches it through a kubectl port-forward and
+# it forwards the websocket here with the browser's headers intact. It is not
+# an in-cluster door for anything else. A port-forward straight to 9222 still
+# works for local tooling and the live tests, because it enters from the
+# node, which NetworkPolicy does not govern. Production still terminates TLS
+# in front of the bus, which is not a toggle that exists yet.
 #
-# The origin allow-list is the one thing here that is not posture. WebSockets
-# are exempt from CORS, and the demo transport is a kubectl port-forward to
-# 9222 on a workstation — for as long as that runs, every page the operator's
-# browser visits can open a socket to localhost:9222, with a credential that
-# lives in browser JS by construction.
+# The origin allow-list is the console server's origin as the browser sees it
+# through the documented port-forward. The proxy forwards Origin unchanged,
+# so the list still applies. WebSockets are exempt from CORS, and for as long
+# as a port-forward runs, every page the operator's browser visits can try to
+# open a socket through it.
 #
 # allowed_origins, NOT same_origin: same_origin compares the browser's Origin
-# against this listener's own host:port, and the UI is always a page on a
-# different port than the bus (vite on 5173, or an nginx port), so it can never
-# match. Measured in a real browser: same_origin gives every UI deployment a
-# 403 at the handshake. A CLI or Node client sends no Origin header at all,
-# which both settings permit — which is exactly why this needed a browser to
-# find.
+# against the Host this listener sees, and behind the proxy that is the bus's
+# own service name, which no browser page is served from. A CLI or Node client
+# sends no Origin header at all, which both settings permit.
 #
-# This is defense in depth and not a boundary: Origin is browser-asserted, so
-# anything that is not a browser simply omits it. The boundary is the web
-# user's grant list below.
+# Origin is browser-asserted, so this stops a browser page and nothing else.
+# The boundary is the grant lists below.
 websocket {
   port: ` + strconv.Itoa(a2aNATSWebSocketPort) + `
   no_tls: true
-  allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]
+  allowed_origins: [` + a2aConsoleOriginList() + `]
 }
 
 jetstream {
@@ -2010,12 +2152,12 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // mode: next and needs its own live test.
 //
 // And the rotation it notices rolls the bus, not the bus's clients. This hash
-// rides the NATS pod template alone; the gateway Deployment and the provision
-// Job take their passwords through valueFrom.secretKeyRef, which a running pod
-// does not re-read, so a repaired credential leaves the gateway holding the old
-// one until something else restarts it. That gap predates this function — the
-// conf digest rolled only the StatefulSet too — and closing it means deciding
-// what a rotation should restart, which is not this function's call.
+// rides the NATS pod template alone; the gateway Deployment takes its password
+// through valueFrom.secretKeyRef, which a running pod does not re-read. The
+// gateway is covered separately: its pod template carries the secret-env digest
+// (stampSecretEnvHash in reconcileA2A), which moves when its password's value
+// does, within secretEnvReprobeInterval. The provision Job holds no password: it
+// authenticates with its projected bus token (a2aBusTokenVolumeSource).
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
@@ -2297,16 +2439,21 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // buildA2ANATSNetworkPolicy governs ingress to the NATS pod. Without it every
 // pod in the cluster reaches 4222/8222/9222 while the deny-by-default bus
 // grants do the real refusing; with it the network layer agrees with the
-// grants: 4222 from exactly the enumerated bus clients, nothing else.
+// grants: 4222 from exactly the enumerated bus clients, 9222 from exactly the
+// console server, nothing else.
 //
-// 8222 (monitor) and 9222 (ws) get no pod-network peer at all, decided rather
-// than forgotten. Both surfaces are node-path consumers: the kubelet's
-// readiness probe on 8222 and the demo's kubectl port-forward on 9222 enter
-// from the node, which NetworkPolicy does not govern (Dataplane V2 exempts
-// host-local traffic), so denying every pod costs neither. An in-cluster ws
-// client would be the web rail deployed into the cluster — a peer to add to
-// this list when it exists, not a reason to leave the port open to every pod
-// now.
+// 8222 (monitor) gets no pod-network peer at all, decided rather than
+// forgotten. The kubelet's readiness probe enters from the node, which
+// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic), so
+// denying every pod costs nothing.
+//
+// 9222 (ws) gets one peer, the console server. The browser reaches the console
+// server through a port-forward and the server proxies the page's websocket to
+// here, so it is the one in-cluster ws client that exists. It is admitted by
+// its own pods' app label and nothing wider. It is not an in-cluster door for
+// anything else, and a new ws client is a peer to decide on here, not a reason
+// to widen this one. A port-forward straight to 9222 still enters from the
+// node and still works for local tooling and the live tests.
 func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 
@@ -2389,6 +2536,17 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						a2aComponentLabel: "seed",
 					}}},
 				},
+			}, {
+				// 9222 from the console server alone. See the doc comment
+				// for why it is the only one.
+				Ports: []networkingv1.NetworkPolicyPort{
+					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSWebSocketPort))},
+				},
+				From: []networkingv1.NetworkPolicyPeer{
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aConsoleName(agent),
+					}}},
+				},
 			}},
 		},
 	}
@@ -2419,6 +2577,7 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 		bridgeWorkersNoun = "worker"
 	}
 	bridgeDefault := strconv.Itoa(a2aBridgeDefaultConcurrency)
+	renderedDefault := strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
 	bridgeMax := strconv.Itoa(a2aBridgeConcurrencyMax)
 	// The reserve without its per-worker term and the term itself, so the
 	// script can compute the worker count that fits beside this CR's
@@ -2437,11 +2596,22 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
   echo "  that sets ` + a2aBridgeConcurrencyEnvVar + ` counts its literal - a \$(NAME) reference to an earlier literal in the same entry is expanded" >&2
   echo "  as the kubelet expands it - or ` + bridgeDefault + ` for a value this render cannot read, a valueFrom or a reference to one; ` + bridgeDefault + ` when none sets it)." >&2
 `
+	if a2aBridgeRendered(agent) {
+		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge ` + bridgeWorkersNoun + `: the operator renders the bridge, at the" >&2
+  echo "  ` + a2aBridgeConcurrencyOperatorEnvVar + ` in its own environment, or ` + renderedDefault + ` when that is unset, ` + bridgeDefault + ` when it is not a count)." >&2
+`
+	}
 	if bridgeWorkersCapped {
 		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: this CR" >&2
   echo "  declares more than that across the spec.deployment.sidecars entries that set ` + a2aBridgeConcurrencyEnvVar + `, and ` + bridgeMax + ` is" >&2
   echo "  the queue behind the bridge's workers, so a count past it is a typo, not a sizing - correct the literal)." >&2
 `
+		if a2aBridgeRendered(agent) {
+			bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: the" >&2
+  echo "  operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` asks for more, and ` + bridgeMax + ` is the queue behind the bridge's workers," >&2
+  echo "  so a count past it is a typo, not a sizing - correct the setting)." >&2
+`
+		}
 	}
 	// What the budget could not read, said on every run and not only in the
 	// refusal. An entry that took the default in place of a count the render
@@ -2455,7 +2625,13 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// per-entry rule on refusal (a2aProvisionRefusalStatus); this is the
 	// surface a successful run has.
 	readNote := ""
-	if bridgeWorkersDefaulted {
+	if bridgeWorkersDefaulted && a2aBridgeRendered(agent) {
+		readNote += `# The operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` is not a count this render could read.
+echo "NOTE: the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` is not a count this render could read, so the rendered bridge" >&2
+echo "  counted as the bridge's default of ` + bridgeDefault + `. The bridge falls back the same way, so the budget and the bridge" >&2
+echo "  agree; set the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` to a count to size both." >&2
+`
+	} else if bridgeWorkersDefaulted {
 		readNote += `# An entry set ` + a2aBridgeConcurrencyEnvVar + ` to something this render could not read as a count.
 echo "NOTE: a spec.deployment.sidecars entry sets ` + a2aBridgeConcurrencyEnvVar + ` to a value this render could not read as a count -" >&2
 echo "  a valueFrom, a \$(NAME) reference to one or to a name no earlier literal in the same entry set, or a value" >&2
@@ -2499,9 +2675,14 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
 `
 		oneSessionAt = ` at ` + bridgeWorkers + ` bridge workers`
 		thatLeaves = ""
+		workerLever := `declare the bridge sidecar with at most ${workers_fit}" >&2
+    echo "  workers - ` + a2aBridgeConcurrencyEnvVar + ` on its spec.deployment.sidecars entry; unset, the bridge runs ` + bridgeDefault + ` - which is" >&2`
+		if a2aBridgeRendered(agent) {
+			workerLever = `set the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` to at most ${workers_fit}" >&2
+    echo "  - the operator renders the bridge; unset, it runs ` + renderedDefault + ` - which is" >&2`
+		}
 		thirdLever = `  if [ "${workers_fit}" -ge 1 ]; then
-    echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and declare the bridge sidecar with at most ${workers_fit}" >&2
-    echo "  workers - ` + a2aBridgeConcurrencyEnvVar + ` on its spec.deployment.sidecars entry; unset, the bridge runs ` + bridgeDefault + ` - which is" >&2
+    echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and ` + workerLever + `
     echo "  the most this stream has room for beside those sessions: the reserve is ` + fixedReserve + ` plus ` + perWorker + ` a worker." >&2
   else
     echo "Fewer bridge workers alone will not fit it beside spec.harness.tuning.maxSessions=` + maxSessions + `: one worker" >&2
@@ -3205,10 +3386,11 @@ const defaultA2AMaxSessions = 10
 // legitimately runs here: the rendered stack and its neighbors (operator,
 // agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
 // rollout surge doubling a Deployment for a moment, and the gateway's
-// count-then-create overshoot. Fifteen covers roughly ten standing pods plus
-// surge; if the base install grows past that, raise this before anything
-// user-visible starts failing admission.
-const a2aQuotaHeadroom = 15
+// count-then-create overshoot. Fifteen covered roughly ten standing pods plus
+// surge; the console server made it eleven, hence sixteen. If the base
+// install grows again, raise this before anything user-visible starts failing
+// admission.
+const a2aQuotaHeadroom = 16
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -3243,10 +3425,7 @@ func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 // unset with API_SERVER_KEY taken through envFrom, gets no hook, and its
 // API tasks report that they carry no trace.
 func a2aBridgeDoorDeclared(agent *agentv1alpha1.PlatformAgent) bool {
-	if agent == nil || agent.Spec.Deployment == nil {
-		return false
-	}
-	for _, c := range agent.Spec.Deployment.Sidecars {
+	for _, c := range a2aBridgeSidecarsInPod(agent) {
 		if _, set := a2aBridgeConcurrencyValue(c); !set {
 			continue
 		}
@@ -3359,11 +3538,8 @@ func a2aActivitySecretEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
 // set when no sidecar sets the key: the default is then the count, not a
 // stand-in for one.
 func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped, defaulted bool) {
-	if agent == nil || agent.Spec.Deployment == nil {
-		return a2aBridgeDefaultConcurrency, false, false
-	}
 	total, declared := 0, false
-	for _, c := range agent.Spec.Deployment.Sidecars {
+	for _, c := range a2aBridgeSidecars(agent) {
 		value, set := a2aBridgeConcurrencyValue(c)
 		if !set {
 			continue
@@ -3609,8 +3785,18 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 	if workers != a2aBridgeDefaultConcurrency || defaulted {
 		source := fmt.Sprintf("the CR declares (%s on spec.deployment.sidecars)", a2aBridgeConcurrencyEnvVar)
 		countIs := "The CR declares"
+		if a2aBridgeRendered(agent) {
+			source = fmt.Sprintf("the operator's rendered bridge runs (%s in the operator's environment)", a2aBridgeConcurrencyOperatorEnvVar)
+			if os.Getenv(a2aBridgeConcurrencyOperatorEnvVar) == "" {
+				source = fmt.Sprintf("the operator's rendered bridge runs (its default of %d, with no %s in the operator's environment)", a2aRenderedBridgeDefaultConcurrency, a2aBridgeConcurrencyOperatorEnvVar)
+			}
+			countIs = "The operator setting asks for"
+		}
 		if defaulted {
 			source = fmt.Sprintf("the render reads from spec.deployment.sidecars (%s; an entry it cannot read as a count, a valueFrom or a reference to one among them, counts as the bridge's default of %d)", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
+			if a2aBridgeRendered(agent) {
+				source = fmt.Sprintf("the operator's rendered bridge runs (%s in the operator's environment, which this render could not read as a count, so the bridge's default of %d)", a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeDefaultConcurrency)
+			}
 			countIs = "That count is"
 		}
 		noun, noLower := "workers", ""
@@ -3620,6 +3806,9 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		reserve := fmt.Sprintf("the reserve is %d at %d %s and %d at the bridge's default of %d%s", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency, noLower)
 		if workers == a2aBridgeDefaultConcurrency {
 			reserve = fmt.Sprintf("the reserve is %d at %d %s, the bridge's default", a2aTasksReserve(agent), workers, noun)
+		}
+		if a2aBridgeRendered(agent) && !defaulted {
+			reserve = fmt.Sprintf("the reserve is %d at %d %s and %d at %d", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency)
 		}
 		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; %s)",
 			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
@@ -3631,6 +3820,10 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower %s, or none for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
 		fits = "the maxSessions, or the worker count, that fits"
 		finish = "The three do not finish the same way. Lowering maxSessions or the bridge's worker count finishes by itself: either CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
+		if a2aBridgeRendered(agent) {
+			ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to set the operator's %s to fewer workers (unset, the rendered bridge runs %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyOperatorEnvVar, a2aRenderedBridgeDefaultConcurrency)
+			finish = "The three do not finish the same way. Lowering maxSessions, or the operator's bridge setting, finishes by itself: either re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
+		}
 	}
 	return fmt.Sprintf(
 		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
@@ -3961,10 +4154,22 @@ func (r *PlatformAgentReconciler) ensureA2ADoorTokenSecret(ctx context.Context, 
 	return r.Create(ctx, secret)
 }
 
+// buildA2AGatewayFencePolicy is the gateway's own fence: the pod selector and
+// the one collector rule of buildA2AGatewayNetworkPolicy, under the gateway's
+// name rather than a door's, so it renders wherever the gateway Deployment
+// does and no door flag decides it. Why it exists at all is on
+// buildA2AGatewayNetworkPolicy.
+func buildA2AGatewayFencePolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	np := buildA2AGatewayNetworkPolicy(agent)
+	np.Name = a2aGatewayNetpolName(agent)
+	np.Labels = a2aLabels(agent, "gateway-netpol")
+	return np
+}
+
 // buildA2ADoorNetworkPolicy is the A2A door's copy of the gateway fence: the
-// same pod selector and the same empty ingress, under the door's own name so
-// it comes and goes with the door's flag and never with the inject door's.
-// Two identical deny-all policies on one pod deny exactly what one does.
+// same pod selector and the same one collector rule, under the door's own
+// name so it comes and goes with the door's flag and never with the inject
+// door's. Two identical policies on one pod admit exactly what one does.
 func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	np := buildA2AGatewayNetworkPolicy(agent)
 	np.Name = a2aDoorName(agent)
@@ -3975,11 +4180,14 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
 // inject backend is armed.
 //
-// PolicyTypes carries Ingress with NO rules, which denies every pod. That is
-// the intent rather than an omission: the two chat backends dial out and
-// listen for nothing, so until this door existed no pod had any business
-// reaching the gateway at all, and the inject port must not become the one
-// that does.
+// PolicyTypes carries Ingress with one rule, and every pod but the one it
+// names is denied. That is the intent rather than an omission: the chat
+// backends dial out and listen for nothing, so until this door existed no
+// pod had any business reaching the gateway at all, and the inject port must
+// not become the one that does. The one rule is the credential broker's
+// second rule, copied (buildCredentialProxyNetworkPolicy): the
+// managed-Prometheus collector, from its own namespace, to the metrics-only
+// port alone (a2aGatewayMetricsPort). The doors' ports admit nobody.
 //
 // This fence is a second control over an edge the bind address already
 // closes, not the first. The door listens on the pod's loopback
@@ -3993,11 +4201,21 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // buildA2ANATSNetworkPolicy says so at length). What answers that caller is
 // the bearer token (ensureA2AInjectTokenSecret).
 //
-// Rendered only with the backend, deliberately. A deny-all-ingress fence on
-// the gateway is a good idea whatever the backend, but rendering one on every
-// next install is a change to installs that did not ask for this, and it
-// would outlive the object it exists to protect. When an in-cluster caller
-// legitimately needs the gateway, it becomes a peer in this rule.
+// This one renders only with the backend, under the door's name, and the
+// gateway also carries a copy under its own name that renders on every next
+// install whatever the doors say (buildA2AGatewayFencePolicy). That copy used
+// to not exist: rendering a policy on every next install was a change to
+// installs that did not ask for one, and with no door the gateway listened on
+// nothing outside its loopback, so there was nothing to fence. The metrics
+// listener ended that. It binds every interface on every next gateway, so
+// without a policy selecting the pod the counters were reachable from the
+// whole pod network on an install with neither door armed. Brian's call on
+// #2473 (2026-10-06) was to always render the gateway's own fence rather than
+// leave that open. The door fences stay as they are, identical in what they
+// admit; two identical policies on one pod admit exactly what one does, and
+// each door's objects still come and go with its own flag. When an in-cluster
+// caller legitimately needs the gateway, it becomes a peer in this rule, and
+// in every copy of it.
 func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -4011,17 +4229,85 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 				MatchLabels: map[string]string{"app": a2aGatewayName(agent)},
 			},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aGatewayMetricsPort)},
+			}},
 		},
 	}
+}
+
+// a2aPrincipalMapVolumeSource is the gateway's one principal-map volume, at
+// the one path the gateway reads its map from (A2A_PRINCIPAL_MAP), and it is
+// the armed backend's table and nothing else. The gateway loads that
+// directory as one flat map and resolves a sender against every key in it,
+// with no record of which source a key came from, so whatever else is
+// mounted there can admit a sender too.
+//
+// A Slack-armed gateway reads the a2a-slack-principal-map Secret alone. The
+// hand-made principal-map ConfigMap is not projected beside it, because a
+// Slack-shaped key written into that ConfigMap would resolve a Slack sender:
+// a configmaps write would grant a principal, which is the impersonation
+// primitive spec-chatops-gateway.md, "The mapping table", keeps the table out
+// of a ConfigMap to avoid. The Secret is referenced, never rendered: it is the
+// install admin's to write, through the install path, and no product
+// ServiceAccount holds a verb on it. No DefaultMode: the pod runs as uid 1000
+// with no fsGroup, and a 0400 Secret file would be root's and unreadable.
+//
+// Every other gateway keeps the volume it had before Slack could arm one: the
+// principal-map ConfigMap, Discord's test table, which never maps a real
+// principal. The eval door's map is its own ConfigMap at its own path and is
+// not this volume. Optional either way, for the gateway's own reason: an
+// install without its table runs. Without Discord's table every Discord
+// sender drops at verification, visibly; without Slack's, every listed Slack
+// sender is attributed by member id, because the table is an override.
+func a2aPrincipalMapVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	if a2aSlackArmed(agent) {
+		return corev1.Volume{
+			Name: a2aPrincipalMapVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: a2aSlackPrincipalMapSecretName,
+				Optional:   ptr.To(true),
+			}},
+		}
+	}
+	return corev1.Volume{
+		Name: a2aPrincipalMapVolume,
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aPrincipalMapConfigMapName},
+			Optional:             ptr.To(true),
+		}},
+	}
+}
+
+// a2aRequiredSecretRef is the gateway's copy of a token ref from the CR,
+// required whatever the CR's own copy says. The gateway refuses half a
+// Slack pair at boot (a2a/gateway/config.go, FromEnv), so an optional ref
+// whose key is missing would start a pod that exits and restarts; a
+// required one holds the pod at container creation, with the missing
+// Secret or key named in its events. A nil ref (a CR the CRD's CEL rule
+// would refuse today) falls back to the default the legacy broker reads,
+// so the two paths read the same Secret.
+func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *corev1.SecretKeySelector {
+	out := defaultSecretRef(ref, defaultPlatformAgentSecrets, defaultKey).DeepCopy()
+	out.Optional = nil
+	return out
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
 // docs/designs/spec-chatops-gateway.md). Which chat backend it starts on is
 // the install's: the Google Chat env and relay token when a2aChatArmed, the
-// optional discord-bot Secret reference otherwise, and the inject door under
-// its own flag beside either. The render is withheld while none of those is
-// configured (a2aGatewayBackend); once rendered, a pod still crash-loops
-// until the gateway image is reachable.
+// Slack token pair from the CR's refs when a2aSlackArmed, the optional
+// discord-bot Secret reference otherwise, and the inject door under its own
+// flag beside any of them. While none of those is configured
+// (a2aGatewayBackend) the first creation is withheld, and a Deployment that
+// already exists is applied at zero replicas over this render's one (the
+// caller sets it); with one, a pod still crash-loops until the gateway image
+// is reachable.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")
@@ -4108,7 +4394,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// NOT the Discord reference: the gateway refuses two real backends, so
 	// an install with both a discord-bot Secret and Chat enabled under next
 	// gets the one its CR names.
-	discordEnv := []corev1.EnvVar{
+	backendEnv := []corev1.EnvVar{
 		// Created by hand at install time (the bot token is operator input,
 		// never repo content); the reference is optional so the pod
 		// schedules before it.
@@ -4118,20 +4404,41 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Optional:             ptr.To(true),
 		}}},
 	}
+	// The Slack backend takes the Discord reference's place on the same
+	// terms: the CR names it (a2aSlackArmed), so a discord-bot Secret left in
+	// the namespace cannot make the gateway refuse two backends. The pair is
+	// read through the CR's own refs, the ones the legacy broker reads, which
+	// is why the legacy consumer is off whenever this is on.
+	if a2aSlackArmed(agent) {
+		slack := agent.Spec.Integration.Slack
+		backendEnv = []corev1.EnvVar{
+			{Name: a2aSlackBotTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.BotTokenSecretRef, a2aSlackBotTokenEnvVar)}},
+			{Name: a2aSlackAppTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.AppTokenSecretRef, a2aSlackAppTokenEnvVar)}},
+			// The allowed-users gate, carried on Chat's terms (see the Chat
+			// pair below): normalized the way the gateway reads it, the
+			// allow-all flag the legacy rule on the RAW list. This is the
+			// gateway's only Slack admission gate (beside refusing another
+			// workspace's member): the principal map overrides attribution,
+			// so a mapped member the CR does not allow is refused under next
+			// as under today.
+			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
+			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
+		}
+	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
 	var chatVolumes []corev1.Volume
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
-		allowed := a2aGchatAllowlist(gchat.AllowedUsers)
-		discordEnv = nil
+		allowed := a2aAllowlist(gchat.AllowedUsers)
+		backendEnv = nil
 		chatEnv = []corev1.EnvVar{
 			// The relay is the broker; the gateway pod holds no cloud credential.
 			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
 			// The allowed-users gate, carried as environment because
 			// environment is what the agent cannot rewrite, from the same
 			// CR list the legacy pin uses. The list is normalized the way
-			// the gateway reads it (a2aGchatAllowlist); the allow-all flag
+			// the gateway reads it (a2aAllowlist); the allow-all flag
 			// is the legacy consumer's rule on the RAW list (allowAllUsers:
 			// absent, or a single empty string), so one CR means one thing
 			// in both modes. A degenerate list - whitespace or commas only -
@@ -4171,13 +4478,22 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Key:                  a2aGatewayPasswordKey,
 		}}},
 	}
-	env = append(env, discordEnv...)
+	env = append(env, backendEnv...)
 	env = append(env, []corev1.EnvVar{
 		// Rendered explicitly even when the CR is silent:
 		// the number a `kubectl describe` reader sees is
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The busy notice's threshold, rendered explicitly
+		// for the same reason: the number a reader of the
+		// live Deployment sees is the bridge worker count it
+		// was derived from (a2aBusyNoticeAt).
+		{Name: a2aBusyNoticeAtEnvVar, Value: a2aBusyNoticeAt(agent)},
+		// The metrics-only listener's port (see
+		// a2aGatewayMetricsPort): the container port below
+		// and the collector's ingress rule name the same one.
+		{Name: a2aGatewayMetricsPortEnvVar, Value: strconv.Itoa(int(a2aGatewayMetricsPort))},
 		// Arms the spawner. The gateway shipped its
 		// session-spawn path dark behind this flag; the
 		// worker image it spawns and the Role that lets
@@ -4241,10 +4557,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// name, so the render and the spawner must agree
 		// or every session is refused at connect.
 		{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
+		// Rendered explicitly at the gateway's default, like
+		// A2A_GCHAT_TOKEN_PATH: the path and the projected
+		// volume below are one fact, and a reader of the live
+		// Deployment sees where the Discord and Slack identity
+		// tables come from.
+		{Name: a2aPrincipalMapEnvVar, Value: a2aPrincipalMapDir},
 	}...)
 	env = append(env, chatEnv...)
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
+	env = append(env, a2aTargetAllowlistEnv(agent)...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -4291,19 +4614,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						WorkingDir: "/",
 						Resources:  a2aResources(a2aGatewayCPURequest, a2aGatewayMemoryRequest, a2aGatewayCPULimit, a2aGatewayMemoryLimit),
 						Env:        env,
-						Ports:      injectPorts,
+						// The doors' ports, then the metrics-only
+						// listener's, for the chart's PodMonitoring.
+						Ports: append(injectPorts, corev1.ContainerPort{
+							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
+						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
-							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
+							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
 						}}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{{
-						Name: "principal-map",
-						VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{Name: "principal-map"},
-							Optional:             ptr.To(true),
-						}},
-					}}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},
@@ -4333,13 +4654,20 @@ type a2aProvisionState struct {
 	// written on the way OUT of the previous one, and nothing else is
 	// guaranteed to wake the reconcile that finally sees it.
 	gatewayHeld bool
-	// gatewayDark reports that the gateway Deployment was withheld because
-	// the install configures no chat backend for it: no discord-bot Secret,
-	// no door armed and Chat not taken by next (a2aGatewayBackend). gatewayDarkReason is the
-	// remedy, for the condition the status writer publishes. A gateway that
-	// already exists is never withheld on this account; see the call site.
+	// gatewayDark reports that the gateway runs nothing because the install
+	// configures no chat backend for it: no discord-bot Secret, no door
+	// armed and neither Chat nor Slack taken by next (a2aGatewayBackend).
+	// Its first creation was withheld, or the Deployment that exists was
+	// applied at zero replicas. gatewayDarkReason is the remedy, for the
+	// condition the status writer publishes. See the call site.
 	gatewayDark       bool
 	gatewayDarkReason string
+	// gatewayWaking reports that a backend has come back for a gateway an
+	// earlier pass darkened, the apply has asked for one replica again, and
+	// the informer does not yet count it ready. The status writers keep the
+	// A2AGateway condition the dark pass wrote while it holds, and it shares
+	// the requeue with gatewayDark.
+	gatewayWaking bool
 	// jobName is the provisioning Job this pass rendered, by its digest
 	// name. The status writer names it when it is what Ready waits on,
 	// and carrying it saves re-rendering the JobSpec to hash it again.
@@ -4360,7 +4688,8 @@ type a2aProvisionState struct {
 // A2A door armed on the operator (the agent-caller install, gke-labs#2252
 // step 1, the same decision: the gateway accepts A2A_DOOR_LISTEN as its
 // ingress); the CR's Google Chat integration under next (a2aChatArmed, which
-// needs no read at all); the discord-bot Secret present in the namespace.
+// needs no read at all); its Slack integration under next (a2aSlackArmed, the
+// same); the discord-bot Secret present in the namespace.
 //
 // The Secret is read through a2aReader, uncached, for the reason every other
 // Secret read here is (see removeA2AInjectBackend): the operator ships
@@ -4370,9 +4699,13 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 	if a2aInjectBackendEnabled() || a2aAgentDoorEnabled() {
 		return true, "", nil
 	}
-	// Before the Secret read: the answer is on the CR, and a Chat install
-	// should pay nothing for a Secret it never created.
-	if a2aChatArmed(agent) {
+	// Before the Secret read: the answer is on the CR, and a Chat or Slack
+	// install should pay nothing for a Secret it never created. Slack's
+	// token Secret is not read here either: the gateway's refs to it are
+	// required (a2aRequiredSecretRef), so a missing Secret or key holds the
+	// pod at container creation, named in its events, rather than starting
+	// one that exits.
+	if a2aChatArmed(agent) || a2aSlackArmed(agent) {
 		return true, "", nil
 	}
 	secret := &corev1.Secret{}
@@ -4385,16 +4718,19 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 		// reference is optional, so a rendered gateway would start with no
 		// token and exit on "no chat backend", which is the crash loop this
 		// check exists to prevent. Withheld, with the key named.
-		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
-			"Deployment is not rendered: put the Discord bot token under that key, or enable spec.integration.googleChat "+
-			"so the next stack takes Google Chat; an eval install arms the inject door (%s=true on the operator) "+
+		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and "+
+			"is not running (never created, or scaled to zero replicas if it existed): put the Discord bot token under that key, "+
+			"or enable spec.integration.googleChat or spec.integration.slack so the next stack takes Google Chat or Slack; "+
+			"an eval install arms the inject door (%s=true on the operator) "+
 			"or the A2A door (%s=true) instead",
 			a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 	case !errors.IsNotFound(err):
 		return false, "", err
 	}
-	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
-		"enable spec.integration.googleChat so the next stack takes Google Chat, or create the %s Secret (key %s) in %s; "+
+	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so it is not running "+
+		"(never created, or scaled to zero replicas if it existed): "+
+		"enable spec.integration.googleChat or spec.integration.slack so the next stack takes Google Chat or Slack, "+
+		"or create the %s Secret (key %s) in %s; "+
 		"an eval install arms the inject door (%s=true on the operator) or the A2A door (%s=true) instead",
 		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 }
@@ -4412,9 +4748,10 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 	return r.ungatedDNSClusterIPs(ctx, agent)
 }
 
-// reconcileA2ANetworkFences applies the three NetworkPolicies that fence the
-// next stack: the bus's ingress policy, the session pods' egress one, and the
-// capability verifier's.
+// reconcileA2ANetworkFences applies the NetworkPolicies that fence the next
+// stack: the bus's ingress policy, the session pods' egress one, and the
+// capability verifier's, plus the gateway's own fence while the gateway
+// Deployment exists and each door's fence while its flag is set.
 //
 // Separate from the rest of reconcileA2A because a NetworkPolicy is not
 // rendering, it is a guardrail, and #1247 settled what that distinction costs:
@@ -4432,12 +4769,17 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 // the bus, and LiteLLM. Delete it while the CR sits Degraded over an unrelated
 // bad CIDR and the confinement is gone from pods that are still running, with
 // the status naming the CIDR and saying nothing about the fence.
-func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+//
+// gatewayFenced reports whether this pass applied the gateway's own fence.
+// reconcileA2A reads it so that fence is written once per pass (see the
+// gateway section there); the refusal path has no use for it.
+func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (gatewayFenced bool, err error) {
 	dnsClusterIPs := r.a2aSessionDNSClusterIPs(ctx, agent)
 	fences := []*networkingv1.NetworkPolicy{
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2ASessionNetworkPolicy(agent, dnsClusterIPs),
 		buildA2AVerifierNetworkPolicy(agent, dnsClusterIPs),
+		buildA2AConsoleNetworkPolicy(agent),
 	}
 	// The gateway fence rides here with the others, for the reason this
 	// function exists: it is what withholds a task-submission endpoint from
@@ -4454,15 +4796,33 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	if a2aAgentDoorEnabled() {
 		fences = append(fences, buildA2ADoorNetworkPolicy(agent))
 	}
+	// The gateway's own fence, keyed on the gateway rather than a flag: the
+	// metrics listener binds every interface whenever the pod runs. Here for
+	// the refusal-path rescue, so it is applied over a gateway that exists.
+	// On the first render the Deployment is absent here, and reconcileA2A
+	// writes the fence itself just ahead of the Deployment it fences; it
+	// does so only when this pass reports it did not, so a running install
+	// applies it once per pass, not twice. Not applied when the Deployment
+	// is absent, so a gateway withheld for want of a backend, or held for the
+	// callout, does not get a fence over nothing. Read from the cache:
+	// Deployment is an Owns() kind. A stale hit renders a fence the next dark
+	// pass removes; a stale miss skips it for one pass on the refusal path
+	// only (on the render path reconcileA2A picks it up).
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
+		fences = append(fences, buildA2AGatewayFencePolicy(agent))
+		gatewayFenced = true
+	} else if !errors.IsNotFound(err) {
+		return false, err
+	}
 	for _, np := range fences {
 		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
-			return err
+			return false, err
 		}
 		if err := r.applyManaged(ctx, agent, np); err != nil {
-			return fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
+			return false, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
 		}
 	}
-	return nil
+	return gatewayFenced, nil
 }
 
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
@@ -4547,11 +4907,19 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 
-	// All three fences ride reconcileA2ANetworkFences so they appear and
+	// The A2A fences ride reconcileA2ANetworkFences so they appear and
 	// disappear with the stack they fence — including the skew freeze, where a
 	// frozen, running bus keeps its ingress policy and the workers on it keep
 	// their egress one.
-	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	gatewayFenced, err := r.reconcileA2ANetworkFences(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+
+	// The console server: the page, its credential, and its websocket proxy.
+	// After the fences, so its pod never runs unfenced, and ahead of the
+	// gateway's hold, because serving the page doesn't need the gateway.
+	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -4808,46 +5176,143 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 	// Before the callout gate: a gateway with no chat backend to start on
-	// is a crash loop, so its first creation is withheld and the CR says
-	// why (#1660, option 1). Creation only, the same rule as the callout
-	// gate below and for the same reason: a gateway that exists is
-	// reconciled whatever happened to its backend, because deleting it
-	// would hand every session pod that hangs off its UID to the garbage
-	// collector. An operator who removes the discord-bot Secret from under
-	// a running gateway gets the crash loop that has always followed that,
-	// visible on the pod; an operator who never created one gets no
-	// Deployment and a condition instead.
+	// is a crash loop (a2a/gateway/config.go, "no chat backend"), so it is
+	// never run without one, and the CR says why. What "not run" means
+	// depends on whether the Deployment exists yet.
 	//
-	// Existence first, backend second, so the backend question (an uncached
-	// Secret read when no door is armed) is asked only on the pass that
-	// would create the gateway, and a running install pays nothing for it.
-	// Through the informer rather than a2aReader, unlike the callout gate
-	// below, because the stale directions cost differently here: a stale
-	// NotFound withholds an apply the gateway does not need for one pass,
-	// and a stale hit -- the Deployment deleted inside the informer's lag,
-	// with the Secret gone at the same moment -- falls through to the callout
-	// gate's live read and at worst re-creates the crash-looping gateway
-	// every install had before this gate. A live read would buy that corner
-	// with one API call per pass on every next install.
-	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); errors.IsNotFound(err) {
-		configured, why, berr := r.a2aGatewayBackend(ctx, agent)
-		if berr != nil {
-			return state, berr
+	// Absent: its first creation is withheld (#1660, option 1), and the
+	// install gets no Deployment and a condition.
+	//
+	// Present: it is applied at zero replicas, never deleted (#2481).
+	// Deleting it would hand every session pod that hangs off its UID to
+	// the garbage collector; leaving it at one replica is the crash loop
+	// this gate exists to prevent, and disarming the last backend is a
+	// normal step (turning the inject door off on an eval install, taking
+	// the discord-bot Secret away, disabling Chat or Slack on the CR), not
+	// a mistake. At zero the object and its UID stay, so the sessions stay
+	// owned, and the same condition the creation path writes says why.
+	// It keeps its own fence (#2473) at zero; only cleanupA2A removes that.
+	// When a backend comes back, the next pass falls through to the
+	// ordinary apply below, which renders one replica on the same object;
+	// the dark state shares the reconcile's requeue (platformagent_controller.go,
+	// the gatewayDark term) so a Secret, which is not watched, is seen
+	// within one requeue. The condition stays until the scaled-up pod is
+	// ready (gatewayWaking).
+	//
+	// So the backend question is asked on every pass, existing gateway or
+	// not, or a running gateway would never see its backend leave. The door
+	// flags, Chat and Slack answer from the environment and the CR without a read;
+	// only an install whose sole backend is a Secret pays a2aGatewayBackend's
+	// one uncached GET per pass. The answer is a2aGatewayBackend's alone:
+	// nothing here assumes which backends are Secret-backed.
+	//
+	// The Deployment read goes through the informer rather than a2aReader,
+	// unlike the callout gate below, because a backend pass needs no more:
+	// the gate re-reads live when it would hold. A dark pass that finds a
+	// gateway confirms it through a2aReader before the zero apply, because
+	// a stale hit -- the Deployment deleted inside the informer's lag --
+	// would otherwise be a server-side apply that creates it at zero
+	// replicas, and the pass that later scales that object to one replica
+	// asks the callout gate nothing, since the gate never holds a gateway
+	// that exists. So a stale hit takes the absent path and creates
+	// nothing. A stale NotFound withholds the apply for one pass, and the
+	// requeue comes back; a dark pass confirms that NotFound live too when
+	// the gateway's fence still stands, so it cannot delete the fence of a
+	// gateway that is there. The live read is one GET per dark pass that
+	// found a gateway or its fence, never on a pass with a backend.
+	liveGateway := &appsv1.Deployment{}
+	getErr := r.Get(ctx, client.ObjectKeyFromObject(dep), liveGateway)
+	if getErr != nil && !errors.IsNotFound(getErr) {
+		return state, getErr
+	}
+	gatewayExists := getErr == nil
+	configured, why, berr := r.a2aGatewayBackend(ctx, agent)
+	if berr != nil {
+		return state, berr
+	}
+	if !configured {
+		state.gatewayDark = true
+		state.gatewayDarkReason = why
+		// The live read also runs when the cache misses the gateway but
+		// still holds its fence (#2473), because the absent path below
+		// removes that fence and a gateway at zero replicas keeps it: a
+		// stale NotFound must not be what deletes the fence of a gateway
+		// that is there. A withheld install with no fence, the steady
+		// dark state that never had a gateway, pays nothing for it.
+		confirm := gatewayExists
+		if !confirm {
+			err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}, &networkingv1.NetworkPolicy{})
+			if err != nil && !errors.IsNotFound(err) {
+				return state, err
+			}
+			confirm = err == nil
 		}
-		if !configured {
-			state.gatewayDark = true
-			state.gatewayDarkReason = why
+		if confirm {
+			err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+			if err != nil && !errors.IsNotFound(err) {
+				return state, err
+			}
+			gatewayExists = err == nil
+		}
+		if gatewayExists {
+			// The callout gate and anything after it are skipped: the
+			// callout gate never holds a gateway that exists, and nothing
+			// later in the ordinary path is needed to run zero pods,
+			// except the gateway's own fence (#2473): a gateway at zero
+			// replicas keeps it, and only cleanupA2A takes it away. The
+			// object is still there and wakes on the next backend, and
+			// the pod it scales away runs out its termination grace with
+			// the metrics port open. The fences pass applied it already
+			// when its cached read found the Deployment; when that read
+			// missed and the live read above found it, it is applied
+			// here, ahead of the zero apply, as the ordinary path does.
+			if !gatewayFenced {
+				fence := buildA2AGatewayFencePolicy(agent)
+				if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
+					return state, err
+				}
+				if err := r.applyManaged(ctx, agent, fence); err != nil {
+					return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
+				}
+			}
+			dep.Spec.Replicas = ptr.To(int32(0))
+			logf.FromContext(ctx).Info("scaling the A2A gateway to zero: no chat backend is configured", "deployment", dep.Name)
+			if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
+				return state, fmt.Errorf("failed to scale the A2A gateway Deployment to zero: %w", err)
+			}
+		} else {
 			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
-			if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+			// The gateway's own fence goes with the gateway that is not
+			// there (removeA2AGatewayFence), confirmed absent by the live
+			// read above whenever a fence stands; the zero path keeps it.
+			if err := r.removeA2AGatewayFence(ctx, agent); err != nil {
 				return state, err
 			}
-			if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
-				return state, err
-			}
-			return state, nil
 		}
-	} else if err != nil {
-		return state, err
+		// The door removals AFTER the apply, as on the ordinary path below,
+		// and the argument there still holds at zero replicas: the apply is
+		// what stops the gateway listening, here by taking the door's env
+		// away and scaling the pod away in the same write, so the fence
+		// outlives the apply. The previous pod runs out its termination
+		// under the gateway's own fence, kept above, which admits nobody
+		// to a door's port; once it is gone nothing listens at zero
+		// replicas. Absent, there was never a listener.
+		if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+			return state, err
+		}
+		if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
+			return state, err
+		}
+		return state, nil
+	}
+	// A backend, and a gateway an earlier pass darkened: the apply below
+	// scales it back to one replica, and until that replica is ready the
+	// CR keeps the A2AGateway condition (as WaitingForReplica) rather than
+	// clearing it over a pod that is not serving yet. The ready count is the
+	// informer's, and the Ready writer re-reads it before keeping the
+	// condition.
+	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent) {
+		state.gatewayWaking = true
 	}
 	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err
@@ -4860,7 +5325,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		// at all (the hold is creation-only), so nothing is listening and
 		// the removal is safe to run now; skipping it would leave a flag
 		// that went off during the hold with the door's objects rendered
-		// until the callout serves.
+		// until the callout serves. The gateway's own fence goes too: it
+		// fences a pod the API server no longer holds (see
+		// removeA2AGatewayFence for the reap window that leaves).
+		if err := r.removeA2AGatewayFence(ctx, agent); err != nil {
+			return state, err
+		}
 		if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 			return state, err
 		}
@@ -4869,20 +5339,54 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		}
 		return state, nil
 	}
+	// The gateway's own fence, ahead of the Deployment so the metrics
+	// listener never binds on a pod no policy selects. Every next gateway
+	// gets it, door or no door (#2473, 2026-10-06); see
+	// buildA2AGatewayNetworkPolicy for why.
+	//
+	// Applied here only when the fences pass above did not apply it. That
+	// pass writes it whenever its cached read finds the Deployment, which it
+	// must, for the refusal path that never reaches this section; writing it
+	// again here would be a second identical SSA request on every pass of a
+	// running install. Keyed on what the fences pass reports, not on a
+	// second read of the Deployment, so the two reads cannot disagree into a
+	// pass that applies the Deployment and no fence: either that pass wrote
+	// it or this one does, and both run before the Deployment apply below.
+	if !gatewayFenced {
+		fence := buildA2AGatewayFencePolicy(agent)
+		if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, fence); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
+		}
+	}
+	// The secret-env digest, on the same terms as the agent gateway and the
+	// broker (platformagent_secret_hash.go). On a Slack-armed install this pod,
+	// not the broker, reads the Slack pair, so without it a rotated token would
+	// reach no pod at all; the stamp covers every Secret ref the render carries
+	// (the bus password, the salt, the Discord or Slack tokens, a door's token)
+	// rather than special-casing Slack. After both gates and the dark branch's
+	// return, so a withheld gateway pays no Secret read and a gateway scaled to
+	// zero is never stamped against a Secret that may be gone; once one exists this is one Get per referenced Secret
+	// per pass, the cost the other two stamped pods already carry.
+	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
+		return state, err
+	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
-	// And the removal AFTER it, which is the other half of the same ordering
-	// argument. The re-render above is what stops the gateway listening; a
-	// fence deleted before it lands leaves the previous pod serving the
-	// inject port with nothing selecting it, reachable on its pod IP by
-	// anything in the cluster for as long as the rollout takes. Deleting
-	// after means the fence outlives the apply, not the rollout: the removal
-	// does not wait for the new pod to be ready, so the previous pod can
-	// serve the port unfenced for the rest of its termination. Narrower than
-	// the other order, not closed; closing it would mean holding the removal
-	// on the Deployment's rollout status.
+	// And the removal AFTER it, the other half of the same ordering
+	// argument. The re-render above is what stops the gateway listening on
+	// the door. Before #2473 this order was what kept the previous pod
+	// fenced, and only through the apply, not the rollout. Now the gateway's
+	// own fence (buildA2AGatewayFencePolicy) selects the same pod and is
+	// written ahead of the Deployment on every pass that reaches here, by
+	// the fences pass or by the render above, and it admits nobody to a
+	// door's port; so dropping a door's fence never leaves the previous pod
+	// unselected. The order stays because a door's fence is still that
+	// door's own object, and costs nothing.
 	if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 		return state, err
 	}
@@ -4891,6 +5395,25 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 
 	return state, nil
+}
+
+// removeA2AGatewayFence takes the gateway's own fence away on a pass that
+// withholds or holds the gateway. Both happen only while the Deployment is
+// absent (the withheld path on a cached NotFound, the held path on a live
+// one), so the order the doors' removal needs (after the apply) does not
+// arise. Absent is not the same as no pod listening: a Deployment deleted by
+// hand leaves its ReplicaSet and pod to the garbage collector, and the pod
+// then runs out its termination grace, so for those seconds the old pod can
+// serve its counters on 9096 with nothing selecting it. Counters only, and
+// the same async-reap gap a2aBusTeardown's session-fence comment names;
+// closing it would mean holding the removal until no gateway pod remains.
+// One cached read: NetworkPolicy is an Owns() kind.
+func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
+	if err := r.deleteOwnedA2AObject(ctx, agent, np, r.Client); err != nil {
+		return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy: %w", err)
+	}
+	return nil
 }
 
 // applyA2AInjectBackend renders the inject backend's own objects, and does
@@ -4930,14 +5453,14 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // Easy to leave out and expensive to leave out. Unsetting the operator's flag
 // re-renders the gateway without the listener, so the Service would go on
 // pointing at a closed port -- harmless -- but the ConfigMap would go on
-// naming a principal nothing checks, the fence would go on denying ingress to
-// a gateway that no longer needs it, and the Secret would leave a live bearer
+// naming a principal nothing checks, the fence would go on fencing a door
+// that is gone, and the Secret would leave a live bearer
 // token for a door that is gone. The first three are residue on an install
 // that is supposed to look like it never had an eval door; the last is more
 // than residue.
 //
-// Called AFTER the gateway Deployment is applied, which is what makes the
-// fence safe to drop -- see the call site. Four reads on each reconcile of a
+// Called AFTER the gateway Deployment is applied -- see the call site for
+// why the order stays now that the gateway's own fence covers the pod. Four reads on each reconcile of a
 // next install is the standing cost. Three are cached: Service, ConfigMap
 // and NetworkPolicy are Owns() kinds (see SetupWithManager), so their
 // informers exist. The Secret is NOT read through the cache, and this is
@@ -5265,6 +5788,12 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&corev1.ConfigMap{ObjectMeta: doorMeta}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: doorMeta}, r.Client},
 		{&corev1.Secret{ObjectMeta: doorMeta}, r.a2aReader()},
+		// The console server, with the gateway: both are front doors onto
+		// the bus, and both go before the bus they front. Its fence goes
+		// later, beside the session fence, for the same reason that one is
+		// late: the Delete above returns before the pod is gone.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
@@ -5325,6 +5854,12 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
 		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The gateway's own fence. Its Deployment is deleted far above, so
+		// what it fences by now is a terminating pod; it goes here rather
+		// than beside the door fences so it outlives that pod for as long as
+		// the teardown's order allows, and above the verifier fence for the
+		// reason that entry gives.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The verifier fence goes before the session fence, not after it, even
 		// though the verifier is rendered after the session one. Two reasons,
 		// and the second is the load-bearing one.
@@ -5347,6 +5882,14 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// fence ABOVE this entry, not below it.
 		// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins that.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The console fence, as late as it can go for the session fence's
+		// reason: directly above the session fence, which has to stay last.
+		// The window matters more here: until the console pod exits, anything
+		// in the cluster that reaches it can read the console password off
+		// /config.json, and the creds Secret that password lives in survives
+		// the flip. The order shortens that window to the pod's exit; it does
+		// not remove it.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The session fence goes after the gateway Deployment above, which is
 		// what stops new pods being spawned. It does not close the window:
 		// Delete returns as soon as the API server accepts it, and the pods
@@ -5388,7 +5931,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Eight reads answer it instead of walking every object
+	// cost for a no-op. Nine reads answer it instead of walking every object
 	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
@@ -5421,6 +5964,17 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//   - the A2A door's fence, the same shape under the other flag: written
 	//     after the pair and deleted before it, left alone only by the hand,
 	//     removed on the today path by nothing but this walk,
+	//   - the gateway's own fence, the same shape again, under no flag. Since
+	//     #2473 every next gateway has it. It is written after the pair and
+	//     deleted between them (after the NATS fence, before the session
+	//     one), so a render or cleanup that dies partway leaves one of the
+	//     pair beside it; the hand that deletes the pair and flips to today
+	//     leaves it alone, and then nothing on the today path but this walk
+	//     removes it,
+	//   - the console fence, for the same hand on an install without the
+	//     inject flag. It is the third fence reconcileA2ANetworkFences writes,
+	//     so the same two deletes leave it standing alone there, and nothing
+	//     on the today path but this walk removes it either,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -5433,8 +5987,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first six are Owns kinds and free; the two Secret reads
-	// are uncached and happen only when the free six all miss.
+	// property. The first eight are Owns kinds and free; the two Secret reads
+	// are uncached and happen only when the free eight all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
 	// object under a reserved name is not residue of this CR and is left to
@@ -5443,7 +5997,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// counted would send every reconcile of a today install into that refusal
 	// -- the shape a next CR deleted and re-created under the same name in
 	// today mode takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at eight
+	// Ownership is read off the fetched object, so the exit stays at ten
 	// Gets.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
@@ -5451,10 +6005,12 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
-	// without the fences every guardrail prefix does. The two door fences
-	// are the ones no prefix leaves alone;
-	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip and its A2A
-	// door twin are what red without them.
+	// without the fences every guardrail prefix does. The inject, door,
+	// console and gateway fences are the ones no prefix leaves alone;
+	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip, its A2A door
+	// twin, TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip and
+	// TestTheA2AGatewayFenceComesAndGoesWithTheGateway are what red without
+	// them.
 	sentinels := []a2aTeardownEntry{
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -5462,6 +6018,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}

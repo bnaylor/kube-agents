@@ -73,8 +73,10 @@ install without the interview.
   ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
   sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
-  (`drift_pubsub_subscription`), and the sink-writer and agent-GSA IAM on
-  them; and, with `enable_drift_detector = true` alongside it, the
+  (`drift_pubsub_subscription`), the sink-writer and agent-GSA IAM on
+  them, and publisher on the topic for anything
+  `drift_pubsub_topic_publishers` names; and, with
+  `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
@@ -732,6 +734,8 @@ with the created topic/subscription — restrict access with
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
+With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
+
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
 install.sh collects. Slack needs no GCP resources, so this is
@@ -764,10 +768,45 @@ subscription (`drift_pubsub_subscription`, default
 `platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
 the sink's writer identity, and `roles/pubsub.subscriber` plus
 `roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
-`pubsub.googleapis.com` to the enabled APIs. Beyond the three names, only the
-module's two required inputs are passed, so its defaults decide the 31-day
-retention and the cluster scope, which is every GKE cluster in the project; a
-caller that needs the module's other knobs instantiates it directly.
+`pubsub.googleapis.com` to the enabled APIs.
+
+`drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
+on the topic to each member it lists, on top of the sink's writer identity.
+Leave it empty unless a test harness has to inject synthetic audit records: the
+detector classifies on the `principalEmail` inside each record and Pub/Sub does
+not attach the publisher's identity to the message, so anything that can
+publish here can make the detector report a change nobody made, under any
+principal it names. Never list the agent's own GSA.
+
+Beyond the three names and that list, the module's two required inputs are
+passed and two more of its optional ones:
+`drift_pubsub_sink_writer_identity_override`, which the module's own
+postcondition tells an operator to set when a project's sink reports a writer
+identity the module did not derive, and `drift_pubsub_sink_drain_duration`,
+the destroy-time wait below. Neither has an installer key, so through the
+front doors both are passthrough lines in `install.env`
+(`TF_VAR_drift_pubsub_sink_writer_identity_override`,
+`TF_VAR_drift_pubsub_sink_drain_duration`) rather than entries in
+`terraform.tfvars`, which `write_tfvars_from_state` regenerates wholesale on
+every `install.sh` and `upgrade.sh` run — a hand-added key there is gone on the
+next one, and for the override that means the failure it cleared comes back.
+A hand-driven apply sets them in `terraform.tfvars`. Everything else is left to the module's defaults,
+which decide the 31-day retention and the cluster scope, every GKE cluster in
+the project; a caller that needs the module's remaining knobs instantiates it
+directly.
+
+The module creates the sink after its publish grant and holds a wait between
+deleting the sink and deleting the topic — `drift_pubsub_sink_drain_duration`,
+two minutes by default — so that Cloud Logging never routes to a topic it
+cannot reach and mails every project owner about it. That wait is why a
+destroy of this configuration pauses once the sink is gone. Raising it takes
+an apply to land before the destroy that should honour it: `time_sleep` reads
+`destroy_duration` from state, since a provider's delete is handed prior state
+and no configuration, and `uninstall.sh` runs no apply of its own. Setting the
+variable and going straight to `uninstall.sh` waits whatever an earlier apply
+recorded, so run `upgrade.sh` in between.
+[The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+is canonical for both orderings.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the

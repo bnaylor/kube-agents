@@ -12,7 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
-- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
+- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`).
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
@@ -188,13 +188,13 @@ the topic has an owner:
 | Release runbooks                                          | `scripts/release/README.md`                  |
 | The evaluation project pool and Prow configuration        | `docs/ci-pool-projects.md`                   |
 | Agent rules, by family (code, CI, pre-PR, evals, docs)    | `.agents/rules/`                             |
+| Who to ask about an area, and who owns a running service  | `docs/ownership.md`                          |
 
 Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, skill
   catalogue and image inventory are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
-  then run `make docs-generate`.
+  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them; new targets get a `## description`
   comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -209,10 +209,9 @@ Rules:
   and a number tells the reader nothing they can act on.
 - **Verify identifiers against source, not against other docs.** GCP service account names live
   in `install.defaults.env`, the Go version in `k8s-operator/go.mod`.
-- **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
-  Compact `| cell | cell |` rows, never re-aligned: the map is edited from several branches a
-  week, and a re-aligned table rewrites rows your PR did not author. `docs/README.md` §5 owns the
-  rest.
+- **Link a new document from the page that owns its topic; add no map entry.** `docs/README.md`
+  is the tree plus two compact tables, never re-aligned. `docs-check-links` fails a document no
+  reader reaches: do not grow its allowlist; argue a new family glob in the PR.
 - **Write it straight.** Lead with the fact; cut hype and self-assessment (`comprehensive`,
   `robust`, `seamless`); skip "not X, but Y" and rule-of-three padding; prefer prose to a
   `**Bold term:** explanation` list; claim first, caveat after. `SKILL.md` files are the
@@ -221,10 +220,9 @@ Rules:
   sections, no summary that repeats the section above it, no scaffolding a reader will skip.
   `.agents/rules/documentation.md` has the full form of both rules and their upstream guide.
 
-Run `make docs-check` before pushing. It checks generated regions, relative links, identifiers
-against source, map (`docs/README.md`) coverage of every Markdown document outside the root
-dot-directories, site pages for maintainer identifiers, and this file plus `CLAUDE.md` against
-the context budget — the six checks CI runs.
+Run `make docs-check` before pushing. It checks generated regions, relative links and that a
+reader reaches every document, identifiers against source, site pages for maintainer identifiers,
+and this file plus `CLAUDE.md` against the context budget — the five checks CI runs.
 
 ## Contributing as an agent
 
@@ -287,8 +285,8 @@ Agents with a user in the loop follow this file.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
-  `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
-  map coverage, site audience, context budget), while the skill also verifies that doc prose still matches the
+  `make docs-check` enforces only the mechanical subset (generated regions, links, reachability,
+  terminology, site audience, context budget), while the skill also verifies that doc prose still matches the
   source. Its dispositions go in **Self-Review** with the adversarial pass's, not in a section of
   their own. `/pr-preflight` runs this pass alongside the adversarial one, each in its own context.
 - **Live-test the change before opening a PR, and describe it in the PR body.** Every pull

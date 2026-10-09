@@ -580,6 +580,42 @@ variable "github_repo" {
   default     = ""
 }
 
+variable "gitops_forge" {
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install declares one gitlab forge and its gitops repository through spec.integration.forges/repositories; github_repo and enable_github_minter must be left unset."
+  type        = string
+  default     = "github"
+  validation {
+    condition     = contains(["github", "gitlab"], var.gitops_forge)
+    error_message = "gitops_forge must be github or gitlab."
+  }
+}
+
+variable "gitops_host" {
+  description = "Hostname of the forge holding the GitOps repository, for a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (gitlab.com). A bare hostname: no scheme, path or port. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_host == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.gitops_host))
+    error_message = "gitops_host must be a bare lowercase hostname, with no scheme, path or port."
+  }
+}
+
+variable "gitlab_repo" {
+  description = "The GitOps repository on GitLab, as the project's full path (group/subgroup/project) or its URL. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+}
+
+variable "gitlab_token_secret_name" {
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding the GitLab access token under the key `token`. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = "gitlab-forge-token"
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_token_secret_name)) && length(var.gitlab_token_secret_name) <= 253
+    error_message = "gitlab_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
 variable "enable_github_minter" {
   description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready."
   type        = bool
@@ -704,6 +740,24 @@ variable "drift_pubsub_sink" {
   description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Guarded by name the way drift_pubsub_topic is, so a second install in the project names its own."
   type        = string
   default     = "platform-agent-drift-audit-sink"
+}
+
+variable "drift_pubsub_topic_publishers" {
+  description = "IAM members granted roles/pubsub.publisher on the drift topic, on top of the sink's own writer identity. Only used when enable_drift_pubsub is true, and empty on an install: the Log Router is what should be putting audit records on this topic, and a member here can make the detector report a change nobody made. The evaluation pool sets it to its CI runners so a bench case can publish synthetic records and exercise the classifier, which it cannot reach any other way — every identity a bench run can authenticate as is a service account the classifier is right to drop. The agent's own service account does not belong here; it already reads this stream."
+  type        = list(string)
+  default     = []
+}
+
+variable "drift_pubsub_sink_writer_identity_override" {
+  description = "The principal to grant roles/pubsub.publisher on the drift topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives. Include the \"serviceAccount:\" prefix. Only used when enable_drift_pubsub is true. Exists because the module derives that identity rather than reading it off the sink, so the grant can precede the sink: a project where Logging reports some other writer identity fails the sink's postcondition, and with nothing to set here it would fail it on every later plan of this composition too, taking the whole apply with it. The failed apply leaves the sink created and exporting without the publish role, which mails every project owner until this is set or the sink is deleted, so it is the fix to reach for first rather than at leisure. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_writer_identity_override line in install.env rather than in terraform.tfvars: write_tfvars_from_state regenerates that file wholesale on every front-door run and never writes this key, so a hand-added one is lost on the next run and the failure returns. A hand-driven apply sets it in terraform.tfvars instead. Leave null unless an apply has told you to set it; the error names the value to use."
+  type        = string
+  default     = null
+}
+
+variable "drift_pubsub_sink_drain_duration" {
+  description = "How long a destroy waits, after deleting the drift sink, before removing the topic and the sink's publish grant. Only used when enable_drift_pubsub is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The module's 120s default is a chosen margin rather than a measured convergence time, so raise it if the mail still arrives and lower it only to trade that risk for a faster teardown. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_drain_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive. Setting it is not enough on its own: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, and uninstall.sh runs no apply before the destroy -- so a value raised and taken straight to uninstall.sh waits the 120s already in state and the mail arrives anyway. Run upgrade.sh (or lifecycle.sh apply) in between. Raising it after a teardown has already mailed is therefore too late for that teardown; the time to set it is at install."
+  type        = string
+  default     = "120s"
 }
 
 variable "enable_drift_detector" {

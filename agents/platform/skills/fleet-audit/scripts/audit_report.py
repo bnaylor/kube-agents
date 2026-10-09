@@ -245,6 +245,7 @@ AUDITS: dict[str, AuditSpec] = {
             "rwo-claim-contended",
             "hpa-floors-at-one",
             "pdb-overlapping",
+            "untargeted-compute-class-workload",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -310,6 +311,25 @@ AUDITS: dict[str, AuditSpec] = {
                     "registry-no-cleanup",
                 ),
             ),
+        ),
+        # §3a of the SOP: the eight checks that judge a reservation an owner
+        # may hold on purpose -- headroom above a workload's peak (3.1), a
+        # volume, disk or address kept for a job, a restore or a cutover
+        # (3.3, 3.4, 3.5), warm node capacity (3.7), a pre-provisioned
+        # namespace (3.10), a standby nothing calls yet (3.13) and a registry
+        # that keeps every image (3.14). The other six are leaks or
+        # misbookings no declaration excuses: a Released volume, a forwarding
+        # rule for a deleted Service, a drain blocker, terminal pods, and a
+        # request below or absent from what the workload uses.
+        declarable=(
+            "overrequest",
+            "unconsumed-pvc",
+            "unattached-disk",
+            "idle-address",
+            "idle-nodepool",
+            "idle-namespace",
+            "idle-workload",
+            "registry-no-cleanup",
         ),
     ),
     "fleet-consistency-drift": AuditSpec(
@@ -414,10 +434,25 @@ AUDITS: dict[str, AuditSpec] = {
         "gce_compute_fleet_sop.md",
         (
             "gce-startup-script-status",
-            "mig-autoscaler-flapping",
-            "ops-agent-guest-health",
+            "mig-convergence-stalled",
             "sole-tenant-headroom",
             "orphaned-snapshots",
+        ),
+        # Every check reads Compute Engine objects that belong to a project, so
+        # the collector names one `project/<id>` entry per project and nothing
+        # else. Declaring the partition is what makes a run that enumerated
+        # some other kind of target -- and so ran none of these four anywhere --
+        # report a gap instead of passing silently.
+        scopes=(
+            (
+                "project",
+                (
+                    "gce-startup-script-status",
+                    "mig-convergence-stalled",
+                    "sole-tenant-headroom",
+                    "orphaned-snapshots",
+                ),
+            ),
         ),
     ),
 }
@@ -437,6 +472,7 @@ COLLECTOR_AUDITS = frozenset(
         "compliance-audit",
         "fleet-consistency-drift",
         "fleet-wide-cost-analysis",
+        "gce-compute-fleet-audit",
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
@@ -732,11 +768,19 @@ ROOT_UID = 0
 # directory under its stream's.
 REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
+#: How a store directory below a host spells the `/` between path segments.
+#: Kept equal to `report_status.STORE_PATH_SEPARATOR`, which reads it back.
+STORE_PATH_SEPARATOR = "%2F"
+
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
 # re-propose a fix it withdrew on its own: strip the label and the close becomes
 # a veto. Every proposal listing carries its labels, so it costs no extra call.
 STALE_CLOSED_LABEL = "audit:stale-closed"
+
+# What a remediation is called when the forge's own noun cannot be read. Every
+# GitHub repository is spoken of this way; a GitLab one as a "merge request".
+DEFAULT_PROPOSAL_NOUN = "pull request"
 
 # Wildcard stagers that must never reach `git add` — an audit stages named
 # remediation files only, never the whole working tree.
@@ -793,6 +837,8 @@ MAX_FINDING_ID = 100
 # one long-named namespace, and short enough that an operator can still type
 # the id into `/remediate`.
 ID_DIGEST_CHARS = 6
+# What `_shorten_id` leaves at the end of a clipped id: a dash and the digest.
+SHORTENED_ID_SUFFIX = re.compile(r"-[0-9a-f]{%d}$" % ID_DIGEST_CHARS)
 
 # The hidden block of finding ids a ledger body, and each remediation pull
 # request's body, carries. The run-over-run delta joins against the report
@@ -1120,6 +1166,51 @@ NAMESPACE_SHAPE_KIND = "Namespace"
 # The allow-all fault names the policy; the withhold publishes only that spelling
 # and holds every other, so an object it cannot classify errs toward holding.
 ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
+# A roll-up names the scope it covers, not an object: the cost SOP's §5
+# collapse gives one `Cluster/<name>` or `Namespace/<name>`, and its 3.5
+# ten-address roll-up `Project/<id>`. The cost stream refuses them the way
+# 2.7 refuses a non-workload with `SHARED_ACCOUNT_WORKLOAD_KINDS`: each of
+# its declarable checks names objects of known kinds, folded as
+# `_object_kind_segment` folds them, and anything else — a scope, or a short
+# spelling like `ns/` a worker may give a §5 collapse — covers no object the
+# check names and is refused on the join, the manifest route and the
+# validator alike. Per check, so the patch stream's `Cluster/<name>`
+# declarations are untouched. 3.1 and 3.13 name whatever controller kind owns
+# the pod — a ReplicationController or a pod-owning custom resource as readily
+# as a Deployment — so for those two only the scope spellings are refused.
+COST_CONTROLLER_CHECKS = frozenset({"overrequest", "idle-workload"})
+# A namespace owns no pods, so under the controller checks these spellings are
+# a roll-up whatever the item says. `Cluster/` and `Project/` are a roll-up
+# only in the roll-up's shape, an empty namespace: a controller always carries
+# its namespace, and a pod-owning custom resource may be called `Cluster`
+# (CloudNativePG's is), so the name alone cannot decide.
+NAMESPACE_KIND_SPELLINGS = frozenset({"namespace", "namespaces", "ns"})
+UNNAMESPACED_SCOPE_SPELLINGS = frozenset({"project", "projects", "cluster", "clusters"})
+COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    "unconsumed-pvc": frozenset({"persistentvolumeclaim"}),
+    "unattached-disk": frozenset({"disk"}),
+    "idle-address": frozenset({"address"}),
+    "idle-nodepool": frozenset({"nodepool"}),
+    "idle-namespace": frozenset({"namespace"}),
+    "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
+}
+# A cost declaration names the object and not its size, and every cost
+# finding is about a size, so the Declared intent row for one carries what
+# the collector measured and the grade it gave, `MAJOR` spelled out: a
+# declared reservation that has grown shows there each run while it stays
+# declared. The excerpt is clipped to its first line and this many characters.
+COST_DECLARED_EXCERPT_CHARS = 100
+COST_DECLARED_MINOR = "minor"
+# The cost checks whose collector candidate carries no `namespace`: 3.10
+# names the namespace itself, 3.7 a node pool, and 3.4, 3.5 and 3.14 a
+# project's disk, address and registry repository. A worker or a note author
+# given a namespace may write it into the field, which would give the same
+# object a second identity, so the validator empties it on these checks before
+# the id is derived and the parser reads it as empty on a note item. Per check
+# and not per object kind: 3.9 files its pile as `Namespace/<ns>` with the
+# namespace set, and compliance 2.6 does too. Every slug here is the cost
+# stream's alone, so no stream test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup"})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -1141,14 +1232,14 @@ SHARED_ACCOUNT_SHIELD_NAMES = 3
 SHARED_ACCOUNT_WORKLOAD_KINDS = frozenset({"deployment", "statefulset", "daemonset", "cronjob", "pod"})
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
-    "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
-    "it; the remaining findings are manual, per pod spec."
+    "ServiceAccount's token, so the shared-account fix this {noun} proposes would remove "
+    "it; a finding still open in this namespace is fixed per pod spec, not on the account."
 )
 SHARED_ACCOUNT_STALE_RESOLUTION = (
-    "The finding has not gone: it stays on the ledger with a manual remediation under the "
-    "shield note, and `/remediate <finding-id>` refuses it while the declaration stands. "
-    "Withdraw the declaration and the next run lists it with the shared-account manifest fix "
-    "again, awaiting `/remediate`."
+    "Nothing here is announced as fixed: a finding still open in this namespace stays on the "
+    "ledger, and while the declaration stands the shared-account fix is not proposed again, by "
+    "this audit or by `/remediate <finding-id>`. Withdraw the declaration and the next run lists "
+    "the namespace's findings with the shared-account manifest fix again, awaiting `/remediate`."
 )
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
@@ -1230,7 +1321,9 @@ GENERATED_FIX_NOTE = (
 )
 # A decline naming the pull request that carries the fix: the one a
 # PodDisruptionBudget `finish` would write still takes.
-PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/pull/\d+")
+# A proposal's URL on either forge: GitHub's `/pull/<n>`, GitLab's
+# `/-/merge_requests/<n>`.
+PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_requests)/\d+")
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
@@ -1298,17 +1391,6 @@ CLONE_TMP_PREFIX = "declared-intent-"
 CLONE_LEASE_SUFFIX = "-declared-intent"
 CLONE_MODE_CONTENT = "content"
 CLONE_MODE_DIRECTORY = "directory"
-# The GitOps base-branch override, which `gitops_workspace.resolve_base_branch`
-# consults before the remote's HEAD, names the branch the fleet deploys from
-# in that one repository. The sibling script inherits the environment, and a
-# directory-mode clone with no `--ref` asks that function which branch to
-# check out, so a context repository copied with the override in place was
-# read at the GitOps repository's branch, not its own default, and one with
-# no branch of that name failed to clone every run. Every copy the search
-# makes runs without the two variables: a pinned entry passes `--ref` and
-# never consulted them, and in content mode the broker resolves the default
-# branch per repository and never reads the agent container's environment.
-BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH")
 
 # The most remediation pull requests one stream may have. Past it the listing
 # stops reading, and a branch that reads as "no pull request exists" is one the
@@ -2362,6 +2444,22 @@ def release_in_flight(audit_id: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _ledger_key(repo: object) -> str:
+    """One spelling per ledger: lowercased, with GitHub's host left off.
+
+    A memory written as `acme/gitops` is the same ledger as one written as
+    `github.com/acme/gitops` -- the managed list's spelling where another
+    forge's entry shares the path, and every GitHub name's on a release that
+    qualified them all beside a second forge; comparing the raw strings would
+    read the next run as a different repository and lose the delta.
+    """
+    key = str(repo).lower()
+    prefix = "github.com/"
+    if key.startswith(prefix) and key.count("/") == 2:
+        key = key[len(prefix):]
+    return key
+
+
 def reports_dir_for(audit_id: str, repo: str) -> Path:
     """The store directory for one stream's ledger in one repository.
 
@@ -2373,14 +2471,30 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     # Lower-cased because GitHub's names are not case-sensitive: `--repo
     # Acme/GitOps` and a ConfigMap's `acme/gitops` are one ledger, and two
     # directories for it would each trust a memory the other has moved past.
+    #
+    # A repository on another forge is named `host/path` at any depth, and its
+    # store is one directory below the host, the path with each `/` spelled
+    # `%2F` -- the layout the workspace directories use. Not one directory per
+    # segment: a reader then has to guess where a store starts, and a project
+    # or group named `runs` reads as one. A GitHub owner has no dot in it, so
+    # `gitlab.com/...` cannot land on a GitHub owner's directory. GitHub
+    # named with its host, as an install managing two forges names it, keeps
+    # the bare slug's directory; `read_report_memory` compares the stored name
+    # through `_ledger_key` so the memory in it carries over too.
     segments = str(repo).lower().split("/")
-    if len(segments) != 2 or not all(
+    if len(segments) == 3 and segments[0] == "github.com":
+        segments = segments[1:]
+    if len(segments) > 2 and "." not in segments[0]:
+        segments = []
+    if len(segments) < 2 or not all(
         REPORT_REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir)
         for part in segments
     ):
-        raise ValueError(f"repository {repo!r} is not owner/name")
+        raise ValueError(f"repository {repo!r} is not owner/name or host/path")
     root = Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR)
-    return root / audit_id / segments[0] / segments[1]
+    if len(segments) > 2:
+        segments = [segments[0], STORE_PATH_SEPARATOR.join(segments[1:])]
+    return root.joinpath(audit_id, *segments)
 
 
 def _redact_document(value: object) -> object:
@@ -2657,7 +2771,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         return None
     stored_issue = envelope.get("issue_number")
     stored_repo = envelope.get("repo")
-    if stored_issue != issue_number or str(stored_repo).lower() != str(repo).lower():
+    if stored_issue != issue_number or _ledger_key(stored_repo) != _ledger_key(repo):
         log(
             f"Stored report for {audit_id} was written for {stored_repo}#{stored_issue}, "
             f"not the open {repo}#{issue_number}; {MEMORY_UNKNOWABLE}"
@@ -2827,6 +2941,31 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     }
 
 
+def report_finding_places(
+    envelope: dict | None, document: dict | None = None
+) -> dict[str, tuple[str, str, str]]:
+    """{published id: (check, cluster, namespace) segments} for every finding
+    the stored run or this one carries.
+
+    The shield in the stale-close pass matches a pull request's ids against
+    the namespaces `start`'s file declares. A published id over
+    `MAX_FINDING_ID` is clipped, and the string no longer says where its
+    segments ended, so they are re-derived from the finding's own fields, the
+    way the id was. Both of the store's documents, as `report_finding_titles`
+    reads them, and this run's.
+    """
+    envelope = envelope or {}
+    places: dict[str, tuple[str, str, str]] = {}
+    for candidate in (envelope.get("ledger_document"), envelope.get("document"), document):
+        findings = candidate.get("findings") if isinstance(candidate, dict) else None
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict):
+                continue
+            check, cluster, namespace, _object = derive_finding_id(finding).split(".")
+            places[published_id(finding)] = (check, cluster, namespace)
+    return places
+
+
 def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]] | None:
     """(every finding id, every (cluster, check) run) the stored run filed, or None.
 
@@ -2863,26 +3002,44 @@ def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]]
     return ids, looked
 
 
-def base_branch() -> str:
-    """The branch remediation pull requests target: this repository's own default.
+def base_branch(repo: str) -> str:
+    """The branch remediation pull requests onto `repo` target.
 
     Not the constant `main` it used to be. A GitOps repository on `master`, or
     one whose fleet configuration lives on a long-running `production` trunk,
     made every audit fetch a ref that is not there — `checkout -B <branch>
     origin/main` then failed, and the whole remediation half of the run died
     after the findings had already been written. Resolution lives in
-    `gitops_workspace` so that `submit-suggestion` gets the same answer; see
-    `resolve_base_branch` for the order (`CREDENTIAL_PROXY_BASE_BRANCH` /
-    `GITOPS_BASE_BRANCH`, then `origin/HEAD`, then `main`).
+    `gitops_workspace`; see `resolve_base_branch` for the order (the base the
+    broker pins `repo` to, then `origin/HEAD`, then `main`). The broker refuses a
+    proposal onto any branch but the pinned one, so the pin has to win.
 
     Answering `main` with no workspace is deliberate, not a fallback that got
     forgotten: `resolve_base_branch` cannot ask a clone that does not exist yet,
     and the callers that reach it in that state are the dry run's renderers,
     which print the base rather than push to it.
+
+    A broker that answers the question with a refusal raises `ForgeError`, so
+    the group being published is skipped as for any other forge refusal; one
+    that does not answer at all raises `BrokerUnavailable`, as `forge` does.
     """
     import gitops_workspace
+    import vcs_client
 
-    return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner)
+    try:
+        return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner, repo)
+    except vcs_client.VcsError as exc:
+        code = f" [{exc.code}]" if exc.code else ""
+        log(f"FAILED: asking the broker for the base branch of {repo}{code}: {exc}")
+        if not exc.code and broker_lost(exc):
+            raise BrokerUnavailable(
+                f"asking for the base branch of {repo}: {exc} This sandbox has no "
+                "other way to publish; check the credential-proxy pod and re-run "
+                "this command."
+            ) from exc
+        raise ForgeError(
+            f"asking the broker for the base branch of {repo} failed{code}: {exc}"
+        ) from exc
 
 
 def assert_pushable(branch: str) -> str:
@@ -2892,18 +3049,7 @@ def assert_pushable(branch: str) -> str:
         short = short[len("refs/heads/"):]
     elif short.startswith("heads/"):
         short = short[len("heads/"):]
-    protected = set(PROTECTED_BRANCHES)
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip().lower()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip().lower()
-    )
-    if override:
-        if override.startswith("refs/heads/"):
-            override = override[len("refs/heads/"):]
-        elif override.startswith("heads/"):
-            override = override[len("heads/"):]
-        protected.add(override)
-    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
+    if short in PROTECTED_BRANCHES or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch}' is strictly blocked by GKE SRE guardrails!"
@@ -3398,6 +3544,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # run goes partial, so the ledger cannot close and nothing is announced
         # as resolved. What is refused is the *silent* zero, which is what
         # published five clean reports on a fleet that was not.
+        #
+        # A zero that is not silent either: a target whose whole roster sits in
+        # `checks_not_applicable`, each with its reason. Every check is
+        # accounted for there, so it needs no limitations note and adds no gap
+        # -- a GCP project holding no instance, MIG, node group or snapshot is
+        # the standing example, and a note would hold every run partial for as
+        # long as that project exists. Only on a stream whose collector can
+        # corroborate the declarations (`cross_check_manifest`): elsewhere
+        # nothing checks them, and this would be a command-free all-clear.
         checks_run = cluster.get("checks_run")
         cluster_label = str(cluster.get("name", "")) or "this cluster"
         if not isinstance(checks_run, list):
@@ -3408,7 +3563,17 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "Zero checks on a cluster you could read is not a clean result — "
                 f"it is an audit that did not run. {_sop_pointer(audit_id)}"
             )
-        if not checks_run and not str(cluster.get("limitations", "")).strip():
+        target_roster = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
+        every_check_inapplicable = (
+            audit_id in COLLECTOR_AUDITS
+            and bool(target_roster)
+            and target_roster <= set(checks_na(cluster))
+        )
+        if (
+            not checks_run
+            and not str(cluster.get("limitations", "")).strip()
+            and not every_check_inapplicable
+        ):
             raise ValidationError(
                 f"scope.clusters[{i}].checks_run: empty for {cluster_label}, which "
                 "claims the cluster was read and nothing was checked on it. That is "
@@ -3416,8 +3581,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "ran, or — if nothing could run there — say why in that cluster's "
                 "limitations, or move it to scope.skipped with a reason. A check "
                 "that cannot apply to this cluster goes in checks_not_applicable "
-                f"with its reason, but a cluster where nothing applies still owes "
-                f"a limitations note. {_sop_pointer(audit_id)}"
+                "with its reason"
+                + (
+                    "; a cluster where every check is listed there needs nothing more"
+                    if audit_id in COLLECTOR_AUDITS
+                    else "; this stream runs no collector to corroborate that, so a "
+                    "cluster where every check is listed there still owes a "
+                    "limitations note or a scope.skipped entry"
+                )
+                + f". {_sop_pointer(audit_id)}"
             )
         seen_checks: set[str] = set()
         for j, entry in enumerate(checks_run):
@@ -3605,6 +3777,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # `id` the document arrived with is discarded rather than rejected: a
         # worker running against a cached SOP would otherwise fail the whole
         # document, and `exit 2` on an audit publishes nothing at all.
+        fold_unnamespaced_check(finding)
         full_id = derive_finding_id(finding)
         fid = _shorten_id(full_id)
         try:
@@ -3788,6 +3961,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "finding is gone. Say what the command showed — the binding "
                     "deleted, the setting changed — so a reader can weigh it"
                 )
+            fold_unnamespaced_check(entry)
             full_id = derive_finding_id(entry)
             if full_id in seen_ids:
                 raise ValidationError(
@@ -3885,6 +4059,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"{', '.join(sorted(SHARED_ACCOUNT_WORKLOAD_KINDS))}); the namespace or the "
                     "account covers no workload"
                 )
+            scope_reason = _rollup_scope_reason(check, str(entry["object"]), str(entry.get("namespace") or ""))
+            if scope_reason:
+                raise ValidationError(
+                    f"{where}.object: {str(entry['object'])!r} {scope_reason}; a declaration "
+                    "justifies one object, never a roll-up, so the roll-up stays under `findings`"
+                )
             for field in ("cluster", "object"):
                 if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
                     raise ValidationError(
@@ -3919,6 +4099,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
             # posture cannot be both. A worker that writes the finding *and*
             # the declaration has not decided, and the ledger would report the
             # object as broken in one section and intended in the next.
+            fold_unnamespaced_check(entry)
             full_id = derive_finding_id(entry)
             if full_id in seen_ids:
                 raise ValidationError(
@@ -4877,6 +5058,32 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 "entry has it, verbatim."
             )
         if not manifest_cluster:
+            # A target the collector never named: nothing corroborates a claim
+            # that every check is inapplicable there, which `validate_findings`
+            # would otherwise accept as full coverage.
+            roster = set(audit_target_checks(audit_id, name))
+            if (
+                roster
+                and not checks_ran(cluster)
+                and roster <= set(checks_na(cluster))
+                and not str(cluster.get("limitations", "")).strip()
+            ):
+                named = next(
+                    (c for c in _manifest_clusters(manifest) if str(c.get("name", "")) == name),
+                    None,
+                )
+                if named and named.get("outcome") == MANIFEST_OUTCOME_OUT_OF_SCOPE:
+                    raise ValidationError(
+                        f"scope.clusters: {name!r} is out of scope for {audit_id} in the "
+                        f"collector manifest{_collector_error(named)}. It need not be "
+                        "listed at all; leave it out of both scope lists."
+                    )
+                raise ValidationError(
+                    f"scope.clusters: {name!r} declares every check inapplicable, but "
+                    f"the collector manifest for {audit_id} does not name it, so "
+                    "nothing corroborates that. Name the checks you ran there, say in "
+                    "its `limitations` why none could run, or leave it out."
+                )
             continue
         claimed = checks_ran(cluster)
         if manifest_cluster.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
@@ -4889,6 +5096,21 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             # `coverage_gaps` turns the limitation into a gap, so the run
             # reports itself partial and names the target whose coverage rests
             # on work the manifest cannot check.
+            # The same holds for a check declared inapplicable there: the
+            # collector read nothing, so nothing corroborates that a check
+            # cannot apply, and a target with every check declared so would
+            # otherwise publish as fully covered.
+            declared_na = checks_na(cluster)
+            if declared_na and not claimed and not str(cluster.get("limitations", "")).strip():
+                raise ValidationError(
+                    f"scope.clusters: {name!r} declares {len(declared_na)} check(s) "
+                    f"inapplicable, but the collector manifest for {audit_id} marks it "
+                    f"{str(manifest_cluster.get('outcome'))!r}"
+                    f"{_collector_error(manifest_cluster)}. Nothing was read there, so "
+                    "nothing shows a check cannot apply. Put it in scope.skipped with "
+                    "the collector's error as the reason, or say in this target's "
+                    "`limitations` what you checked by hand."
+                )
             if claimed and not str(cluster.get("limitations", "")).strip():
                 raise ValidationError(
                     f"scope.clusters: {name!r} claims {len(claimed)} check(s) ran, "
@@ -5826,9 +6048,27 @@ def parse_declarations(
             log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")
             continue
         obj = f"{kind}/{name}"
+        scope_reason = _rollup_scope_reason(check, obj, item["namespace"])
+        if scope_reason:
+            # Said here, where every item passes: `finish` refuses the item
+            # on the join too, but only where a finding meets its key, and
+            # silently on the manifest route.
+            log(f"WARNING: {item_where}: {obj!r} {scope_reason}; a declaration names one object, never a roll-up; skipped.")
+            continue
+        namespace = item["namespace"].strip()
+        if namespace and check in UNNAMESPACED_CHECKS:
+            # The finding for these checks carries no namespace (the
+            # validator empties the worker's, `fold_unnamespaced_check`); an
+            # owner who wrote one here meant the same object, and an item
+            # filed as written would join nothing.
+            log(
+                f"NOTE: {item_where}: {check!r} names an object outside any namespace; "
+                f"namespace {namespace!r} is read as empty."
+            )
+            namespace = ""
         entry = {
             "check": check,
-            "namespace": item["namespace"].strip(),
+            "namespace": namespace,
             "object": obj,
             "repo": repo,
             "path": path,
@@ -6146,6 +6386,8 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
         return None
     if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
         return None
+    if _rollup_scope_reason(check, str(item.get("object", "")), str(item.get("namespace") or "")):
+        return None
     return match
 
 
@@ -6175,13 +6417,24 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
         if isinstance(cluster, dict)
     }
     declared = list(data.get("declared") or [])
+    # Derived ids on both sides: the validator has already emptied the
+    # namespace a worker wrote onto a 3.7 or 3.10 finding (`fold_unnamespaced_check`),
+    # so a finding or a declared entry and the collector's candidate for the
+    # same object carry one id here.
     known = {derive_finding_id(f) for f in data.get("findings") or []} | {
         derive_finding_id(e) for e in declared
     }
+    # A cost entry the worker moved itself carries the worker's title; the
+    # Declared intent row owes the collector's measured size and grade on
+    # every route, so the candidate it meets here rewrites that title.
+    worker_declared = {derive_finding_id(e): e for e in declared}
     added: list[str] = []
     for entry, candidate in _candidates(manifest):
         keyed = {**candidate, "cluster": str(candidate.get("cluster") or entry.get("name") or "")}
         identity = derive_finding_id(keyed)
+        own = worker_declared.get(identity)
+        if own is not None and _is_cost_declarable(str(own.get("check", ""))):
+            own["title"] = cost_declared_title(str(own.get("check", "")), str(own.get("object", "")), str(keyed.get("severity", "")), str(keyed.get("excerpt", "")))
         if identity in known or keyed["cluster"] not in audited:
             continue
         match = _declaration_covers(keyed, scoped, fleet_wide, declarable)
@@ -6194,7 +6447,11 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
                 "cluster": keyed["cluster"],
                 "namespace": str(keyed.get("namespace") or ""),
                 "object": str(keyed.get("object", "")),
-                "title": f"{keyed.get('check', '')} on {keyed.get('object', '')}: a collector candidate the document did not report",
+                "title": (
+                    cost_declared_title(str(keyed.get("check", "")), str(keyed.get("object", "")), str(keyed.get("severity", "")), str(keyed.get("excerpt", "")))
+                    if _is_cost_declarable(str(keyed.get("check", "")))
+                    else f"{keyed.get('check', '')} on {keyed.get('object', '')}: a collector candidate the document did not report"
+                ),
                 "declaration": {field: str(match.get(field, "")) for field in DECLARATION_FIELDS},
             }
         )
@@ -6202,7 +6459,7 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
         log(
             f"DECLARED: {_shorten_id(identity)} — {keyed.get('check', '')} on "
             f"{keyed['cluster']}/{keyed.get('namespace') or '(cluster)'}/{keyed.get('object', '')} "
-            f"is a collector candidate the document did not report and is declared at "
+            f"({keyed.get('severity', '')}) is a collector candidate the document did not report and is declared at "
             f"{match.get('repo', '')}:{match.get('path', '')}; listed under Declared intent."
         )
     if added:
@@ -6213,6 +6470,57 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
 def _is_namespace_object(obj: str) -> bool:
     """Whether `obj` names a Namespace, on the same folding the join uses."""
     return _object_kind_segment(obj) == _id_segment(NAMESPACE_SHAPE_KIND)
+
+
+def fold_unnamespaced_check(entry: dict) -> None:
+    """Empty `namespace` in place on an entry of a check whose object has none.
+
+    Run before an entry's id is derived, on findings, `declared[]` and
+    `resolved_because` alike: the collector files these checks' candidates
+    with no namespace, and a worker that wrote a namespace into the field
+    would otherwise give the same object a second identity that every
+    derived-id consumer — the duplicate check, `still_flagged_ids`, the
+    unpublished-candidate rows — treats as a different finding. Keyed on the
+    check (`UNNAMESPACED_CHECKS`), never on the object's kind: 3.9's
+    `Namespace/<ns>` pile and compliance 2.6's `Namespace/<ns>` posture carry
+    their namespace, and their ledger ids must not move.
+    """
+    if isinstance(entry, dict) and entry.get("namespace") and str(entry.get("check", "")) in UNNAMESPACED_CHECKS:
+        entry["namespace"] = ""
+
+
+def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | None:
+    """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
+
+    A cost check with fixed object kinds accepts only those
+    (`COST_DECLARABLE_OBJECT_KINDS`). The two controller checks file whatever
+    kind owns the pod, so they refuse a namespace spelling always and a
+    `Cluster/` or `Project/` only with an empty namespace, the roll-up's
+    shape: a controller carries its namespace, a §5 collapse or the 3.5
+    roll-up does not. Another stream's check is not judged here.
+    """
+    kind = _object_kind_segment(obj)
+    if check in COST_CONTROLLER_CHECKS:
+        if kind in NAMESPACE_KIND_SPELLINGS:
+            return f"names a namespace (`{kind}/`), which owns no pod a {check} finding names"
+        if kind in UNNAMESPACED_SCOPE_SPELLINGS and not str(namespace or "").strip():
+            return f"names a roll-up's scope (`{kind}/` with no namespace), not a controller a {check} finding names"
+        return None
+    allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
+    if allowed is not None and kind not in allowed:
+        return f"names a `{kind}/`, not one of the kinds a {check} finding names ({', '.join(sorted(allowed))})"
+    return None
+
+
+def _is_cost_declarable(check: str) -> bool:
+    return check in COST_CONTROLLER_CHECKS or check in COST_DECLARABLE_OBJECT_KINDS
+
+
+def cost_declared_title(check: str, obj: str, severity: str, excerpt: str) -> str:
+    """The Declared intent row's title for a cost posture: the object, the grade and the measured size."""
+    grade = severity if severity == COST_DECLARED_MINOR else severity.upper()
+    measured = clip_text(str(excerpt or "").strip().splitlines()[0] if str(excerpt or "").strip() else "", COST_DECLARED_EXCERPT_CHARS)
+    return f"{obj} — {check}, {grade}: {measured}" if measured else f"{obj} — {check}, {grade}"
 
 
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
@@ -6284,6 +6592,16 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None
+        scope_reason = _rollup_scope_reason(check, str(finding.get("object", "")), str(finding.get("namespace") or "")) if match is not None else None
+        if scope_reason:
+            # A roll-up carries no object identity of its own; a note that
+            # names its scope would silence every member at once.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {finding.get('object', '')} "
+                f"{scope_reason}; a declaration justifies one object, never a roll-up. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
         if match is None or derive_finding_id(finding) in already:
             kept.append(finding)
             continue
@@ -6293,7 +6611,11 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 "cluster": str(finding.get("cluster", "")),
                 "namespace": str(finding.get("namespace") or ""),
                 "object": str(finding.get("object", "")),
-                "title": str(finding.get("title", "")),
+                "title": (
+                    cost_declared_title(check, str(finding.get("object", "")), str(finding.get("severity", "")), str((finding.get("evidence") or {}).get("excerpt", "")))
+                    if _is_cost_declarable(check)
+                    else str(finding.get("title", ""))
+                ),
                 "declaration": {
                     field: str(match.get(field, "")) for field in DECLARATION_FIELDS
                 },
@@ -6303,7 +6625,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
         log(
             f"DECLARED: {finding.get('id', '')} — {check} on "
             f"{finding.get('cluster', '')}/{finding.get('namespace') or '(cluster)'}/"
-            f"{finding.get('object', '')} is declared at {match.get('repo', '')}:"
+            f"{finding.get('object', '')} ({finding.get('severity', '')}) is declared at {match.get('repo', '')}:"
             f"{match.get('path', '')}; listed under Declared intent, not as a finding."
         )
     if moved:
@@ -6389,7 +6711,9 @@ def shield_declared_account_siblings(
     Returns the ids shielded, each logged, and nothing in the document
     records them: the findings changed, plus every 2.7 candidate the
     collector still emits in a shielded namespace that the document neither
-    reports nor declares. A 2.7 pull request is one namespace's one file, so
+    reports nor declares. A complete run's stale close acts on these; a
+    partial run's acts on `shield_filed_namespaces` alone, since a
+    `declared[]` entry is the worker's writing. A 2.7 pull request is one namespace's one file, so
     a sibling the worker left out is on the same branch as the ones it
     reported; counted as held rather than shielded, it would keep that
     pull request open past the close the shield exists to make.
@@ -6458,6 +6782,26 @@ def shield_declared_account_siblings(
                 "request is closed with the others rather than held open for it."
             )
     return changed
+
+
+def shield_filed_namespaces(declarations: list[dict] | None) -> set[tuple[str, str]]:
+    """`(cluster, namespace)`, folded, for every 2.7 declaration `start` filed; the empty cluster for a fleet-wide item.
+
+    The stale-close pass reads a pull request's namespace off its own ids
+    and closes a shared-account pull request whose namespace one of these
+    covers, whatever workloads the pull request carries and whether or not
+    this run read that cluster: the fix it proposes is forbidden by the
+    declaration, not by anything this run observed.
+    """
+    keys: set[tuple[str, str]] = set()
+    for entry in declarations or []:
+        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
+            continue
+        if _object_kind_segment(str(entry.get("object", ""))) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
+            continue
+        cluster = str(entry.get(DECLARATION_CLUSTER_FIELD, "") or "")
+        keys.add((_id_segment(cluster) if cluster else "", _id_segment(str(entry.get("namespace") or ""))))
+    return keys
 
 
 class ContainmentError(ValidationError):
@@ -7424,7 +7768,7 @@ def is_machine_author(comment: dict) -> bool:
     )
 
 
-def collector_hold_reason(target: str) -> str:
+def collector_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a collector-held finding is neither refused nor acted on.
 
     The finding is on the ledger under _Held by the collector_ and absent from
@@ -7437,13 +7781,13 @@ def collector_hold_reason(target: str) -> str:
         f"`{target}` rides this ledger's hidden block because the collector still "
         "emits a candidate for it and this run's document did not carry it; it is "
         "released when the collector stops emitting it or a `declared` entry "
-        "covers it. There is no finding in the document to open a pull request "
+        f"covers it. There is no finding in the document to open a {noun} "
         "from. The request stands: the first run whose document carries the "
         "finding acts on it, and one where the collector no longer sees it says so"
     )
 
 
-def collector_candidate_reason(target: str) -> str:
+def collector_candidate_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a still-flagged id that was never on the ledger is deferred.
 
     The sibling of `collector_hold_reason` for an id the collector emits and
@@ -7455,7 +7799,7 @@ def collector_candidate_reason(target: str) -> str:
         f"`{target}` is not in this run's document, but the collector emits it "
         "as a candidate this run's document did not carry; it is listed under "
         "`unpublished_candidates` on the run's JSON line. There is no finding in "
-        "the document to open a pull request from. The request stands: the first "
+        f"the document to open a {noun} from. The request stands: the first "
         "run whose document carries the finding acts on it, and one where the "
         "collector no longer sees it says so"
     )
@@ -7472,7 +7816,7 @@ def deferral_reason(target: str) -> str:
     )
 
 
-def declared_reason(target: str, entry: dict) -> str:
+def declared_reason(target: str, entry: dict, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a declared posture is refused, with the file that covers it.
 
     A refusal, not a deferral: a declaration is an owner's standing choice,
@@ -7490,7 +7834,7 @@ def declared_reason(target: str, entry: dict) -> str:
         f"`{target}` is a posture a repository declaration covers — "
         f"`{where}` — so this "
         "run lists it under _Declared intent_ rather than as a finding, and a "
-        "pull request for it would contradict the ledger. Remove the "
+        f"{noun} for it would contradict the ledger. Remove the "
         "declaration; the finding returns on the next run, and a new request "
         "then opens it"
     )
@@ -7517,6 +7861,7 @@ def parse_remediate_commands(
     declared: list[dict] | None = None,
     collector_held: set[str] | None = None,
     collector_flagged: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -7619,8 +7964,8 @@ def parse_remediate_commands(
                         # reason teaches the reader to discount the next one.
                         f"@{author} is not recorded as a collaborator on this "
                         f"repository (`authorAssociation: {association or 'NONE'}`), "
-                        "so this command was not acted on. A remediation pull "
-                        "request may only be requested by someone who could merge it."
+                        f"so this command was not acted on. A remediation {noun} "
+                        "may only be requested by someone who could merge it."
                     ],
                 }
             )
@@ -7667,16 +8012,16 @@ def parse_remediate_commands(
                 deferred.append(deferral_reason(target))
                 continue
             if target in held_ids:
-                deferred.append(collector_hold_reason(target))
+                deferred.append(collector_hold_reason(target, noun))
                 continue
             if target in flagged_ids:
-                deferred.append(collector_candidate_reason(target))
+                deferred.append(collector_candidate_reason(target, noun))
                 continue
             # After the two deferrals, for the reason `handle_finish` gives on
             # the clean branch: a deferral's marker is not an answer and this
             # refusal's is. The sets are disjoint either way.
             if target in covered:
-                reasons.append(declared_reason(target, covered[target]))
+                reasons.append(declared_reason(target, covered[target], noun))
                 continue
             if not target:
                 # An empty target is not a wildcard. Reading it as one would
@@ -7722,7 +8067,7 @@ def parse_remediate_commands(
                 reasons.append(
                     f"`{target}` has a `{kind}` remediation, not a `manifest` one. "
                     "Only a finding whose fix is a file in this repository can become "
-                    "a pull request; run the command in the report instead"
+                    f"a {noun}; run the command in the report instead"
                     + _promotable_hint(promotable)
                 )
                 continue
@@ -8399,6 +8744,7 @@ def render_finding(
     state: str | None = None,
     pr_url: str | None = None,
     new: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     fid = str(finding.get("id", ""))
     # Every free-text field is clipped, not only the evidence. The body budget
@@ -8433,7 +8779,7 @@ def render_finding(
             lines.append(
                 "  The proposed fix was merged and this finding still reproduces. "
                 "The remediation was incomplete, or something outside this "
-                "repository reverted it — the merged pull request is not reopened."
+                f"repository reverted it — the merged {noun} is not reopened."
             )
     lines.append("")
 
@@ -8505,6 +8851,7 @@ def select_rendered_findings(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     new_ids: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
@@ -8531,6 +8878,7 @@ def select_rendered_findings(
             state=(states or {}).get(fid),
             pr_url=(pr_urls or {}).get(fid),
             new=fid in (new_ids or set()),
+            noun=noun,
         )
         cost = len("\n".join(rendered)) + 2
         cost += len(fid) + 3  # its slot in the hidden delta block
@@ -8541,19 +8889,50 @@ def select_rendered_findings(
     return ordered[:fitted], ordered[fitted:]
 
 
-def _render_header(audit_id: str) -> list[str]:
+def _dry_run_repo(audit_id: str, repo: str | None) -> str | None:
+    """The repository a dry run previews, `--repo` or else resolved best-effort.
+
+    For the noun: without `--repo` the dry run still resolves the repository to
+    find its manifests, and a preview that said "pull request" for a GitLab
+    repository would not be the body `finish` publishes. Nothing here fails
+    the dry run; an unresolvable repository previews GitHub's noun as before.
+    """
+    if repo:
+        return repo
+    try:
+        return resolve_repo(audit_id=audit_id)
+    except Exception:  # noqa: BLE001 - a preview's wording, never a gate
+        return None
+
+
+def _proposal_noun(repo: str | None) -> str:
+    """What `repo`'s forge calls a change proposal; "pull request" when unsure.
+
+    Read from the managed entry the repository was registered as, with no
+    forge call: the ledger body is rendered in a dry run too, and a GitHub
+    repository answers without reading anything.
+    """
+    try:
+        import gitops_workspace
+
+        return gitops_workspace.proposal_noun(repo) if repo else DEFAULT_PROPOSAL_NOUN
+    except Exception:
+        return DEFAULT_PROPOSAL_NOUN
+
+
+def _render_header(audit_id: str, noun: str = "pull request") -> list[str]:
     return [
         f"This issue is the ledger for the `{audit_id}` audit. It is rewritten in "
         "full on every run — hand edits to this description will be lost, and the "
         "audit will never open a second ledger for this stream. It closes when the "
         "audit comes back clean.",
         "",
-        "Fixes are proposed as separate remediation pull requests, one per group of "
+        f"Fixes are proposed as separate remediation {noun}s, one per group of "
         "findings that share a file, linked from each finding below. **A human "
         "reviewer** can ask for one that was not opened automatically by commenting "
         "`/remediate <finding-id>` (or `/remediate all`) — the commenter must be a "
         "collaborator on this repository, and only a finding whose remediation is a "
-        "file in this repository can become a pull request.",
+        f"file in this repository can become a {noun}.",
         "",
         # The paragraph above is an instruction, and the audit agent is one of
         # the readers of this body. On issue #29 it read that line, followed it,
@@ -8586,7 +8965,7 @@ def _render_header(audit_id: str) -> list[str]:
         "passed its gates as `pending_remediation_requests`. Only when a "
         "collaborator asks the agent directly, in the agent's own task, does the "
         "fix go through the fleet-audit skill's `remediate` command — never "
-        "through `submit-suggestion`, whose pull requests this audit cannot "
+        f"through `submit-suggestion`, whose {noun}s this audit cannot "
         "deduplicate, refresh, or close._",
     ]
 
@@ -8779,6 +9158,7 @@ def _render_findings(
     pr_urls: dict[str, str] | None = None,
     gaps: list[str] | None = None,
     new_ids: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -8812,7 +9192,7 @@ def _render_findings(
 
     new_ids = new_ids or set()
     rendered, omitted = select_rendered_findings(
-        findings, budget, states=states, pr_urls=pr_urls, new_ids=new_ids
+        findings, budget, states=states, pr_urls=pr_urls, new_ids=new_ids, noun=noun
     )
 
     # A one-row-per-finding index, so the state of the whole stream is legible
@@ -8848,6 +9228,7 @@ def _render_findings(
                 state=states.get(fid),
                 pr_url=pr_urls.get(fid),
                 new=fid in new_ids,
+                noun=noun,
             )
 
     if omitted:
@@ -8924,7 +9305,7 @@ def _finding_identity_lines(fid: str, title: str, cluster: str, namespace: str, 
     ]
 
 
-def _render_held_overflow(overflow: int) -> list[str]:
+def _render_held_overflow(overflow: int, noun: str = DEFAULT_PROPOSAL_NOUN) -> list[str]:
     """The line every tier ends with when `MAX_HELD_IDS` left held findings out."""
     if not overflow:
         return []
@@ -8933,7 +9314,7 @@ def _render_held_overflow(overflow: int) -> list[str]:
         f"_The collector still flags {overflow} more that this ledger has stopped "
         f"tracking: it holds at most {MAX_HELD_IDS} at once, lowest ids first. They "
         "stay on each run's JSON line as `unpublished_candidates` while the collector "
-        "flags them, and their pull requests stay open._",
+        f"flags them, and their {noun}s stay open._",
     ]
 
 
@@ -8944,6 +9325,7 @@ def _render_collector_held(
     overflow: int = 0,
     preview: bool = False,
     carried: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     """The previous findings this run carries forward because the collector still flags them.
 
@@ -8967,14 +9349,14 @@ def _render_collector_held(
     """
     if not held:
         return []
-    noun = "finding" if len(held) == 1 else "findings"
+    count_word = "finding" if len(held) == 1 else "findings"
     out = ["", HELD_SECTION_BEGIN, HELD_SECTION_HEADING, ""]
     if carried:
         # No collector ran this run, so nothing here may read as this run's
         # observation: the rows are held from a previous run's manifest, and
         # the command line, where there is one, is the last one recorded.
         out.append(
-            f"{len(held)} previous {noun} held from a previous run's manifest; this run "
+            f"{len(held)} previous {count_word} held from a previous run's manifest; this run "
             "passed none and cannot release them. Each stays until a manifest run no "
             "longer emits it or a `declared` entry covers it; a `resolved_because` "
             "entry does not release it. The automatic sweep passes over these; a "
@@ -8992,7 +9374,7 @@ def _render_collector_held(
         )
     else:
         out.append(
-            f"{len(held)} previous {noun} this run's document did not carry, kept on "
+            f"{len(held)} previous {count_word} this run's document did not carry, kept on "
             "the ledger because the collector still emits a candidate for each: the "
             "condition is still observed, so it is not resolved. Each stays until the "
             "collector stops emitting it or a `declared` entry covers it; a "
@@ -9038,11 +9420,16 @@ def _render_collector_held(
                 "there this run and still flags this object."
             )
         out.append(f"- **Finding id:** `{fid}`")
-    return out + _render_held_overflow(overflow) + _held_span_close(held)
+    return out + _render_held_overflow(overflow, noun) + _held_span_close(held)
 
 
 def _render_held_note(
-    held: list[dict], *, overflow: int = 0, preview: bool = False, carried: bool = False
+    held: list[dict],
+    *,
+    overflow: int = 0,
+    preview: bool = False,
+    carried: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     """The third tier for the held section: the count, and where the ids are.
 
@@ -9093,7 +9480,7 @@ def _render_held_note(
         HELD_SECTION_HEADING,
         "",
         opening,
-    ] + _render_held_overflow(overflow) + _held_span_close(held)
+    ] + _render_held_overflow(overflow, noun) + _held_span_close(held)
 
 
 def _held_span_close(held: list[dict]) -> list[str]:
@@ -9118,6 +9505,7 @@ def _render_withheld(
     findings: list[dict],
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
     below_floor: list[str] | None = None,
     triage_reasons: dict[str, str] | None = None,
 ) -> list[str]:
@@ -9165,9 +9553,9 @@ def _render_withheld(
     if withheld:
         out += [
             "",
-            f"{len(withheld)} finding(s) qualify for an automatic remediation pull "
-            f"request but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-            "one bad night cannot bury this repository in generated pull requests. "
+            f"{len(withheld)} finding(s) qualify for an automatic remediation {noun} "
+            f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+            f"one bad night cannot bury this repository in generated {noun}s. "
             "Comment `/remediate <finding-id>` to open any of them now — an explicit "
             "request is not capped.",
             "",
@@ -9417,6 +9805,7 @@ def render_issue_body(
     held_overflow: int = 0,
     held_preview: bool = False,
     held_carried: bool = False,
+    noun: str = "pull request",
     new_ids: set[str] | None = None,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
@@ -9458,7 +9847,7 @@ def render_issue_body(
     # table already shows every gap the document authored.
     extra_gaps = [gap for gap in gaps if gap not in document_gaps]
 
-    fixed: list[str] = _render_header(audit_id)
+    fixed: list[str] = _render_header(audit_id, noun)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id, extra_gaps=extra_gaps)
     fixed += _render_declared_intent_search(data)
     withheld_section = _render_withheld(
@@ -9466,6 +9855,7 @@ def render_issue_body(
         findings,
         uncorroborated=list(uncorroborated or []),
         needs_triage=list(needs_triage or []),
+        noun=noun,
         below_floor=list(below_floor or []),
         triage_reasons=triage_reasons,
     )
@@ -9507,6 +9897,7 @@ def render_issue_body(
             pr_urls=pr_urls,
             gaps=gaps,
             new_ids=new_ids,
+            noun=noun,
         )
 
     findings_lines, omitted = select(0)
@@ -9537,7 +9928,11 @@ def render_issue_body(
     held_section: list[str] = _render_held_ids_only(held_entries)
     for candidate_section in (
         _render_collector_held(
-            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+            held_entries,
+            overflow=held_overflow,
+            preview=held_preview,
+            carried=held_carried,
+            noun=noun,
         ),
         _render_collector_held(
             held_entries,
@@ -9545,9 +9940,14 @@ def render_issue_body(
             overflow=held_overflow,
             preview=held_preview,
             carried=held_carried,
+            noun=noun,
         ),
         _render_held_note(
-            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+            held_entries,
+            overflow=held_overflow,
+            preview=held_preview,
+            carried=held_carried,
+            noun=noun,
         ),
     ):
         if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
@@ -9601,6 +10001,7 @@ def render_delta_comment(
     *,
     omitted: int = 0,
     gaps: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str | None:
     """The delta comment, or None when nothing changed (silence beats noise).
 
@@ -9671,7 +10072,7 @@ def render_delta_comment(
             "",
             f"**Coverage of this run is partial** ({len(gaps)} hold(s) declared "
             "beside the document), so nothing above is reported as resolved and no "
-            "remediation pull request was retired:",
+            f"remediation {noun} was retired:",
             "",
         ]
         out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in gaps[:MAX_DELTA_ROWS]]
@@ -9682,12 +10083,26 @@ def render_delta_comment(
     return _clip_comment("\n".join(out))
 
 
+def _no_close_clause(closed_prs, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
+    """How a partial or held comment states the stale-close outcome of this run,
+    in the forge's noun."""
+    urls = [str(u) for u in (closed_prs or [])]
+    if not urls:
+        return f"no remediation {noun} has been closed"
+    return (
+        f"no remediation {noun} has been closed as stale, except the one the "
+        f"compliance shield forbids ({', '.join(urls)}), closed on its declaration"
+    )
+
+
 def render_clean_comment(
     audit_id: str,
     data: dict,
     generated_at: datetime,
     *,
     gaps: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
+    closed_prs: list[str] | None = None,
 ) -> str:
     """Comment posted when an audit that previously had findings comes back clean.
 
@@ -9735,7 +10150,7 @@ def render_clean_comment(
             "**This is not an all-clear, and the ledger stays open.** With no "
             "trusted record of the findings this ledger carries, the run cannot "
             "tell whether they were fixed, so nothing has been reported as "
-            "resolved and no remediation pull request has been closed. "
+            f"resolved and {_no_close_clause(closed_prs, noun)}. "
             + LOST_RECORD_WAY_OUT,
             "",
             f"Why the ledger stays open ({len(gaps)}):",
@@ -9750,8 +10165,7 @@ def render_clean_comment(
             "",
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
-            "nothing has been reported as resolved and no remediation pull request "
-            "has been closed. "
+            f"nothing has been reported as resolved and {_no_close_clause(closed_prs, noun)}. "
             + (
                 # Beside a lost record, complete coverage no longer closes it:
                 # the way out is the one the /remediate answer names too.
@@ -9883,6 +10297,8 @@ def render_held_comment(
     collector: list[str] | None = None,
     carried: list[str] | None = None,
     gaps: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
+    closed_prs: list[str] | None = None,
 ) -> str:
     """Comment posted when a clean run is refused its close (`HELD`).
 
@@ -9914,10 +10330,10 @@ def render_held_comment(
     names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
     if len(clusters) > len(shown):
         names += f", and {len(clusters) - len(shown)} more"
-    noun = "finding" if len(held) == 1 else "findings"
+    count_word = "finding" if len(held) == 1 else "findings"
     out = [
         f"### `{audit_id}` found nothing — but did not account for {len(held)} "
-        f"previous {noun}, so the ledger stays open",
+        f"previous {count_word}, so the ledger stays open",
         "",
         f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
         f"{len(clusters)} audited cluster(s): {names}.",
@@ -9927,7 +10343,7 @@ def render_held_comment(
         "on that cluster — yet the document neither reports the finding again nor "
         "carries a `resolved_because` entry saying what that check showed. From "
         'here "fixed" and "not written down" are the same absence, so nothing has '
-        "been reported as resolved, no remediation pull request has been closed, "
+        f"been reported as resolved, {_no_close_clause(closed_prs, noun)}, "
         "and the ledger stays open. It closes on the next run that reports each of "
         "these again, or says per finding why it is gone; `start` lists them "
         "under `carried`.",
@@ -10027,6 +10443,7 @@ def render_remediation_pr_body(
     *,
     issue_number: int | None,
     generated_at: datetime,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """The body of one remediation pull request.
 
@@ -10041,8 +10458,8 @@ def render_remediation_pr_body(
 
     out = [
         f"Proposed fix for {findings_phrase(len(ordered))} from the "
-        f"`{audit_id}` audit. The audit inspected the fleet read-only; this pull "
-        "request is the only thing it proposes to change, and applying it is a "
+        f"`{audit_id}` audit. The audit inspected the fleet read-only; this "
+        f"{noun} is the only thing it proposes to change, and applying it is a "
         "human decision.",
     ]
     if issue_number:
@@ -10052,7 +10469,7 @@ def render_remediation_pr_body(
 
     out += ["", "## Findings this fixes", ""]
     for finding in ordered:
-        out += render_finding(finding)
+        out += render_finding(finding, noun=noun)
         out.append("")
 
     out += ["## Files", ""]
@@ -10064,8 +10481,8 @@ def render_remediation_pr_body(
         "---",
         "",
         f"Generated by the Platform Agent `{audit_id}` watchdog at "
-        f"{generated_at.isoformat()}. If this fix is wrong, close this pull "
-        "request — the finding stays on the ledger and no replacement is opened "
+        f"{generated_at.isoformat()}. If this fix is wrong, close this {noun} "
+        "— the finding stays on the ledger and no replacement is opened "
         "automatically.",
         "",
         delta_block(ids),
@@ -10091,6 +10508,7 @@ def render_stale_close_comment(
     pr_number: int | str = 0,
     reason: str = "",
     resolution: str = "",
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """Why a remediation pull request is being closed unmerged.
 
@@ -10103,7 +10521,7 @@ def render_stale_close_comment(
         reason
         or (
             f"Closing unmerged: as of {stamp} the `{audit_id}` audit no longer "
-            "reproduces the finding(s) this pull request was opened for. Something "
+            f"reproduces the finding(s) this {noun} was opened for. Something "
             "else fixed them, or the objects are gone."
         ),
         "",
@@ -10129,7 +10547,7 @@ def render_stale_close_comment(
         # every reader a fresh pull request writes a cheque the harness does not
         # cash, and the ones it silently fails are precisely the low-severity
         # findings nobody is watching for.
-        "The branch is left in place, and this pull request is labelled "
+        f"The branch is left in place, and this {noun} is labelled "
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
@@ -10150,7 +10568,7 @@ def render_stale_close_comment(
 
 
 def render_persists_comment(
-    audit_id: str, finding: dict, generated_at: datetime
+    audit_id: str, finding: dict, generated_at: datetime, noun: str = DEFAULT_PROPOSAL_NOUN
 ) -> str:
     """Said once, on a merged pull request whose finding still reproduces."""
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
@@ -10160,7 +10578,7 @@ def render_persists_comment(
         f"reproduces `{finding.get('id', '')}` — {_cell(finding.get('title', ''))}.",
         "",
         "Either the remediation was incomplete, or something outside this "
-        "repository reverted it. This pull request is **not** reopened: it "
+        f"repository reverted it. This {noun} is **not** reopened: it "
         "merged, and reopening it would misrepresent history. The finding "
         "stays on the ledger, flagged, until it stops reproducing.",
         "",
@@ -10217,6 +10635,7 @@ def render_ack_comment(
     accepted: list[str],
     outcomes: dict[str, str],
     generated_at: datetime,
+    noun: str = "pull request",
 ) -> str:
     """Said once per `/remediate` the harness *did* act on.
 
@@ -10228,7 +10647,7 @@ def render_ack_comment(
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [f"That `/remediate` was processed on {stamp}:", ""]
     for fid in accepted:
-        out.append(f"- `{fid}` — {outcomes.get(fid, 'no pull request was opened')}")
+        out.append(f"- `{fid}` — {outcomes.get(fid, f'no {noun} was opened')}")
     out += ["", acked_marker(comment_id)]
     return "\n".join(out)
 
@@ -10242,6 +10661,7 @@ def render_clean_remediate_answer(
     held: bool = False,
     lost_memory: bool = False,
     partial: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """Said once per `/remediate` standing on a ledger that came back clean.
 
@@ -10272,7 +10692,7 @@ def render_clean_remediate_answer(
                 if targets
                 else "which findings the ledger carried."
             )
-            + " A pull request here would propose a fix for a finding whose "
+            + f" A {noun} here would propose a fix for a finding whose "
             "state this run did not establish."
         )
     elif held:
@@ -10280,7 +10700,7 @@ def render_clean_remediate_answer(
             f"The {audit_name(audit_id)} audit found **0 findings** on this run, but "
             "it did not account for the findings this ledger was carrying"
             + (f" — {named} among them" if targets else "")
-            + ", so nothing has been reported as resolved. A pull request here "
+            + f", so nothing has been reported as resolved. A {noun} here "
             "would propose a fix for a finding whose state this run did not "
             "establish."
         )
@@ -10292,11 +10712,11 @@ def render_clean_remediate_answer(
                 if targets
                 else ", so there is nothing left to remediate."
             )
-            + " A pull request here would propose a change nobody needs."
+            + f" A {noun} here would propose a change nobody needs."
         )
     out = [
         f"@{request.get('author', 'someone')} — that `/remediate` was read on "
-        f"{stamp}, and no pull request was opened.",
+        f"{stamp}, and no {noun} was opened.",
         "",
         middle,
         "",
@@ -10349,7 +10769,6 @@ def run_cmd(
     check: bool = True,
     capture: bool = True,
     cwd: str | Path | None = None,
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -10359,9 +10778,6 @@ def run_cmd(
     nothing else's. It never crossed to the credential container — the shim
     that used to stand in for `git` here sent argv alone — and forge calls do
     not come through here at all; see `forge`.
-
-    `env` replaces the child's environment when given; None inherits this
-    process's, as `subprocess.run` does.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -10373,7 +10789,6 @@ def run_cmd(
             text=True,
             capture_output=capture,
             cwd=str(target) if target is not None else None,
-            env=env,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
@@ -10633,6 +11048,7 @@ def pr_record(proposal: dict) -> dict:
     return {
         "number": proposal.get("number"),
         "headRefName": str(proposal.get("source") or ""),
+        "baseRefName": str(proposal.get("target") or ""),
         "state": state,
         "mergedAt": closed if state == "MERGED" else "",
         "closedAt": closed,
@@ -10719,6 +11135,18 @@ def refresh_credentials(repo: str | None = None) -> None:
     403 -- is not that condition, and stays the error it is.
     """
     from github_token_refresh import refresh_git_credentials
+    import gitops_workspace
+
+    # Only GitHub's credential is minted per repository and needs this. A
+    # repository on another forge is reached with a stored token the broker
+    # reads per call, so there is nothing to refresh -- and the refresh path
+    # takes only a bare `owner/name`. GitHub named with its host, as an install
+    # managing two forges names it, is refreshed as the slug.
+    host, path = gitops_workspace.split_host(repo) if repo else ("", repo)
+    if host and host != gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        log(f"No credential refresh for {repo}: its forge's token is stored, not minted.")
+        return
+    repo = path if host else repo
 
     endpoint = proxy_endpoint()
     if not endpoint:
@@ -10747,8 +11175,11 @@ def resolve_repo(
     if repo and str(repo).strip():
         r = str(repo).strip()
         if not gitops_workspace.is_valid_repo_slug(r):
-            raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
-        managed = gitops_workspace.get_managed_github_repos()
+            raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
+        managed = gitops_workspace.get_managed_repos()
+        # A bare `owner/name` from a cron or an operator, on an install whose
+        # list now spells GitHub with its host.
+        r = gitops_workspace.qualify(r, managed)
         if managed and r not in managed:
             raise ValueError(
                 f"Repository {r!r} is not in the managed repositories list: {managed}"
@@ -10770,7 +11201,7 @@ def resolve_repo(
             )
             record = gitops_workspace.read_lease(holder)
             if record and record.get("repo"):
-                return record["repo"]
+                return gitops_workspace.qualify(record["repo"])
         except Exception:
             pass
 
@@ -10839,7 +11270,10 @@ def current_branch() -> str:
     return (res.stdout or "").strip()
 
 
-def ensure_labels(repo: str, audit_id: str) -> None:
+def ensure_labels(repo: str, audit_id: str, noun: str | None = None) -> None:
+    # The forge's own word: GitLab PUTs the description on every run, so the
+    # label on every merge request would otherwise name a pull request.
+    noun = noun or _proposal_noun(repo)
     labels = [
         (
             "agent:audit",
@@ -10854,7 +11288,7 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         (
             "audit:remediation",
             "0E8A16",
-            "Pull request proposing a fix for one group of audit findings",
+            f"{noun.capitalize()} proposing a fix for one group of audit findings",
         ),
         (
             # Load-bearing, not decorative: `pr_closed_by_harness` reads this
@@ -11040,8 +11474,9 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     `audit:stale-closed` is what tells a close the harness made from a close a
     human made. And when it closed, for the other half of the same rule: a
     `/remediate` only overrules a human close if it was written after it, and
-    that comparison needs a time on both sides. Both come back as `pr_record`
-    names them.
+    that comparison needs a time on both sides. And the branch it targets, so a
+    refresh of an open pull request is cut from that branch. All three come back
+    as `pr_record` names them.
 
     Read to the last page. A page that is missing reads as "no pull request"
     for every finding it would have covered, so a lookup that fails partway
@@ -11265,8 +11700,9 @@ class _GroupPush(NamedTuple):
     """What landing a group's files learned, for the pull-request step after it.
 
     `base` is the branch the pull request targets, which the two mechanisms
-    answer differently: the clone asks its own `origin/HEAD`, the broker reports
-    the base of the repository it cloned. `proposable` is False when there is
+    answer differently: the clone takes the base `base_branch` resolves (or the
+    one an open pull request already targets), the broker reports the base of
+    the repository it cloned. `proposable` is False when there is
     nothing to propose — the fix is already on the base — and the caller returns
     without opening anything.
     """
@@ -11276,14 +11712,19 @@ class _GroupPush(NamedTuple):
 
 
 def _land_group_via_clone(
+    repo: str,
     audit_id: str,
     group: list[dict],
     branch: str,
     paths: list[str],
     snapshot: dict[str, bytes],
     root: Path,
+    base: str | None = None,
 ) -> _GroupPush:
     """Cut the branch in the leased clone, stage the files, commit, force-push.
+
+    `base` is the branch an open pull request for `branch` already targets.
+    Without one, the branch is cut from the repository's base branch.
 
     `finish` owns the working tree while it runs: the checkout is forced, and
     the caller re-materialises the files from `snapshot` afterwards, because a
@@ -11292,7 +11733,7 @@ def _land_group_via_clone(
     untracked. Do not leave unrelated uncommitted work in the tree during an
     audit.
     """
-    base = base_branch()
+    base = base or base_branch(repo)
 
     git(["fetch", "origin", base])
     git(["checkout", "--force", "-B", branch, f"origin/{base}"])
@@ -11332,6 +11773,22 @@ def _land_group_via_clone(
     return _GroupPush(base, True)
 
 
+def content_workspace_repo(repo: str) -> str:
+    """`repo` as the broker's file workspace takes it: GitHub's bare `owner/name`.
+
+    The workspace keys GitHub's repositories by the bare slug, and the managed
+    list can spell one `github.com/owner/name` (`gitops_workspace.qualify`),
+    so that spelling is put back to the slug at the door. A repository on another forge is passed with its host, and the
+    broker clones it from the forge that serves it.
+    """
+    import gitops_workspace
+
+    host, path = gitops_workspace.split_host(repo)
+    if host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return path
+    return repo
+
+
 def _land_group_via_broker(
     repo: str,
     audit_id: str,
@@ -11339,6 +11796,7 @@ def _land_group_via_broker(
     branch: str,
     paths: list[str],
     snapshot: dict[str, bytes],
+    noun: str | None = None,
 ) -> _GroupPush:
     """Hand the broker the group's bytes and let it own the branch.
 
@@ -11360,7 +11818,7 @@ def _land_group_via_broker(
 
     changes = {path: snapshot[path] for path in paths}
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=branch
     ) as workspace:
         continuing = workspace.started_from == f"origin/{branch}"
         result = workspace.commit(
@@ -11397,6 +11855,7 @@ def open_remediation_pr(
     issue_number: int | None,
     existing: dict | None,
     generated_at: datetime,
+    noun: str | None = None,
 ) -> str | None:
     """Land the group's files on their own branch, then open or refresh its PR.
 
@@ -11404,19 +11863,50 @@ def open_remediation_pr(
     — the title, the body, the labels — does not, so the pull-request half is
     written once and both mechanisms feed it.
     """
+    import gitops_workspace
+
     branch = assert_pushable(group_branch_for(audit_id, group))
     paths = group_paths(group)
-    landed = (
-        _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot)
-        if content_mode()
-        else _land_group_via_clone(audit_id, group, branch, paths, snapshot, root)
-    )
+    if content_mode():
+        # The broker's workspace continues the branch when the remote has it
+        # and takes no base, so nothing is derived or checked for one here.
+        landed = _land_group_via_broker(
+            repo, audit_id, group, branch, paths, snapshot, noun=noun
+        )
+    else:
+        # The clone recuts the branch, so an open pull request's branch is cut
+        # from the base it targets. Cut from a newly configured base instead,
+        # its diff would carry every commit the new base has that the old one
+        # lacks.
+        open_base = (
+            str(existing.get("baseRefName") or "")
+            if existing and str(existing.get("state", "")).upper() == "OPEN"
+            else ""
+        )
+        # The target is the forge's answer, and anyone who can retarget the
+        # pull request chooses it. It reaches `git fetch` as an argument, so a
+        # value not shaped like a branch name -- `--depth=1` reads as an option
+        # -- is dropped for the resolved base rather than handed to git.
+        if open_base and not gitops_workspace.is_valid_ref(open_base):
+            log(
+                f"WARNING: {branch}: the open pull request targets {open_base!r}, "
+                "which is not a branch name this harness will pass to git; using "
+                "the resolved base instead."
+            )
+            open_base = ""
+        landed = _land_group_via_clone(
+            repo, audit_id, group, branch, paths, snapshot, root, base=open_base or None
+        )
     if not landed.proposable:
         return None
     base = landed.base
 
     body = render_remediation_pr_body(
-        audit_id, group, issue_number=issue_number, generated_at=generated_at
+        audit_id,
+        group,
+        issue_number=issue_number,
+        generated_at=generated_at,
+        noun=noun or _proposal_noun(repo),
     )
     title = remediation_pr_title(audit_id, group)
     highest = next(
@@ -11494,6 +11984,10 @@ def close_stale_remediation_prs(
     *,
     branch_by_finding: dict[str, str] | None = None,
     shielded_ids: set[str] | None = None,
+    noun: str | None = None,
+    shielded_only: bool = False,
+    shielded_namespaces: set[tuple[str, str]] | None = None,
+    finding_places: dict[str, tuple[str, str, str]] | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -11501,7 +11995,24 @@ def close_stale_remediation_prs(
     findings `shield_declared_account_siblings` demoted this run proposes the
     shared-account fix for a namespace that now holds a declared workload, so
     it is closed with that reason rather than left open as the only fix there
-    is — merging it would be the harm the shield exists to prevent.
+    is — merging it would be the harm the shield exists to prevent. With
+    `shielded_only`, that is the only close made: a run over partial coverage
+    cannot say a finding stopped reproducing, but the shield's close rests on
+    the declaration, not on what the run could read, so it still stands.
+    `shielded_namespaces` are the `(cluster, namespace)` pairs `start`'s
+    file declares a 2.7 workload in (the empty cluster for a fleet-wide
+    item): a covered id of that check whose cluster and namespace segments
+    match is shielded whatever workload it names, so a pull request in such a
+    namespace closes even when this run read none of it. Where an id lives
+    comes first from the pull request's own body: the `Where:` line under
+    each covered finding, which `parse_finding_locations` reads back, is the
+    one artifact that always holds a covered id beside its cluster and
+    namespace, whatever the store remembers. Then from `finding_places`, the
+    segments re-derived from the finding's own fields in the stored or
+    current document (`report_finding_places`). An id neither carries is read
+    off the string, which is exact for an unclipped id; one shaped like a
+    clipped id (ending in the shortening digest) is not matched at all, since
+    its trimmed segments could equal another namespace's.
 
     Two reasons a pull request is stale, and the second one is why this cannot
     just read the hidden block. A pull request is stale when every finding it
@@ -11522,9 +12033,41 @@ def close_stale_remediation_prs(
     but the close is retried until it succeeds — the marker records that the
     announcement happened, not that the pull request shut.
     """
+    noun = noun or _proposal_noun(repo)
     closed: list[str] = []
     branch_by_finding = branch_by_finding or {}
     shielded_ids = shielded_ids or set()
+    shielded_namespaces = shielded_namespaces or set()
+    finding_places = finding_places or {}
+    check_segment = _id_segment(SHARED_ACCOUNT_CHECK)
+
+    def is_shielded(fid: str, located: dict[str, dict[str, str]]) -> bool:
+        if fid in shielded_ids:
+            return True
+        if not shielded_namespaces:
+            return False
+        where = located.get(fid)
+        if where is not None:
+            namespace = str(where.get("namespace") or "")
+            place = (
+                fid.split(".", 1)[0],
+                _id_segment(str(where.get("cluster") or "")),
+                _id_segment(namespace) if namespace.strip() else ID_EMPTY_SEGMENT,
+            )
+        else:
+            place = finding_places.get(fid)
+        if place is None:
+            parts = fid.split(".")
+            if len(parts) != ID_SEGMENTS or SHORTENED_ID_SUFFIX.search(fid):
+                return False
+            place = (parts[0], parts[1], parts[2])
+        check, cluster, namespace = place
+        if check != check_segment:
+            return False
+        return any(
+            key_namespace == namespace and (not key_cluster or key_cluster == cluster)
+            for key_cluster, key_namespace in shielded_namespaces
+        )
     live_branches = set(branch_by_finding.values())
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
@@ -11532,6 +12075,7 @@ def close_stale_remediation_prs(
         number = int(pr.get("number", 0))
         head = str(pr.get("headRefName", ""))
         covered = parse_delta_block(str(pr.get("body", "")))
+        located = parse_finding_locations(str(pr.get("body", "")))
         # A body written under a different identity scheme names its findings
         # by ids this run cannot join against, so "none of them still
         # reproduce" is unknowable rather than true — and acting on it closes
@@ -11548,7 +12092,24 @@ def close_stale_remediation_prs(
         # an unjoinable body: that is "cannot tell", not "none of them", and the
         # branch rule below is the only one allowed to act on it.
         persisting = [fid for fid in covered if fid in current_ids] if joinable else []
-        only_shielded = bool(persisting) and all(fid in shielded_ids for fid in persisting)
+        # The shield's test runs over what persists *or* is shielded: a declared
+        # workload is neither current nor still flagged, and a pull request
+        # covering only declared workloads is the forbidden fix as well.
+        shield_persisting = (
+            [fid for fid in covered if fid in current_ids or is_shielded(fid, located)] if joinable else []
+        )
+        only_shielded = bool(shield_persisting) and all(is_shielded(fid, located) for fid in shield_persisting)
+        # The shield's reason is for a pull request something still holds open
+        # under the shield: a persisting finding, or one the shield demoted or
+        # counted this run. On a complete run a covered finding that resolved
+        # is announced resolved by the delta, so a pull request none of whose
+        # findings persist takes the default reason, as it did before. A
+        # partial run cannot tell resolved from unread, so its close keeps it.
+        shield_reason = only_shielded and (
+            shielded_only or bool(persisting) or any(fid in shielded_ids for fid in shield_persisting)
+        )
+        if shielded_only and not only_shielded:
+            continue
         if not orphaned:
             if not covered or not joinable or (persisting and not only_shielded):
                 continue
@@ -11561,7 +12122,7 @@ def close_stale_remediation_prs(
         # of the fix that exists anywhere. Closing it destroys reviewed work to
         # correct a grouping that never changed, and points the reviewer at a
         # replacement branch that was never pushed.
-        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding and fid not in shielded_ids)
+        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding and not is_shielded(fid, located))
         if orphaned and stranded:
             log(
                 f"PR #{number} covers {', '.join(stranded)}, which still "
@@ -11598,15 +12159,15 @@ def close_stale_remediation_prs(
         # run actually established, so that is what the comment says.
         reason = ""
         resolution = ""
-        if only_shielded:
-            reason = SHARED_ACCOUNT_STALE_REASON
+        if shield_reason:
+            reason = SHARED_ACCOUNT_STALE_REASON.format(noun=noun)
             resolution = SHARED_ACCOUNT_STALE_RESOLUTION
         elif persisting or not joinable:
             reason = (
                 f"Closing unmerged: the `{audit_id}` audit no longer groups its "
                 f"findings onto `{head}`. The set of files this fix would touch "
                 "has changed, so the work now lives on a different branch — "
-                "this pull request would conflict with it."
+                f"this {noun} would conflict with it."
             )
 
         # Label first, and refuse to close without it. The label is the only
@@ -11639,7 +12200,13 @@ def close_stale_remediation_prs(
                 repo,
                 number,
                 render_stale_close_comment(
-                    audit_id, findings, generated_at, pr_number=number, reason=reason, resolution=resolution
+                    audit_id,
+                    findings,
+                    generated_at,
+                    pr_number=number,
+                    reason=reason,
+                    resolution=resolution,
+                    noun=noun,
                 ),
                 what="stale-close comment",
             )
@@ -11659,6 +12226,7 @@ def comment_on_merged_but_persisting(
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
     generated_at: datetime,
+    noun: str | None = None,
 ) -> None:
     """Say once, on the merged pull request, that its finding still reproduces.
 
@@ -11666,6 +12234,7 @@ def comment_on_merged_but_persisting(
     than by mutating the trigger, and the pull request is never reopened: it
     merged, and reopening it would misrepresent history.
     """
+    noun = noun or _proposal_noun(repo)
     for finding in sort_findings(findings):
         fid = str(finding.get("id", ""))
         pr = pr_by_finding.get(fid)
@@ -11685,7 +12254,7 @@ def comment_on_merged_but_persisting(
         post_pr_comment(
             repo,
             number,
-            render_persists_comment(audit_id, finding, generated_at),
+            render_persists_comment(audit_id, finding, generated_at, noun),
             what="merged-but-persists comment",
         )
 
@@ -11767,6 +12336,7 @@ def ack_remediate_requests(
     outcomes: dict[str, str],
     existing_comments: list[dict],
     generated_at: datetime,
+    noun: str = "pull request",
 ) -> None:
     """Answer each acted-on `/remediate` exactly once, on the same guard as refusals."""
     for comment_id, accepted in accepted_by_comment.items():
@@ -11779,7 +12349,7 @@ def ack_remediate_requests(
         post_comment(
             repo,
             issue_number,
-            render_ack_comment(comment_id, accepted, outcomes, generated_at),
+            render_ack_comment(comment_id, accepted, outcomes, generated_at, noun),
             what="/remediate acknowledgement",
         )
 
@@ -11850,7 +12420,10 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return []
     recorded = data.get("repo")
-    if repo and (not isinstance(recorded, str) or recorded.strip().lower() != repo.strip().lower()):
+    # Compared as one ledger, for `read_run_record`'s reason: `start` can record
+    # `github.com/owner/name`, as the managed list spells it, and a dry run's
+    # bare `--repo owner/name` names the same repository.
+    if repo and (not isinstance(recorded, str) or _ledger_key(recorded.strip()) != _ledger_key(repo.strip())):
         return []
     entries = data.get(DECLARATIONS_KEY)
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
@@ -12298,7 +12871,9 @@ def has_run_record(audit_id: str, repo: str | None = None) -> bool:
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return False
     recorded = data.get("repo")
-    return not repo or (isinstance(recorded, str) and recorded.strip().lower() == repo.strip().lower())
+    # Through `_ledger_key`, for `read_run_record`'s reason: the bare and the
+    # host-qualified GitHub name are one repository's record.
+    return not repo or (isinstance(recorded, str) and _ledger_key(recorded.strip()) == _ledger_key(repo.strip()))
 
 
 def decline_unwritten_fixes(
@@ -12352,7 +12927,10 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     context = data.get("context_repos")
     if not isinstance(recorded, str) or not recorded or not isinstance(context, list):
         return None
-    if repo and recorded.strip().lower() != repo.strip().lower():
+    # Through `_ledger_key`: `start` records the name it resolved, which can be
+    # `github.com/owner/name` as the managed list spells it, while a dry run
+    # takes `--repo` as given -- the bare `owner/name` the SKILL prescribes.
+    if repo and _ledger_key(recorded.strip()) != _ledger_key(repo.strip()):
         return None
     searched = data.get(RUN_RECORD_SEARCHED_KEY)
     sources = data.get(RUN_RECORD_SOURCES_KEY)
@@ -12379,7 +12957,7 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
 
 def join_harness_declarations(
     data: dict, record: dict | None, audit_id: str, repo: str | None, manifest: dict | None = None
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], set[tuple[str, str]]]:
     """Fold `start`'s search into the document and apply its declarations.
 
     What `finish` — real and dry — and `remediate` share, in the one order
@@ -12389,9 +12967,12 @@ def join_harness_declarations(
     candidate the document left out is declared from `manifest` (when the
     caller has one), then a declared 2.7 workload's siblings go manual.
     Returns the ids that moved or were declared from the manifest, so a
-    caller can refuse one by name, and the ids the shield changed, for the
-    stale-close pass;
-    neither list is written into the document, so neither can arrive in it.
+    caller can refuse one by name; the shielded ids for a complete run's
+    stale close (the siblings the shield changed and the held candidates it
+    counted); and the namespaces `start`'s file declares a 2.7 workload in,
+    which the close matches a pull request's own ids against and which are
+    all a partial run's close may act on. None of the three is written into
+    the document, so none can arrive in it.
     Run on a validated document, after `load_findings`, so the ids are the
     derived ones.
     """
@@ -12400,7 +12981,7 @@ def join_harness_declarations(
     moved = apply_declarations(data, declarations)
     from_manifest = declare_collector_candidates(data, declarations, manifest)
     shielded = shield_declared_account_siblings(data, declarations, manifest)
-    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded
+    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, shield_filed_namespaces(declarations)
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -12414,7 +12995,9 @@ def load_findings(path: str, audit_id: str) -> dict:
     return validate_findings(data, audit_id)
 
 
-def remediation_file_problem(finding: dict, root: Path) -> str | None:
+def remediation_file_problem(
+    finding: dict, root: Path, noun: str = DEFAULT_PROPOSAL_NOUN
+) -> str | None:
     """`None` if this finding's fix is a readable file inside `root`; else why not.
 
     Split out so the question can be asked without being answered destructively.
@@ -12441,17 +13024,19 @@ def remediation_file_problem(finding: dict, root: Path) -> str | None:
         return (
             f"named `{path}` as the fix, but that path does not resolve to a "
             "real file inside the repository, so nothing was read from it and "
-            "no pull request can be opened"
+            f"no {noun} can be opened"
         )
     if resolved.is_file():
         return None
     return (
-        f"named `{path}` as the fix but did not write it, so no pull "
-        "request can be opened for this finding"
+        f"named `{path}` as the fix but did not write it, so no {noun} "
+        "can be opened for this finding"
     )
 
 
-def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
+def degrade_missing_remediations(
+    findings: list[dict], root: Path, noun: str = DEFAULT_PROPOSAL_NOUN
+) -> list[str]:
     """Downgrade manifest findings whose file was never written, and report them.
 
     This used to raise, which is the wrong shape of failure by a wide margin.
@@ -12472,7 +13057,7 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     """
     degraded: list[str] = []
     for finding in findings:
-        reason = remediation_file_problem(finding, root)
+        reason = remediation_file_problem(finding, root, noun)
         if reason is None:
             continue
         remediation = finding.get("remediation") or {}
@@ -13010,7 +13595,7 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
         reset=reset,
         owner=f"fleet-audit:{audit_id}",
     )
-    gitops_workspace.configure_identity(target, _workspace_runner)
+    gitops_workspace.configure_identity(target, _workspace_runner, repo=repo)
     set_workspace(target)
     return target
 
@@ -13106,7 +13691,7 @@ def _clone_step(
         str(CLONE_SCRIPT),
         "clone",
         "--repo",
-        slug,
+        content_workspace_repo(slug),
         "--depth",
         str(CLONE_DEPTH),
         "--into",
@@ -13124,8 +13709,7 @@ def _clone_step(
         cmd.append(f"--prefix={prefix}")
     if force:
         cmd.append("--force")
-    env = {k: v for k, v in os.environ.items() if k not in BASE_BRANCH_OVERRIDE_VARS}
-    result = run_cmd(cmd, check=False, env=env)
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         at = f" at {ref}" if ref else ""
         log(f"WARNING: {slug}: clone{at} exited {result.returncode}; not searched.")
@@ -13636,7 +14220,7 @@ def handle_fetch(args: argparse.Namespace) -> None:
 
     written: list[str] = []
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=args.branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
     ) as workspace:
         for path, target in targets.items():
             content = workspace.read(path)
@@ -13676,7 +14260,7 @@ def handle_list(args: argparse.Namespace) -> None:
     import credential_proxy_client
 
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=args.branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
     ) as workspace:
         entries = workspace.list(args.prefix)
         sha = _tree_sha(workspace)
@@ -13840,7 +14424,7 @@ def handle_grep(args: argparse.Namespace) -> None:
     import credential_proxy_client
 
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=args.branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
     ) as workspace:
         result = workspace.grep(
             args.pattern,
@@ -13875,6 +14459,7 @@ def _handle_finish_dry_run(
     waiver: str = "",
     record: dict | None = None,
 ) -> None:
+    noun = _proposal_noun(_dry_run_repo(audit_id, repo))
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
@@ -13893,7 +14478,7 @@ def _handle_finish_dry_run(
     # that would actually be published rather than an optimistic one. Every
     # step below therefore sees the post-degradation findings, exactly as
     # `handle_finish` does.
-    degraded = degrade_missing_remediations(findings, root)
+    degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation path is not a readable file inside "
@@ -13985,6 +14570,7 @@ def _handle_finish_dry_run(
                     now,
                     collector=[entry["id"] for entry in preview_held],
                     gaps=gaps,
+                    noun=noun,
                 )
             )
             return
@@ -13995,7 +14581,7 @@ def _handle_finish_dry_run(
             )
         else:
             log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
-        print(render_clean_comment(audit_id, data, now, gaps=gaps))
+        print(render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun))
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
@@ -14053,6 +14639,7 @@ def _handle_finish_dry_run(
         data,
         generated_at=now,
         audit_id=audit_id,
+        noun=noun,
         gaps=gaps,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
@@ -14090,7 +14677,7 @@ def _handle_finish_dry_run(
         print("")
         print(
             render_remediation_pr_body(
-                audit_id, group, issue_number=None, generated_at=now
+                audit_id, group, issue_number=None, generated_at=now, noun=noun
             )
         )
 
@@ -14105,6 +14692,7 @@ def _open_promoted_prs(
     root: Path,
     issue_number: int | None,
     generated_at: datetime,
+    noun: str | None = None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
 
@@ -14154,6 +14742,7 @@ def _open_promoted_prs(
                     issue_number=issue_number,
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
+                    noun=noun,
                 )
             except BrokerUnavailable:
                 # The broker is gone, not this group: the next group would fail
@@ -14203,12 +14792,18 @@ def _remediation_outcomes(
     plan: PromotionPlan,
     pr_by_finding: dict[str, dict | None],
     opened: list[str],
+    noun: str = "pull request",
+    refusal: str = "",
 ) -> dict[str, str]:
     """One sentence per accepted `/remediate` target, for the acknowledgement.
 
     Pure: `pr_by_finding` is expected to be the mapping *after* this run's pull
     requests were opened, so a freshly opened request is named by its URL
     rather than reported as missing.
+
+    `refusal` is why no proposal can be published to this repository at all
+    (`remediation_refusal`). With one, a missing proposal says that instead of
+    promising a retry that would fail the same way.
     """
     just_opened = set(opened)
     outcomes: dict[str, str] = {}
@@ -14216,27 +14811,82 @@ def _remediation_outcomes(
         pr = pr_by_finding.get(fid) or {}
         url = str(pr.get("url") or "")
         if url and url in just_opened:
-            outcomes[fid] = f"pull request opened — {url}"
+            outcomes[fid] = f"{noun} opened — {url}"
         elif fid in plan.already_open:
             outcomes[fid] = (
-                f"a pull request is already open — {url or 'see the table above'}; "
+                f"a {noun} is already open — {url or 'see the table above'}; "
                 "its labels were re-asserted and its diff left untouched rather "
                 "than force-pushed over"
             )
         elif fid in plan.superseded:
             outcomes[fid] = (
-                f"not re-opened — {url or 'the pull request'} was closed by a "
+                f"not re-opened — {url or 'the ' + noun} was closed by a "
                 "person *after* this request was written, so the close answers "
                 f"it. Comment `/remediate {fid}` again to overrule that."
             )
         elif url:
-            outcomes[fid] = f"pull request refreshed — {url}"
+            outcomes[fid] = f"{noun} refreshed — {url}"
+        elif refusal:
+            outcomes[fid] = f"no {noun} was opened: {refusal}"
         else:
             outcomes[fid] = (
-                "no pull request was opened; the harness could not publish it "
+                f"no {noun} was opened; the harness could not publish it "
                 "this run and will retry on the next audit"
             )
     return outcomes
+
+
+def _unserved_host_refusal(repo: str, host: str) -> str:
+    """Why content mode cannot publish to `repo`'s host, or "".
+
+    The broker's file workspace clones from any forge the install serves, and
+    the managed list is the sandbox's view of which those are: a non-GitHub
+    host no managed entry names is one the broker would refuse at the open, a
+    failure the person who asked would read as a broken run. Said up front
+    instead. A list that cannot be read refuses nothing here; the broker still
+    refuses an unserved host itself.
+    """
+    import gitops_workspace
+
+    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return ""
+    try:
+        served = {
+            gitops_workspace.split_host(entry)[0]
+            for entry in gitops_workspace.get_managed_repos()
+        }
+    except Exception:  # noqa: BLE001 - advisory; the broker is the gate
+        return ""
+    if host in served:
+        return ""
+    return (
+        f"{repo} is on {host}, which is not a forge this install serves -- no "
+        "managed repository names it -- so a retry will not change this."
+    )
+
+
+def remediation_refusal(repo: str) -> str:
+    """Why no remediation proposal can be published to `repo`, or "".
+
+    In content mode the broker's file workspace clones from the repository's
+    own forge, so every forge gets its proposal. In directory mode the local
+    clone rides the credential the GitHub CLI installed and reaches GitHub
+    only; `start` and `finish` stop at that clone for a repository on another
+    forge, so this answer is for a direct `remediate` call there. Said in the
+    reply, because the person who asked reads that, not the log.
+    """
+    import gitops_workspace
+
+    host, _ = gitops_workspace.split_host(repo)
+    if content_mode():
+        return _unserved_host_refusal(repo, host)
+    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return ""
+    return (
+        f"{repo} is on {host}, and this run is in directory mode, whose local "
+        "clone reaches GitHub only, so a retry will not change this. Content "
+        "mode publishes to every forge."
+    )
 
 
 def handle_remediate(args: argparse.Namespace) -> None:
@@ -14253,6 +14903,19 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # back for want of a declared-intent search, and a pull request for one of
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    # Where no proposal can be published, say so before planning one: the
+    # other surfaces refuse up front, and a run that reached the push would
+    # report REMEDIATED with nothing opened and the reason only in the log. A
+    # dry run would preview a body no run sends -- with or without `--repo`,
+    # since without it the dry run still resolves the repository it previews.
+    refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
+    # Resolved once for the whole preview, as `_handle_finish_dry_run` does: a
+    # failed read falls back to "pull request", so a lookup per group could
+    # preview one group as a merge request and the next as a pull request.
+    dry_noun = _proposal_noun(refusal_repo) if args.dry_run else ""
+    refusal = remediation_refusal(refusal_repo) if refusal_repo else ""
+    if refusal:
+        raise ValidationError(refusal)
     record = read_run_record(audit_id, repo=repo_hint)
     # The same hold `finish` applies from the collector manifest, when the
     # caller has one. An id the document lacks and the collector still flags
@@ -14351,15 +15014,20 @@ def handle_remediate(args: argparse.Namespace) -> None:
             log(f"WOULD OPEN: {group_branch_for(audit_id, group)}")
             print(
                 render_remediation_pr_body(
-                    audit_id, group, issue_number=args.issue, generated_at=now
+                    audit_id,
+                    group,
+                    issue_number=args.issue,
+                    generated_at=now,
+                    noun=dry_noun,
                 )
             )
         return
 
     repo = repo_hint or resolve_repo(audit_id=audit_id, repo=opt_repo)
+    noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    ensure_labels(repo, audit_id)
+    ensure_labels(repo, audit_id, noun=noun)
 
     # A named finding whose manifest was never written cannot become a pull
     # request, so it is refused — but only it. `/remediate all` expands to
@@ -14367,7 +15035,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # file would answer a request for thirty fixes with zero, which is both
     # the least useful outcome and the hardest to act on. Refuse by name,
     # proceed with the rest, and let the operator see exactly which is which.
-    degraded = set(degrade_missing_remediations(findings, root))
+    degraded = set(degrade_missing_remediations(findings, root, noun))
     refused = [fid for fid in args.finding if fid in degraded]
     requested = [fid for fid in args.finding if fid not in degraded]
     for fid in refused:
@@ -14451,6 +15119,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         root=root,
         issue_number=issue_number,
         generated_at=now,
+        noun=noun,
     )
     print(
         json.dumps(
@@ -14637,7 +15306,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
     # measured against the search record.
-    shielded_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[1])
+    _moved_ids, shielded_list, shielded_namespaces = join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)
+    shielded_ids = set(shielded_list)
     withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(
@@ -14656,9 +15326,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         return
 
     repo = repo_hint
+    noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    ensure_labels(repo, audit_id)
+    ensure_labels(repo, audit_id, noun=noun)
 
     # A PodDisruptionBudget named at the workload's own declaration would be
     # written over the Deployment it protects; it goes back to `manual`, and
@@ -14674,7 +15345,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         for f in findings
         if (f.get("remediation") or {}).get("kind") == "manifest"
     }
-    degraded = degrade_missing_remediations(findings, root)
+    degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
@@ -14819,6 +15490,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # The body's headings name what it rendered; the stored document also names
     # what the body budget cut, which a resolved finding may be.
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
+    finding_places = report_finding_places(memory, data)
     # A block written under a different identity scheme cannot be joined
     # against this one: the same finding is spelled differently on the two
     # sides, so every id on the left looks fixed and every id on the right
@@ -15061,14 +15733,23 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
         prs_closed = (
             []
-            if gaps or unaccounted
+            if (gaps or unaccounted) and not shielded_namespaces
             else close_stale_remediation_prs(
                 # No finding is current, but one the collector still flags is
                 # not stale either: a pull request whose finding never reached
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
-                shielded_ids=shielded_ids,
+                # Over a gap or an unaccounted finding the close acts on the
+                # namespaces `start`'s file declares and on nothing the
+                # worker wrote; a complete run keeps the shield's ids too.
+                shielded_ids=set() if (gaps or unaccounted) else shielded_ids,
+                shielded_namespaces=shielded_namespaces,
+                finding_places=finding_places,
+                # Over a gap or an unaccounted finding only the shield's close
+                # is made; it rests on the declaration, not on this run's read.
+                shielded_only=bool(gaps or unaccounted),
+                noun=noun,
             )
         )
         conversation_unread = False
@@ -15126,9 +15807,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                                 "author": request.get("author", "someone"),
                                 "reasons": [deferral_reason(t) for t in held]
                                 + [
-                                    collector_hold_reason(t)
+                                    collector_hold_reason(t, noun)
                                     if t in held_ids
-                                    else collector_candidate_reason(t)
+                                    else collector_candidate_reason(t, noun)
                                     for t in flagged
                                 ],
                             }
@@ -15146,7 +15827,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                                 "comment_id": request.get("comment_id", ""),
                                 "author": request.get("author", "someone"),
                                 "reasons": [
-                                    declared_reason(t, covered_by_id[t]) for t in covered
+                                    declared_reason(t, covered_by_id[t], noun)
+                                    for t in covered
                                 ],
                             }
                         ],
@@ -15165,6 +15847,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                         held=bool(unaccounted) and not gaps,
                         lost_memory=bool(lost_gaps),
                         partial=len(gaps) > len(lost_gaps),
+                        noun=noun,
                     ),
                     what="/remediate answer on a clean run",
                 )
@@ -15200,6 +15883,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                         collector=held_collector_ids,
                         carried=held_carried_ids,
                         gaps=gaps,
+                        noun=noun,
+                        closed_prs=prs_closed,
                     ),
                     what="held-open comment over partial coverage",
                 )
@@ -15207,13 +15892,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 post_comment(
                     repo,
                     existing_issue,
-                    render_clean_comment(audit_id, data, now, gaps=gaps),
+                    render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun, closed_prs=prs_closed),
                     what="partial all-clear comment",
                 )
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot vouch for the ledger's state; issue #{existing_issue} stays "
-                "open and no remediation pull request was closed."
+                "open and no remediation pull request was closed"
+                + (f", except the compliance shield's ({len(prs_closed)})." if prs_closed else ".")
             )
         elif existing_issue and unaccounted:
             # Zero findings over complete coverage, and the previous body
@@ -15231,6 +15917,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                     now,
                     collector=held_collector_ids,
                     carried=held_carried_ids,
+                    noun=noun,
+                    closed_prs=prs_closed,
                 ),
                 what="held-open comment",
             )
@@ -15238,13 +15926,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"Audit {audit_id} found nothing, but {len(unaccounted)} previous "
                 "finding(s) under checks it says it ran are neither reported nor "
                 f"explained; issue #{existing_issue} stays open and no remediation "
-                "pull request was closed."
+                "pull request was closed"
+                + (f", except the compliance shield's ({len(prs_closed)})." if prs_closed else ".")
             )
         elif existing_issue:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now, gaps=gaps),
+                render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun),
                 what="all-clear comment",
             )
             # Completed, not "not planned": a closed ledger means the fleet is
@@ -15270,7 +15959,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # before. Open one: an audit that cannot speak for the fleet has
             # something to say, and it must land somewhere durable.
             rendered = render_issue_body(
-                data, generated_at=now, audit_id=audit_id, gaps=gaps
+                data, generated_at=now, audit_id=audit_id, gaps=gaps,
+                noun=noun,
             )
             invalidate_report_memory(audit_id, repo)
             opened = forge(
@@ -15454,6 +16144,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         declared=declared,
         collector_held=held_ids,
         collector_flagged=candidate_only,
+        noun=noun,
     )
     triage_reasons = triage_markers(findings, manifest)
     plan = promotion_candidates(
@@ -15514,6 +16205,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         data,
         generated_at=now,
         audit_id=audit_id,
+        noun=noun,
         gaps=gaps,
         states=states,
         pr_urls=pr_urls,
@@ -15599,18 +16291,26 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     # A merged fix whose finding still reproduces is said once, on the pull
     # request, and the pull request is never reopened.
-    comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now)
+    comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now, noun=noun)
 
     # Retiring a pull request means asserting its finding no longer reproduces.
     # Over incomplete coverage that assertion is unfounded, so nothing is
-    # closed and every open fix survives to the next complete run.
-    if gaps:
+    # closed and every open fix survives to the next complete run, except the
+    # shield's close, which rests on the declaration and not on this run's read.
+    if gaps and not shielded_namespaces:
         prs_closed = []
         log(
             "Coverage is partial, so no remediation pull request was closed as "
             "stale; a fix cannot be retired on evidence the audit never gathered."
         )
     else:
+        if gaps:
+            log(
+                "Coverage is partial, so only the shield's closes are made: a pull "
+                "request whose remaining findings share a namespace with a declared "
+                "workload is closed on the declaration, not on this run's reading; "
+                "every other open fix survives to the next complete run."
+            )
         prs_closed = close_stale_remediation_prs(
             repo,
             audit_id,
@@ -15624,12 +16324,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             previous_titles,
             {},
             now,
+            noun=noun,
             branch_by_finding={
                 str(finding.get("id", "")): group_branch_for(audit_id, group)
                 for group in remediation_groups(findings)
                 for finding in group
             },
-            shielded_ids=shielded_ids,
+            shielded_ids=set() if gaps else shielded_ids,
+            shielded_namespaces=shielded_namespaces,
+            finding_places=finding_places,
+            shielded_only=bool(gaps),
         )
 
     prs_opened = _open_promoted_prs(
@@ -15641,6 +16345,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         root=root,
         issue_number=number,
         generated_at=now,
+        noun=noun,
     )
 
     # What the live ledger renders once this branch is done, for the store.
@@ -15664,6 +16369,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 data,
                 generated_at=now,
                 audit_id=audit_id,
+                noun=noun,
                 gaps=gaps,
                 states=states,
                 pr_urls=pr_urls,
@@ -15688,9 +16394,17 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             repo,
             number,
             requests.accepted_by_comment,
-            _remediation_outcomes(requests, plan, pr_by_finding, prs_opened),
+            _remediation_outcomes(
+                requests,
+                plan,
+                pr_by_finding,
+                prs_opened,
+                noun,
+                remediation_refusal(repo),
+            ),
             ledger_comments,
             now,
+            noun,
         )
 
     if status == "UPDATED" and number is not None:
@@ -15713,6 +16427,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 now,
                 omitted=len(rendered.omitted),
                 gaps=collector_gaps,
+                noun=noun,
             )
             if comment:
                 post_comment(repo, number, comment, what="delta comment")

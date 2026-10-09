@@ -64,8 +64,10 @@ right now. There are four things it does not have. The bus needs all four:
 
 A2A has a named construct for each: durable status/artifact update events, the task state
 machine, typed Parts (text, data, file), and taskId/contextId. It also has `auth-required`
-as a first-class task state, which gives the parked authority work somewhere to land
-without a protocol rev.
+as a first-class task state, which gave the parked authority work somewhere to land
+without a protocol rev. It did not need it (9/9): the capability envelope refuses with a
+terminal `rejected` instead, because there is nothing the requester could supply to make
+the answer different - `auth-required` promises a retry that does not exist here.
 
 The honest counterargument: adoption surveys consistently show A2A being used at trust
 boundaries between organizations, while teams that own all their agents in one process use
@@ -204,6 +206,13 @@ The tier and the scope are **deliberately not on the wire**. Putting them there 
 a consumer authorize on content it did not verify, in the shape that looks most like
 working code - and that is the one thing 09 forbids.
 
+`authority.via` (added 10/5) is attribution of a third kind: `{"taskId": "...", "session":
+"..."}`. On a task the gateway minted on a session's request, it names the session turn that
+asked and that turn's session. On the wake-up turn after it, `taskId` is the minted task whose
+end woke the session (not the turn that asked), and `session` is still the session that asked.
+Like `requester` and `audience` it is populated by the gateway only and advisory; absent on a
+task a human turn started.
+
 **The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
 four of:
 
@@ -230,6 +239,18 @@ four of:
 refusal the gateway answers itself - carries null and always will. Null means "no
 capability accompanies this", which rule 2 turns into a refusal wherever a capability is
 required. It does not mean "unarmed".
+
+**Rule 2 is enforceable because submissions have one author.** The rule is only as good as
+the guarantee that a null-grants submission cannot come from somewhere the minting path
+does not cover, and that guarantee is not a convention: `a2a.tasks.*.*.in` publish is held
+by exactly one rendered identity, the a2a chat gateway (C20), and the gateway mints before
+it publishes. Every other principal on the bus - the bridge included - holds subscribe on
+that subject and not publish, so there is no second author to produce the shape rule 2
+refuses. Eval traffic is not an exception: it enters through the gateway's inject side door
+and takes the same mint path as a chat message, rather than publishing envelopes of its own.
+A consumer implementing rule 2 is therefore checking an invariant the server already holds,
+and an install that widens `.in` publish to a second identity has broken the rule's premise
+before any consumer sees it.
 
 **What this does not give a consumer.** It does not answer "who is the human". The chain
 terminates at a request id, not a person; `authority.requester` names a pseudonymized
@@ -268,13 +289,15 @@ starting it.
 
 ### Subjects
 
-| Subject                                     | Carries                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `a2a.tasks.{addressee}.{taskId}.in`         | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels).                                                                                                                                                   |
-| `a2a.tasks.{addressee}.{taskId}.events`     | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                      |
-| `a2a.tasks.{addressee}.{taskId}.supervisor` | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence. |
-| `a2a.agents.{profile}`                      | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                   |
-| `agents.hb.{agentType}.{owner}.{session}`   | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                |
+| Subject                                     | Carries                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `a2a.tasks.{addressee}.{taskId}.in`         | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels).                                                                                                                                                                                                             |
+| `a2a.tasks.{addressee}.{taskId}.events`     | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                                                                                |
+| `a2a.tasks.{addressee}.{taskId}.supervisor` | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence.                                                           |
+| `a2a.cap.verify.{caller}`                   | Added 9/9 with the capability envelope. An executor's request to resolve a capability reference, executor to the verifier. `{caller}` is the asking principal's name and the verifier reads its identity off that token rather than off the payload, which is sound only because each principal's grant is exactly one subject: a `a2a.cap.verify.*` grant would turn the identity check into a self-assertion. The `cap` KV bucket behind it is readable by the verifier alone. |
+| `a2a.cap.reply.{caller}.{inbox}`            | Added 9/9. The verifier's answer, verifier to the one executor that asked. Scoped under `{caller}` so a principal's reply grant cannot reach another's - a subscribe permission on a reply space is interception and not observation, because any subscriber may join a queue group on it.                                                                                                                                                                                       |
+| `a2a.agents.{profile}`                      | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                                                                             |
+| `agents.hb.{agentType}.{owner}.{session}`   | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                                                                          |
 
 **The addressee token (added in 0.4) is the authorization seam.** `{addressee}` is the
 executor's name - a profile, or a chat session. With it in the subject, connection-time
@@ -289,7 +312,9 @@ are NATS token separators, and a dotted value silently changes the subject's tok
 count out from under every wildcard filter. (Topic tokens already carry this rule; it
 is the same rule.) Session names (`<profile>-<animal>`) and sanitized profile names
 comply by construction; the library enforces it anyway. Per-task (rather than
-per-executor) scoping stays the parked tightening with the authority work.
+per-executor) scoping is still parked: the authority work landed the capability
+envelope above, which answers "may this task do this" per task without narrowing the
+subject grants, and narrowing them remains a separate tightening nobody has needed yet.
 
 (0.1's `.request` becomes `.in` because it now carries follow-up input and cancel, not just
 the one submission.)
@@ -326,11 +351,19 @@ calls and become properties of the stream:
 - Steering (added 8/24; refusal posture recorded 8/31): a follow-up `message` on `…in`
   while the task is `working` is legal. It is steering input - delivered to the
   executor, incorporated at its next turn boundary, no state transition implied. The
-  hard interrupt is `cancel`, not a steer. An executor that cannot absorb input
-  mid-turn (today's standing front door) refuses instead: a non-final `status-update`
-  carrying the task's CURRENT state, visible on the stream - never a silent drop, and
-  never a state change caused by the follow-up alone. Assertion 21's stdin delivery
-  applies to absorbing executors; a refusal satisfies its never-silently-dropped half.
+  hard interrupt is `cancel`, not a steer. An executor that cannot absorb input mid-turn
+  may queue it instead (the standing front door, 10/8): it answers each follow-up with a
+  non-final `status-update` carrying the task's CURRENT state and a `data` part
+  `{"steerNotice": {"steer": "queued"|"refused", "envelopeId", "reason"}}`, runs queued
+  follow-ups as further turns after the current one, publishes each earlier turn's
+  answer as a `turn` artifact and the last as the `result`. The executor bounds the
+  follow-ups it takes per task, counting those already run, not only those waiting. A
+  refusal (`queue-full` past that bound, `task-ending`, `task-ended`, `no-text`,
+  `capability`, `no-resume`) is that non-final `status-update` with
+  `"steer": "refused"`: never a silent drop, never a state change caused by the
+  follow-up alone.
+  Assertion 21's stdin delivery applies to absorbing executors; a refusal satisfies its
+  never-silently-dropped half.
 - Turn accounting is the steering contract (amended 8/31, from the worker adapter). A
   harness driven over stream-json emits one `result` per user turn, so once steers
   exist, "the harness produced a result" no longer means "the task is done." The
@@ -377,17 +410,19 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and four names are reserved so renderers and audit tooling can rely on them:
+artifact, and six names are reserved so renderers and audit tooling can rely on them:
 
-| Name       | Content                                                                                                                                                         |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                 |
-| `thinking` | Reasoning deltas. Debug views only                                                                                                                              |
-| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                           |
-| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation |
+| Name       | Content                                                                                                                                                                                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                        |
+| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                     |
+| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                  |
+| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation                                                                                        |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
+| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                           |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-four carry reserved semantics. An `activity` entry is one `data` part whose object carries
+six carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
@@ -670,9 +705,27 @@ Verified identity (added 9/9):
     an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
     belong in `tests/conformance/` rather than in the library suite. That is a placement
     rule and not a pointer to existing coverage: read `tests/conformance/` itself before
-    relying on any of them being asserted. One of the three cannot pass as stated in any
-    case - the static `worker` user holds publish on every addressee's `…events`, so
-    that writer set is not yet single-writer, and it closes when `worker` is retired.
+    relying on any of them being asserted. The `…events` caveat this item used to carry
+    is closed: retiring the static `worker` user took away the one publish grant that
+    wildcarded the addressee token, and the writer set is asserted empty by
+    `test_A3_the_events_subject_has_no_rendered_writer`. The static half went to
+    `bridge`, whose grant names its one addressee literally; the callout half went to
+    `agent`, which holds no task-plane publish at all.
+25. A submission whose `authority.grants` is null, names a key the gateway never wrote,
+    or names a capability whose `delegate` is a different principal is refused, and the
+    refusal is a `rejected` terminal on the task's event subject rather than a log line.
+    Assert all three separately: the null case is the one a relaxed configuration turns
+    off, and the forged-reference cases are the ones a suite built only from
+    well-formed capabilities never reaches.
+26. A capability narrowed at one hop cannot be widened at the next - by tier, by scope,
+    or by replacing the payload wholesale - demonstrated against a running verifier
+    rather than against the resolver in-process. Like 24 these are permissions
+    invariants as much as protocol ones: no principal but the gateway may write under
+    `$KV.cap.root.*`, and no principal but the verifier may read the store by any JetStream
+    path that returns a capability (`STREAM.CREATE` and `STREAM.INFO` on the bucket are the
+    carve-out, held by the `provision` principal the rendered Job authenticates as and by the
+    static `seed` identity beside it; neither verb returns an entry). Per `AGENTS.md` those
+    belong in `tests/conformance/`.
 
 ## Open Questions
 

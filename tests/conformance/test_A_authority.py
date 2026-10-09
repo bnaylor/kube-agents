@@ -427,6 +427,146 @@ class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+
+class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
+    """A3 on the A2A door's developer class: the one door path that asserts a
+    principal outside the eval namespace, so the one that has to show where
+    the principal came from.
+
+    A bearer that is not the door's static token is checked with Google as an
+    access token issued for the install's client; the verified email is the
+    principal, and only if it is on the door's own allowlist. Three things
+    make that hold: the token is bound to the install's client and to a
+    verified email; the gateway admits only an id carrying the class's prefix
+    and on the allowlist; and the prefix is one no eval caller can spell, so
+    the static token's holder, who names their caller freely, cannot reach a
+    developer's tasks or conversations. A fourth keeps the roster honest: the
+    class has no map, and the gateway's default map is the chat one.
+    """
+
+    def test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google"), "check")
+        self.assertRegex(
+            body,
+            r"string\(info\.Aud\) != v\.clientID && string\(info\.Azp\) != v\.clientID \{[^}]*return \"\"",
+            "a token issued for another OAuth client is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'string\(info\.EmailVerified\) != "true" \{[^}]*return ""',
+            "a token without a verified email is no longer refused",
+        )
+
+    def test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google"), "verify")
+        self.assertRegex(
+            body,
+            r"if !strings\.HasPrefix\(token, a2aGoogleAccessTokenPrefix\) \{\s*return \"\",",
+            "a bearer not shaped like a Google access token is no longer refused before it is sent to Google",
+        )
+        self.assertLess(
+            body.index("a2aGoogleAccessTokenPrefix"),
+            body.index("v.check("),
+            "the prefix check no longer runs before the tokeninfo call",
+        )
+
+    def test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google_identity"), "resolveA2AGooglePrincipal")
+        self.assertIn("strings.CutPrefix(authorID, a2aGoogleCallerPrefix)", body)
+        self.assertRegex(
+            body,
+            r'if !ok \|\| email == "" \{\s*return ""',
+            "an id without the class's prefix is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if !g\.a2aGoogleAllowed\[strings\.ToLower\(email\)\] \{\s*return ""',
+            "a verified email off the door's allowlist is no longer refused",
+        )
+
+    def test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google"), "identify")
+        self.assertRegex(
+            body,
+            r"if err == nil && !d\.googleAllowed\[strings\.ToLower\(email\)\] \{[^}]*return \"\", false",
+            "the door no longer refuses a verified account off its allowlist before it creates state for it",
+        )
+
+    def test_A3_no_eval_caller_can_spell_a_google_caller(self) -> None:
+        found = re.search(r'\ba2aGoogleCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_google"))
+        self.assertIsNotNone(found, "a2aGoogleCallerPrefix is no longer a string constant in a2adoor_google.go")
+        prefix = found.group(1)
+        self.assertTrue(
+            prefix.startswith(":"),
+            f"a2aGoogleCallerPrefix is {prefix!r}: without the leading colon an eval caller "
+            "naming a context that carries the email spells a Google caller's conversation key",
+        )
+        caller_of = h.go_function_body(h.text("a2a_door_callers"), "callerOf")
+        self.assertRegex(
+            caller_of,
+            r'if strings\.Contains\(caller, ":"\) \{\s*return "",',
+            "an eval caller may now contain a colon, so it can spell a Google caller",
+        )
+        self.assertRegex(
+            caller_of,
+            r'if caller == "" \{\s*return "",',
+            "an eval caller may now be empty, so its conversation key could start a2a:: as a Google caller's does",
+        )
+
+    def test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
+        self.assertRegex(
+            body,
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend \{\s*return func",
+            "the Google class's roster falls through to principalMapFor, whose default is the chat map",
+        )
+
+
+class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
+    """A3 on the gateway's Slack backend under `next`: the allowlist is the
+    admission gate, and the principal is either the IdP identity the admin's
+    map joins to the member id, or the member id Slack asserted, qualified
+    `slack:`.  The map is an override and not a gate, so three things carry
+    the invariant: a member of another workspace (a Slack Connect guest) is
+    not a turn at all, so admission never reaches past the install's own
+    workspace; an unlisted sender resolves to nothing whatever the map says;
+    and the map cannot assert the reserved prefix, so a principal that claims
+    to be a bare member id always is one.
+    """
+
+    def test_A3_an_unlisted_slack_sender_resolves_to_nothing(self) -> None:
+        body = h.go_function_body(h.text("a2a_slack_identity"), "slackPrincipal")
+        self.assertRegex(
+            body,
+            r'if authorID == "" \|\| \(!g\.slackAllowAll && !g\.slackAllowed\[authorID\]\) \{\s*return "", false',
+            "a Slack sender off the allowlist (or with no member id) is no longer refused",
+        )
+
+    def test_A3_another_workspaces_member_is_not_a_turn(self) -> None:
+        source = h.text("a2a_slack_ingress")
+        inbound = h.go_function_body(source, "inbound")
+        self.assertRegex(
+            inbound,
+            r"if s\.foreignSender\(m\) \{\s*return InboundMessage\{\}, false",
+            "the Slack ingress no longer refuses a member of another workspace before admission",
+        )
+        foreign = h.go_function_body(source, "foreignSender")
+        self.assertIn(
+            "if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {",
+            foreign,
+        )
+        other = h.go_function_body(source, "otherWorkspace")
+        self.assertIn('return team != "" && (s.teamID == "" || team != s.teamID)', other)
+
+    def test_A3_the_slack_map_cannot_assert_a_member_id_principal(self) -> None:
+        body = h.go_function_body(h.text("a2a_slack_identity"), "slackPrincipal")
+        self.assertRegex(
+            body,
+            r"if strings\.HasPrefix\(mapped, slackMemberPrincipalPrefix\) \{\s*return \"\", true",
+            "a map value carrying the reserved slack: prefix is no longer refused",
+        )
+
+
 RBAC_GROUP = "rbac.authorization.k8s.io"
 
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is
@@ -882,6 +1022,37 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             any(self._subject_matches(g, self.IN_PROBE) for g in gateway),
             "the requester can no longer write the in subject; the probe below is then vacuous",
         )
+
+    def test_A3_the_session_grants_no_publish_on_another_addressees_in_subject(self) -> None:
+        """Every `TaskInSubject` call in `sessionGrants` names this session's own pod.
+
+        `_session_publish_derivation` above reads only the function's initial
+        `Publish: []string{...}` literal, because that is where the per-task
+        wildcard mutation it exists to catch would land. It is blind to
+        anything appended to `g.Publish` afterward -- and the per-session
+        consumer API grants and the capability path (the verify subject and
+        its reply namespace) are built exactly that way. None of those is the
+        delegation primitive's: delegation adds no session grant. A line like
+        `g.Publish = append(g.Publish, lib.TaskInSubject("platform", "*"))`
+        would hand the session a requester's grant on another addressee's
+        task -- it could mint or steer that addressee's tasks as if from the
+        user -- and would not appear in that narrower reading at all.
+        Checked over the whole function body instead: every `TaskInSubject`
+        call in it, including the legitimate one (the per-session consumer's
+        read filter, built the same way as the publish grants around it),
+        must name `pod`, the session's own attested name, and nothing else.
+        """
+        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        calls = re.findall(r"TaskInSubject\(\s*([^,]+),", body)
+        self.assertTrue(calls, "sessionGrants calls TaskInSubject nowhere; the probe below is vacuous")
+        for arg in calls:
+            self.assertEqual(
+                "pod",
+                arg.strip(),
+                f"sessionGrants calls TaskInSubject({arg.strip()}, ...): a literal "
+                f"addressee here grants the session a publish on another "
+                f"addressee's in subject",
+            )
 
     def test_A3_the_events_subject_has_no_rendered_writer(self) -> None:
         """A chat session's `…events` has no writer in the rendered map at all.

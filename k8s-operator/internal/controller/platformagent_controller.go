@@ -256,6 +256,12 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	// conditionReasonInvalidCredentialProxyResources: the CR's
+	// spec.deployment.credentialProxy.resources fails
+	// ValidateCredentialProxyResources, so the override is ignored and the
+	// proxy Deployment is rendered at the operator's default resources.
+	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -306,6 +312,12 @@ type PlatformAgentReconciler struct {
 	// next event. Keyed by ObjectKey, value time.Time; cleared by any write
 	// whose echo carries the field, and when the CR is deleted.
 	prunedUsageStatus sync.Map
+
+	// credentialProxyWarningsLogged records, per CR, the spec generation whose
+	// credential-proxy resources warnings reconcileCredentialProxy last logged,
+	// so each generation logs them once. Keyed by ObjectKey, value int64;
+	// cleared when the CR is deleted.
+	credentialProxyWarningsLogged sync.Map
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -361,6 +373,14 @@ type PlatformAgentReconciler struct {
 	// MetadataDaemonIPOverride configures static override for the Workload Identity metadata daemon IP
 	// (e.g. from KUBERNETES_METADATA_DAEMON_IP or --kubernetes-metadata-daemon-ip).
 	MetadataDaemonIPOverride string
+
+	// OperatorNamespace is the namespace this operator's pods run in, from
+	// POD_NAMESPACE (OperatorNamespaceEnv), which both install paths set on
+	// the manager container from the Downward API. The gateway and broker
+	// NetworkPolicies admit the operator's pods in it on the metrics ports,
+	// for the usage counters poller (usage_counters_poller.go); empty, as
+	// under `make run` off the cluster, renders no such rule.
+	OperatorNamespace string
 
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
@@ -518,6 +538,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
 				"name", instance.Name, "namespace", instance.Namespace, "fields", gitProblemFields(&instance.Spec.Integration.IntegrationSpec))
 		}
+		r.recordIntegrationWarnings(instance)
 	}
 
 	// 1. Intercept Deletion
@@ -647,6 +668,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The gateway's annotation leaves out what only the broker reads, so a
+	// forge configuration change rolls the broker and not the gateway.
+	gatewayPolicyHash, err := getConfigMapHash(gatewayPolicyView(buildCredentialProxyPolicyConfigMap(instance)))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// 9b. Refuse a CR that mounts the broker's own volumes into the agent container.
 	//
@@ -770,7 +797,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -907,10 +934,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// predicate's false negatives, a terminated pod still counted and an
 	// informer copy older than the pass's own apply, clear on a Deployment
 	// event the requeue does not need to wait for.
-	// gatewayDark shares it too: the discord-bot Secret is not watched, so
-	// its creation is invisible without a requeue, and the pass that renders
-	// the gateway once it exists has to be a pass that happens.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark) {
+	// gatewayDark shares it too: a backend Secret is not watched, so its
+	// creation is invisible without a requeue, and the pass that renders the
+	// gateway (or scales a darkened one back to a replica) once it exists has
+	// to be a pass that happens. gatewayWaking rides the same term: the
+	// A2AGateway condition is kept until the scaled-up replica is ready, and
+	// the pass that clears it should not depend on the Deployment's status
+	// event alone.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark || a2aState.gatewayWaking) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -1061,6 +1092,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 
 		// Resource is deleted. Safe to remove finalizer and update.
 		r.forgetUsageStatus(agent)
+		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -2240,20 +2272,56 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	objs := []client.Object{buildCredentialProxyService(agent)}
+	// The resources override is checked here as well as at admission, because
+	// the chart installs with the webhook off. Rendered, an override under the
+	// floor runs the broker with its budget off, and a request above its limit
+	// is refused by the API server as Invalid, which
+	// applyCredentialProxyDeployment reads as an immutable-field change and
+	// answers by deleting the running proxy. Refused, the override is ignored
+	// rather than the Deployment withheld: the Deployment is rendered at the
+	// operator's default resources, so the image, the policy hash that rolls
+	// the pod for a pool-mapping change, the Secret env hash and the caller and
+	// egress env keep flowing, and updateStatusReady reports the refusal as
+	// Degraded.
+	refusal, warnings := credentialProxyResourcesRefusal(agent)
+	// The warnings are logged once per spec generation: every pass that follows
+	// reads the same spec and would repeat them indefinitely, with no way to
+	// acknowledge one, and the webhook, where it is on, has already said each
+	// once at apply. The gate is held in memory, keyed on the generation this
+	// step last logged, rather than on status.observedGeneration: the
+	// forbidden-mount, shell-sandbox and RuntimeClass refusals run before this
+	// step and record the generation as observed, so a generation that first
+	// went Degraded there would reach this step already observed and never log.
+	// The residue is that an operator restart logs each CR's warnings once more.
+	key := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.credentialProxyWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+		for _, warning := range warnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
+		r.credentialProxyWarningsLogged.Store(key, agent.Generation)
+	}
+	rendered := agent
+	if refusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the operator's default resources",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
+		rendered = agent.DeepCopy()
+		rendered.Spec.Deployment.CredentialProxy = nil
+	}
 	// This pod, not the gateway, is where the Slack and Teams tokens and the
 	// model-provider keys are read out of a Secret as environment, so it needs
 	// the same digest — see platformagent_secret_hash.go. Stamping only the
 	// gateway would have left the credentials most likely to be rotated
-	// reaching a container that never restarts.
-	proxy := buildCredentialProxyDeployment(agent, policyHash)
+	// reaching a container that never restarts. (On a Slack-armed next install
+	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
+	// stamps.)
+	proxy := buildCredentialProxyDeployment(rendered, policyHash)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
-	objs := []client.Object{
-		buildCredentialProxyService(agent),
-		proxy,
-		buildCredentialProxyNetworkPolicy(agent),
-	}
+	objs = append(objs, proxy)
+	objs = append(objs, credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -2465,7 +2533,7 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
-		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -3016,12 +3084,15 @@ type splitWorkloadStatus struct {
 // rather than reporting a readiness it could not check. NotFound is not an error here: it
 // is the ordinary state between applying the objects and the API server serving them back,
 // and it reads as not-ready, which is what it is.
-// The second result is non-empty when a next install's A2A gateway is
-// withheld for want of a chat backend (a2aGatewayBackend): the remedy text
-// the status writer publishes as the A2AGateway condition. A withheld gateway
-// is left out of the list rather than counted as not ready, because it is
-// absent on purpose and Ready would otherwise never be true on such an
-// install (#1660, option 1).
+// The second result is non-empty when a next install's A2A gateway runs
+// nothing for want of a chat backend (a2aGatewayBackend), withheld or scaled
+// to zero: the remedy text the status writer publishes as the A2AGateway
+// condition. Such a gateway is left out of the list rather than counted as
+// not ready, because it runs nothing on purpose and Ready would otherwise
+// never be true on such an install (#1660, option 1; #2481). It is also
+// non-empty while a darkened gateway is coming back (a2a.gatewayWaking) and
+// has no ready replica, carrying a2aGatewayWakingMessage; that gateway IS
+// counted, as the not-ready workload it is.
 func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) ([]splitWorkloadStatus, string, error) {
 	shell := &appsv1.StatefulSet{}
 	shellName := shellSandboxName(agent)
@@ -3134,7 +3205,18 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			} else {
 				workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
 			}
+		} else if a2a.gatewayDark {
+			// Present at zero replicas, scaled there for want of a backend:
+			// the same report as the absent case above, since what it runs
+			// is the same nothing.
+			gatewayDark = a2a.gatewayDarkReason
 		} else {
+			// Coming back from dark: the condition stays until a replica is
+			// ready, by this read rather than the render's, so a pod that
+			// turned ready since the render clears it on this pass.
+			if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
+				gatewayDark = a2aGatewayWakingMessage
+			}
 			workloads = append(workloads, splitWorkloadStatus{
 				name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
 			})
@@ -3157,21 +3239,41 @@ func busProvisioned(agent *agentv1alpha1.PlatformAgent) bool {
 // *Current answer so a quiet pass stays quiet (#1392).
 //
 // a2aGatewayConditionCurrent reports whether the CR's A2AGateway condition
-// already says dark, where "" means the condition is to be absent.
+// already says what this pass found, where "" means the condition is to be
+// absent. The reason follows the message (a2aGatewayConditionReason).
 func a2aGatewayConditionCurrent(agent *agentv1alpha1.PlatformAgent, dark string) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
 	if dark == "" {
 		return existing == nil
 	}
 	return existing != nil && existing.Status == metav1.ConditionFalse &&
-		existing.Reason == a2aGatewayDarkReason && existing.Message == dark
+		existing.Reason == a2aGatewayConditionReason(dark) && existing.Message == dark
 }
 
-// setA2AGatewayCondition writes the withheld-gateway condition on the
+// a2aGatewayConditionReason is the reason that goes with a condition
+// message: WaitingForReplica for the way back from dark, NoChatBackend for
+// every remedy a2aGatewayBackend writes.
+func a2aGatewayConditionReason(dark string) string {
+	if dark == a2aGatewayWakingMessage {
+		return a2aGatewayWakingReason
+	}
+	return a2aGatewayDarkReason
+}
+
+// a2aGatewayConditionStands reports whether the CR carries the A2AGateway
+// condition, dark or on its way back. The way back from dark reads it to
+// keep the condition until the scaled-up gateway is ready (gatewayWaking).
+func a2aGatewayConditionStands(agent *agentv1alpha1.PlatformAgent) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
+	return existing != nil && existing.Status == metav1.ConditionFalse &&
+		(existing.Reason == a2aGatewayDarkReason || existing.Reason == a2aGatewayWakingReason)
+}
+
+// setA2AGatewayCondition writes the dark-gateway condition on the
 // EventWatcher pattern: present while the state holds, removed the pass it
 // stops holding. Not Degraded: the install configured no chat backend and
-// the rest of the stack is up; the message says what would render the
-// gateway.
+// the rest of the stack is up; the message says what would run the gateway,
+// or, on the way back, that it is waiting for the replica.
 func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now metav1.Time) {
 	if dark == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aGatewayConditionType)
@@ -3180,7 +3282,7 @@ func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               a2aGatewayConditionType,
 		Status:             metav1.ConditionFalse,
-		Reason:             a2aGatewayDarkReason,
+		Reason:             a2aGatewayConditionReason(dark),
 		Message:            dark,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -3310,8 +3412,13 @@ func setBusProvisionedCondition(agent *agentv1alpha1.PlatformAgent, want bool, j
 // pass whose conditions already match writes nothing.
 func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) error {
 	dark := ""
-	if a2a.gatewayDark {
+	switch {
+	case a2a.gatewayDark:
 		dark = a2a.gatewayDarkReason
+	case a2a.gatewayWaking:
+		// The render's ready count, not a fresh read: this writer reads no
+		// workloads, and the requeue brings the pass that clears it.
+		dark = a2aGatewayWakingMessage
 	}
 	want := wantBusProvisioned(agent, a2a)
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
@@ -3319,11 +3426,37 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
 		return nil
 	}
+	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
+		wantLive := wantBusProvisioned(live, a2a)
+		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive)
+	}) {
+		return nil
+	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	return r.Status().Update(ctx, agent)
+}
+
+// liveAgentSatisfies checks whether the uncached live object already satisfies pred.
+// If it does, live status and ResourceVersion are adopted into agent (so subsequent
+// deferred writers operate on the fresh version), and returns true. If the live object
+// is from a different generation, adoption is refused.
+func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pred func(*agentv1alpha1.PlatformAgent) bool) bool {
+	if r.APIReader == nil {
+		return false
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		return false
+	}
+	if live.Generation == agent.Generation && pred(live) {
+		agent.Status = *live.Status.DeepCopy()
+		agent.ResourceVersion = live.ResourceVersion
+		return true
+	}
+	return false
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -3438,7 +3571,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
 			if a2aGatewayDark != "" {
 				condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout and bus provisioning are all ready; " +
-					"the A2A gateway is not rendered (no chat backend, see the A2AGateway condition)"
+					"the A2A gateway is not running (no chat backend, see the A2AGateway condition)"
 			}
 		}
 	case errWorkload == nil:
@@ -3485,6 +3618,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
+	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
+
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
 	// The Degraded message is the Ready one unless a branch says otherwise.
@@ -3529,6 +3664,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if proxyResourcesRefusal != "" {
+		// Same shape as the git refusal above: the spec is read here, on
+		// every pass, rather than carried from reconcileCredentialProxy, so
+		// the condition clears on the pass the override is corrected.
+		// Degraded only, as the held minter entry above: the proxy runs at
+		// the operator's defaults, so Ready and the phase keep what the
+		// workload says. Last, because the reasons above report lost
+		// function and must not be masked by it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidCredentialProxyResources
+		degradedMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg
@@ -3721,33 +3867,42 @@ func (r *PlatformAgentReconciler) usageStatusPruned(agent *agentv1alpha1.Platfor
 	return time.Since(recorded.(time.Time)) < usageStatusReprobeInterval
 }
 
-// noteUsageStatusEcho reads the server's copy of the status back after a
-// write. controller-runtime decodes the response into agent through a decoder
-// that zeroes the target first (apiutil's target-zeroing decoder), so a
-// status.usage the served CRD does not know comes back empty although a
-// non-empty list was just written — a merging decoder would leave the written
-// list in place and this check would never fire. That emptiness is the
-// pruning, recorded with the time so the gate skips the field until the next
-// probe, and logged once per record. An echo that carries the field clears the
-// record. A resolved list that is itself empty says nothing either way and is
-// left alone: nil and empty compare equal in the gate, so it cannot loop.
+// noteUsageStatusEcho reads the server's copy of the status back after the
+// Ready writer's write. controller-runtime decodes the response into agent
+// through a decoder that zeroes the target first (apiutil's target-zeroing
+// decoder), so a status.usage the served CRD does not know comes back empty
+// although a non-empty list was just written — a merging decoder would leave
+// the written list in place and this check would never fire. A resolved list
+// that is itself empty says nothing either way and is left alone: nil and
+// empty compare equal in the gate, so it cannot loop. noteUsageEcho records
+// what the echo said.
 func (r *PlatformAgentReconciler) noteUsageStatusEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, written []string) {
-	key := client.ObjectKeyFromObject(agent)
 	if len(written) == 0 {
 		return
 	}
-	if len(agent.Status.Usage.ActiveInterfaces) == 0 {
-		// Said once per record, not once per write: a status write for any
-		// other reason while the record is fresh re-records silently.
-		fresh := r.usageStatusPruned(agent)
-		r.prunedUsageStatus.Store(key, time.Now())
-		if !fresh {
-			logf.FromContext(ctx).Info("the served CRD has no status.usage; apply this release's CRD to get status.usage.activeInterfaces, which is probed again after the interval",
-				"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
-		}
+	r.noteUsageEcho(ctx, agent, len(agent.Status.Usage.ActiveInterfaces) != 0)
+}
+
+// noteUsageEcho is the one record both status.usage writers keep: echoed
+// false is a write whose status.usage fields came back absent, the pruning,
+// recorded with the time so that each writer skips the field until the next
+// probe and logged once per record; echoed true clears it. The Ready writer
+// calls it with whether activeInterfaces came back, the usage counters poller
+// with whether the counters did.
+func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, echoed bool) {
+	key := client.ObjectKeyFromObject(agent)
+	if echoed {
+		r.prunedUsageStatus.Delete(key)
 		return
 	}
-	r.prunedUsageStatus.Delete(key)
+	// Said once per record, not once per write: a status write for any
+	// other reason while the record is fresh re-records silently.
+	fresh := r.usageStatusPruned(agent)
+	r.prunedUsageStatus.Store(key, time.Now())
+	if !fresh {
+		logf.FromContext(ctx).Info("the served CRD has no status.usage; apply this release's CRD to get status.usage, which is probed again after the interval",
+			"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
+	}
 }
 
 // forgetUsageStatus drops the CR's pruning record when the CR goes away, so the
@@ -4275,6 +4430,26 @@ const (
 	workloadNotRendered workloadRenderState = false
 )
 
+// degradedStatusCurrent reports whether the given PlatformAgent's status matches
+// what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
+// condition's status, reason, message, and observedGeneration, plus the rendered-gated
+// VolumesDropped condition.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	if existing == nil ||
+		agent.Status.Phase != "Degraded" ||
+		existing.Status != metav1.ConditionFalse ||
+		existing.Reason != reason ||
+		existing.Message != message ||
+		existing.ObservedGeneration != agent.Generation {
+		return false
+	}
+	if !rendered {
+		return true
+	}
+	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+}
+
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
 // Ready=False condition carrying the reason and message. It writes only when
 // something it is about to write differs from what the status already holds.
@@ -4321,7 +4496,6 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// same reason: a term no write can satisfy would make every requeue tick a
 	// status write (#1392).
 	hostPathDroppedMsg := ""
-	hostPathDroppedUnchanged := true
 	if rendered {
 		// Qualified the same way updateStatusReady qualifies it. That function
 		// reads the roll off the gateway workload it fetches anyway; this one
@@ -4342,15 +4516,16 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 			oldPods = r.gatewayRollIncomplete(ctx, agent)
 		}
 		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
-		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 	}
-	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
-		agent.Status.Phase == "Degraded" &&
-		existing.Status == metav1.ConditionFalse &&
-		existing.Reason == reason &&
-		existing.Message == message &&
-		existing.ObservedGeneration == agent.Generation &&
-		hostPathDroppedUnchanged {
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg) {
+		return nil
+	}
+
+	// If the cached agent missed the status condition due to watch event lag,
+	// check the live object before attempting an Update that would conflict (409).
+	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg)
+	}) {
 		return nil
 	}
 
@@ -4372,6 +4547,31 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	}
 	return r.Status().Update(ctx, agent)
+}
+
+// conditionReasonIntegrationWarning is the Event reason for a declaration that
+// is valid but does nothing.
+const conditionReasonIntegrationWarning = "IntegrationWarning"
+
+// recordIntegrationWarnings writes each of the integration's Warnings() as a
+// Warning Event on the PlatformAgent. Admission returns the same warnings, but
+// the chart ships the webhook off, and on such an install a credentialed forge
+// the broker is not given would otherwise leave no trace: the status is Ready,
+// because nothing is invalid. Each warning names a field path and a provider,
+// never a repository value, so nothing a clone URL carries reaches an Event.
+// The API server aggregates a repeated Event, so writing it on every
+// reconcile raises its count rather than adding one per pass.
+func (r *PlatformAgentReconciler) recordIntegrationWarnings(agent *agentv1alpha1.PlatformAgent) {
+	if agent.Spec.Integration == nil {
+		return
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return
+	}
+	for _, warning := range resolved.Warnings() {
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonIntegrationWarning, warning)
+	}
 }
 
 // recordEvent writes an Event on obj through the manager's recorder, and

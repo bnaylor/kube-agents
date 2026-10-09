@@ -224,6 +224,11 @@ def is_token(token: str) -> bool:
 class StaticFileCredential:
     """A long-lived token an administrator put in a Secret, read from its file.
 
+    `stored_token` marks it for the content workspace: nothing ambient stands
+    behind a stored token, so a clone that holds one presents it on its own
+    push, and asks again before every presentation whether the repository
+    still earns it.
+
     Nothing to acquire and nothing to refresh, so `ensure` does nothing -- the
     strategy says the token does not need it rather than implementing a step
     that returns at once. The file is read on every call instead of once at
@@ -242,6 +247,8 @@ class StaticFileCredential:
     answers a private repository with 404 and reads like the repository is
     gone.
     """
+
+    stored_token = True
 
     def __init__(
         self,
@@ -274,6 +281,11 @@ class StaticFileCredential:
         try:
             with open(self._token_path, encoding="utf-8") as handle:
                 token = handle.read().strip()
+        except UnicodeDecodeError:
+            # Bytes that are not text at all -- a UTF-16 export from Windows
+            # tooling -- are no more a token than a second line is, and get
+            # the same refusal below rather than escaping as a bare 500.
+            token = ""
         except OSError as exc:
             raise WorkspaceError(
                 f"the forge credential for {self._host} could not be read: {type(exc).__name__}",

@@ -1,6 +1,6 @@
 ---
 name: fleet-audit
-description: Publish the findings of an autonomous fleet audit as one continuously-rewritten GitHub issue per audit stream, and propose fixes as narrow remediation pull requests.
+description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
 ---
 
 # fleet-audit — Audit Findings to a Ledger Issue
@@ -8,7 +8,7 @@ description: Publish the findings of an autonomous fleet audit as one continuous
 Every autonomous audit watchdog ends the same way: findings must reach a human somewhere durable,
 reviewable, and de-duplicated. This skill is that ending, in two tiers:
 
-- **Tier 1 — the ledger.** Each audit stream owns **exactly one open GitHub issue**, rewritten in
+- **Tier 1 — the ledger.** Each audit stream owns **exactly one open issue** on the forge, rewritten in
   full on every run and closed as completed when the fleet comes back clean. An operator watches one
   issue per stream instead of drowning in chat logs.
 - **Tier 2 — the fixes.** When a finding's remediation is a file in this repository, it travels
@@ -181,11 +181,18 @@ Before inspecting anything, claim the workspace:
 ```
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints
-a repo-scoped GitHub token, establishes a clean workspace, ensures the audit's labels exist, locates
+configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), makes
+the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
-administrator to add it to `$GITOPS_STATE_CONFIGMAP`. It creates **no branch** — there is no report
+administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
+gives it: `owner/name` on GitHub, `<host>/<path>` for a repository on another forge
+(`gitlab.com/acme/platform/infra`). In content mode the broker's file workspace clones a repository
+from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
+work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
+serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository
+elsewhere stop at the clone, with no ledger written. Run the audit in content mode for those. It
+creates **no branch** — there is no report
 branch. It prints exactly one JSON line:
 
 ```json
@@ -255,7 +262,7 @@ and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
-whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a) searches them before it
+whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a) searches them before it
 reports a posture as a finding. They are read and nothing else: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
@@ -276,9 +283,8 @@ to it.
 half of that step, already done by the time `start` prints. On a stream with a declared-intent step,
 `start` reads every repository in `declared_intent_repos` it can — each `context_repos` entry
 through `inspect_repository.py clone` at the entry's `ref` when it has one and at its own default
-branch otherwise (the copy runs without `GITOPS_BASE_BRANCH` and `CREDENTIAL_PROXY_BASE_BRANCH`,
-which name the GitOps repository's branch and which a directory-mode clone with no `--ref` would
-otherwise check out), the GitOps repository
+branch otherwise (a base branch the operator configures applies only to a gitops or managed
+repository, so a context repository is never read at it), the GitOps repository
 from the clone it just reset or through the same script in content mode — for `declares:`
 frontmatter in OKF notes, within the paths each repository's `.kube-agents/intent.yaml` names
 (`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
@@ -395,10 +401,11 @@ says how to read its manifest and what is still yours to write — the upgrade a
 stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
 streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
-§3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2) and the
-stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3).
-The compliance, stockout and cost collectors may also give a target `checks_unevaluated`,
-`{check, reason}` for a check whose own read failed: it did not run and is not inapplicable, so it
+§3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2), the
+stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3) and the GCE
+compute stream (`compute_fleet_audit.py`, `governance/gce_compute_fleet_sop.md` §2).
+The compliance, obtainability, stockout, cost and GCE compute collectors may also give a target `checks_unevaluated`,
+`{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.
@@ -485,7 +492,7 @@ A check the cluster's shape rules out is not a gap. Declaring it in that cluster
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
 that _can_ apply to it is a fully covered cluster. Without that, a fleet of Autopilot clusters is
 permanently partial: the ledger never closes, `resolved` is pinned at `0`, and no stale remediation
-pull request is ever cleaned up.
+pull request is ever cleaned up, the shield's close (SOP 2.7) aside.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
@@ -496,7 +503,7 @@ A gap changes what the run is _allowed to conclude_, because a finding's absence
 cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
-- closes **no** remediation pull request as stale, so a fix survives to the next complete run;
+- closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
@@ -615,7 +622,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
 real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-`obtainability-audit`, `compliance-audit` and `security-patch-orchestrator` have one today, because their SOPs have a step that writes the list. A
+`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator` and `fleet-wide-cost-analysis` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -636,7 +643,9 @@ field, and publishes nothing:
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
 
-  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran.
+  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran, or, on a
+  collector stream (above), every check it is answerable for is in its `checks_not_applicable` with a
+  reason and the manifest names it as collected (that one adds no gap).
   Enumerating a cluster and checking nothing on it is not a clean cluster — it is an audit that did
   not happen, and without this field the harness cannot tell the two apart. See
   [Scope, skipped, and limitations](#scope-skipped-and-limitations).
@@ -835,7 +844,7 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for obtainability, two for compliance and six for the patch stream, and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream and eight for the waste audit, and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing.
 
@@ -872,7 +881,7 @@ What `finish` does with it:
   faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
   object tells it apart; `declared[]` entries publish.
   `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
-  pull request is retired, and the withheld ids enter no delta block and no remediation pull
+  pull request is retired (except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading), and the withheld ids enter no delta block and no remediation pull
   request. The ledger names the withheld postures under _Declared intent not searched_ below the
   Scope table, the clean comment lists them, and the JSON line carries their ids as
   `postures_withheld`.
@@ -939,8 +948,10 @@ exist in the code — `resolved` and `resolved-merged` — but neither is ever r
 resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
 the finding's open pull request is closed as stale. The compliance stream has a third close: a pull
 request whose remaining findings are all shielded (SOP 2.7, a declared workload sharing the `default`
-ServiceAccount) is closed with that reason, and those findings stay on the ledger as `manual` rather
-than becoming promotable again. A resolution whose fix had already **merged** is
+ServiceAccount) is closed with that reason, on a partial run too when a note `start` filed covers the
+namespace, since the reason is the declaration and not this run's reading, and those findings stay
+on the ledger, not proposed again while
+the declaration stands, rather than becoming promotable. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
 Three of the five are easy to misread:
@@ -1179,7 +1190,7 @@ every binding, `debug-binding` included — and the document neither reports the
 carries a `resolved_because` entry for it, nor lists it under `declared`, the run either saw it gone
 or left it out, and from the document the two are the same absence. The ledger stays open and gets
 a comment naming each such finding and the check that ran (plus any `resolved_because` reasons and
-declared postures the document does carry), no remediation pull request is closed, and `finish` returns
+declared postures the document does carry), no remediation pull request is closed (except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading), and `finish` returns
 `status: "HELD"` with `resolved: 0`, `silent_ok: false` and the ids in `unaccounted`. Report it as
 you would a partial run — the ledger URL and the held ids — and on the next run either report the
 finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On a
@@ -1248,7 +1259,7 @@ after the close lands, so that a record older than the issue is never trusted; a
 after either delete leaves the run after it one of these. A held-open run only comments, so a failed
 store write there keeps the record, which still describes the body. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
-trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
+trusted record. A clean run never closes the ledger (the shield's close of a shared-account pull request aside): the ledger stays open with a coverage gap saying the store
 had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
 findings run rewrites the body or a human who has checked the findings closes the issue. Say so in
 your report: the gap names both ways out only when the collector flags nothing, and otherwise says

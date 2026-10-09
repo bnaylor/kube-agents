@@ -144,6 +144,10 @@ func verifiedByFor(backend string) string {
 	case consoleBackend:
 		return consoleVerifiedBy
 	case slackBackend:
+		// The map-joined case. A Slack requester's mechanism depends on its
+		// principal, so the authority path asks verifiedByOf, which sends
+		// Slack to slackVerifiedByFor; this arm is what a caller with no
+		// principal in hand gets.
 		return slackVerifiedBy
 	case injectBackend:
 		// Its own value, not "principal-map" and deliberately nothing a real
@@ -159,18 +163,28 @@ func verifiedByFor(backend string) string {
 		// distinguishable downstream even though both resolve through a
 		// door-scoped map into the eval namespace.
 		return a2aVerifiedBy
+	case a2aGoogleBackend:
+		// What checked the caller is Google, through the door's tokeninfo
+		// call: neither the door's static token nor a map.
+		return a2aGoogleVerifiedBy
 	}
 	return "principal-map"
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the door's own map on inject, nothing at all on the
-// console, the mapping table everywhere else (Discord's ConfigMap, Slack's
-// a2a-slack-principal-map Secret).
+// allowlist on gchat and on Slack (where the principal map is an override,
+// not a gate, except that a reserved-prefix entry refuses), the door's own
+// map on inject, nothing at all on the console, the mapping table
+// everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return "the allowed users list"
+	case slackBackend:
+		// The list is the gate; the map is named too for the one refusal it
+		// still makes, a listed member whose entry carries the reserved
+		// slack: prefix (resolveSlackPrincipal).
+		return "the allowed users list (or correct their principal map entry)"
 	case consoleBackend:
 		// Cannot happen from a real console frame; a spoofed author id can.
 		return "nothing - only the console credential's own frames are accepted here"
@@ -178,6 +192,8 @@ func unverifiedRemedyFor(backend string) string {
 		return "the inject door's principal map"
 	case a2aBackend:
 		return "the A2A door's principal map"
+	case a2aGoogleBackend:
+		return "the A2A door's allowed users list"
 	}
 	return "the principal map"
 }
@@ -323,6 +339,17 @@ type GoogleChatAdapter struct {
 	// only by Run's goroutine.
 	countInterval time.Duration
 	subscription  string
+
+	// metrics counts each pull by outcome beside the summary line's counts
+	// (SetMetrics; nil counts nothing).
+	metrics *Metrics
+}
+
+// SetMetrics gives the adapter the gateway's counters, so each pull is
+// counted by outcome where the summary line counts it. Called once, before
+// Run.
+func (a *GoogleChatAdapter) SetMetrics(m *Metrics) {
+	a.metrics = m
 }
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
@@ -598,6 +625,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				return ctx.Err()
 			}
 			failedPulls++
+			a.metrics.gchatPull(gchatPullFailed)
 			a.log.Warn("gchat event pull failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -608,6 +636,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 		}
 		if env == nil {
 			emptyPulls++
+			a.metrics.gchatPull(gchatPullEmpty)
 			// Usually the server-side long poll has already paced this;
 			// the delay only bites on an early-empty synchronous pull.
 			select {
@@ -618,6 +647,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			continue
 		}
 		received++
+		a.metrics.gchatPull(gchatPullEvents)
 		ev, decodeErr := decodeGchatEvent(env.Data)
 		// Acked before the handler runs, which makes ingress at-most-once —
 		// a deliberate, recorded decision, not an oversight. Acking after a
@@ -959,19 +989,26 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // resolvePrincipal establishes the requester's principal from the backend's
 // identity mechanism. On gchat the Google-asserted email IS the principal,
 // gated by the allowlist (the mapping table other backends need is exactly
-// what that backend exists to not have). On the console the NATS grant is
+// what that backend exists to not have). On Slack the same kind of allowlist
+// is the gate, and the principal map, when it names the sender, overrides
+// the member-id principal (resolveSlackPrincipal).
+// On the console the NATS grant is
 // the mechanism: only the console credential can publish on the console
 // subject, so the author is the console principal - but only on a console
 // conversation, so the string "console" arriving on any other backend is
 // just an unmapped id. The inject door has a map, but its own and prefixed
-// (resolveInjectPrincipal), never this one. Everything else goes through the
-// principal map. Empty means drop.
+// (resolveInjectPrincipal), never this one; the A2A door has its own too
+// (resolveA2APrincipal), and its Google-verified callers resolve as Chat's do,
+// the email gated by the door's own allowlist (resolveA2AGooglePrincipal).
+// Everything else goes through the principal map. Empty means drop.
 func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 	switch backend {
 	case injectBackend:
 		return g.resolveInjectPrincipal(authorID)
 	case a2aBackend:
 		return g.resolveA2APrincipal(authorID)
+	case a2aGoogleBackend:
+		return g.resolveA2AGooglePrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -987,8 +1024,66 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 			return authorID
 		}
 		return ""
+	case slackBackend:
+		return g.resolveSlackPrincipal(authorID)
 	}
 	return g.pm.Resolve(authorID)
+}
+
+// resolveSlackPrincipal is Chat's allowlist rule carried to Slack
+// (spec.integration.slack.allowedUsers), which is the only admission gate,
+// as on the legacy path. A listed sender (or any sender under allow-all) is
+// then attributed by the principal map when it names them - the IdP
+// identity an admin joined to the member id - and otherwise by the member id
+// itself, qualified slackMemberPrincipalPrefix, as Chat attributes by the
+// email Google asserts. The map is an optional override, not a second gate.
+// Exact match, no case fold: a Slack member id is an opaque token, not an
+// address. A map value carrying the reserved prefix is refused, which makes
+// a mistaken entry a lockout rather than a principal that misstates how it
+// was established. Empty means drop.
+func (g *Gateway) resolveSlackPrincipal(authorID string) string {
+	principal, reserved := g.slackPrincipal(authorID)
+	if reserved {
+		g.log.Error("the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it",
+			"member", authorID, "prefix", slackMemberPrincipalPrefix)
+	}
+	return principal
+}
+
+// slackRosterPrincipal is the same rule for a roster member, silently: the
+// roster resolves every channel member twice on every turn, and a refusal
+// there is not an admission decision (the member is recorded by raw id), so
+// logging it would repeat one mistaken map entry on every turn in every
+// channel the member is in. The requester path logs it once per message.
+func (g *Gateway) slackRosterPrincipal(authorID string) string {
+	principal, _ := g.slackPrincipal(authorID)
+	return principal
+}
+
+// slackPrincipal is the Slack rule both paths share: empty for an unlisted
+// member or a refused map entry, and reserved reports the second.
+func (g *Gateway) slackPrincipal(authorID string) (principal string, reserved bool) {
+	if authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {
+		return "", false
+	}
+	if mapped := g.pm.Resolve(authorID); mapped != "" {
+		if strings.HasPrefix(mapped, slackMemberPrincipalPrefix) {
+			return "", true
+		}
+		return mapped, false
+	}
+	return slackMemberPrincipalPrefix + authorID, false
+}
+
+// slackVerifiedByFor names the mechanism behind one Slack principal: the
+// map's join when the map named the sender, the member id alone when it did
+// not. The prefix decides, and it can only come from resolveSlackPrincipal,
+// which refuses a map value that carries it.
+func slackVerifiedByFor(principal string) string {
+	if strings.HasPrefix(principal, slackMemberPrincipalPrefix) {
+		return slackMemberVerifiedBy
+	}
+	return slackVerifiedBy
 }
 
 // resolveInjectPrincipal resolves an author the side door delivered, and it
@@ -1047,6 +1142,25 @@ func (g *Gateway) resolveA2APrincipal(authorID string) string {
 		return ""
 	}
 	return principal
+}
+
+// resolveA2AGooglePrincipal resolves a caller the A2A door verified with
+// Google. The door has already checked the token; what is left is the
+// gateway's own gate, the same one Chat applies to a Google-asserted email:
+// the email is the principal, admitted only if it is on the door's
+// allowlist. The author must carry the class's prefix, so an id that did
+// not come through the door's Google check resolves to nothing even on this
+// arm. The email is returned as Google sent it, case-preserved, for the
+// reason the gchat arm keeps the case: the audit join hashes that string.
+func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
+	email, ok := strings.CutPrefix(authorID, a2aGoogleCallerPrefix)
+	if !ok || email == "" {
+		return ""
+	}
+	if !g.a2aGoogleAllowed[strings.ToLower(email)] {
+		return ""
+	}
+	return email
 }
 
 // gchatConversationID mints the session key for one inbound message. space is

@@ -105,11 +105,12 @@ import urllib.parse
 import yaml
 
 try:
-    from . import classify, nightly, post_health, tiers, trend
+    from . import classify, forge_lane, nightly, post_health, tiers, trend
     from .health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
+    import forge_lane
     import nightly
     import post_health
     import tiers
@@ -431,9 +432,12 @@ def tier_pass_rates(data: dict, tier: str, days: int) -> dict[str, tuple[int, in
     inside the last `days` before the reference time, run-level events
     excluded and infra reps uncounted. A data.json with no time anchor
     counts every run of the tier; a run without a start time is skipped
-    when there is one."""
+    when there is one. A nightly run is judged a run-level event with the
+    rest of its night, so a split night's small writers part is not
+    (nightly.joined_night_runs)."""
     anchor = reference_ms(data)
     runs = gate_runs(data) if tier == tiers.TIER_PRESUBMIT else nightly_runs(data)
+    nights = nightly.joined_night_runs(runs) if tier == tiers.TIER_NIGHTLY else {}
     tally: dict[str, list[int]] = {}
     for run in runs:
         started = iso_ms(run.get("started"))
@@ -441,7 +445,7 @@ def tier_pass_rates(data: dict, tier: str, days: int) -> dict[str, tuple[int, in
             started is None or started <= anchor - days * DAY_MS or started > anchor
         ):
             continue
-        if is_run_event(run):
+        if is_run_event(nights.get(id(run), run)):
             continue
         for task in run_tasks(run):
             p, f, _ = rep_counts(task_reps(task))
@@ -900,12 +904,14 @@ def case_strip(appearances: list[tuple[dict, dict]]) -> list[dict]:
     ]
 
 
-def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[dict, dict]], classified: dict[str, dict]) -> dict | None:
+def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[dict, dict]], classified: dict[str, dict], nights: dict[int, dict] | None = None) -> dict | None:
     """The case's newest non-pass appearance: the presubmit's first, the
     nightly's only when the presubmit has none on record. Carries the
     grader's reason and excerpt (classify.py's readers) and, for a run the
     Brief classified, that run's tag for the case (``cls``,
-    ``also_failing_prs``) so the page can say whose failure it was."""
+    ``also_failing_prs``) so the page can say whose failure it was.
+    ``nights`` is ``nightly.joined_night_runs`` of the nightly runs, so a
+    nightly failure's ``event`` is judged with the rest of its night."""
     for tier, rows in ((tiers.TIER_PRESUBMIT, gate), (tiers.TIER_NIGHTLY, nightly)):
         for run, task in reversed(rows):
             state = cell_state(task)
@@ -925,7 +931,7 @@ def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[d
                 "excerpt": classify.excerpt_of(task),
                 "cls": tagged.get("cls"),
                 "also_failing_prs": tagged.get("also_failing_prs", 0),
-                "event": is_run_event(run),
+                "event": is_run_event((nights or {}).get(id(run), run)),
             }
     return None
 
@@ -942,10 +948,11 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
     Grid need beyond the runs -- roster status, domain, notes, the per-tier
     7- and 30-day rates, the strip and the last failure."""
     gate = appearances_by_case(gate_runs(data))
-    nightly = appearances_by_case(nightly_runs(data))
+    nights = nightly.joined_night_runs(nightly_runs(data))
+    nightly_rows = appearances_by_case(nightly_runs(data))
     rates = {
         (tier, days): tier_pass_rates(data, tier, days)
-        for tier in tiers.TIERS
+        for tier in tiers.CASE_TIERS
         for days in TIER_RATE_WINDOWS_DAYS
     }
     cases = {}
@@ -966,10 +973,10 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
             "issues": list(note.get("issues") or []),
             "rates": {
                 tier: [rate_pair(rates[(tier, days)].get(name)) for days in TIER_RATE_WINDOWS_DAYS]
-                for tier in tiers.TIERS
+                for tier in tiers.CASE_TIERS
             },
             "strip": case_strip(gate.get(name, [])),
-            "last_failure": last_failure(name, gate.get(name, []), nightly.get(name, []), classified),
+            "last_failure": last_failure(name, gate.get(name, []), nightly_rows.get(name, []), classified, nights),
         }
     return cases
 
@@ -1111,6 +1118,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         "pending": pending_builds(data),
         "releases": [compact_release(r) for r in sorted_releases(data)],
         "nightly": nightly.nightly_document(data),
+        "gitlab": forge_lane.gitlab_document(data, now),
         "trend": trend.trend_document(store, data),
     }
 

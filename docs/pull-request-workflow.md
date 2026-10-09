@@ -228,7 +228,8 @@ code-scanning tab on the merged head is still the final check.
 `make terraform-test`. It runs the `terraform test` suite of each directory under
 `terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
 needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
-plugin cache); it needs Terraform 1.7 or newer for `mock_provider`, above the 1.5 floor the modules
+plugin cache); it needs Terraform 1.11 or newer — `mock_provider` from 1.7 and `override_during`
+from 1.11 — above the 1.5 floor the modules
 and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
 below includes it.
 
@@ -456,14 +457,24 @@ The two labels are the two people:
   change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
   on the `lgtm` (#1075).
 
-Everyone `.github/auto_request_review.yml` can assign is an `OWNERS` approver for what it assigns
-them: its `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt` entries send a
-change there to its own `eval-crew` group, so the reviewer the bot's green check summons can clear
-both labels in one action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
-paths still waits on a root approver's `/approve` after that review. The bot never requests the
-author, so a member's own case or roster change goes to the rest of the group, with the author's
-`approved` already on it (#1075). That is a property of two lists agreeing today — the alias in
-`OWNERS_ALIASES` and the group in the bot's config — not a guarantee either file makes.
+Who to ask about a particular area, as opposed to who may approve, is
+[`docs/ownership.md`](ownership.md).
+Whoever `.github/auto_request_review.yml` assigns can give the pull request the label it was drawn
+for. Its pool for an ordinary change is the `repository-owners` group, root approvers, plus
+`repository-reviewers`, people `OWNERS` lists under `reviewers` alone, and the script decides
+between them by what the author's own approval already covers (#1075): an approver's own change opens with `approved` on it and needs
+only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
+approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
+same test decides what counts as already reviewed — an approval from a `reviewers`-only account
+settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt` and
+`hack/eval/blocking-roster.txt` entries send a change there to its own `eval-crew` group, so the
+reviewer the bot's green check summons can clear both labels in one action. Not every `eval-crew`
+member is a root approver, so a change that also touches root-owned paths still waits on a root
+approver's `/approve` after that review. The bot never requests the author, so a member's own case
+or roster change goes to the rest of the group, with the author's `approved` already on it. That
+is a property of the lists agreeing today — the alias in `OWNERS_ALIASES`, the `reviewers` list in
+`OWNERS` and the groups in the bot's config — which `scripts/test_request_reviewers.py` pins; none
+of the files guarantees it.
 
 Before any of that, a pull request from an author Prow does not already trust is labelled
 `needs-ok-to-test`, and its Prow presubmits hold until a member comments `/ok-to-test`. It gates
@@ -483,11 +494,16 @@ A person who applies the same label by hand keeps it: the workflow removes only 
 a repository admin can use, forces a check that cannot pass on its own, required or not. The forced status
 embeds the base SHA at override time, so by itself it would expire on the next merge to `main` and
 Tide would re-run the job — which is how an override came to need repeating whenever `main` moved
-before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green, so
-an override usually holds for the head it was given until a push — subject to the same race with
-Tide's sync, and a lost race costs more here, because the retest is of a check that cannot pass: it
-comes back red and the override has to be given again. Prow's `/override-sticky` would do this
-without the race, with the `[prow:skip-retest]` sentinel Tide accepts regardless of base — but it is
+before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green,
+and when the re-pin loses its race with Tide's sync, the retest's step 0 reads the override off the
+head and reuses it the way it reuses a green. So an override holds for the head it was given until a
+push. This Prow build has no `/override-cancel` (step 0 would honour one). A retest that cannot
+reuse it — a status read refused on its first page or stopped (by a failed later page, or by step
+0's page cap) before it reached the override's event, a run with nowhere to record the reuse, or the
+operator's `EVAL_SKIP_REVALIDATION=1` lever below — runs the matrix instead, and its red does not
+withdraw the override. The next retest reads it off the head again when the cause was transient; an
+override that has fallen behind the page cap stays out of reach until a new `/override` or a push. Prow's `/override-sticky` would hold it without the race, with the `[prow:skip-retest]`
+sentinel Tide accepts regardless of base — but it is
 not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
 `/override`, and the command is silently ignored.
@@ -550,9 +566,10 @@ saying so, and Tide reads the result as current. It is a race against Tide's rou
 sync, and the sweep sometimes loses it; when it does, Tide starts the retest as before (a
 batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
 it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
-makes cheap: before the job leases an evaluation project it looks for a green build of this job at
-the pull request's head, attested by the Prow-posted success status on that head, and reuses its
-verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
+makes cheap: before the job leases an evaluation project it looks for a green build of this job — at
+the pull request's head, or at an earlier head from which every change since is inert — attested by
+the Prow-posted success status, or failing both an admin `/override` of this job at the pull
+request's current head, and reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
 costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
 still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
 everything since, on the pull request's side and on `main`'s, is inert.
@@ -564,7 +581,14 @@ can ask for — a non-inert push is, and `EVAL_SKIP_REVALIDATION=1` in the job's
 green at the head, so a newer red at the same head is overridden on the next trigger, and the
 script's header says why to read such a red as flake or as a real break, not as noise. An admin
 `/override` is carried by the re-pin the same way as a green, because crier stamps the same
-`BaseSHA:` suffix on it, but not by step 0, which reuses only a build that passed. What this trades
+`BaseSHA:` suffix on it, and by step 0 as the third kind of verdict: the success status the Prow bot
+posts at the head for an admin's `/override`, pointing at that comment on this pull request, counts
+(a later `/override-cancel` would withdraw it, where a Prow build has that command), so a retest or a batch
+after an override reuses it in seconds, and so does the retest Tide starts on a pull request it has
+just merged by override. The reused run reports as an ordinary `Job succeeded.`, so from then on the
+check and the re-pin read like a green; the `/override` comment, the build log's `REVALIDATED` line
+and a key the run leaves in its `finished.json` metadata are the record that it was one, and step 0
+reads the key so that such a run is never itself taken for a green. What this trades
 away, on every retest and not only when the sweep wins: the combination of a head with the `main`
 it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
@@ -650,16 +674,21 @@ Four states that look like somebody else's problem and are not:
 `skip_reason()` and `already_reviewed_reason()` in
 [`scripts/request_reviewers.py`](../scripts/request_reviewers.py) are the same rule in code for the
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
-carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
-the changed files has submitted `APPROVED`, and when a human other than the author has submitted
-`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+carrying an ignored keyword, when someone is already requested, when no `OWNERS` approver covers
+the change and the author's own approval does not either (a pull request with no changed files),
+when an `OWNERS` approver for one of the changed files has submitted `APPROVED` (or, on a pull
+request the author's own approval already covers, anyone `OWNERS` lists under `reviewers` for
+them), and when a human other than the author has submitted `CHANGES_REQUESTED` — each person's
+latest verdict, as GitHub counts them. An account
 `.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
 robot that reviews under a user account re-reviews every push and files its follow-ups as
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
 request and the check-run path would never request a human, and a review request outstanding to it
-is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
-`approvers` is not a hand-off: it cannot produce the `approved` label, so the auto-request counts it
-no more than a comment and still asks someone who can `/approve`. Of these reasons, `/request-review`
+is answered by the robot and cleared, so it counts as nobody asked. An approval from an account in
+neither `OWNERS` list is never a hand-off, and one from `reviewers` alone is a hand-off only when
+the author's own approval already covers the change: on any other pull request it cannot produce
+the `approved` label, so the auto-request counts it no more than a comment and still asks someone
+who can `/approve`. Of these reasons, `/request-review`
 skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
