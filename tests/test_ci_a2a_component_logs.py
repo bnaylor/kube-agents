@@ -138,6 +138,7 @@ class A2AComponentLogsTest(unittest.TestCase):
             self.assertIn(f"-n {_NS}", read)
             self.assertIn("--all-containers", read)
             self.assertIn("--ignore-errors", read)
+            self.assertIn("--prefix", read)
             self.assertIn("--tail=", read)
         self.assertEqual(sum("--previous" in r for r in reads), 1, reads)
 

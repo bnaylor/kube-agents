@@ -118,20 +118,22 @@ readonly AGENT_DIAG_POD_STATUS_JSONPATH='{range .items[*]}{.metadata.name}{"\tph
 # Operator-rendered pods carry this label, its value the component.
 readonly A2A_DIAG_COMPONENT_LABEL="kubeagents.x-k8s.io/a2a-component"
 # Session pods are the gateway's, not the operator's, so they carry the
-# standard component key instead (a2aSessionComponent in
-# k8s-operator/internal/controller/platformagent_a2a_manifests.go). They run
-# the a2a-worker image, and their files are named for that.
+# standard component key instead (sessionRole in a2a/gateway/spawn.go, which
+# stamps them). They run the a2a-worker image, and their files are named for
+# that.
 readonly A2A_DIAG_SESSION_SELECTOR="app.kubernetes.io/component=a2a-session"
 readonly A2A_DIAG_SESSION_COMPONENT="worker"
 # One line per pod: name, component label (empty for a session pod), and the
 # restart count of each container. The label key's dots are escaped for
 # kubectl's JSONPath.
 readonly A2A_DIAG_PODS_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.kubeagents\.x-k8s\.io/a2a-component}{"\t"}{.status.containerStatuses[*].restartCount}{"\n"}{end}'
-# Smaller than the agent's tails: these logs are quiet (a component logs its
-# start, its bus connection and its failures), and there are up to
-# A2A_DIAG_MAX_PODS of them, two files each.
-readonly A2A_DIAG_LOG_TAIL_LINES=5000
-readonly A2A_DIAG_LOG_MAX_BYTES=$((2 * 1024 * 1024))
+# The agent's line tail, half its byte cap: there are up to A2A_DIAG_MAX_PODS
+# of these, two files each. Most are quiet (a start, a bus connection, the
+# failure), and a crash's previous log is a few lines. The A2A gateway is not:
+# it logs every task's ingress, spawn and end, so on a long nightly its file
+# keeps the most recent stretch, cut by the byte cap.
+readonly A2A_DIAG_LOG_TAIL_LINES=20000
+readonly A2A_DIAG_LOG_MAX_BYTES=$((4 * 1024 * 1024))
 # A bound on the pods read, so a session leak cannot turn one run's artifacts
 # into hundreds of files. The operator renders under a dozen pods and the
 # gateway caps sessions at A2A_MAX_SESSIONS, so a healthy install is well under.
