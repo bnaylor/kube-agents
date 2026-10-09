@@ -1,6 +1,9 @@
 // worker-adapter is the session-pod entry point: the thin shim between the
 // bus and the harness (spec-subagent-profiles.md, "The adapter"). One task
-// per process; the terminal state is the exit code.
+// per process, and its terminal state is the exit code, unless the spawner
+// sets A2A_SESSION_REUSE=true: then the process serves every turn of its
+// session's conversation until SIGTERM, and the exit code is the last task's
+// (0 when the SIGTERM found it idle).
 //
 // Env contract, matching what the gateway's spawner sets: TASK_ID, PROFILE,
 // NATS_URL are the spec trio; A2A_SESSION carries the session addressee for
@@ -250,6 +253,14 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		TaskDeadline:       envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
 		KillGrace:          envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
 		Logger:             log,
+
+		// The same argv with the delegate tool off, for a task that runs
+		// without it whatever the pod was started with (a wake in a reused
+		// pod; workeradapter's delegateOffForTask).
+		HarnessCommandNoDelegate: harnessCommandWithoutDelegate(),
+		// Literal "true" only, like EnvClusterView; a profile pod never
+		// serves a second task, and validate refuses the pair.
+		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
 	}, true
 }
 
@@ -356,7 +367,22 @@ func harnessCommand() []string {
 // else, so A2A_DELEGATE_TOOL=off is one decision rather than three that could
 // drift apart.
 func delegateToolEnabled() bool {
-	return os.Getenv(lib.EnvDelegateTool) != "off"
+	return os.Getenv(lib.EnvDelegateTool) != "off" && !delegateToolSuppressed
+}
+
+// delegateToolSuppressed is set only while harnessCommandWithoutDelegate
+// builds its argv, so harnessCommand stays the one place the harness flags are
+// assembled. configFromEnv runs once, before anything else is started, so
+// nothing reads it concurrently.
+var delegateToolSuppressed bool
+
+// harnessCommandWithoutDelegate is harnessCommand as it would be under
+// A2A_DELEGATE_TOOL=off: no delegate tool on the allowlist, no MCP config, no
+// delegate prompt.
+func harnessCommandWithoutDelegate() []string {
+	delegateToolSuppressed = true
+	defer func() { delegateToolSuppressed = false }()
+	return harnessCommand()
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare

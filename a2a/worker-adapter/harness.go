@@ -3,7 +3,9 @@
 // subject, publishes the lifecycle events, drives the harness over the
 // headless stream-json contract, forwards steering and follow-ups onto the
 // harness stdin, and exits with a code matching the terminal state. One task
-// per process; the pod exists because the message is already durable.
+// per process, unless the pod is a reused session pod (Config.SessionReuse),
+// which runs each turn of its conversation in turn; either way the pod exists
+// because the message is already durable.
 package workeradapter
 
 import (
@@ -28,6 +30,11 @@ import (
 const DefaultHarnessPath = "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
 
 const (
+	// harnessResumeFlag continues an earlier harness session by id. The
+	// pinned binary takes it with --print (`claude -p --resume <id>`), and
+	// the agent SDK passes it alongside --input-format stream-json, the
+	// shape harnessCommand builds.
+	harnessResumeFlag = "--resume"
 	// stderrTailBytes is how much of the harness's stderr is kept for a
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
@@ -476,4 +483,16 @@ func truncate(s string, n int) string {
 		cut = i
 	}
 	return s[:cut] + "…"
+}
+
+// withResume is argv continuing harness session id, or argv unchanged when
+// there is none. It copies rather than appending in place: argv is the pod's
+// shared Config value, and every task builds its own from it.
+func withResume(argv []string, id string) []string {
+	if id == "" {
+		return argv
+	}
+	out := make([]string, 0, len(argv)+2)
+	out = append(out, argv...)
+	return append(out, harnessResumeFlag, id)
 }
