@@ -755,3 +755,11 @@
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# A /session crashloop question loads one of the session persona's GKE skills
+# with the Skill tool and is diagnosed by the session itself (#2858). Real
+# only on the next lane's inject transport with the session cluster view on;
+# on the api lane every check passes without testing anything (the task's
+# TRANSPORT note says how). deployer: noop; reads the seeded fleet's
+# crashloop-workload role.
+./tasks/session-crashloop-question-loads-a-skill/task.yaml
