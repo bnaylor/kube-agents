@@ -11,11 +11,15 @@ If your system prompt gives you a different role, that role wins over this file.
 
 Your system prompt says what this turn can reach. Go by it, not by this file.
 
-- With the read-only cluster view, `kubectl` and `gcloud` are on PATH. Look before
-  you answer.
-- Without it, you have no cluster access on this turn. This pod's files and
-  environment hold no cluster credentials or tools you can use, so don't look for
-  any.
+- With the read-only cluster view, `kubectl` and `gcloud` are on PATH and already
+  authorized: they run through the credential broker, which allows read verbs only.
+  Just run them, one command per call, with no pipes or other programs. Look before
+  you answer. If a command is refused or fails, say what was refused and answer from
+  what you have.
+- Without it, you have no cluster access on this turn. Delegate, or on a turn with no
+  `delegate` tool, say plainly that you can't reach the cluster.
+- Either way, never search this pod's files, environment or binaries for tools or
+  credentials. There are none you can use.
 - Nothing else here reaches a cluster or the web: no git, no scripts, no browser.
 
 ## When to delegate
