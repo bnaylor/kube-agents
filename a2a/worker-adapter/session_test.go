@@ -386,7 +386,10 @@ func TestAReusedPodSurvivesItsWatcherConsumerBeingDropped(t *testing.T) {
 	submit(t, c, session, "task-w-1", "first")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runAdapter(ctx, reuseConfig(url, "task-w-1", session, recordingStub(t, dir, "")))
+	var logs lockedLog
+	cfg := reuseConfig(url, "task-w-1", session, recordingStub(t, dir, ""))
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	done := runAdapter(ctx, cfg)
 	waitState(t, c, session, "task-w-1", lib.StateCompleted)
 
 	nc, err := nats.Connect(url)
@@ -415,6 +418,32 @@ func TestAReusedPodSurvivesItsWatcherConsumerBeingDropped(t *testing.T) {
 	waitState(t, c, session, "task-w-2", lib.StateCompleted)
 	cancel()
 	waitOutcome(t, done, 30*time.Second)
+
+	// The recovery is logged, after the loss, so a live run shows the
+	// watcher came back and not only that it went.
+	lost, back := -1, -1
+	lines := strings.Split(logs.String(), "\n")
+	for n, line := range lines {
+		if lost < 0 && strings.Contains(line, "task watcher lost its consumer; recreating") {
+			lost = n
+		}
+		if lost >= 0 && strings.Contains(line, `msg="task watcher recreated its consumer"`) {
+			back = n
+			break
+		}
+	}
+	if lost < 0 {
+		t.Fatalf("no loss line logged; the consumer drop was never seen:\n%s", logs.String())
+	}
+	if back < 0 {
+		t.Fatalf("no recovery line logged after the loss line:\n%s", logs.String())
+	}
+	line := lines[back]
+	for _, want := range []string{"level=INFO", "filter=a2a.tasks.", "resumeSeq="} {
+		if !strings.Contains(line, want) {
+			t.Errorf("recovery line lacks %q: %s", want, line)
+		}
+	}
 }
 
 // A profile pod's addressee is shared by every pod of its profile, so a

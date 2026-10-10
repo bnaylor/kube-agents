@@ -129,6 +129,11 @@ func (w *taskWatcher) nextTask(ctx context.Context) (*lib.Envelope, uint64, erro
 	for {
 		cons, err := w.consumer(ctx, filter)
 		if err == nil {
+			if failures > 0 {
+				// The pair to the Warn below, so a live run shows the
+				// recovery and not only the loss.
+				w.log.Info("task watcher recreated its consumer", "filter", filter, "resumeSeq", w.next)
+			}
 			var env *lib.Envelope
 			var seq uint64
 			var healthy bool
