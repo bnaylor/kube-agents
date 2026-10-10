@@ -348,3 +348,25 @@ func TestThePrimerReplaysHandOffsAndFailuresAsTheyEnded(t *testing.T) {
 		t.Errorf("want the refused hand-off and the failed turn marked as ended:\n%s", primer)
 	}
 }
+
+// A stream read that fails, rather than finding nothing, leaves the turn out:
+// replaying it as asked and never answered would tell the pod the request
+// went unanswered when it may well have been. A cancelled context makes every
+// read fail that way; a live one on a task with no events is "not found",
+// and the turn is replayed with what the user asked.
+func TestAFailedStreamReadLeavesTheTurnOut(t *testing.T) {
+	r := startRig(t)
+	someone := TaskRequester{Backend: "discord", Subject: "someone-hash"}
+	rec := &SessionRecord{Key: "discord:g1/primer-read-error", Tasks: []TaskRef{
+		{ID: "task-no-events", Addressee: "platform", Request: "an ask with no events yet", Requester: &someone},
+	}}
+	live, _, _, _ := r.g.buildRehydrationPrimer(context.Background(), rec, "")
+	if !strings.Contains(live, "an ask with no events yet") {
+		t.Fatalf("a not-found read should still replay what was asked:\n%s", live)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if failed, _, _, _ := r.g.buildRehydrationPrimer(ctx, rec, ""); strings.Contains(failed, "an ask with no events yet") {
+		t.Errorf("a failed read replayed the turn as asked and never answered:\n%s", failed)
+	}
+}
