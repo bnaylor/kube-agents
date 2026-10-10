@@ -111,11 +111,11 @@ verification_spec:
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            skill: '.*gke-[a-z-]+.*'
+            skill: ".*gke-[a-z-]+.*"
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            command: '.*gke-[a-z-]+.*'
+            command: ".*gke-[a-z-]+.*"
 
   - name: the-session-diagnoses-the-oom-itself
     role: objective
@@ -166,8 +166,8 @@ verification_spec:
         - type: tool_called
           tool_names: ["Glob"]
           arguments:
-            path: '(?i).*skills.*'
+            path: "(?i).*skills.*"
         - type: tool_called
           tool_names: ["Grep"]
           arguments:
-            path: '(?i).*skills.*'
+            path: "(?i).*skills.*"
