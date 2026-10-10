@@ -490,6 +490,9 @@ INJECT_LANE_REQUESTING = [
     # with a pull request; the persona's rule now puts that manifest in the
     # reply (SOUL.md §3, item 3), so the allowance is gone and the lane's
     # github_writes safeguard grades the case at zero like any other.
+    # Refused the direct apply, it may propose the change as a pull request
+    # (#2610, 2026-10-10); its objective's pull_request_opened leaf allows one.
+    "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",
