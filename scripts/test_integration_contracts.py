@@ -137,6 +137,11 @@ class SpecToolRegistryTest(unittest.TestCase):
     #
     # * a built-in on the adapter's `defaultAllowedTools` constant in
     #   a2a/cmd/worker-adapter/main.go, the surface every session gets;
+    # * `Bash`, from the same file's `clusterViewAllowedTools`, the surface a
+    #   session gets only with the cluster view (`Bash(kubectl:*)` and
+    #   `Bash(gcloud:*)`, both the Bash tool); `defaultDisallowedTools`
+    #   disallows it otherwise, which is what lets a case read a Bash call as
+    #   "the view was on";
     # * the delegate MCP tool, as main.go's `delegateToolID` composes it:
     #   "mcp__" + DelegateMCPServer + "__" + DelegateToolName, both halves
     #   from a2a/worker-adapter/mcp.go;
@@ -148,7 +153,7 @@ class SpecToolRegistryTest(unittest.TestCase):
     #   cutting each skill's frontmatter down to the two fields that tool
     #   runs unprompted. Neither proves the harness exposes the tool, only
     #   that this repository relies on it; the eval is what proves the rest.
-    SESSION_HARNESS_TOOLS = {"Read", "Glob", "Grep", "mcp__a2a__delegate", "Skill"}
+    SESSION_HARNESS_TOOLS = {"Read", "Glob", "Grep", "Bash", "mcp__a2a__delegate", "Skill"}
     WORKER_ADAPTER_MAIN = "a2a/cmd/worker-adapter/main.go"
     WORKER_ADAPTER_MCP = "a2a/worker-adapter/mcp.go"
     SKILL_TOOL_EVIDENCE = (
@@ -374,6 +379,10 @@ class SpecToolRegistryTest(unittest.TestCase):
         allowed = self._go_string_const(main, "defaultAllowedTools")
         self.assertTrue(allowed, f"{self.WORKER_ADAPTER_MAIN} no longer defines defaultAllowedTools as a literal")
         evidenced.update(t.strip() for t in allowed.split(",") if t.strip())
+        view = re.search(r'^\s*clusterViewAllowedTools\s*=\s*defaultAllowedTools\s*\+\s*"([^"]*)"\s*$', main, re.M)
+        if view:
+            # `Bash(kubectl:*)` is the Bash tool with a permission rule.
+            evidenced.update(t.strip().split("(")[0] for t in view.group(1).split(",") if t.strip())
 
         server = self._go_string_const(mcp, "DelegateMCPServer")
         tool = self._go_string_const(mcp, "DelegateToolName")

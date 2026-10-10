@@ -17,11 +17,16 @@
 The case has no inject-only marker to lean on (the bench has none), so each
 check is written to pass on an api record: the positive checks behind a
 ``none`` of the inject transport's task marker, the skill-file check over
-Claude Code tool names a Hermes trajectory never carries. These tests run
-the case's own entries through devops-bench's runner against the three
-records that matter -- an api run, main's session (no skill to load), and the
-branch's session -- plus the two ways a session can pass the skill check and
-still be wrong: delegating, and reading the skill files by hand.
+Claude Code tool names a Hermes trajectory never carries. Nor does an inject
+record say whether the session cluster view was on, so the case branches on
+the one behavioural marker, a Bash call (the worker adapter allows Bash only
+with the view): with one, the view-on rules apply (a gke- skill, kubectl, no
+delegation); without, the skill check skips and the answer alone grades.
+These tests run the case's own entries through devops-bench's runner against
+an api run, main's and the branch's sessions with the view on, a delegated
+run with the view off (whose final trace is the wake turn's), and the ways
+each can still be wrong: delegating with the view, an ungrounded answer, and
+reading the skill files by hand.
 
 The inject records use the transport's own entry names, and the scorer's
 reading of them is asserted too, so a renamed marker fails here rather than
@@ -45,7 +50,7 @@ CASE_ID = "session-crashloop-question-loads-a-skill"
 TASK = Path(__file__).resolve().parent.parent / "tasks" / CASE_ID / "task.yaml"
 
 SKILL = "the-session-loads-a-gke-skill"
-GROUNDED = "the-session-diagnoses-the-oom-itself"
+GROUNDED = "the-answer-names-the-oom"
 NO_SKILL_READ = "the-session-does-not-read-its-skill-files"
 
 ANSWER = (
@@ -123,20 +128,54 @@ def test_the_branch_is_green():
 
 
 def test_the_older_skill_key_counts():
-    assert _status(SKILL, ANSWER, _inject(_call("Skill", {"command": "gke-stall-detection"}))) == "pass"
+    record = _inject(_call("Skill", {"command": "gke-stall-detection"}), KUBECTL)
+    assert _status(SKILL, ANSWER, record) == "pass"
 
 
 def test_a_skill_that_is_not_a_shipped_gke_skill_does_not_count():
-    assert _status(SKILL, ANSWER, _inject(_call("Skill", {"skill": "review"}))) == "fail"
+    assert _status(SKILL, ANSWER, _inject(_call("Skill", {"skill": "review"}), KUBECTL)) == "fail"
 
 
-def test_a_delegated_answer_fails_the_grounded_check():
-    """The child's relayed text names the OOM; the session did not find it."""
-    assert _status(GROUNDED, ANSWER, _inject(SKILL_CALL, DELEGATE)) == "fail"
+def test_delegating_with_the_view_fails_the_grounded_check():
+    """The view was on (Bash ran) and the session still handed the question
+    on: the answer is the child's, not the session's."""
+    assert _status(GROUNDED, ANSWER, _inject(SKILL_CALL, KUBECTL, DELEGATE)) == "fail"
+
+
+def test_bash_without_kubectl_fails_the_grounded_check():
+    """The view was on, but the session never read the cluster with kubectl."""
+    record = _inject(SKILL_CALL, _call("Bash", {"command": "gcloud container clusters list"}))
+    assert _status(GROUNDED, ANSWER, record) == "fail"
 
 
 def test_an_answer_without_the_oom_fails_the_grounded_check():
     assert _status(GROUNDED, GENERAL_ANSWER, _inject(SKILL_CALL, KUBECTL)) == "fail"
+
+
+# View off: the session delegates, and the probe of the root follows the
+# chain to the wake turn, so the final trace is the wake's calls -- usually
+# none. A refused delegation forms no chain and leaves the delegate call in.
+@pytest.mark.parametrize("record", [_inject(), _inject(DELEGATE)], ids=["wake", "no-chain"])
+def test_view_off_a_relayed_grounded_answer_is_green(record: list[dict[str, Any]]):
+    for name in (SKILL, GROUNDED, NO_SKILL_READ):
+        assert _status(name, ANSWER, record) == "pass", name
+
+
+def test_view_off_an_ungrounded_answer_fails():
+    assert _status(GROUNDED, GENERAL_ANSWER, _inject()) == "fail"
+
+
+def test_view_off_a_pod_search_fails():
+    record = _inject(_call("Glob", {"pattern": "**/*", "path": "/home/node"}))
+    assert _status(NO_SKILL_READ, ANSWER, record) == "fail"
+
+
+def test_a_view_on_session_that_never_runs_bash_reads_as_view_off():
+    """The documented cost of having no view marker: without a Bash call the
+    record cannot say the view was on, so the skill check skips."""
+    record = _inject(DELEGATE)
+    assert _status(SKILL, ANSWER, record) == "pass"
+    assert _status(GROUNDED, ANSWER, record) == "pass"
 
 
 @pytest.mark.parametrize(
