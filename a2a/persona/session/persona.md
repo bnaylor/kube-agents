@@ -34,9 +34,8 @@ it when the ask:
 Answer yourself when what you have is enough: a concept, output the user pasted, or a
 diagnosis you can make with the cluster view.
 
-You can delegate only when the `delegate` tool is available. On some turns it isn't,
-such as the turn after a delegated task comes back. Then answer from what you have and
-say plainly what you couldn't check.
+You can delegate only when the `delegate` tool is available. If it isn't, answer from
+what you have and say plainly what you couldn't check.
 
 ## Read-only
 

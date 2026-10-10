@@ -31,8 +31,17 @@ var writeCommandRE = regexp.MustCompile(
 		`|\bgcloud\b[^\n` + "`" + `]*\s(create|delete|update|upgrade|resize|add-iam-policy-binding|remove-iam-policy-binding|set-iam-policy|enable|disable|deploy)\b`)
 
 // otherProgramRE finds a command line that runs a program the worker image
-// does not ship.
-var otherProgramRE = regexp.MustCompile(`^\s*(\$\s+)?(\./|python3?\s|git\s|jq\s|bash\s|sh\s)`)
+// does not ship. The build has already rewritten a ./scripts/ path to the
+// not-shipped placeholder, so a line that starts with the placeholder is a
+// program too; the literal is spelled out rather than taken from
+// shippedFileArg so the check does not move with the constant.
+var otherProgramRE = regexp.MustCompile(`^\s*(\$\s+)?(\./|python3?\s|git\s|jq\s|bash\s|sh\s|<file not in this session>)`)
+
+// unshippedRefRE finds a reference to a file the session does not ship: a
+// scripts/ or assets/ path, the cluster agent's /opt/data tree or its
+// settings file, starting a word. Written independently of filePathRE. A
+// path inside a URL is documentation and is not a reference.
+var unshippedRefRE = regexp.MustCompile("(^|[\\s(`\"'])((\\./)?(assets|scripts)/|/opt/data/|SETTINGS\\.md)")
 
 func buildShipped(t *testing.T) string {
 	t.Helper()
@@ -104,9 +113,17 @@ func TestShippedTreeIsLoadableByClaudeCode(t *testing.T) {
 		}
 		// Only SKILL.md ships, and Claude Code gives the model the skill's
 		// directory with its text: a path left in would send it looking.
-		for _, ref := range []string{"assets/", "scripts/", "/opt/data/", "SETTINGS.md"} {
-			if strings.Contains(string(rest), ref) {
-				t.Errorf("%s: still points at %q, which is not shipped", name, ref)
+		// Checked in prose and command blocks; a manifest or other inert
+		// block is left as written.
+		inFence, check := false, true
+		for i, l := range strings.Split(string(rest), "\n") {
+			if trimmed := strings.TrimSpace(l); strings.HasPrefix(trimmed, codeFence) {
+				inFence = !inFence
+				check = !inFence || commandBlock(strings.TrimSpace(strings.TrimPrefix(trimmed, codeFence)))
+				continue
+			}
+			if check && unshippedRefRE.MatchString(l) {
+				t.Errorf("%s:%d: still points at a file that is not shipped: %s", name, i+1, strings.TrimSpace(l))
 			}
 		}
 		if !strings.Contains(string(rest), sessionPreamble) {
@@ -253,7 +270,8 @@ func TestWorkerImageShipsTheTreeWhereTheHarnessReadsIt(t *testing.T) {
 
 // The tree is built group- and world-unwritable. COPY --from keeps these
 // modes, so this plus root ownership is what stops the harness (uid 1000)
-// rewriting a skill or adding one.
+// editing a shipped file or the skills directory in place. The harness owns
+// the config directory above them, so it is not a boundary against it.
 func TestShippedTreeIsNotWritableByOthers(t *testing.T) {
 	out := buildShipped(t)
 	n := 0
@@ -360,6 +378,17 @@ func TestClassifyBlock(t *testing.T) {
 		{"bash", "env FOO=1 kubectl delete pod p", blockWrite},
 		{"bash", "kubectl get pods -o name | xargs kubectl delete", blockWrite},
 		{"bash", "timeout 5 kubectl get pods", blockUnavailable},
+		// A console block is a transcript: only its "$ " lines are commands,
+		// and the rest is output. Same for an untagged block.
+		{"console", "$ kubectl get pods -n x\nNAME READY STATUS", blockRead},
+		{"console", "$ kubectl delete pod p -n x\npod \"p\" deleted", blockWrite},
+		{"console", "NAME READY STATUS", blockInert},
+		{"", "$ kubectl get pods -n x\nNAME READY STATUS", blockRead},
+		{"", "$ kubectl get pods \\\n  -n x\nNAME READY STATUS", blockRead},
+		// A "$ " prompt in a shell block is stripped from that line; its
+		// unprompted neighbours are still commands.
+		{"bash", "$ kubectl get pods -n x", blockRead},
+		{"bash", "$ kubectl get pods -n x\nkubectl delete pod p", blockWrite},
 	} {
 		if got := classifyBlock(tc.lang, strings.Split(tc.body, "\n")); got != tc.want {
 			t.Errorf("classifyBlock(%q, %q) = %d, want %d", tc.lang, tc.body, got, tc.want)
@@ -390,5 +419,70 @@ func TestPreambleSkipsHeadingsInsideCodeBlocks(t *testing.T) {
 	i := slices.Index(got, sessionPreamble)
 	if i < 1 || got[i-2] != "# Title" {
 		t.Errorf("preamble placed at %d:\n%s", i, strings.Join(got, "\n"))
+	}
+}
+
+// A console transcript of a read ships with no note: the session can run it.
+func TestConsoleTranscriptOfAReadIsNotMarked(t *testing.T) {
+	src := "---\nname: demo\ndescription: A demo.\n---\n\n# Demo\n\n```console\n$ kubectl get pods -n x\nNAME READY STATUS\n```\n"
+	out, err := transformSkill("demo", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range []string{unavailableNote, proposeOnlyNote, pipeNote} {
+		if strings.Contains(string(out), note) {
+			t.Errorf("a read-only console block was marked %q:\n%s", note, out)
+		}
+	}
+}
+
+// A path is rewritten where it starts a word in prose or a command block,
+// and left alone inside a URL or a block that is not commands.
+func TestReplaceFileReferences(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"url in prose",
+			"See https://cloud.google.com/kubernetes-engine/docs/tutorials/scripts/setup.sh for more.",
+			"See https://cloud.google.com/kubernetes-engine/docs/tutorials/scripts/setup.sh for more."},
+		{"manifest in a yaml block",
+			"```yaml\nmountPath: /opt/data/scripts\n```",
+			"```yaml\nmountPath: /opt/data/scripts\n```"},
+		{"json block",
+			"```json\n{\"path\": \"scripts/x.sh\"}\n```",
+			"```json\n{\"path\": \"scripts/x.sh\"}\n```"},
+		{"text block",
+			"```text\nscripts/x.sh\n```",
+			"```text\nscripts/x.sh\n```"},
+		{"path in prose",
+			"Run scripts/x.sh first.",
+			"Run " + shippedFileProse + " first."},
+		{"path at line start",
+			"SETTINGS.md holds it.",
+			shippedFileProse + " holds it."},
+		{"path in parentheses",
+			"(see ./assets/a.yaml)",
+			"(see " + shippedFileProse + ")"},
+		{"inline code",
+			"Use `scripts/x.sh`.",
+			"Use " + shippedFileProse + "."},
+		{"markdown link",
+			"Use [the script](scripts/x.sh).",
+			"Use " + shippedFileProse + "."},
+		{"bash block",
+			"```bash\n./scripts/audit.sh a\npython3 /opt/data/scripts/r.py\n```",
+			"```bash\n" + shippedFileArg + " a\npython3 " + shippedFileArg + "\n```"},
+		{"console block",
+			"```console\n$ kubectl apply -f assets/a.yaml\n```",
+			"```console\n$ kubectl apply -f " + shippedFileArg + "\n```"},
+		{"untagged block",
+			"```\n$ python3 /opt/data/scripts/r.py\n```",
+			"```\n$ python3 " + shippedFileArg + "\n```"},
+		{"url in a bash block",
+			"```bash\ncurl -O https://example.com/scripts/x.sh\n```",
+			"```bash\ncurl -O https://example.com/scripts/x.sh\n```"},
+	} {
+		got := strings.Join(replaceFileReferences(strings.Split(tc.in, "\n")), "\n")
+		if got != tc.want {
+			t.Errorf("%s:\n got %q\nwant %q", tc.name, got, tc.want)
+		}
 	}
 }

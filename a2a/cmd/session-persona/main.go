@@ -29,7 +29,8 @@ const (
 	skillsDir = "skills"
 	// dirMode and fileMode leave the shipped tree readable, and the
 	// Dockerfile copies it in owned by root, so the harness (uid 1000)
-	// cannot rewrite a skill or add one.
+	// cannot edit a shipped file or the skills directory in place. It owns
+	// the config directory above them, so this is not a boundary against it.
 	dirMode  = 0o755
 	fileMode = 0o644
 )

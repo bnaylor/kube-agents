@@ -14,8 +14,9 @@ const (
 	frontmatterFence = "---"
 	// codeFence opens and closes a Markdown code block.
 	codeFence = "```"
-	// shellPrompt marks a command line inside an untagged block, as in a
-	// worked example that shows a command and its output together.
+	// shellPrompt marks a command line in a transcript (a console or
+	// untagged block), as in a worked example that shows a command and its
+	// output together. In a shell-tagged block it is stripped from the line.
 	shellPrompt = "$ "
 	// shellComment, lineContinuation, placeholderOpen and quoteChar are the
 	// shell syntax the classifier reads: a comment line, a backslash that
@@ -58,7 +59,8 @@ const (
 	shippedFileProse = "the cluster agent's file (not in this session)"
 	shippedFileArg   = "<file not in this session>"
 	// filePathPattern is a relative scripts/ or assets/ path, an absolute
-	// script path, or the cluster agent's settings file.
+	// script path, or the cluster agent's settings file. filePathRE adds the
+	// left boundary it is matched under.
 	filePathPattern = `(\./)?(assets|scripts)/[\w./-]+|/opt/data/[\w./-]+|SETTINGS\.md`
 
 	// sessionPreamble follows each skill's title. It says, once, what the
@@ -73,9 +75,13 @@ const (
 
 var (
 	// fileLinkRE is a Markdown link to a relative scripts/ or assets/
-	// path; filePathRE is filePathPattern on its own.
+	// path. filePathRE is filePathPattern starting a word: at the start of
+	// the line or after whitespace, a parenthesis, a backtick or a quote. It
+	// captures that boundary so the replacement keeps it, and it leaves a
+	// path inside a URL alone (".../docs/scripts/setup.sh" is documentation,
+	// not the cluster agent's file).
 	fileLinkRE = regexp.MustCompile(`\[[^\]]*\]\((\./)?(assets|scripts)/[^)]*\)`)
-	filePathRE = regexp.MustCompile(filePathPattern)
+	filePathRE = regexp.MustCompile("(^|[\\s(`\"'])(" + filePathPattern + ")")
 	// quotedFilePathRE is the same path as inline code in prose, replaced
 	// with its backticks so the replacement reads as prose.
 	quotedFilePathRE = regexp.MustCompile("`(" + filePathPattern + ")`")
@@ -84,8 +90,13 @@ var (
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 	// headingRE matches an ATX heading and captures its level.
 	headingRE = regexp.MustCompile(`^(#{1,6})\s`)
-	// shellLangs are the info strings whose blocks hold commands.
-	shellLangs = map[string]bool{"bash": true, "sh": true, "shell": true, "console": true, "zsh": true}
+	// shellLangs are the info strings whose blocks are all commands, the
+	// same set as deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+	// transcriptLangs are the ones whose blocks are a transcript: only a
+	// shellPrompt line is a command, and the rest is what it printed. Any
+	// other info string (yaml, json, text) marks an inert block.
+	shellLangs      = map[string]bool{"bash": true, "sh": true, "shell": true, "zsh": true}
+	transcriptLangs = map[string]bool{"": true, "console": true}
 	// The read tables below have to be a subset of what the credential
 	// broker lets a session run: agents/platform/scripts/command_policy.py
 	// (KUBECTL_READ_VERBS, KUBECTL_REFUSED_SUBCOMMANDS, GCLOUD_READ_COMMANDS),
@@ -381,24 +392,32 @@ func noteFor(c blockClass) string {
 	return ""
 }
 
+// commandBlock reports whether a code block with this info string holds
+// commands, as a shell block or a transcript.
+func commandBlock(lang string) bool {
+	return shellLangs[lang] || transcriptLangs[lang]
+}
+
 // classifyBlock reads a code block's commands and returns the strictest
-// class among them. A shell-tagged block is all commands; an untagged block
-// counts only its "$ " lines, as in a worked example.
+// class among them. A shell-tagged block is all commands, with a "$ "
+// prompt stripped where a line has one; a console or untagged block is a
+// transcript and counts only its "$ " lines, as in a worked example. A
+// prompted line in a shell block keeps its unprompted neighbours as
+// commands, so a block mixing the two is marked by its strictest line
+// rather than by the prompted ones alone.
 func classifyBlock(lang string, body []string) blockClass {
-	shell := shellLangs[lang]
-	if !shell && lang != "" {
+	if !commandBlock(lang) {
 		return blockInert
 	}
+	transcript := transcriptLangs[lang]
 	var cmds []string
 	var cur strings.Builder
 	for _, raw := range body {
 		l := strings.TrimSpace(raw)
-		if !shell {
-			if !strings.HasPrefix(l, shellPrompt) {
-				continue
-			}
-			l = strings.TrimPrefix(l, shellPrompt)
+		if transcript && cur.Len() == 0 && !strings.HasPrefix(l, shellPrompt) {
+			continue
 		}
+		l = strings.TrimPrefix(l, shellPrompt)
 		if cur.Len() == 0 && (l == "" || strings.HasPrefix(l, shellComment)) {
 			continue
 		}
@@ -560,23 +579,29 @@ func insertPreamble(lines []string) []string {
 
 // replaceFileReferences rewrites every reference to a file that is not
 // shipped: a Markdown link or path in prose becomes shippedFileProse, and a
-// path inside a code block becomes shippedFileArg.
+// path inside a command block (shell or transcript) becomes shippedFileArg.
+// A block with any other info string is left as written: a manifest's
+// mountPath: /opt/data/scripts is the manifest, not a reference to a script.
 func replaceFileReferences(lines []string) []string {
 	out := make([]string, len(lines))
-	inFence := false
+	inFence, rewrite := false, false
 	for i, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), codeFence) {
+		if trimmed := strings.TrimSpace(l); strings.HasPrefix(trimmed, codeFence) {
 			inFence = !inFence
+			rewrite = inFence && commandBlock(strings.TrimSpace(strings.TrimPrefix(trimmed, codeFence)))
 			out[i] = l
 			continue
 		}
 		if inFence {
-			out[i] = filePathRE.ReplaceAllLiteralString(l, shippedFileArg)
+			if rewrite {
+				l = filePathRE.ReplaceAllString(l, "${1}"+shippedFileArg)
+			}
+			out[i] = l
 			continue
 		}
 		l = fileLinkRE.ReplaceAllString(l, shippedFileProse)
 		l = quotedFilePathRE.ReplaceAllLiteralString(l, shippedFileProse)
-		out[i] = filePathRE.ReplaceAllLiteralString(l, shippedFileProse)
+		out[i] = filePathRE.ReplaceAllString(l, "${1}"+shippedFileProse)
 	}
 	return out
 }

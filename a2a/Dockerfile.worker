@@ -91,7 +91,9 @@ RUN mkdir -p /home/node/.claude /scratch \
 # The persona and skills land where Claude Code reads user memory and user
 # skills: CLAUDE_CONFIG_DIR below, which nothing in the session pod's spec
 # mounts over. Copied after the chown so they stay root-owned: the harness
-# reads them, and cannot rewrite a skill or add one beside them.
+# reads them and cannot edit one in place. It does own /home/node/.claude, so
+# it could move skills/ aside and write its own; this keeps the shipped text
+# from being changed by accident, and is not a boundary against the harness.
 COPY --from=build /out/claude/CLAUDE.md /home/node/.claude/CLAUDE.md
 COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
 USER node

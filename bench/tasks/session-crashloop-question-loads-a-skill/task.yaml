@@ -144,11 +144,18 @@ verification_spec:
 
   # The skill comes in through the Skill tool, whose result is the skill's
   # text; the session never needs to open the files. A Read, Glob or Grep
-  # that reaches into a skills directory means the model went looking for
-  # its skills by hand instead (the PR rewrites every script and asset path
-  # out of the shipped SKILL.md files for exactly this reason). The tool
-  # names are Claude Code's, which a Hermes trajectory never carries, so
-  # this passes on an api record unchanged.
+  # that reaches the skills tree means the model went looking for its skills
+  # by hand instead (the PR rewrites every script and asset path out of the
+  # shipped SKILL.md files for exactly this reason). The tree is
+  # /home/node/.claude/skills (CLAUDE_CONFIG_DIR in a2a/Dockerfile.worker), so
+  # the leaves cover a path or pattern naming .claude or skills, a Grep
+  # filtered to SKILL.md by its glob, a Grep over the home directory or an
+  # ancestor of it, and a recursive Markdown Glob rooted there: each of those
+  # reads or lists the skill files without naming them. The session has no
+  # files of its own under ~/.claude or ~ to look for, and the green runs
+  # used only Skill and Bash. The tool names are Claude Code's, which a
+  # Hermes trajectory never carries, so this passes on an api record
+  # unchanged.
   - name: the-session-does-not-read-its-skill-files
     role: objective
     mode: assert
@@ -158,16 +165,35 @@ verification_spec:
         - type: tool_called
           tool_names: ["Read"]
           arguments:
-            file_path: '(?i).*(/skills/.*|skill\.md)'
+            file_path: '(?i).*(/\.claude(/.*)?|/skills/.*|skill\.md)'
         - type: tool_called
           tool_names: ["Glob"]
           arguments:
-            pattern: '(?i).*(skills|skill\.md).*'
+            pattern: '(?i).*(\.claude|skills|skill\.md).*'
         - type: tool_called
           tool_names: ["Glob"]
           arguments:
-            path: "(?i).*skills.*"
+            path: '(?i).*(\.claude|skills).*'
+        # A recursive Markdown glob rooted at the home directory or above,
+        # whether the root is in the pattern or in path.
+        - type: tool_called
+          tool_names: ["Glob"]
+          arguments:
+            pattern: '(?i)(~|/home(/node)?)?/\*\*.*\.md'
+        - type: tool_called
+          tool_names: ["Glob"]
+          arguments:
+            pattern: '(?i).*\*\*.*\.md'
+            path: "(?i)(~|/home(/node)?|)/?"
         - type: tool_called
           tool_names: ["Grep"]
           arguments:
-            path: "(?i).*skills.*"
+            path: '(?i).*(\.claude|skills).*'
+        - type: tool_called
+          tool_names: ["Grep"]
+          arguments:
+            glob: '(?i).*(\.claude|skills|skill\.md).*'
+        - type: tool_called
+          tool_names: ["Grep"]
+          arguments:
+            path: "(?i)(~|/home(/node)?|)/?"
