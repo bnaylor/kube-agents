@@ -76,19 +76,20 @@ const (
 var (
 	// fileLinkRE is a Markdown link to a relative scripts/ or assets/
 	// path. filePathRE is filePathPattern starting a word: at the start of
-	// the line or after whitespace, a parenthesis, a backtick or a quote. It
+	// the line or after whitespace, a parenthesis, a backtick, a quote, an
+	// `=` (a flag's attached value) or a `,` (a list of paths). It
 	// captures that boundary so the replacement keeps it, and it leaves a
 	// path inside a URL alone (".../docs/scripts/setup.sh" is documentation,
 	// not the cluster agent's file).
 	fileLinkRE = regexp.MustCompile(`\[[^\]]*\]\((\./)?(assets|scripts)/[^)]*\)`)
-	filePathRE = regexp.MustCompile("(^|[\\s(`\"'])(" + filePathPattern + ")")
+	filePathRE = regexp.MustCompile("(^|[\\s(`\"'=,])(" + filePathPattern + ")")
 	// quotedFilePathRE is the same path as inline code in prose, replaced
 	// with its backticks so the replacement reads as prose.
 	quotedFilePathRE = regexp.MustCompile("`(" + filePathPattern + ")`")
 	// skillNameRE is the Agent Skills name rule: lowercase letters, digits
 	// and hyphens.
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
-	// headingRE matches an ATX heading and captures its level.
+	// headingRE matches an ATX heading.
 	headingRE = regexp.MustCompile(`^(#{1,6})\s`)
 	// shellLangs are the info strings whose blocks are all commands, the
 	// same set as deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
@@ -303,15 +304,17 @@ func splitFrontmatter(src []byte) (fm, body []byte, err error) {
 	return []byte(rest[:end]), []byte(rest[end+len("\n"+frontmatterFence+"\n"):]), nil
 }
 
-// replaceClusterAgentSections swaps each section whose own text calls a
-// cluster-agent tool, subsections included, for its heading and
-// sessionReportNote. A section runs from its heading to the next heading at
-// the same or a higher level.
+// replaceClusterAgentSections swaps the own text of each section that calls
+// a cluster-agent tool for its heading and sessionReportNote. A section's
+// own text runs from its heading to the next heading of any level, and that
+// is both what decides and what is removed: the subsections under it are
+// judged on their own text and kept unless they call one too, so a marker in
+// a parent's intro cannot take the diagnostic steps nested under it.
 func replaceClusterAgentSections(lines []string) []string {
 	// own ends at the next heading of any level: the marker has to be in
 	// the section's own text, or the title section, which spans the whole
 	// file, would be the one replaced.
-	type section struct{ start, own, end, level int }
+	type section struct{ start, own int }
 	var sections []section
 	inFence := false
 	for i, l := range lines {
@@ -322,34 +325,23 @@ func replaceClusterAgentSections(lines []string) []string {
 		if inFence {
 			continue
 		}
-		if m := headingRE.FindStringSubmatch(l); m != nil {
+		if headingRE.MatchString(l) {
 			if n := len(sections); n > 0 {
 				sections[n-1].own = i
 			}
-			sections = append(sections, section{start: i, own: len(lines), end: len(lines), level: len(m[1])})
-		}
-	}
-	for i := range sections {
-		for j := i + 1; j < len(sections); j++ {
-			if sections[j].level <= sections[i].level {
-				sections[i].end = sections[j].start
-				break
-			}
+			sections = append(sections, section{start: i, own: len(lines)})
 		}
 	}
 
 	var out []string
 	next := 0
 	for _, s := range sections {
-		if s.start < next {
-			continue // inside a section already replaced
-		}
 		if !strings.Contains(strings.Join(lines[s.start:s.own], "\n"), clusterAgentOnlyMarker) {
 			continue
 		}
 		out = append(out, lines[next:s.start]...)
 		out = append(out, lines[s.start], "", sessionReportNote, "")
-		next = s.end
+		next = s.own
 	}
 	return append(out, lines[next:]...)
 }

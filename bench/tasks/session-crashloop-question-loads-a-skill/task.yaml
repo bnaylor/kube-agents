@@ -150,9 +150,9 @@ verification_spec:
   # /home/node/.claude/skills (CLAUDE_CONFIG_DIR in a2a/Dockerfile.worker), so
   # the leaves cover a path or pattern naming .claude or skills, a Grep
   # filtered to SKILL.md by its glob, a Grep over the home directory or an
-  # ancestor of it, and a recursive Markdown Glob rooted there: each of those
-  # reads or lists the skill files without naming them. The session has no
-  # files of its own under ~/.claude or ~ to look for, and the green runs
+  # ancestor of it, and any Glob rooted there: each of those reads or lists
+  # the skill files without naming them. The session has no files of its own
+  # under ~/.claude or ~ to look for, and the green runs
   # used only Skill and Bash. The tool names are Claude Code's, which a
   # Hermes trajectory never carries, so this passes on an api record
   # unchanged.
@@ -174,16 +174,16 @@ verification_spec:
           tool_names: ["Glob"]
           arguments:
             path: '(?i).*(\.claude|skills).*'
-        # A recursive Markdown glob rooted at the home directory or above,
-        # whether the root is in the pattern or in path.
+        # Any glob rooted at the home directory or above, whether the root is
+        # in the pattern or in path: it lists the skill files whatever the
+        # pattern, the rule the Grep leaf below applies to its path.
         - type: tool_called
           tool_names: ["Glob"]
           arguments:
-            pattern: '(?i)(~|/home(/node)?)?/\*\*.*\.md'
+            pattern: '(?i)(~|/home(/node)?)(/.*)?|/\*.*'
         - type: tool_called
           tool_names: ["Glob"]
           arguments:
-            pattern: '(?i).*\*\*.*\.md'
             path: "(?i)(~|/home(/node)?|)/?"
         - type: tool_called
           tool_names: ["Grep"]

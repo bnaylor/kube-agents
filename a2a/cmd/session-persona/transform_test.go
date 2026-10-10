@@ -41,11 +41,27 @@ var otherProgramRE = regexp.MustCompile(`^\s*(\$\s+)?(\./|python3?\s|git\s|jq\s|
 // scripts/ or assets/ path, the cluster agent's /opt/data tree or its
 // settings file, starting a word. Written independently of filePathRE. A
 // path inside a URL is documentation and is not a reference.
-var unshippedRefRE = regexp.MustCompile("(^|[\\s(`\"'])((\\./)?(assets|scripts)/|/opt/data/|SETTINGS\\.md)")
+var unshippedRefRE = regexp.MustCompile("(^|[\\s(`\"'=,])((\\./)?(assets|scripts)/|/opt/data/|SETTINGS\\.md)")
 
+// The shipped-tree check has to see the shapes the rewrite handles, or a
+// path the rewrite missed would ship with the check green.
+func TestUnshippedRefRESeesAttachedAndListedPaths(t *testing.T) {
+	for _, l := range []string{
+		"kubectl apply --filename=assets/x.yaml",
+		"kubectl apply -f=./assets/x.yaml",
+		"kubectl apply -f <file not in this session>,assets/b.yaml",
+	} {
+		if !unshippedRefRE.MatchString(l) {
+			t.Errorf("unshippedRefRE misses %q", l)
+		}
+	}
+}
+
+// buildShipped builds into a directory that does not exist yet, as the
+// Dockerfile does (/out/claude), so build creates it and sets its mode.
 func buildShipped(t *testing.T) string {
 	t.Helper()
-	out := t.TempDir()
+	out := filepath.Join(t.TempDir(), "claude")
 	if err := build(repoSkillsDir, repoPersona, out); err != nil {
 		t.Fatal(err)
 	}
@@ -297,6 +313,33 @@ func TestShippedTreeIsNotWritableByOthers(t *testing.T) {
 	}
 }
 
+// An -out directory that already exists is the caller's: build writes into
+// it and leaves its mode alone (-out /tmp must keep /tmp's sticky bit).
+func TestBuildLeavesAnExistingOutDirsMode(t *testing.T) {
+	out := t.TempDir()
+	const callerMode = 0o750
+	if err := os.Chmod(out, callerMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := build(repoSkillsDir, repoPersona, out); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != callerMode {
+		t.Errorf("build changed the existing -out dir to %o, want %o", info.Mode().Perm(), callerMode)
+	}
+	skills, err := os.Stat(filepath.Join(out, skillsDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skills.Mode().Perm() != dirMode {
+		t.Errorf("%s is %o, want %o", skillsDir, skills.Mode().Perm(), dirMode)
+	}
+}
+
 func TestTransformDropsFrontmatterBeyondNameAndDescription(t *testing.T) {
 	src := "---\nname: demo\ndescription: A demo.\nallowed-tools: Bash\nhooks:\n  PreToolUse: []\n---\n\n# Demo\n\nBody.\n"
 	out, err := transformSkill("demo", []byte(src))
@@ -396,21 +439,35 @@ func TestClassifyBlock(t *testing.T) {
 	}
 }
 
-// A cluster-agent section is replaced by its heading and the session note;
-// its siblings survive, and the title section that contains it is not the
-// one replaced.
+// A cluster-agent section's own text is replaced by its heading and the
+// session note; its siblings survive, the title section that contains it is
+// not the one replaced, and a subsection that does not call the tool itself
+// is kept.
 func TestReplaceClusterAgentSections(t *testing.T) {
 	src := strings.Split("# Title\n\nIntro.\n\n## Step 1\n\nKeep.\n\n## Step 2\n\nCall kanban_complete(x).\n\n### Detail\n\nMore.\n\n## Step 3\n\nKeep too.", "\n")
 	got := strings.Join(replaceClusterAgentSections(src), "\n")
-	for _, want := range []string{"Intro.", "## Step 1", "Keep.", "## Step 2", sessionReportNote, "## Step 3", "Keep too."} {
+	for _, want := range []string{"Intro.", "## Step 1", "Keep.", "## Step 2", sessionReportNote, "### Detail", "More.", "## Step 3", "Keep too."} {
 		if !strings.Contains(got, want) {
 			t.Errorf("lost %q:\n%s", want, got)
 		}
 	}
-	for _, gone := range []string{"kanban_complete", "### Detail", "More."} {
-		if strings.Contains(got, gone) {
-			t.Errorf("kept %q:\n%s", gone, got)
+	if strings.Contains(got, "kanban_complete") {
+		t.Errorf("kept kanban_complete:\n%s", got)
+	}
+}
+
+// A marker in a parent section's intro replaces that intro only: the
+// diagnostic steps nested under it are the skill, and they ship.
+func TestReplaceClusterAgentSectionsKeepsAParentsChildren(t *testing.T) {
+	src := strings.Split("# Title\n\nIntro.\n\n## Diagnostic Workflow\n\nFile the result with `kanban_complete` when you are done.\n\n### Step 0\n\n```bash\nkubectl get pods -n x\n```\n\n#### Step 0a\n\nCheck events.\n\n### Step 1\n\nRead the logs.\n\n## Notes\n\nLast.", "\n")
+	got := strings.Join(replaceClusterAgentSections(src), "\n")
+	for _, want := range []string{"Intro.", "## Diagnostic Workflow", sessionReportNote, "### Step 0", "kubectl get pods -n x", "#### Step 0a", "Check events.", "### Step 1", "Read the logs.", "## Notes", "Last."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "kanban_") {
+		t.Errorf("kept the marker:\n%s", got)
 	}
 }
 
@@ -476,6 +533,18 @@ func TestReplaceFileReferences(t *testing.T) {
 		{"untagged block",
 			"```\n$ python3 /opt/data/scripts/r.py\n```",
 			"```\n$ python3 " + shippedFileArg + "\n```"},
+		{"attached long flag",
+			"```bash\nkubectl apply --filename=assets/x.yaml\n```",
+			"```bash\nkubectl apply --filename=" + shippedFileArg + "\n```"},
+		{"attached short flag",
+			"```bash\nkubectl apply -f=./assets/x.yaml\n```",
+			"```bash\nkubectl apply -f=" + shippedFileArg + "\n```"},
+		{"comma list",
+			"```bash\nkubectl apply -f assets/a.yaml,assets/b.yaml\n```",
+			"```bash\nkubectl apply -f " + shippedFileArg + "," + shippedFileArg + "\n```"},
+		{"comma list in prose",
+			"Apply assets/a.yaml,assets/b.yaml first.",
+			"Apply " + shippedFileProse + "," + shippedFileProse + " first."},
 		{"url in a bash block",
 			"```bash\ncurl -O https://example.com/scripts/x.sh\n```",
 			"```bash\ncurl -O https://example.com/scripts/x.sh\n```"},

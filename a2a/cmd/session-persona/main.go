@@ -13,8 +13,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -70,7 +72,7 @@ func build(skillsSrc, personaSrc, out string) error {
 	if err != nil {
 		return err
 	}
-	if err := mkdir(out); err != nil {
+	if err := mkdirOut(out); err != nil {
 		return err
 	}
 	if err := writeFile(filepath.Join(out, personaFile), persona); err != nil {
@@ -97,6 +99,22 @@ func build(skillsSrc, personaSrc, out string) error {
 		}
 	}
 	return nil
+}
+
+// mkdirOut creates out if it is missing and sets its mode only then: a
+// directory the caller already has (-out /tmp, -out .) is the caller's, and
+// its mode is left as it is.
+func mkdirOut(out string) error {
+	info, err := os.Stat(out)
+	switch {
+	case err == nil && !info.IsDir():
+		return fmt.Errorf("%s is not a directory", out)
+	case err == nil:
+		return nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return err
+	}
+	return mkdir(out)
 }
 
 // mkdir and writeFile set the mode explicitly after creating, so the shipped

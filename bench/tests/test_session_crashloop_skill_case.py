@@ -154,6 +154,14 @@ def test_an_answer_without_the_oom_fails_the_grounded_check():
         _call("Glob", {"pattern": "**/*.md", "path": "/"}),
         _call("Grep", {"pattern": "OOMKilled", "path": "/home/node"}),
         _call("Read", {"file_path": "/home/node/.claude/CLAUDE.md"}),
+        # A recursive glob over the home or the root with no Markdown leaf
+        # still lists the skill files.
+        _call("Glob", {"pattern": "**/*", "path": "/home/node"}),
+        _call("Glob", {"pattern": "**", "path": "/"}),
+        _call("Glob", {"pattern": "**/SKILL*", "path": "/home/node"}),
+        _call("Glob", {"pattern": "/home/node/**"}),
+        _call("Glob", {"pattern": "/home/node/**/*"}),
+        _call("Glob", {"pattern": "~/**/kubectl"}),
     ],
 )
 def test_reading_the_skill_files_by_hand_fails(call: dict[str, Any]):
@@ -167,6 +175,7 @@ def test_other_reads_do_not_trip_the_skill_file_check():
         _call("Glob", {"pattern": "*.yaml"}),
         _call("Glob", {"pattern": "**/*.md", "path": "/scratch"}),
         _call("Grep", {"pattern": "OOMKilled", "path": "/scratch"}),
+        _call("Glob", {"pattern": "/scratch/**/*"}),
         _call("Bash", {"command": "kubectl get pods -n seeded-debug"}),
     )
     assert _status(NO_SKILL_READ, ANSWER, record) == "pass"
