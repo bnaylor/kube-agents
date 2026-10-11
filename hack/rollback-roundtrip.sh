@@ -102,15 +102,10 @@ readonly JOB_CONDITION_FAILED="Failed"
 # "cannot be scheduled onto any available node:" behind "Pod <name>", and a
 # count of nodes short of CPU or memory there is a pod an Autopilot scale-up
 # places. A message with no such count (a taint, a selector or affinity
-# only, or the RuntimeClass sentence) fails on the first read as before. The
-# agent pods carry AGENT_POD_LABEL=<cr>-gateway (platformagent_manifests.go),
-# and only for one of them can the wait end before the CR clears (see
-# assert_not_degraded), as only for one of them can the deploy's gate.
+# only, or the RuntimeClass sentence) fails on the first read as before.
 # tests/test_rollback_roundtrip.py holds these to hack/ci-deploy.sh.
 readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
 readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
-readonly UNSCHEDULABLE_POD_PREFIX="Pod "
-readonly AGENT_POD_LABEL="app"
 
 # A container waiting for one of these is not coming up on its own, and a pod
 # holding one is stuck rather than starting.
@@ -176,11 +171,14 @@ readonly DEFAULT_BRIDGE_TIMEOUT=300
 readonly DEFAULT_SETTLE_TIMEOUT=300
 # How long a not-degraded check waits out that one Degraded: hack/ci-deploy.sh's
 # window (MODE_NEXT_UNSCHEDULABLE_ATTEMPTS reads, MODE_NEXT_POLL_SECONDS
-# apart). The wait ends early when the CR stops saying Degraded, or when the
-# pod the condition names is bound to a node and the agent Deployment is
-# rolled out: the operator watches no Pods, so the scheduler placing the pod
-# wakes nothing, and the status can keep the scheduler's message until the
-# operator's next pass, up to its fifteen-minute steady-state requeue.
+# apart). Only the CR ending the Degraded ends the wait early. The operator
+# watches no Pods, so the scheduler placing a pod starts no pass, and the
+# status keeps the scheduler's message while the pod starts. But it owns
+# the agent Deployment (Owns, no predicate), so the agent pod going Ready
+# changes that Deployment's status and starts a pass that scans the pods
+# again. In periodic 2109267671341076480 the agent pod was bound at
+# 15:14:12Z, the pass its readiness started ran at 15:15:19Z, and the check
+# read the old message at about 15:15:20Z, while that pass was running.
 readonly DEFAULT_UNSCHEDULABLE_TIMEOUT=300
 # One today turn's request, and how many fresh tunnels it gets.
 readonly DEFAULT_TURN_TIMEOUT=120
@@ -693,33 +691,6 @@ degraded_baseline_summary() {
   fi
 }
 
-# The agent pod a PodUnschedulable condition names, as "<name> <node>", once
-# it is bound to a node; nothing while it is not. The pod list comes on
-# stdin. As in hack/ci-deploy.sh's gate, a pod being deleted is skipped (the
-# operator's scan skips those too), and so is one that is Failed or Succeeded
-# (an evicted pod keeps its node until pod GC). The named pod, while it is listed
-# and live, decides alone; once it is not (the rollout replaced it), the
-# first live agent pod bound to a node does.
-readonly PY_BOUND_AGENT_POD='
-import json, sys
-named, prefix = sys.argv[1], sys.argv[2]
-live = []
-for pod in json.load(sys.stdin).get("items") or []:
-    meta, st = pod.get("metadata") or {}, pod.get("status") or {}
-    pod_name = meta.get("name", "")
-    if not pod_name.startswith(prefix) or meta.get("deletionTimestamp") or st.get("phase") in ("Failed", "Succeeded"):
-        continue
-    live.append((pod_name, (pod.get("spec") or {}).get("nodeName") or ""))
-pick = [p for p in live if p[0] == named] or [p for p in live if p[1]]
-if pick and pick[0][1]:
-    print("%s %s" % pick[0])
-'
-bound_agent_pod() {
-  local pods
-  pods="$(k_read get pods -l "${AGENT_POD_LABEL}=${AGENT_DEPLOYMENT}" -o json)" || return 0
-  printf '%s' "${pods}" | python3 -c "${PY_BOUND_AGENT_POD}" "$1" "${AGENT_DEPLOYMENT}-"
-}
-
 # Whether the CR's last read is the one Degraded the window forgives: phase
 # Degraded, Ready reason PodUnschedulable, and a capacity count in the
 # scheduler's words.
@@ -733,49 +704,29 @@ capacity_unschedulable() {
 # carry with the same reason. One Degraded phase is waited out instead of
 # failed on at once: a pod waiting for CPU or memory
 # (capacity_unschedulable), up to UNSCHEDULABLE_TIMEOUT, with a line per
-# change. The wait ends when the CR stops saying Degraded. When the pod the
-# condition names is an agent pod, it also ends once that pod is bound to a
-# node and the agent Deployment is rolled out, which is the wait the
-# condition describes being over while the status still carries it
-# (DEFAULT_UNSCHEDULABLE_TIMEOUT says why). Still there at the bound, or
-# turned into any other Degraded, it fails as before, saying what the last
-# read of the agent's pods and rollout found. A forgiven Degraded is named in
-# the PASS line.
+# change. The wait ends only when the CR stops saying Degraded, so the PASS
+# is the operator's own verdict after the pod came up, and a fault on a pod
+# its scan reaches later is read rather than hidden behind this one. Still
+# there at the bound, or turned into any other Degraded, it fails as before.
+# A forgiven Degraded is named in the PASS line.
 assert_not_degraded() {
-  local name="$1" start=$SECONDS deadline forgiven="" waited="" bound="" named rollout handoff now last=""
+  local name="$1" start=$SECONDS deadline forgiven="" waited="" last=""
   deadline=$((SECONDS + UNSCHEDULABLE_TIMEOUT))
   while :; do
     read_cr_state || fail "${name}" "the CR could not be read"
     [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ] || break
     capacity_unschedulable || fail "${name}" "$(cr_state_summary) ($(degraded_baseline_summary))"
     waited="$(cr_state_summary)"
-    handoff="the pod it names is not an agent pod, so only the CR clearing ends the wait"
-    if [[ "${CR_READY_MSG}" == "${UNSCHEDULABLE_POD_PREFIX}${AGENT_DEPLOYMENT}-"* ]]; then
-      named="${CR_READY_MSG#"${UNSCHEDULABLE_POD_PREFIX}"}"
-      bound="$(bound_agent_pod "${named%% *}")"
-      if [ -z "${bound}" ]; then
-        handoff="no live agent pod bound to a node (${named%% *} decides while it is listed)"
-      else
-        rollout="$(rollout_state deployment "${AGENT_DEPLOYMENT}")"
-        [ "${rollout}" = "ok" ] && break
-        handoff="${bound%% *} is on ${bound#* }, but deployment/${AGENT_DEPLOYMENT} is not rolled out: ${rollout}"
-        bound=""
-      fi
-    fi
     if [ "${SECONDS}" -ge "${deadline}" ]; then
-      fail "${name}" "still Degraded after ${UNSCHEDULABLE_TIMEOUT}s on a pod waiting for CPU or memory; ${handoff}: $(cr_state_summary) ($(degraded_baseline_summary))"
+      fail "${name}" "still Degraded after ${UNSCHEDULABLE_TIMEOUT}s on a pod waiting for CPU or memory: $(cr_state_summary) ($(degraded_baseline_summary))"
     fi
-    now="${CR_READY_MSG} ${handoff}"
-    if [ "${now}" != "${last}" ]; then
-      note "${name}: Degraded on a pod waiting for CPU or memory (#2414), $((SECONDS - start))s in; waiting up to ${UNSCHEDULABLE_TIMEOUT}s for it to clear (${handoff}): $(cr_state_summary)"
-      last="${now}"
+    if [ "${CR_READY_MSG}" != "${last}" ]; then
+      note "${name}: Degraded on a pod waiting for CPU or memory (#2414), $((SECONDS - start))s in; waiting up to ${UNSCHEDULABLE_TIMEOUT}s for the operator to clear it: $(cr_state_summary)"
+      last="${CR_READY_MSG}"
     fi
     sleep "${POLL_SECONDS}"
   done
-  if [ -n "${bound}" ]; then
-    note "${name}: forgiving a stale PodUnschedulable after $((SECONDS - start))s: ${bound%% *} is on ${bound#* } and deployment/${AGENT_DEPLOYMENT} is rolled out"
-    forgiven="forgave a transient PodUnschedulable on capacity: ${bound%% *} is on ${bound#* } and deployment/${AGENT_DEPLOYMENT} is rolled out, though the CR still reads phase ${CR_PHASE} (the operator watches no Pods); "
-  elif [ -n "${waited}" ]; then
+  if [ -n "${waited}" ]; then
     note "${name}: the PodUnschedulable on capacity cleared after $((SECONDS - start))s"
     forgiven="forgave a transient PodUnschedulable on capacity, cleared after $((SECONDS - start))s (was: ${waited}); "
   fi
