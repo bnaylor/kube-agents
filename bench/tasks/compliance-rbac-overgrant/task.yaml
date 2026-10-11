@@ -80,8 +80,9 @@
 # remediation pull requests, but on this fixture it opens none: check 2.4's
 # fix is `kind: manual` by the SOP, the pool repo carries no manifests (a
 # README and the declared-intent note only), so no compliance fix has a
-# declaration or directory to anchor to and every one is manual, and nothing
-# here is on the sweep's auto-open list. The case requests no pull request,
+# declaration or directory to anchor to and every one is manual. The
+# promotion sweep opens only `manifest` fixes, so it has nothing to open
+# here. The case requests no pull request,
 # which matches. On the inject lane (spec.mode next), a remediation pull
 # request opened any other way (for example a worker using submit-suggestion,
 # which the fleet-audit red lines and submit-suggestion's own description
