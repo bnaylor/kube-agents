@@ -317,6 +317,11 @@ FAKE_KUBECTL = textwrap.dedent(
                     s["unbound_node"] = pod["spec"].pop("nodeName")
         if how == "clears":
             s["unschedulable_until"] = s["tick"] + 6
+        # Other agent pods the scheduler's wait leaves beside it, and an agent
+        # rollout that has not finished.
+        s["pods"].extend(sc.get("late_pods", []))
+        if sc.get("late_rollout_stuck"):
+            s["objects"]["deployment/platform-agent-gateway"]["status"]["readyReplicas"] = 0
 
     def job(name, cond):
         conds = [] if cond == "Running" else [{"type": cond, "status": "True"}]
@@ -467,6 +472,14 @@ FAKE_KUBECTL = textwrap.dedent(
     sys.exit(main(sys.argv[1:]))
     '''
 ).lstrip()
+
+
+def capacity_message(pod: str) -> str:
+    """The operator's PodUnschedulable message for a pod short of CPU and memory."""
+    return (
+        f"Pod {pod} cannot be scheduled onto any available node: 0/3 nodes are available: "
+        "1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 Insufficient memory."
+    )
 
 
 def b64(value: str) -> str:
@@ -822,6 +835,39 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertIn("leg2.not-degraded: Degraded on a pod waiting for CPU or memory", result.stdout)
         self.assertLess(time.monotonic() - started, 60)
 
+    def test_a_bound_pod_whose_rollout_is_not_done_is_not_forgiven(self) -> None:
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_rollout_stuck=True), ROLLBACK_UNSCHEDULABLE_TIMEOUT="2"
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "platform-agent-gateway-abc is on gk3-pool-1-node-a, but deployment/platform-agent-gateway is not rolled out: 0/1 ready")
+
+    def test_the_named_pod_decides_over_a_bound_sibling(self) -> None:
+        sibling = {"metadata": {"name": "platform-agent-gateway-def", "labels": {"app": "platform-agent-gateway"}}, "spec": {"nodeName": "gk3-pool-1-node-b"}, "status": {"phase": "Running"}}
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="persistent", late_pods=[sibling]), ROLLBACK_UNSCHEDULABLE_TIMEOUT="2"
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "no live agent pod bound to a node (platform-agent-gateway-abc decides while it is listed)")
+
+    def test_a_failed_pod_that_keeps_its_node_is_not_a_hand_off(self) -> None:
+        evicted = {"metadata": {"name": "platform-agent-gateway-evicted", "labels": {"app": "platform-agent-gateway"}}, "spec": {"nodeName": "gk3-pool-1-node-b"}, "status": {"phase": "Failed"}}
+        result, _, _ = self.run_sim(
+            healthy_next_state(
+                late_unschedulable_on="next",
+                late_unschedulable="persistent",
+                late_message=capacity_message("platform-agent-gateway-old"),
+                late_pods=[evicted],
+            ),
+            ROLLBACK_UNSCHEDULABLE_TIMEOUT="2",
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "no live agent pod bound to a node")
+
+    def test_a_stale_capacity_unschedulable_on_another_pod_fails_at_the_window(self) -> None:
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_message=capacity_message("platform-agent-a2a-gateway-x")),
+            ROLLBACK_UNSCHEDULABLE_TIMEOUT="2",
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "the pod it names is not an agent pod, so only the CR clearing ends the wait")
+
     def test_an_unschedulable_that_is_not_capacity_fails_at_once(self) -> None:
         # A taint or a selector only: no scale-up places the pod.
         result, _, _ = self.run_sim(
@@ -841,6 +887,26 @@ class KeptRoundTripTest(RoundTripTest):
         )
         self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/CrashLoopBackOff")
         self.assertNotIn("waiting for CPU or memory", result.stdout)
+
+    def test_a_replaced_named_pod_hands_off_to_a_bound_sibling(self) -> None:
+        # The pod the condition names is gone (the rollout replaced it): the
+        # first live agent pod bound to a node decides.
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_message=capacity_message("platform-agent-gateway-old"))
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(x for x in result.stdout.splitlines() if x.startswith("PASS leg2.not-degraded:"))
+        self.assertIn("platform-agent-gateway-abc is on gk3-pool-1-node-a", line)
+
+    def test_a_capacity_unschedulable_on_another_pod_that_clears_is_forgiven(self) -> None:
+        # The operator scans the A2A pods too; the deploy's gate waits on a
+        # capacity message about any of them, and so does this.
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="clears", late_message=capacity_message("platform-agent-a2a-gateway-x"))
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(x for x in result.stdout.splitlines() if x.startswith("PASS leg2.not-degraded:"))
+        self.assertIn("cleared after", line)
 
     def test_provisioning_slower_than_the_ready_bound_gets_the_bus_up_budget(self) -> None:
         # Under next the CR is not Ready until the provisioning Job is done.
