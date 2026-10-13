@@ -222,17 +222,20 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		delegateSocket = workeradapter.DelegateSocketPath()
 	}
 	return workeradapter.Config{
-		NATSURL:        natsURL,
-		NATSUser:       os.Getenv("NATS_USER"),
-		NATSPassword:   os.Getenv("NATS_PASSWORD"),
-		BusTokenFile:   busTokenFile(),
-		PodName:        os.Getenv(lib.EnvPodName),
-		TaskID:         taskID,
-		Profile:        profile,
-		Session:        os.Getenv("A2A_SESSION"),
-		Namespace:      namespace,
-		Scope:          scope,
-		DelegateSocket: delegateSocket,
+		NATSURL:      natsURL,
+		NATSUser:     os.Getenv("NATS_USER"),
+		NATSPassword: os.Getenv("NATS_PASSWORD"),
+		BusTokenFile: busTokenFile(),
+		PodName:      os.Getenv(lib.EnvPodName),
+		TaskID:       taskID,
+		Profile:      profile,
+		Session:      os.Getenv("A2A_SESSION"),
+		Primer:       readPrimer(log),
+		// Literal "true" only, like EnvClusterView.
+		ProfileExecutor: os.Getenv(lib.EnvProfileExecutor) == "true",
+		Namespace:       namespace,
+		Scope:           scope,
+		DelegateSocket:  delegateSocket,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a
@@ -475,4 +478,24 @@ func envDuration(key string, defSeconds int) time.Duration {
 		fmt.Fprintf(os.Stderr, "ignoring bad %s=%q\n", key, v)
 	}
 	return time.Duration(defSeconds) * time.Second
+}
+
+// readPrimer reads the conversation so far from the file the spawner mounts
+// (lib.EnvPrimerFile). Unset or missing is a first turn, not an error: a pod
+// from a spawner older than the mount, or one started by hand. A read error
+// is logged and the turn runs without it, since a turn with no context
+// beats no turn.
+func readPrimer(log *slog.Logger) string {
+	path := os.Getenv(lib.EnvPrimerFile)
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- the spawner's own mount path
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn("could not read the transcript primer; this turn runs without the conversation so far", "path", path, "error", err)
+		}
+		return ""
+	}
+	return string(b)
 }

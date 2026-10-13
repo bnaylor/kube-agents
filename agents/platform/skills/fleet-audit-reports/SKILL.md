@@ -22,7 +22,7 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`.
+`document`, and sometimes `ledger_document`, `inspect_s`, `publish_s` and `collect_s`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
@@ -39,6 +39,9 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   key existed lack it; read their counts as they are. `streams` and `show` carry it.
 - `current_ids` is exactly what the body's hidden block published: the findings the body rendered
   plus the ids the collector held. Derive this run's full set from `document`.
+- `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
+  publish, and for the collector to run. An envelope has only the ones `finish` could measure.
+  `show` gives them, with null for the others; `streams` does not carry them.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
   run, not something to answer from. No subcommand returns it.
 
@@ -75,7 +78,9 @@ object per call.
   Arguments that do not parse are the exception: argparse prints usage to stderr and stdout is
   empty. Every answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
   unreadable; its other rows still stand — report them and name the unreadable ones.
-- Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
+- Every subcommand but `streams` takes `--repo`, the repository as the managed list or the `repos`
+  list names it: `owner/name` (or `github.com/owner/name`) on GitHub, `<host>/<path>` for a
+  repository on another forge. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
   `repos` to choose from — ask which, or run once per repository, never pick one silently.
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run:
@@ -89,8 +94,8 @@ object per call.
   `not_applicable_matched`, `not_applicable_returned` and `not_applicable_truncated`; `diff` caps
   `added` and `resolved` independently and reports `added_total`, `resolved_total`, `unchanged` and
   `truncated` — quote `added_total`, not the length of `added`. Findings sort severity-first, so a
-  cap drops only the least severe; `checks` keeps the document's order, so a capped answer lines up
-  with the issue's table.
+  cap drops only the least severe; `checks` keeps the document's order, one row per cluster and
+  check, while the issue's table groups clusters that ran the same command into one row.
 - `--root` overrides the store root. In the pod, leave it alone.
 
 ## The four questions this gets asked

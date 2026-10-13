@@ -1117,7 +1117,10 @@ class GitHardeningTest(unittest.TestCase):
         self.append_repository_config(
             repository, "\n[help]\n\tautocorrect = immediate\n"
         )
-        self.assertIsNone(git_argument_violation(["git", "bisct", "run", "x"]))
+        # Under the subcommand allowlist, `bisct` is refused at the argument gate
+        # as unsupported. Even if reached by an executor, autocorrection is pinned
+        # to 0 so the command fails rather than executing.
+        self.assertIsNotNone(git_argument_violation(["git", "bisct", "run", "x"]))
         result = executor.execute(
             ["git", "bisct", "run", str(self.payload)], cwd=str(repository)
         )
@@ -1433,8 +1436,157 @@ class GitHardeningTest(unittest.TestCase):
             git_argument_violation(["git", "config", "user.email", "a@b.invalid"])
         )
         self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name", "bot"])
+        )
+        self.assertIsNone(
             git_argument_violation(["git", "config", "--get", "remote.origin.url"])
         )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "-l"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--show-origin", "--get", "remote.origin.url"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--add", "user.name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--unset", "user.email"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name"])
+        )
+        # Writing unapproved keys repo-locally is also refused.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "core.pager", "sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "alias.foo", "bar"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--unset", "core.pager"])
+        )
+        # Trailing query flags after positional arguments do not bypass write restrictions.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "diff.external", "payload", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--show-origin", "core.pager", "sh"])
+        )
+        # Subcommand-slot anchoring: `--namespace config` cannot spoof the config start,
+        # and a pathspec or `-C` directory named `config` is not mistaken for `git config`.
+        self.assertIsNotNone(
+            git_argument_violation(
+                ["git", "--namespace", "config", "--namespace", "user.name", "config", "alias.zz", "!sh"]
+            )
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "add", "--", "config", "a.yaml", "b.yaml"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "-C", "config", "config", "user.name", "bot"])
+        )
+        # git >= 2.46 subverbs, case-insensitive keys, -t / --blob options, and abbreviated write flags.
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "get", "user.name"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "set", "user.name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "unset", "user.email"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "User.Name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "-t", "int", "core.packedGitLimit"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--blob", "HEAD:.gitmodules", "--list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "get", "--url", "https://h", "http.sslVerify"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "set", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "unset", "core.pager"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--unset-a", "core.pager"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--remove-s", "remote.origin"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--rename-s", "user", "other"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--edit"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "-e"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--expiry-date", "alias.zz", "now"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--expiry-date", "user.name"])
+        )
+        # --attr-source is skipped by _git_plan and refused by git_argument_violation.
+        self.assertEqual(
+            ("difftool", []),
+            credential_proxy._git_plan(["git", "--attr-source", "status", "difftool"]),
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "difftool"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "config", "alias.zz", "!sh"])
+        )
+
+    def test_unsupported_git_subcommands_are_refused(self):
+        for argv in (
+            ["git", "foobar"],
+            ["git", "custom-verb"],
+            ["git", "x"],
+            ["git", "gc"],
+            ["git", "archive"],
+            ["git", "-C", "/tmp", "not-a-subcommand"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_supported_git_subcommands_are_allowed(self):
+        for argv in (
+            ["git", "status"],
+            ["git", "diff"],
+            ["git", "log"],
+            ["git", "branch"],
+            ["git", "cat-file", "-t", "HEAD"],
+            ["git", "describe", "--tags"],
+            ["git", "rev-list", "-n", "1", "--all"],
+            ["git", "rev-parse", "HEAD"],
+            ["git", "version"],
+            ["git", "--version"],
+            ["git", "-v"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
 
     def test_alias_configuration_and_repo_local_execution_are_refused(self):
         # Configuring aliases via git config is refused by git_argument_violation (#1498).
@@ -2071,6 +2223,17 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
         self.assertEqual("git.argument.refused", body["rule"])
+
+    def test_an_unallowlisted_builtin_subcommand_comes_back_as_a_policy_block(self):
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {"argv": ["git", "gc"], "cwd": str(workspace)}
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("blocked", body["status"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.argument.refused", body["rule"])
+        self.assertIn("subcommand is not supported by the credential proxy", body["message"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
@@ -4879,6 +5042,22 @@ class CommandExecutorTest(unittest.TestCase):
             self.assertNotIn(name, environment)
             self.assertNotIn(value, environment.values())
 
+    def test_git_environment_excludes_unrelated_credentials(self):
+        executor = self.executor(max_output_bytes=1 << 16)
+        environment = self.git_environment(executor)
+        self.assertNotIn("KUBECONFIG", environment)
+        self.assertNotIn("CLOUDSDK_CONFIG", environment)
+
+    def test_kubectl_environment_excludes_gh_config_dir(self):
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=1 << 16), body="env"
+        )
+        environment = self.dumped_environment(
+            executor.execute(["kubectl", "get", "pods"])
+        )
+        self.assertNotIn("GH_CONFIG_DIR", environment)
+        self.assertIn("KUBECONFIG", environment)
+
     def test_bootstrap_prepares_profile_for_later_commands(self):
         import os
 
@@ -6493,9 +6672,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         reservations = []
         real_reserve = executor.reserve_child_memory
 
-        def spy_reserve(caller=None, yield_when=None, deadline=None):
-            reservations.append({"yield_when": yield_when, "deadline": deadline})
-            return real_reserve(caller=caller, yield_when=yield_when, deadline=deadline)
+        def spy_reserve(caller=None, yield_when=None, deadline=None, queued_at=None):
+            reservations.append({"yield_when": yield_when, "deadline": deadline, "queued_at": queued_at})
+            return real_reserve(
+                caller=caller, yield_when=yield_when, deadline=deadline, queued_at=queued_at
+            )
 
         yield_deadlines = []
         real_await = executor._await_covered_refreshers
@@ -6516,6 +6697,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(yield_deadlines))
         self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
         self.assertIsNotNone(reservations[1]["yield_when"])
+        # The second leg is handed the first's arrival, so the one admission
+        # is observed from it; the first measures its own.
+        self.assertIsNone(reservations[0]["queued_at"])
+        self.assertIsNotNone(reservations[1]["queued_at"])
+        self.assertLessEqual(reservations[1]["queued_at"], reservations[1]["deadline"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
         # Reworded for the leg it ran on: stepped aside, with the budget's
         # figures, never `_admit`'s text naming the full wait bound.
@@ -7231,6 +7417,27 @@ class SlackRelayTest(unittest.TestCase):
         """
         relay = self.relay()
         for method in ("chat.delete", "conversations.kick", "conversations.archive", "files.remove"):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call("T123", method, {})
+
+    def test_removing_the_bots_own_reaction_is_the_one_remove_that_passes(self):
+        """`reactions.remove` takes off only the token's own reaction.
+
+        The exemption is the exact method name. Every other `*.remove` and
+        `*.delete` is still refused, and so is a case variant of the exempt
+        name: the verb rule case-folds, the exemption does not.
+        """
+        relay = self.relay()
+        self.assertTrue(relay.api_call("T123", "reactions.remove", {})["ok"])
+        for method in (
+            "chat.delete",
+            "bookmarks.remove",
+            "pins.remove",
+            "Reactions.Remove",
+            "reactions.REMOVE",
+            " reactions.remove",
+        ):
             with self.subTest(method=method):
                 with self.assertRaises(ValueError):
                     relay.api_call("T123", method, {})
@@ -8959,6 +9166,144 @@ class VcsRouteTest(unittest.TestCase):
             credential_proxy.build_vcs_broker(overlapping)
 
 
+class ContentWorkspaceOnGitLabTest(unittest.TestCase):
+    """The content workspace end to end on a real two-forge registry: the real
+    locate, the real credential selector, the real token-file credential, and
+    a store recording every git call it makes."""
+
+    TOKEN = "glpat-SENTINEL-must-never-appear"
+
+    def setUp(self):
+        import content_workspace
+        self.cw = content_workspace
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name)
+        token = self.base / "token"
+        token.write_text(self.TOKEN)
+        path = self.base / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(token), "allowedPaths": ["acme"]},
+        ]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            self.registry = credential_proxy.providers.Registry()
+        self.managed = {"gitlab:gitlab.com/acme/infra", "github:github.com/acme/fleet"}
+        self.context = {"gitlab:gitlab.com/acme/notes"}
+        for patcher in (
+            mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry),
+            mock.patch.object(credential_proxy, "managed_repositories", side_effect=lambda: frozenset(self.managed)),
+            mock.patch.object(credential_proxy, "context_repositories", side_effect=lambda: frozenset(self.context)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        (self.base / "data").mkdir()
+        self.calls = []
+
+        def runner(argv, cwd, config=()):
+            self.calls.append((list(argv), tuple(config)))
+            result = types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+            if "diff" in argv and "--cached" in argv:
+                result.exit_code = 1
+            return result
+
+        self.store = content_workspace.ContentWorkspaceStore(
+            self.base / "trees", self.base / "data", runner,
+            credential_for=lambda repo: credential_proxy._workspace_credential(self.registry, repo),
+            locate=credential_proxy._workspace_locate,
+        )
+
+    def _config_of(self, subcommand):
+        return [config for argv, config in self.calls if argv[1] == subcommand]
+
+    def _commit(self, handle):
+        self.store.commit(
+            handle, "platform-agent/change", "feat: a change",
+            [self.cw.Change(self.cw.repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+        )
+
+    def test_a_managed_gitlab_clone_carries_the_helper_scoped_to_its_host_and_never_the_token(self):
+        workspace = self.store.open("gitlab.com/acme/infra")
+        clone = next(argv for argv, _ in self.calls if argv[1] == "clone")
+        self.assertIn("https://gitlab.com/acme/infra.git", clone)
+        config = dict(self._config_of("clone")[0])
+        self.assertEqual("", config["credential.helper"])
+        self.assertIn("credential.https://gitlab.com.helper", config)
+        self.assertNotIn(self.TOKEN, json.dumps(self.calls))
+        self.assertEqual("gitlab.com/acme/infra", workspace.repo)
+
+    def test_a_context_gitlab_repository_never_gets_the_write_token(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            workspace = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual([()], self._config_of("clone"))
+        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
+        self.assertIn("presents none", "\n".join(logs.output))
+
+    def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
+        with self.assertRaises(self.cw.ContentWorkspaceError):
+            self.store.open("gitlab.com/other/infra")
+        self.assertEqual([], self._config_of("clone"))
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="gitlab.com/other/infra")
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(store, "h")
+
+    def test_a_forge_the_install_names_but_has_no_credential_for_is_refused(self):
+        path = self.base / "github-only.json"
+        path.write_text(json.dumps({"forges": [{"provider": "github", "host": "github.com"}]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            github_only = credential_proxy.providers.Registry()
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=github_only):
+            for refused in ("gitlab.com/acme/infra", "evil.example.com/acme/infra"):
+                with self.subTest(refused=refused):
+                    with self.assertRaises(self.cw.ContentWorkspaceError):
+                        credential_proxy._workspace_locate(refused)
+
+    def test_a_stored_token_is_withdrawn_when_the_repository_is_unregistered_after_open(self):
+        workspace = self.store.open("gitlab.com/acme/infra")
+        self.managed.discard("gitlab:gitlab.com/acme/infra")
+        self.calls.clear()
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(self.store, workspace.handle)
+        self._commit(workspace.handle)
+        self.assertEqual([()], self._config_of("fetch"))
+
+    def test_a_gitlab_push_carries_the_helper_and_a_github_push_carries_nothing(self):
+        gitlab = self.store.open("gitlab.com/acme/infra")
+        self._commit(gitlab.handle)
+        self.calls.clear()
+        self.store.push(gitlab.handle, "platform-agent/change")
+        self.assertIn("credential.https://gitlab.com.helper", dict(self._config_of("push")[0]))
+        github = self.store.open("acme/fleet")
+        self.assertIsInstance(github.credential, credential_proxy.providers.NoCredential)
+        self._commit(github.handle)
+        self.calls.clear()
+        self.store.push(github.handle, "platform-agent/change")
+        self.assertEqual([()], self._config_of("push"))
+
+    def test_a_github_handle_opened_as_context_pushes_on_the_ambient_credential(self):
+        # Review: push carried the read mint's layer, which clears
+        # `credential.helper`, so a repository promoted to managed after `open`
+        # pushed with no credential at all.
+        from providers.credentials import MintedReadCredential
+        import content_workspace
+        mint = MintedReadCredential("github", lambda provider, repo: "ghs_minted", "github.com")
+        store = content_workspace.ContentWorkspaceStore(
+            self.base / "trees2", self.base / "data",
+            lambda argv, cwd, config=(): self.calls.append((list(argv), tuple(config)))
+            or types.SimpleNamespace(exit_code=1 if ("diff" in argv and "--cached" in argv) else 0, stdout="", stderr=""),
+            credential_for=lambda repo: mint,
+        )
+        workspace = store.open("acme/tf-live")
+        store.commit(
+            workspace.handle, "platform-agent/change", "feat: a change",
+            [content_workspace.Change(content_workspace.repo_relative("m.yaml"), b"x\n")],
+        )
+        self.calls.clear()
+        store.push(workspace.handle, "platform-agent/change")
+        self.assertEqual([()], self._config_of("push"))
+
+
 class TwoForgeInstallTest(unittest.TestCase):
     """Review: an install serving GitHub and GitLab has no one forge to default
     to, and the callers that held a bare GitHub name stopped working on it."""
@@ -8987,6 +9332,36 @@ class TwoForgeInstallTest(unittest.TestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_the_workspace_locates_a_host_qualified_repository_through_its_forge(self):
+        self.assertEqual(
+            ("gitlab.com/acme/infra", "https://gitlab.com/acme/infra.git"),
+            credential_proxy._workspace_locate("gitlab.com/acme/infra"),
+        )
+        # GitHub's comes back as the bare name the store keys it by.
+        self.assertEqual(
+            ("acme/infra", "https://github.com/acme/infra.git"),
+            credential_proxy._workspace_locate("github.com/acme/infra"),
+        )
+        import content_workspace
+        for refused in ("evil.example.com/acme/infra", "bitbucket.org/acme/infra"):
+            with self.subTest(refused=refused):
+                with self.assertRaises(content_workspace.ContentWorkspaceError):
+                    credential_proxy._workspace_locate(refused)
+
+    def test_a_workspace_write_to_a_gitlab_repository_asks_that_forges_list(self):
+        import content_workspace
+        store = mock.Mock()
+        managed = frozenset({"gitlab:gitlab.com/acme/infra"})
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed):
+            store.get.return_value = mock.Mock(repo="gitlab.com/acme/infra")
+            credential_proxy.require_managed_workspace(store, "h")
+            store.get.return_value = mock.Mock(repo="gitlab.com/acme/other")
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                credential_proxy.require_managed_workspace(store, "h")
+            store.get.return_value = mock.Mock(repo="evil.example.com/acme/infra")
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                credential_proxy.require_managed_workspace(store, "h")
 
     def test_a_workspace_write_to_a_managed_github_repository_still_passes(self):
         store = mock.Mock()
@@ -9051,6 +9426,44 @@ class TwoForgeInstallTest(unittest.TestCase):
         handler._handle_forge_refresh()
         self.assertEqual([("github", "acme/infra")], calls)
         self.assertEqual(HTTPStatus.OK, replies[-1][0])
+
+    def test_the_lift_reads_hostless_as_the_parser_does_and_needs_one_forge(self):
+        # Review (#2439): `_hosted` counted slashes, and took the first forge
+        # carrying the provider.
+        self.assertEqual("https://github.com/acme/infra", credential_proxy._hosted("acme/infra.git", "github"))
+        self.assertEqual("github.com/acme", credential_proxy._hosted("github.com/acme", "github"))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+            {"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/u", "allowedPaths": []},
+        ]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            two = credential_proxy.providers.Registry()
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=two):
+            self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "gitlab"))
+
+    def test_a_pin_is_one_repository_on_one_forge_however_the_paths_coincide(self):
+        # The pinned base names its host: on a broker serving GitHub and GitLab,
+        # `acme/infra` on each is a different repository with its own base, a
+        # nested GitLab path pins as the forge reads it, and `www.gitlab.com`
+        # is gitlab.com.
+        pins = credential_proxy.parse_pinned_bases(json.dumps([
+            {"repository": "https://github.com/acme/infra", "branch": "release"},
+            {"repository": "https://gitlab.com/acme/infra", "branch": "main"},
+            {"repository": "https://www.gitlab.com/acme/platform/fleet", "branch": "stable"},
+        ]))
+        self.assertEqual({
+            ("github.com", "acme/infra"): "release",
+            ("gitlab.com", "acme/infra"): "main",
+            ("gitlab.com", "acme/platform/fleet"): "stable",
+        }, pins)
+        pinned = credential_proxy.providers.pinned_base
+        self.assertEqual("release", pinned(pins, "github.com", "acme/infra"))
+        self.assertEqual("main", pinned(pins, "gitlab.com", "acme/infra"))
+        self.assertEqual("stable", pinned(pins, "gitlab.com", "acme/platform/fleet"))
+        self.assertIsNone(pinned(pins, "github.com", "acme/platform/fleet"))
 
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()
@@ -9224,6 +9637,15 @@ class WorkspaceRouteTest(unittest.TestCase):
         handler.workspaces = store
         handler._workspace_route(route, payload)
         return store
+
+    def test_open_passes_a_host_qualified_name_to_the_store_and_still_refuses_a_bad_slug(self):
+        import content_workspace
+        store = self._route("open", {"repo": "gitlab.com/acme/platform/infra"})
+        store.open.assert_called_once_with("gitlab.com/acme/platform/infra", None, None, None, caller=None)
+        for bad in ("acme/..", "", None, 7):
+            with self.subTest(bad=bad):
+                with self.assertRaises(content_workspace.ContentWorkspaceError):
+                    self._route("open", {"repo": bad})
 
     def test_open_hands_the_caller_label_to_the_store(self):
         store = self._route("open", {"repo": "acme/fleet", "caller": "t_f660e9c5"})
