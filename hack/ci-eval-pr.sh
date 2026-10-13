@@ -628,7 +628,9 @@ report_partial_verdict() {
 # was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
 # follows it: a pod replaced mid-run starts a fresh gateway log, and the
 # pod and event watch it stops, the previous containers and the restart
-# record are what say why.
+# record are what say why. collect_litellm_log follows those: the
+# thinking-replay hook's per-request line is in the LiteLLM log alone, so a
+# green run without it cannot say whether the hook touched its traffic.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -649,6 +651,7 @@ profile_and_dump_on_exit() {
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
+  collect_litellm_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
