@@ -101,7 +101,7 @@ kubectl patch platformagent platform-agent -n kubeagents-system \
   --type=merge -p '{"metadata":{"finalizers":null}}'
 ```
 
-The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.mode: next`, the JetStream volume, so a cleared finalizer leaves them behind. A teardown that clears it also deletes the `kubeagents:minimal:…` ClusterRole and binding, but not the others or the volume. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name: `kubeagents:minimal:kubeagents-system:platform-agent` and `kubeagents:tokenreview:kubeagents-system:platform-agent`, and under `next` the callout's binding `kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent`. This removes them all:
+The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.mode: next`, the JetStream volume, so a cleared finalizer leaves them behind. A teardown that has to clear it deletes them itself: the `kubeagents:minimal:…` and `kubeagents:tokenreview:…` ClusterRoles and bindings, the callout's binding, and the JetStream volume. The loop below is for a finalizer you cleared by hand. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name: `kubeagents:minimal:kubeagents-system:platform-agent` and `kubeagents:tokenreview:kubeagents-system:platform-agent`, and under `next` the callout's binding `kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent`. This removes them all:
 
 ```bash
 for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do
