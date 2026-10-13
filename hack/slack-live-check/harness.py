@@ -117,8 +117,11 @@ FAILED_STATES = frozenset({"failed", "canceled", "rejected"})
 # relay.go relayTerminal: the notices for a task that did not complete.
 FAILURE_POST_PATTERN = re.compile(r"❌ failed: .*|❌ the task failed|🛑 canceled|🚫 the executor rejected the task(?:: .*)?", re.DOTALL)
 # gateway.go steerTask: the steer acknowledgements, and the notice when the steer
-# could not be published. Either one means the turn started no task.
+# could not be published. Any of them means the turn started no task.
+# ackSteerSession (steered into the running task) and, since #2634,
+# ackSteerQueued (queued as the session's next turn).
 STEER_ACK_PREFIX = "✏️ steering sent — "
+STEER_QUEUED_ACK = "✏️ got it, I'll take that next"
 STEER_FAILED_NOTICE = "⚠️ could not send that to the running task; it is still working on the original instruction"
 # The notices the gateway posts in place of startTask for a turn it will not run:
 # refuseAtSessionCap's "🚦 not started: … (cap N)" and "⚠️ not started: can't count…"
@@ -430,7 +433,7 @@ def classify(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith(REFUSAL_NOTICE_PREFIX):
         return KIND_REFUSAL
-    if stripped.startswith(STEER_ACK_PREFIX) or stripped == STEER_FAILED_NOTICE:
+    if stripped.startswith(STEER_ACK_PREFIX) or stripped in (STEER_QUEUED_ACK, STEER_FAILED_NOTICE):
         return KIND_STEER
     state = status_state(stripped)
     if state:

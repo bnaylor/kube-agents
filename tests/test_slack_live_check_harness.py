@@ -1307,6 +1307,8 @@ class UnitTest(unittest.TestCase):
         for notice in NOT_STARTED_NOTICES:
             self.assertEqual(harness.classify(notice), harness.KIND_NOT_STARTED, notice)
         self.assertEqual(harness.classify("✏️ steering sent — the worker picks it up"), harness.KIND_STEER)
+        # The queued acknowledgement (#2634) is a steer too, not the bot's answer.
+        self.assertEqual(harness.classify("✏️ got it, I'll take that next"), harness.KIND_STEER)
         for failure in ("🚫 *rejected*", "❌ *failed* — the pod died", "🛑 *canceled*", "❌ could not reach the bus; try again",
                         "❌ failed: the executor is down", "❌ the task failed", "🛑 canceled",
                         "🚫 the executor rejected the task", "🚫 the executor rejected the task: no capability"):
@@ -1326,7 +1328,11 @@ class UnitTest(unittest.TestCase):
         # Main moved the notice into a constant; pin the constant and its use.
         self.assertIn(f'const noticeSteerNotSent = "{harness.STEER_FAILED_NOTICE}"', gateway)
         self.assertIn("g.post(rec.Key, noticeSteerNotSent)", gateway)
-        self.assertIn('g.post(rec.Key, "✏️ steering sent — ', gateway)
+        # Since #2634 both steer acknowledgements are constants; pin them by name.
+        self.assertRegex(gateway, r'ackSteerSession\s*=\s*"' + re.escape(harness.STEER_ACK_PREFIX))
+        self.assertRegex(gateway, r'ackSteerQueued\s*=\s*"' + re.escape(harness.STEER_QUEUED_ACK) + '"')
+        self.assertIn("g.post(rec.Key, ackSteerSession)", gateway)
+        self.assertIn("g.post(rec.Key, ackSteerQueued)", gateway)
         self.assertIn('line := fmt.Sprintf("%s **%s**", icon, label)', relay)
         self.assertIn('line := fmt.Sprintf("%s **%s**", icon, state)', relay)
         self.assertEqual(relay.count('line += " — " + progress'), 2)
