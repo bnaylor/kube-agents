@@ -107,7 +107,7 @@ kubectl -n argocd exec argocd-application-controller-0 -- argocd-k8s-auth gcp
 
 You want an `ExecCredential` containing a token. A `Permission 'iam.serviceAccounts.getAccessToken' denied` immediately after granting the binding is usually propagation lag — check with `gcloud iam service-accounts get-iam-policy` and retry rather than granting more.
 
-The binding is at the **project** level deliberately. That is what lets the Platform Agent oversee _any_ cluster in the project, including clusters that do not exist yet: a cluster created next month is already reachable, with no new IAM. Registering it becomes a single credential-free manifest holding only its API endpoint and public CA:
+The binding is at the **project** level deliberately. That is what lets the Platform Agent oversee _any_ cluster in the project, including clusters that do not exist yet: a cluster created next month needs no new IAM. Registering it becomes a single credential-free manifest holding only its API endpoint and public CA:
 
 ```yaml
 apiVersion: v1
@@ -134,6 +134,31 @@ stringData:
 ```
 
 Both values come from `gcloud container clusters describe CLUSTER_NAME --region REGION --format='value(endpoint)'` and `--format='value(masterAuth.clusterCaCertificate)'`. Because the file carries no credential, it is safe to commit — which means cluster registration itself becomes a reviewable pull request, and an `ApplicationSet` with a cluster generator selecting on `gitops-role: workload` can deploy to each registered cluster automatically.
+
+### A cluster created in the same pull request
+
+The endpoint and CA exist only once the cluster does, so a Secret in this form cannot ride in the pull request that creates its cluster. Workloads for that cluster wait for a second pull request. To register the cluster in the same one, address it through [Connect Gateway](https://docs.cloud.google.com/kubernetes-engine/enterprise/multicluster-management/gateway/using) instead, whose URL is built from values known up front:
+
+1. Register the cluster to the fleet in the same pull request: the cluster's Terraform `fleet` block, or a Config Connector `GKEHubMembership` (the layout README's [Reconciler](https://github.com/gke-labs/kube-agents/blob/main/examples/gitops-repo/README.md#reconciler) section shows one).
+2. Grant the ArgoCD service account a Connect Gateway role (`roles/gkehub.gatewayReader` for reads, `roles/gkehub.gatewayEditor` to apply), alongside the cluster-access role above.
+3. Point the Secret's `server` at the gateway and leave `caData` empty, as the kubeconfig `gcloud` generates for the gateway does.
+
+```yaml
+stringData:
+  name: CLUSTER_NAME
+  server: https://connectgateway.googleapis.com/v1/projects/PROJECT_NUMBER/locations/global/gkeMemberships/CLUSTER_NAME
+  config: |
+    {
+      "execProviderConfig": {
+        "command": "argocd-k8s-auth",
+        "args": ["gcp"],
+        "apiVersion": "client.authentication.k8s.io/v1beta1"
+      },
+      "tlsClientConfig": { "insecure": false, "caData": "" }
+    }
+```
+
+The membership name defaults to the cluster name. For a regional membership, both the host and the path carry the region: `https://REGION-connectgateway.googleapis.com/v1/projects/PROJECT_NUMBER/locations/REGION/gkeMemberships/CLUSTER_NAME`. This form is documented in Google Cloud blog posts rather than in the Argo CD or GKE product docs, so test it on one cluster first. Connect Gateway also has a quota of 10 active streams per fleet host project; whether ArgoCD's watches count against it is not documented. Config Sync, the reconciler the reference layout recommends, needs neither the gateway nor this Secret.
 
 ## Provision cloud resources from the same repo
 

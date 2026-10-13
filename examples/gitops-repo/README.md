@@ -23,7 +23,11 @@ gitops-repo/
 - **Propose** (`submit-suggestion`): branch `<tier>-agent/<change_type>-<target>` → stage only
   targeted files (never `git add .`) → Conventional Commit → PR.
 - **Apply:** on merge, the **customer's CI/CD** applies changed paths — `kubectl apply` for K8s/KCC
-  YAML, `terraform apply` for HCL. kube-agents never calls cluster/cloud APIs directly.
+  YAML, `terraform apply` for HCL. kube-agents never calls cluster/cloud APIs directly. A pipeline
+  that only runs `kubectl apply` renders no Helm chart, so on such a repo the agent can propose
+  Kubernetes and KCC YAML and Terraform, but cannot install a third-party chart on any cluster. Asked
+  for a new cluster with a chart on it, it proposes the cluster and its cloud resources and stops on
+  the chart, naming the missing reconciler. [Reconciler](#reconciler) below is the recommended fix.
 - **Review gate:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/namespaces/**`,
   `**/policy/**`, `knowledge/**` and `.kube-agents/**` require human review (see `CODEOWNERS.example` —
   copy to `CODEOWNERS` and fill in real teams when forking) + the security review gate (06 §7).
@@ -65,5 +69,120 @@ gitops-repo/
   chart via `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents --version 1.2.0`, container
   images via `1.2.0` tags — never `:latest` or a branch ref. Canonical rules:
   [release versioning & promotion](../../docs/site/src/content/docs/deploy/release-versioning.md).
+
+## Reconciler
+
+Recommended: **Config Sync on every cluster, enrolled through Config Connector**, with the pipeline
+above still applying `provisioning/` and `fleet/` where Config Connector runs. It renders Helm charts,
+and it can take on a cluster created in the same pull request, because every object that enrolls the
+cluster names it by values known before it exists: project, location and cluster name.
+
+Once per fleet, in `fleet/`, turn the feature on:
+
+```yaml
+apiVersion: gkehub.cnrm.cloud.google.com/v1beta1
+kind: GKEHubFeature
+metadata:
+  name: configmanagement
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  projectRef:
+    external: projects/PROJECT_ID
+  location: global
+  resourceID: configmanagement # must be exactly this
+```
+
+Per cluster, in `clusters/<cluster>/provisioning/` beside its `ContainerCluster`, register it to the
+fleet and point Config Sync at the cluster's `namespaces/` directory:
+
+```yaml
+apiVersion: gkehub.cnrm.cloud.google.com/v1beta1
+kind: GKEHubMembership
+metadata:
+  name: CLUSTER_NAME
+  annotations:
+    cnrm.cloud.google.com/project-id: PROJECT_ID
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  location: global
+  authority: # fleet Workload Identity; the issuer uses the cluster's own location
+    issuer: https://container.googleapis.com/v1/projects/PROJECT_ID/locations/LOCATION/clusters/CLUSTER_NAME
+  endpoint:
+    gkeCluster:
+      resourceRef:
+        name: CLUSTER_NAME # the ContainerCluster in this directory
+---
+apiVersion: gkehub.cnrm.cloud.google.com/v1beta1
+kind: GKEHubFeatureMembership
+metadata:
+  name: CLUSTER_NAME-configsync
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  projectRef:
+    external: projects/PROJECT_ID
+  location: global
+  membershipLocation: global
+  membershipRef:
+    name: CLUSTER_NAME
+  featureRef:
+    name: configmanagement
+  configmanagement:
+    configSync:
+      sourceFormat: unstructured
+      git:
+        syncRepo: https://github.com/ORG/REPO
+        syncBranch: main
+        policyDir: clusters/CLUSTER_NAME/namespaces
+        secretType: token # or ssh; none for a public repo
+```
+
+`policyDir` is `namespaces/`, not the cluster's whole directory: Config Sync applies every YAML file
+under it, and `provisioning/` holds Config Connector objects the cluster itself cannot apply. With
+`token` or `ssh`, the cluster also needs the Git credential Config Sync reads, created out of band
+rather than committed.
+
+A chart then goes in the cluster's `namespaces/config-management-system/` directory as a `RootSync`
+with a Helm source. Config Sync supports a `RootSync` declared in a repository another `RootSync`
+syncs:
+
+```yaml
+apiVersion: configsync.gke.io/v1beta1
+kind: RootSync
+metadata:
+  name: cert-manager
+  namespace: config-management-system
+spec:
+  sourceType: helm
+  sourceFormat: unstructured
+  helm:
+    repo: https://charts.jetstack.io
+    chart: cert-manager
+    version: CHART_VERSION # pin it
+    releaseName: cert-manager
+    namespace: cert-manager
+    auth: none # a public chart
+    includeCRDs: true
+```
+
+Config Sync renders the chart with `helm template`, so chart hooks do not run. A Terraform repository
+reaches the same result with the cluster's `fleet` block and a `google_gke_hub_feature_membership`,
+the pattern [Google's Config Sync install guide](https://docs.cloud.google.com/kubernetes-engine/config-sync/docs/how-to/installing-config-sync)
+documents.
+
+Two other reconcilers can also target a cluster created in the same pull request:
+
+- **Flux 2.7 or later**, hub and spoke: a `ConfigMap` with `provider: gcp` and
+  `cluster: projects/PROJECT_ID/locations/LOCATION/clusters/CLUSTER_NAME`, referenced from the
+  `Kustomization` or `HelmRelease` with `spec.kubeConfig.configMapRef`. Flux looks the endpoint and CA
+  up after the cluster exists, and uses the IP endpoint.
+- **Argo CD through Connect Gateway**: see
+  [GitOps with Argo CD](../../docs/site/src/content/docs/deploy/gitops-argocd.md#a-cluster-created-in-the-same-pull-request).
+
+Argo CD clusters registered by endpoint and CA, and a Terraform `helm` provider configured from a
+cluster created in the same apply, cannot: both need values that exist only after the cluster does.
+The Platform Agent follows whichever form the repository already uses for its other clusters, and
+stops rather than introduce one.
 
 `cluster-a/` and its `namespaces/team-x/` are illustrative scaffolding, not a live target.
