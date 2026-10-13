@@ -37,7 +37,7 @@ RECEIPT = (
 # own table is deliberately absent: the module creates it on first write, and
 # a board that predates the patch must read as "no children" (fail-open).
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER);
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
@@ -56,14 +56,14 @@ def board(path):
     conn.row_factory = sqlite3.Row
     conn.executescript(BOARD_SCHEMA)
     conn.execute(
-        "INSERT INTO tasks VALUES (?, 'running', NULL)", (DELEGATION_CARD,)
+        "INSERT INTO tasks (id, status, result) VALUES (?, 'running', NULL)", (DELEGATION_CARD,)
     )
     conn.commit()
     return conn
 
 
 def add_card(conn, task_id, status="running"):
-    conn.execute("INSERT INTO tasks VALUES (?, ?, NULL)", (task_id, status))
+    conn.execute("INSERT INTO tasks (id, status, result) VALUES (?, ?, NULL)", (task_id, status))
     conn.commit()
 
 
@@ -465,6 +465,24 @@ class TestTheDependencyBlock(Fixture):
         self.link("t_sibling", "t_agg")
         self.assertIsNotNone(self.block())
 
+    def test_a_card_this_worker_no_longer_runs_is_left_to_upstream(self):
+        """A released or reassigned claim: block_task reports the block
+        didn't land, rather than the worker being told it holds the card."""
+        self.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (DELEGATION_CARD,))
+        self.assertIsNone(self.block())
+
+    def test_another_runs_card_is_left_to_upstream(self):
+        self.conn.execute("UPDATE tasks SET current_run_id = 8 WHERE id = ?", (DELEGATION_CARD,))
+        self.assertIsNone(refuse_idle_dependency_block(DELEGATION_CARD, "dependency", self.conn, 7))
+        self.assertIsNotNone(refuse_idle_dependency_block(DELEGATION_CARD, "dependency", self.conn, 8))
+
+    def test_the_refusal_says_a_linked_successor_runs_after_completion(self):
+        add_card(self.conn, "t_next_stage", status="todo")
+        self.event("t_next_stage", "created")
+        self.event(DELEGATION_CARD, "claimed")
+        self.link(DELEGATION_CARD, "t_next_stage")
+        self.assertIn("complete this card and it starts", self.block())
+
     def test_a_read_error_lets_the_block_through(self):
         broken = mock.Mock()
         broken.execute.side_effect = sqlite3.OperationalError("database is locked")
@@ -540,9 +558,9 @@ class TestTheApplier(unittest.TestCase):
     def test_the_dependency_gate_runs_just_before_block_task(self):
         self.applier.apply(self.tmp)
         out = self.patched()
-        self.assertIn("_refuse_idle_dependency_block(tid, kind, conn)", out)
+        self.assertIn("tid, kind, conn, _worker_run_id(tid)", out)
         self.assertLess(
-            out.index("_refuse_idle_dependency_block(tid, kind, conn)"),
+            out.index("_refuse_idle_dependency_block("),
             out.index("ok = kb.block_task("),
         )
 

@@ -1,8 +1,9 @@
-"""Refuse to close a card whose fanned-out children are still running.
+"""Refuse to close a card whose fanned-out children are still running, or to
+re-queue one with nothing to wait on.
 
 Installed into the image at ``/opt/hermes/tools/kanban_children_settled.py``
-and wired into ``tools/kanban_tools.py`` (the ``kanban_create`` and
-``kanban_complete`` handlers) by
+and wired into ``tools/kanban_tools.py`` (the ``kanban_create``,
+``kanban_complete`` and ``kanban_block`` handlers) by
 ``deploy/docker/patches/apply_kanban_children_settled.py``.
 
 Why
@@ -426,17 +427,22 @@ DEPENDENCY_REFUSAL = (
     "kanban_complete with the synthesized answer once they're settled. "
     "If a child is blocked or keeps failing, use "
     "kanban_block(kind=\"needs_input\") naming it, or complete with the "
-    "answer you have and say plainly which part is missing and why."
+    "answer you have and say plainly which part is missing and why. "
+    "A card that lists this one in its `parents` runs only after you "
+    "finish, so don't wait for it: complete this card and it starts."
 )
 
 
-def refuse_idle_dependency_block(task_id, kind, conn) -> str | None:
+def refuse_idle_dependency_block(task_id, kind, conn, run_id=None) -> str | None:
     """The block gate. ``None`` when the block may proceed.
 
     ``conn`` is the board connection the ``kanban_block`` handler already has
     open; it is read, never written or closed. Only ``kind="dependency"`` is
     considered, and only a card with nothing unfinished to wait on is refused
-    (see the module docstring). Fails open on any error.
+    (see the module docstring). A card that isn't this worker's running card
+    any more (its claim was released or reassigned; ``run_id`` is the
+    worker's dispatcher run, when known) is left to upstream's ``block_task``,
+    which reports that the block didn't land. Fails open on any error.
     """
     if kind != "dependency":
         return None
@@ -444,6 +450,13 @@ def refuse_idle_dependency_block(task_id, kind, conn) -> str | None:
     if not key:
         return None
     try:
+        card = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (key,)
+        ).fetchone()
+        if card is None or card[0] != "running":
+            return None
+        if run_id is not None and card[1] is not None and int(card[1]) != int(run_id):
+            return None
         if conn.execute(_UNSETTLED_PARENT_SQL, (key,)).fetchone():
             return None
         if _children_the_repair_will_flip(conn, key):

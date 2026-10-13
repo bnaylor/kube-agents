@@ -89,7 +89,9 @@ BLOCK_GATE = (
     "        # unfinished to wait on re-queues it to a fresh worker that can't\n"
     "        # see this one's work (#2610, #250/#251). See\n"
     "        # tools/kanban_children_settled.py.\n"
-    "        _dependency_err = _refuse_idle_dependency_block(tid, kind, conn)\n"
+    "        _dependency_err = _refuse_idle_dependency_block(\n"
+    "            tid, kind, conn, _worker_run_id(tid)\n"
+    "        )\n"
     "        if _dependency_err:\n"
     "            return tool_error(_dependency_err)\n"
 ) + BLOCK_ANCHOR

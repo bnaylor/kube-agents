@@ -272,6 +272,18 @@ check(
 )
 check("the stage card stays with its worker", status(stage_b) == "running", f"status={status(stage_b)}")
 
+# A card that isn't running any more (its claim was released by a stale-claim
+# sweep or a restart) is left to upstream's block_task, whatever it answers,
+# rather than refused with "you still hold the card".
+conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL WHERE id = ?", (stage_b,))
+conn.commit()
+lost = tool_block("dependency")
+check(
+    "a card this worker no longer runs is left to upstream, not refused",
+    "kanban_block refused" not in lost,
+    lost,
+)
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} check(s):")
