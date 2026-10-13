@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Tests for sa_role_watch.py: the management cluster and the project policies
+are faked at the sandbox hop, the scope at fleet_scope_targets, and the ledger
+is a real file."""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import command_policy  # noqa: E402
+import fleet_scope_targets  # noqa: E402
+import sa_role_watch  # noqa: E402
+
+NAMESPACE = "kubeagents-system"
+MANAGEMENT = "mgmt-proj"
+SCOPED = "team-proj"
+AGENT_GSA = "kubeagents-platform-gsa@mgmt-proj.iam.gserviceaccount.com"
+FEDERATED_GSA = "kubeagents-broker@mgmt-proj.iam.gserviceaccount.com"
+KSA = "kubeagents-platform-agent"
+
+
+def completed(argv, stdout="", returncode=0, stderr=""):
+    return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+
+
+def platform_agent(*, service_account=KSA, wif=None):
+    security = {"serviceAccountName": service_account} if service_account else {}
+    if wif is not None:
+        security["workloadIdentityFederation"] = wif
+    return {"metadata": {"name": "platformagent"}, "spec": {"security": security}}
+
+
+def binding(role, *emails, condition=None):
+    b = {"role": role, "members": [f"serviceAccount:{e}" for e in emails]}
+    if condition:
+        b["condition"] = {"title": condition, "expression": "true"}
+    return b
+
+
+def read_only_policy(email=AGENT_GSA):
+    return {"bindings": [binding(role, email) for role in sa_role_watch.READ_ONLY_ROLES]}
+
+
+class FakeSandbox:
+    """Answers the watch's argvs; anything else is a test bug."""
+
+    def __init__(self, *, agents=None, annotation=AGENT_GSA, policies=None):
+        self.agents = [platform_agent()] if agents is None else agents
+        self.annotation = annotation
+        self.policies = policies if policies is not None else {MANAGEMENT: read_only_policy()}
+        self.calls = []
+
+    def __call__(self, argv, *, timeout):
+        self.calls.append(list(argv))
+        if argv[:3] == ["kubectl", "get", sa_role_watch.PLATFORM_AGENT_RESOURCE]:
+            return completed(argv, json.dumps({"items": self.agents}))
+        if argv[:3] == ["kubectl", "get", sa_role_watch.SERVICE_ACCOUNT_RESOURCE]:
+            annotations = {sa_role_watch.WORKLOAD_IDENTITY_ANNOTATION: self.annotation} if self.annotation else {}
+            return completed(argv, json.dumps({"metadata": {"name": argv[3], "annotations": annotations}}))
+        if argv[:3] == ["gcloud", "projects", "get-iam-policy"]:
+            policy = self.policies.get(argv[3])
+            if isinstance(policy, Exception):
+                raise policy
+            if policy is None:
+                return completed(argv, returncode=1, stderr=f"PERMISSION_DENIED on {argv[3]}")
+            return completed(argv, json.dumps(policy))
+        raise AssertionError(f"unexpected sandbox call: {argv}")
+
+
+class WatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "sa_role_watch.json"
+        env = patch.dict(os.environ, {"GCP_PROJECT_ID": MANAGEMENT, "KUBE_DEFAULT_NAMESPACE": NAMESPACE})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("SA_ROLE_WATCH_PROJECT", None)
+        self.scope = None
+        scope = patch.object(fleet_scope_targets, "declared_scope_targets", side_effect=lambda: self.scope)
+        scope.start()
+        self.addCleanup(scope.stop)
+
+    def tick(self, sandbox, *, dry_run=False):
+        with patch.object(sa_role_watch, "run_sandbox", sandbox):
+            return sa_role_watch.tick(self.state, dry_run=dry_run)
+
+    def scoped(self, *projects):
+        self.scope = fleet_scope_targets.ScopeTargets(
+            projects=(MANAGEMENT, *projects), unread=(), resolved_at="2026-10-13T00:00:00Z", path="fleet_scope.json"
+        )
+
+
+class ReadOnlyIsQuiet(WatchTest):
+    def test_an_account_holding_only_the_read_only_set_prints_nothing(self):
+        self.assertEqual([], self.tick(FakeSandbox()))
+        self.assertEqual([], self.tick(FakeSandbox()))
+
+    def test_another_members_admin_role_is_not_this_accounts(self):
+        policy = read_only_policy()
+        policy["bindings"].append(binding("roles/owner", "someone-else@mgmt-proj.iam.gserviceaccount.com"))
+        policy["bindings"].append({"role": "roles/editor", "members": [f"deleted:serviceAccount:{AGENT_GSA}?uid=1"]})
+        self.assertEqual([], self.tick(FakeSandbox(policies={MANAGEMENT: policy})))
+
+
+class DriftIsReportedOnChange(WatchTest):
+    def admin_policy(self, *roles):
+        policy = read_only_policy()
+        policy["bindings"] += [binding(role, AGENT_GSA) for role in roles]
+        return policy
+
+    def test_a_role_beyond_the_set_names_the_role_and_the_project(self):
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/container.admin")}))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.DRIFT_PREFIX, lines[0])
+        self.assertIn("`roles/container.admin`", lines[0])
+        self.assertIn(f"project `{MANAGEMENT}`", lines[0])
+        self.assertIn(AGENT_GSA, lines[0])
+        self.assertIn("agent pod and credential broker", lines[0])
+
+    def test_the_same_drift_is_said_once(self):
+        sandbox = FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/container.admin")})
+        self.assertEqual(1, len(self.tick(sandbox)))
+        self.assertEqual([], self.tick(sandbox))
+
+    def test_a_second_role_is_said_alone_and_a_removal_is_said(self):
+        self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/container.admin")}))
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/container.admin", "roles/owner")}))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("`roles/owner`", lines[0])
+        self.assertNotIn("container.admin", lines[0])
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner")}))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.CLEARED_PREFIX, lines[0])
+        self.assertIn("no longer holds `roles/container.admin`", lines[0])
+
+    def test_a_custom_role_and_a_conditional_grant_are_reported(self):
+        policy = read_only_policy()
+        policy["bindings"].append(binding("projects/mgmt-proj/roles/clusterMaker", AGENT_GSA))
+        policy["bindings"].append(binding("roles/container.clusterAdmin", AGENT_GSA, condition="weekdays"))
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: policy}))
+        self.assertIn("`projects/mgmt-proj/roles/clusterMaker`", lines[0])
+        self.assertIn("`roles/container.clusterAdmin (when: weekdays)`", lines[0])
+
+    def test_member_case_does_not_hide_a_grant(self):
+        policy = read_only_policy()
+        policy["bindings"].append({"role": "roles/editor", "members": [f"serviceAccount:{AGENT_GSA.upper()}"]})
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: policy}))
+        self.assertIn("`roles/editor`", lines[0])
+
+    def test_every_scoped_project_is_checked(self):
+        self.scoped(SCOPED)
+        sandbox = FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/compute.admin")})
+        lines = self.tick(sandbox)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(f"project `{SCOPED}`", lines[0])
+        checked = {c[3] for c in sandbox.calls if c[:3] == ["gcloud", "projects", "get-iam-policy"]}
+        self.assertEqual({MANAGEMENT, SCOPED}, checked)
+
+    def test_dry_run_writes_no_ledger(self):
+        self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner")}), dry_run=True)
+        self.assertFalse(self.state.exists())
+
+
+class FailuresHoldTheirRows(WatchTest):
+    def test_an_unreadable_project_keeps_its_drift_and_says_so_once(self):
+        admin = read_only_policy()
+        admin["bindings"].append(binding("roles/owner", AGENT_GSA))
+        self.tick(FakeSandbox(policies={MANAGEMENT: admin}))
+        lines = self.tick(FakeSandbox(policies={}))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.PROJECT_UNREAD_PREFIX, lines[0])
+        self.assertIn("PERMISSION_DENIED", lines[0])
+        self.assertEqual([], self.tick(FakeSandbox(policies={})))
+        # Back, with the role still there: recovery is said, the role is not repeated.
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: admin}))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.PROJECT_RECOVERED_PREFIX, lines[0])
+
+    def test_a_timeout_is_a_project_failure_not_a_crash(self):
+        sandbox = FakeSandbox(policies={MANAGEMENT: subprocess.TimeoutExpired(["gcloud"], 60)})
+        lines = self.tick(sandbox)
+        self.assertIn("timed out after 60s", lines[0])
+
+    def test_a_cluster_read_failure_is_said_once_and_recovers(self):
+        broken = FakeSandbox(agents=[])
+        lines = self.tick(broken)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.CHECK_FAILED_PREFIX, lines[0])
+        self.assertIn(f"no PlatformAgent in namespace {NAMESPACE}", lines[0])
+        self.assertEqual([], self.tick(broken))
+        self.assertEqual([sa_role_watch.CHECK_RECOVERED_LINE], self.tick(FakeSandbox()))
+
+    def test_an_unreadable_scope_still_checks_the_management_project(self):
+        def unreadable():
+            raise fleet_scope_targets.ScopeRenderUnreadable("KUBEAGENTS_SCOPE_FILE=/x cannot be read")
+
+        with patch.object(fleet_scope_targets, "declared_scope_targets", side_effect=unreadable):
+            sandbox = FakeSandbox()
+            lines = self.tick(sandbox)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("`spec.scope`", lines[0])
+        self.assertTrue(any(c[:3] == ["gcloud", "projects", "get-iam-policy"] for c in sandbox.calls))
+
+
+class Identities(WatchTest):
+    def test_without_federation_one_account_is_both_pods(self):
+        identities, account, annotated = self.read(FakeSandbox())
+        self.assertEqual({AGENT_GSA: [sa_role_watch.AGENT_POD_SOURCE, sa_role_watch.BROKER_SOURCE]}, identities)
+        self.assertEqual(f"{NAMESPACE}/{KSA}", account)
+
+    def test_federation_adds_the_brokers_own_account(self):
+        wif = {"audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/q",
+               "serviceAccountEmail": FEDERATED_GSA}
+        sandbox = FakeSandbox(agents=[platform_agent(wif=wif)])
+        identities, _, _ = self.read(sandbox)
+        self.assertEqual({AGENT_GSA: [sa_role_watch.AGENT_POD_SOURCE], FEDERATED_GSA: [sa_role_watch.BROKER_SOURCE]}, identities)
+
+    def test_a_half_filled_federation_block_is_not_armed(self):
+        sandbox = FakeSandbox(agents=[platform_agent(wif={"serviceAccountEmail": FEDERATED_GSA})])
+        identities, _, _ = self.read(sandbox)
+        self.assertEqual([AGENT_GSA], list(identities))
+
+    def test_the_cr_name_is_the_default_service_account(self):
+        sandbox = FakeSandbox(agents=[platform_agent(service_account="")])
+        _, account, _ = self.read(sandbox)
+        self.assertEqual(f"{NAMESPACE}/platformagent", account)
+
+    def test_a_federated_drift_names_the_broker(self):
+        wif = {"audience": "//iam.googleapis.com/projects/1/x", "serviceAccountEmail": FEDERATED_GSA}
+        policy = read_only_policy()
+        policy["bindings"].append(binding("roles/container.admin", FEDERATED_GSA))
+        lines = self.tick(FakeSandbox(agents=[platform_agent(wif=wif)], annotation=None, policies={MANAGEMENT: policy}))
+        drift = [line for line in lines if line.startswith(sa_role_watch.DRIFT_PREFIX)]
+        self.assertEqual(1, len(drift), lines)
+        self.assertIn(f"`{FEDERATED_GSA}` (credential broker)", drift[0])
+
+    def test_an_absent_annotation_is_said_once_and_its_return_is_said(self):
+        wif = {"audience": "//iam.googleapis.com/projects/1/x", "serviceAccountEmail": FEDERATED_GSA}
+        absent = FakeSandbox(agents=[platform_agent(wif=wif)], annotation=None,
+                             policies={MANAGEMENT: read_only_policy(FEDERATED_GSA)})
+        lines = self.tick(absent)
+        self.assertEqual([sa_role_watch.NO_ANNOTATION_NOTE.format(account=f"{NAMESPACE}/{KSA}")], lines)
+        self.assertEqual([], self.tick(absent))
+        back = FakeSandbox(agents=[platform_agent(wif=wif)], policies={MANAGEMENT: read_only_policy(FEDERATED_GSA)})
+        lines = self.tick(back)
+        self.assertIn(sa_role_watch.ANNOTATION_RESTORED_NOTE.format(account=f"{NAMESPACE}/{KSA}", email=AGENT_GSA), lines)
+
+    def test_no_account_anywhere_fails_the_check(self):
+        lines = self.tick(FakeSandbox(annotation=None))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("names a Google service account", lines[0])
+
+    def read(self, sandbox):
+        with patch.object(sa_role_watch, "run_sandbox", sandbox):
+            return sa_role_watch.read_identities(NAMESPACE)
+
+
+class TheBrokerAllowsWhatTheWatchRuns(unittest.TestCase):
+    """Every argv the watch sends, put through the broker's own policy: a
+    refused verb would turn every tick into a "check failed" line."""
+
+    def test_each_argv_is_allowed(self):
+        argvs = [
+            ["kubectl", "get", sa_role_watch.PLATFORM_AGENT_RESOURCE, "-n", NAMESPACE, "-o", "json"],
+            ["kubectl", "get", sa_role_watch.SERVICE_ACCOUNT_RESOURCE, KSA, "-n", NAMESPACE, "-o", "json"],
+            ["gcloud", "projects", "get-iam-policy", MANAGEMENT, "--format=json"],
+            list(sa_role_watch.CONFIG_PROJECT_ARGV),
+        ]
+        for argv in argvs:
+            with self.subTest(argv=argv):
+                decision = command_policy.evaluate(argv)
+                self.assertTrue(decision.allowed, f"{argv}: {decision.rule_id} {decision.message}")
+
+    def test_the_policy_write_beside_the_read_stays_refused(self):
+        decision = command_policy.evaluate(["gcloud", "projects", "set-iam-policy", MANAGEMENT, "policy.json"])
+        self.assertFalse(decision.allowed)
+
+
+if __name__ == "__main__":
+    unittest.main()
