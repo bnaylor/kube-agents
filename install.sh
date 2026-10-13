@@ -81,7 +81,7 @@ readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
-# How check_flag_against_install_env compares a typed chat flag with the key
+# How check_flag_against_install_env compares a typed chat flag or --mode with the key
 # install.env records: a boolean read through is_truthy, a literal string, a
 # list read through hcl_csv_list (the form write_tfvars_from_state renders), or
 # a credential, whose value is never printed and whose home is the live Secret
@@ -96,7 +96,8 @@ readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
 # about, and not SLACK_ENABLED: the panel turns Slack on without asking for
 # the tokens, and its apply does not check for them.
 readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
-# The chat flags this run typed, one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
+# The flags held to install.env that this run typed (the chat flags and
+# --mode), one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
 # noted by parse_args; and the keys among them that install.env does not
 # assign, for record_flags_into_install_env to append once the run commits.
 INSTALL_ENV_FLAGS_TYPED=""
@@ -322,10 +323,15 @@ bootstrap_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
+  # switch the install's component stack for one run, and the next run from a
+  # clean shell would switch it back. --mode is refused for the same reason
+  # when it disagrees with this file (check_flags_against_install_env).
+  unset PLATFORM_AGENT_MODE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -430,6 +436,14 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# A self-managed GitLab behind a private CA: a FILE the CA is read from, and
+# the ConfigMap it goes into, which install.env records. The file's path is
+# never recorded.
+PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
+PARAM_GITOPS_CA_SECRET="${GITOPS_CA_SECRET:-}"
+# Whether the CA file came from --gitops-ca-file rather than the interview: a
+# flag with gitlab.com is refused, an interview answer is cleared.
+PARAM_GITOPS_CA_FILE_FROM_FLAG="false"
 # Whether a value came from a flag rather than install.env: a switch of forge
 # by flag drops what the file recorded for the other forge, but refuses a flag
 # that contradicts it.
@@ -547,6 +561,10 @@ PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
+# Empty takes DEFAULT_PLATFORM_AGENT_MODE. Seeded from install.env, so a re-run
+# without --mode keeps the mode the file records.
+PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
+PARAM_PLATFORM_AGENT_MODE_PASSED="false"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
@@ -603,6 +621,13 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
+  --mode=MODE                   The PlatformAgent's spec.mode: today | next. next also
+                                renders the NATS bus and the A2A gateway, a development
+                                stack. Recorded in install.env as PLATFORM_AGENT_MODE when
+                                the file sets none; one that sets it differently refuses
+                                the flag, so change that key instead
+                                (a mode switch: docs/designs/spec-mode-switch.md)
+                                (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
@@ -651,6 +676,9 @@ Flags for AI Agents & Automation:
                                 non-interactively, leaves the Secret for you to create
   --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
                                 (default: gitlab-forge-token)
+  --gitops-ca-file=PATH         PEM CA that signed a self-managed GitLab's certificate (a private
+                                CA). Read into Secret gitlab-forge-ca after the apply; the
+                                broker trusts it for the GitLab host only
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -768,8 +796,9 @@ Flags for AI Agents & Automation:
                                 workspace the agent serves. The relay keys each one by
                                 the team it authenticates as
   --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
-  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
-                                agent. Empty allows all users
+  --slack-allowed-users=USERS   Comma-separated Slack member IDs (e.g. U0123ABCD; not
+                                emails) allowed to talk to the agent. Empty allows
+                                every workspace member
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
@@ -795,8 +824,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run, except the chat flags, which must
-  agree with it (see --enable-slack). Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags and --mode,
+  which must agree with it (see --enable-slack and --mode). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -899,6 +928,18 @@ require_scope_flag_value() {
   exit 1
 }
 
+# --mode= given nothing is refused like an empty toggle: it cannot mean "keep
+# the recorded mode" (omitting the flag does that), and read as the default it
+# would switch a next install to today for this run. The value itself is
+# checked in main, against the CRD's enum and against install.env, once the
+# shared helpers are loaded.
+require_mode_flag_value() {
+  [ -n "${1:-}" ] && return 0
+  print_error "--mode= was given an empty value."
+  print_info "Pass --mode=today or --mode=next; to keep the mode install.env records, omit the flag."
+  exit 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -910,6 +951,13 @@ parse_args() {
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
+      --mode=*)
+        PARAM_PLATFORM_AGENT_MODE="${1#*=}"; PARAM_PLATFORM_AGENT_MODE_PASSED="true"
+        require_mode_flag_value "$PARAM_PLATFORM_AGENT_MODE"
+        # Held to install.env as the chat flags are: the run after a one-run
+        # switch, and every upgrade.sh, would read the file and switch back.
+        note_install_env_flag PLATFORM_AGENT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE
+        shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
@@ -935,6 +983,7 @@ parse_args() {
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
+      --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
@@ -1723,8 +1772,9 @@ install_env_records_key() {
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
 # needs the installer not to rewrite it. Naming the drift costs nothing
 # and leaves the decision where it belongs. The one write install.sh does make
-# is narrower: a chat key the file does not assign, appended from a chat flag
-# with the settings a toggle recorded true brings (record_flags_into_install_env);
+# is narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
+# appended from a chat flag or --mode, with the settings a chat toggle recorded
+# true brings (record_flags_into_install_env);
 # it never changes a key the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
@@ -1767,7 +1817,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET)
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
@@ -1962,16 +2012,17 @@ record_gitops_forge_keys() {
   [ -z "$recorded" ] && recorded="github"
   [ "$current" = "gitlab" ] || [ "$recorded" != "$current" ] || return 0
   if [ "$recorded" = "gitlab" ] && [ "$current" = "gitlab" ]; then
-    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO
+    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO GITOPS_CA_SECRET
     if [ "$(recorded_install_env_value "$file" GITOPS_HOST)" = "${GITOPS_HOST:-}" ] &&
       [ "$(recorded_install_env_value "$file" GITLAB_TOKEN_SECRET)" = "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}" ] &&
-      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ]; then
+      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_CA_SECRET)" = "${GITOPS_CA_SECRET:-}" ]; then
       return 0
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
   # run's validator would refuse the pair.
-  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -1979,6 +2030,7 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   else
     write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
@@ -1996,7 +2048,9 @@ record_gitops_forge_keys() {
 # configures something upgrade.sh renders from the file alone, and upgrade.sh
 # takes none of them, so one that beat the file for a single run would be undone
 # by the next upgrade with no one told: a Slack relay switched off, a home
-# channel or an allowlist put back. So against an existing install.env:
+# channel or an allowlist put back. --mode is held the same way, for the same
+# reason (validate_platform_agent_mode); it is not a chat key and brings no
+# companions. So against an existing install.env:
 #
 #   - a flag that disagrees with the key the file assigns is refused before
 #     anything is applied, naming the file and the key;
@@ -2035,7 +2089,7 @@ install_env_toggle_companions() {
   esac
 }
 
-# A chat flag this run typed, noted for check_flags_against_install_env. Its
+# A chat flag or --mode this run typed, noted for check_flags_against_install_env. Its
 # value is read from the PARAM_* at check time, so a flag given twice is checked
 # at the value that won.
 note_install_env_flag() {
@@ -2108,7 +2162,7 @@ check_flag_against_install_env() {
       ;;
   esac
   print_error "${flag}=$(printf '%q' "$value") disagrees with the install configuration, so it would hold for this run only: ${file} records ${recorded_shown}."
-  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records a chat flag only where install.env assigns no such key; it does not change a key the file assigns."
+  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records ${flag} only where install.env assigns no ${key}; it does not change a key the file assigns."
   local remedy
   remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
   case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
@@ -2118,11 +2172,14 @@ check_flag_against_install_env() {
   if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
     remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
   fi
+  if [ "$key" = "PLATFORM_AGENT_MODE" ]; then
+    remedy="${remedy}. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}"
+  fi
   print_info "${remedy}."
   return 1
 }
 
-# Every chat flag this run typed, against an existing install.env. Each
+# Every chat flag and --mode this run typed, against an existing install.env. Each
 # disagreement is named before the run stops, so one run lists them all.
 check_flags_against_install_env() {
   local file="${INSTALL_ENV_FILE:-}" entry key flag kind param default_var default refused="false"
@@ -2250,7 +2307,7 @@ bootstrap_install_env_file() {
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
     print_info "Kept your install configuration: ${destination}"
-    # The chat flags check_flags_against_install_env queued: written only once
+    # The flags check_flags_against_install_env queued: written only once
     # this run goes on to the apply or the handoff (record_flags_into_install_env).
     if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
       print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
@@ -2512,6 +2569,10 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_NAME "${CLUSTER_NAME:-}"
   write_env_var "$tmp" REGION "${REGION:-}"
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
+  # Recorded on every first install, the default included: the file is the one
+  # place a later run, and every upgrade.sh, reads the mode from, and a --mode
+  # that disagrees with it is refused (check_flags_against_install_env).
+  write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -2565,6 +2626,7 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
@@ -4272,6 +4334,35 @@ validate_litellm_redaction_ip_action() {
   fi
 }
 
+# --mode, or the PLATFORM_AGENT_MODE install.env records: one of the CRD's
+# spec.mode values, named by whichever carried it. Checked before
+# check_flags_against_install_env, so a misspelt --mode is refused as one
+# rather than as a disagreement with the file. Against an existing
+# install.env, --mode is then held to the file like the chat flags
+# (note_install_env_flag in parse_args): every other flag that overrides the
+# file applies for one run and is warned about
+# (warn_flag_beats_unrecorded_file_value); this one is refused, because the
+# run after it reads the file again and switches back, and upgrade.sh takes no
+# --mode to stop it: a next install would lose its A2A stack on the next
+# upgrade, a today install gain one for a single run. Switching is an edit to
+# the file, which every later run then keeps, and the apply that carries it
+# says so (announce_platform_agent_mode_switch). A file that assigns no
+# PLATFORM_AGENT_MODE has the --mode recorded into it when the run commits
+# (record_flags_into_install_env). Needs installer_common.sh sourced.
+validate_platform_agent_mode() {
+  local value="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  is_valid_platform_agent_mode "$value" && return 0
+  if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+    print_error "--mode must be today or next, got '${value}'."
+  elif [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix it in ${INSTALL_ENV_FILE}."
+  else
+    # No file yet: a first install seeds the key from the environment.
+    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
+  fi
+  return 1
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -4387,8 +4478,12 @@ validate_gitops_forge_flags() {
       print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
       PARAM_GITOPS_HOST=""
     fi
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
-      print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded GitLab CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitOps forge is GitHub."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] || [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-host, --gitlab-token-file and --gitops-ca-file apply only with --gitops-forge=gitlab."
       return 1
     fi
     return 0
@@ -4455,7 +4550,81 @@ validate_gitops_forge_flags() {
       return 1
     fi
   fi
+  # A private CA is for a self-managed host only: gitlab.com presents a
+  # certificate the public CAs sign, and a private CA must never vouch for it.
+  if ! gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}"; then
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+      # An interview answer for an earlier host: the user went back and chose
+      # gitlab.com, so the file is not theirs to keep. Refusing it would
+      # repeat on every pass, with no prompt left to clear it.
+      print_info "Dropping the CA file from the earlier answer: gitlab.com uses the public CAs."
+      PARAM_GITOPS_CA_FILE=""
+    fi
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-ca-file is for a self-managed GitLab: give its hostname with --gitops-host. gitlab.com uses the public CAs."
+      return 1
+    fi
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded GitLab CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitLab host is gitlab.com, which uses the public CAs."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+  fi
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    case "$PARAM_GITOPS_CA_FILE" in
+      \~/*) PARAM_GITOPS_CA_FILE="${HOME}/${PARAM_GITOPS_CA_FILE#\~/}" ;;
+    esac
+    if [ ! -r "$PARAM_GITOPS_CA_FILE" ] || [ -d "$PARAM_GITOPS_CA_FILE" ]; then
+      print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' is not readable."
+      # An interview answer is cleared, so the next pass can answer "none":
+      # its prompt offers no default.
+      [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+      return 1
+    fi
+    # A regular file is checked now, before the apply records the ConfigMap's
+    # name in install.env, the tfvars and the CR. /dev/stdin and a process
+    # substitution can be read only once, so they are checked when they are
+    # read, after the apply.
+    if [ -f "$PARAM_GITOPS_CA_FILE" ]; then
+      local pem_problem
+      pem_problem="$(gitlab_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
+      if [ -n "$pem_problem" ]; then
+        print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+        [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+        return 1
+      fi
+    fi
+    PARAM_GITOPS_CA_SECRET="${PARAM_GITOPS_CA_SECRET:-${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}}"
+  fi
+  # A name from install.env or the environment is held to the rule the CRD,
+  # the chart and Terraform hold it to, here, where the message names the key.
+  if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ] &&
+    { [ "${#PARAM_GITOPS_CA_SECRET}" -gt 253 ] ||
+      ! [[ "$PARAM_GITOPS_CA_SECRET" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+    print_error "GITOPS_CA_SECRET must be a valid Kubernetes Secret name (got '${PARAM_GITOPS_CA_SECRET}')."
+    return 1
+  fi
   return 0
+}
+
+# True when HOST is a self-managed GitLab: not empty and not gitlab.com in
+# either spelling. The one definition the interview and the validator share.
+gitlab_host_is_self_managed() {
+  case "${1:-}" in
+    ""|gitlab.com|www.gitlab.com) return 1 ;;
+  esac
+  return 0
+}
+
+# Why PEM text cannot be stored as the GitLab CA, or "" when it can: it holds
+# no certificate, or it holds a private key. A CA's private key never goes in
+# the CA Secret: anyone who can read that Secret could sign with it.
+gitlab_ca_pem_problem() {
+  local pem="$1"
+  if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
+    printf '%s' "holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
+  elif [[ "$pem" == *"PRIVATE KEY"* ]]; then
+    printf '%s' "holds a private key. Give the CA certificate alone; nothing was stored."
+  fi
 }
 
 # Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
@@ -4484,6 +4653,53 @@ gitlab_token_strip() {
   local t="$1"
   t="${t//[[:space:]]/}"
   printf '%s' "$t"
+}
+
+# Creates (or replaces) the Secret the GitLab forge's caBundleRef names, from
+# --gitops-ca-file, under the key ca.crt. A CA certificate is public, but it
+# goes in a Secret for its integrity: changing it then needs the same rights as
+# changing the token Secret beside it. Server-side apply, as for the token, so
+# no last-applied copy is kept. The file is read once, here: a process
+# substitution cannot be read twice. It must hold at least one PEM certificate
+# and no private key. Without a file, an existing Secret is kept, and a missing
+# one is named, because until it exists every call to the forge fails on its
+# certificate.
+create_gitlab_ca_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITOPS_CA_SECRET:-}"
+  [ -n "$name" ] || return 0
+  local how="  kubectl create secret generic ${name} -n ${namespace} --context ${context} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+  if [ -z "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    if ! kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+      print_warning "Secret '${name}' with the GitLab CA does not exist, so the agent cannot verify the GitLab host's certificate yet."
+      print_info "Create it; the agent picks it up with no restart:"
+      print_info "$how"
+    fi
+    return 0
+  fi
+  local pem="" pem_problem=""
+  IFS= read -r -d '' pem <"$PARAM_GITOPS_CA_FILE" || true
+  pem_problem="$(gitlab_ca_pem_problem "$pem")"
+  if [ -n "$pem_problem" ]; then
+    # Only a one-shot source (/dev/stdin, a process substitution) reaches
+    # here with bad content: a regular file was checked before the apply. The
+    # apply has named the Secret already, so say how to create it and go on to
+    # the health checks, as a missing token does.
+    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+    print_warning "The agent cannot verify the GitLab host's certificate until Secret '${name}' exists. Create it; the agent picks it up with no restart:"
+    print_info "$how"
+    return 0
+  fi
+  printf '%s' "$pem" | kubectl create secret generic "$name" -n "$namespace" --context "$context" \
+    --from-file=ca.crt=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+      -n "$namespace" --context "$context" -f - >/dev/null 2>&1
+  local rcs=("${PIPESTATUS[@]}")
+  if [ "${rcs[1]}" -ne 0 ] || [ "${rcs[2]}" -ne 0 ]; then
+    print_error "Could not write the GitLab CA Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[1]}, apply ${rcs[2]})."
+    return 1
+  fi
+  print_success "GitLab CA stored in Secret '${name}' (namespace ${namespace})."
 }
 
 # Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
@@ -5178,6 +5394,10 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        # The menu edits no mode key, but an install.env edited by hand since
+        # the last apply reaches the cluster through this apply too, with no
+        # confirmation after the notice.
+        announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
         check_scope_container_access || exit 1
         enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
@@ -5252,6 +5472,13 @@ main() {
     # The menu reloads install.env and reads the scope keys, and the scoped
     # service account pool's switch and cap, from it alone; a flag here would
     # be validated and then dropped without a word.
+    # --mode likewise: the menu applies the mode install.env records, so a
+    # flag here would be dropped and the switch it asked for never announced.
+    if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+      print_error "--menu takes no --mode: it applies the PLATFORM_AGENT_MODE install.env records."
+      print_info "Set PLATFORM_AGENT_MODE in install.env to switch the mode; the menu's apply says it is a mode switch before it applies it."
+      exit 1
+    fi
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
@@ -5353,9 +5580,13 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
-  # The chat flags against an existing install.env, as soon as is_truthy and
-  # the defaults are loaded: a flag that disagrees with the file stops the run
-  # here, before the interview and long before anything is applied.
+  # The mode first: a value the CRD refuses is named as that, not as a
+  # disagreement with install.env.
+  validate_platform_agent_mode || exit 1
+  # The chat flags and --mode against an existing install.env, as soon as
+  # is_truthy and the defaults are loaded: a flag that disagrees with the file
+  # stops the run here, before the interview and long before anything is
+  # applied.
   check_flags_against_install_env || exit 1
 
   # 3. Google Cloud Authentication Check
@@ -5688,7 +5919,7 @@ main() {
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
-    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+    prompt_read "Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
@@ -5776,7 +6007,7 @@ main() {
     # toggle.
     echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
-    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<member IDs, e.g. U0123ABCD>, re-run with --slack-bot-token and --slack-app-token"
     echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
@@ -5830,6 +6061,9 @@ main() {
   if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
     hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
   fi
+  # The mode was checked at step 2, before check_flags_against_install_env
+  # held --mode to install.env (validate_platform_agent_mode).
+  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
   # cap the module would refuse is named with its key before the interview.
@@ -6020,9 +6254,14 @@ main() {
       [[ "$github_repo" == */* ]] || github_repo=""
       while true; do
         prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
-        [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
+        gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
         prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
         prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        # Only a self-managed instance can be behind a private CA.
+        # No default: empty must stay a way to answer "none" on every pass.
+        if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+        fi
         PARAM_GITOPS_REPO="$github_repo"
         if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
           github_repo="$PARAM_GITOPS_REPO"
@@ -6519,6 +6758,15 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
+  export PLATFORM_AGENT_MODE="$platform_agent_mode"
+  # The bus's two third-party images are the operator's compiled defaults
+  # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
+  # this installer nor the chart points at a mirror, so a next install that
+  # mirrors its third-party images still pulls those two from Docker Hub.
+  if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
+    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's two images (nats, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
+    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists both)."
+  fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
@@ -6555,6 +6803,7 @@ main() {
   export GITOPS_FORGE="$PARAM_GITOPS_FORGE"
   export GITOPS_HOST="$PARAM_GITOPS_HOST"
   export GITLAB_TOKEN_SECRET="$PARAM_GITLAB_TOKEN_SECRET"
+  export GITOPS_CA_SECRET="$PARAM_GITOPS_CA_SECRET"
   # One release of overlap: the agent runtime and the chart still speak
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
@@ -6645,6 +6894,20 @@ main() {
       --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
   fi
+  # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
+  # it is named before the operator confirms the apply. Outside the gate
+  # above, so --dry-run and --generate-only say it too; it takes the reads the
+  # scope check in the gate just made, and reads for itself when the gate did
+  # not run. The reads need this cluster's context, which the gate fetched for
+  # an applying run. A first install reads nothing (the generator found no
+  # cluster); on a cluster that exists, a missing context or a read that fails
+  # says the check did not run.
+  # -y applies without the step-11 prompt, so the notice is the ungated one.
+  local mode_notice_route=""
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then
+    mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+  fi
+  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install
@@ -6694,6 +6957,14 @@ main() {
     summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
   fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
+  # Named on every run, a first install included, where no switch notice
+  # fires: next is an unsupported stack, and a copied --mode=next would
+  # otherwise install it without a word before the confirmation.
+  if [ "$platform_agent_mode" = "next" ]; then
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack: the NATS bus and the A2A gateway)"
+  else
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
+  fi
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
@@ -6853,8 +7124,8 @@ main() {
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
-    # Past every gate that can stop this route: a chat flag whose key the
-    # install.env lacks is recorded for the handoff.
+    # Past every gate that can stop this route: a chat flag or --mode whose
+    # key the install.env lacks is recorded for the handoff.
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
@@ -6929,8 +7200,8 @@ main() {
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
   # Past every gate that can stop this route (set -e makes each step above
-  # one): a chat flag whose key the install.env lacks is recorded for the
-  # apply.
+  # one): a chat flag or --mode whose key the install.env lacks is recorded
+  # for the apply.
   # The forge keys likewise, and only here: a forge switch the operator
   # previewed (--generate-only) or declined must leave install.env as it was,
   # or the next upgrade.sh would render the forge nobody applied.
@@ -6974,6 +7245,7 @@ main() {
   fi
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_ca_secret "$namespace" "$expected_ctx" || exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do

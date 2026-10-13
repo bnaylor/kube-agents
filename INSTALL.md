@@ -97,10 +97,11 @@ Four behaviours worth knowing before the first run:
   container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
-  reports it. It costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull
-  subscription — and it reaches past the clusters this install manages: the sink exports the
-  admin-activity audit records of every GKE cluster in the project, including clusters this
-  install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
+  reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub
+  topic and a pull subscription — and a sink in each project a declared scope lists, and it reaches
+  past the clusters this install manages: the sinks export the admin-activity audit records of
+  every GKE cluster in those projects, including clusters this install does not manage, and the
+  subscription retains a copy of them for 31 days. Opt out with
   `ENABLE_DRIFT_DETECTOR=false` in `install.env`. A first run records the
   `--enable-drift-detector=false` flag for you, because it is the run that writes that file; over
   an `install.env` that already exists the flag applies to one run and is recorded nowhere, which
@@ -128,7 +129,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave and the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave, or the `PLATFORM_AGENT_MODE` a `--mode` gave, that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
@@ -267,8 +268,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
 
 A flag left out does not always take the shipped default. A flag wins over an `install.env` from an
 earlier run, which wins over an exported variable — including an exported API key — which wins over
-`install.defaults.env`. The chat flags are the exception: over an existing `install.env` one that
-disagrees with the file is refused. See
+`install.defaults.env`. The chat flags and `--mode` are the exception: over an existing `install.env`
+one that disagrees with the file is refused. See
 [`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv).
 
 ---
@@ -410,6 +411,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   GitHub token minter and Hindsight need `third_party_image_registry` (or
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
+- **Component stack (`--mode`)**: `./install.sh --mode=next` installs with `spec.mode: next`, an
+  unsupported development stack; the default is `today`. With an `install.env` you wrote
+  yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
+  sets a different one. Terraform takes `platform_agent_mode`,
+  the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
+  `install.env` and re-run `install.sh` or a full `upgrade.sh`;
+  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key.
+
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -507,6 +516,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is only `SLACK_HOME_CHANNEL`, a channel ID, and that page's home-channel section says how to set it.
+
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
    - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
@@ -517,7 +528,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
    - If you left `SLACK_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its channel or DM the home channel, where scheduled audits post (step 5).
 3. **Approve Pairing Code (Optional / First-time setup)**:
-   - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
+   - Only if you set the Hermes Slack DM policy to `pairing` yourself: a kube-agents install gates Slack with the allowlist instead, and the A2A gateway under `spec.mode: next` has no pairing. A member the policy does not know gets a one-time code; approve it from the gateway logs:
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve slack <PAIRING_CODE>
      ```
@@ -564,9 +575,10 @@ To add a chat platform later, edit `install.env` and re-run `./install.sh`, then
 
 - Google Chat: set `GOOGLE_CHAT_ENABLED=true` and `ALLOWED_USERS=` to the comma-separated emails
   allowed to use the agent. `./install.sh --menu` edits both for you.
-- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated user IDs or
-  emails, and re-run with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked
-  for them.
+- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated Slack member
+  IDs (for example `U0123ABCD`), not emails or display names: an email matches nobody. To find a
+  member ID, open the person's Slack profile, then the **⋮** menu, then **Copy member ID**. Re-run
+  with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked for them.
 
 The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
 empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,
@@ -1112,3 +1124,39 @@ make uninstall
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
   ```
 - For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).
+
+### 5. Slack Bot Doesn't Answer
+
+When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
+
+- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope and Event Subscriptions (`app_mention`, `message.*`) must be enabled.
+  - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
+  - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
+  - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
+  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
+- **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md#verify) maps the A2A gateway's log lines to causes and fixes.
+
+**Which logs to read:**
+
+- **Default (`mode: today`):**
+  - Check Socket Mode connectivity and token validation in the credential proxy:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
+    ```
+  - Check message reception, allowlist filtering, and agent processing in the gateway pod:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c platform-agent
+    ```
+- **A2A Stack (`spec.mode: next`):**
+  - Check the A2A gateway pod for Socket Mode connection, token errors, and session spawning:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway
+    ```
+  - Check the `PlatformAgent` CR status for gateway enablement:
+    ```bash
+    kubectl get platformagent platform-agent -n kubeagents-system -o yaml
+    ```
+    (The `A2AGateway` condition is present only while the gateway runs nothing: `status: False` with reason `NoChatBackend` when no chat backend is configured, or `WaitingForReplica` while a scaled-up replica comes back. On an install with Slack enabled it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
