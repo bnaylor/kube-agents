@@ -194,7 +194,7 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
     | grep -E 'Slack relay enabled|Slack relay initialization failed|Slack bot token authentication failed'
   ```
 
-  The pattern matches exactly three lines. `Slack relay enabled workspaces=1` as the last line is
+  The pattern matches exactly three kinds of line. `Slack relay enabled workspaces=1` as the last line is
   the healthy reading: the number counts the bot tokens Slack accepted, one per workspace.
   `Slack bot token authentication failed` means Slack refused one of the bot tokens; it gives the
   error type and Slack's error, not which token. `Slack relay initialization failed; retrying`
@@ -328,7 +328,8 @@ The operator moves Slack in three steps:
    - Messages the broker had taken from Slack but not yet handed to the agent are lost: the
      broker acknowledges each event to Slack when it arrives and holds it in memory.
    - A question the agent was answering stops with its pod and gets no answer.
-   - A board card that was running is put back in the queue when the new pod starts, and runs
+   - A board card that was running is put back in the queue once the board reclaims its stale
+     claim, which can take up to 30 minutes (`kanban.dispatch_stale_timeout_seconds`), and runs
      again from the start.
 2. It creates the NATS bus and the auth callout. It creates the A2A gateway once a callout
    replica is ready, which needs the bus to be running. The provisioning Job, started at the same
@@ -372,7 +373,7 @@ kubectl get platformagent platform-agent -n kubeagents-system \
   switch gets no answer: mention the app.
 - **Not the cards in flight, outside the home channel.** A card filed before the switch from a
   DM or from any channel other than the home channel posts nothing after it: the gateway refuses
-  the post and logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
+  the post and, with a home channel set, logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
   in a home-channel thread still posts its progress and report there. Either way its buttons stop
   working, because the gateway does not take button clicks.
 - **The home channel only from `install.env`**, as in step 2 above.
