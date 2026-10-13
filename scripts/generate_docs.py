@@ -109,6 +109,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Security and compliance": [
         "gke-backup-dr",
         "gke-platform-security",
+        "gke-workload-identity",
     ],
     "Networking and storage": [
         "gcp-networking-fabric-audit",
@@ -161,6 +162,7 @@ CRON_CADENCE = {
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
     "50 8 * * *": "Daily 08:50",
+    "10 10 * * *": "Daily 10:10",
     "0 9 * * *": "Daily 09:00",
     "20 9 * * *": "Daily 09:20",
     "0 10 * * *": "Daily 10:00",
