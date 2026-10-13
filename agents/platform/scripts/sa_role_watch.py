@@ -5,9 +5,10 @@ The install grants the agent's Google service account the ``read-only``
 permission set: viewer roles and nothing that can create or change a cluster.
 The installer warns when a ``custom`` set names an admin role, but only at the
 moment the roles are chosen. A role granted later, by hand or by another tool,
-goes unnoticed, and it is what the hosted GKE MCP server in the agent container
-runs on: an account holding ``roles/container.admin`` lets that server create a
-cluster no pull request ever proposed (#2941, #2935).
+goes unnoticed, and it is what the Google-hosted GKE MCP server acts with, since
+the agent container calls it on that account's credentials: an account holding
+``roles/container.admin`` let it create a cluster no pull request ever proposed
+(#2941, #2935).
 
 This is a ``no_agent`` entry on the Platform Agent's roster. The tick prompts
 no model. Each tick:
@@ -131,10 +132,10 @@ CHECK_FAILED_PREFIX = f"⚠️ **{WATCH_NAME} — check failed:**"
 CHECK_RECOVERED_LINE = f"✅ **{WATCH_NAME}** — the check runs again."
 PROJECT_UNREAD_PREFIX = f"⚠️ **{WATCH_NAME} — project not checked:**"
 PROJECT_RECOVERED_PREFIX = f"✅ **{WATCH_NAME}** — checked again:"
+UNWATCHED_PREFIX = f"ℹ️ **{WATCH_NAME}:**"
 DRIFT_ADVICE = (
-    "These are outside the read-only set: anything running on this account, the hosted GKE MCP "
-    "server in the agent container included, can use them without a pull request. Remove them "
-    "unless they were granted on purpose."
+    "These are outside the read-only set: anything running on this account can use them without "
+    "a pull request. Remove them unless they were granted on purpose."
 )
 NO_ANNOTATION_NOTE = (
     f"ℹ️ **{WATCH_NAME}:** the agent's ServiceAccount `{{account}}` carries no "
@@ -146,6 +147,9 @@ ANNOTATION_RESTORED_NOTE = (
     "Identity again; that account is checked too."
 )
 LEDGER_KEY_SEPARATOR = "|"
+CONDITIONAL_SUFFIX = " (conditional)"
+#: Over-cap projects a scope note names before counting the rest.
+MAX_PROJECTS_IN_NOTE = 8
 #: The ledger's record of an annotation that was read and absent.
 ANNOTATION_ABSENT = ""
 #: The ledger's key for a scope that could not be read, beside the projects.
@@ -238,21 +242,43 @@ def read_identities(ns: str) -> tuple[dict[str, list[str]], str, str | None]:
 
 
 def projects_to_check(management: str) -> tuple[list[str], str | None]:
-    """The management project and the resolved scope, and a note when the
-    scope could not be read (the management project is still checked)."""
+    """The management project and the declared scope's projects, and a note
+    naming what the scope leaves unchecked (the management project is always
+    checked).
+
+    A project the reconcile could not read (`denied`, `unreachable`, or not yet
+    resolved on a fresh install) is still checked: its cluster listing failing
+    says nothing about whether its policy can be read, and a failure is named
+    like any other. A project past the scope's `maxProjects` is not, since the
+    cap is the operator's bound on how many projects a tick touches; the note
+    names them instead."""
     try:
         targets = fleet_scope_targets.declared_scope_targets()
     except fleet_scope_targets.ScopeRenderUnreadable as exc:
         return [management], str(exc)
     if targets is None:
         return [management], None
-    return list(dict.fromkeys([management, *targets.projects])), None
+    unread = [p for p, outcome in targets.unread if p != fleet_scope_targets.UNRESOLVED_SCOPE_ROW]
+    over_cap = [p for p, outcome in targets.unread if outcome == fleet_scope_targets.OUTCOME_OVER_CAP]
+    checked = [p for p in [*targets.projects, *unread] if p not in over_cap]
+    # The snapshot lists the management project by id, first. A management
+    # project the operator was given by number would otherwise be read twice
+    # and every drift in it said twice, under each spelling.
+    if not (management.isdigit() and targets.projects):
+        checked.insert(0, management)
+    note = None
+    if over_cap:
+        shown = code_list(over_cap[:MAX_PROJECTS_IN_NOTE])
+        rest = len(over_cap) - MAX_PROJECTS_IN_NOTE
+        note = f"{len(over_cap)} project(s) past the scope's maxProjects are not checked: {shown}" + (f" and {rest} more" if rest > 0 else "")
+    return list(dict.fromkeys(checked)), note
 
 
 def roles_beyond_read_only(policy: dict, emails: set[str]) -> dict[str, set[str]]:
     """Per account, each role bound to it that the read-only set lacks. A
-    conditional binding is named with its condition, since the grant then
-    holds only where the condition does."""
+    conditional binding is marked as one, since the grant then holds only
+    where the condition does; its title is free text whoever sets the policy
+    writes, so it stays out of a line chat posts."""
     allowed = set(READ_ONLY_ROLES)
     members = {(SERVICE_ACCOUNT_MEMBER_PREFIX + e).lower(): e for e in emails}
     found: dict[str, set[str]] = {}
@@ -260,8 +286,7 @@ def roles_beyond_read_only(policy: dict, emails: set[str]) -> dict[str, set[str]
         role = binding.get("role") or ""
         if not role or role in allowed:
             continue
-        condition = (binding.get("condition") or {}).get("title")
-        label = f"{role} (when: {condition})" if condition else role
+        label = f"{role}{CONDITIONAL_SUFFIX}" if binding.get("condition") else role
         for member in binding.get("members") or []:
             email = members.get(str(member).lower())
             if email:
@@ -390,8 +415,17 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
                 lines.append(f"{CLEARED_PREFIX} `{email}` ({via}) no longer holds {code_list(gone)} in project `{project}`.")
             if now_held:
                 roles[key] = now_held
-    # An account or project no longer checked drops out silently: the
-    # annotation and scope lines already said why.
+    # A recorded drift whose account or project is no longer checked (the
+    # annotation was repointed, federation changed, the scope narrowed) is said
+    # once as it leaves the ledger, so chat's last word is not a stale grant.
+    for key, last in sorted(held.items()):
+        email, _, project = key.partition(LEDGER_KEY_SEPARATOR)
+        if key in roles or (email in emails and project in futures):
+            continue
+        lines.append(
+            f"{UNWATCHED_PREFIX} `{email}` in project `{project}` is no longer checked; it held "
+            f"{code_list(last)} when last read."
+        )
 
     old_errors = state.get("project_errors") or {}
     for project, text in sorted(errors.items()):

@@ -91,10 +91,14 @@ class WatchTest(unittest.TestCase):
         with patch.object(sa_role_watch, "run_sandbox", sandbox):
             return sa_role_watch.tick(self.state, dry_run=dry_run)
 
-    def scoped(self, *projects):
+    def scoped(self, *projects, unread=(), management=MANAGEMENT):
         self.scope = fleet_scope_targets.ScopeTargets(
-            projects=(MANAGEMENT, *projects), unread=(), resolved_at="2026-10-13T00:00:00Z", path="fleet_scope.json"
+            projects=(management, *projects), unread=tuple(unread), resolved_at="2026-10-13T00:00:00Z",
+            path="fleet_scope.json",
         )
+
+    def checked(self, sandbox):
+        return [c[3] for c in sandbox.calls if c[:3] == ["gcloud", "projects", "get-iam-policy"]]
 
 
 class ReadOnlyIsQuiet(WatchTest):
@@ -146,7 +150,9 @@ class DriftIsReportedOnChange(WatchTest):
         policy["bindings"].append(binding("roles/container.clusterAdmin", AGENT_GSA, condition="weekdays"))
         lines = self.tick(FakeSandbox(policies={MANAGEMENT: policy}))
         self.assertIn("`projects/mgmt-proj/roles/clusterMaker`", lines[0])
-        self.assertIn("`roles/container.clusterAdmin (when: weekdays)`", lines[0])
+        self.assertIn("`roles/container.clusterAdmin (conditional)`", lines[0])
+        # The condition's title is free text a policy author writes; it stays out of chat.
+        self.assertNotIn("weekdays", lines[0])
 
     def test_member_case_does_not_hide_a_grant(self):
         policy = read_only_policy()
@@ -162,6 +168,43 @@ class DriftIsReportedOnChange(WatchTest):
         self.assertIn(f"project `{SCOPED}`", lines[0])
         checked = {c[3] for c in sandbox.calls if c[:3] == ["gcloud", "projects", "get-iam-policy"]}
         self.assertEqual({MANAGEMENT, SCOPED}, checked)
+
+    def test_a_scoped_project_the_reconcile_could_not_read_is_still_checked(self):
+        self.scoped(unread=[(SCOPED, "denied"), (fleet_scope_targets.UNRESOLVED_SCOPE_ROW, "unresolved")])
+        sandbox = FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/owner")})
+        lines = self.tick(sandbox)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(f"project `{SCOPED}`", lines[0])
+        self.assertEqual({MANAGEMENT, SCOPED}, set(self.checked(sandbox)))
+
+    def test_projects_past_max_projects_are_named_not_read(self):
+        over = [f"over-{i}" for i in range(sa_role_watch.MAX_PROJECTS_IN_NOTE + 2)]
+        self.scoped(unread=[(p, fleet_scope_targets.OUTCOME_OVER_CAP) for p in over])
+        sandbox = FakeSandbox()
+        lines = self.tick(sandbox)
+        self.assertEqual([MANAGEMENT], self.checked(sandbox))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(f"{len(over)} project(s) past the scope's maxProjects", lines[0])
+        self.assertIn("and 2 more", lines[0])
+        self.assertEqual([], self.tick(sandbox))
+
+    def test_a_numeric_management_project_is_read_once(self):
+        with patch.dict(os.environ, {"GCP_PROJECT_ID": "123456789"}):
+            self.scoped(SCOPED)
+            sandbox = FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner"), SCOPED: read_only_policy()})
+            lines = self.tick(sandbox)
+        self.assertEqual([MANAGEMENT, SCOPED], self.checked(sandbox))
+        self.assertEqual(1, len(lines), lines)
+
+    def test_a_project_leaving_the_scope_says_its_last_drift_once(self):
+        self.scoped(SCOPED)
+        self.tick(FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/owner")}))
+        self.scoped()
+        lines = self.tick(FakeSandbox())
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(f"in project `{SCOPED}` is no longer checked", lines[0])
+        self.assertIn("`roles/owner`", lines[0])
+        self.assertEqual([], self.tick(FakeSandbox()))
 
     def test_dry_run_writes_no_ledger(self):
         self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner")}), dry_run=True)
@@ -240,6 +283,15 @@ class Identities(WatchTest):
         drift = [line for line in lines if line.startswith(sa_role_watch.DRIFT_PREFIX)]
         self.assertEqual(1, len(drift), lines)
         self.assertIn(f"`{FEDERATED_GSA}` (credential broker)", drift[0])
+
+    def test_a_repointed_annotation_says_the_old_accounts_drift_once(self):
+        policy = read_only_policy()
+        policy["bindings"].append(binding("roles/owner", AGENT_GSA))
+        self.tick(FakeSandbox(policies={MANAGEMENT: policy}))
+        other = "other-gsa@mgmt-proj.iam.gserviceaccount.com"
+        lines = self.tick(FakeSandbox(annotation=other, policies={MANAGEMENT: policy}))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(f"`{AGENT_GSA}` in project `{MANAGEMENT}` is no longer checked", lines[0])
 
     def test_an_absent_annotation_is_said_once_and_its_return_is_said(self):
         wif = {"audience": "//iam.googleapis.com/projects/1/x", "serviceAccountEmail": FEDERATED_GSA}

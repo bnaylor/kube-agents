@@ -270,8 +270,9 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 The install grants the agent's Google service account the `read-only`
 permission set, and the installer warns about an admin role in a `custom` set,
 but only when the set is chosen. A role granted afterwards, by hand or by
-another tool, is what the hosted GKE MCP server in the agent container runs on,
-and nothing in the product said so. `sa_role_watch.py` is that check.
+another tool, is what the Google-hosted GKE MCP server acts with when the agent
+container calls it on that account's credentials, and nothing in the product
+said so. `sa_role_watch.py` is that check.
 
 Each tick reads, through the shell sandbox and so through the credential
 broker, the `PlatformAgent` in the agent's namespace and the ServiceAccount it
