@@ -168,7 +168,7 @@ Only run the real install after I say yes.
    kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=25m
    ```
 
-   While it waits, the phase reads `Provisioning` and the `Ready` condition's message names the workload it is waiting on. That is a slow start. `phase: Degraded` with reason `A2AProvisionFailed` is a broken one: the provisioning Job failed, and its pod log says why.
+   While it waits, the phase reads `Provisioning`. Once the agent's own pod is ready, the `Ready` condition's message names the A2A workload it is waiting on; before that it reads `Waiting for deployment replicas to be ready`. That is a slow start. `phase: Degraded` with reason `A2AProvisionFailed` is a broken one: the provisioning Job failed, and its pod log says why.
 
 3. **Read the A2A conditions.**
 
@@ -185,7 +185,7 @@ Only run the real install after I say yes.
    | `BusProvisioned`      | `True` | `ProvisionJobComplete` |
    | `BusCredentialsReady` | `True` | `CalloutServing`       |
 
-   `A2AGateway` and `A2AVerifier` appear only when something is wrong. `A2AGateway` `False` with `NoChatBackend` means no chat backend is enabled, so the operator runs no A2A gateway; with `WaitingForReplica` a backend has come back and the gateway's replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
+   `A2AGateway` and `A2AVerifier` appear only when something needs a look. `A2AGateway` `False` with `NoChatBackend` means no chat backend is enabled, so the operator runs no A2A gateway, and the install still reaches `Ready` with a message saying so; with `WaitingForReplica` a backend has come back and the gateway's replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
 
 4. **List the A2A pods.** Every pod the A2A stack runs carries the label `app.kubernetes.io/part-of=a2a-next`, so this lists them apart from step 4's pods:
 
