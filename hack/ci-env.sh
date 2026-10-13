@@ -65,11 +65,19 @@ readonly ENVOY_LOG_TAIL_LINES=20000
 # Every replica: the chart runs two, each serving its own share of requests,
 # and `logs deployment/...` reads one of them. Bounded like the gateway log:
 # kubectl's line tail, which it applies per pod (at 1000 lines a six-hour run
-# came back clipped to its last minutes), then a byte cap on the file, the
-# gateway log's per-pod budget for each of the chart's two replicas.
+# came back clipped to its last minutes), then a byte cap on the whole file,
+# twice the gateway log's for the chart's two replicas. kubectl prints the
+# pods one after another, so a file over the cap loses the first pod's oldest
+# lines first. Two full line tails fit under it at up to ~400 bytes a line,
+# so the cap is the belt for a log with long lines.
 readonly LITELLM_LOG_TAIL_LINES=20000
 readonly LITELLM_LOG_MAX_BYTES=$((16 * 1024 * 1024))
 readonly LITELLM_LOG_ARTIFACT="litellm.log"
+# The existence check gives up after this, so an unreachable cluster costs
+# the trap seconds rather than a hang inside the deadline's grace. The log
+# read itself is unbounded, like the gateway log's: a timeout there would cut
+# a large read short.
+readonly LITELLM_LOG_REQUEST_TIMEOUT="30s"
 # The Deployment that says LiteLLM is installed at all, and the pod label and
 # container its pods carry; the chart and the kustomize base render the same
 # three (charts/kube-agents/templates/litellm.yaml).
@@ -269,7 +277,8 @@ collect_litellm_log() {
   fi
   mkdir -p "${artifact_dir}" || true
   local found=""
-  if ! found=$("${kctl[@]}" get "${LITELLM_LOG_DEPLOYMENT}" -n "${ns}" -o name 2>&1); then
+  if ! found=$("${kctl[@]}" get "${LITELLM_LOG_DEPLOYMENT}" -n "${ns}" -o name \
+    --request-timeout="${LITELLM_LOG_REQUEST_TIMEOUT}" 2>&1); then
     echo "note: no LiteLLM log for this run: ${LITELLM_LOG_DEPLOYMENT} in ${ns} could not be read: ${found//$'\n'/ }" \
       | tee "${log}" || true
     return 0

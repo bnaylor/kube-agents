@@ -40,7 +40,7 @@ for arg in "$@"; do
   case "$arg" in
     get)
       if [ -n "${STUB_NO_DEPLOYMENT:-}" ]; then
-        echo 'Error from server (NotFound): deployments.apps "litellm" not found' >&2
+        echo "Error from server (NotFound): deployments.apps \"litellm\" not found (args: $*)" >&2
         exit 1
       fi
       echo "deployment.apps/litellm"
@@ -83,6 +83,13 @@ def constant(name: str) -> int:
     if value.startswith("$(("):
         return int(eval(value[3:-2]))
     return int(value)
+
+
+def constant_str(name: str) -> str:
+    src = ENV_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(rf'^readonly {name}="([^"]*)"$', src, re.MULTILINE)
+    assert match is not None, name
+    return match.group(1)
 
 
 def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
@@ -160,6 +167,9 @@ class LiteLLMLogCollectionTest(unittest.TestCase):
         text = log.read_text(encoding="utf-8")
         self.assertIn("not found", text)
         self.assertNotIn("ARGS:", text, "no logs read is attempted without the Deployment")
+        # The check is bounded, so an unreachable cluster costs the trap
+        # seconds rather than a hang inside the deadline's grace.
+        self.assertIn(f"--request-timeout={constant_str('LITELLM_LOG_REQUEST_TIMEOUT')}", text)
 
     def test_a_kubectl_that_fails_leaves_the_status_alone(self):
         proc, log = run_collect(STUB_FAIL="1")

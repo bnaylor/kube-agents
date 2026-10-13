@@ -3458,7 +3458,11 @@ job_started_epoch() {
 # round trip, and the diagnostics collector is re-armed under a prefix
 # before it starts: whatever ends the run after that (a pass, a failure, the
 # deadline's TERM), the EXIT trap stops the watch, whose tails then cover
-# the flip, and writes a rollback-* snapshot beside the eval's.
+# the flip, and writes a rollback-* snapshot beside the eval's. The LiteLLM
+# log is not taken here: the flip patches spec.mode, which leaves
+# deployment/litellm alone (the operator only reads it), so the trap's
+# capture still holds the eval's lines, with the round trip's single-turn
+# requests after them.
 #
 # The round trip runs in the background and is waited on, so a SIGTERM (the
 # job's deadline) reaches this script's trap during the wait rather than
