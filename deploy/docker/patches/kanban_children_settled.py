@@ -1,5 +1,6 @@
-"""Refuse to close a card whose fanned-out children are still running, or to
-re-queue one with nothing to wait on.
+"""Refuse to close a card whose fanned-out children are still running, or
+whose declared steps are not all done, or to re-queue one with nothing to wait
+on.
 
 Installed into the image at ``/opt/hermes/tools/kanban_children_settled.py``
 and wired into ``tools/kanban_tools.py`` (the ``kanban_create``,
@@ -135,6 +136,42 @@ The refusal is not rationed like the completion gate's, because it can't
 wedge anything: the worker still holds its card and can poll, complete, or
 block with any other kind. Every read fails open.
 
+A card whose declared steps are not all done
+--------------------------------------------
+On 0.8.0 (#2935, card ``t_bb95580d``, "Provision new GKE cluster with Agent
+Substrate installed") the worker created the cluster, failed to install
+Substrate, and called ``kanban_complete``. The thread showed ``done``, the
+cluster kept billing, and the software the card named was never installed.
+``agents/platform/SOUL.md`` already said a new cluster goes through a pull
+request; prose did not stop it, which is the pattern #630, #802 and #1010 set
+before it.
+
+So a card can carry a plan, one ``step <key>: <status>`` line per deliverable,
+and ``kanban_complete`` is refused while any step's latest status is not
+``done``. The creator writes the plan into the card's ``body`` when it files
+the card, and the worker records progress with ``kanban_comment``; the gate
+reads both, body first and then comments in order, and the latest line per
+key wins. Either side declaring a step is enough to hold the card, so an
+ungated completion needs the creator and the worker to both skip the rule.
+Comments, not ``metadata``: upstream writes a card's metadata only in the
+``kanban_complete`` call itself, so a plan kept there would be written by the
+call it is meant to check. Comments also survive a respawn, since a fresh
+worker is handed the card's recent comments.
+
+The statuses are ``planned``, ``done`` and ``failed``, and nothing else
+settles a step. There is no ``skipped``: a step a worker could skip and then
+complete over is #2935 again with one more line. A step that turned out to
+be unneeded, or failed, ends the card in ``kanban_block``, whose ``reason``
+names what was not delivered and what was left behind (#2939).
+
+This refusal is not rationed like the fan-out one. A live child can outlast
+its creator's worker, so that gate gives way on the retry; a step is the
+worker's own to finish, and ``kanban_block`` is always open to it, so a
+standing refusal cannot wedge the card. A worker that neither finishes nor
+blocks runs out of turns, and the worker-exit path records that run as
+failed, which for this card is the honest outcome. A card with no step line
+anywhere completes as before. Every read fails open.
+
 Scope: the checks live in the ``kanban_complete`` and ``kanban_block`` tool
 handlers, so the CLI and the scheduler (``kb.complete_task`` and
 ``kb.block_task`` direct writers) are unaffected — no cron
@@ -148,6 +185,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 logger = logging.getLogger(__name__)
@@ -183,6 +221,37 @@ NUDGE_TTL_SECONDS = 15 * 60
 #: back through a tool result and a runaway creator should not get a runaway
 #: refusal.
 MAX_LISTED_CHILDREN = 10
+
+#: A step line: ``step <key>: <status>``, anywhere in a card's body or a
+#: comment, one per line. Keys are short slugs so a sentence that happens to
+#: start with "step" does not read as one; status words are matched whole.
+STEP_LINE_RE = re.compile(
+    r"^[ \t>*-]*step[ \t]+([a-z0-9][a-z0-9-]{0,39})[ \t]*:[ \t]*(planned|done|failed)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: The one status that settles a step.
+STEP_DONE = "done"
+#: How many unfinished steps the refusal names.
+MAX_LISTED_STEPS = 10
+
+_CARD_BODY_SQL = "SELECT COALESCE(body, '') FROM tasks WHERE id = ?"
+#: Comments in the order they were written; the id breaks a same-second tie.
+_CARD_COMMENTS_SQL = (
+    "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at, id"
+)
+
+STEPS_REFUSAL = (
+    "kanban_complete refused: {count} step(s) this card declared are not "
+    "done — {listing}. A card closes `done` only when every step it names "
+    "was delivered; completing now would tell the requester it was. Either "
+    "finish the step and record it with "
+    "kanban_comment(body=\"step <key>: done\"), or end the card with "
+    "kanban_block(kind=\"needs_input\") whose `reason` names what was not "
+    "delivered and, for anything already created, the resource, its state and "
+    "how to remove it. There is no way to skip a step: one that turned out "
+    "to be unneeded is a block that says so. The `result` you submitted has "
+    "been saved on this card in the meantime."
+)
 
 #: Cards refused once and not yet completed, task id -> ``time.monotonic()``
 #: at refusal. Keyed per card for the reason ``kanban_result_required``
@@ -488,3 +557,63 @@ def refuse_idle_dependency_block(task_id, kind, conn, run_id=None) -> str | None
         key, len(children),
     )
     return DEPENDENCY_REFUSAL.format(listing=listing)
+
+
+def card_steps(conn, task_id: str) -> dict[str, str]:
+    """Each declared step's latest status, by key: the card's body first,
+    then its comments in the order they were written."""
+    steps: dict[str, str] = {}
+    row = conn.execute(_CARD_BODY_SQL, (task_id,)).fetchone()
+    texts = [row[0] if row else ""]
+    texts += [r[0] or "" for r in conn.execute(_CARD_COMMENTS_SQL, (task_id,)).fetchall()]
+    for text in texts:
+        for key, status in STEP_LINE_RE.findall(str(text)):
+            steps[key.lower()] = status.lower()
+    return steps
+
+
+def require_steps_settled(task_id, connect, result=None) -> str | None:
+    """The step gate. ``None`` when the completion may proceed.
+
+    ``connect`` and ``result`` are as for :func:`require_children_settled`,
+    and the submitted result is stashed before any refusal the same way. A
+    card with no step line completes as before. Not rationed (see the module
+    docstring). Fails open on any error.
+    """
+    key = str(task_id or "").strip()
+    if not key:
+        return None
+    try:
+        conn = connect()
+        try:
+            unfinished = [
+                (step, status)
+                for step, status in card_steps(conn, key).items()
+                if status != STEP_DONE
+            ]
+            if not unfinished:
+                return None
+            _stash_submitted_result(conn, key, result)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001 — advisory gate, never block
+        logger.warning(
+            "kanban_children_settled: could not check %s's declared steps or "
+            "preserve its submitted result (allowing the completion): %r",
+            key, exc,
+        )
+        return None
+    listing = ", ".join(
+        f"`{step}` ({status})" for step, status in unfinished[:MAX_LISTED_STEPS]
+    )
+    overflow = len(unfinished) - MAX_LISTED_STEPS
+    if overflow > 0:
+        listing += f" and {overflow} more"
+    logger.warning(
+        "kanban_children_settled: refused completing %s with %d step(s) not done",
+        key, len(unfinished),
+    )
+    return STEPS_REFUSAL.format(count=len(unfinished), listing=listing)
