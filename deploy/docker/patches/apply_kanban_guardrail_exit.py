@@ -10,8 +10,8 @@ phase:
    kanban stop gate that runs only in the text-response phase
    (``agent/turn_stop_gates.py``). Nudge the worker to finish on the board and
    return ``_verdict("continue")`` instead.
-2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, the single
-   funnel every exit passes through, for the six sibling exits that leak the
+2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, the funnel
+   every exit without a failed result passes through, for the six sibling exits that leak the
    same way and for the halt path when its nudges are spent. A
    retries-exhausted exit whose last failure was a rate limit is blocked with
    the provider's text instead of being charged a ``timed_out``. Either write

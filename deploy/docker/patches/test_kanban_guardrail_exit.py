@@ -1233,6 +1233,19 @@ class CloseFailedChatTurnTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual((com.calls, rec.calls), ([], []))
 
+    def test_a_charge_that_did_not_land_is_logged_with_the_task_and_run(self):
+        with self.assertLogs(kge.logger, level="INFO") as logs:
+            self._close(AUTH_RESULT, rows=(("t_80ff98c9", "running", 29),))
+        self.assertTrue(
+            any("t_80ff98c9" in line and "run 28" in line and "not confirmed" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_charge_that_landed_logs_nothing_at_info(self):
+        with mock.patch.object(kge.logger, "info") as info:
+            self._close(AUTH_RESULT)
+        info.assert_not_called()
+
     def test_a_non_worker_is_untouched(self):
         code, com, rec = self._close(AUTH_RESULT, environ={})
         self.assertIsNone(code)

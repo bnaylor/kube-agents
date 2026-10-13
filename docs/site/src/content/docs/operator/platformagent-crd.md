@@ -326,14 +326,16 @@ differently: when the retries were spent on provider rate limits (429s), the wor
 card instead, kind `transient`, with the provider's error text as the reason; `kanban_unblock` it
 once the quota window has passed. A second rate-limit block after an unblock sends the card to
 `triage`. A turn that fails outright, because the provider refused the call (an HTTP 401, a billing
-wall, a safety block) or the last retry ended on an error, is recorded by the worker itself: the error Hermes reported goes on the
-card as a comment, the run is charged as `crashed` and counted, and the card goes back to `ready`
-until it reaches its retry limit. The charge's own error text is fixed and names no provider error,
-so the dispatcher's respawn guard does not mistake it for an auth or quota blocker. Goal-mode cards
-get none of this: their failures exit through the dispatcher's reaper as before, with exit 1, or
-exit 75 and a `rate_limited` run for a rate limit or a billing wall. A run that stops
-without a terminal call and reaches the dispatcher unexplained surfaces instead as a **protocol
-violation**, which describes the symptom and hides the cause; the image narrows that window in
+wall, a safety block) or the last retry ended on an error, is recorded by the worker itself: the
+error Hermes reported goes on the card as a comment, the run is charged as `crashed` and counted,
+and the card goes back to `ready` until it reaches its retry limit. The chat thread shows the
+generic "worker crashed" line for it, so read the card's comment for the cause. The charge's own
+error text names no provider error, so the dispatcher retries the card rather than parking it as
+an auth or quota failure. Goal-mode cards, which the dispatcher runs as a loop of turns judged
+against the card's goal, get none of this: their failures exit through the dispatcher's reaper as
+before, with exit 1, or exit 75 and a `rate_limited` run for a rate limit or a billing wall. A run
+that stops without a terminal call and reaches the dispatcher unexplained surfaces instead as a
+**protocol violation**, which describes the symptom and hides the cause; the image narrows that window in
 [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much

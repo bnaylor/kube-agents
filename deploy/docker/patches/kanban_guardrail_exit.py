@@ -1047,9 +1047,12 @@ def close_failed_chat_turn(
             record_failure=record_failure,
         )
         if not landed:
+            # Not landed covers a card that moved on, a charge refused inside
+            # its transaction, and a read-back that failed; the line names no
+            # cause because it cannot tell them apart.
             logger.info(
-                "kanban task %s run %s: failed-turn charge not recorded (card not "
-                "running on this run); exit %s is left to the reaper",
+                "kanban task %s run %s: failed-turn charge not confirmed on the "
+                "board; exiting %s",
                 env.get(TASK_ENV),
                 run_id,
                 code,
