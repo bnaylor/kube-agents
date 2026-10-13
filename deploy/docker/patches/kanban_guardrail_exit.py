@@ -250,6 +250,20 @@ books the exit as ``crashed``, through its usual path. ``rate_limit`` records
 nothing and writes no comment. Its transient block already carries the text,
 and it exits 75 like the quiet path.
 
+Releasing the claim before the process exits has a cost, the same one the
+backstop's ``timed_out`` charge has always had. After the turn,
+``_finalize_single_query`` still waits for ``notify_on_complete`` background
+processes, for up to ``terminal.oneshot_completion_wait_seconds`` (600s by
+default). The card is back in ``ready`` during that wait, so a respawned
+worker can run in the same workspace alongside the old process's background
+children for up to that long. The old process also stops counting toward the
+dispatcher's concurrency limits once its claim is released.
+
+A worker whose ``chat()`` returns before any turn runs (credentials
+unresolved, the agent failed to initialise) exits 1 as well
+(``single_query_exit_code``), as the ``-Q`` branch does. There is no result
+to record, so the reaper books it.
+
 No board write reaches chat without feeding the guard: ``commented`` is not a
 kind the notifier posts. The ``crashed`` event the charge writes is, and it is
 what tells the thread the run failed.
@@ -407,9 +421,16 @@ FAILED_TURN_COMMENT_MAX_CHARS = 1000
 PROFILE_ENV = "HERMES_PROFILE"
 FAILED_TURN_COMMENT_AUTHOR = DETECTOR
 
-#: The attribute the chat-render site leaves the exit code on, for the
-#: single-query exit in ``cli.py``.
+#: The attributes the chat-render site leaves on the CLI object for the
+#: single-query exit in ``cli.py``: the exit code, and whether a turn result
+#: reached the site at all.
 EXIT_CODE_ATTR = "_kube_kanban_exit_code"
+TURN_SEEN_ATTR = "_kube_kanban_turn_seen"
+
+#: What a kanban worker exits with when ``chat()`` returned before any turn,
+#: mirroring the ``-Q`` branch's ``sys.exit(1)  # credentials or agent init
+#: failed``.
+NO_TURN_EXIT_CODE = 1
 
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
@@ -1009,7 +1030,7 @@ def close_failed_chat_turn(
             from hermes_cli.kanban_db_dispatch import _record_task_failure
 
             record_failure = _record_task_failure
-        record_failed_turn(
+        landed = record_failed_turn(
             task_id=env.get(TASK_ENV),
             run_id=run_id,
             comment=failed_turn_comment(
@@ -1025,6 +1046,48 @@ def close_failed_chat_turn(
             add_comment=add_comment,
             record_failure=record_failure,
         )
+        if not landed:
+            logger.info(
+                "kanban task %s run %s: failed-turn charge not recorded (card not "
+                "running on this run); exit %s is left to the reaper",
+                env.get(TASK_ENV),
+                run_id,
+                code,
+            )
     except Exception:
         logger.debug("failed-turn charge for task %s failed", env.get(TASK_ENV), exc_info=True)
     return code
+
+
+def single_query_exit_code(
+    code,
+    *,
+    turn_seen,
+    environ=None,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+):
+    """The exit code ``_run_single_query_mode`` leaves with on the chat path.
+
+    ``code`` is what the chat-render site left (``close_failed_chat_turn``),
+    and ``turn_seen`` says whether that site saw a turn result at all. A
+    kanban worker whose ``chat()`` returned before any turn ran (runtime
+    credentials unresolved, the agent failed to initialise) exits
+    ``NO_TURN_EXIT_CODE``, as the ``-Q`` branch does for the same cases
+    ("credentials or agent init failed"). Nothing is written to the board for
+    it: there is no result to describe, so the reaper books the exit. ``None``
+    leaves the exit alone, with the same exclusions as the rest of the module.
+    """
+    if code:
+        return code
+    env = os.environ if environ is None else environ
+    if turn_seen or not env.get(TASK_ENV):
+        return None
+    if goal_mode is None:
+        goal_mode = env.get(GOAL_MODE_ENV) == GOAL_MODE_ON
+    if card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    ):
+        return None
+    return NO_TURN_EXIT_CODE

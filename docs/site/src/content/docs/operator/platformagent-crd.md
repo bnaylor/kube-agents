@@ -325,13 +325,13 @@ and the upstream error rate before suspecting the worker. One `apiMaxRetries` ex
 differently: when the retries were spent on provider rate limits (429s), the worker blocks its own
 card instead, kind `transient`, with the provider's error text as the reason; `kanban_unblock` it
 once the quota window has passed. A second rate-limit block after an unblock sends the card to
-`triage`. A turn that fails outright,
-because the provider refused the call (an HTTP 401, a billing wall, a safety block) or the last
-retry ended on an error, is recorded by the worker itself: the error Hermes reported goes on the
+`triage`. A turn that fails outright, because the provider refused the call (an HTTP 401, a billing
+wall, a safety block) or the last retry ended on an error, is recorded by the worker itself: the error Hermes reported goes on the
 card as a comment, the run is charged as `crashed` and counted, and the card goes back to `ready`
 until it reaches its retry limit. The charge's own error text is fixed and names no provider error,
 so the dispatcher's respawn guard does not mistake it for an auth or quota blocker. Goal-mode cards
-run Hermes' quiet path, which exits 75 on a billing wall and records nothing. A run that stops
+get none of this: their failures exit through the dispatcher's reaper as before, with exit 1, or
+exit 75 and a `rate_limited` run for a rate limit or a billing wall. A run that stops
 without a terminal call and reaches the dispatcher unexplained surfaces instead as a **protocol
 violation**, which describes the symptom and hides the cause; the image narrows that window in
 [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).

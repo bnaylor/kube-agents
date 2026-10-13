@@ -45,8 +45,10 @@ phase:
    neither anchor overlaps it.
 7. ``cli.py`` — ``_run_single_query_mode``'s non-quiet branch, after
    ``chat()`` and the resume summary: exit with the code edit 5 left on the
-   CLI object. Without it the chat path exits 0 for every failed turn, and a
-   failure edit 5 could not record is booked as a protocol violation.
+   CLI object, or 1 for a kanban worker whose ``chat()`` returned before any
+   turn ran (``-Q`` exits 1 for the same credential and agent-init failures).
+   Without it the chat path exits 0 for every failed turn, and a failure edit
+   5 could not record is booked as a protocol violation.
 
 The inserts mirror code that is already in the tree: edit 1 copies the shape of
 upstream's kanban stop gate in ``agent/turn_stop_gates.py`` (local import,
@@ -306,6 +308,7 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
         # after the summary.
         # See hermes_cli/kanban_guardrail_exit.py.
         if turn.result and os.environ.get("HERMES_KANBAN_TASK"):
+            self._kube_kanban_turn_seen = True
             try:
                 from hermes_cli.kanban_guardrail_exit import (
                     block_rate_limited_worker as _kube_block_rate_limited_chat,
@@ -353,9 +356,21 @@ SINGLE_QUERY_INSERT = '''        # kube-agents patch: a kanban worker whose turn
         # the -Q path does (exit 1; 75 for a rate limit) instead of 0.
         # _chat_render_turn set the code after recording the failure; if that
         # record was refused, this exit is what the reaper counts instead of
-        # booking a protocol violation.
+        # booking a protocol violation. A worker whose chat() returned before
+        # any turn (credentials or agent init failed) exits 1, as -Q does.
         # See hermes_cli/kanban_guardrail_exit.py.
         _kube_kanban_exit_code = getattr(cli, "_kube_kanban_exit_code", None)
+        try:
+            from hermes_cli.kanban_guardrail_exit import (
+                single_query_exit_code as _kube_single_query_exit_code,
+            )
+
+            _kube_kanban_exit_code = _kube_single_query_exit_code(
+                _kube_kanban_exit_code,
+                turn_seen=getattr(cli, "_kube_kanban_turn_seen", False),
+            )
+        except Exception:
+            logger.debug("kanban single-query exit check failed", exc_info=True)
         if _kube_kanban_exit_code:
             sys.exit(_kube_kanban_exit_code)
 '''
