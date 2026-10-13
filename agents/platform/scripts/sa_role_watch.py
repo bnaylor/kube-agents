@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -133,6 +134,7 @@ CHECK_RECOVERED_LINE = f"✅ **{WATCH_NAME}** — the check runs again."
 PROJECT_UNREAD_PREFIX = f"⚠️ **{WATCH_NAME} — project not checked:**"
 PROJECT_RECOVERED_PREFIX = f"✅ **{WATCH_NAME}** — checked again:"
 UNWATCHED_PREFIX = f"ℹ️ **{WATCH_NAME}:**"
+SCOPE_RECOVERED_LINE = f"✅ **{WATCH_NAME}** — every project in the scope is checked again."
 DRIFT_ADVICE = (
     "These are outside the read-only set: anything running on this account can use them without "
     "a pull request. Remove them unless they were granted on purpose."
@@ -150,6 +152,13 @@ LEDGER_KEY_SEPARATOR = "|"
 CONDITIONAL_SUFFIX = " (conditional)"
 #: Over-cap projects a scope note names before counting the rest.
 MAX_PROJECTS_IN_NOTE = 8
+UNRESOLVED_SCOPE_NOTE = "folder, organisation or selector members the reconcile has not resolved are not checked"
+#: What an account read off the ServiceAccount or the CR must look like before
+#: it is checked or named in chat: those values are whatever whoever can patch
+#: them writes, and a backtick or newline would leave the line's code span.
+ACCOUNT_EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$")
+#: Characters kept out of a tool's error text before chat quotes it.
+CHAT_UNSAFE_CHARS = str.maketrans({"`": "'"})
 #: The ledger's record of an annotation that was read and absent.
 ANNOTATION_ABSENT = ""
 #: The ledger's key for a scope that could not be read, beside the projects.
@@ -166,15 +175,17 @@ def run_sandbox(argv: list[str], *, timeout: float) -> subprocess.CompletedProce
 
 
 def stderr_excerpt(text: str | None) -> str:
-    return " ".join((text or "").split())[:STDERR_EXCERPT_CHARS]
+    """One line of a tool's error output, short, with nothing in it that could
+    end a chat line's formatting."""
+    return " ".join((text or "").split()).translate(CHAT_UNSAFE_CHARS)[:STDERR_EXCERPT_CHARS]
 
 
 def failure_text(exc: BaseException) -> str:
     if isinstance(exc, subprocess.TimeoutExpired):
         return f"timed out after {int(exc.timeout)}s"
     if isinstance(exc, RuntimeError):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"
+        return stderr_excerpt(str(exc))
+    return stderr_excerpt(f"{type(exc).__name__}: {exc}")
 
 
 def read_json(argv: list[str], *, timeout: float):
@@ -228,6 +239,10 @@ def read_identities(ns: str) -> tuple[dict[str, list[str]], str, str | None]:
     wif = security.get("workloadIdentityFederation") or {}
     federated = (wif.get("serviceAccountEmail") or "").strip() if (wif.get("audience") or "").strip() else ""
 
+    for value, where in ((annotated, f"the ServiceAccount's {WORKLOAD_IDENTITY_ANNOTATION} annotation"),
+                         (federated, "spec.security.workloadIdentityFederation.serviceAccountEmail")):
+        if value and not ACCOUNT_EMAIL_PATTERN.match(value):
+            raise RuntimeError(f"{where} is not a service account email; nothing was checked")
     identities: dict[str, list[str]] = {}
     if annotated:
         identities.setdefault(annotated.lower(), []).append(AGENT_POD_SOURCE)
@@ -241,7 +256,7 @@ def read_identities(ns: str) -> tuple[dict[str, list[str]], str, str | None]:
     return identities, f"{ns}/{account}", annotated
 
 
-def projects_to_check(management: str) -> tuple[list[str], str | None]:
+def projects_to_check(management: str) -> tuple[list[str], str | None, bool]:
     """The management project and the declared scope's projects, and a note
     naming what the scope leaves unchecked (the management project is always
     checked).
@@ -251,13 +266,18 @@ def projects_to_check(management: str) -> tuple[list[str], str | None]:
     says nothing about whether its policy can be read, and a failure is named
     like any other. A project past the scope's `maxProjects` is not, since the
     cap is the operator's bound on how many projects a tick touches; the note
-    names them instead."""
+    names them instead.
+
+    The flag says whether the list is the whole scope. A scope that could not
+    be read, or that the reconcile has not resolved in full, is not: a project
+    missing from it this tick may be back next tick, so its recorded rows are
+    held rather than said to be no longer checked."""
     try:
         targets = fleet_scope_targets.declared_scope_targets()
     except fleet_scope_targets.ScopeRenderUnreadable as exc:
-        return [management], str(exc)
+        return [management], stderr_excerpt(str(exc)), False
     if targets is None:
-        return [management], None
+        return [management], None, True
     unread = [p for p, outcome in targets.unread if p != fleet_scope_targets.UNRESOLVED_SCOPE_ROW]
     over_cap = [p for p, outcome in targets.unread if outcome == fleet_scope_targets.OUTCOME_OVER_CAP]
     checked = [p for p in [*targets.projects, *unread] if p not in over_cap]
@@ -266,12 +286,16 @@ def projects_to_check(management: str) -> tuple[list[str], str | None]:
     # and every drift in it said twice, under each spelling.
     if not (management.isdigit() and targets.projects):
         checked.insert(0, management)
-    note = None
+    notes = []
+    complete = True
+    if targets.note or any(p == fleet_scope_targets.UNRESOLVED_SCOPE_ROW for p, _ in targets.unread):
+        notes.append(UNRESOLVED_SCOPE_NOTE)
+        complete = False
     if over_cap:
         shown = code_list(over_cap[:MAX_PROJECTS_IN_NOTE])
         rest = len(over_cap) - MAX_PROJECTS_IN_NOTE
-        note = f"{len(over_cap)} project(s) past the scope's maxProjects are not checked: {shown}" + (f" and {rest} more" if rest > 0 else "")
-    return list(dict.fromkeys(checked)), note
+        notes.append(f"{len(over_cap)} project(s) past the scope's maxProjects are not checked: {shown}" + (f" and {rest} more" if rest > 0 else ""))
+    return list(dict.fromkeys(checked)), "; ".join(notes) or None, complete
 
 
 def roles_beyond_read_only(policy: dict, emails: set[str]) -> dict[str, set[str]]:
@@ -353,13 +377,9 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     state = load_state(state_path)
     lines: list[str] = []
-    try:
-        management = management_project()
-        if not management:
-            raise RuntimeError(f"no GCP project: set {PROJECT_ENVS[0]} or configure gcloud in the sandbox")
-        identities, account, annotated = read_identities(namespace())
-        projects, scope_note = projects_to_check(management)
-    except Exception as exc:  # noqa: BLE001 - a failed check is reported once, not raised every tick
+
+    def check_failed(exc: BaseException) -> list[str]:
+        # The ledger's rows are kept as they are: nothing was read.
         text = failure_text(exc)
         if state.get("check_error") != text:
             lines.append(f"{CHECK_FAILED_PREFIX} {text}")
@@ -368,6 +388,24 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         if not dry_run:
             save_state(state_path, state)
         return lines
+
+    try:
+        management = management_project()
+        if not management:
+            raise RuntimeError(f"no GCP project: set {PROJECT_ENVS[0]} or configure gcloud in the sandbox")
+        identities, account, annotated = read_identities(namespace())
+        projects, scope_note, scope_complete = projects_to_check(management)
+    except Exception as exc:  # noqa: BLE001 - a failed check is reported once, not raised every tick
+        return check_failed(exc)
+
+    emails = set(identities)
+    with ThreadPoolExecutor(max_workers=POLICY_WORKERS) as pool:
+        futures = {project: pool.submit(read_project, project, emails) for project in projects}
+    # With the sandbox gone no project can be read, and one cause is one line,
+    # not one per project (stall_watch.py's READ_FAILURES makes the same call).
+    for future in futures.values():
+        if isinstance(future.exception(), sandbox_exec.SandboxUnavailable):
+            return check_failed(future.exception())
 
     if state.get("check_error"):
         lines.append(CHECK_RECOVERED_LINE)
@@ -383,9 +421,6 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         lines.append(ANNOTATION_RESTORED_NOTE.format(account=account, email=annotated))
     state["annotation"] = annotated or ANNOTATION_ABSENT
 
-    emails = set(identities)
-    with ThreadPoolExecutor(max_workers=POLICY_WORKERS) as pool:
-        futures = {project: pool.submit(read_project, project, emails) for project in projects}
     errors: dict[str, str] = {}
     if scope_note:
         errors[SCOPE_ERROR_KEY] = scope_note
@@ -418,9 +453,15 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     # A recorded drift whose account or project is no longer checked (the
     # annotation was repointed, federation changed, the scope narrowed) is said
     # once as it leaves the ledger, so chat's last word is not a stale grant.
+    # While the scope is read only in part, a project missing from it is held
+    # instead: it is likely back next tick, and saying it left would re-announce
+    # its drift as new when it returns.
     for key, last in sorted(held.items()):
         email, _, project = key.partition(LEDGER_KEY_SEPARATOR)
         if key in roles or (email in emails and project in futures):
+            continue
+        if email in emails and not scope_complete:
+            roles[key] = last
             continue
         lines.append(
             f"{UNWATCHED_PREFIX} `{email}` in project `{project}` is no longer checked; it held "
@@ -431,9 +472,11 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     for project, text in sorted(errors.items()):
         if old_errors.get(project) != text:
             lines.append(f"{PROJECT_UNREAD_PREFIX} `{project}`: {text}")
-    recovered = sorted(p for p in old_errors if p not in errors and (p in futures or p == SCOPE_ERROR_KEY))
+    recovered = sorted(p for p in old_errors if p not in errors and p in futures)
     if recovered:
         lines.append(f"{PROJECT_RECOVERED_PREFIX} {code_list(recovered)}.")
+    if SCOPE_ERROR_KEY in old_errors and SCOPE_ERROR_KEY not in errors:
+        lines.append(SCOPE_RECOVERED_LINE)
 
     state["roles"] = roles
     state["project_errors"] = errors

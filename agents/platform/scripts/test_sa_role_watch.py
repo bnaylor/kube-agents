@@ -15,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import command_policy  # noqa: E402
 import fleet_scope_targets  # noqa: E402
+import sandbox_exec  # noqa: E402
 import sa_role_watch  # noqa: E402
 
 NAMESPACE = "kubeagents-system"
@@ -173,8 +174,10 @@ class DriftIsReportedOnChange(WatchTest):
         self.scoped(unread=[(SCOPED, "denied"), (fleet_scope_targets.UNRESOLVED_SCOPE_ROW, "unresolved")])
         sandbox = FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/owner")})
         lines = self.tick(sandbox)
-        self.assertEqual(1, len(lines), lines)
+        self.assertEqual(2, len(lines), lines)
         self.assertIn(f"project `{SCOPED}`", lines[0])
+        # The unresolved row is the scope saying it is partial; that is said too.
+        self.assertIn(sa_role_watch.UNRESOLVED_SCOPE_NOTE, lines[1])
         self.assertEqual({MANAGEMENT, SCOPED}, set(self.checked(sandbox)))
 
     def test_projects_past_max_projects_are_named_not_read(self):
@@ -205,6 +208,44 @@ class DriftIsReportedOnChange(WatchTest):
         self.assertIn(f"in project `{SCOPED}` is no longer checked", lines[0])
         self.assertIn("`roles/owner`", lines[0])
         self.assertEqual([], self.tick(FakeSandbox()))
+
+    def test_a_partial_scope_holds_rows_instead_of_dropping_them(self):
+        self.scoped(SCOPED)
+        self.tick(FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/owner")}))
+
+        def unreadable():
+            raise fleet_scope_targets.ScopeRenderUnreadable("KUBEAGENTS_SCOPE_FILE=/x cannot be read")
+
+        with patch.object(fleet_scope_targets, "declared_scope_targets", side_effect=unreadable):
+            lines = self.tick(FakeSandbox())
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("`spec.scope`", lines[0])
+        # Back in full: the held drift is not re-announced, and the scope's return is said once.
+        lines = self.tick(FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/owner")}))
+        self.assertEqual([sa_role_watch.SCOPE_RECOVERED_LINE], lines)
+
+    def test_losing_the_sandbox_mid_tick_is_one_line(self):
+        self.scoped(*[f"p{i}" for i in range(6)])
+        gone = sandbox_exec.SandboxUnavailable("could not reach the shell sandbox: Connection refused")
+        sandbox = FakeSandbox(policies={p: gone for p in [MANAGEMENT, *[f"p{i}" for i in range(6)]]})
+        lines = self.tick(sandbox)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.CHECK_FAILED_PREFIX, lines[0])
+
+    def test_error_text_cannot_leave_its_code_span(self):
+        sandbox = FakeSandbox(policies={})
+        real = sandbox.__call__
+
+        def noisy(argv, *, timeout):
+            r = real(argv, timeout=timeout)
+            if argv[:3] == ["gcloud", "projects", "get-iam-policy"]:
+                r.stderr = "denied `\n` **now**\nsecond line"
+            return r
+
+        lines = self.tick(noisy)
+        self.assertNotIn("`\\n`", lines[0])
+        self.assertEqual(1, lines[0].count("\n") + 1)
+        self.assertEqual(2, lines[0].count("`"))
 
     def test_dry_run_writes_no_ledger(self):
         self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner")}), dry_run=True)
@@ -303,6 +344,12 @@ class Identities(WatchTest):
         back = FakeSandbox(agents=[platform_agent(wif=wif)], policies={MANAGEMENT: read_only_policy(FEDERATED_GSA)})
         lines = self.tick(back)
         self.assertIn(sa_role_watch.ANNOTATION_RESTORED_NOTE.format(account=f"{NAMESPACE}/{KSA}", email=AGENT_GSA), lines)
+
+    def test_an_annotation_that_is_not_an_email_is_refused_not_quoted(self):
+        lines = self.tick(FakeSandbox(annotation="x`\n**pwned**"))
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("is not a service account email", lines[0])
+        self.assertNotIn("pwned", lines[0])
 
     def test_no_account_anywhere_fails_the_check(self):
         lines = self.tick(FakeSandbox(annotation=None))

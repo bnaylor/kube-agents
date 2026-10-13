@@ -294,7 +294,10 @@ when it goes, and an unchanged account prints nothing. That is why it can run
 hourly: a fresh install or a new grant is named within the hour, and a quiet
 hour costs one `kubectl` pair and one policy read per project, no model turn. A
 project whose policy cannot be read keeps its last answer and its failure is
-said once. It reads project-level bindings only: a role granted on a folder,
+said once. So does a project missing from a scope the tick could read only in part (the
+render unreadable, or members the reconcile has not resolved), and the partial
+scope is said once. Losing the shell sandbox mid-tick is one failure line, not
+one per project. It reads project-level bindings only: a role granted on a folder,
 the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, once.
