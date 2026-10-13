@@ -188,9 +188,58 @@ leaving on a rate limit:
 Both sites share the exclusions above and the board check: only a card still
 ``running`` is blocked, so whichever site runs second finds nothing to do.
 ``billing`` is deliberately not treated the same way: a credit wall does not
-clear on its own, and it keeps today's exit-75 path. So does ``goal_mode``,
-where the ``kanban_block`` tool refuses ``transient`` and the goal loop owns the
-card's lifecycle.
+clear on its own. On the ``-Q`` path it keeps the stock exit 75; on the chat
+path it exits 1 (see the fourth fix). ``goal_mode`` is not blocked either:
+the ``kanban_block`` tool refuses ``transient`` there and the goal loop owns
+the card's lifecycle.
+
+The fourth fix: a failed turn on the chat path exits 0 (2026-10-13)
+-------------------------------------------------------------------
+Card ``t_80ff98c9`` on ka-next-4, run 28. The worker's model call had been in
+flight 628 seconds when the provider answered HTTP 401 (``mint used too
+late``: the credential expired during the call). Hermes printed ``Non-retryable
+client error (HTTP 401). Aborting.`` and ``run_conversation`` returned
+``failed=True, failure_reason="auth"``. The worker then exited ``rc=0``, and the
+reaper booked ``protocol_violation`` with nothing on the card or in chat about a
+model error. Run 29 did the work.
+
+The failed result never reaches ``finalize_turn``: a phase that ends the turn
+with a result dict (``nonretryable_client_error_result``,
+``max_retries_exhausted_result``, the content-policy and invalid-response exits,
+and the rest) is returned straight out of ``run_conversation``. The only code
+that sees it is the single-query site. The ``-Q`` path's exit-code block maps a
+failed result to exit 1, and ``rate_limit``/``billing`` on a kanban worker to
+75. The chat path never reaches that block and exits 0 for every failed turn.
+
+``failed_turn_exit_code`` makes the chat path exit the way the quiet path
+already does, with one divergence: ``billing`` exits 1, not 75. Exit 75 books
+the run ``rate_limited``, which counts nothing and, once
+``check_respawn_guard``'s five-minute cooldown has passed, respawns the card
+with no limit. A credit wall would be retried every five minutes forever. Today,
+on this path, the violation limit at least bounds it. Exit 1 is booked
+``crashed`` and counted, so a persistent failure trips the breaker at
+``max_retries`` and a transient one (this 401) is retried. One caveat comes
+with the reaper's counted path: ``_account_crashes`` trips a card on its first
+failure when three or more workers die with the same error text in one sweep,
+and every exit-1 worker's text is ``pid N exited with code 1``. A provider
+outage that fails three in-flight workers at once gives up on all three. The
+``-Q`` path has always worked this way, and kanban_scheduling keeps the rule on
+purpose.
+
+The reason goes on the card as a comment, ``record_failed_turn_comment``, and
+deliberately not as the failure's error text. ``_record_task_failure`` writes
+its error to ``last_failure_error``, and ``check_respawn_guard`` refuses to
+respawn any card whose ``last_failure_error`` matches ``_RESPAWN_BLOCKER_RE``
+(``auth…``, ``quota``, ``403``, ``billing``…). Nothing but a completion, an
+unblock or a reassign clears that column, so a counted failure carrying
+``litellm.AuthenticationError`` parks the card in ``ready`` for good: no
+respawn, no ``gave_up``, one ``respawn_guarded`` event per dispatcher tick. The
+reaper's own text for exit 1, ``pid N exited with code 1``, matches nothing. A
+comment never reaches ``last_failure_error``, and the retry worker reads it
+under the card's comments. No board write reaches chat without feeding the
+guard: ``commented`` is not a kind the notifier posts. The ``crashed`` event the
+reaper writes for the exit is, and it is what tells the thread the run failed.
+``rate_limit`` writes no comment; its transient block already carries the text.
 
 What is deliberately *not* excluded is the halt nudge. It fires during a cron run
 too — ``kanban_stop_nudge_enabled()`` is on whenever ``HERMES_KANBAN_TASK`` is
@@ -205,12 +254,15 @@ module exists to prevent.
 
 from __future__ import annotations
 
+import logging
 import os
 
 try:  # In the image, /opt/hermes is on sys.path.
     from tools.kanban_ownership import in_cron_run, is_delegated_child
 except ImportError:  # Local unittest discovery: the patches dir is top-level.
     from kanban_ownership import in_cron_run, is_delegated_child
+
+logger = logging.getLogger(__name__)
 
 # Mirrors ``agent.kanban_stop._DEFAULT_MAX_ATTEMPTS``. Duplicated rather than
 # imported so this module stays importable on a host without Hermes, which is
@@ -236,7 +288,7 @@ RATE_LIMIT_BLOCK_KIND = "transient"
 #: ``FailoverReason`` values, as ``result["failure_reason"]`` spells them, that
 #: mean the provider throttled the call rather than the task being broken.
 #: ``billing`` is absent on purpose: a credit wall does not clear on its own and
-#: keeps the stock exit-75 path.
+#: is not blocked ``transient``.
 RATE_LIMIT_FAILURE_REASONS = frozenset({"rate_limit"})
 
 #: The loop's ``_turn_exit_reason`` when the retry loop ends with no response.
@@ -285,6 +337,43 @@ TEXT_RESPONSE_LEAD = "model replied in text and made no terminal kanban call"
 TEXT_RESPONSE_CONSEQUENCE = (
     " The card was not closed and the reply was not saved as its result."
 )
+
+#: The chat path's exit codes for a kanban worker's failed turn, mirroring
+#: ``cli.py``'s ``_run_quiet_single_query``: 1 for a failed result, and
+#: ``hermes_cli.kanban_db.KANBAN_RATE_LIMIT_EXIT_CODE`` (75, duplicated so the
+#: module imports without Hermes; the verifier pins it) for a rate limit.
+FAILED_TURN_EXIT_CODE = 1
+RATE_LIMIT_EXIT_CODE = 75
+
+#: ``failure_reason`` values the chat path exits ``RATE_LIMIT_EXIT_CODE`` for.
+#: The quiet path also sends ``billing`` there; the chat path does not, because
+#: exit 75 respawns the card every cooldown with no limit. See the docstring.
+RATE_LIMIT_EXIT_REASONS = RATE_LIMIT_FAILURE_REASONS
+
+#: Stands in for a failed result that carries no ``failure_reason``
+#: (content-policy blocks, invalid-response exhaustion, overflow partials).
+UNCLASSIFIED_FAILURE_REASON = "unclassified"
+
+#: The comment a failed chat-path turn leaves on its card. It describes and does
+#: not instruct: the retry worker reads it under the card's comments.
+FAILED_TURN_COMMENT = (
+    "Run {run} ended on a failed model turn (failure_reason={reason}) and the "
+    "worker exited with code {code} so the dispatcher can count the failure "
+    "and retry the card. Error: {text}"
+)
+
+#: Longest error text put in that comment. Hermes has already summarised it
+#: (``_summarize_api_error`` truncates at 1000 characters).
+FAILED_TURN_COMMENT_MAX_CHARS = 1000
+
+#: Who the comment is from when the worker has no ``HERMES_PROFILE`` (the
+#: dispatcher always sets it; ``kanban_comment`` defaults its author to it).
+PROFILE_ENV = "HERMES_PROFILE"
+FAILED_TURN_COMMENT_AUTHOR = DETECTOR
+
+#: The attribute the chat-render site leaves the exit code on, for the
+#: single-query exit in ``cli.py``.
+EXIT_CODE_ATTR = "_kube_kanban_exit_code"
 
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
@@ -367,9 +456,11 @@ def should_record_missing_terminal(
     if not task_id:
         return False
     if interrupted or failed or iteration_limit_fallback:
-        # Interrupts are the caller's business, ``failed`` turns already exit
-        # nonzero, and the iteration-budget path records its own failure
-        # immediately above this check.
+        # Interrupts are the caller's business, ``failed`` turns belong to the
+        # single-query sites (most never reach finalize_turn at all, and on the
+        # chat path failed_turn_exit_code is what makes them exit nonzero),
+        # and the iteration-budget path records its own failure immediately
+        # above this check.
         return False
     return not card_is_somebody_elses(
         goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
@@ -726,3 +817,129 @@ def block_rate_limited_worker(
         block_task=block_task,
         run_id=worker_run_id(env),
     )
+
+
+def failed_turn_exit_code(
+    result,
+    *,
+    environ=None,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+):
+    """The exit code a kanban worker's failed chat-path turn should leave with.
+
+    ``None`` means "not this function's business, exit as the chat path always
+    has": the result did not fail, the process is not a kanban worker, or the
+    card is somebody else's (the exclusion chain the board writes share).
+    Otherwise it is what ``_run_quiet_single_query`` would exit with for the
+    same result, except ``billing``: ``RATE_LIMIT_EXIT_CODE`` for a rate limit,
+    ``FAILED_TURN_EXIT_CODE`` for everything else, ``billing`` included. See
+    the module docstring for why ``billing`` does not get 75 here.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return None
+    env = os.environ if environ is None else environ
+    if not env.get(TASK_ENV):
+        return None
+    if goal_mode is None:
+        goal_mode = env.get(GOAL_MODE_ENV) == GOAL_MODE_ON
+    if card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    ):
+        return None
+    if str(result.get("failure_reason") or "") in RATE_LIMIT_EXIT_REASONS:
+        return RATE_LIMIT_EXIT_CODE
+    return FAILED_TURN_EXIT_CODE
+
+
+def failed_turn_comment(*, run_id, failure_reason, error_text, exit_code) -> str:
+    """The comment body: which run, the classified reason, the exit, the error."""
+    text = " ".join(str(error_text or "").split()) or RATE_LIMIT_REASON_NO_TEXT
+    return FAILED_TURN_COMMENT.format(
+        run=run_id if run_id is not None else "?",
+        reason=failure_reason or UNCLASSIFIED_FAILURE_REASON,
+        code=exit_code,
+        text=text[:FAILED_TURN_COMMENT_MAX_CHARS],
+    )
+
+
+def record_failed_turn_comment(
+    *, task_id: str, run_id, body: str, author: str, connect, add_comment
+) -> bool:
+    """Put ``body`` on the card as a comment. Returns whether it did.
+
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` and ``add_comment``
+    is ``hermes_cli.kanban_db.add_comment``, both injected. Only a card still
+    ``running`` under this worker's run is written to: a card that changed
+    hands is the newer worker's, and a comment there would describe a run it
+    did not have. A comment never touches ``last_failure_error``, which is the
+    point; see the module docstring.
+    """
+    conn = connect()
+    try:
+        if not task_is_still_running(conn, task_id, run_id):
+            return False
+        add_comment(conn, task_id, author, body)
+        return True
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def close_failed_chat_turn(
+    result,
+    *,
+    connect=None,
+    add_comment=None,
+    environ=None,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+):
+    """The chat-render site: return the exit code for a failed kanban turn,
+    after leaving its reason on the card. ``None`` leaves the exit alone.
+
+    Runs after ``block_rate_limited_worker`` at the same site. A rate limit
+    gets its exit code and no comment, because the transient block (or the
+    board having moved on) already says why. Every other failed result gets
+    ``record_failed_turn_comment`` first. The comment is best-effort: a write
+    that fails still returns the exit code, because the exit code is what lets
+    the dispatcher count and retry the run.
+    """
+    env = os.environ if environ is None else environ
+    code = failed_turn_exit_code(
+        result,
+        environ=env,
+        goal_mode=goal_mode,
+        cron_run=cron_run,
+        delegated_child=delegated_child,
+    )
+    if code is None or code == RATE_LIMIT_EXIT_CODE:
+        return code
+    run_id = worker_run_id(env)
+    try:
+        if connect is None:
+            connect = _default_connect()
+        if add_comment is None:
+            from hermes_cli import kanban_db as _kb
+
+            add_comment = _kb.add_comment
+        record_failed_turn_comment(
+            task_id=env.get(TASK_ENV),
+            run_id=run_id,
+            body=failed_turn_comment(
+                run_id=run_id,
+                failure_reason=result.get("failure_reason"),
+                error_text=result.get("error"),
+                exit_code=code,
+            ),
+            author=env.get(PROFILE_ENV) or FAILED_TURN_COMMENT_AUTHOR,
+            connect=connect,
+            add_comment=add_comment,
+        )
+    except Exception:
+        logger.debug("failed-turn comment for task %s failed", env.get(TASK_ENV), exc_info=True)
+    return code

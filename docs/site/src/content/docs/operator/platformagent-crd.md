@@ -319,14 +319,20 @@ are scaffolded.
 Both limits matter because they fail the same way, and it is not an obvious way. A run that
 exhausts either stops mid-task without ever calling a terminal kanban tool. The card is charged a
 `timed_out` failure whose error text names how the turn ended — `Iteration budget exhausted (N/M)`
-for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for `apiMaxRetries` — and
-retrying re-runs into the same wall, so read that text and the upstream error rate before suspecting
-the worker. One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on
+for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for an `apiMaxRetries`
+exhaustion that ends with no response — and retrying re-runs into the same wall, so read that text
+and the upstream error rate before suspecting the worker. One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on
 provider rate limits (429s), the worker blocks its own card instead, kind `transient`, with the
 provider's error text as the reason; `kanban_unblock` it once the quota window has passed. A
-second rate-limit block after an unblock sends the card to `triage`. An exit like this that reaches
-the dispatcher unexplained surfaces instead as a **protocol violation**, which describes the
-symptom and hides the cause; the image narrows that window in
+second rate-limit block after an unblock sends the card to `triage`. A turn that fails outright,
+because the provider refused the call (an HTTP 401, a billing wall, a safety block) or the last
+retry ended on an error, ends the worker with exit code 1 instead: the dispatcher books the run
+`crashed`, counts it, and retries the card up to its retry limit, and the error Hermes reported is
+left on the card as a comment. Goal-mode cards run Hermes' quiet path, which exits 75 on a billing
+wall and leaves no comment. When three or more workers crash with the same exit in one dispatcher
+pass, the dispatcher gives up on each of those cards at once. A run that stops without a terminal
+call and reaches the dispatcher unexplained surfaces instead as a **protocol violation**, which
+describes the symptom and hides the cause; the image narrows that window in
 [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much
