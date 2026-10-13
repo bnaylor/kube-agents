@@ -1117,6 +1117,10 @@ class FailedTurnErrorTextTest(unittest.TestCase):
         """Proves the copy is live: the provider text the charge must not carry."""
         self.assertIsNotNone(RESPAWN_BLOCKER_COPY.search(AUTH_ERROR))
 
+    def test_the_charged_text_does_not_promise_a_comment(self):
+        """The comment is written after the charge and can fail on its own."""
+        self.assertIn("any comment", kge.FAILED_TURN_ERROR)
+
     def test_the_charged_text_does_not_count_as_a_protocol_violation(self):
         self.assertNotIn("protocol violation", kge.FAILED_TURN_ERROR)
 
@@ -1149,7 +1153,8 @@ class RecordFailedTurnTest(unittest.TestCase):
         self.assertEqual(kwargs["event_payload_extra"]["failure_reason"], "auth")
         self.assertTrue(conn.closed)
 
-    def test_the_comment_is_written_before_the_charge(self):
+    def test_the_comment_is_written_after_the_charge_lands(self):
+        """The comment says the run counted; it must not precede the charge."""
         order = []
 
         class OrderedComments(CommentRecorder):
@@ -1163,7 +1168,7 @@ class RecordFailedTurnTest(unittest.TestCase):
                 return super().__call__(*a, **k)
 
         self._record([("t_80ff98c9", "running", 28)], comments=OrderedComments(), record=OrderedCharges())
-        self.assertEqual(order, ["comment", "charge"])
+        self.assertEqual(order, ["charge", "comment"])
 
     def test_a_card_that_changed_hands_is_left_alone(self):
         did, com, rec, _ = self._record([("t_80ff98c9", "running", 29)])
@@ -1175,15 +1180,20 @@ class RecordFailedTurnTest(unittest.TestCase):
         self.assertFalse(did)
         self.assertEqual((com.calls, rec.calls), ([], []))
 
-    def test_a_failed_comment_still_charges(self):
-        """The charge is what hands the card back with the failure counted."""
+    def test_a_failed_comment_leaves_the_charge_standing(self):
+        """The charge is what hands the card back with the failure counted,
+        which is why FAILED_TURN_ERROR does not promise a comment."""
         did, _, rec, _ = self._record([("t_80ff98c9", "running", 28)], comments=CommentRecorder(raises=True))
         self.assertTrue(did)
         self.assertEqual(len(rec.calls), 1)
 
-    def test_a_charge_refused_inside_its_transaction_is_reported(self):
-        did, _, _, _ = self._record([("t_80ff98c9", "running", 28)], record=Recorder(writes=False))
+    def test_a_charge_refused_inside_its_transaction_leaves_no_comment(self):
+        """The run id moved between the read and the charge: the card is a
+        newer run's, and a comment saying this run counted would be false."""
+        did, com, rec, _ = self._record([("t_80ff98c9", "running", 28)], record=Recorder(writes=False))
         self.assertFalse(did)
+        self.assertEqual(len(rec.calls), 1)
+        self.assertEqual(com.calls, [])
 
 
 class CloseFailedChatTurnTest(unittest.TestCase):

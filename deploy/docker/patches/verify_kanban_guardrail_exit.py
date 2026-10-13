@@ -1633,6 +1633,31 @@ conn = board()
 worker = spawn_worker(conn, moved_card)
 code = render_failed_turn(AUTH_RESULT, env_for(moved_card, moved_run + 1000))
 conn = board()
+# A charge refused inside its transaction: the run moved after the worker's
+# read. Nothing lands, so no comment may claim the run counted.
+race_card, race_run = claimed_card("Rotate credentials (run moved mid-charge)")
+_race_comments = []
+_race_landed = GUARD.record_failed_turn(
+    task_id=race_card,
+    run_id=race_run,
+    comment="should not appear",
+    author="platform",
+    failure_reason="auth",
+    failure_retryable=False,
+    connect=board,
+    add_comment=lambda conn, tid, author, body: _race_comments.append(body),
+    record_failure=lambda conn, tid, **kw: KD._record_task_failure(
+        conn, tid, **dict(kw, expected_run_id=race_run + 1000)
+    ),
+) if hasattr(GUARD, "record_failed_turn") else None
+check(
+    "a charge refused inside its transaction leaves no comment and is reported",
+    _race_landed is False
+    and _race_comments == []
+    and row(board(), race_card)["status"] == "running",
+    f"landed={_race_landed!r} comments={_race_comments} status={row(board(), race_card)['status']!r}",
+)
+
 check(
     "a stale run id writes nothing",
     row(conn, moved_card)["status"] == "running"

@@ -228,7 +228,8 @@ Before it exits, the worker records the failure itself
   ``litellm.AuthenticationError`` parks the card in ``ready`` for good: no
   respawn, no ``gave_up``, one ``respawn_guarded`` event per dispatcher tick.
   So the charge carries ``FAILED_TURN_ERROR``, fixed text the pattern does not
-  match, and the reason goes in a comment, written first. A comment never
+  match, and the reason goes in a comment, written once the charge has
+  landed so it never describes a run the board refused. A comment never
   reaches ``last_failure_error``, and the retry worker reads it under the
   card's comments.
 * **The reaper's burst breaker.** ``_account_crashes`` trips a card on its
@@ -397,11 +398,13 @@ FAILED_TURN_OUTCOME = "crashed"
 #: would match ``check_respawn_guard``'s ``_RESPAWN_BLOCKER_RE`` and park the
 #: card in ``ready`` for good. It must also never contain "protocol violation"
 #: (``_protocol_violation_streak`` counts that). The retry worker reads it
-#: under "Prior attempts", so it describes and does not instruct. The verifier
+#: under "Prior attempts", so it describes and does not instruct. It does not
+#: promise the comment exists: that write comes after the charge and can fail
+#: on its own. The verifier
 #: checks it against the pinned tree's real pattern.
 FAILED_TURN_ERROR = (
-    "worker turn failed and the run ended; the error Hermes reported is in "
-    "the comment this run left on the card"
+    "worker turn failed and the run ended; any comment this run left on the "
+    "card carries the error Hermes reported"
 )
 
 #: The comment a failed chat-path turn leaves on its card. It describes and does
@@ -934,8 +937,8 @@ def record_failed_turn(
     add_comment,
     record_failure,
 ) -> bool:
-    """Comment on the card, then charge the failed run to it. Returns whether
-    the charge landed.
+    """Charge the failed run to the card, then comment the reason. Returns
+    whether the charge landed.
 
     ``connect`` is ``hermes_cli.kanban_db_connect.connect``, ``add_comment`` is
     ``hermes_cli.kanban_db.add_comment`` and ``record_failure`` is
@@ -946,20 +949,20 @@ def record_failed_turn(
     keyword ``apply_kanban_guardrail_exit`` adds), so a card that changed hands
     in between is left to its new worker.
 
-    The comment goes first and carries the reason: ``failure_reason`` and the
-    error Hermes summarised. The charge carries ``FAILED_TURN_ERROR``, fixed
-    text that ``check_respawn_guard`` cannot mistake for an auth or quota
-    blocker. A comment that fails to write does not stop the charge: the
-    charge is what returns the card to ``ready`` with the failure counted.
+    The charge carries ``FAILED_TURN_ERROR``, fixed text that
+    ``check_respawn_guard`` cannot mistake for an auth or quota blocker. The
+    comment carries the reason, ``failure_reason`` and the error Hermes
+    summarised, and is written only when ``charge_landed`` confirms the charge,
+    because it says the run counted as a failure. A charge refused inside its
+    transaction (the card changed hands after the read above) leaves no
+    comment on a card a newer run now owns. A comment that fails to write
+    leaves the charge standing, which is why ``FAILED_TURN_ERROR`` does not
+    promise one.
     """
     conn = connect()
     try:
         if not task_is_still_running(conn, task_id, run_id):
             return False
-        try:
-            add_comment(conn, task_id, author, comment)
-        except Exception:
-            logger.debug("failed-turn comment for task %s failed", task_id, exc_info=True)
         record_failure(
             conn,
             task_id,
@@ -974,9 +977,15 @@ def record_failed_turn(
                 "detector": DETECTOR,
             },
         )
-        return charge_landed(
+        if not charge_landed(
             conn, task_id, run_id, FAILED_TURN_ERROR, outcome=FAILED_TURN_OUTCOME
-        )
+        ):
+            return False
+        try:
+            add_comment(conn, task_id, author, comment)
+        except Exception:
+            logger.debug("failed-turn comment for task %s failed", task_id, exc_info=True)
+        return True
     finally:
         try:
             conn.close()
@@ -1001,8 +1010,8 @@ def close_failed_chat_turn(
     Runs after ``block_rate_limited_worker`` at the same site. A rate limit
     gets its exit code and nothing else, because the transient block (or the
     board having moved on) already says why. Every other failed result gets
-    ``record_failed_turn``: a comment with the reason, then a counted
-    ``crashed`` charge that hands the card back to ``ready``. The exit code is
+    ``record_failed_turn``: a counted ``crashed`` charge that hands the card
+    back to ``ready``, then a comment with the reason once the charge landed. The exit code is
     returned either way. When the charge landed the card is no longer
     ``running`` and the reaper skips it, so the code only matters when the
     charge was refused or failed; then the reaper books the exit as it would

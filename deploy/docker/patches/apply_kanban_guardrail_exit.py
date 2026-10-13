@@ -29,10 +29,10 @@ phase:
    result. Same block; whichever of the two runs second finds the card already
    moved. After it, ``close_failed_chat_turn`` picks the exit code the ``-Q``
    path would use for a failed result (1, or 75 for a rate limit; ``billing``
-   gets 1 here). For anything but a rate limit it first leaves the reason on
-   the card as a comment and charges the run itself (``crashed``, counted,
-   claim released, text clear of ``check_respawn_guard``'s pattern), so the
-   reaper's burst breaker never sees it.
+   gets 1 here). For anything but a rate limit it charges the run itself
+   (``crashed``, counted, claim released, text clear of
+   ``check_respawn_guard``'s pattern), so the reaper's burst breaker never
+   sees it, and then leaves the reason on the card as a comment.
 6. ``hermes_cli/kanban_db_dispatch.py`` — two edits to ``_record_task_failure``:
    an ``expected_run_id`` keyword, and a check of it against the
    ``current_run_id`` the function already reads inside its write transaction.
@@ -301,9 +301,9 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
         # never reaches the exit-code block in cli.py, so this is where its
         # failed result is last in hand. Block the card here on a 429
         # exhaustion; the exit-code site covers the -Q path and finds nothing
-        # left to do when this ran first. Then, for any other failure, leave
-        # the reason on the card as a comment, charge the run to the card
-        # (counted, back to ready) and pick the exit code the -Q path would
+        # left to do when this ran first. Then, for any other failure, charge
+        # the run to the card (counted, back to ready), leave the reason as a
+        # comment once that landed, and pick the exit code the -Q path would
         # have used (billing aside); _run_single_query_mode exits with it
         # after the summary.
         # See hermes_cli/kanban_guardrail_exit.py.
