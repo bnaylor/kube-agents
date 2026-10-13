@@ -59,16 +59,21 @@ and still be useless:
    the run closed ``blocked`` with the provider text as its summary, and no
    failure counted. A stale run id is refused, a non-429 exhaustion still
    records ``timed_out``, and ``billing`` is not blocked.
-7. **A failed chat-path turn exits nonzero and is retried.** The real, patched
-   ``_chat_render_turn`` is run on the ka-next-4 401 result (display hooks
-   stubbed): it must leave exit code 1 (75 for a rate limit, 1 for
-   ``billing``) and a comment naming ``failure_reason`` and the provider
-   error. A forked child then exits with that code and the real reaper
-   (``detect_crashed_workers``) must book the run ``crashed``, count it, leave
-   ``last_failure_error`` clear of ``_RESPAWN_BLOCKER_RE`` so
-   ``check_respawn_guard`` returns ``None``, and the next ``dispatch_once``
-   must respawn the card. The ``cli.py`` exit is checked for placement after
-   ``chat()`` and the summary, inside the ``try`` that finalizes the query.
+7. **A failed chat-path turn is charged by the worker and retried.** The
+   charged text is checked against the pinned tree's own
+   ``_RESPAWN_BLOCKER_RE``, so a Hermes bump that widens it fails the build.
+   The real, patched ``_chat_render_turn`` is run on the ka-next-4 401 result
+   (display hooks stubbed) inside a forked stand-in worker the dispatcher
+   reaps. It must leave exit code 1 (75 for a rate limit, 1 for ``billing``),
+   a comment naming ``failure_reason`` and the provider error, and its own
+   ``crashed`` charge: card back in ``ready``, one failure counted,
+   ``check_respawn_guard`` returning ``None``, the reaper leaving it alone, and
+   the next ``dispatch_once`` respawning it. A second failure reaches
+   ``gave_up``. Three workers failing in one reaper pass all stay retryable,
+   which the reaper's burst breaker would not allow. A stale run id writes
+   nothing and falls back to the reaper. The ``cli.py`` exit is checked for
+   placement after ``chat()`` and the summary, inside the ``try`` that
+   finalizes the query.
 
 The per-turn ``max_web_searches`` ceiling that triggered all this is a config
 change, not a patch, and is gated where the template is built — see the
@@ -1438,33 +1443,92 @@ def render_failed_turn(result, environ):
     return me.__dict__.get(EXIT_ATTR)
 
 
-def exit_like_a_worker(code):
-    """Fork a child that exits ``code`` and let the dispatcher's reaper see it."""
+def spawn_worker(conn, tid):
+    """Fork a stand-in worker process and record its pid the way the dispatcher
+    does at spawn. It waits for ``release`` and exits with the code written
+    there, so the exit lands after the board writes, as a real worker's does."""
+    read_end, write_end = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os._exit(code)
-    for _ in range(200):
+        os.close(write_end)
+        data = os.read(read_end, 8)
+        os._exit(int(data or b"0"))
+    os.close(read_end)
+    KD._set_worker_pid(conn, tid, pid)
+    return pid, write_end
+
+
+def exit_worker(worker, code):
+    """Let the stand-in exit ``code`` and have the dispatcher reap it."""
+    pid, write_end = worker
+    os.write(write_end, str(code or 0).encode())
+    os.close(write_end)
+    for _ in range(500):
         if pid in KD.reap_worker_zombies():
-            break
+            return
         __import__("time").sleep(0.01)
-    return pid
+
+
+def env_for(tid, run_id):
+    return {
+        "HERMES_KANBAN_TASK": tid,
+        "HERMES_KANBAN_RUN_ID": str(run_id),
+        "HERMES_KANBAN_DB": str(DB),
+        "HERMES_PROFILE": "platform",
+    }
+
+
+def run_failed_worker(tid, run_id, result=None):
+    """Spawn, fail the turn through the real chat-render site, exit, reap.
+    Returns the exit code the site left."""
+    conn = board()
+    worker = spawn_worker(conn, tid)
+    code = render_failed_turn(result or AUTH_RESULT, env_for(tid, run_id))
+    exit_worker(worker, code)
+    return code
+
+
+def respawn_once(tid):
+    saved = KD._profile_exists_fn
+    KD._profile_exists_fn = lambda: (lambda name: True)
+    spawned = []
+    try:
+        KD.dispatch_once(board(), spawn_fn=lambda task, ws, board=None: spawned.append(task.id))
+    finally:
+        KD._profile_exists_fn = saved
+    return tid in spawned
 
 
 os.environ["HERMES_KANBAN_CRASH_GRACE_SECONDS"] = "0"
+
+# The charged text, against the pinned tree's own respawn-guard pattern. A
+# Hermes bump that widens _RESPAWN_BLOCKER_RE to match it fails the build here,
+# instead of stranding every failed card in ready.
+charged = getattr(GUARD, "FAILED_TURN_ERROR", None)
+check(
+    "the charged failure text is not a respawn blocker in this tree",
+    charged is not None and not KD._RESPAWN_BLOCKER_RE.search(charged),
+    f"FAILED_TURN_ERROR={charged!r}",
+)
+check(
+    "and is not counted as a protocol violation",
+    charged is not None and "protocol violation" not in charged,
+)
+
+# One worker, the ka-next-4 401.
 auth_card, auth_run = claimed_card("Count pods in kubeagents-system (401)")
-worker_env = {
-    "HERMES_KANBAN_TASK": auth_card,
-    "HERMES_KANBAN_RUN_ID": str(auth_run),
-    "HERMES_KANBAN_DB": str(DB),
-    "HERMES_PROFILE": "platform",
-}
-code = render_failed_turn(AUTH_RESULT, worker_env)
+code = run_failed_worker(auth_card, auth_run)
 check(
     "a failed kanban turn on the chat path exits 1, as the -Q path does",
     code == 1,
     f"exit code {code!r} (None is the stock chat path: exit 0)",
 )
+crashed = KD.detect_crashed_workers(board())
 conn = board()
+after = row(conn, auth_card)
+run = conn.execute(
+    "SELECT outcome, error, metadata FROM task_runs WHERE id = ?", (auth_run,)
+).fetchone()
 comments = [
     r["body"]
     for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (auth_card,))
@@ -1478,30 +1542,24 @@ check(
     f"comments: {comments}",
 )
 check(
-    "the card is still running for the reaper to classify",
-    row(conn, auth_card)["status"] == "running",
-)
-
-KD._set_worker_pid(conn, auth_card, exit_like_a_worker(code or 0))
-crashed = KD.detect_crashed_workers(conn)
-conn = board()
-after = row(conn, auth_card)
-run = conn.execute(
-    "SELECT outcome, metadata FROM task_runs WHERE id = ?", (auth_run,)
-).fetchone()
-check(
-    "the reaper books the run crashed, not a protocol violation",
-    auth_card in crashed and run["outcome"] == "crashed" and "protocol_violation" not in (run["metadata"] or ""),
-    f"crashed={crashed} outcome={run['outcome']!r} metadata={run['metadata']!r}",
+    "the worker charged its own run crashed, not a protocol violation",
+    run["outcome"] == "crashed" and run["error"] == charged
+    and "protocol_violation" not in (run["metadata"] or ""),
+    f"outcome={run['outcome']!r} error={run['error']!r} metadata={run['metadata']!r}",
 )
 check(
-    "the failure is counted and the card is back in ready",
+    "the reaper left it alone: the card was no longer running",
+    auth_card not in crashed,
+    f"crashed={crashed}",
+)
+check(
+    "the failure is counted once and the card is back in ready",
     after["consecutive_failures"] == 1 and after["status"] == "ready",
     f"failures={after['consecutive_failures']!r} status={after['status']!r}",
 )
 check(
-    "last_failure_error is clear of the respawn guard's blocker pattern",
-    not KD._RESPAWN_BLOCKER_RE.search(after["last_failure_error"] or ""),
+    "last_failure_error is the charged text",
+    after["last_failure_error"] == charged,
     f"last_failure_error={after['last_failure_error']!r}",
 )
 check(
@@ -1509,29 +1567,86 @@ check(
     KD.check_respawn_guard(conn, auth_card) is None,
     f"guard={KD.check_respawn_guard(conn, auth_card)!r}",
 )
-_saved_profile_fn = KD._profile_exists_fn
-KD._profile_exists_fn = lambda: (lambda name: True)
-try:
-    respawned = []
-    KD.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: respawned.append(task.id))
-finally:
-    KD._profile_exists_fn = _saved_profile_fn
-check("and the next dispatch_once respawns it", auth_card in respawned, f"spawned={respawned}")
+check("and the next dispatch_once respawns it", respawn_once(auth_card))
+
+# At max_retries the card gives up. respawn_once claimed it again; fail that run.
+conn = board()
+second_run = K.get_task(conn, auth_card).current_run_id
+run_failed_worker(auth_card, second_run)
+KD.detect_crashed_workers(board())
+conn = board()
+gave_up = [p for k, p in events(conn, auth_card) if k == "gave_up"]
+check(
+    "a second consecutive failure reaches gave_up (max_retries defaults to 2)",
+    row(conn, auth_card)["status"] == "blocked" and len(gave_up) == 1,
+    f"status={row(conn, auth_card)['status']!r} gave_up={gave_up}",
+)
+check(
+    "and the gave_up event names failure_reason and this detector",
+    gave_up and '"failure_reason": "auth"' in gave_up[0] and DETECTOR in gave_up[0],
+    f"payload={gave_up[:1]}",
+)
+
+# A burst: three workers fail in the same reaper pass, as every in-flight
+# worker did when the shared credential expired. The reaper's burst breaker
+# would give up on all three at once; charged by the workers, each stays
+# retryable.
+burst = [claimed_card(f"Burst card {i} (401)") for i in range(3)]
+workers = []
+conn = board()
+for tid, run_id in burst:
+    workers.append(spawn_worker(conn, tid))
+codes = [render_failed_turn(AUTH_RESULT, env_for(tid, run_id)) for tid, run_id in burst]
+for worker, c in zip(workers, codes):
+    exit_worker(worker, c)
+crashed = KD.detect_crashed_workers(board())
+conn = board()
+rows = [row(conn, tid) for tid, _ in burst]
+check(
+    "three failed workers in one pass all stay retryable (no gave_up on attempt 1)",
+    all(r["status"] == "ready" and r["consecutive_failures"] == 1 for r in rows)
+    and not any(k == "gave_up" for tid, _ in burst for k, _ in events(conn, tid)),
+    f"rows={[(r['status'], r['consecutive_failures']) for r in rows]} codes={codes} crashed={crashed}",
+)
+
+# A charge refused because the card changed hands: no comment, no charge, and
+# the exit falls back to the reaper, which counts it as it always has.
+moved_card, moved_run = claimed_card("Rotate credentials (card moved)")
+conn = board()
+worker = spawn_worker(conn, moved_card)
+code = render_failed_turn(AUTH_RESULT, env_for(moved_card, moved_run + 1000))
+conn = board()
+check(
+    "a stale run id writes nothing",
+    row(conn, moved_card)["status"] == "running"
+    and not conn.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (moved_card,)).fetchone(),
+)
+exit_worker(worker, code)
+crashed = KD.detect_crashed_workers(board())
+check(
+    "and its exit 1 is booked crashed by the reaper instead",
+    code == 1 and moved_card in crashed and row(board(), moved_card)["consecutive_failures"] == 1,
+    f"code={code!r} crashed={crashed}",
+)
 
 # billing exits 1 on the chat path, not the quiet path's 75: 75 would respawn
 # a credit wall every cooldown with no limit.
 bill2_card, bill2_run = claimed_card("Estimate egress cost (billing, chat path)")
 code = render_failed_turn(
     {"final_response": "Error code: 402", "failed": True, "failure_reason": "billing", "error": "Error code: 402"},
-    dict(worker_env, HERMES_KANBAN_TASK=bill2_card, HERMES_KANBAN_RUN_ID=str(bill2_run)),
+    env_for(bill2_card, bill2_run),
 )
-check("billing exits 1 on the chat path", code == 1, f"exit code {code!r}")
+check(
+    "billing exits 1 on the chat path and is charged like any other failure",
+    code == 1 and row(board(), bill2_card)["consecutive_failures"] == 1,
+    f"exit code {code!r}",
+)
 
 # A rate limit keeps its transient block and mirrors the quiet path's 75.
 rl_card, rl_run = claimed_card("Summarise fleet posture (chat path)")
 code = render_failed_turn(
     dict(STORM_RESULT, final_response=STORM_ERROR),
-    dict(worker_env, HERMES_KANBAN_TASK=rl_card, HERMES_KANBAN_RUN_ID=str(rl_run)),
+    env_for(rl_card, rl_run),
 )
 conn = board()
 check(
@@ -1540,8 +1655,9 @@ check(
     f"exit code {code!r} status={block_row(conn, rl_card)['status']!r}",
 )
 check(
-    "and gets no comment: the block carries the text",
-    not conn.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (rl_card,)).fetchone(),
+    "and gets no comment or charge: the block carries the text",
+    not conn.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (rl_card,)).fetchone()
+    and not (block_row(conn, rl_card)["consecutive_failures"] or 0),
 )
 
 # Not a worker: the chat path exits as it always has.

@@ -12,6 +12,7 @@ import ast
 import importlib
 import importlib.util
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -1095,79 +1096,152 @@ class CommentRecorder:
         return 1
 
 
-class RecordFailedTurnCommentTest(unittest.TestCase):
-    def _record(self, rows, run_id=28):
-        conn = ClosableConn(board(rows))
-        rec = CommentRecorder()
-        did = kge.record_failed_turn_comment(
-            task_id="t_80ff98c9", run_id=run_id, body="b", author="platform",
-            connect=lambda: conn, add_comment=rec,
-        )
-        return did, rec, conn
+# A copy of upstream's ``_RESPAWN_BLOCKER_RE`` (hermes_cli/kanban_db_dispatch.py,
+# v2026.9.14). A copy drifts, so the build gate checks the charged text against
+# the pinned tree's own pattern; this is the early warning on a host.
+RESPAWN_BLOCKER_COPY = re.compile(
+    r"\b(quota|rate[\s_\-]?limit|429|403|auth\w*|"
+    r"unauthorized|forbidden|billing|subscription|"
+    r"access[\s_]denied|permission[\s_]denied|"
+    r"invalid[\s_]api[\s_]key)\b",
+    re.IGNORECASE,
+)
 
-    def test_a_card_running_on_this_run_gets_the_comment(self):
-        did, rec, conn = self._record([("t_80ff98c9", "running", 28)])
+
+class FailedTurnErrorTextTest(unittest.TestCase):
+    def test_the_charged_text_is_not_a_respawn_blocker(self):
+        """A match parks the card in ready for good (check_respawn_guard)."""
+        self.assertIsNone(RESPAWN_BLOCKER_COPY.search(kge.FAILED_TURN_ERROR))
+
+    def test_the_copy_does_match_the_incident_text(self):
+        """Proves the copy is live: the provider text the charge must not carry."""
+        self.assertIsNotNone(RESPAWN_BLOCKER_COPY.search(AUTH_ERROR))
+
+    def test_the_charged_text_does_not_count_as_a_protocol_violation(self):
+        self.assertNotIn("protocol violation", kge.FAILED_TURN_ERROR)
+
+    def test_the_charged_text_fits_what_the_board_keeps(self):
+        self.assertLessEqual(len(kge.FAILED_TURN_ERROR), kge.RECORDED_ERROR_MAX_CHARS)
+
+
+class RecordFailedTurnTest(unittest.TestCase):
+    def _record(self, rows, run_id=28, comments=None, record=None):
+        conn = ClosableConn(board(rows))
+        com = comments or CommentRecorder()
+        rec = record or Recorder()
+        did = kge.record_failed_turn(
+            task_id="t_80ff98c9", run_id=run_id, comment="the reason", author="platform",
+            failure_reason="auth", failure_retryable=False,
+            connect=lambda: conn, add_comment=com, record_failure=rec,
+        )
+        return did, com, rec, conn
+
+    def test_a_card_running_on_this_run_is_commented_then_charged(self):
+        did, com, rec, conn = self._record([("t_80ff98c9", "running", 28)])
         self.assertTrue(did)
-        self.assertEqual(rec.calls, [("t_80ff98c9", "platform", "b")])
+        self.assertEqual(com.calls, [("t_80ff98c9", "platform", "the reason")])
+        task_id, kwargs = rec.calls[0]
+        self.assertEqual(task_id, "t_80ff98c9")
+        self.assertEqual(kwargs["outcome"], kge.FAILED_TURN_OUTCOME)
+        self.assertEqual(kwargs["error"], kge.FAILED_TURN_ERROR)
+        self.assertTrue(kwargs["release_claim"] and kwargs["end_run"])
+        self.assertEqual(kwargs["expected_run_id"], 28)
+        self.assertEqual(kwargs["event_payload_extra"]["failure_reason"], "auth")
         self.assertTrue(conn.closed)
 
+    def test_the_comment_is_written_before_the_charge(self):
+        order = []
+
+        class OrderedComments(CommentRecorder):
+            def __call__(self, *a):
+                order.append("comment")
+                return super().__call__(*a)
+
+        class OrderedCharges(Recorder):
+            def __call__(self, *a, **k):
+                order.append("charge")
+                return super().__call__(*a, **k)
+
+        self._record([("t_80ff98c9", "running", 28)], comments=OrderedComments(), record=OrderedCharges())
+        self.assertEqual(order, ["comment", "charge"])
+
     def test_a_card_that_changed_hands_is_left_alone(self):
-        did, rec, _ = self._record([("t_80ff98c9", "running", 29)])
+        did, com, rec, _ = self._record([("t_80ff98c9", "running", 29)])
         self.assertFalse(did)
-        self.assertEqual(rec.calls, [])
+        self.assertEqual((com.calls, rec.calls), ([], []))
 
     def test_a_card_no_longer_running_is_left_alone(self):
-        did, rec, _ = self._record([("t_80ff98c9", "done", 28)])
+        did, com, rec, _ = self._record([("t_80ff98c9", "done", 28)])
         self.assertFalse(did)
-        self.assertEqual(rec.calls, [])
+        self.assertEqual((com.calls, rec.calls), ([], []))
+
+    def test_a_failed_comment_still_charges(self):
+        """The charge is what hands the card back with the failure counted."""
+        did, _, rec, _ = self._record([("t_80ff98c9", "running", 28)], comments=CommentRecorder(raises=True))
+        self.assertTrue(did)
+        self.assertEqual(len(rec.calls), 1)
+
+    def test_a_charge_refused_inside_its_transaction_is_reported(self):
+        did, _, _, _ = self._record([("t_80ff98c9", "running", 28)], record=Recorder(writes=False))
+        self.assertFalse(did)
 
 
 class CloseFailedChatTurnTest(unittest.TestCase):
-    """The chat-render site: exit code first, reason as a comment."""
+    """The chat-render site: comment, charge, exit code."""
 
-    def _close(self, result, rows=(("t_80ff98c9", "running", 28),), recorder=None, **over):
+    def _close(self, result, rows=(("t_80ff98c9", "running", 28),), recorder=None, record=None, **over):
         conn = ClosableConn(board(list(rows)))
-        rec = recorder or CommentRecorder()
+        com = recorder or CommentRecorder()
+        rec = record or Recorder()
         kwargs = dict(
-            connect=lambda: conn, add_comment=rec, environ=WORKER_ENV,
+            connect=lambda: conn, add_comment=com, record_failure=rec, environ=WORKER_ENV,
             cron_run=False, delegated_child=False,
         )
         kwargs.update(over)
-        return kge.close_failed_chat_turn(result, **kwargs), rec
+        return kge.close_failed_chat_turn(result, **kwargs), com, rec
 
-    def test_the_incident_exits_1_with_the_reason_on_the_card(self):
-        code, rec = self._close(AUTH_RESULT)
+    def test_the_incident_is_charged_with_the_reason_in_a_comment_and_exits_1(self):
+        code, com, rec = self._close(AUTH_RESULT)
         self.assertEqual(code, 1)
-        self.assertEqual(len(rec.calls), 1)
-        task_id, author, body = rec.calls[0]
+        task_id, author, body = com.calls[0]
         self.assertEqual((task_id, author), ("t_80ff98c9", "platform"))
         self.assertIn("failure_reason=auth", body)
         self.assertIn("AuthenticationError", body)
+        self.assertEqual(rec.calls[0][1]["error"], kge.FAILED_TURN_ERROR)
 
-    def test_a_rate_limit_exits_75_without_a_comment(self):
-        code, rec = self._close({"failed": True, "failure_reason": "rate_limit", "error": "429"})
+    def test_billing_is_charged_and_exits_1(self):
+        code, _, rec = self._close({"failed": True, "failure_reason": "billing", "error": "402"})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(rec.calls), 1)
+
+    def test_a_rate_limit_exits_75_and_writes_nothing(self):
+        code, com, rec = self._close({"failed": True, "failure_reason": "rate_limit", "error": "429"})
         self.assertEqual(code, 75)
-        self.assertEqual(rec.calls, [])
+        self.assertEqual((com.calls, rec.calls), ([], []))
 
-    def test_a_comment_that_fails_still_exits_nonzero(self):
-        """The exit code is what lets the dispatcher count and retry the run."""
-        code, _ = self._close(AUTH_RESULT, recorder=CommentRecorder(raises=True))
+    def test_a_charge_that_raises_still_exits_nonzero(self):
+        """Then the reaper counts the exit, as it would without this patch."""
+        class Boom(Recorder):
+            def __call__(self, *a, **k):
+                raise sqlite3.OperationalError("database is locked")
+
+        code, _, _ = self._close(AUTH_RESULT, record=Boom())
         self.assertEqual(code, 1)
 
-    def test_a_card_that_changed_hands_still_exits_nonzero_but_is_not_commented(self):
-        code, rec = self._close(AUTH_RESULT, rows=(("t_80ff98c9", "running", 29),))
+    def test_a_card_that_changed_hands_still_exits_nonzero_but_is_not_touched(self):
+        code, com, rec = self._close(AUTH_RESULT, rows=(("t_80ff98c9", "running", 29),))
         self.assertEqual(code, 1)
-        self.assertEqual(rec.calls, [])
+        self.assertEqual((com.calls, rec.calls), ([], []))
 
     def test_a_non_worker_is_untouched(self):
-        code, rec = self._close(AUTH_RESULT, environ={})
+        code, com, rec = self._close(AUTH_RESULT, environ={})
         self.assertIsNone(code)
-        self.assertEqual(rec.calls, [])
+        self.assertEqual((com.calls, rec.calls), ([], []))
 
     def test_the_author_falls_back_when_no_profile_is_set(self):
         env = {k: v for k, v in WORKER_ENV.items() if k != "HERMES_PROFILE"}
-        _, rec = self._close(AUTH_RESULT, environ=env)
-        self.assertEqual(rec.calls[0][1], kge.FAILED_TURN_COMMENT_AUTHOR)
+        _, com, _ = self._close(AUTH_RESULT, environ=env)
+        self.assertEqual(com.calls[0][1], kge.FAILED_TURN_COMMENT_AUTHOR)
 
 
 # The applier is exercised against a miniature of the five real files, in the
@@ -1707,6 +1781,9 @@ class ApplierTest(unittest.TestCase):
         kb_mod = types.ModuleType("hermes_cli.kanban_db")
         kb_mod.add_comment = lambda conn, tid, author, body: comments.append(body)
         kb_mod.block_task = lambda *a, **k: False
+        charges = Recorder()
+        dispatch_mod = types.ModuleType("hermes_cli.kanban_db_dispatch")
+        dispatch_mod._record_task_failure = charges
         hermes_cli = types.ModuleType("hermes_cli")
         hermes_cli.kanban_guardrail_exit = kge
         hermes_cli.kanban_db = kb_mod
@@ -1715,6 +1792,7 @@ class ApplierTest(unittest.TestCase):
             "hermes_cli.kanban_guardrail_exit": kge,
             "hermes_cli.kanban_db": kb_mod,
             "hermes_cli.kanban_db_connect": connect_mod,
+            "hermes_cli.kanban_db_dispatch": dispatch_mod,
         }
         saved = {n: sys.modules.get(n) for n in names}
         sys.modules.update(names)
@@ -1750,6 +1828,8 @@ class ApplierTest(unittest.TestCase):
             self.assertTrue(cli.finalized, "the single query is still finalized")
             self.assertEqual(len(comments), 1)
             self.assertIn("failure_reason=auth", comments[0])
+            self.assertEqual(len(charges.calls), 1, "the worker charges its own failure")
+            self.assertEqual(charges.calls[0][1]["expected_run_id"], 28)
 
             # Not a worker: the same failed turn returns normally (exit 0).
             plain = CLI()

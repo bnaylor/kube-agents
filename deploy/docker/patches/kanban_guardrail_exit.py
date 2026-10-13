@@ -215,31 +215,44 @@ failed result to exit 1, and ``rate_limit``/``billing`` on a kanban worker to
 already does, with one divergence: ``billing`` exits 1, not 75. Exit 75 books
 the run ``rate_limited``, which counts nothing and, once
 ``check_respawn_guard``'s five-minute cooldown has passed, respawns the card
-with no limit. A credit wall would be retried every five minutes forever. Today,
-on this path, the violation limit at least bounds it. Exit 1 is booked
-``crashed`` and counted, so a persistent failure trips the breaker at
-``max_retries`` and a transient one (this 401) is retried. One caveat comes
-with the reaper's counted path: ``_account_crashes`` trips a card on its first
-failure when three or more workers die with the same error text in one sweep,
-and every exit-1 worker's text is ``pid N exited with code 1``. A provider
-outage that fails three in-flight workers at once gives up on all three. The
-``-Q`` path has always worked this way, and kanban_scheduling keeps the rule on
-purpose.
+with no limit. A credit wall would be retried every five minutes forever.
+Today, on this path, the violation limit at least bounds it.
 
-The reason goes on the card as a comment, ``record_failed_turn_comment``, and
-deliberately not as the failure's error text. ``_record_task_failure`` writes
-its error to ``last_failure_error``, and ``check_respawn_guard`` refuses to
-respawn any card whose ``last_failure_error`` matches ``_RESPAWN_BLOCKER_RE``
-(``auth…``, ``quota``, ``403``, ``billing``…). Nothing but a completion, an
-unblock or a reassign clears that column, so a counted failure carrying
-``litellm.AuthenticationError`` parks the card in ``ready`` for good: no
-respawn, no ``gave_up``, one ``respawn_guarded`` event per dispatcher tick. The
-reaper's own text for exit 1, ``pid N exited with code 1``, matches nothing. A
-comment never reaches ``last_failure_error``, and the retry worker reads it
-under the card's comments. No board write reaches chat without feeding the
-guard: ``commented`` is not a kind the notifier posts. The ``crashed`` event the
-reaper writes for the exit is, and it is what tells the thread the run failed.
-``rate_limit`` writes no comment; its transient block already carries the text.
+Before it exits, the worker records the failure itself
+(``record_failed_turn``). An exit code alone is not enough, for two reasons.
+
+* **The respawn guard.** ``check_respawn_guard`` refuses to respawn a card
+  whose ``last_failure_error`` matches ``_RESPAWN_BLOCKER_RE`` (``auth…``,
+  ``quota``, ``403``, ``billing``…). Nothing but a completion, an unblock or a
+  reassign clears that column, so a charge carrying
+  ``litellm.AuthenticationError`` parks the card in ``ready`` for good: no
+  respawn, no ``gave_up``, one ``respawn_guarded`` event per dispatcher tick.
+  So the charge carries ``FAILED_TURN_ERROR``, fixed text the pattern does not
+  match, and the reason goes in a comment, written first. A comment never
+  reaches ``last_failure_error``, and the retry worker reads it under the
+  card's comments.
+* **The reaper's burst breaker.** ``_account_crashes`` trips a card on its
+  first failure when three or more crashes in one sweep share an error
+  fingerprint, and every exit-1 worker's text is ``pid N exited with code 1``.
+  The 401 above came from a credential that expired while the shared LiteLLM
+  stalled, which fails every in-flight worker together. Through the reaper,
+  three or more of them would all give up on attempt 1. A charge the worker
+  makes itself never enters that pass. The bound becomes ``max_retries`` per
+  card instead (see ``FAILED_TURN_OUTCOME`` for what is booked and posted).
+
+The charge is ``_record_task_failure`` with ``release_claim`` and ``end_run``,
+as the backstop's ``timed_out`` uses, conditioned on this worker's run. The
+card goes back to ``ready`` with the failure counted, or to ``blocked`` with
+``gave_up`` at ``max_retries``. The worker then exits 1. With the card no
+longer ``running`` the reaper skips it, so the code matters only when the
+charge was refused (the card changed hands) or failed. In that case the reaper
+books the exit as ``crashed``, through its usual path. ``rate_limit`` records
+nothing and writes no comment. Its transient block already carries the text,
+and it exits 75 like the quiet path.
+
+No board write reaches chat without feeding the guard: ``commented`` is not a
+kind the notifier posts. The ``crashed`` event the charge writes is, and it is
+what tells the thread the run failed.
 
 What is deliberately *not* excluded is the halt nudge. It fires during a cron run
 too — ``kanban_stop_nudge_enabled()`` is on whenever ``HERMES_KANBAN_TASK`` is
@@ -354,12 +367,35 @@ RATE_LIMIT_EXIT_REASONS = RATE_LIMIT_FAILURE_REASONS
 #: (content-policy blocks, invalid-response exhaustion, overflow partials).
 UNCLASSIFIED_FAILURE_REASON = "unclassified"
 
+#: How a failed chat-path turn's charge is booked: the run's outcome and the
+#: event kind. ``crashed`` is what the reaper books for the same worker exiting
+#: 1, so the run history reads the same whichever of the two recorded it, and
+#: upstream's diagnostics already treat it as "the worker got off the ground
+#: but died; read the log". The notifier posts upstream's line for it, "worker
+#: crashed (pid gone); dispatcher will retry", and on Slack with a waking
+#: subscription the creator's wake explains it. ``timed_out`` would post
+#: "timed out (max_runtime=0s)", which is false.
+FAILED_TURN_OUTCOME = "crashed"
+
+#: The charge's error text, which ``_record_task_failure`` writes to
+#: ``last_failure_error``, the run and the event. Fixed text on purpose: the
+#: provider's message (``litellm.AuthenticationError``, "quota", "billing")
+#: would match ``check_respawn_guard``'s ``_RESPAWN_BLOCKER_RE`` and park the
+#: card in ``ready`` for good. It must also never contain "protocol violation"
+#: (``_protocol_violation_streak`` counts that). The retry worker reads it
+#: under "Prior attempts", so it describes and does not instruct. The verifier
+#: checks it against the pinned tree's real pattern.
+FAILED_TURN_ERROR = (
+    "worker turn failed and the run ended; the error Hermes reported is in "
+    "the comment this run left on the card"
+)
+
 #: The comment a failed chat-path turn leaves on its card. It describes and does
 #: not instruct: the retry worker reads it under the card's comments.
 FAILED_TURN_COMMENT = (
-    "Run {run} ended on a failed model turn (failure_reason={reason}) and the "
-    "worker exited with code {code} so the dispatcher can count the failure "
-    "and retry the card. Error: {text}"
+    "Run {run} ended on a failed model turn (failure_reason={reason}). The run "
+    "counts as a failure toward the card's retry limit, and the worker exited "
+    "with code {code}. Error: {text}"
 )
 
 #: Longest error text put in that comment. Hermes has already summarised it
@@ -607,11 +643,12 @@ def record_missing_terminal_call(
             pass
 
 
-def charge_landed(conn, task_id: str, run_id, error: str) -> bool:
+def charge_landed(conn, task_id: str, run_id, error: str, outcome=OUTCOME) -> bool:
     """Whether the charge just attempted was written, read back from the board.
 
     With ``run_id``, the answer is this worker's own run row: closed with
-    ``OUTCOME`` (or ``TRIPPED_OUTCOME`` when the charge tripped the breaker)
+    ``outcome`` (default ``OUTCOME``; ``TRIPPED_OUTCOME`` when the charge
+    tripped the breaker)
     and this charge's error text. The card's status cannot answer it: a
     charge refused because the card changed hands leaves it ``running`` under
     the newer run, and that worker can close the card before this read, so
@@ -631,10 +668,10 @@ def charge_landed(conn, task_id: str, run_id, error: str) -> bool:
     if row is None:
         return False
     try:
-        outcome, run_error = row["outcome"], row["error"]
+        run_outcome, run_error = row["outcome"], row["error"]
     except (TypeError, IndexError, KeyError):
-        outcome, run_error = row[0], row[1]
-    return outcome in (OUTCOME, TRIPPED_OUTCOME) and run_error == error[
+        run_outcome, run_error = row[0], row[1]
+    return run_outcome in (outcome, TRIPPED_OUTCOME) and run_error == error[
         :RECORDED_ERROR_MAX_CHARS
     ]
 
@@ -864,24 +901,61 @@ def failed_turn_comment(*, run_id, failure_reason, error_text, exit_code) -> str
     )
 
 
-def record_failed_turn_comment(
-    *, task_id: str, run_id, body: str, author: str, connect, add_comment
+def record_failed_turn(
+    *,
+    task_id: str,
+    run_id,
+    comment: str,
+    author: str,
+    failure_reason,
+    failure_retryable,
+    connect,
+    add_comment,
+    record_failure,
 ) -> bool:
-    """Put ``body`` on the card as a comment. Returns whether it did.
+    """Comment on the card, then charge the failed run to it. Returns whether
+    the charge landed.
 
-    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` and ``add_comment``
-    is ``hermes_cli.kanban_db.add_comment``, both injected. Only a card still
-    ``running`` under this worker's run is written to: a card that changed
-    hands is the newer worker's, and a comment there would describe a run it
-    did not have. A comment never touches ``last_failure_error``, which is the
-    point; see the module docstring.
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect``, ``add_comment`` is
+    ``hermes_cli.kanban_db.add_comment`` and ``record_failure`` is
+    ``hermes_cli.kanban_db_dispatch._record_task_failure``, all injected.
+    Nothing is written unless the card is still ``running`` under this
+    worker's run, and the charge is conditioned on that run again inside
+    ``_record_task_failure``'s own transaction (``expected_run_id``, the
+    keyword ``apply_kanban_guardrail_exit`` adds), so a card that changed hands
+    in between is left to its new worker.
+
+    The comment goes first and carries the reason: ``failure_reason`` and the
+    error Hermes summarised. The charge carries ``FAILED_TURN_ERROR``, fixed
+    text that ``check_respawn_guard`` cannot mistake for an auth or quota
+    blocker. A comment that fails to write does not stop the charge: the
+    charge is what returns the card to ``ready`` with the failure counted.
     """
     conn = connect()
     try:
         if not task_is_still_running(conn, task_id, run_id):
             return False
-        add_comment(conn, task_id, author, body)
-        return True
+        try:
+            add_comment(conn, task_id, author, comment)
+        except Exception:
+            logger.debug("failed-turn comment for task %s failed", task_id, exc_info=True)
+        record_failure(
+            conn,
+            task_id,
+            error=FAILED_TURN_ERROR,
+            outcome=FAILED_TURN_OUTCOME,
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run_id,
+            event_payload_extra={
+                "failure_reason": str(failure_reason or UNCLASSIFIED_FAILURE_REASON),
+                "failure_retryable": failure_retryable,
+                "detector": DETECTOR,
+            },
+        )
+        return charge_landed(
+            conn, task_id, run_id, FAILED_TURN_ERROR, outcome=FAILED_TURN_OUTCOME
+        )
     finally:
         try:
             conn.close()
@@ -894,20 +968,24 @@ def close_failed_chat_turn(
     *,
     connect=None,
     add_comment=None,
+    record_failure=None,
     environ=None,
     goal_mode=None,
     cron_run=None,
     delegated_child=None,
 ):
-    """The chat-render site: return the exit code for a failed kanban turn,
-    after leaving its reason on the card. ``None`` leaves the exit alone.
+    """The chat-render site: settle a failed kanban turn on the board and
+    return the exit code. ``None`` leaves the exit alone.
 
     Runs after ``block_rate_limited_worker`` at the same site. A rate limit
-    gets its exit code and no comment, because the transient block (or the
+    gets its exit code and nothing else, because the transient block (or the
     board having moved on) already says why. Every other failed result gets
-    ``record_failed_turn_comment`` first. The comment is best-effort: a write
-    that fails still returns the exit code, because the exit code is what lets
-    the dispatcher count and retry the run.
+    ``record_failed_turn``: a comment with the reason, then a counted
+    ``crashed`` charge that hands the card back to ``ready``. The exit code is
+    returned either way. When the charge landed the card is no longer
+    ``running`` and the reaper skips it, so the code only matters when the
+    charge was refused or failed; then the reaper books the exit as it would
+    without this patch (``crashed``, counted, through its burst breaker).
     """
     env = os.environ if environ is None else environ
     code = failed_turn_exit_code(
@@ -927,19 +1005,26 @@ def close_failed_chat_turn(
             from hermes_cli import kanban_db as _kb
 
             add_comment = _kb.add_comment
-        record_failed_turn_comment(
+        if record_failure is None:
+            from hermes_cli.kanban_db_dispatch import _record_task_failure
+
+            record_failure = _record_task_failure
+        record_failed_turn(
             task_id=env.get(TASK_ENV),
             run_id=run_id,
-            body=failed_turn_comment(
+            comment=failed_turn_comment(
                 run_id=run_id,
                 failure_reason=result.get("failure_reason"),
                 error_text=result.get("error"),
                 exit_code=code,
             ),
             author=env.get(PROFILE_ENV) or FAILED_TURN_COMMENT_AUTHOR,
+            failure_reason=result.get("failure_reason"),
+            failure_retryable=result.get("failure_retryable"),
             connect=connect,
             add_comment=add_comment,
+            record_failure=record_failure,
         )
     except Exception:
-        logger.debug("failed-turn comment for task %s failed", env.get(TASK_ENV), exc_info=True)
+        logger.debug("failed-turn charge for task %s failed", env.get(TASK_ENV), exc_info=True)
     return code
