@@ -140,7 +140,7 @@ Both values come from `gcloud container clusters describe CLUSTER_NAME --region 
 The endpoint and CA exist only once the cluster does, so a Secret in this form cannot ride in the pull request that creates its cluster. Workloads for that cluster wait for a second pull request. To register the cluster in the same one, address it through [Connect Gateway](https://docs.cloud.google.com/kubernetes-engine/enterprise/multicluster-management/gateway/using) instead, whose URL is built from values known up front:
 
 1. Register the cluster to the fleet in the same pull request: the cluster's Terraform `fleet` block, or a Config Connector `GKEHubMembership` (the layout README's [Reconciler](https://github.com/gke-labs/kube-agents/blob/main/examples/gitops-repo/README.md#reconciler) section shows one).
-2. Grant the ArgoCD service account a Connect Gateway role (`roles/gkehub.gatewayReader` for reads, `roles/gkehub.gatewayEditor` to apply), alongside the cluster-access role above.
+2. Grant the ArgoCD service account `roles/gkehub.gatewayEditor`, alongside the cluster-access role above. ArgoCD applies on every sync, so `roles/gkehub.gatewayReader` is enough only for Applications it never syncs.
 3. Point the Secret's `server` at the gateway and leave `caData` empty, as the kubeconfig `gcloud` generates for the gateway does.
 
 ```yaml
@@ -158,7 +158,7 @@ stringData:
     }
 ```
 
-The membership name defaults to the cluster name. For a regional membership, both the host and the path carry the region: `https://REGION-connectgateway.googleapis.com/v1/projects/PROJECT_NUMBER/locations/REGION/gkeMemberships/CLUSTER_NAME`. This form is documented in Google Cloud blog posts rather than in the Argo CD or GKE product docs, so test it on one cluster first. Connect Gateway also has a quota of 10 active streams per fleet host project; whether ArgoCD's watches count against it is not documented. Config Sync, the reconciler the reference layout recommends, needs neither the gateway nor this Secret.
+The membership name defaults to the cluster name. Build the URL from the membership's actual location, not from this example: a `GKEHubMembership` sets it in `spec.location`, and Terraform reports it as `fleet[0].membership_location`. For a regional membership, both the host and the path carry the region: `https://REGION-connectgateway.googleapis.com/v1/projects/PROJECT_NUMBER/locations/REGION/gkeMemberships/CLUSTER_NAME`. This form is documented in a [Google Cloud blog post](https://cloud.google.com/blog/products/containers-kubernetes/connect-gateway-with-argocd) rather than in the Argo CD or GKE product docs, so test it on one cluster first. The [Connect Gateway page](https://docs.cloud.google.com/kubernetes-engine/enterprise/multicluster-management/gateway/using) also sets a per-project quota on active streams; whether ArgoCD's watches count against it is not documented. Config Sync, the reconciler the reference layout recommends when you need charts, needs neither the gateway nor this Secret.
 
 ## Provision cloud resources from the same repo
 

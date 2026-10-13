@@ -15,4 +15,5 @@ GitHub Actions is the reference; CircleCI/Jenkins/Argo/Flux/Atlantis are equally
 
 `kubectl apply` renders no Helm chart. For charts, and for workloads on a cluster created in the
 same pull request, pair this pipeline with a reconciler that syncs the repository:
-[Reconciler](../../README.md#reconciler) in the layout README names the recommended one.
+[Reconciler](../../README.md#reconciler) in the layout README names the recommended one. With it in place, this pipeline stops
+applying `clusters/*/namespaces/`, which Config Sync then owns.

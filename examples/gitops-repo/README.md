@@ -23,11 +23,7 @@ gitops-repo/
 - **Propose** (`submit-suggestion`): branch `<tier>-agent/<change_type>-<target>` → stage only
   targeted files (never `git add .`) → Conventional Commit → PR.
 - **Apply:** on merge, the **customer's CI/CD** applies changed paths — `kubectl apply` for K8s/KCC
-  YAML, `terraform apply` for HCL. kube-agents never calls cluster/cloud APIs directly. A pipeline
-  that only runs `kubectl apply` renders no Helm chart, so on such a repo the agent can propose
-  Kubernetes and KCC YAML and Terraform, but cannot install a third-party chart on any cluster. Asked
-  for a new cluster with a chart on it, it proposes the cluster and its cloud resources and stops on
-  the chart, naming the missing reconciler. [Reconciler](#reconciler) below is the recommended fix.
+  YAML, `terraform apply` for HCL. kube-agents never calls cluster/cloud APIs directly.
 - **Review gate:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/namespaces/**`,
   `**/policy/**`, `knowledge/**` and `.kube-agents/**` require human review (see `CODEOWNERS.example` —
   copy to `CODEOWNERS` and fill in real teams when forking) + the security review gate (06 §7).
@@ -72,10 +68,17 @@ gitops-repo/
 
 ## Reconciler
 
-Recommended: **Config Sync on every cluster, enrolled through Config Connector**, with the pipeline
-above still applying `provisioning/` and `fleet/` where Config Connector runs. It renders Helm charts,
-and it can take on a cluster created in the same pull request, because every object that enrolls the
-cluster names it by values known before it exists: project, location and cluster name.
+The pipeline above applies YAML with `kubectl apply`, which renders no Helm chart, for a new cluster
+or an existing one. So a pull request on a repository applied that way can carry Kubernetes and KCC
+YAML and Terraform, but no third-party chart. When you need charts, or workloads on a cluster created
+in the same pull request, add a reconciler that syncs the repository. The one this layout recommends
+is **Config Sync on every cluster, enrolled through Config Connector**: it renders Helm charts, and it
+can take on a cluster created in the same pull request, because every object that enrolls the cluster
+names it by values known before it exists (project, location and cluster name).
+
+Config Sync then applies each cluster's `clusters/<cluster>/namespaces/`, and the pipeline keeps
+applying everything else (`provisioning/` and `fleet/` where Config Connector runs, `agents/` and
+`policy/` as before). Narrow the pipeline's paths to match, so no object has two appliers.
 
 Once per fleet, in `fleet/`, turn the feature on:
 
@@ -139,9 +142,14 @@ spec:
 ```
 
 `policyDir` is `namespaces/`, not the cluster's whole directory: Config Sync applies every YAML file
-under it, and `provisioning/` holds Config Connector objects the cluster itself cannot apply. With
-`token` or `ssh`, the cluster also needs the Git credential Config Sync reads, created out of band
-rather than committed.
+under it, and `provisioning/` holds Config Connector objects the cluster itself cannot apply.
+
+The same-pull-request property holds end to end for a public repository (`secretType: none`), or for
+a source the cluster reaches with its own Google identity (`gcpserviceaccount` or `gcenode`, such as a
+repository on Google Cloud). A private GitHub repository needs `token` or `ssh`, and Config Sync reads
+that credential from a Secret in the new cluster's `config-management-system` namespace, which exists
+only once Config Sync is installed there. Create it after the cluster comes up, never commit it; the
+cluster's first sync waits for it.
 
 A chart then goes in the cluster's `namespaces/config-management-system/` directory as a `RootSync`
 with a Helm source. Config Sync supports a `RootSync` declared in a repository another `RootSync`
@@ -163,10 +171,14 @@ spec:
     releaseName: cert-manager
     namespace: cert-manager
     auth: none # a public chart
-    includeCRDs: true
+    values:
+      crds:
+        enabled: true # cert-manager ships its CRDs as templates behind this value
 ```
 
-Config Sync renders the chart with `helm template`, so chart hooks do not run. A Terraform repository
+Config Sync renders the chart with `helm template`, so a chart's hook and test manifests are applied
+as ordinary objects, without Helm's hook ordering or deletion policy. A chart that keeps its CRDs in a
+`crds/` directory instead needs `includeCRDs: true`. A Terraform repository
 reaches the same result with the cluster's `fleet` block and a `google_gke_hub_feature_membership`,
 the pattern [Google's Config Sync install guide](https://docs.cloud.google.com/kubernetes-engine/config-sync/docs/how-to/installing-config-sync)
 documents.
@@ -180,9 +192,10 @@ Two other reconcilers can also target a cluster created in the same pull request
 - **Argo CD through Connect Gateway**: see
   [GitOps with Argo CD](../../docs/site/src/content/docs/deploy/gitops-argocd.md#a-cluster-created-in-the-same-pull-request).
 
-Argo CD clusters registered by endpoint and CA, and a Terraform `helm` provider configured from a
-cluster created in the same apply, cannot: both need values that exist only after the cluster does.
-The Platform Agent follows whichever form the repository already uses for its other clusters, and
-stops rather than introduce one.
+Argo CD clusters registered by endpoint and CA cannot: the Secret needs the endpoint and CA, which
+exist only after the cluster does. A Terraform `helm` provider configured from a cluster created in
+the same apply works only with care: the provider reads values unknown at plan time, and
+[HashiCorp's helm provider docs](https://registry.terraform.io/providers/hashicorp/helm/latest/docs)
+recommend separate applies for the cluster and the charts.
 
 `cluster-a/` and its `namespaces/team-x/` are illustrative scaffolding, not a live target.
