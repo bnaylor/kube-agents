@@ -231,11 +231,26 @@ unsupported development stack. A file with no such line means `today`. Of `upgra
 full applies the key; a re-run of `install.sh` applies it too. Only the `install.sh` and
 `upgrade.sh` of releases after 0.9.0 read it, so upgrade to such a release first.
 [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
-has the rules for the key. This section covers what a switch does to Slack, in order.
+has the rules for the key. This section covers what a switch does to chat: Google Chat first, then
+Slack, in order.
 
-With Google Chat also enabled, Google Chat takes the A2A gateway and Slack stays on the credential
-broker under `next`, as under `today`. Then none of the Slack steps below apply: switch, check Slack
-as in [Checking the result](#slack), and leave the Slack app as it is.
+### Google Chat
+
+With Google Chat enabled, Google Chat takes the A2A gateway under `next`. The thing that changes for
+it is the home channel, where alerts and scheduled reports land. Under `next` the gateway posts them
+only to `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (the `PlatformAgent`'s
+`spec.integration.googleChat.homeChannel`), and it must be a space name, `spaces/<id>`. A home
+channel set from chat with `/sethome`, or by the install's first chat message, is kept in the
+Planning Agent's profile and does not count. With the key unset or not a space name, the agent posts
+nothing to Google Chat unprompted. So before switching to `next`, set `GOOGLE_CHAT_HOME_CHANNEL` in
+the same `install.env` as `PLATFORM_AGENT_MODE`, so the one full run applies both
+([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After the switch, check
+that a scheduled report or an alert reaches that space.
+
+With Slack enabled too, Slack stays on the credential broker under `next`, as under `today`. Then
+none of the Slack steps below apply: switch, check Slack as in [Checking the result](#slack), and
+leave the Slack app as it is. The rest of this section is for an install whose Slack takes the
+gateway.
 
 ### Before the switch
 
