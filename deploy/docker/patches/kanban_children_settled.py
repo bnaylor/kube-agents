@@ -168,9 +168,18 @@ This refusal is not rationed like the fan-out one. A live child can outlast
 its creator's worker, so that gate gives way on the retry; a step is the
 worker's own to finish, and ``kanban_block`` is always open to it, so a
 standing refusal cannot wedge the card. A worker that neither finishes nor
-blocks runs out of turns, and the worker-exit path records that run as
-failed, which for this card is the honest outcome. A card with no step line
-anywhere completes as before. Every read fails open.
+blocks runs out of turns. The worker-exit path records that run as a counted
+failure, upstream hands the card to one fresh worker (which inherits the
+step comments, so it sees what was planned and what failed), and a second
+such run ends the card ``blocked`` by upstream's failure limit. None of those
+paths is ``done``. A card with no step line anywhere completes as before.
+Every read fails open.
+
+Who wrote a line is not checked: a comment's ``author`` is the profile name,
+and the worker and the card that filed it are usually the same profile, so it
+cannot tell them apart. The gate makes an undelivered completion an explicit
+false statement rather than an easy one; it does not stop a worker that writes
+``done`` over a step it did not do.
 
 Scope: the checks live in the ``kanban_complete`` and ``kanban_block`` tool
 handlers, so the CLI and the scheduler (``kb.complete_task`` and
@@ -223,10 +232,14 @@ NUDGE_TTL_SECONDS = 15 * 60
 MAX_LISTED_CHILDREN = 10
 
 #: A step line: ``step <key>: <status>``, anywhere in a card's body or a
-#: comment, one per line. Keys are short slugs so a sentence that happens to
-#: start with "step" does not read as one; status words are matched whole.
+#: comment, one per line, optionally as a list item. The key starts with a
+#: letter and is a short slug, and the status word must end the line or be
+#: followed by a separated reason (`` - ...``, ``: ...``, `` (...)``), so prose
+#: such as "Step 1: Planned maintenance is Sunday" or "Step two: failed pods are
+#: restarted" is not a plan, and "done-ish" is not ``done``.
 STEP_LINE_RE = re.compile(
-    r"^[ \t>*-]*step[ \t]+([a-z0-9][a-z0-9-]{0,39})[ \t]*:[ \t]*(planned|done|failed)\b",
+    r"^[ \t>*-]*(?:\d+[.)][ \t]*)?step[ \t]+([a-z][a-z0-9-]{0,39})[ \t]*:[ \t]*"
+    r"(planned|done|failed)(?=[ \t]*$|[ \t]+[-\u2013\u2014(]|[ \t]*[\u2013\u2014:(])",
     re.IGNORECASE | re.MULTILINE,
 )
 #: The one status that settles a step.

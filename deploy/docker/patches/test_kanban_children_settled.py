@@ -606,10 +606,44 @@ class TestTheStepGate(unittest.TestCase):
         self.card("step x_y: planned\nstep /etc/passwd: planned", task_id="t_not_slugs")
         self.assertEqual({}, kcs.card_steps(self.conn, "t_not_slugs"))
 
+    def test_prose_that_mentions_a_step_is_not_a_plan(self):
+        self.card(
+            "Step 1: Planned maintenance window is Sunday.\n"
+            "Step two: failed pods are restarted by the controller.\n"
+            "The next step: done by Friday."
+        )
+        self.assertEqual({}, kcs.card_steps(self.conn, STEP_CARD))
+        self.assertIsNone(self.gate())
+
+    def test_a_hedged_status_is_not_done_and_a_reason_is_allowed(self):
+        self.card("step substrate: planned\nstep cluster: planned\nstep pool: planned")
+        self.comment("step substrate: done-ish except helm failed")
+        self.comment("1. step cluster: done (PR #12)\n2) step pool: done - labels set")
+        self.assertEqual(
+            {"substrate": "planned", "cluster": "done", "pool": "done"}, kcs.card_steps(self.conn, STEP_CARD)
+        )
+
     def test_the_refusal_is_not_rationed(self):
         self.card("step substrate: planned")
         self.assertIsNotNone(self.gate())
         self.assertIsNotNone(self.gate())
+
+    def test_prose_that_mentions_a_step_is_not_a_plan(self):
+        self.card(
+            "Step 1: Planned maintenance window is Sunday.\n"
+            "Step two: failed pods are restarted by the controller.\n"
+            "The next step: done by Friday."
+        )
+        self.assertEqual({}, kcs.card_steps(self.conn, STEP_CARD))
+        self.assertIsNone(self.gate())
+
+    def test_a_hedged_status_is_not_done_and_a_reason_is_allowed(self):
+        self.card("step substrate: planned\nstep cluster: planned\nstep pool: planned")
+        self.comment("step substrate: done-ish except helm failed")
+        self.comment("1. step cluster: done (PR #12)\n2) step pool: done - labels set")
+        self.assertEqual(
+            {"substrate": "planned", "cluster": "done", "pool": "done"}, kcs.card_steps(self.conn, STEP_CARD)
+        )
 
     def test_another_cards_steps_do_not_count(self):
         self.card("Provision a cluster.")
