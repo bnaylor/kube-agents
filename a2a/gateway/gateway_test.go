@@ -1090,6 +1090,8 @@ type fakeSpawner struct {
 	sessionPods []sessionPod
 	// orphansErr fails TerminalOrphans, the orphan sweep's list.
 	orphansErr error
+	// deleteErr fails Delete (the call is still recorded).
+	deleteErr error
 }
 
 func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
@@ -1148,13 +1150,19 @@ func (s *fakeSpawner) failSpawns(err error) {
 
 func (s *fakeSpawner) Delete(_ context.Context, podName string) error {
 	s.mu.Lock()
-	hook := s.onDelete
+	hook, err := s.onDelete, s.deleteErr
 	s.deletes = append(s.deletes, podName)
 	s.mu.Unlock()
 	if hook != nil {
 		hook(podName)
 	}
-	return nil
+	return err
+}
+
+func (s *fakeSpawner) setDeleteErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteErr = err
 }
 
 func (s *fakeSpawner) deleted() []string {

@@ -469,6 +469,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			}
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote))
 		}
+		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts

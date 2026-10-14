@@ -330,6 +330,137 @@ func TestAnOverdueTaskOnAReusedPodIsClosedAndThePodRetired(t *testing.T) {
 	}
 }
 
+// overdueRecord is a conversation whose reused pod has held its task past the
+// task deadline plus the pod grace.
+func overdueRecord(key, pod, taskID string) *SessionRecord {
+	return &SessionRecord{
+		Key: key, ContextID: "ctx-" + taskID, Kind: "group", Profile: "chat",
+		Addressee: pod, BusSession: pod, PodName: pod, PodReuse: true, SessionRouted: true,
+		LastUserMessage: time.Now().UTC(),
+		ActiveTask: &ActiveTask{TaskID: taskID, CorrelationID: "corr-" + taskID,
+			SubmittedAt: time.Now().Add(-(defaultTaskDeadline + podDeadlineGrace + time.Minute))},
+		Tasks: []TaskRef{{ID: taskID, Addressee: pod}},
+	}
+}
+
+// A gateway with no spawner (A2A_SPAWN_SESSIONS dropped after an armed run
+// spawned the pod) leaves an overdue task alone: it cannot delete the pod, so
+// it does not write the terminal the deletion rule pairs with the delete, and
+// the reap does not dereference the missing spawner.
+func TestAnOverdueTaskIsLeftAloneWithoutASpawner(t *testing.T) {
+	r := startRigWith(t, reuseOn)
+	ctx := context.Background()
+	pod := "chat-lynx-nil"
+	rec := overdueRecord("discord:g1/t-overdue-nil", pod, "task-nil")
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if r.g.taskOverdue(rec, time.Now()) {
+		t.Fatal("taskOverdue is true with no spawner")
+	}
+	r.g.reapSession(ctx, rec)
+	r.g.retireOverdue(ctx, rec.Key)
+	if sup := supervisorTerminal(t, r, pod, "task-nil"); sup != nil {
+		t.Fatalf("a supervisor terminal was published with nothing to delete the pod: %+v", sup)
+	}
+	fresh, err := r.g.reg.Get(ctx, rec.Key)
+	if err != nil || fresh == nil {
+		t.Fatalf("record: %+v, %v", fresh, err)
+	}
+	if fresh.PodName != pod || !fresh.PodReuse || fresh.ActiveTask == nil {
+		t.Fatalf("record changed with no spawner: pod %q reuse %v active %+v", fresh.PodName, fresh.PodReuse, fresh.ActiveTask)
+	}
+}
+
+// A failed delete after the overdue terminal leaves the pod on the record for
+// the reap, but unmarked: once the relay releases the task, the next turn
+// retires the wedged pod and spawns fresh rather than being routed to it.
+func TestAFailedOverdueDeleteUnmarksThePod(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	pod := "chat-lynx-del"
+	rec := overdueRecord("discord:g1/t-overdue-del", pod, "task-del")
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.g.reg.IndexTask(ctx, "task-del", rec.Key); err != nil {
+		t.Fatal(err)
+	}
+	spawn.setDeleteErr(errors.New("apiserver unavailable"))
+	r.g.reapSession(ctx, rec)
+	if sup := supervisorTerminal(t, r, pod, "task-del"); sup == nil || sup.Status.State != lib.StateFailed {
+		t.Fatalf("supervisor terminal = %+v, want failed", sup)
+	}
+	if d := spawn.deleted(); len(d) != 1 || d[0] != pod {
+		t.Fatalf("delete attempts %v, want one for %s", d, pod)
+	}
+	fresh, _ := r.g.reg.Get(ctx, rec.Key)
+	if fresh.PodName != pod || fresh.PodReuse {
+		t.Fatalf("after the failed delete: pod %q reuse %v, want the pod kept and unmarked", fresh.PodName, fresh.PodReuse)
+	}
+	waitIdle(t, r, rec.Key)
+
+	spawn.setDeleteErr(nil)
+	spawn.setReusable(pod)
+	say(r, rec.Key, "m-del-1", "are you there?")
+	waitFor(t, "a fresh spawn", func() bool { return len(spawn.calls()) == 1 })
+	if s := spawn.calls()[0].Session; s == pod {
+		t.Fatal("the next turn went to the wedged pod")
+	}
+	if d := spawn.deleted(); len(d) != 2 || d[1] != pod {
+		t.Fatalf("deleted %v, want the wedged pod retired by the next turn", d)
+	}
+}
+
+// A gateway that stops between the overdue terminal and its record write
+// leaves the pod marked. The relay that later releases the task on that
+// supervisor's terminal unmarks it in the same write, so the next turn never
+// sees the pod free and still reusable. An executor's own terminal leaves the
+// mark alone.
+func TestASupervisorTerminalUnmarksAReusedPod(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		supervisor bool
+	}{
+		{name: "supervisor", supervisor: true},
+		{name: "executor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := startReuseRig(t)
+			ctx := context.Background()
+			pod := "chat-lynx-rs"
+			rec := overdueRecord("discord:g1/t-restart-"+tc.name, pod, "task-rs-"+tc.name)
+			taskID := rec.ActiveTask.TaskID
+			if err := r.g.reg.Put(ctx, rec); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.g.reg.IndexTask(ctx, taskID, rec.Key); err != nil {
+				t.Fatal(err)
+			}
+			if tc.supervisor {
+				if err := r.g.publishSupervisorTerminal(ctx, pod, taskID, rec.ContextID, rec.ActiveTask.CorrelationID,
+					lib.StateFailed, noteTaskOverdue); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				origin := &lib.Envelope{Kind: lib.KindMessage, TaskID: taskID, ContextID: rec.ContextID, CorrelationID: rec.ActiveTask.CorrelationID}
+				exec, err := r.bus.NewTaskExecution(origin, lib.Party{Session: pod, AgentType: "test-executor"}, pod)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitIdle(t, r, rec.Key)
+			fresh, _ := r.g.reg.Get(ctx, rec.Key)
+			if fresh.PodReuse == tc.supervisor {
+				t.Fatalf("PodReuse = %v after the %s terminal", fresh.PodReuse, tc.name)
+			}
+		})
+	}
+}
+
 // supervisorTerminal is the final the gateway wrote for a task as its
 // supervisor, or nil.
 func supervisorTerminal(t *testing.T, r *rig, addressee, taskID string) *lib.StatusUpdate {
@@ -666,6 +797,65 @@ func TestSessionPodsListsTheLiveOnes(t *testing.T) {
 	slices.Sort(got)
 	if want := []string{"live=conv-live", "pending=conv-pending"}; !slices.Equal(got, want) {
 		t.Fatalf("SessionPods = %v, want %v", got, want)
+	}
+	// The cap counts exactly the pods its eviction can choose from.
+	n, err := s.LiveSessions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(pods) {
+		t.Fatalf("LiveSessions = %d over %d evictable pods; the count and the candidates disagree", n, len(pods))
+	}
+}
+
+// At the cap with one pod already being deleted, its slot is the one that
+// frees: the turn goes ahead and no other conversation's idle pod is evicted
+// for it.
+func TestTheCapDoesNotEvictForAPodAlreadyGoing(t *testing.T) {
+	r, _ := startReuseRig(t)
+	ctx := context.Background()
+	mk := func(name, convo string, deleting bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-ns",
+				Labels:      map[string]string{labelPartOf: partOfValue, labelRole: sessionRole},
+				Annotations: map[string]string{annoConvo: convo, annoReuse: reuseValue}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		if deleting {
+			p.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+			p.Finalizers = []string{"test"}
+		}
+		return p
+	}
+	idleKey := "discord:g1/t-cap-idle"
+	idleRec := &SessionRecord{Key: idleKey, ContextID: "ctx-ci", Kind: "group", Profile: "chat",
+		Addressee: "chat-vole-idle", BusSession: "chat-vole-idle", PodName: "chat-vole-idle", PodReuse: true,
+		SessionRouted: true, LastUserMessage: time.Now().Add(-time.Hour).UTC()}
+	if err := r.g.reg.Put(ctx, idleRec); err != nil {
+		t.Fatal(err)
+	}
+	cs := k8sfake.NewSimpleClientset(
+		mk("chat-vole-going", "discord:g1/t-cap-going", true),
+		mk("chat-vole-idle", idleKey, false),
+	)
+	const capOfTwo = 2
+	g := &Gateway{
+		cfg:          &Config{MaxSessions: capOfTwo},
+		spawner:      &podSpawner{cfg: &Config{Namespace: "test-ns"}, client: cs, log: slog.Default()},
+		reg:          r.g.reg,
+		adapter:      r.adapter,
+		log:          slog.Default(),
+		sessionLocks: map[string]*sessionLockEntry{},
+	}
+	requester := &SessionRecord{Key: "discord:g1/t-cap-new"}
+	if g.refuseAtSessionCap(ctx, requester, false) {
+		t.Fatal("refused at the cap though one of the two pods is already going")
+	}
+	if _, err := cs.CoreV1().Pods("test-ns").Get(ctx, "chat-vole-idle", metav1.GetOptions{}); err != nil {
+		t.Fatalf("the idle pod was evicted for a slot already freeing: %v", err)
+	}
+	if fresh, _ := r.g.reg.Get(ctx, idleKey); fresh == nil || fresh.PodName != "chat-vole-idle" {
+		t.Fatalf("the idle conversation lost its pod: %+v", fresh)
 	}
 }
 

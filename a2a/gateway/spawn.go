@@ -171,8 +171,9 @@ type spawner interface {
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
 	// their annotations carry (sweep's scan).
 	TerminalOrphans(ctx context.Context) ([]orphanPod, error)
-	// LiveSessions counts session pods not yet in a terminal phase - the
-	// session cap's denominator.
+	// LiveSessions counts session pods not yet in a terminal phase and not
+	// being deleted - the session cap's denominator, over the same pods
+	// SessionPods offers the cap's eviction.
 	LiveSessions(ctx context.Context) (int, error)
 	// Reusable reports whether a pod can take its conversation's next task:
 	// spawned for reuse, running, not being deleted, its worker not exited,
@@ -550,6 +551,13 @@ func (s *podSpawner) Delete(ctx context.Context, podName string) error {
 // orphans the registry has forgotten. Terminal pods are sweep's inventory,
 // not load, so they don't count - matching what a `pods` ResourceQuota
 // counts, which is the layer that backstops this number.
+//
+// A pod being deleted does not count either, though the quota still does
+// until it is gone: its slot is already freeing, and the cap's eviction
+// cannot choose it (SessionPods skips it too), so counting it would evict
+// some other conversation's live pod for a slot nobody needs. The count and
+// the candidates agree, and the overlap while it terminates is the same one
+// a successful eviction already leaves, which the quota headroom absorbs.
 func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
 	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
@@ -559,7 +567,7 @@ func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
 	}
 	n := 0
 	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
 			continue
 		}
 		n++
@@ -730,9 +738,10 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	}
 	// Full, but a pod at the cap may only be holding a conversation nobody
 	// is in right now. Evicting the longest-idle one makes room for one that
-	// is; its conversation is told, and resumes cold with the primer. The
-	// deleted pod may still count above until it is gone, so a successful
-	// eviction is the slot rather than a recount.
+	// is; its conversation is told, and resumes cold with the primer. A
+	// successful eviction is the slot; the count is not read again. A pod
+	// already being deleted is not counted above (LiveSessions), so its
+	// freeing slot never costs another conversation its pod.
 	if g.evictIdleSession(ctx, rec) {
 		return false
 	}

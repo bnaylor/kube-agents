@@ -1177,6 +1177,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if child {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
+		unmarkOnSupervisorTerminal(rec, active.TaskID, healedSource)
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is

@@ -167,9 +167,16 @@ func (g *Gateway) evictSession(ctx context.Context, p sessionPod) bool {
 // well before this, so reaching it means the adapter is wedged, or its
 // terminal never reached the gateway; a reused pod's own deadline is hours
 // away and would not save the conversation.
+//
+// Never without a spawner (A2A_SPAWN_SESSIONS dropped after an armed run
+// spawned the pod): the supervisor's terminal is only safe when the pod is
+// deleted right after it, since a wedged adapter that wakes would publish a
+// second final, and nothing here can delete the pod. The record is left as
+// it is: reuseLivePod refuses every pod without a spawner anyway, and a
+// spawner armed again finds the task overdue and retires it then.
 func (g *Gateway) taskOverdue(rec *SessionRecord, now time.Time) bool {
 	active := rec.ActiveTask
-	return rec.PodReuse && rec.PodName != "" && rec.PodName == rec.BusSession &&
+	return g.spawner != nil && rec.PodReuse && rec.PodName != "" && rec.PodName == rec.BusSession &&
 		active != nil && !active.Detached && !active.SubmittedAt.IsZero() &&
 		rec.AddresseeFor(active.TaskID) == rec.BusSession &&
 		now.Sub(active.SubmittedAt) >= g.cfg.TaskDeadline+podDeadlineGrace
@@ -203,16 +210,39 @@ func (g *Gateway) retireOverdue(ctx context.Context, key string) {
 		g.log.Error("overdue check: supervisor terminal failed; keeping the pod", "task", active.TaskID, "err", err)
 		return
 	}
+	// Unmarked whatever the delete does: the adapter is wedged, and a pod
+	// that outlives this (a failed delete) must not be handed the next turn
+	// once the relay releases the task. That turn retires it and spawns
+	// fresh instead (reuseLivePod). A gateway that stops between the publish
+	// and this write is covered by the relay and the heal, which unmark a
+	// reused pod whenever they release its task on a supervisor's terminal
+	// (unmarkOnSupervisorTerminal), in the same write that releases it.
+	rec.PodReuse = false
 	if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
 		// The terminal is out, so the relay releases the task, and the pod,
-		// still on the record, goes at the idle TTL like any idle pod.
-		g.log.Error("overdue check: pod delete failed; the reap retires it once idle", "pod", rec.PodName, "err", err)
-		return
+		// still on the record, goes at the idle TTL like any idle pod, or
+		// at the next turn.
+		g.log.Error("overdue check: pod delete failed; unmarked for reuse, the reap retires it once idle", "pod", rec.PodName, "err", err)
+	} else {
+		g.log.Warn("overdue check: closed a wedged task and retired its pod", "task", active.TaskID, "pod", rec.PodName,
+			"age", time.Since(active.SubmittedAt).Round(time.Second))
+		rec.PodName = ""
 	}
-	g.log.Warn("overdue check: closed a wedged task and retired its pod", "task", active.TaskID, "pod", rec.PodName,
-		"age", time.Since(active.SubmittedAt).Round(time.Second))
-	rec.PodName = ""
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("overdue check: record write failed", "conversation", rec.Key, "err", err)
+	}
+}
+
+// unmarkOnSupervisorTerminal stops a reused pod being handed another task once
+// a supervisor's terminal has released a task it held. Every such terminal is
+// the gateway's word that the pod failed the task: it died (the sweep), never
+// came up (a failed spawn), wedged (retireOverdue), or is being retired after
+// a stop. Called where the relay and the heal release the task, so the record
+// write that frees the conversation also unmarks the pod, and no turn can see
+// it free and still reusable.
+func unmarkOnSupervisorTerminal(rec *SessionRecord, taskID string, source TerminalSource) {
+	if source == TerminalFromSupervisor && rec.PodReuse && rec.PodName == rec.BusSession &&
+		rec.AddresseeFor(taskID) == rec.BusSession {
+		rec.PodReuse = false
 	}
 }
