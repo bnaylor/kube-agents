@@ -27,7 +27,7 @@ Identity Service Account bindings, the `gke-workload-identity` skill.
 > **MCP Tools:** `gke:get_cluster`, `k8s:check_k8s_auth`,
 > `k8s:get_k8s_resource`
 >
-> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. The `gke` MCP server offers read tools only, and the broker refuses `kubectl` and `gcloud` writes.
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Golden Path Security Defaults
 
@@ -55,9 +55,10 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
   --quiet
 ```
 
-If it is not enabled, Secret Manager with a 120s rotation interval is a Day-1 cluster setting,
-changed as Config Connector YAML on the cluster's `ContainerCluster` through
-`gcp-config-connector`.
+If it is not enabled, Secret Manager with a 120s rotation interval is a Day-1 cluster setting.
+Config Connector's `ContainerCluster` has no field for it, so it has no declarative path in a
+Config Connector repository: say so, and block rather than invent a field. A Terraform repository
+carries it on the cluster resource.
 
 > **Note:** For configuring `SecretProviderClass` manifests and mounting secrets
 > as volumes inside application deployments, see the `gke-workload-security`
@@ -100,9 +101,11 @@ Config Connector YAML on the cluster's `ContainerCluster` through `gcp-config-co
 ## Shielded Nodes & GKE Sandbox Enablement
 
 Enabling verifiable node boot integrity and kernel isolation features at the
-cluster level: Shielded Nodes (`spec.enableShieldedNodes`) and the GKE Sandbox (gVisor)
-runtime are changed as Config Connector YAML on the cluster's `ContainerCluster` through
-`gcp-config-connector`.
+cluster level. Shielded Nodes (`spec.enableShieldedNodes`) are changed as Config Connector
+YAML on the cluster's `ContainerCluster` through `gcp-config-connector`. The GKE Sandbox
+(gVisor) runtime is a node pool setting, `spec.nodeConfig.sandboxConfig.sandboxType: gvisor` on
+a `ContainerNodePool`; the field is immutable and the default pool cannot run it, so propose a
+new sandboxed node pool rather than editing an existing one.
 
 > **Note:** To run workloads inside the gVisor sandbox, specify
 > `runtimeClassName: gvisor` in your Pod specs as detailed in the
@@ -195,5 +198,6 @@ gcloud container clusters describe CLUSTER_NAME --location LOCATION \
 **Security Posture (`--security-posture`)** turns on configuration auditing (`standard`) and,
 with `--workload-vulnerability-scanning`, OS vulnerability scanning of running workloads. Both
 are changed as Config Connector YAML on the cluster's `ContainerCluster` through
-`gcp-config-connector`, in `spec.securityPostureConfig.mode` and
-`spec.securityPostureConfig.vulnerabilityMode`.
+`gcp-config-connector`: `spec.securityPostureConfig.mode: BASIC` and
+`spec.securityPostureConfig.vulnerabilityMode: VULNERABILITY_BASIC` (Config Connector's values,
+not gcloud's `standard`).

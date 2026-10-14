@@ -17,7 +17,7 @@ This reference covers running batch processing and high-performance computing
 > **MCP Tools:** `get_k8s_resource`, `describe_k8s_resource`, `get_k8s_logs`,
 > `list_k8s_events`
 >
-> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. The `gke` MCP server offers read tools only, and the broker refuses `kubectl` and `gcloud` writes.
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## When to Use
 
@@ -83,8 +83,10 @@ spec:
 ### Kueue (Job Queuing)
 
 Kueue manages job scheduling and resource allocation for batch workloads. Its release
-manifests (`https://github.com/kubernetes-sigs/kueue/releases/latest/download/manifests.yaml`)
-and the queues below are proposed as a pull request through `submit-suggestion`:
+manifests (from `https://github.com/kubernetes-sigs/kueue/releases`, pinned to a release rather
+than `latest`) and the queues below are proposed as a pull request through `submit-suggestion`.
+Kueue's CRDs are too large for client-side apply, so the repository's applier must use
+server-side apply; say so in the pull request if it does not:
 
 ```yaml
 # Define a ClusterQueue
@@ -128,7 +130,8 @@ communication, Standard clusters use a node pool with compact placement, propose
 ### MPI Workloads
 
 Use the MPI Operator for MPI-based HPC applications. Its manifest
-(`https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml`)
+(from `https://github.com/kubeflow/mpi-operator/releases`, pinned to a release rather than
+`master`)
 and the `MPIJob` below are proposed as a pull request through `submit-suggestion`:
 
 ```yaml

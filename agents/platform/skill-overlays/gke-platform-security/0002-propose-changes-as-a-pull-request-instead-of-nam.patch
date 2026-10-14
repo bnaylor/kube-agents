@@ -15,11 +15,11 @@ diff --git a/SKILL.md b/SKILL.md
 -> `k8s:get_k8s_resource`, `k8s:apply_k8s_manifest`, `gke:update_cluster`
 +> `k8s:get_k8s_resource`
 +>
-+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. The `gke` MCP server offers read tools only, and the broker refuses `kubectl` and `gcloud` writes.
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
  
  ## Golden Path Security Defaults
  
-@@ -51,14 +53,12 @@ secret rotation.
+@@ -51,14 +53,13 @@ secret rotation.
  gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
    --format="value(secretManagerConfig.enabled)" \
    --quiet
@@ -31,14 +31,15 @@ diff --git a/SKILL.md b/SKILL.md
 -  --quiet
  ```
  
-+If it is not enabled, Secret Manager with a 120s rotation interval is a Day-1 cluster setting,
-+changed as Config Connector YAML on the cluster's `ContainerCluster` through
-+`gcp-config-connector`.
++If it is not enabled, Secret Manager with a 120s rotation interval is a Day-1 cluster setting.
++Config Connector's `ContainerCluster` has no field for it, so it has no declarative path in a
++Config Connector repository: say so, and block rather than invent a field. A Terraform repository
++carries it on the cluster resource.
 +
  > **Note:** For configuring `SecretProviderClass` manifests and mounting secrets
  > as volumes inside application deployments, see the `gke-workload-security`
  > skill.
-@@ -93,31 +93,16 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
+@@ -93,31 +94,18 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
  ## Binary Authorization
  
  Not enabled in golden path by default but recommended for enforcing production
@@ -70,13 +71,15 @@ diff --git a/SKILL.md b/SKILL.md
 -  --enable-gke-sandbox \
 -  --quiet
 -```
-+cluster level: Shielded Nodes (`spec.enableShieldedNodes`) and the GKE Sandbox (gVisor)
-+runtime are changed as Config Connector YAML on the cluster's `ContainerCluster` through
-+`gcp-config-connector`.
++cluster level. Shielded Nodes (`spec.enableShieldedNodes`) are changed as Config Connector
++YAML on the cluster's `ContainerCluster` through `gcp-config-connector`. The GKE Sandbox
++(gVisor) runtime is a node pool setting, `spec.nodeConfig.sandboxConfig.sandboxType: gvisor` on
++a `ContainerNodePool`; the field is immutable and the default pool cannot run it, so propose a
++new sandboxed node pool rather than editing an existing one.
  
  > **Note:** To run workloads inside the gVisor sandbox, specify
  > `runtimeClassName: gvisor` in your Pod specs as detailed in the
-@@ -169,26 +154,10 @@ The five most common predefined IAM roles for GKE platform and cluster access:
+@@ -169,26 +157,10 @@ The five most common predefined IAM roles for GKE platform and cluster access:
  
  Common project-level IAM policy binding patterns for granting backend Google
  Service Accounts (GSAs) access to external Google Cloud services before linking
@@ -107,7 +110,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ## Resources
  
-@@ -198,4 +167,3 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
+@@ -198,4 +170,3 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
  - [Binary Authorization on GKE](https://cloud.google.com/binary-authorization/docs/setting-up)
  - [Shielded GKE Nodes](https://cloud.google.com/kubernetes-engine/docs/how-to/shielded-gke-nodes)
  - [GKE Sandbox (gVisor)](https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods)

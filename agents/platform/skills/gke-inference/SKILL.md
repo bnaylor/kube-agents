@@ -18,7 +18,7 @@ Inference Quickstart (GIQ) and best practices for LLM serving.
 > `describe_k8s_resource`, `list_k8s_events`.
 > **CLI-only:** `gcloud container ai profiles *`
 >
-> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. The `gke` MCP server offers read tools only, and the broker refuses `kubectl` and `gcloud` writes.
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## When to Use
 

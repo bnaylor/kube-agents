@@ -25,5 +25,6 @@ gcloud container clusters describe CLUSTER_NAME --location LOCATION \
 **Security Posture (`--security-posture`)** turns on configuration auditing (`standard`) and,
 with `--workload-vulnerability-scanning`, OS vulnerability scanning of running workloads. Both
 are changed as Config Connector YAML on the cluster's `ContainerCluster` through
-`gcp-config-connector`, in `spec.securityPostureConfig.mode` and
-`spec.securityPostureConfig.vulnerabilityMode`.
+`gcp-config-connector`: `spec.securityPostureConfig.mode: BASIC` and
+`spec.securityPostureConfig.vulnerabilityMode: VULNERABILITY_BASIC` (Config Connector's values,
+not gcloud's `standard`).
