@@ -1675,9 +1675,9 @@ code spans as written, converts bold only on a closed `**` pair, never alters a
 link's destination, and refuses a link whose label carries a URL naming a host other
 than the one it opens. A link the agent already wrote in the surfaces' own `<url|text>`
 form is kept as the link it is when it is closed, sits in prose (not in a code span or
-after an unclosed fence), has an `http(s)` URL in the same class a markdown link's must
-be in, and has text that names no other host: the refusal a markdown link with that
-label meets (#3015). The markdown rules read a kept link as a link, so a bold pair
+after an unclosed fence), has an `http(s)` URL with no whitespace, angle bracket or pipe
+in it, and has text that names no other host: the refusal a markdown link with that
+label meets. The markdown rules read a kept link as a link, so a bold pair
 around it converts and a markdown link that overlaps it is refused. Posts ask Slack not
 to unfurl links or media: an answer cites console and documentation links, and each
 unfurled into a preview card under it. Everything else posted is escaped first (`&`,
@@ -1686,7 +1686,7 @@ model output, and an unescaped `<!channel>` in a result would ping the room. The
 Chat adapter applies the same markdown rules, and keeps the same links, behind its own
 defang, in two halves: the link defang reads prose, link text and an unclosed fence but
 not a closed code span, a fenced block or a kept link; the mention defang reads
-everything, code included. The adapters translate each chunk of a result alone, so the chunker closes a
+everything, code included, but a kept link, whose URL and text hold no `<`. The adapters translate each chunk of a result alone, so the chunker closes a
 fenced block it cuts and reopens it with a bare fence at the start of the next chunk,
 reading the cut with the same code-span parse the adapters use: every chunk is balanced on
 its fences, so a cut block never leaks its closer into the next chunk, the fences added stay

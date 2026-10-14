@@ -282,7 +282,7 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 // legacy Hermes path's converter is not this code path's to reuse.
 //
 // One <url|text> the executor wrote is not escaped: a closed one, in prose,
-// whose URL is http(s) in the markdown link's destination class and whose
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
 // text does not name another host (keepChatLinks), which is the link
 // rewriteLinks would have written from [text](url), refused on the same
 // label-host ground. Its URL and text are escaped as the rest of the text is,

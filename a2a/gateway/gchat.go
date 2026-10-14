@@ -881,13 +881,13 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // character.
 //
 // One <url|text> the executor wrote is not defanged: a closed one, in prose,
-// whose URL is http(s) in the markdown link's destination class and whose
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
 // text does not name another host (keepChatLinks). That is the link
 // rewriteLinks would have written from [text](url), refused on the same
 // label-host ground, so the visible text still cannot name a host the link
-// does not open, and a model that writes Chat's form instead of markdown
-// gets a link instead of a broken one. It is passed through as written, and
-// the markdown rules read it as the link it is (rewriteMarkdown).
+// does not open, and a model that writes Chat's form instead of markdown gets
+// a link instead of a broken one. It is passed through as written, and the
+// markdown rules read it as the link it is (rewriteMarkdown).
 //
 // Around those, the defang runs first, the way the Slack adapter escapes
 // first: every <users/…> anywhere in the text, and every other <url|text the
@@ -895,10 +895,10 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // closed it, is defused before the markdown rules see it, and the markdown
 // link's destination class excludes `<`, so the <url|text> rewriteLinks
 // generates afterwards is the adapter's own — which is the distinction the
-// <users/…> defang already drew, applied to the sequence next to it. The
-// kept link's text admits no `<`, so no mention rides out in it. The
-// markdown rules (bold pairs, code spans, links, the label-host refusal) are
-// the ones markdown.go holds for both chat surfaces.
+// <users/…> defang already drew, applied to the sequence next to it. The kept
+// link's text admits no `<`, so no mention rides out in it. The markdown
+// rules (bold pairs, code spans, links, the label-host refusal) are the ones
+// markdown.go holds for both chat surfaces.
 func toGchatText(s string) string {
 	return rewriteMarkdown(keepChatLinks(s, defangGchatControls, func(dest, label string) string {
 		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
