@@ -21,7 +21,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ## When to Use
  
-@@ -81,12 +82,11 @@ spec:
+@@ -81,12 +82,13 @@ spec:
  
  ### Kueue (Job Queuing)
  
@@ -32,14 +32,16 @@ diff --git a/SKILL.md b/SKILL.md
 -kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/latest/download/manifests.yaml
 -```
 +Kueue manages job scheduling and resource allocation for batch workloads. Its release
-+manifests (from `https://github.com/kubernetes-sigs/kueue/releases`, pinned to a release rather
-+than `latest`) and the queues below are proposed as a pull request through `submit-suggestion`.
++manifests and the queues below are proposed as a pull request through `submit-suggestion`.
++Pin the manifests to a release tag rather than `latest`: the `manifests.yaml` asset at
++`https://github.com/kubernetes-sigs/kueue/releases/download/<TAG>/manifests.yaml`, with the
++tag named in the pull request.
 +Kueue's CRDs are too large for client-side apply, so the repository's applier must use
 +server-side apply; say so in the pull request if it does not:
  
  ```yaml
  # Define a ClusterQueue
-@@ -121,27 +121,18 @@ spec:
+@@ -121,27 +123,19 @@ spec:
  ### Compact Placement (Low-Latency Networking)
  
  For tightly-coupled HPC workloads that need low-latency inter-node
@@ -69,14 +71,15 @@ diff --git a/SKILL.md b/SKILL.md
 -# Install MPI Operator
 -kubectl apply -f https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml
 -```
-+Use the MPI Operator for MPI-based HPC applications. Its manifest
-+(from `https://github.com/kubeflow/mpi-operator/releases`, pinned to a release rather than
-+`master`)
-+and the `MPIJob` below are proposed as a pull request through `submit-suggestion`:
++Use the MPI Operator for MPI-based HPC applications. Its manifest and the `MPIJob` below
++are proposed as a pull request through `submit-suggestion`. Pin the manifest to a release tag
++rather than `master`:
++`https://raw.githubusercontent.com/kubeflow/mpi-operator/<TAG>/deploy/v2beta1/mpi-operator.yaml`,
++with the tag named in the pull request:
  
  ```yaml
  apiVersion: kubeflow.org/v2beta1
-@@ -197,7 +188,7 @@ For batch clusters, allow node pools to scale to zero when no jobs are running:
+@@ -197,7 +191,7 @@ For batch clusters, allow node pools to scale to zero when no jobs are running:
  
  -   Autopilot (golden path): Automatic, nodes scale to zero when no pods are
      scheduled

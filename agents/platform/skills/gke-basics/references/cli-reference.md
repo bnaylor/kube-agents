@@ -46,12 +46,10 @@ Default preference order:
 :                   : versions, Cloud Logging    : logging read`               :
 :                   : queries.                   :                             :
 | **`kubectl`**     | Neither MCP nor `gcloud`   | `kubectl top pods`,         |
-:                   : covers the operation, or   : `kubectl port-forward`      :
+:                   : covers the operation, or   : `kubectl top nodes`         :
 :                   : user explicitly prefers    :                             :
 :                   : kubectl. Required for\:    :                             :
-:                   : `kubectl top`, `kubectl    :                             :
-:                   : exec`, `kubectl            :                             :
-:                   : port-forward`, custom CRDs :                             :
+:                   : `kubectl top`, custom CRDs :                             :
 :                   : not in MCP.                :                             :
 
 ### User preference override
@@ -204,10 +202,10 @@ No MCP or `gcloud` equivalent:
 ```bash
 kubectl top pods --all-namespaces --sort-by=cpu
 kubectl top nodes
-kubectl exec -it <POD_NAME> -n <NAMESPACE> -- /bin/sh
-kubectl port-forward svc/<SERVICE> <LOCAL_PORT>:<REMOTE_PORT> -n <NAMESPACE>
-kubectl cp <NAMESPACE>/<POD>:<PATH> <LOCAL_PATH>
 ```
+
+`kubectl exec`, `kubectl port-forward` and `kubectl cp` reach into a running pod, and the
+broker refuses them; when a task needs one, give the user the command to run.
 
 Scaling a Deployment (its `replicas`) or installing a Helm chart is a manifest change,
 proposed as a pull request through `submit-suggestion`.

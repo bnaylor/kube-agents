@@ -83,8 +83,10 @@ spec:
 ### Kueue (Job Queuing)
 
 Kueue manages job scheduling and resource allocation for batch workloads. Its release
-manifests (from `https://github.com/kubernetes-sigs/kueue/releases`, pinned to a release rather
-than `latest`) and the queues below are proposed as a pull request through `submit-suggestion`.
+manifests and the queues below are proposed as a pull request through `submit-suggestion`.
+Pin the manifests to a release tag rather than `latest`: the `manifests.yaml` asset at
+`https://github.com/kubernetes-sigs/kueue/releases/download/<TAG>/manifests.yaml`, with the
+tag named in the pull request.
 Kueue's CRDs are too large for client-side apply, so the repository's applier must use
 server-side apply; say so in the pull request if it does not:
 
@@ -129,10 +131,11 @@ communication, Standard clusters use a node pool with compact placement, propose
 
 ### MPI Workloads
 
-Use the MPI Operator for MPI-based HPC applications. Its manifest
-(from `https://github.com/kubeflow/mpi-operator/releases`, pinned to a release rather than
-`master`)
-and the `MPIJob` below are proposed as a pull request through `submit-suggestion`:
+Use the MPI Operator for MPI-based HPC applications. Its manifest and the `MPIJob` below
+are proposed as a pull request through `submit-suggestion`. Pin the manifest to a release tag
+rather than `master`:
+`https://raw.githubusercontent.com/kubeflow/mpi-operator/<TAG>/deploy/v2beta1/mpi-operator.yaml`,
+with the tag named in the pull request:
 
 ```yaml
 apiVersion: kubeflow.org/v2beta1
