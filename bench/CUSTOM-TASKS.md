@@ -620,10 +620,11 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
   the object may be in it. `exists` and `absent` take no `value`.
 - Every op but `absent` fails when no matching file holds such a document, so a case cannot pass on
   an object nobody added.
-- A file the pull request adds is read whole from the files listing's patch, which needs only
-  `pull_requests: read`. Any other file, or an added one GitHub left no patch for (a large or binary
-  file), is read from `/contents` at the head, which needs `contents: read`; the grading mint does not
-  ask for it, so such a read is an error until it does. At most 40 files are read that way.
+- Only files the pull request adds are read, whole from the files listing's patch, which needs
+  only `pull_requests: read`. A glob that names any other file (modified, renamed), or an added
+  file GitHub left no patch for (large or binary), makes the check an error naming it: reading that
+  file needs `contents: read`, which the grading mint does not grant. A case asserting over an edit
+  to an existing file (a node pool resize in Terraform, say) needs that permission added first.
 - GitHub only: on a GitLab merge request a check with `content` is an error, not a pass.
 
 ```yaml

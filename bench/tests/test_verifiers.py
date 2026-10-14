@@ -3547,10 +3547,10 @@ def _added_patch(text: str) -> str:
 
 
 def _content_routes(
-    github, files: dict[str, str], *, statuses: dict[str, str] | None = None, patches: bool = False
+    github, files: dict[str, str], *, statuses: dict[str, str] | None = None, patches: bool = True
 ) -> None:
-    """The file listing (with each added file's patch when `patches`) and each
-    file's `/contents` read at the head."""
+    """The file listing, with each added file's patch when `patches`, as
+    GitHub returns it."""
     statuses = statuses or {}
     entries = []
     for path, text in files.items():
@@ -3559,12 +3559,6 @@ def _content_routes(
             entry["patch"] = _added_patch(text)
         entries.append(entry)
     _pr_files_route(github, *entries)
-    repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
-    for path, text in files.items():
-        github.routes[f"{repo}/contents/{path}?ref={_PR_HEAD_SHA}"] = (
-            200,
-            {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()},
-        )
 
 
 def _content_pr(github, files: dict[str, str], **kw):
@@ -3649,23 +3643,6 @@ def test_a_removed_file_is_not_read(token, github):
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
     assert res.status == "fail" and "no such document" in res.reason
     assert not any("/contents/" in url for url, _ in github.calls)
-
-
-def test_an_added_file_is_read_from_the_listing_without_contents_access(token, github):
-    """The grading credential has no `contents: read`; a file the pull request
-    adds is whole in its patch, so it needs none."""
-    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML}, patches=True)
-    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
-    assert res.status == "pass", res.reason
-    assert not any("/contents/" in url for url, _ in github.calls)
-
-
-def test_a_modified_file_is_read_at_the_head(token, github):
-    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
-                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "modified"}, patches=True)
-    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
-    assert res.status == "pass", res.reason
-    assert any("/contents/" in url for url, _ in github.calls)
 
 
 def test_not_matches_needs_the_field_to_be_there(token, github):
@@ -3774,15 +3751,6 @@ def test_a_value_on_a_presence_op_is_refused():
         _pr_check(content=[{"paths": ["x"], "op": "exists", "field": "a", "value": "c3-standard-4"}])
 
 
-def test_a_large_file_names_its_size_not_a_permission(token, github):
-    _content_pr(github, {f"{_CLUSTER_DIR}/big.yaml": _CLUSTER_YAML},
-                statuses={f"{_CLUSTER_DIR}/big.yaml": "modified"})
-    repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
-    github.routes[f"{repo}/contents/{_CLUSTER_DIR}/big.yaml?ref={_PR_HEAD_SHA}"] = (200, {"encoding": "none", "content": ""})
-    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
-    assert res.status == "error" and "over 1 MB" in res.reason and "contents: read" not in res.reason
-
-
 def test_an_empty_value_is_still_a_present_key(token, github):
     doc = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: \"\"\n"
     _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
@@ -3807,12 +3775,29 @@ def test_a_field_path_is_checked_when_the_case_loads():
         _pr_check(content=[{"paths": ["x"], "op": "exists", "field": 'a.["unclosed'}])
 
 
-def test_unreadable_contents_are_unevaluable_not_a_fail(token, github):
+def test_an_added_file_is_read_from_the_listing_alone(token, github):
+    """The grading credential has no `contents: read`; a file the pull request
+    adds is whole in its patch, so nothing else is fetched."""
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
-    repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
-    github.routes[f"{repo}/contents/{_CLUSTER_DIR}/cluster.yaml?ref={_PR_HEAD_SHA}"] = (403, {"message": "denied"})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
-    assert res.status == "error" and "contents: read" in res.reason
+    assert res.status == "pass", res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_a_modified_file_under_a_glob_is_unevaluable_and_names_the_permission(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "modified"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error"
+    assert "cluster.yaml (modified)" in res.reason and "contents: read" in res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_an_added_file_without_a_patch_is_unevaluable(token, github):
+    """GitHub leaves the patch out for a large or binary file."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/big.yaml": _CLUSTER_YAML}, patches=False)
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error" and "big.yaml (added)" in res.reason
 
 
 def test_a_content_check_needs_a_value_for_its_op():

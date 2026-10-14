@@ -53,7 +53,6 @@ for the harness), so devops-bench discovers them without a fork.
 
 from __future__ import annotations
 
-import base64
 import fnmatch
 import http.client
 import json
@@ -1070,10 +1069,6 @@ _PR_COMMITS_MAX_PAGES = 3
 # `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
 _PR_FILES_PAGE_SIZE = 100
 _PR_FILES_MAX_PAGES = 30
-# Files a `content` check reads from `/contents` at the pull request's head, at
-# most: each is one call against the run's budget. Added files come whole in
-# the listing's patch and cost nothing, so they do not count.
-_PR_CONTENT_MAX_FILES = 40
 # `/pulls/{n}/files` statuses whose file is not at the head any more.
 _PR_FILE_GONE_STATUSES = frozenset({"removed"})
 # Offending documents a failed content assertion names before counting the rest.
@@ -2603,29 +2598,31 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
-    # Assertions over what the pull request writes, read at its head (see
-    # PullRequestContentCheck): the object a provisioning case expects, with
-    # the fields it must carry, rather than only that some file changed.
-    # Listed from `/pulls/{n}/files`, which needs `pull_requests: read`. A file
-    # the pull request adds is read from that listing's patch, which for an
-    # added file is the whole file; any other is read from
-    # `/contents/{path}?ref=<head>`, which needs `contents: read` -- the grading
-    # mint (hack/ci-eval-pr.sh) does not ask for it today, so a case that
-    # asserts over a modified file errors there rather than passing.
+    # Assertions over what the pull request writes (see PullRequestContentCheck):
+    # the object a provisioning case expects, with the fields it must carry,
+    # rather than only that some file changed. Read from `/pulls/{n}/files`,
+    # whose patch carries a file the pull request adds whole, so the credential
+    # needs only `pull_requests: read`. A glob that names any other file is an
+    # error (see _head_files).
     content: list[PullRequestContentCheck] = Field(default_factory=list)
 
     def _head_files(
-        self, owner: str, repo: str, number: int, pull: dict | None, token: str, budget: float
+        self, owner: str, repo: str, number: int, token: str, budget: float
     ) -> tuple[dict[str, str], str | None]:
-        """``(path -> text at the head, unevaluable reason)`` for every file the
-        pull request adds or changes that a :attr:`content` glob names."""
-        sha = str(((pull or {}).get("head") or {}).get("sha") or "")
-        if not sha:
-            return {}, f"GitHub returned no head commit for {owner}/{repo}#{number}; the content checks could not be evaluated"
+        """``(path -> text, unevaluable reason)`` for every file the pull request
+        adds that a :attr:`content` glob names, rebuilt from the listing's patch.
+
+        Only added files are read. Any other file a glob names (modified,
+        renamed, copied), or an added one GitHub left no patch for (large or
+        binary), would have to come from ``/contents``, which needs
+        ``contents: read``; the grading mint (hack/ci-eval-pr.sh) does not ask
+        for it, so such a match is unevaluable rather than graded on half the
+        pull request.
+        """
         globs = [g for check in self.content for g in check.paths]
         base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
-        wanted: list[str] = []
         texts: dict[str, str] = {}
+        unread: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
@@ -2643,44 +2640,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 if not path or not any(fnmatch.fnmatchcase(path, g) for g in globs):
                     continue
                 added = _added_file_text(entry)
-                if added is not None:
-                    texts[path] = added
+                if added is None:
+                    unread.append(f"{path} ({entry.get('status') or 'unknown'})")
                 else:
-                    wanted.append(path)
+                    texts[path] = added
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
-        if len(wanted) > _PR_CONTENT_MAX_FILES:
+        if unread:
+            named = ", ".join(unread[:_PR_CONTENT_MAX_NAMED])
+            more = len(unread) - _PR_CONTENT_MAX_NAMED
             return {}, (
-                f"{owner}/{repo}#{number} changes {len(wanted)} files the content globs name "
-                f"that its listing does not carry whole, more than the {_PR_CONTENT_MAX_FILES} "
-                "this check reads from `/contents`; narrow the globs"
+                f"{owner}/{repo}#{number}: the content globs name {named}"
+                + (f" and {more} more" if more > 0 else "")
+                + ", which the files listing does not carry whole; `content` reads only files "
+                "the pull request adds, and reading any other needs `contents: read`, which "
+                "the grading mint does not grant, so the content checks could not be evaluated"
             )
-        for path in wanted:
-            status, body = _http_get_json(
-                f"https://api.github.com/repos/{owner}/{repo}/contents/"
-                f"{urllib.parse.quote(path)}?ref={sha}",
-                token,
-                budget,
-            )
-            encoded = body.get("content") if isinstance(body, dict) else None
-            where = f"{path} at {sha[:12]} in {owner}/{repo}"
-            if status in (401, 403):
-                return {}, (
-                    f"GitHub answered {status} for {where}: reading a file the pull request "
-                    "does not add needs `contents: read`, which the grading token lacks, so "
-                    "the content checks could not be evaluated"
-                )
-            if status == 404:
-                return {}, f"GitHub answered 404 for {where}: the path is not at the pull request's head, so the content checks could not be evaluated"
-            if status != 200 or not isinstance(body, dict):
-                return {}, f"GitHub answered {status} for {where}, so the content checks could not be evaluated"
-            if body.get("encoding") != "base64" or not isinstance(encoded, str):
-                return {}, (
-                    f"GitHub returned {where} without its content (encoding "
-                    f"{body.get('encoding')!r}: a file over 1 MB, or not a file), so the content "
-                    "checks could not be evaluated"
-                )
-            texts[path] = base64.b64decode(encoded).decode("utf-8", errors="replace")
         return texts, None
 
     def _changed_paths(
@@ -3530,7 +3505,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
             if self.content:
                 try:
-                    texts, unevaluable = self._head_files(owner, repo, number, pull, token, budget)
+                    texts, unevaluable = self._head_files(owner, repo, number, token, budget)
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                     continue
