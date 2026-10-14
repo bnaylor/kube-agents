@@ -605,14 +605,19 @@ optional `kind`, an optional dotted `field` that steps through lists
 and a `quantifier` of `all` (the default) or `any` over the documents kept.
 
 - Files parse as multi-document YAML with every scalar kept as written (`true` is the text `true`,
-  `1.30` stays `1.30`) and aliases and merge keys (`<<`) refused, so a file using either counts as not parsed. A file that does not parse, such as Terraform, is one text
-  document with no kind. With `field` empty, the text is that raw file, or, for a parsed document,
-  the document re-serialised as YAML. A map or list value compares as one YAML line per entry.
-- `exists`: the key is there, even with an empty value. `contains`: a value equals `value` exactly (substring only when
-  `field` is empty). `matches`: a value matches the regular expression. `not_matches`: the field is
-  there and no value matches, so a node pool that leaves its machine type out fails a "not E2"
-  check. `absent`: no kept document has the field, or, with `field` empty, no document of that kind;
-  a matching file that does not parse fails it, since the object may be in it.
+  `1.30` stays `1.30`). Aliases and merge keys (`<<`) are refused, and a file using either counts as
+  not parsed, like one with a syntax error or a non-YAML file such as Terraform: that file is one
+  text document with no kind. A file that parses to nothing (empty, comments only) has no documents;
+  a root list's mappings are documents of their own; any other scalar or list is a text document
+  with no kind. With `field` empty the text is the raw file for an unparsed file, else the document
+  written back as YAML with every scalar as the file had it. A map or list value compares as one YAML
+  line per entry, and `^`/`$` in a regex anchor at each line.
+- `exists`: the key is there, even with an empty value. `contains`: a value equals `value` exactly
+  (substring only when `field` is empty). `matches`: a value matches the regular expression.
+  `not_matches`: the field is there with a non-empty value and no value matches, so a node pool that
+  leaves its machine type out fails a "not E2" check. `absent`: no kept document has the field, or,
+  with `field` empty, no document of that kind; a matching file that does not parse fails it, since
+  the object may be in it. `exists` and `absent` take no `value`.
 - Every op but `absent` fails when no matching file holds such a document, so a case cannot pass on
   an object nobody added.
 - A file the pull request adds is read whole from the files listing's patch, which needs only

@@ -2298,6 +2298,8 @@ class PullRequestContentCheck(BaseModel):
     def _value_fits_op(self):
         if self.op in ("contains", "matches", "not_matches") and not self.value:
             raise ValueError(f"`{self.op}` needs a `value`")
+        if self.op in ("exists", "absent") and self.value:
+            raise ValueError(f"`{self.op}` compares nothing, so a `value` on it would never be read")
         if self.field:
             _field_keys(self.field)
         if self.op in ("matches", "not_matches"):
@@ -2350,11 +2352,25 @@ def _field_keys(dotted: str) -> list[str]:
     return keys
 
 
+class _AsWrittenDumper(yaml.SafeDumper):
+    """Resolves no implicit types, so a string that reads like ``false`` or
+    ``1.30`` needs no quotes and is written plain."""
+
+    yaml_implicit_resolvers: dict = {}
+
+
+def _dump_as_written(value: Any) -> str:
+    """YAML for a tree the text-only loader built, with every scalar written
+    as the file had it (``false``, not ``'false'``)."""
+    return yaml.dump(value, Dumper=_AsWrittenDumper, sort_keys=False, width=float("inf"),
+                     allow_unicode=True, default_flow_style=False)
+
+
 def _scalar_text(value: Any) -> str:
     """A resolved value as text: a scalar as the file wrote it, a map or list
     as one-line-per-entry YAML."""
     if isinstance(value, (dict, list)):
-        return yaml.safe_dump(value, sort_keys=False, width=float("inf"), allow_unicode=True).strip()
+        return _dump_as_written(value).strip()
     return str(value)
 
 
@@ -2379,26 +2395,24 @@ def _resolve_field(node: Any, dotted: str) -> list[Any]:
 
 def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
     """``(documents, parsed)`` for one file: ``(label, mapping or None, text)``
-    per document, and whether the file parsed. A file that does not parse (or
-    uses an alias) is one text document with no kind; a document that is not a
-    mapping is skipped rather than demoting the file."""
+    per document, and whether the file parsed. Only a parse error (or an alias
+    or merge key, refused as one) leaves a file unparsed; it is then one text
+    document with no kind. A file that parses to nothing (empty, comments only)
+    has no documents. A root list's mappings are documents of their own, and
+    any other scalar or list is a text document with no kind."""
     try:
         parsed = [d for d in yaml.load_all(text, Loader=_ContentLoader) if d is not None]
     except yaml.YAMLError:
         return [(path, None, text)], False
-    docs = [
-        (f"{path}#{i}", doc,
-         yaml.safe_dump(doc, sort_keys=False, width=float("inf"), allow_unicode=True))
-        for i, doc in enumerate(parsed)
-        if isinstance(doc, dict)
-    ]
-    if not docs:
-        return [(path, None, text)], False
-    if len(docs) < len(parsed):
-        # A file mixing objects with bare scalars or lists: keep the objects,
-        # add the raw text for text checks, and report it as not fully read so
-        # `absent` fails closed rather than passing over what was skipped.
-        return docs + [(path, None, text)], False
+    docs: list[tuple[str, Any, str]] = []
+    for i, doc in enumerate(parsed):
+        items = doc if isinstance(doc, list) else [doc]
+        for j, item in enumerate(items):
+            label = f"{path}#{i}" if not isinstance(doc, list) else f"{path}#{i}.{j}"
+            if isinstance(item, dict):
+                docs.append((label, item, _dump_as_written(item)))
+            else:
+                docs.append((label, None, _dump_as_written(item)))
     return docs, True
 
 
@@ -2462,7 +2476,7 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
             if not check.field:
                 return any(check.value in t for t in texts)
             return any(t == check.value for t in texts)
-        hit = any(re.search(check.value, t) for t in texts)
+        hit = any(re.search(check.value, t, re.MULTILINE) for t in texts)
         # not_matches needs the field to be there: a pool that leaves its
         # machine type out gets GKE's default, which may be the very series
         # the check forbids.
@@ -2649,10 +2663,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 budget,
             )
             encoded = body.get("content") if isinstance(body, dict) else None
-            if status != 200 or not isinstance(encoded, str) or body.get("encoding") != "base64":
+            where = f"{path} at {sha[:12]} in {owner}/{repo}"
+            if status in (401, 403):
                 return {}, (
-                    f"GitHub answered {status} for {path} at {sha[:12]} in {owner}/{repo}; "
-                    "the token needs `contents: read`, so the content checks could not be evaluated"
+                    f"GitHub answered {status} for {where}: reading a file the pull request "
+                    "does not add needs `contents: read`, which the grading token lacks, so "
+                    "the content checks could not be evaluated"
+                )
+            if status == 404:
+                return {}, f"GitHub answered 404 for {where}: the path is not at the pull request's head, so the content checks could not be evaluated"
+            if status != 200 or not isinstance(body, dict):
+                return {}, f"GitHub answered {status} for {where}, so the content checks could not be evaluated"
+            if body.get("encoding") != "base64" or not isinstance(encoded, str):
+                return {}, (
+                    f"GitHub returned {where} without its content (encoding "
+                    f"{body.get('encoding')!r}: a file over 1 MB, or not a file), so the content "
+                    "checks could not be evaluated"
                 )
             texts[path] = base64.b64decode(encoded).decode("utf-8", errors="replace")
         return texts, None

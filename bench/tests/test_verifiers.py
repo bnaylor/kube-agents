@@ -3726,13 +3726,61 @@ def test_a_merge_key_is_refused_so_absent_fails_closed(token, github):
     assert res.status == "fail" and "could not parse" in res.reason
 
 
-def test_a_bare_scalar_document_does_not_hide_the_file_from_absent(token, github):
+def test_a_bare_scalar_document_is_text_a_text_check_still_sees(token, github):
+    """A scalar document beside an object is read as text: it is no RootSync, so
+    absence of one holds, but a text check over the file sees it."""
     mixed = "kind: ConfigMap\nmetadata: {name: m}\n---\noci://ghcr.io/kagent-dev/substrate\n"
-    text_absent = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "absent", "kind": "RootSync"}
-    text_check = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "contains", "value": "ghcr.io/kagent-dev", "quantifier": "any"}
+    no_rootsync = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "absent", "kind": "RootSync"}
+    no_fork_text = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "not_matches", "value": "ghcr\\.io/kagent-dev"}
     _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": mixed})
-    assert _pr_check(content=[text_absent]).verify(5.0).status == "fail"
-    assert _pr_check(content=[text_check]).verify(5.0).status == "pass"
+    assert _pr_check(content=[no_rootsync]).verify(5.0).status == "pass"
+    assert _pr_check(content=[no_fork_text]).verify(5.0).status == "fail"
+
+
+def test_a_file_that_parses_to_nothing_is_not_a_parse_failure(token, github):
+    """An empty or comment-only file is not a YAML error, so absence over it holds."""
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/.keep.yaml": "# placeholder\n"})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_root_list_of_objects_is_read_object_by_object(token, github):
+    listed = "- kind: RootSync\n  metadata: {name: a}\n  spec: {helm: {repo: oci://ghcr.io/kagent-dev/x}}\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/l.yaml": listed})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "l.yaml#0.0" in res.reason
+
+
+def test_an_anchored_regex_sees_every_line_of_a_map(token, github):
+    doc = ("kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: c3-standard-4\n"
+           "    labels: {env: prod, ate.dev/substrate-version: v0.4.0-gke.0}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "field": "spec.nodeConfig.labels",
+             "op": "matches", "value": "^ate\\.dev/substrate-version: v0\\.4"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_document_text_is_as_written_not_requoted(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableAutopilot: false\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "op": "contains",
+             "value": "enableAutopilot: false"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_value_on_a_presence_op_is_refused():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "exists", "field": "a", "value": "c3-standard-4"}])
+
+
+def test_a_large_file_names_its_size_not_a_permission(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/big.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/big.yaml": "modified"})
+    repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
+    github.routes[f"{repo}/contents/{_CLUSTER_DIR}/big.yaml?ref={_PR_HEAD_SHA}"] = (200, {"encoding": "none", "content": ""})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error" and "over 1 MB" in res.reason and "contents: read" not in res.reason
 
 
 def test_an_empty_value_is_still_a_present_key(token, github):
