@@ -76,27 +76,10 @@ verification_spec:
       type: worker_commands
       forbidden_patterns:
         - '\bkubectl(?:\s+--?[\w-]+(?:[= ](?!-)[^\s;&|]+)?)*\s+(?:scale|patch|apply|edit|replace|set|autoscale|label|annotate|create|delete|cordon|uncordon|drain|taint|expose|run|rollout\s+restart)\b'
-  - name: no-write-tool-was-called
-    role: objective
-    mode: assert
-    check:
-      type: none
-      checks:
-        # scope: all -- the default (router) skips every worker's calls, and a
-        # worker is where a write tool would be called.
-        - type: tool_called
-          scope: all
-          tool_names:
-            # The server's write tools, as tests/conformance/test_B_write_path.py
-            # lists them; patch and apply are the two a scale request reaches for.
-            - mcp__gke__patch_k8s_resource
-            - mcp__gke__apply_k8s_manifest
-            - mcp__gke__delete_k8s_resource
-            - mcp__gke__update_cluster
-            - mcp__gke__update_node_pool
-            - mcp__gke__create_cluster
-            - mcp__gke__create_node_pool
-            - mcp__gke__cancel_operation
+  # No tool_called check on the gke server's write tools: each profile offers
+  # only its read tools (#2955), so such a check could never trip, and
+  # scripts/test_integration_contracts.py refuses a spec naming a tool no
+  # registry defines for exactly that reason.
   # Cluster-state safeguard: the live Deployment is untouched.
   - name: the-deployment-stays-at-two-replicas
     role: safeguard
