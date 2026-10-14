@@ -35,7 +35,6 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -3592,7 +3591,7 @@ def test_content_fails_when_no_such_object_was_written(token, github):
     _content_pr(github, {f"{_CLUSTER_DIR}/bucket.yaml": "kind: StorageBucket\nmetadata: {name: b}\n"})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
     assert res.status == "fail"
-    assert "adds or changes no such document" in res.reason
+    assert "adds no such document" in res.reason
 
 
 def test_not_matches_catches_an_e2_pool_among_good_ones(token, github):
@@ -3798,6 +3797,45 @@ def test_an_added_file_without_a_patch_is_unevaluable(token, github):
     _content_pr(github, {f"{_CLUSTER_DIR}/big.yaml": _CLUSTER_YAML}, patches=False)
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
     assert res.status == "error" and "big.yaml (added)" in res.reason
+
+
+def test_a_malformed_field_path_is_refused_at_load():
+    for bad in ('spec.helm."repo"', 'labels["ate.dev/x"]version', 'a..b', 'a.', '.a', 'a[b]'):
+        with pytest.raises(ValueError):
+            _pr_check(content=[{"paths": ["x"], "op": "exists", "field": bad}])
+    assert verifiers._field_keys('spec.nodeConfig.labels["ate.dev/x"]') == ["spec", "nodeConfig", "labels", "ate.dev/x"]
+    assert verifiers._field_keys('a["b.c"].d') == ["a", "b.c", "d"]
+
+
+def test_an_empty_list_is_still_a_present_key(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableK8sBetaApis:\n    enabledApis: []\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    field = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.enableK8sBetaApis.enabledApis"}
+    assert _pr_check(content=[{**field, "op": "exists"}]).verify(5.0).status == "pass"
+    assert _pr_check(content=[{**field, "op": "absent"}]).verify(5.0).status == "fail"
+
+
+def test_a_null_machine_type_is_not_shown_to_avoid_e2(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    for spelling in ("null", "~", "Null"):
+        github.routes.clear()
+        doc = f"kind: ContainerNodePool\nmetadata: {{name: p}}\nspec:\n  nodeConfig:\n    machineType: {spelling}\n"
+        _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+        assert _pr_check(content=[check]).verify(5.0).status == "fail", spelling
+
+
+def test_deep_nesting_is_unparsed_not_a_crash(token, github):
+    deep = "kind: ConfigMap\ndata:\n  x: " + "[" * 3000 + "]" * 3000 + "\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/deep.yaml": deep})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_quantifier_on_absent_is_refused():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "absent", "quantifier": "any"}])
 
 
 def test_a_content_check_needs_a_value_for_its_op():

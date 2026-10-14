@@ -598,7 +598,7 @@ both names, and needs `pull_requests: read`; an answer it cannot read is an erro
 `content` lists assertions over what the pull request writes, for a case whose answer is an object
 with particular fields rather than any change at all: the `ContainerCluster` a provisioning request
 should add, carrying both beta APIs, with every node pool it adds off E2. Each entry names `paths`
-(`fnmatch` globs over the files the pull request adds or changes; a removed file is not read), an
+(`fnmatch` globs over the files the pull request adds; a removed file is skipped, and any other file a glob names is an error, below), an
 optional `kind`, an optional dotted `field` that steps through lists
 (`spec.enableK8sBetaApis.enabledApis`; a key holding dots is bracketed,
 `spec.nodeConfig.labels["ate.dev/substrate-version"]`), an `op`, a `value` for the ops that compare,
@@ -614,10 +614,10 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
   line per entry, and `^`/`$` in a regex anchor at each line.
 - `exists`: the key is there, even with an empty value. `contains`: a value equals `value` exactly
   (substring only when `field` is empty). `matches`: a value matches the regular expression.
-  `not_matches`: the field is there with a non-empty value and no value matches, so a node pool that
+  `not_matches`: the field is there with a value that is not empty or a spelling of null (`~`, `null`) and no value matches, so a node pool that
   leaves its machine type out fails a "not E2" check. `absent`: no kept document has the field, or,
   with `field` empty, no document of that kind; a matching file that does not parse fails it, since
-  the object may be in it. `exists` and `absent` take no `value`.
+  the object may be in it. `exists` and `absent` take no `value`, and `absent` no `quantifier`. An empty list or map still counts as the key being there. A `field` outside the grammar (a quote outside brackets, text glued to a bracket) is refused when the case loads.
 - Every op but `absent` fails when no matching file holds such a document, so a case cannot pass on
   an object nobody added.
 - Only files the pull request adds are read, whole from the files listing's patch, which needs

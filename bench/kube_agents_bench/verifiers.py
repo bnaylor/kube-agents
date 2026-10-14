@@ -2240,15 +2240,17 @@ def _stream_started() -> datetime | None:
 
 
 class PullRequestContentCheck(BaseModel):
-    """One assertion over the files a pull request adds or changes, read at its head.
+    """One assertion over the files a pull request adds.
 
-    ``paths`` are ``fnmatch`` globs over the files the pull request lists, a
-    removed file excepted. Each matching file is parsed as multi-document YAML
+    ``paths`` are ``fnmatch`` globs over the files the pull request lists. A
+    removed file is skipped; a file it adds is read; any other file a glob
+    names (modified, renamed) makes the check unevaluable (see
+    ``_head_files``). Each matching file is parsed as multi-document YAML
     with scalars kept as the text the file holds (``true`` is ``"true"``,
     ``1.30`` is ``"1.30"``) and aliases refused; a file that does not parse is
     one text document with no kind, which is how a Terraform file is read, and
-    a document that is not a mapping is skipped (its file then also reads as
-    raw text, and counts as not parsed). Merge keys (``<<``) are refused like
+    a root list's mappings are documents of their own, and any other scalar or
+    list is a text document with no kind. Merge keys (``<<``) are refused like
     aliases. ``kind`` keeps the documents
     of that ``kind`` ("" for every document). ``field`` is a dotted path into
     each kept document, stepping through lists element by element, so
@@ -2295,6 +2297,8 @@ class PullRequestContentCheck(BaseModel):
             raise ValueError(f"`{self.op}` needs a `value`")
         if self.op in ("exists", "absent") and self.value:
             raise ValueError(f"`{self.op}` compares nothing, so a `value` on it would never be read")
+        if self.op == "absent" and self.quantifier != "all":
+            raise ValueError("`absent` is decided over every document, so a `quantifier` on it would never be read")
         if self.field:
             _field_keys(self.field)
         if self.op in ("matches", "not_matches"):
@@ -2331,20 +2335,28 @@ class _ContentLoader(yaml.BaseLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+# The spellings of null a text-only loader keeps as text: a field holding one
+# is set to nothing, and GKE fills it with its default, so `not_matches`
+# cannot show it avoids anything.
+_YAML_NULL_SPELLINGS = frozenset({"", "~", "null", "Null", "NULL"})
+
 # A field segment: a bare key, or a bracketed quoted key that may hold dots
 # (`labels["ate.dev/substrate-version"]`).
-_FIELD_SEGMENT = re.compile(r'\.?(?:\["([^"]+)"\]|([^.\[]+))')
+_FIELD_PATH = re.compile(r'(?:[^.\["\]]+|\["[^"]+"\])(?:\.[^.\["\]]+|\["[^"]+"\])*')
+_FIELD_SEGMENT = re.compile(r'\.?(?:\["([^"]+)"\]|([^.\["\]]+))')
 
 
 def _field_keys(dotted: str) -> list[str]:
-    keys, pos = [], 0
-    while pos < len(dotted):
-        m = _FIELD_SEGMENT.match(dotted, pos)
-        if not m or m.end() == pos:
-            raise ValueError(f"`field` {dotted!r} is not a dotted path")
-        keys.append(m.group(1) if m.group(1) is not None else m.group(2))
-        pos = m.end()
-    return keys
+    """The keys of a dotted path, refusing anything outside its grammar
+    (a quote or bracket outside a bracketed key, text glued to a bracket),
+    which would otherwise name keys no document has."""
+    if not _FIELD_PATH.fullmatch(dotted):
+        raise ValueError(
+            f"`field` {dotted!r} is not a dotted path; a key holding dots is bracketed, "
+            'as labels["ate.dev/substrate-version"]'
+        )
+    # findall gives "" for the alternative that did not match.
+    return [bracketed or bare for bracketed, bare in _FIELD_SEGMENT.findall(dotted)]
 
 
 class _AsWrittenDumper(yaml.SafeDumper):
@@ -2382,9 +2394,10 @@ def _resolve_field(node: Any, dotted: str) -> list[Any]:
         values = nxt
     flat: list[Any] = []
     for value in values:
-        flat += value if isinstance(value, list) else [value]
+        # An empty list still says the key is there; it stands in as "".
+        flat += (value or [""]) if isinstance(value, list) else [value]
     # Kept even when null or empty: the key is there, which is what
-    # `exists` and `absent` ask; the comparing ops drop the nulls themselves.
+    # `exists` and `absent` ask; the comparing ops skip empty values.
     return flat
 
 
@@ -2397,7 +2410,9 @@ def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
     any other scalar or list is a text document with no kind."""
     try:
         parsed = [d for d in yaml.load_all(text, Loader=_ContentLoader) if d is not None]
-    except yaml.YAMLError:
+    except (yaml.YAMLError, RecursionError):
+        # RecursionError: PyYAML composes recursively, and a few hundred nested
+        # brackets in an added file would otherwise crash the verifier.
         return [(path, None, text)], False
     docs: list[tuple[str, Any, str]] = []
     for i, doc in enumerate(parsed):
@@ -2461,12 +2476,13 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
             return f"{check.label()}: found in {named}" + (f" and {more} more" if more > 0 else "")
         return None
     if not kept:
-        return f"{check.label()}: the pull request adds or changes no such document"
+        return f"{check.label()}: the pull request adds no such document"
 
     def holds(values: list[Any]) -> bool:
         if check.op == "exists":
             return bool(values)
         texts = [_scalar_text(v) for v in values if v is not None]
+        filled = [t for t in texts if t.strip() not in _YAML_NULL_SPELLINGS]
         if check.op == "contains":
             if not check.field:
                 return any(check.value in t for t in texts)
@@ -2475,7 +2491,7 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         # not_matches needs the field to be there: a pool that leaves its
         # machine type out gets GKE's default, which may be the very series
         # the check forbids.
-        return hit if check.op == "matches" else (any(texts) and not hit)
+        return hit if check.op == "matches" else (bool(filled) and not hit)
 
     failing = [label for label, values in kept if not holds(values)]
     if check.quantifier == "any" and len(failing) < len(kept):
