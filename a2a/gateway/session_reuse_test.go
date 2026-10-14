@@ -380,10 +380,9 @@ func TestAFailedOverdueDeleteUnmarksThePod(t *testing.T) {
 	ctx := context.Background()
 	pod := "chat-lynx-del"
 	rec := overdueRecord("discord:g1/t-overdue-del", pod, "task-del")
+	// The task is not indexed, so the relay never routes its terminal and
+	// cannot be what unmarks the pod: this is retireOverdue's own write.
 	if err := r.g.reg.Put(ctx, rec); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.g.reg.IndexTask(ctx, "task-del", rec.Key); err != nil {
 		t.Fatal(err)
 	}
 	spawn.setDeleteErr(errors.New("apiserver unavailable"))
@@ -398,7 +397,11 @@ func TestAFailedOverdueDeleteUnmarksThePod(t *testing.T) {
 	if fresh.PodName != pod || fresh.PodReuse {
 		t.Fatalf("after the failed delete: pod %q reuse %v, want the pod kept and unmarked", fresh.PodName, fresh.PodReuse)
 	}
-	waitIdle(t, r, rec.Key)
+	// The release the relay would make on that terminal.
+	fresh.ActiveTask = nil
+	if err := r.g.reg.Put(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
 
 	spawn.setDeleteErr(nil)
 	spawn.setReusable(pod)

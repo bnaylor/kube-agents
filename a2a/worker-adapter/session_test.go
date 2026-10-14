@@ -463,21 +463,30 @@ func TestSessionReuseIsRefusedWithoutASessionOfItsOwn(t *testing.T) {
 // A reused pod's watcher refuses a new task it cannot show it has the
 // submission for. When the per-subject cap has evicted the submission, the
 // oldest surviving steer comes first, and running it as the request is what
-// the refusal stops. Nothing pending behind the first message is the proof, so
-// a real submission with a steer already behind it is refused too: a session
-// cannot see the cap.
+// the refusal stops. A submission with a person's few follow-ups already
+// behind it (a wake still queued behind the turn before it) is taken.
 func TestTheWatcherRefusesANewTaskItCannotShowIsASubmission(t *testing.T) {
 	const session, taskID = "sess", "t1"
-	const renderCap, evictingCap = 4096, 2
+	// renderCap is the render's per-subject cap; evictingCap is the smallest
+	// on which the check holds, so its cap plus one messages evict the
+	// submission and leave exactly the bound behind the first survivor.
+	const renderCap, evictingCap = 4096, maxPendingBehindSubmission + 1
+	steers := func(n int) []string {
+		out := []string{"the request"}
+		for i := 1; i <= n; i++ {
+			out = append(out, fmt.Sprintf("steer %d", i))
+		}
+		return out
+	}
 	for _, tc := range []struct {
 		name     string
 		cap      int64
 		messages []string
 		take     string // the text taken as the submission; "" for a refusal
 	}{
-		{name: "the submission alone", cap: renderCap, messages: []string{"the request"}, take: "the request"},
-		{name: "the submission evicted", cap: evictingCap, messages: []string{"the request", "steer one", "steer two"}},
-		{name: "a steer already behind the submission", cap: renderCap, messages: []string{"the request", "steer one"}},
+		{name: "the submission alone", cap: renderCap, messages: steers(0), take: "the request"},
+		{name: "follow-ups already behind the submission", cap: renderCap, messages: steers(3), take: "the request"},
+		{name: "the submission evicted", cap: evictingCap, messages: steers(evictingCap)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			js, cleanup := capTasksStream(t, tc.cap)

@@ -28,6 +28,15 @@ const (
 	// pod. An idle pod that cannot see its own subjects is worse than none.
 	watchRecreateAttempts = 12
 	watchRecreateBackoff  = 5 * time.Second
+	// maxPendingBehindSubmission is how many messages may wait behind a new
+	// task's first message for the watcher to take it as the submission
+	// (take). An eviction by the per-subject cap leaves at least the cap less
+	// one behind it, so the check holds on any TASKS whose cap is above this
+	// plus one: the render's is 4096, and an older stream has none. The
+	// gateway publishes one message per chat message, so nothing a person or
+	// a wake's follow-ups do stacks this many behind a submission in the
+	// seconds the watcher may lag.
+	maxPendingBehindSubmission = 32
 )
 
 // runSessionLoop is a reused session pod's life after its first task: wait for
@@ -235,12 +244,11 @@ var errSubmissionUnproven = errors.New("cannot show the first message of a new t
 // from a submission (fetchOriginAtSeq says the same of the first task), so
 // the check is on how many messages wait behind it. An eviction leaves the
 // subject full, every message on it behind the one delivered, so NumPending
-// is at least the cap less one. With nothing pending, nothing was evicted on
-// any cap of two or more (the render's is 4096). Anything pending is refused,
-// a real submission with a steer already behind it included: the cap is not
-// visible to a session, and running a steer as the request is the one thing
-// this must not do. The refusal ends the pod; the gateway's sweep closes the
-// task and the next turn starts a fresh pod with the conversation so far.
+// is at least the cap less one; fewer than maxPendingBehindSubmission pending
+// means nothing was evicted on any cap above it. NumPending counts every
+// subject the watcher reads, not only this task's, which can only make it
+// refuse more. The refusal ends the pod: the gateway's sweep closes the task
+// and the next turn starts a fresh pod with the conversation so far.
 func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, error) {
 	md, err := msg.Metadata()
 	if err != nil {
@@ -273,7 +281,7 @@ func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, erro
 		return nil, 0, false, nil
 	}
 	w.handled[env.TaskID] = true
-	if md.NumPending > 0 {
+	if md.NumPending >= maxPendingBehindSubmission {
 		return nil, 0, false, fmt.Errorf("task %s at %s sequence %d has %d message(s) behind it, so TASKS may have evicted its submission and this may be a steer (max_msgs_per_subject with discard=old); refusing to run it, and ending this pod so the next turn starts fresh: %w",
 			env.TaskID, msg.Subject(), seq, md.NumPending, errSubmissionUnproven)
 	}

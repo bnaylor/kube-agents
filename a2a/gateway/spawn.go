@@ -703,8 +703,9 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 // naming the numbers - never silently queued, never dropped. replacing marks a turn that retires its previous incarnation in
 // the same breath: the doomed pod is usually still live at count time, so
 // it hands its slot to its successor rather than double-counting - and if
-// it already went terminal, the extra slot is a transient overshoot the
-// quota headroom absorbs.
+// it already went terminal or is already being deleted (LiveSessions counts
+// neither), the extra slot is a transient overshoot the quota headroom
+// absorbs.
 //
 // The count-then-create race is real, and wider than one: conversations run
 // on distinct queue workers, so every delegation in flight inside the
