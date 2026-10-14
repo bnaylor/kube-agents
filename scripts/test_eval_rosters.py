@@ -175,6 +175,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "scale-request-proposes-pr",  # the mirrored gke-* skills' pull request path, #2937
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
+    "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
