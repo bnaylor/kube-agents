@@ -177,8 +177,10 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # did before the budget existed: a listing phase that cannot run two at once
 # is slower than the OOM exposure the budget prevents, and the case is real --
 # GKE Autopilot without bursting sets a container's limits equal to its
-# requests, so the proxy's limit there is its 512Mi request. The operator's
-# sizing test holds the limit to the same floor
+# requests, so the proxy's limit there is its memory request, which a CR
+# override can set under this floor (the operator's own default is 1Gi,
+# above it, so that the budget runs there). The operator's sizing test holds
+# the limit and the default request to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
@@ -427,6 +429,18 @@ ADMISSION_BOUNDS = frozenset(
 # and is counted by ADMISSION_REFUSALS_METRIC instead. The top bucket holds
 # the waits that were answered just under it.
 ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
+# The version-control route's counter, by verb and outcome: the series the
+# operator reads `status.usage.remediationsProposedTotal` from, as
+# `verb="proposal-create",status="success"`. The verb label is the route
+# table's vocabulary (vcs_broker.VCS_VERBS) or LABEL_OTHER; the status label
+# reuses the exec route's outcome words.
+VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
+VCS_VERB_LABEL = "verb"
+# Proposals this install opened that the forge reports merged, counted once
+# each per broker process as the broker's reads show them
+# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# `status.usage.remediationsMergedTotal` from. No labels.
+VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -451,6 +465,12 @@ TOOL_STATUS_BUSY = "busy"
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
 LABEL_OTHER = "other"
+# The outcomes the version-control counter distinguishes, in the exec route's
+# words: success (the forge answered), error (the forge or git failed, or the
+# request could not be read), blocked (refused at the route: an unknown verb,
+# a repository this install does not manage), busy (no command slot for the
+# wait) and abandoned (the caller hung up before the answer).
+VCS_STATUSES = frozenset({TOOL_STATUS_SUCCESS, TOOL_STATUS_ERROR, TOOL_STATUS_BLOCKED, TOOL_STATUS_BUSY, TOOL_STATUS_ABANDONED})
 # `subcommand` when the argv names the tool and nothing after it.
 SUBCOMMAND_NONE = "none"
 # The `subcommand` vocabularies the policy tables do not already supply. The
@@ -7017,6 +7037,10 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
+        # Looked up at call time: the handler's registry is a class attribute
+        # a test replaces per case, and this broker outlives none of them.
+        merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -7282,6 +7306,16 @@ def strip_credential_query_keys(query: str) -> str:
     return "&".join(kept)
 
 
+def _vcs_verb_label(verb: str) -> str:
+    """The ``verb`` label a version-control request is counted under.
+
+    The route table's vocabulary, or LABEL_OTHER for anything else: the verb
+    comes off the path, which is caller text, and a label that carried it would
+    let one caller mint a series per request.
+    """
+    return verb if verb in vcs_broker.VCS_VERBS else LABEL_OTHER
+
+
 def _endpoint_label(path: str) -> str:
     """The route family ``path`` falls in, for the request counter.
 
@@ -7469,6 +7503,8 @@ class ProxyMetrics:
         self._lock = threading.Lock()
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
+        self._vcs: dict[tuple[str, str], int] = {}
+        self._merged = 0
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -7553,10 +7589,21 @@ class ProxyMetrics:
         with self._lock:
             self._requests[key] = self._requests.get(key, 0) + 1
 
+    def record_vcs(self, verb: str, status: str) -> None:
+        key = (verb, status)
+        with self._lock:
+            self._vcs[key] = self._vcs.get(key, 0) + 1
+
+    def record_merged(self, count: int) -> None:
+        with self._lock:
+            self._merged += count
+
     def render(self) -> str:
         with self._lock:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
+            vcs = sorted(self._vcs.items())
+            merged = self._merged
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
@@ -7621,6 +7668,20 @@ class ProxyMetrics:
                     f"# TYPE {CHILD_MEMORY_BUDGET_METRIC} gauge",
                     f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
                 ]
+        lines += [
+            f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb and outcome.",
+            f"# TYPE {VCS_REQUESTS_METRIC} counter",
+        ]
+        for (verb, status), count in vcs:
+            lines.append(
+                f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
+                f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
+            f"# TYPE {VCS_MERGED_METRIC} counter",
+            f"{VCS_MERGED_METRIC} {merged}",
+        ]
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -7792,6 +7853,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # control is not behind a switch, because it is the only way the sandbox
     # reaches a repository at all.
     vcs: vcs_broker.VcsBroker | None = None
+    # Set by _repository_is_permitted on a refusal: the status it answered.
+    repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
     # Unix socket is the access control, behaving as it did before there was an
     # authenticator at all.
@@ -7880,6 +7943,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         An unreadable list refuses rather than allows, and says which of the two
         it was in the log: an authorization check that fails open is not one.
         """
+        # The status this method answered with on a refusal, for a caller that
+        # counts refusals apart from faults (the version-control counter).
+        self.repository_refusal_status = None
         try:
             permitted = repository_is_managed(repository, forge)
         except Exception as exc:
@@ -7888,6 +7954,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "could not be read type=%s",
                 type(exc).__name__,
             )
+            self.repository_refusal_status = HTTPStatus.SERVICE_UNAVAILABLE
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -7898,6 +7965,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return False
         if permitted:
             return True
+        self.repository_refusal_status = HTTPStatus.FORBIDDEN
         LOGGER.warning(
             "refused a repository this install does not manage repository=%s",
             _sanitize_for_logging(repository),
@@ -8938,6 +9006,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
 
+        Counts the request under its verb and outcome once the dispatch has
+        answered, whichever exit it took; the verb label is the route table's
+        vocabulary or LABEL_OTHER, never the path.
+        """
+        # Hyphens and underscores reach the same route. A caller that guessed
+        # the punctuation wrong should not get a 404 that reads as though the
+        # verb does not exist.
+        verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+        status = self._dispatch_vcs_post(verb)
+        self.metrics.record_vcs(_vcs_verb_label(verb), status)
+
+    def _dispatch_vcs_post(self, verb: str) -> str:
+        """Answer one version-control request and return its outcome label.
+
         A separate namespace rather than more verbs on an existing one, because
         they are a different protocol: every route here stands alone, holds
         nothing across calls and leaves nothing behind, so there is no handle
@@ -8951,15 +9033,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "VCS_UNAVAILABLE",
                 },
             )
-            return
-        # Hyphens and underscores reach the same route. A caller that guessed
-        # the punctuation wrong should not get a 404 that reads as though the
-        # verb does not exist.
-        verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+            return TOOL_STATUS_ERROR
         route = vcs_broker.route_table(self.vcs).get(verb)
         if route is None:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
-            return
+            return TOOL_STATUS_BLOCKED
         body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
             # One slot for the whole request: the body, which may carry a
@@ -8984,12 +9062,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         )
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                    return
+                    return TOOL_STATUS_ERROR
                 except OSError as exc:
                     LOGGER.warning(
                         "request body not received verb=%s type=%s", verb, type(exc).__name__
                     )
-                    return
+                    return TOOL_STATUS_ERROR
                 # The managed-repository control, on the same footing as
                 # `require_managed_workspace` on the content routes: the broker
                 # holds the forge credential, so "is this a repository we act
@@ -9007,16 +9085,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     try:
                         forge, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:
+                        # A repository this install serves no credential for
+                        # (`ForgeUnsupported`, a 501) or one an allowlist declines
+                        # (a 403) is a refusal; a repository field that cannot be
+                        # read is a request the broker could not use.
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                        return
+                        refused = exc.status == HTTPStatus.FORBIDDEN or isinstance(exc, providers.ForgeUnsupported)
+                        return TOOL_STATUS_BLOCKED if refused else TOOL_STATUS_ERROR
                     if not self._repository_is_permitted(repository, forge):
-                        return
+                        # Refused on the managed list, or the list itself could
+                        # not be read: the first is a refusal, the second a fault.
+                        if self.repository_refusal_status == HTTPStatus.SERVICE_UNAVAILABLE:
+                            return TOOL_STATUS_ERROR
+                        return TOOL_STATUS_BLOCKED
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
+                return TOOL_STATUS_SUCCESS
         except CallerHungUp as exc:
             # The exception names what the request was queued for.
             LOGGER.info("vcs %s abandoned: %s", verb, exc)
-            return
+            return TOOL_STATUS_ABANDONED
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
             # `refresh_forge_credential` raises it: the credential strategy asks
@@ -9031,10 +9119,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "REPOSITORY_NOT_MANAGED",
                 },
             )
-            return
+            return TOOL_STATUS_BLOCKED
         except providers.WorkspaceError as exc:
             self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-            return
+            return TOOL_STATUS_ERROR
         except subprocess.CalledProcessError as exc:
             # git's stderr can carry the remote URL with a credential in it, so
             # it goes to the log through the same redactor the exec path uses
@@ -9055,7 +9143,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
             )
-            return
+            return TOOL_STATUS_ERROR
         except CommandSlotUnavailable as exc:
             # Raised before the body was read, so nothing is left half-done --
             # and the body is drained before the answer, or a caller still
@@ -9064,13 +9152,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             LOGGER.warning("command queued too long verb=%s: %s", verb, exc)
             drain_request_body(self, body_limit)
             self._busy(exc)
-            return
+            return TOOL_STATUS_BUSY
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
-            return
+            return TOOL_STATUS_ERROR
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
