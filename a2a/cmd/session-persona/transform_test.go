@@ -494,6 +494,44 @@ func TestConsoleTranscriptOfAReadIsNotMarked(t *testing.T) {
 	}
 }
 
+// A block that writes is marked as a proposal. The shipped skills teach no
+// writes any more, so this fixture is what exercises the mark.
+func TestWriteBlockIsMarkedProposeOnly(t *testing.T) {
+	src := "---\nname: demo\ndescription: A demo.\n---\n\n# Demo\n\n```bash\ngcloud container clusters update c --location l --enable-shielded-nodes\n```\n"
+	out, err := transformSkill("demo", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(out), "\n")
+	i := slices.IndexFunc(lines, func(l string) bool { return strings.HasPrefix(strings.TrimSpace(l), codeFence) })
+	if i < 0 || precedingNote(lines, i) != proposeOnlyNote {
+		t.Errorf("the write block is not marked propose-only:\n%s", out)
+	}
+}
+
+// writeCommandRE is the read-only test's only detector, and the shipped skills
+// no longer give it anything to find, so its matches are pinned here.
+func TestWriteCommandRE(t *testing.T) {
+	for _, tc := range []struct {
+		line  string
+		write bool
+	}{
+		{"kubectl scale deployment web --replicas=3", true},
+		{"kubectl autoscale deployment web --min=1 --max=10", true},
+		{"kubectl apply -f assets/hpa-example.yaml", true},
+		{"kubectl label --overwrite ns x pod-security.kubernetes.io/enforce=restricted", true},
+		{"gcloud container clusters update c --location l --enable-vertical-pod-autoscaling", true},
+		{"gcloud iam service-accounts add-iam-policy-binding sa --role roles/iam.workloadIdentityUser", true},
+		{"kubectl get deployment web -o yaml", false},
+		{"kubectl describe hpa web", false},
+		{"gcloud container clusters describe c --location l", false},
+	} {
+		if got := writeCommandRE.MatchString(tc.line); got != tc.write {
+			t.Errorf("writeCommandRE.MatchString(%q) = %v, want %v", tc.line, got, tc.write)
+		}
+	}
+}
+
 // A path is rewritten where it starts a word in prose or a command block,
 // and left alone inside a URL or a block that is not commands.
 func TestReplaceFileReferences(t *testing.T) {

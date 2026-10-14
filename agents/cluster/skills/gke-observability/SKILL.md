@@ -7,7 +7,7 @@ description: Workflows for setting up and auditing observability (logging, monit
 
 This skill provides workflows for ensuring your GKE cluster and workloads have adequate observability for production use.
 
-> You are read-only (SOUL.md, Read-Only Boundary): each change below is a proposal you report with your findings, never a command you run.
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
 
 ## Workflows
 
@@ -104,7 +104,9 @@ Propose the monitoring components `SYSTEM_COMPONENTS`, `APISERVER`,
 If using GKE Dataplane V2, you can enable advanced L4 observability.
 
 Propose enabling Dataplane V2 observability (Config Connector
-`ContainerCluster` field `spec.monitoringConfig.advancedDatapathObservabilityConfig`).
+`ContainerCluster` field `spec.monitoringConfig.advancedDatapathObservabilityConfig`,
+a list whose entry sets `enableMetrics: true`, plus `relayMode` for flow
+observability).
 
 This allows you to observe traffic flows and network metrics.
 

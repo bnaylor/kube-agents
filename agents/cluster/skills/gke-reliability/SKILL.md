@@ -7,7 +7,7 @@ description: Workflows for ensuring high availability and reliability of GKE wor
 
 This skill provides workflows for configuring your GKE cluster and workloads for high availability and reliability.
 
-> You are read-only (SOUL.md, Read-Only Boundary): each change below is a proposal you report with your findings, never a command you run.
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
 
 ## Workflows
 

@@ -9,7 +9,7 @@ This skill provides workflows and best practices for securing GKE workloads. It
 covers security auditing, Identity and Access Management (Workload Identity),
 Network Security (Network Policies), and Node Security.
 
-> You are read-only (SOUL.md, Read-Only Boundary): each change below is a proposal you report with your findings, never a command you run.
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
 
 ## Workflows
 
@@ -66,8 +66,10 @@ Each step is a change you propose.
 3. **Annotate KSA:** the `iam.gke.io/gcp-service-account` annotation in the
    manifest above links the KSA to the GSA.
 
-4. **Example Pod:** use the asset `assets/workload-identity-pod.yaml` as the
-   test Pod manifest to propose. Update the `<ksa-name>` in the file first.
+4. **Example Pod:** propose a test Pod in `workload-identity-test-ns` with
+   `serviceAccountName: <ksa-name>` and the node selector
+   `iam.gke.io/gke-metadata-server-enabled: "true"`. A complete example is in
+   `assets/workload-identity-pod.yaml`.
 
 ### 3. Implement Network Policies
 
@@ -92,21 +94,37 @@ gcloud container clusters describe <cluster-name> \
 - If neither is active, propose enabling Calico network policy enforcement in
   the two steps below.
 
-**Enable Network Policy Enforcement (non-DPv2 clusters):**
+**Network Policy Enforcement (non-DPv2 clusters):**
 
 On clusters without Dataplane V2 this is two sequential changes, in this order:
 first enable the NetworkPolicy addon on the control plane (Config Connector
-`ContainerCluster` field `spec.addonsConfig.networkPolicyConfig.disabled: false`),
-then enable network policy enforcement on the nodes (`spec.networkPolicy.enabled: true`).
+`ContainerCluster` field `spec.addonsConfig.networkPolicyConfig.disabled: false`,
+with `spec.networkPolicy.enabled: false` alongside it, since the addon setting
+does nothing without a `networkPolicy` block), then enable network policy
+enforcement on the nodes (`spec.networkPolicy.enabled: true`, `provider: CALICO`).
 GKE rejects node enforcement with HTTP 400 until the addon is enabled, and
 node pools may be recreated, which can take several minutes. Propose both, with
 that order stated.
 
-**Apply Default Deny Policy:**
+**Default Deny Policy:**
 Isolate namespaces by denying all ingress and egress traffic by default.
 
-Propose [assets/default-deny-netpol.yaml](assets/default-deny-netpol.yaml),
-with `<target-namespace>` set to the namespace to isolate, as the manifest.
+Propose this manifest, with `<target-namespace>` set to the namespace to
+isolate. It is also in
+[assets/default-deny-netpol.yaml](assets/default-deny-netpol.yaml).
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: <target-namespace>
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
 
 ### 4. Enable Shielded Nodes
 
@@ -119,7 +137,7 @@ Propose enabling Shielded Nodes (Config Connector `ContainerCluster` field
 
 Run untrusted workloads in a sandbox for extra isolation.
 
-**Enable GKE Sandbox:**
+**GKE Sandbox:**
 Propose a node pool with GKE Sandbox enabled (Config Connector
 `ContainerNodePool` field `spec.nodeConfig.sandboxConfig.sandboxType: gvisor`).
 
