@@ -611,7 +611,7 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
   check over it fails, since the object it looks for may be in it. Empty documents (a trailing or
   doubled `---`) are nothing; an empty file has no documents. A root list's mappings are documents
   of their own; any other scalar or list is a text document with no kind. With `field` empty the
-  text is the slice of the file the document came from, quoting and all. A map or list value
+  text is the slice of the file the document came from, quoting and comments included, so a `contains` on it can be met by a comment; assert on a `field` when the value is what matters. A map or list value
   compares as YAML written back one line per entry (quoted where YAML needs it), and `^`/`$` in a
   regex anchor at each line; to test one label, address it with a bracketed key instead.
 - `exists`: the key is there, even with an empty value. `contains`: a value equals `value` exactly

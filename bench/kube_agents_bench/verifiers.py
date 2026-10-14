@@ -1069,6 +1069,8 @@ _PR_COMMITS_MAX_PAGES = 3
 # `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
 _PR_FILES_PAGE_SIZE = 100
 _PR_FILES_MAX_PAGES = 30
+# git's blob id for an empty file.
+_EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 # `/pulls/{n}/files` statuses whose file is not at the head any more.
 _PR_FILE_GONE_STATUSES = frozenset({"removed"})
 # Offending documents a failed content assertion names before counting the rest.
@@ -2450,8 +2452,10 @@ def _added_file_text(entry: dict) -> str | None:
     patch = entry.get("patch")
     if entry.get("status") != "added":
         return None
-    if patch is None and entry.get("changes") == 0 and entry.get("additions") == 0:
+    if patch is None and entry.get("sha") == _EMPTY_BLOB_SHA:
         # An empty file: git emits no hunk for it, so there is no patch to read.
+        # Known by its blob, not by its zero line counts, which a binary file
+        # shares.
         return ""
     if not isinstance(patch, str):
         return None

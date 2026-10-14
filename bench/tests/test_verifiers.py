@@ -3863,9 +3863,18 @@ def test_an_empty_added_file_reads_as_empty(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
     _pr_head_routes(github, changed_files=1)
-    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/.keep", "status": "added", "additions": 0, "changes": 0})
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/.keep", "status": "added", "additions": 0, "changes": 0,
+                             "sha": verifiers._EMPTY_BLOB_SHA})
     check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
     assert _pr_check(content=[check]).verify(5.0).status == "pass"
+    # A binary file also has no patch and zero line counts; only the empty blob is known empty.
+    github.routes.clear()
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/blob.bin", "status": "added", "additions": 0, "changes": 0,
+                             "sha": "0" * 40})
+    assert _pr_check(content=[check]).verify(5.0).status == "error"
 
 
 def test_a_terraform_file_is_raw_text_and_scoped_checks_fail_closed(token, github):
