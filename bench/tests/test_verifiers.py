@@ -35,6 +35,7 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -3508,6 +3509,178 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+# ---- content: what the pull request writes, read at its head
+
+_CLUSTER_DIR = "clusters/substrate-a/provisioning"
+_CLUSTER_YAML = """apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: substrate-a
+spec:
+  location: us-central1
+  enableK8sBetaApis:
+    enabledApis:
+      - certificates.k8s.io/v1beta1/podcertificaterequests
+      - certificates.k8s.io/v1beta1/clustertrustbundles
+  workloadIdentityConfig:
+    workloadPool: proj.svc.id.goog
+---
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: substrate-pool
+spec:
+  nodeConfig:
+    machineType: c3-standard-4
+    labels:
+      ate.dev/substrate-version: v0.4.0-gke.0
+"""
+_BETA_API = "certificates.k8s.io/v1beta1/podcertificaterequests"
+
+
+def _added_patch(text: str) -> str:
+    """What `/pulls/{n}/files` carries as the patch of a file the pull request adds."""
+    lines = text.rstrip("\n").split("\n")
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + line for line in lines)
+
+
+def _content_routes(
+    github, files: dict[str, str], *, statuses: dict[str, str] | None = None, patches: bool = False
+) -> None:
+    """The file listing (with each added file's patch when `patches`) and each
+    file's `/contents` read at the head."""
+    statuses = statuses or {}
+    entries = []
+    for path, text in files.items():
+        entry = {"filename": path, "status": statuses.get(path, "added")}
+        if patches and entry["status"] == "added":
+            entry["patch"] = _added_patch(text)
+        entries.append(entry)
+    _pr_files_route(github, *entries)
+    repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
+    for path, text in files.items():
+        github.routes[f"{repo}/contents/{path}?ref={_PR_HEAD_SHA}"] = (
+            200,
+            {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()},
+        )
+
+
+def _content_pr(github, files: dict[str, str], **kw):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=len(files))
+    _content_routes(github, files, **kw)
+
+
+def _beta_api_check(**kw):
+    return {"paths": [f"{_CLUSTER_DIR}/*.yaml"], "kind": "ContainerCluster",
+            "field": "spec.enableK8sBetaApis.enabledApis", "op": "contains", "value": _BETA_API, **kw}
+
+
+def test_content_passes_when_the_cluster_carries_the_beta_api(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_content_fails_when_the_beta_api_is_missing(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML.replace(_BETA_API, "x/v1/y")})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "ContainerCluster.spec.enableK8sBetaApis.enabledApis contains" in res.reason
+    assert f"{_CLUSTER_DIR}/cluster.yaml#0" in res.reason
+
+
+def test_content_fails_when_no_such_object_was_written(token, github):
+    """A pull request that never wrote the cluster fails rather than passing vacuously."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/bucket.yaml": "kind: StorageBucket\nmetadata: {name: b}\n"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "adds or changes no such document" in res.reason
+
+
+def test_not_matches_catches_an_e2_pool_among_good_ones(token, github):
+    e2 = _CLUSTER_YAML + "---\nkind: ContainerNodePool\nmetadata: {name: extra}\nspec:\n  nodeConfig:\n    machineType: e2-standard-4\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": e2})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "#2" in res.reason
+    # With `any`, one good pool is enough; `all` is what a "no E2" rule needs.
+    assert _pr_check(content=[{**check, "quantifier": "any"}]).verify(5.0).status == "pass"
+
+
+def test_matches_reads_a_label_key_with_dots_and_slashes(token, github):
+    """A label key holds dots, so the label map is read whole and matched as text."""
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.labels", "op": "matches", "value": r"ate\.dev/substrate-version.*v0\.4\.0"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_absent_fails_on_a_forbidden_chart_anywhere(token, github):
+    fork = "kind: RootSync\nmetadata: {name: substrate, namespace: config-management-system}\nspec:\n  helm:\n    repo: oci://ghcr.io/kagent-dev/substrate/helm\n"
+    check = {"paths": ["clusters/**", "clusters/*/*/*", "clusters/*/*/*/*"], "op": "absent", "value": "",
+             "field": "spec.helm.repo"}
+    files = {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML,
+             "clusters/substrate-a/namespaces/config-management-system/substrate.yaml": fork}
+    _content_pr(github, files)
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "substrate.yaml#0" in res.reason
+    # And the same check passes when no document has the field.
+    github.routes.clear()
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_text_contains_reads_a_terraform_file_raw(token, github):
+    hcl = 'resource "google_container_cluster" "a" {\n  enable_k8s_beta_apis {\n    enabled_apis = ["%s"]\n  }\n}\n' % _BETA_API
+    check = {"paths": ["clusters/*/provisioning/*.tf"], "op": "contains", "value": _BETA_API}
+    _content_pr(github, {"clusters/substrate-a/provisioning/main.tf": hcl})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_removed_file_is_not_read(token, github):
+    """A file the pull request deletes is not at the head, so it neither satisfies nor trips a check."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "removed"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail" and "no such document" in res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_an_added_file_is_read_from_the_listing_without_contents_access(token, github):
+    """The grading credential has no `contents: read`; a file the pull request
+    adds is whole in its patch, so it needs none."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML}, patches=True)
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_a_modified_file_is_read_at_the_head(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "modified"}, patches=True)
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert any("/contents/" in url for url, _ in github.calls)
+
+
+def test_unreadable_contents_are_unevaluable_not_a_fail(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
+    github.routes[f"{repo}/contents/{_CLUSTER_DIR}/cluster.yaml?ref={_PR_HEAD_SHA}"] = (403, {"message": "denied"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error" and "contents: read" in res.reason
+
+
+def test_a_content_check_needs_a_value_for_its_op():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "contains"}])
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "matches", "value": "("}])
 
 
 def test_a_previous_reps_pull_request_is_a_fail(token, github):

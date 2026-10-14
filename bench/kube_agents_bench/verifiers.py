@@ -53,6 +53,7 @@ for the harness), so devops-bench discovers them without a fork.
 
 from __future__ import annotations
 
+import base64
 import fnmatch
 import http.client
 import json
@@ -67,6 +68,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
@@ -1068,6 +1070,14 @@ _PR_COMMITS_MAX_PAGES = 3
 # `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
 _PR_FILES_PAGE_SIZE = 100
 _PR_FILES_MAX_PAGES = 30
+# Files a `content` check reads at the pull request's head, at most. Each is
+# one `/contents` call against the run's budget; a case names a handful of
+# globs, and a pull request matching more than this is not the one it meant.
+_PR_CONTENT_MAX_FILES = 40
+# `/pulls/{n}/files` statuses whose file is not at the head any more.
+_PR_FILE_GONE_STATUSES = frozenset({"removed"})
+# Offending documents a failed content assertion names before counting the rest.
+_PR_CONTENT_MAX_NAMED = 5
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -2234,6 +2244,158 @@ def _stream_started() -> datetime | None:
         return None
 
 
+class PullRequestContentCheck(BaseModel):
+    """One assertion over the files a pull request adds or changes, read at its head.
+
+    ``paths`` are ``fnmatch`` globs over the files the pull request lists, a
+    removed file excepted. Each matching file is parsed as multi-document YAML
+    with ``yaml.safe_load_all``; a file that does not parse is one text
+    document with no kind, which is how a Terraform file is read. ``kind``
+    keeps the documents of that ``kind`` ("" for every document). ``field`` is
+    a dotted path into each kept document, stepping through lists element by
+    element, so ``spec.nodeConfig.machineType`` or
+    ``spec.enableK8sBetaApis.enabledApis`` resolve to the values found there;
+    "" is the document itself, as text (the raw file for a document with no
+    kind).
+
+    ``op`` is what each kept document must show:
+
+    - ``exists``: the field resolves to at least one value;
+    - ``contains``: one resolved value equals ``value`` (for ``field: ""``,
+      ``value`` occurs in the text);
+    - ``matches`` / ``not_matches``: one / none of the resolved values
+      matches the regular expression ``value`` (``re.search``);
+    - ``absent``: across every matching file, no kept document has the field
+      (with ``field: ""``, no document of that ``kind`` at all).
+
+    Every op but ``absent`` needs at least one kept document, so a pull request
+    that never wrote the object fails rather than passing vacuously, and
+    ``quantifier`` says whether ``all`` kept documents (the default) or ``any``
+    one must satisfy it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1)
+    kind: str = ""
+    field: str = ""
+    op: Literal["exists", "contains", "matches", "not_matches", "absent"]
+    value: str = ""
+    quantifier: Literal["all", "any"] = "all"
+
+    @model_validator(mode="after")
+    def _value_fits_op(self):
+        if self.op in ("contains", "matches", "not_matches") and not self.value:
+            raise ValueError(f"`{self.op}` needs a `value`")
+        if self.op in ("matches", "not_matches"):
+            try:
+                re.compile(self.value)
+            except re.error as exc:
+                raise ValueError(f"`value` is not a regular expression: {exc}") from exc
+        return self
+
+    def label(self) -> str:
+        what = self.kind or "document"
+        at = f".{self.field}" if self.field else ""
+        tail = f" {self.value!r}" if self.value else ""
+        return f"{what}{at} {self.op}{tail} in {', '.join(self.paths)}"
+
+
+def _resolve_field(node: Any, dotted: str) -> list[Any]:
+    """Every value at ``dotted`` under ``node``, stepping into lists."""
+    values = [node]
+    for key in dotted.split("."):
+        nxt: list[Any] = []
+        for value in values:
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, dict) and key in item:
+                    nxt.append(item[key])
+        values = nxt
+    flat: list[Any] = []
+    for value in values:
+        flat += value if isinstance(value, list) else [value]
+    return [v for v in flat if v is not None]
+
+
+def _documents(path: str, text: str) -> list[tuple[str, Any, str]]:
+    """``(label, parsed, text)`` per document in a file; a file that does not
+    parse as YAML, or holds no mapping, is one document of its raw text."""
+    try:
+        parsed = [d for d in yaml.safe_load_all(text) if d is not None]
+    except yaml.YAMLError:
+        parsed = []
+    if not parsed or not all(isinstance(d, dict) for d in parsed):
+        return [(path, None, text)]
+    return [
+        (f"{path}#{i}", doc, yaml.safe_dump(doc, sort_keys=False))
+        for i, doc in enumerate(parsed)
+    ]
+
+
+def _added_file_text(entry: dict) -> str | None:
+    """The whole text of a file the pull request adds, rebuilt from its patch,
+    or None when the listing cannot carry it (not an added file, or GitHub left
+    the patch out because the file is too large)."""
+    patch = entry.get("patch")
+    if entry.get("status") != "added" or not isinstance(patch, str):
+        return None
+    lines = []
+    for line in patch.split("\n"):
+        if line.startswith("@@") or line.startswith("\\"):
+            continue
+        if not line.startswith("+"):
+            return None
+        lines.append(line[1:])
+    return "\n".join(lines) + "\n"
+
+
+def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) -> str | None:
+    """Why ``files`` (path -> text at the head) fail ``check``, or None."""
+    matched = {p: t for p, t in files.items() if any(fnmatch.fnmatchcase(p, g) for g in check.paths)}
+    kept = []
+    for path, text in sorted(matched.items()):
+        for label, doc, doc_text in _documents(path, text):
+            kind = doc.get("kind") if isinstance(doc, dict) else None
+            if check.kind and kind != check.kind:
+                continue
+            values = _resolve_field(doc, check.field) if check.field and isinstance(doc, dict) else (
+                [] if check.field else [doc_text]
+            )
+            kept.append((label, values))
+    if check.op == "absent":
+        present = [label for label, values in kept if values]
+        if present:
+            named = ", ".join(present[:_PR_CONTENT_MAX_NAMED])
+            more = len(present) - _PR_CONTENT_MAX_NAMED
+            return f"{check.label()}: found in {named}" + (f" and {more} more" if more > 0 else "")
+        return None
+    if not kept:
+        return f"{check.label()}: the pull request adds or changes no such document"
+
+    def holds(values: list[Any]) -> bool:
+        if check.op == "exists":
+            return bool(values)
+        if check.op == "contains":
+            if not check.field:
+                return any(check.value in str(v) for v in values)
+            return any(str(v) == check.value for v in values)
+        hit = any(re.search(check.value, str(v)) for v in values)
+        return hit if check.op == "matches" else not hit
+
+    failing = [label for label, values in kept if not holds(values)]
+    if check.quantifier == "any" and len(failing) < len(kept):
+        return None
+    if check.quantifier == "all" and not failing:
+        return None
+    named = ", ".join(failing[:_PR_CONTENT_MAX_NAMED])
+    more = len(failing) - _PR_CONTENT_MAX_NAMED
+    return (
+        f"{check.label()} ({check.quantifier}): not so in {named}"
+        + (f" and {more} more" if more > 0 else "")
+    )
+
+
 @VERIFIERS.register("pull_request_opened")
 class PullRequestOpenedVerifier(BaseVerifier):
     """A remediation pull request THIS run opened (or, with
@@ -2342,6 +2504,72 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Assertions over what the pull request writes, read at its head (see
+    # PullRequestContentCheck): the object a provisioning case expects, with
+    # the fields it must carry, rather than only that some file changed.
+    # Listed from `/pulls/{n}/files`, which needs `pull_requests: read`. A file
+    # the pull request adds is read from that listing's patch, which for an
+    # added file is the whole file; any other is read from
+    # `/contents/{path}?ref=<head>`, which needs `contents: read` -- the grading
+    # mint (hack/ci-eval-pr.sh) does not ask for it today, so a case that
+    # asserts over a modified file errors there rather than passing.
+    content: list[PullRequestContentCheck] = Field(default_factory=list)
+
+    def _head_files(
+        self, owner: str, repo: str, number: int, pull: dict | None, token: str, budget: float
+    ) -> tuple[dict[str, str], str | None]:
+        """``(path -> text at the head, unevaluable reason)`` for every file the
+        pull request adds or changes that a :attr:`content` glob names."""
+        sha = str(((pull or {}).get("head") or {}).get("sha") or "")
+        if not sha:
+            return {}, f"GitHub returned no head commit for {owner}/{repo}#{number}; the content checks could not be evaluated"
+        globs = [g for check in self.content for g in check.paths]
+        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        wanted: list[str] = []
+        texts: dict[str, str] = {}
+        for page in range(1, _PR_FILES_MAX_PAGES + 1):
+            status, files = _http_get_json(
+                f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
+            )
+            if status != 200 or not isinstance(files, list):
+                return {}, (
+                    f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
+                    "the token needs `pull_requests: read` to read what the pull request "
+                    "writes, so the content checks could not be evaluated"
+                )
+            for entry in files:
+                if not isinstance(entry, dict) or entry.get("status") in _PR_FILE_GONE_STATUSES:
+                    continue
+                path = str(entry.get("filename") or "")
+                if not path or not any(fnmatch.fnmatchcase(path, g) for g in globs):
+                    continue
+                added = _added_file_text(entry)
+                if added is not None:
+                    texts[path] = added
+                else:
+                    wanted.append(path)
+            if len(files) < _PR_FILES_PAGE_SIZE:
+                break
+        if len(wanted) + len(texts) > _PR_CONTENT_MAX_FILES:
+            return {}, (
+                f"{owner}/{repo}#{number} writes {len(wanted) + len(texts)} files the content "
+                f"globs name, more than the {_PR_CONTENT_MAX_FILES} this check reads; narrow the globs"
+            )
+        for path in wanted:
+            status, body = _http_get_json(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/"
+                f"{urllib.parse.quote(path)}?ref={sha}",
+                token,
+                budget,
+            )
+            encoded = body.get("content") if isinstance(body, dict) else None
+            if status != 200 or not isinstance(encoded, str) or body.get("encoding") != "base64":
+                return {}, (
+                    f"GitHub answered {status} for {path} at {sha[:12]} in {owner}/{repo}; "
+                    "the token needs `contents: read`, so the content checks could not be evaluated"
+                )
+            texts[path] = base64.b64decode(encoded).decode("utf-8", errors="replace")
+        return texts, None
 
     def _changed_paths(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -3178,6 +3406,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "requires the fix to leave unchanged (`unchanged_paths`) -- a "
                         "remediation written over the workload's own declaration"
                     )
+                    continue
+            if self.content:
+                try:
+                    texts, unevaluable = self._head_files(owner, repo, number, pull, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                failures = [r for r in (_content_rejection(c, texts) for c in self.content) if r]
+                if failures:
+                    rejected.append(f"{slug}: " + "; ".join(failures))
                     continue
             # Within the skew allowance a pull request a hair older than the
             # run is still this run's; "an earlier repetition" only when the

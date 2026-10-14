@@ -595,6 +595,39 @@ file whether it lands beside the workload's declaration or over it, and only the
 the Deployment it was meant to protect. The clause lists `/pulls/{n}/files`, counts a rename under
 both names, and needs `pull_requests: read`; an answer it cannot read is an error, not a pass.
 
+`content` lists assertions over what the pull request writes, for a case whose answer is an object
+with particular fields rather than any change at all: the `ContainerCluster` a provisioning request
+should add, carrying both beta APIs, on no E2 node pool. Each entry names `paths` (`fnmatch` globs
+over the files the pull request adds or changes; a removed file is not read), an optional `kind`, an
+optional dotted `field` that steps through lists (`spec.enableK8sBetaApis.enabledApis`;
+`spec.nodeConfig.labels` reads a map whose keys hold dots whole), an `op` of `exists`, `contains`,
+`matches`, `not_matches` or `absent`, a `value` for the three that compare, and a `quantifier` of
+`all` (the default) or `any` over the documents kept. Files parse as multi-document YAML; one that
+does not, such as Terraform, is a single text document with no kind, read whole when `field` is
+empty. Every op but `absent` fails when the pull request wrote no such document, so a case cannot
+pass on an object nobody added. A file the pull request adds is read from the listing's patch, which
+for an added file is the whole file and needs only `pull_requests: read`; a modified file is read
+from `/contents` at the head, which needs `contents: read`, and the grading mint does not ask for it,
+so an assertion over a modified file is an error until it does.
+
+```yaml
+- name: the-new-cluster-turns-on-both-beta-apis
+  check:
+    type: pull_request_opened
+    owner: gke-agentic
+    content:
+      - paths: ["clusters/*/provisioning/*.yaml"]
+        kind: ContainerCluster
+        field: spec.enableK8sBetaApis.enabledApis
+        op: contains
+        value: certificates.k8s.io/v1beta1/podcertificaterequests
+      - paths: ["clusters/*/provisioning/*.yaml"]
+        kind: ContainerNodePool
+        field: spec.nodeConfig.machineType
+        op: not_matches
+        value: "^e2-"
+```
+
 `accepts_stream_pull_request: true` is for a case whose later runs meet a pull request an earlier
 run left open on the same branch, as a fleet audit's remediation case does. The audit's `finish`
 names the branch after the files the fix touches, so every later run of the audit on the
