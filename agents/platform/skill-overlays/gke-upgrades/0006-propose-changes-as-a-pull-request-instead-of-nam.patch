@@ -52,14 +52,16 @@ diff --git a/SKILL.md b/SKILL.md
 diff --git a/references/runbook-template.md b/references/runbook-template.md
 --- a/references/runbook-template.md
 +++ b/references/runbook-template.md
-@@ -2,12 +2,16 @@
+@@ -1,13 +1,17 @@
+ # Runbook Command Templates
  
- Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME`, `ZONE`, `TARGET_VERSION`, `NODE_POOL_NAME`.
- 
+-Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME`, `ZONE`, `TARGET_VERSION`, `NODE_POOL_NAME`.
++Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME`, `ZONE`, `LOCATION` (the zone or region), `TARGET_VERSION`, `NODE_POOL_NAME`. The operator steps take `--location`, which accepts a zone or a region.
++
 +> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 +
 +Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`, except a node pool's version, which is a step for the platform operator (a `spec.version` in the repository pins a release-channel pool against auto-upgrade); each check step is a read command.
-+
+ 
  ## Table of Contents
 -- [Pre-flight](#pre-flight) (Line 12-31)
 -- [Control plane upgrade](#control-plane-upgrade) (Line 32-47)
