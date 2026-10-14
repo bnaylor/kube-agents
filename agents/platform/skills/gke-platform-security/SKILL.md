@@ -24,8 +24,8 @@ controls (such as SecretProviderClass volume mounts, Network Policies, and Pod
 Security Standards), refer to the `gke-workload-security` skill; for Workload
 Identity Service Account bindings, the `gke-workload-identity` skill.
 
-> **MCP Tools:** `gke:get_cluster`, `k8s:check_k8s_auth`,
-> `k8s:get_k8s_resource`
+> **MCP Tools:** `get_cluster`, `check_k8s_auth`, `get_k8s_resource` (all on the `gke`
+> server)
 >
 > A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
@@ -100,8 +100,7 @@ Config Connector YAML on the cluster's `ContainerCluster` through `gcp-config-co
 
 ## Shielded Nodes & GKE Sandbox Enablement
 
-Enabling verifiable node boot integrity and kernel isolation features at the
-cluster level. Shielded Nodes (`spec.enableShieldedNodes`) are changed as Config Connector
+Verifiable node boot integrity is a cluster setting and kernel isolation a node pool one. Shielded Nodes (`spec.enableShieldedNodes`) are changed as Config Connector
 YAML on the cluster's `ContainerCluster` through `gcp-config-connector`. The GKE Sandbox
 (gVisor) runtime is a node pool setting, `spec.nodeConfig.sandboxConfig.sandboxType: gvisor` on
 a `ContainerNodePool`; the field is immutable and the default pool cannot run it, so propose a
