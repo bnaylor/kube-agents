@@ -2403,26 +2403,43 @@ def _resolve_field(node: Any, dotted: str) -> list[Any]:
 
 def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
     """``(documents, parsed)`` for one file: ``(label, mapping or None, text)``
-    per document, and whether the file parsed. Only a parse error (or an alias
-    or merge key, refused as one) leaves a file unparsed; it is then one text
-    document with no kind. A file that parses to nothing (empty, comments only)
-    has no documents. A root list's mappings are documents of their own, and
-    any other scalar or list is a text document with no kind."""
+    per document, and whether the file parsed.
+
+    A document's text is the slice of the file it was read from, so a text
+    check sees the file as written, quoting and all. Only a parse error (or an
+    alias or merge key, refused as one) leaves a file unparsed; it is then one
+    text document with no kind. Empty documents (a trailing or doubled
+    ``---``) are nothing. A file whose only document is a scalar is not YAML in
+    any useful sense (a Terraform file reads as one long plain scalar), so it
+    is one raw text document with no kind, and counts as not parsed. A root
+    list's mappings are documents of their own; any other scalar or list is a
+    text document with no kind."""
+    docs: list[tuple[str, Any, str]] = []
+    nodes: list[tuple[Any, str]] = []
+    loader = _ContentLoader(text)
     try:
-        parsed = [d for d in yaml.load_all(text, Loader=_ContentLoader) if d is not None]
+        while loader.check_node():
+            node = loader.get_node()
+            raw = text[node.start_mark.index:node.end_mark.index]
+            doc = loader.construct_document(node)
+            if doc is None or doc == "":
+                continue
+            nodes.append((doc, raw))
     except (yaml.YAMLError, RecursionError):
         # RecursionError: PyYAML composes recursively, and a few hundred nested
         # brackets in an added file would otherwise crash the verifier.
         return [(path, None, text)], False
-    docs: list[tuple[str, Any, str]] = []
-    for i, doc in enumerate(parsed):
-        items = doc if isinstance(doc, list) else [doc]
-        for j, item in enumerate(items):
-            label = f"{path}#{i}" if not isinstance(doc, list) else f"{path}#{i}.{j}"
-            if isinstance(item, dict):
-                docs.append((label, item, _dump_as_written(item)))
-            else:
-                docs.append((label, None, _dump_as_written(item)))
+    finally:
+        loader.dispose()
+    if len(nodes) == 1 and not isinstance(nodes[0][0], (dict, list)):
+        return [(path, None, text)], False
+    for i, (doc, raw) in enumerate(nodes):
+        if isinstance(doc, list):
+            for j, item in enumerate(doc):
+                text_of = _dump_as_written(item) if isinstance(item, dict) else str(item)
+                docs.append((f"{path}#{i}.{j}", item if isinstance(item, dict) else None, text_of))
+        else:
+            docs.append((f"{path}#{i}", doc if isinstance(doc, dict) else None, raw))
     return docs, True
 
 
@@ -2431,7 +2448,12 @@ def _added_file_text(entry: dict) -> str | None:
     or None when the listing cannot carry it (not an added file, or GitHub left
     the patch out because the file is too large)."""
     patch = entry.get("patch")
-    if entry.get("status") != "added" or not isinstance(patch, str):
+    if entry.get("status") != "added":
+        return None
+    if patch is None and entry.get("changes") == 0 and entry.get("additions") == 0:
+        # An empty file: git emits no hunk for it, so there is no patch to read.
+        return ""
+    if not isinstance(patch, str):
         return None
     lines = []
     raw = patch.split("\n")

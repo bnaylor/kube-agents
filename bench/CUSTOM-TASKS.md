@@ -606,18 +606,19 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
 
 - Files parse as multi-document YAML with every scalar kept as written (`true` is the text `true`,
   `1.30` stays `1.30`). Aliases and merge keys (`<<`) are refused, and a file using either counts as
-  not parsed, like one with a syntax error or a non-YAML file such as Terraform: that file is one
-  text document with no kind. A file that parses to nothing (empty, comments only) has no documents;
-  a root list's mappings are documents of their own; any other scalar or list is a text document
-  with no kind. With `field` empty the text is the raw file for an unparsed file, else the document
-  written back as YAML with every scalar as the file had it. A map or list value compares as one YAML
-  line per entry, and `^`/`$` in a regex anchor at each line.
+  not parsed, like one with a syntax error, or one whose only document is a scalar (a Terraform file
+  reads that way): that file is one raw text document with no kind, and any kind- or field-scoped
+  check over it fails, since the object it looks for may be in it. Empty documents (a trailing or
+  doubled `---`) are nothing; an empty file has no documents. A root list's mappings are documents
+  of their own; any other scalar or list is a text document with no kind. With `field` empty the
+  text is the slice of the file the document came from, quoting and all. A map or list value
+  compares as YAML written back one line per entry (quoted where YAML needs it), and `^`/`$` in a
+  regex anchor at each line; to test one label, address it with a bracketed key instead.
 - `exists`: the key is there, even with an empty value. `contains`: a value equals `value` exactly
   (substring only when `field` is empty). `matches`: a value matches the regular expression.
   `not_matches`: the field is there with a value that is not empty or a spelling of null (`~`, `null`) and no value matches, so a node pool that
   leaves its machine type out fails a "not E2" check. `absent`: no kept document has the field, or,
-  with `field` empty, no document of that kind; a matching file that does not parse fails it, since
-  the object may be in it. `exists` and `absent` take no `value`, and `absent` no `quantifier`. An empty list or map still counts as the key being there. A `field` outside the grammar (a quote outside brackets, text glued to a bracket) is refused when the case loads.
+  with `field` empty, no document of that kind; a matching file that does not parse fails it. `exists` and `absent` take no `value`, and `absent` no `quantifier`. An empty list or map still counts as the key being there. A `field` outside the grammar (a quote outside brackets, text glued to a bracket) is refused when the case loads.
 - Every op but `absent` fails when no matching file holds such a document, so a case cannot pass on
   an object nobody added.
 - Only files the pull request adds are read, whole from the files listing's patch, which needs

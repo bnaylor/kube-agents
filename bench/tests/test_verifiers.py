@@ -3843,6 +3843,42 @@ def test_an_unparsed_file_fails_every_scoped_op_not_only_absent(token, github):
     assert res.status == "fail" and "hidden.yaml" in res.reason
 
 
+def test_a_trailing_document_marker_adds_no_document(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "field": "metadata.name", "op": "exists"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": _CLUSTER_YAML + "---\n---\n"})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_document_text_is_the_file_slice_with_its_quoting(token, github):
+    doc = 'kind: CronJob\nmetadata: {name: j}\nspec:\n  schedule: "*/5 * * * *"\n'
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains",
+             "value": 'schedule: "*/5 * * * *"'}
+    _content_pr(github, {f"{_CLUSTER_DIR}/j.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_an_empty_added_file_reads_as_empty(token, github):
+    """GitHub carries no patch for an empty new file; it is read as empty, not unevaluable."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/.keep", "status": "added", "additions": 0, "changes": 0})
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_terraform_file_is_raw_text_and_scoped_checks_fail_closed(token, github):
+    """A .tf file reads as one YAML plain scalar; it is kept raw, and a kind-scoped
+    check over it is not shown rather than passing."""
+    hcl = 'resource "google_container_cluster" "a" {\n  name = "a"\n}\n'
+    _content_pr(github, {"clusters/substrate-a/provisioning/main.tf": hcl})
+    raw = {"paths": ["clusters/*/provisioning/*.tf"], "op": "contains", "value": '{\n  name = "a"'}
+    scoped = {"paths": ["clusters/*/provisioning/*.tf"], "kind": "RootSync", "op": "absent"}
+    assert _pr_check(content=[raw]).verify(5.0).status == "pass"
+    assert _pr_check(content=[scoped]).verify(5.0).status == "fail"
+
+
 def test_a_quantifier_on_absent_is_refused():
     with pytest.raises(ValueError):
         _pr_check(content=[{"paths": ["x"], "op": "absent", "quantifier": "any"}])
