@@ -24,7 +24,7 @@ diff --git a/SKILL.md b/SKILL.md
 -5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. Use `--add-maintenance-exclusion-until-end-of-support` for persistent exclusions.
 -6. **Correct gcloud syntax**: When providing `gcloud` commands for exclusions, you MUST use the separate flag syntax: `--add-maintenance-exclusion-name`, `--add-maintenance-exclusion-start`, `--add-maintenance-exclusion-end` (or `--add-maintenance-exclusion-until-end-of-support`), and `--add-maintenance-exclusion-scope` (do NOT use a single comma-separated `--add-maintenance-exclusion` flag).
 +5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. A persistent exclusion that runs until End of Support has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
-+6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope`.
++6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope` (`NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`, as the GKE API spells them, not gcloud's lowercase forms).
  
  ## Mandatory Upgrade Overrides
  
@@ -155,7 +155,7 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 -  --add-maintenance-exclusion-until-end-of-support
 -```
 +- **Recurring maintenance window**: `spec.maintenancePolicy.recurringWindow` with `startTime` and `endTime` (`YYYY-MM-DDTHH:MM:SSZ`) and `recurrence` (e.g. `FREQ=WEEKLY;BYDAY=SA`).
-+- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope`.
++- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope` (as the GKE API spells it: `NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`).
 +- **Persistent exclusion (until End of Support)** and **node pool level exclusions**: each has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
  
  ## Rollback/Downgrade guidance
@@ -198,7 +198,7 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
  
 -# Cordon old pool
 -kubectl cordon -l cloud.google.com/gke-nodepool=NODE_POOL_NAME
-+Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Workloads move off the old pool when a later pull request removes its `ContainerNodePool`. Before that:
++Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
  
 +```bash
  # Record current PDB state BEFORE touching anything — this file is how you put
@@ -261,7 +261,38 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 diff --git a/references/troubleshooting.md b/references/troubleshooting.md
 --- a/references/troubleshooting.md
 +++ b/references/troubleshooting.md
-@@ -20,6 +20,8 @@
+@@ -3,23 +3,25 @@
+ ## Diagnostic flowchart
+ 
+ ## Table of Contents
+-- [Diagnostic flowchart](#diagnostic-flowchart) (Line 3-21)
+-- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common) (Line 23-44)
+-- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods) (Line 46-65)
+-- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain) (Line 67-75)
+-- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation) (Line 77-97)
+-- [5. PVC attachment issues](#5-pvc-attachment-issues) (Line 99-107)
+-- [6. Long termination grace periods](#6-long-termination-grace-periods) (Line 119-126)
+-- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level) (Line 119-126)
+-- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration) (Line 128-154)
+-- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues) (Line 156-195)
+-- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status) (Line 197-228)
+-- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak) (Line 230-248)
+-- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy) (Line 250-266)
+-- [Validation after applying a fix](#validation-after-applying-a-fix) (Line 268-279)
++- [Diagnostic flowchart](#diagnostic-flowchart)
++- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common)
++- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods)
++- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain)
++- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation)
++- [5. PVC attachment issues](#5-pvc-attachment-issues)
++- [6. Long termination grace periods](#6-long-termination-grace-periods)
++- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level)
++- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration)
++- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues)
++- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status)
++- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak)
++- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy)
++- [Validation after applying a fix](#validation-after-applying-a-fix)
  
  When an upgrade is stuck or failing, work through these checks in order. Each section has the diagnosis command, what to look for, and the fix.
  
@@ -416,7 +447,7 @@ diff --git a/references/troubleshooting.md b/references/troubleshooting.md
 -  --location=LOCATION \
 -  --cluster-version VERSION
 -```
-+**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade (`spec.version: VERSION` on its `ContainerNodePool`) through `gcp-config-connector`.
++**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by making sure its `ContainerNodePool` holds the target `spec.version: VERSION`. If the repository already holds it, there is nothing to propose: Config Connector reconciles toward it on its own, so check its status rather than opening an empty pull request; otherwise propose the version through `gcp-config-connector`.
  A partially-upgraded node pool runs mixed versions until you resume it or roll it back.
  
  ## 11. Upgrade too slow or too disruptive (tune blue-green soak)
@@ -432,7 +463,7 @@ diff --git a/references/troubleshooting.md b/references/troubleshooting.md
 -  --standard-rollout-policy=batch-node-count=2,batch-soak-duration=10s \
 -  --node-pool-soak-duration=600s
 -```
-+**Update an existing node pool (Standard clusters only):** on its `ContainerNodePool`, propose the blue-green strategy in `spec.upgradeSettings.strategy` with `spec.upgradeSettings.blueGreenSettings.standardRolloutPolicy` (e.g. `batchNodeCount: 2`, `batchSoakDuration: 10s`) and `spec.upgradeSettings.blueGreenSettings.nodePoolSoakDuration: 600s` as a pull request.
++**Update an existing node pool (Standard clusters only):** on its `ContainerNodePool`, propose the blue-green strategy in `spec.upgradeSettings.strategy` (`BLUE_GREEN`, as the GKE API spells it) with `spec.upgradeSettings.blueGreenSettings.standardRolloutPolicy` (e.g. `batchNodeCount: 2`, `batchSoakDuration: 10s`) and `spec.upgradeSettings.blueGreenSettings.nodePoolSoakDuration: 600s` as a pull request.
  
  **Maintenance-window interaction:** surge upgrades **pause** when they run past the maintenance window and resume in the next one; blue-green upgrades **continue to completion** even past the window, and the extra pool keeps workloads available — prefer blue-green when a window is too short to finish.
  

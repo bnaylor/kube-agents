@@ -3,20 +3,20 @@
 ## Diagnostic flowchart
 
 ## Table of Contents
-- [Diagnostic flowchart](#diagnostic-flowchart) (Line 3-21)
-- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common) (Line 23-44)
-- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods) (Line 46-65)
-- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain) (Line 67-75)
-- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation) (Line 77-97)
-- [5. PVC attachment issues](#5-pvc-attachment-issues) (Line 99-107)
-- [6. Long termination grace periods](#6-long-termination-grace-periods) (Line 119-126)
-- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level) (Line 119-126)
-- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration) (Line 128-154)
-- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues) (Line 156-195)
-- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status) (Line 197-228)
-- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak) (Line 230-248)
-- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy) (Line 250-266)
-- [Validation after applying a fix](#validation-after-applying-a-fix) (Line 268-279)
+- [Diagnostic flowchart](#diagnostic-flowchart)
+- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common)
+- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods)
+- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain)
+- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation)
+- [5. PVC attachment issues](#5-pvc-attachment-issues)
+- [6. Long termination grace periods](#6-long-termination-grace-periods)
+- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level)
+- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration)
+- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues)
+- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status)
+- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak)
+- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy)
+- [Validation after applying a fix](#validation-after-applying-a-fix)
 
 When an upgrade is stuck or failing, work through these checks in order. Each section has the diagnosis command, what to look for, and the fix.
 
@@ -184,7 +184,7 @@ gcloud container node-pools get-upgrade-info POOL_NAME --cluster CLUSTER_NAME --
 - `CLUSTER_DISRUPTION_BUDGET` / `CLUSTER_DISRUPTION_BUDGET_MINOR_UPGRADE` — a post-operation cooldown protecting cluster stability.
 - `SYSTEM_CONFIG` — temporarily paused by GKE for technical or business reasons. **Do not force a manual upgrade unless it is required.**
 
-**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade (`spec.version: VERSION` on its `ContainerNodePool`) through `gcp-config-connector`.
+**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by making sure its `ContainerNodePool` holds the target `spec.version: VERSION`. If the repository already holds it, there is nothing to propose: Config Connector reconciles toward it on its own, so check its status rather than opening an empty pull request; otherwise propose the version through `gcp-config-connector`.
 A partially-upgraded node pool runs mixed versions until you resume it or roll it back.
 
 ## 11. Upgrade too slow or too disruptive (tune blue-green soak)
@@ -196,7 +196,7 @@ Blue-green upgrades add batch/soak controls that surge upgrades don't have. Use 
 - `BATCH_SOAK_DURATION` — wait after each batch drain (default `0s`).
 - `NODE_POOL_SOAK_DURATION` — wait after all batches drain, before the blue pool is deleted (default `3600s`).
 
-**Update an existing node pool (Standard clusters only):** on its `ContainerNodePool`, propose the blue-green strategy in `spec.upgradeSettings.strategy` with `spec.upgradeSettings.blueGreenSettings.standardRolloutPolicy` (e.g. `batchNodeCount: 2`, `batchSoakDuration: 10s`) and `spec.upgradeSettings.blueGreenSettings.nodePoolSoakDuration: 600s` as a pull request.
+**Update an existing node pool (Standard clusters only):** on its `ContainerNodePool`, propose the blue-green strategy in `spec.upgradeSettings.strategy` (`BLUE_GREEN`, as the GKE API spells it) with `spec.upgradeSettings.blueGreenSettings.standardRolloutPolicy` (e.g. `batchNodeCount: 2`, `batchSoakDuration: 10s`) and `spec.upgradeSettings.blueGreenSettings.nodePoolSoakDuration: 600s` as a pull request.
 
 **Maintenance-window interaction:** surge upgrades **pause** when they run past the maintenance window and resume in the next one; blue-green upgrades **continue to completion** even past the window, and the extra pool keeps workloads available — prefer blue-green when a window is too short to finish.
 

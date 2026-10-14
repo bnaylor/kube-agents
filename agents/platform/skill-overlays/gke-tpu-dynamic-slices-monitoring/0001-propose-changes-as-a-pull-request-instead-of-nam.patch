@@ -8,15 +8,26 @@ Retire-When: never; kube-agents proposes every change as a pull request
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md
 +++ b/SKILL.md
-@@ -11,6 +11,8 @@ metadata:
- Monitors the status of TPU Slice custom resources, troubleshoots provisioning
- failures, validates workload manifests on dynamic slices, and performs cleanups.
+@@ -1,7 +1,7 @@
+ ---
+ name: gke-tpu-dynamic-slices-monitoring
+ description: >-
+-  Monitors, troubleshoots, and manages GKE TPU Dynamic Slices custom resources. Use when checking TPU slice lifecycle states, troubleshooting slice provisioning failures, validating single-slice or multi-slice (JobSet) workload manifests, or safely patching stuck finalizers and disabling the slice controller. Don't use for generic GKE cluster node pool creation or standard non-TPU workload management (use gke-basics or gke-cluster-creation instead).
++  Monitors, troubleshoots, and manages GKE TPU Dynamic Slices custom resources. Use when checking TPU slice lifecycle states, troubleshooting slice provisioning failures, validating single-slice or multi-slice (JobSet) workload manifests, or diagnosing stuck finalizers and the slice controller for the platform operator to clear. Don't use for generic GKE cluster node pool creation or standard non-TPU workload management (use gke-basics or gke-cluster-creation instead).
+ metadata:
+   category: Containers
+ ---
+@@ -9,7 +9,9 @@ metadata:
+ # GKE TPU Dynamic Slices Monitoring & Management
  
-+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ Monitors the status of TPU Slice custom resources, troubleshoots provisioning
+-failures, validates workload manifests on dynamic slices, and performs cleanups.
++failures, validates workload manifests on dynamic slices, and hands cleanups to the platform operator.
 +
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
  ## Prerequisites
  
- -   Cloud Logging enabled for the project.
 @@ -140,14 +142,10 @@ If deploying a multi-slice JobSet, verify:
  If a slice is stuck in `DEACTIVATING` or deletion hangs indefinitely due to stuck finalizers:
  

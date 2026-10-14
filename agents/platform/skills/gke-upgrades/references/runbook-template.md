@@ -63,7 +63,7 @@ kubectl get pods -A | grep -v Running | grep -v Completed
 Each of these is proposed as a pull request on the cluster's `ContainerCluster` through `gcp-config-connector`:
 
 - **Recurring maintenance window**: `spec.maintenancePolicy.recurringWindow` with `startTime` and `endTime` (`YYYY-MM-DDTHH:MM:SSZ`) and `recurrence` (e.g. `FREQ=WEEKLY;BYDAY=SA`).
-- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope`.
+- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope` (as the GKE API spells it: `NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`).
 - **Persistent exclusion (until End of Support)** and **node pool level exclusions**: each has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
 
 ## Rollback/Downgrade guidance
@@ -82,7 +82,7 @@ Propose `spec.version: TARGET_PREVIOUS_VERSION` on the pool's `ContainerNodePool
 
 ### Downgrade Node Pool (Safe migration - recommended)
 
-Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Workloads move off the old pool when a later pull request removes its `ContainerNodePool`. Before that:
+Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
 
 ```bash
 # Record current PDB state BEFORE touching anything — this file is how you put
