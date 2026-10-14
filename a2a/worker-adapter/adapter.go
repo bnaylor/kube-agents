@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -603,6 +604,29 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 		}
 	}
 	argv = withResume(argv, plan.resume)
+	env := cfg.HarnessEnv
+	if delegate && cfg.SessionReuse {
+		// A reused pod runs every turn of its conversation, and two turns
+		// can have different requesters. Each turn's listener gets a path of
+		// its own, and only that turn's harness is told it
+		// (taskDelegateSocket), so nothing kept from an earlier turn dials
+		// the current one at a path it already knows.
+		socket, err = taskDelegateSocket(cfg.DelegateSocket)
+		if err != nil {
+			state := lib.StateFailed
+			ferr := a.finalize(state, "reason: delegate-socket-failed - "+err.Error(), "")
+			return done(Result{State: state}, ferr)
+		}
+		var rewrote bool
+		argv, env, rewrote = withDelegateSocket(argv, env, socket)
+		if !rewrote && slices.Contains(argv, MCPConfigFlag) {
+			// The harness is configured for MCP but not by the shape the pod
+			// builds, so its delegate server may still name the configured
+			// path, where nothing listens in a reused pod.
+			log.Warn("the harness's --mcp-config has no delegate server entry to point at this turn's socket; the delegate tool may not reach it",
+				"socket", socket)
+		}
+	}
 
 	// The listener is up before the harness starts, so the tool can never
 	// race it, and down when this task returns, so an ask from this task's
@@ -617,7 +641,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 	}
 	defer stopDelegate()
 
-	proc, err := startHarness(argv, cfg.HarnessEnv, prompt, cfg.KillGrace, log)
+	proc, err := startHarness(argv, env, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -654,6 +678,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		err := proc.cmd.Wait()
 		took := time.Since(reapStart)
 		proc.reaped()
+		proc.killLeftovers()
 		waitDone <- reapOutcome{err, took}
 	}()
 

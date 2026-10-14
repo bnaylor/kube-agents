@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -309,7 +312,9 @@ func TestTheDelegateToolIsDecidedPerTaskInAReusedPod(t *testing.T) {
 	const session = "chat-stoat-d3w4"
 	dir := t.TempDir()
 	sock := delegateSock(t)
-	check := fmt.Sprintf(`if [ -S %q ]; then echo listening > "$dir/sock.$n"; else echo absent > "$dir/sock.$n"; fi`, sock)
+	// A reused pod's turn listens on a path of its own, which it is told in
+	// A2A_DELEGATE_SOCKET; a turn with the tool off is told nothing.
+	check := `if [ -n "$A2A_DELEGATE_SOCKET" ] && [ -S "$A2A_DELEGATE_SOCKET" ]; then echo listening > "$dir/sock.$n"; else echo absent > "$dir/sock.$n"; fi`
 	with := recordingStub(t, dir, "echo WITH > \"$dir/tool.$n\"\n"+check)
 	without := recordingStub(t, dir, "echo WITHOUT > \"$dir/tool.$n\"\n"+check)
 
@@ -511,5 +516,139 @@ func TestTheWatcherRefusesANewTaskItCannotShowIsASubmission(t *testing.T) {
 				t.Fatalf("took %s, want %q", env.Payload, tc.take)
 			}
 		})
+	}
+}
+
+// A background process the model leaves behind in a clean turn does not live
+// into the next one: once the harness has exited and been reaped, what is left
+// of its process group is killed (the code does it before the turn's outcome
+// is handed back; this test shows only that it dies).
+func TestAReusedPodKillsWhatATurnLeftBehind(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-ferret-k1l2"
+	dir := t.TempDir()
+	// The leftover lets go of the harness's stdout, as a background job
+	// started through a tool does, so the harness's own exit ends the turn.
+	harness := recordingStub(t, dir, `sleep 300 >/dev/null 2>&1 &
+echo $! > "$dir/bg.$n"`)
+	submit(t, c, session, "task-k-1", "start something")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, reuseConfig(url, "task-k-1", session, harness))
+	waitState(t, c, session, "task-k-1", lib.StateCompleted)
+
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(readRun(t, dir, "bg", 1)), "%d", &pid); err != nil || pid <= 0 {
+		t.Fatalf("no background pid recorded: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(waitDeadline)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("the background process %d from the first turn is still alive after the turn ended", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}
+
+// Each turn of a reused pod has its own delegate socket, and the path goes
+// with the turn: whatever kept the first turn's path, or knows the configured
+// one, cannot reach the second turn's listener.
+func TestEachReusedTurnHasItsOwnDelegateSocket(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-ferret-s3o4"
+	dir := t.TempDir()
+	sock := delegateSock(t)
+	harness := recordingStub(t, dir, `echo "$A2A_DELEGATE_SOCKET" > "$dir/sock.$n"
+if [ "$n" = 2 ]; then while [ ! -e "$dir/go" ]; do sleep 0.1; done; fi`)
+	submit(t, c, session, "task-s-1", "first")
+	cfg := reuseConfig(url, "task-s-1", session, harness)
+	cfg.DelegateSocket = sock
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+	waitState(t, c, session, "task-s-1", lib.StateCompleted)
+
+	first := strings.TrimSpace(readRun(t, dir, "sock", 1))
+	if first == "" || first == sock || filepath.Dir(first) != filepath.Dir(sock) {
+		t.Fatalf("first turn's socket = %q, want a fresh name beside %s", first, sock)
+	}
+	if _, err := os.Stat(first); !os.IsNotExist(err) {
+		t.Fatalf("the first turn's socket %s outlived its turn (stat err=%v)", first, err)
+	}
+
+	submit(t, c, session, "task-s-2", "second")
+	deadline := time.Now().Add(waitDeadline)
+	for readRunIfAny(dir, "sock", 2) == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("the second turn's harness never started")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	second := strings.TrimSpace(readRun(t, dir, "sock", 2))
+	if second == first || second == sock {
+		t.Fatalf("second turn's socket = %q, the same as an earlier or the configured path", second)
+	}
+	if fi, err := os.Stat(second); err != nil || fi.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("the second turn is not listening at %s: %v", second, err)
+	}
+	for _, old := range []string{first, sock} {
+		if conn, err := net.Dial("unix", old); err == nil {
+			conn.Close()
+			t.Fatalf("dialing %s reached a listener during the second turn", old)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, session, "task-s-2", lib.StateCompleted)
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}
+
+// readRunIfAny is readRun for a file that may not be written yet.
+func readRunIfAny(dir, what string, n int) string {
+	b, _ := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%s.%d", what, n)))
+	return strings.TrimSpace(string(b))
+}
+
+// withDelegateSocket rewrites the delegate server's socket inside the
+// --mcp-config argument the pod builds, adds it to the environment, and leaves
+// its inputs alone.
+func TestWithDelegateSocketRewritesTheMCPConfig(t *testing.T) {
+	cfg, err := json.Marshal(map[string]any{MCPServersKey: map[string]any{
+		DelegateMCPServer: map[string]any{"command": "/bin/adapter", "args": []string{"mcp"},
+			MCPEnvKey: map[string]string{EnvDelegateSocket: DefaultDelegateSocket}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := []string{"claude", "--print", MCPConfigFlag, string(cfg), "--strict-mcp-config"}
+	env := []string{"PATH=/bin"}
+	const turnSocket = "/scratch/a2a-delegate-0123456789abcdef.sock"
+	gotArgv, gotEnv, rewrote := withDelegateSocket(argv, env, turnSocket)
+	if !rewrote {
+		t.Fatal("the delegate server's entry was not found")
+	}
+	if argv[3] != string(cfg) || len(env) != 1 {
+		t.Fatal("withDelegateSocket modified its inputs")
+	}
+	var parsed map[string]map[string]struct {
+		Command string            `json:"command"`
+		Env     map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal([]byte(gotArgv[3]), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	srv := parsed[MCPServersKey][DelegateMCPServer]
+	if srv.Env[EnvDelegateSocket] != turnSocket || srv.Command != "/bin/adapter" {
+		t.Fatalf("delegate server after the rewrite = %+v", srv)
+	}
+	if !slices.Contains(gotEnv, EnvDelegateSocket+"="+turnSocket) {
+		t.Fatalf("env = %v, want the turn's socket in it", gotEnv)
 	}
 }

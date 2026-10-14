@@ -355,14 +355,14 @@ func harnessCommand() []string {
 			self = "/usr/local/bin/worker-adapter"
 		}
 		sock := workeradapter.DelegateSocketPath()
-		mcpCfg, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
+		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
 			workeradapter.DelegateMCPServer: map[string]any{
-				"command": self,
-				"args":    []string{"mcp"},
-				"env":     map[string]string{workeradapter.EnvDelegateSocket: sock},
+				"command":               self,
+				"args":                  []string{"mcp"},
+				workeradapter.MCPEnvKey: map[string]string{workeradapter.EnvDelegateSocket: sock},
 			},
 		}})
-		argv = append(argv, "--mcp-config", string(mcpCfg), "--strict-mcp-config")
+		argv = append(argv, workeradapter.MCPConfigFlag, string(mcpCfg), "--strict-mcp-config")
 	}
 	if len(prompts) > 0 {
 		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))

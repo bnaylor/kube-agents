@@ -403,6 +403,15 @@ func (p *harnessProc) closeStdin() {
 // grace. Timers are retained so the reaper can stop them before the pgid is
 // recycled — the Hermes bridge hit exactly that, killing an unrelated process.
 func (p *harnessProc) kill(grace time.Duration) {
+	// Reaped already (a cancel or eviction that wins the select after the
+	// reap): killLeftovers has emptied the group, so its id may be free for
+	// reuse, and a signal now could reach an unrelated process.
+	p.mu.Lock()
+	reaped := p.reapedAt
+	p.mu.Unlock()
+	if reaped {
+		return
+	}
 	pid := p.cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	if grace <= 0 {
@@ -424,6 +433,25 @@ func (p *harnessProc) kill(grace time.Duration) {
 		return
 	}
 	p.killTimers = append(p.killTimers, t)
+}
+
+// killLeftovers SIGKILLs whatever is left in the harness's process group once
+// the harness itself has been reaped, after a clean exit as much as after a
+// kill. A process the model started in the background (the Bash tool's `&`)
+// stays in the group and outlives the harness otherwise, and in a reused pod
+// it would still be running, with the pod's credentials and its scratch
+// directory, during the next turn, which can be another requester's. The
+// escalation timers do not cover it: reaped stops them, and a clean exit arms
+// none.
+//
+// Called right after the reap and before the next turn can start, from the
+// goroutine that reaped. The group's id is the harness's pid, and the kernel
+// does not hand out an id still in use as a live process group's, so while
+// anything is left in the group this reaches only that; with nothing left it
+// finds nothing (ESRCH). A process that left the group (setsid, or setpgid)
+// is not reached.
+func (p *harnessProc) killLeftovers() {
+	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 }
 
 // reaped stops any armed escalation timers; called after Wait so a recycled
