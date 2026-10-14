@@ -3718,6 +3718,33 @@ def test_an_alias_is_refused_not_expanded(token, github):
     assert _pr_check(content=[exists]).verify(5.0).status == "fail"
 
 
+def test_a_merge_key_is_refused_so_absent_fails_closed(token, github):
+    merged = ("kind: RootSync\nmetadata: {name: s}\nspec:\n  <<: {helm: {repo: oci://ghcr.io/kagent-dev/x}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "field": "spec.helm.repo", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/s.yaml": merged})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_bare_scalar_document_does_not_hide_the_file_from_absent(token, github):
+    mixed = "kind: ConfigMap\nmetadata: {name: m}\n---\noci://ghcr.io/kagent-dev/substrate\n"
+    text_absent = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "absent", "kind": "RootSync"}
+    text_check = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "contains", "value": "ghcr.io/kagent-dev", "quantifier": "any"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": mixed})
+    assert _pr_check(content=[text_absent]).verify(5.0).status == "fail"
+    assert _pr_check(content=[text_check]).verify(5.0).status == "pass"
+
+
+def test_an_empty_value_is_still_a_present_key(token, github):
+    doc = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: \"\"\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    absent = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "field": "spec.nodeConfig.machineType", "op": "absent"}
+    not_e2 = {**absent, "op": "not_matches", "value": "^e2-"}
+    assert _pr_check(content=[absent]).verify(5.0).status == "fail"
+    # An empty machine type is GKE's default too, so "not E2" is not shown.
+    assert _pr_check(content=[not_e2]).verify(5.0).status == "fail"
+
+
 def test_a_patch_ending_without_a_newline_is_rebuilt():
     entry = {"status": "added", "patch": "@@ -0,0 +1,2 @@\n+kind: A\n+x: 1\n\\ No newline at end of file"}
     assert verifiers._added_file_text(entry) == "kind: A\nx: 1\n"

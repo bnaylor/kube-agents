@@ -605,10 +605,10 @@ optional `kind`, an optional dotted `field` that steps through lists
 and a `quantifier` of `all` (the default) or `any` over the documents kept.
 
 - Files parse as multi-document YAML with every scalar kept as written (`true` is the text `true`,
-  `1.30` stays `1.30`) and aliases refused. A file that does not parse, such as Terraform, is one text
+  `1.30` stays `1.30`) and aliases and merge keys (`<<`) refused, so a file using either counts as not parsed. A file that does not parse, such as Terraform, is one text
   document with no kind. With `field` empty, the text is that raw file, or, for a parsed document,
   the document re-serialised as YAML. A map or list value compares as one YAML line per entry.
-- `exists`: the field has a value. `contains`: a value equals `value` exactly (substring only when
+- `exists`: the key is there, even with an empty value. `contains`: a value equals `value` exactly (substring only when
   `field` is empty). `matches`: a value matches the regular expression. `not_matches`: the field is
   there and no value matches, so a node pool that leaves its machine type out fails a "not E2"
   check. `absent`: no kept document has the field, or, with `field` empty, no document of that kind;

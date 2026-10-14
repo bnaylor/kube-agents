@@ -2252,7 +2252,9 @@ class PullRequestContentCheck(BaseModel):
     with scalars kept as the text the file holds (``true`` is ``"true"``,
     ``1.30`` is ``"1.30"``) and aliases refused; a file that does not parse is
     one text document with no kind, which is how a Terraform file is read, and
-    a document that is not a mapping is skipped. ``kind`` keeps the documents
+    a document that is not a mapping is skipped (its file then also reads as
+    raw text, and counts as not parsed). Merge keys (``<<``) are refused like
+    aliases. ``kind`` keeps the documents
     of that ``kind`` ("" for every document). ``field`` is a dotted path into
     each kept document, stepping through lists element by element, so
     ``spec.nodeConfig.machineType`` or ``spec.enableK8sBetaApis.enabledApis``
@@ -2264,7 +2266,7 @@ class PullRequestContentCheck(BaseModel):
 
     ``op`` is what each kept document must show:
 
-    - ``exists``: the field resolves to at least one value;
+    - ``exists``: the key is there (even with an empty or null value);
     - ``contains``: one resolved value equals ``value`` exactly (for
       ``field: ""``, ``value`` occurs in the text);
     - ``matches``: one resolved value matches the regular expression
@@ -2323,6 +2325,14 @@ class _ContentLoader(yaml.BaseLoader):
             raise yaml.YAMLError("aliases are not read in graded content")
         return super().compose_node(parent, index)
 
+    def construct_mapping(self, node, deep=False):  # noqa: D102 - yaml's own hook
+        # A merge key would splice fields in that this loader does not
+        # resolve, so an object could carry a field no assertion sees.
+        for key_node, _ in node.value:
+            if getattr(key_node, "tag", "") == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+                raise yaml.YAMLError("merge keys are not read in graded content")
+        return super().construct_mapping(node, deep=deep)
+
 
 # A field segment: a bare key, or a bracketed quoted key that may hold dots
 # (`labels["ate.dev/substrate-version"]`).
@@ -2362,7 +2372,9 @@ def _resolve_field(node: Any, dotted: str) -> list[Any]:
     flat: list[Any] = []
     for value in values:
         flat += value if isinstance(value, list) else [value]
-    return [v for v in flat if v is not None and v != ""]
+    # Kept even when null or empty: the key is there, which is what
+    # `exists` and `absent` ask; the comparing ops drop the nulls themselves.
+    return flat
 
 
 def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
@@ -2380,7 +2392,14 @@ def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
         for i, doc in enumerate(parsed)
         if isinstance(doc, dict)
     ]
-    return (docs or [(path, None, text)]), bool(docs)
+    if not docs:
+        return [(path, None, text)], False
+    if len(docs) < len(parsed):
+        # A file mixing objects with bare scalars or lists: keep the objects,
+        # add the raw text for text checks, and report it as not fully read so
+        # `absent` fails closed rather than passing over what was skipped.
+        return docs + [(path, None, text)], False
+    return docs, True
 
 
 def _added_file_text(entry: dict) -> str | None:
@@ -2438,7 +2457,7 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
     def holds(values: list[Any]) -> bool:
         if check.op == "exists":
             return bool(values)
-        texts = [_scalar_text(v) for v in values]
+        texts = [_scalar_text(v) for v in values if v is not None]
         if check.op == "contains":
             if not check.field:
                 return any(check.value in t for t in texts)
@@ -2447,7 +2466,7 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         # not_matches needs the field to be there: a pool that leaves its
         # machine type out gets GKE's default, which may be the very series
         # the check forbids.
-        return hit if check.op == "matches" else (bool(texts) and not hit)
+        return hit if check.op == "matches" else (any(texts) and not hit)
 
     failing = [label for label, values in kept if not holds(values)]
     if check.quantifier == "any" and len(failing) < len(kept):
