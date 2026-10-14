@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
@@ -34,6 +36,14 @@ const (
 	// inside the pod's own reconnect is never rejected; that is for the live
 	// run past the real hour.
 	reuseAttempts = 5
+	// reuseRetryGap spaces those turns past one reconnect of the fixture's
+	// verifier. Its connection takes nats.go's default reconnect wait before
+	// it is back, and the pod takes a turn within milliseconds of the
+	// submission, so turns sent back to back all land inside the same gap and
+	// are all rejected (seen under -race: five rejections in 150ms, every one
+	// inside one verifier outage). A gap longer than the wait puts each turn
+	// in a different part of the verifier's connect cycle.
+	reuseRetryGap = nats.DefaultReconnectWait + time.Second
 	// reuseRunTimeout bounds each whole test.
 	reuseRunTimeout = 120 * time.Second
 	// verifierUnreachable is the rejection reason a capability check gives
@@ -165,7 +175,8 @@ func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 		case st == lib.StateCompleted:
 			completed = true
 		case st == lib.StateRejected && strings.Contains(why, verifierUnreachable):
-			t.Logf("%s rejected during a fixture reconnect; sending another", task)
+			t.Logf("%s rejected during a fixture reconnect; sending another in %s", task, reuseRetryGap)
+			time.Sleep(reuseRetryGap)
 		default:
 			t.Fatalf("%s ended %s: %s", task, st, why)
 		}
