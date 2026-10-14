@@ -200,16 +200,19 @@ func unverifiedRemedyFor(backend string) string {
 }
 
 // gchatLinkRe matches markdown links for rewriteLinks to turn into Chat's
-// <url|text> form. The URL class excludes `<`, `>` and `|` so a crafted
+// <url|text> form. The URL class (chatLinkURLPattern, which the executor's
+// own <url|text> links are read with too) excludes `<`, `>` and `|` so a crafted
 // markdown link cannot close the generated sequence early and pick its own
 // display text; none of the three is legal in a URL unencoded, so refusing
 // them costs nothing real. It admits one level of balanced parentheses, as
 // slackLinkRE does and for the same reason: a `.../wiki/Foo_(bar)`
 // destination otherwise ends at the first `)`.
-var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://(?:[^()\s<>|]|\([^()\s<>|]*\))+)\)`)
+var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((` + chatLinkURLPattern + `)\)`)
 
 // gchatPipeRe matches Chat's other in-text control sequence, the <url|text>
-// link, closed or not. The segment before the pipe must be non-empty and
+// link, closed or not, for the defang. A closed one that the adapter would
+// have made from a markdown link never reaches it (toGchatText); every other
+// one does, and is defanged. The segment before the pipe must be non-empty and
 // space-free, which is the shape Chat linkifies; prose like `a < b | c >` is
 // left alone. An opener the executor never closed counts too: the adapter
 // writes its own <url|text> for every markdown link that follows, and that
@@ -877,21 +880,35 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // the one it opens. The defusing is a visible space, not an invisible
 // character.
 //
-// The defang runs first, the way the Slack adapter escapes first: every
-// <users/…> anywhere in the text, and every <url|text the executor opened
-// outside a closed code span, whether or not the executor closed it, is
-// defused before the markdown rules see it, and the markdown link's
-// destination class excludes `<`, so the <url|text> rewriteLinks generates
-// afterwards is the adapter's own — which is the distinction the <users/…>
-// defang already drew, applied to the sequence next to it. The markdown
-// rules (bold pairs, code spans, links, the label-host refusal) are the
-// ones markdown.go holds for both chat surfaces.
+// One <url|text> the executor wrote is not defanged: a closed one, in prose,
+// whose URL is http(s) in the markdown link's destination class and whose
+// text does not name another host (rewriteAroundNativeLinks). That is the
+// link rewriteLinks would have written from [text](url), refused on the same
+// label-host ground, so the visible text still cannot name a host the link
+// does not open, and a model that writes Chat's form instead of markdown
+// gets a link instead of a broken one. It is passed through as written.
+//
+// Around those, the defang runs first, the way the Slack adapter escapes
+// first: every <users/…> anywhere in the text, and every other <url|text the
+// executor opened outside a closed code span, whether or not the executor
+// closed it, is defused before the markdown rules see it, and the markdown
+// link's destination class excludes `<`, so the <url|text> rewriteLinks
+// generates afterwards is the adapter's own — which is the distinction the
+// <users/…> defang already drew, applied to the sequence next to it. The
+// kept link's text admits no `<`, so no mention rides out in it. The
+// markdown rules (bold pairs, code spans, links, the label-host refusal) are
+// the ones markdown.go holds for both chat surfaces.
 func toGchatText(s string) string {
-	return rewriteMarkdown(defangGchatControls(s), gchatLinkRe)
+	return rewriteAroundNativeLinks(s, func(rest string) string {
+		return rewriteMarkdown(defangGchatControls(rest), gchatLinkRe)
+	}, func(dest, label string) string {
+		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
+	})
 }
 
 // defangGchatControls neutralizes Chat's in-text control sequences in a span
-// the adapter did not author, so the text renders as itself. The mention pass
+// the adapter did not author and did not keep as a link (toGchatText), so
+// the text renders as itself. The mention pass
 // runs first and over the whole text, code included: a ping-all that Chat
 // honoured from inside a code span would be loud, and the cost of defusing
 // one that it would not is a space in a code span that was quoting a

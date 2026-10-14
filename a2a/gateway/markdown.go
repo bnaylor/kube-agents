@@ -10,8 +10,9 @@ import (
 // convention -- into surfaces that read a dialect of it. This file holds the
 // rules Slack's mrkdwn and Google Chat's text format share: a bold pair is one
 // star, not two; a code span is verbatim to the markdown rules; a markdown
-// link becomes <url|text>; and a link whose label carries a URL must not
-// name a host the link does not open. What differs per surface -- the
+// link becomes <url|text>; an executor's own closed <url|text> is kept as
+// that same link would be (rewriteAroundNativeLinks); and a link whose label
+// carries a URL must not name a host the link does not open. What differs per surface -- the
 // escaping or defang that runs over the whole text before any of this, and
 // the exact URL class -- stays in the adapter that owns it.
 
@@ -82,6 +83,21 @@ const (
 	chatLinkClose = ">"
 )
 
+// chatLinkURLPattern is the link destination both chat surfaces accept from
+// raw executor text: an http(s) URL with no whitespace, no angle bracket and
+// no pipe, and at most one level of balanced parentheses. None of the
+// refused characters is legal in a URL unencoded. gchatLinkRe reads markdown
+// destinations with it and chatNativeLinkRE reads <url|text> ones.
+const chatLinkURLPattern = `https?://(?:[^()\s<>|]|\([^()\s<>|]*\))+`
+
+// chatNativeLinkRE matches a closed <url|text> link the executor wrote in
+// the surfaces' own form (models write it as well as the markdown one). The
+// URL is chatLinkURLPattern; the text is one line of at least one character
+// with no angle bracket and no pipe, so a second opener, a nested sequence
+// or a pipe that two readers could split differently is not a match and is
+// left to the surface's escaping or defang.
+var chatNativeLinkRE = regexp.MustCompile(`<(` + chatLinkURLPattern + `)\|([^<>|\n]+)>`)
+
 // rewriteMarkdown translates the two markdown forms the relay emits, bold
 // pairs and links, into the form both chat surfaces read, leaving code spans
 // as written. It runs after the surface's own escaping or defang: Slack's
@@ -131,6 +147,48 @@ func rewriteOutsideCode(s string, rewrite func(string) string) string {
 		b.WriteString(s[r[0]:r[1]])
 		end = r[1]
 	}
+	b.WriteString(rewrite(s[end:]))
+	return b.String()
+}
+
+// rewriteAroundNativeLinks keeps each <url|text> link the executor wrote
+// that the adapters would have made from the markdown link [text](url), and
+// hands everything else to rewrite. A link is kept when chatNativeLinkRE
+// matches it in a stretch outside every code span, an unclosed fence
+// included (the link pass reads one as code to the end of the text, so a
+// markdown link there is not converted either), and its text does not name
+// a host other than its URL's (linkLabelMisnamesHost, the refusal a
+// markdown link with that label meets). link writes each kept one; the
+// stretches between them go to rewrite one at a time, which is where the
+// surface's escaping or defang and the markdown rules run. A link a code
+// span cuts short, an unclosed opener and a refused link are not kept, so
+// rewrite defuses them as it did before.
+//
+// The kept link never reaches the markdown rules. Converting it to
+// [text](url) instead would have let a `[` before it, or one inside its
+// text, join it to a different markdown link than the one it was, and let
+// a markdown link around it nest the two sequences. The cost is that a
+// bold pair wrapping a kept link is left as written.
+func rewriteAroundNativeLinks(s string, rewrite func(string) string, link func(dest, label string) string) string {
+	var b strings.Builder
+	end := 0
+	keep := func(prose string, offset int) {
+		for _, m := range chatNativeLinkRE.FindAllStringSubmatchIndex(prose, -1) {
+			dest, label := prose[m[2]:m[3]], prose[m[4]:m[5]]
+			if linkLabelMisnamesHost(label, dest) {
+				continue
+			}
+			b.WriteString(rewrite(s[end : offset+m[0]]))
+			b.WriteString(link(dest, label))
+			end = offset + m[1]
+		}
+	}
+	gap := 0
+	for _, r := range mdCodeSpanRE.FindAllStringIndex(s, -1) {
+		keep(s[gap:r[0]], gap)
+		gap = r[1]
+	}
+	keep(s[gap:], gap)
 	b.WriteString(rewrite(s[end:]))
 	return b.String()
 }
