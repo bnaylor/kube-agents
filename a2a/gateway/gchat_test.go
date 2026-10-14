@@ -572,10 +572,11 @@ func TestToGchatTextKeepsAnExecutorsChatLink(t *testing.T) {
 		"<https://evil.example/login|https://github.com/x>":        "< https://evil.example/login|https://github.com/x>",
 		"<https://evil.example|**https://good.example**>":          "< https://evil.example|*https://good.example*>",
 		"<https://evil.example|https://good.example@evil.example>": "< https://evil.example|https://good.example@evil.example>",
-		// Markdown link syntax in the text: it is the kept link's text and
-		// never reaches the markdown rules, so it cannot be joined to a
-		// different link; where it names another host the whole is refused
-		// and defanged, and the markdown link inside converts on its own.
+		// Markdown link syntax in the text: it is the kept link's text, and
+		// the markdown link it spells overlaps the kept link, so it is not
+		// converted and cannot be joined to a different link; where it
+		// names another host the whole is refused and defanged, and the
+		// markdown link inside converts on its own.
 		"<https://x.example/a|[doc](https://x.example/b)>":                        "<https://x.example/a|[doc](https://x.example/b)>",
 		"<https://x.example/a|x](https://x.example/b) [y>":                        "<https://x.example/a|x](https://x.example/b) [y>",
 		"<https://evil.example|x](https://good.example) [y>":                      "< https://evil.example|x](https://good.example) [y>",
@@ -607,9 +608,15 @@ func TestToGchatTextKeepsAnExecutorsChatLink(t *testing.T) {
 		"<https://x.example|see `code`>":                 "< https://x.example|see `code`>",
 		"see ``` <https://x.example|doc>":                "see ``` < https://x.example|doc>",
 		"```\nsort <f|uniq\n``` <https://x.example|doc>": "```\nsort <f|uniq\n``` <https://x.example|doc>",
-		// A bold pair around a kept link is left as written: the link
-		// never reaches the markdown rules.
-		"**<https://x.example|doc>**": "**<https://x.example|doc>**",
+		// The markdown rules read a kept link as the link it is: a bold
+		// pair around it or in its text converts, a `**` in its URL is not
+		// half of a pair, and a markdown link that overlaps it is refused
+		// rather than nested with it or cut into it.
+		"**<https://x.example|doc>**":                        "*<https://x.example|doc>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"**a <https://x.example/**/p|doc> b**":               "*a <https://x.example/**/p|doc> b*",
+		"[see <https://x.example|doc>](https://x.example/p)": "[see <https://x.example|doc>](https://x.example/p)",
+		"<https://x.example|a [b> c](https://x.example/p)":   "<https://x.example|a [b> c](https://x.example/p)",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {

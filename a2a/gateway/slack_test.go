@@ -1106,6 +1106,13 @@ func TestToMrkdwnKeepsAnExecutorsSlackLink(t *testing.T) {
 		"<mailto:a@x.example|mail>":                                 "&lt;mailto:a@x.example|mail&gt;",
 		"`<https://x.example|doc>`":                                 "`&lt;https://x.example|doc&gt;`",
 		"see ``` <https://x.example|doc>":                           "see ``` &lt;https://x.example|doc&gt;",
+		// The markdown rules read a kept link as the link it is: the bold
+		// a heading becomes wraps it, and a markdown link around it or
+		// inside it is refused rather than nested.
+		"# Opened <https://x.example/p|PR 3>":                "*Opened <https://x.example/p|PR 3>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"[t](https://evil.example/<https://good.example|x>)": "[t](https://evil.example/<https://good.example|x>)",
+		"<https://x.example/a|[doc](https://x.example/b)>":   "<https://x.example/a|[doc](https://x.example/b)>",
 	}
 	for in, want := range cases {
 		if got := toMrkdwn(in); got != want {

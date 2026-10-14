@@ -275,27 +275,24 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 // the only < and > on the wire are the ones our own deterministic link
 // translation writes or keeps (below), and so a prompt-injected <!channel>
 // inside a code span is as inert as one in prose; the two translations then
-// leave code spans as written, since the task's result is
-// executor output of arbitrary shape and a `**kwargs` or a `**/*.yaml` in
-// it is the answer, not bold. The rules are the ones markdown.go holds for
-// both chat surfaces. Narrow on purpose: full markdown fidelity is
-// presentation polish, and the legacy Hermes path's converter is not this
-// code path's to reuse.
+// leave code spans as written, since the task's result is executor output of
+// arbitrary shape and a `**kwargs` or a `**/*.yaml` in it is the answer, not
+// bold. The rules are the ones markdown.go holds for both chat surfaces.
+// Narrow on purpose: full markdown fidelity is presentation polish, and the
+// legacy Hermes path's converter is not this code path's to reuse.
 //
 // One <url|text> the executor wrote is not escaped: a closed one, in prose,
 // whose URL is http(s) in the markdown link's destination class and whose
-// text does not name another host (rewriteAroundNativeLinks), which is the
-// link rewriteLinks would have written from [text](url), refused on the same
-// label-host ground. Its URL and text are escaped as the rest of the text
-// is, and only its own angle brackets stay live. Its URL must start with
+// text does not name another host (keepChatLinks), which is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground. Its URL and text are escaped as the rest of the text is,
+// and only its own angle brackets stay live. Its URL must start with
 // http(s)://, so a <!channel>, <@U…> or <#C…> is never one, and its text
 // admits no angle bracket, so none rides out inside it.
 func toMrkdwn(text string) string {
-	return rewriteAroundNativeLinks(rewriteSlackBlocks(text), func(rest string) string {
-		return rewriteMarkdown(slackEscaper.Replace(rest), slackLinkRE)
-	}, func(dest, label string) string {
+	return rewriteMarkdown(keepChatLinks(rewriteSlackBlocks(text), slackEscaper.Replace, func(dest, label string) string {
 		return chatLinkOpen + slackEscaper.Replace(dest) + chatLinkSep + slackEscaper.Replace(label) + chatLinkClose
-	})
+	}), slackLinkRE)
 }
 
 var (
