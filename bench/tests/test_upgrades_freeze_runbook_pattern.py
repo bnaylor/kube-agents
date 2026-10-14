@@ -1,10 +1,10 @@
-"""upgrades-freeze-runbook-probe's node-pool check wants the pull-request form.
+"""upgrades-freeze-runbook-probe's node-pool check matches the command, not prose about it.
 
-Since #2937 gke-upgrades sends a node-pool upgrade out as a pull request
-changing ``spec.version`` on the pool's ``ContainerNodePool``, never as a
-``gcloud`` write. The check accepts the field as a dotted path in prose or as
-a ``version:`` line in proposed YAML; a gcloud-only runbook, or YAML that sets
-only the cluster's ``minMasterVersion``, does not pass.
+The report_contains verifier runs ``re.search`` over the whole report after
+``_normalize`` flattens it to one lowercased line, so a sentence naming
+``clusters upgrade`` and ``--node-pool`` looks like a command unless the
+pattern insists on the ``gcloud`` head and on argument-shaped tokens between
+the head and the flag.
 """
 
 from __future__ import annotations
@@ -14,38 +14,37 @@ from pathlib import Path
 
 import yaml
 
-from kube_agents_bench.verifiers import _normalize, _normalize_lines
+from kube_agents_bench.verifiers import _normalize
 
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "upgrades-freeze-runbook-probe" / "task.yaml"
-CHECK = "the-runbook-upgrades-the-pool-by-pull-request"
+CHECK = "the-runbook-uses-clusters-upgrade-node-pool"
 
 
-def _passes(report: str) -> bool:
+def _matches(report: str) -> bool:
     doc = yaml.safe_load(TASK.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    spec = check["check"]
-    text = _normalize(report)
-    if any(_normalize(p) not in text for p in spec["required_phrases"]):
-        return False
-    lines = _normalize_lines(report)
-    return any(_normalize(p) in text for p in spec["any_of_phrases"]) or any(
-        re.search(p, lines) for p in spec["any_of_patterns"]
-    )
+    return any(re.search(p, _normalize(report)) for p in check["check"]["any_of_patterns"])
 
 
-def test_pull_request_runbooks_pass():
+def test_node_pool_upgrade_commands_match():
     for report in (
-        "1. Open a pull request setting `spec.version` on the `default-pool` ContainerNodePool to 1.33.2-gke.1.",
-        "```yaml\napiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\n"
-        "metadata:\n  name: default-pool\nspec:\n  version: 1.33.2-gke.1\n```",
+        "```\ngcloud container clusters upgrade prod-1 \\\n  --node-pool=default-pool \\\n"
+        "  --cluster-version=1.33.2-gke.1 --location us-central1\n```",
+        "gcloud container clusters upgrade $CLUSTER --location=$REGION --node-pool $POOL --cluster-version <version>",
+        "gcloud beta container clusters upgrade prod-1 --node-pool=pool-a",
+        "`gcloud container clusters upgrade prod-1 --location us-central1 --node-pool pool-a`",
     ):
-        assert _passes(report), report
+        assert _matches(report), report
 
 
-def test_gcloud_and_cluster_only_runbooks_fail():
+def test_prose_and_other_commands_do_not_match():
     for report in (
-        "gcloud container clusters upgrade prod-1 --node-pool default-pool --cluster-version 1.33.2-gke.1",
-        "```yaml\nkind: ContainerCluster\nspec:\n  minMasterVersion: 1.33.2-gke.1\n```\n"
-        "The ContainerNodePool follows on auto-upgrade.",
+        "Node pools are upgraded with `clusters upgrade` and the `--node-pool` flag. Runbook: 1. "
+        "`gcloud container node-pools upgrade default-pool --cluster prod-1 --cluster-version X`",
+        "Step 2: `gcloud container node-pools upgrade default-pool --cluster prod-1 --cluster-version "
+        "1.33.2-gke.1` (note: `clusters upgrade` is the control-plane form; add `--node-pool` only for a single pool)",
+        "gcloud container clusters upgrade prod-1 --master --cluster-version X; then set --node-pool-soak-duration",
+        "gcloud container clusters upgrade prod-1 --cluster-version X, then repeat with --node-pool for each pool",
+        "gcloud container clusters upgrade prod-1 --node-pool-soak-duration=600s",
     ):
-        assert not _passes(report), report
+        assert not _matches(report), report
