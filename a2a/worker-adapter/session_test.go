@@ -3,6 +3,7 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -456,5 +457,50 @@ func TestSessionReuseIsRefusedWithoutASessionOfItsOwn(t *testing.T) {
 	cfg = Config{SessionReuse: true, Profile: "p"}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("SessionReuse with no session validated")
+	}
+}
+
+// A reused pod's watcher refuses a new task it cannot show it has the
+// submission for. When the per-subject cap has evicted the submission, the
+// oldest surviving steer comes first, and running it as the request is what
+// the refusal stops. Nothing pending behind the first message is the proof, so
+// a real submission with a steer already behind it is refused too: a session
+// cannot see the cap.
+func TestTheWatcherRefusesANewTaskItCannotShowIsASubmission(t *testing.T) {
+	const session, taskID = "sess", "t1"
+	const renderCap, evictingCap = 4096, 2
+	for _, tc := range []struct {
+		name     string
+		cap      int64
+		messages []string
+		take     string // the text taken as the submission; "" for a refusal
+	}{
+		{name: "the submission alone", cap: renderCap, messages: []string{"the request"}, take: "the request"},
+		{name: "the submission evicted", cap: evictingCap, messages: []string{"the request", "steer one", "steer two"}},
+		{name: "a steer already behind the submission", cap: renderCap, messages: []string{"the request", "steer one"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js, cleanup := capTasksStream(t, tc.cap)
+			defer cleanup()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			for _, text := range tc.messages {
+				publishMessage(ctx, t, js, lib.TaskInSubject(session, taskID), text)
+			}
+			w := &taskWatcher{js: js, log: slog.Default(), stem: session, addr: session, next: 1, handled: map[string]bool{}}
+			env, _, err := w.nextTask(ctx)
+			if tc.take == "" {
+				if !errors.Is(err, errSubmissionUnproven) {
+					t.Fatalf("nextTask = %v, %v; want a refusal", env, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("nextTask: %v", err)
+			}
+			if !strings.Contains(string(env.Payload), tc.take) {
+				t.Fatalf("took %s, want %q", env.Payload, tc.take)
+			}
+		})
 	}
 }

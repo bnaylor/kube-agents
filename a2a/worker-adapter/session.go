@@ -141,6 +141,11 @@ func (w *taskWatcher) nextTask(ctx context.Context) (*lib.Envelope, uint64, erro
 			if err == nil {
 				return env, seq, nil
 			}
+			if errors.Is(err, errSubmissionUnproven) {
+				// Not the consumer's fault, and a new consumer would read
+				// the same thing.
+				return nil, 0, err
+			}
 			if healthy {
 				failures = 0
 			}
@@ -195,7 +200,11 @@ func (w *taskWatcher) read(ctx context.Context, cons jetstream.Consumer) (*lib.E
 					msgs = nil
 					continue
 				}
-				if env, seq, isTask := w.take(msg); isTask {
+				env, seq, isTask, err := w.take(msg)
+				if err != nil {
+					return nil, 0, true, err
+				}
+				if isTask {
 					return env, seq, true, nil
 				}
 			}
@@ -208,13 +217,35 @@ func (w *taskWatcher) read(ctx context.Context, cons jetstream.Consumer) (*lib.E
 	}
 }
 
+// errSubmissionUnproven is the watcher refusing a new task whose first message
+// it cannot show is the submission (take says how it tells).
+var errSubmissionUnproven = errors.New("cannot show the first message of a new task is its submission")
+
 // take decides whether one message is a new task's submission, advancing the
-// watcher's position either way.
-func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool) {
+// watcher's position either way. An error is a new task it refuses to run.
+//
+// The submission is the first message on its task's `…in` subject, and the
+// gateway publishes nothing else there until it has published it. The
+// watcher reads this session's subjects in stream order from a position
+// before that submission, so the first message it sees for a task it has not
+// run is the submission, unless TASKS evicted it: the per-subject cap
+// (max_msgs_per_subject, discard old) drops a subject's oldest message, and
+// the oldest surviving steer then comes first. A steer is kind:message on the
+// same subject with the same task id, and nothing in the envelope tells it
+// from a submission (fetchOriginAtSeq says the same of the first task), so
+// the check is on how many messages wait behind it. An eviction leaves the
+// subject full, every message on it behind the one delivered, so NumPending
+// is at least the cap less one. With nothing pending, nothing was evicted on
+// any cap of two or more (the render's is 4096). Anything pending is refused,
+// a real submission with a steer already behind it included: the cap is not
+// visible to a session, and running a steer as the request is the one thing
+// this must not do. The refusal ends the pod; the gateway's sweep closes the
+// task and the next turn starts a fresh pod with the conversation so far.
+func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, error) {
 	md, err := msg.Metadata()
 	if err != nil {
 		w.log.Error("task watcher skipping a message with no metadata", "subject", msg.Subject(), "err", err)
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	seq := md.Sequence.Stream
 	if seq >= w.next {
@@ -223,10 +254,10 @@ func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool) {
 	env, err := lib.ParseEnvelope(msg.Data())
 	if err != nil {
 		w.log.Error("task watcher skipping an unparseable envelope", "subject", msg.Subject(), "err", err)
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	if env.Kind != lib.KindMessage || w.handled[env.TaskID] {
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	// The task id has to be the one its subject names, or the task would
 	// run under one id and read its steers and cancel from another. Only
@@ -235,14 +266,18 @@ func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool) {
 	if msg.Subject() != lib.TaskInSubject(w.addr, env.TaskID) {
 		w.log.Error("task watcher skipping a submission whose task id disagrees with its subject",
 			"subject", msg.Subject(), "taskId", env.TaskID)
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	if env.To != nil && env.To.Session != w.addr {
 		w.log.Error("task watcher skipping a to/addressee mismatch", "subject", msg.Subject(), "to", env.To.Session)
-		return nil, 0, false
+		return nil, 0, false, nil
 	}
 	w.handled[env.TaskID] = true
-	return env, seq, true
+	if md.NumPending > 0 {
+		return nil, 0, false, fmt.Errorf("task %s at %s sequence %d has %d message(s) behind it, so TASKS may have evicted its submission and this may be a steer (max_msgs_per_subject with discard=old); refusing to run it, and ending this pod so the next turn starts fresh: %w",
+			env.TaskID, msg.Subject(), seq, md.NumPending, errSubmissionUnproven)
+	}
+	return env, seq, true, nil
 }
 
 // delegateOffForTask reports whether a task runs without the delegate tool,
