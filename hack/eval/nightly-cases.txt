@@ -266,11 +266,10 @@
 # file's fourteen.
 #
 # 2026-10-14 adds scale-request-proposes-pr: one case, three units, deployer:
-# noop at the 200s default, about 10 serial minutes. It is the last entry
-# below, after upgrades-audit-reports-upgrade-blocked, and makes this file
-# seventy-two cases (216 units) of an eighty-six-case, 258-unit matrix
-# (counted over the entries, not from the tally above, which was two short on
-# main).
+# noop at the 200s default, about 10 serial minutes. It sits below, after
+# upgrades-audit-reports-upgrade-blocked, and makes this file seventy-three
+# cases (219 units) of an eighty-seven-case, 261-unit matrix (counted over the
+# entries, not from the tallies above, which run short of main's own list).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -824,6 +823,13 @@
 # scale (#2937's skills sweep); the case grades that the reply proposes the
 # scaled manifest (inline or as a pull request, which its pull_request_opened
 # leaf requests, so it runs in the writers part) and that no worker ran a
-# kubectl write or called a write tool. Nightly from its first merge; a
+# kubectl write. Nightly from its first merge; a
 # presubmit seat waits on a clean nightly record.
 ./tasks/scale-request-proposes-pr/task.yaml
+
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
