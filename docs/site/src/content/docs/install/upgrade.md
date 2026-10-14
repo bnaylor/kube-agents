@@ -258,7 +258,10 @@ gateway.
 ### Before the switch
 
 1. Check that Slack answers now, as in [Checking the result](#slack).
-2. Check the Slack settings `next` depends on:
+2. Check the Slack settings `next` depends on. A full upgrade refuses a switch to `next` that
+   would hand the gateway a setting it cannot use, and names it
+   ([When an upgrade is refused](#when-an-upgrade-is-refused)); `--plan` warns of the same
+   ones. Checking first saves a refused run:
    - The bot token is one `xoxb-` token, not a comma-separated list: the A2A gateway takes a
      single workspace's token
      ([Get the tokens](/kube-agents/install/slack-app/#get-the-tokens)). This counts the
@@ -447,7 +450,7 @@ To roll back to an older release, switch to `today` first:
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first three are
-settled before the run touches the cluster at all. The last three need the cluster: they are settled
+settled before the run touches the cluster at all. The last four need the cluster: they are settled
 after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
 skips those — but still before any CRD, chart or Terraform change of the new release.
 
@@ -479,6 +482,20 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
+- **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
+  `install.env`. With `next`, Slack on and Google Chat off, the A2A gateway takes Slack, and the run
+  refuses three settings it cannot use, naming each one:
+  - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
+    email matches nobody. Replace it with the person's member ID (in Slack, their profile, then
+    **⋮** (More), then **Copy member ID**).
+  - a `SLACK_HOME_CHANNEL` that is not a channel ID (`C...` or `G...`): the gateway's notify route
+    does not arm, so proactive posts and board-card reports stop. The ID is at the bottom of the
+    channel details' About tab.
+  - a `SLACK_BOT_TOKEN` that holds several tokens, or one with a comma or space left in it: the
+    gateway takes one workspace's token, whole. The run gives the count, never the token. Keep a
+    multi-workspace install on `today`.
+
+  `--plan` warns of the same three without refusing.
 
 ## Where to go next
 
