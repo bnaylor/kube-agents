@@ -507,7 +507,7 @@ class TestTheStepGate(unittest.TestCase):
     worker closed the card ``done``. Steps declared on the card hold it."""
 
     SCHEMA = """
-    CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, body TEXT);
+    CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, body TEXT, assignee TEXT);
     CREATE TABLE task_comments (
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
         author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -523,15 +523,16 @@ class TestTheStepGate(unittest.TestCase):
 
     def card(self, body="", task_id=STEP_CARD):
         self.conn.execute(
-            "INSERT INTO tasks (id, status, result, body) VALUES (?, 'running', NULL, ?)", (task_id, body)
+            "INSERT INTO tasks (id, status, result, body, assignee) VALUES (?, 'running', NULL, ?, 'platform')",
+            (task_id, body),
         )
         self.conn.commit()
 
-    def comment(self, body, task_id=STEP_CARD, at=None):
+    def comment(self, body, task_id=STEP_CARD, at=None, author="platform"):
         self.clock += 1
         self.conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'platform', ?, ?)",
-            (task_id, body, self.clock if at is None else at),
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, author, body, self.clock if at is None else at),
         )
         self.conn.commit()
 
@@ -628,22 +629,21 @@ class TestTheStepGate(unittest.TestCase):
         self.assertIsNotNone(self.gate())
         self.assertIsNotNone(self.gate())
 
-    def test_prose_that_mentions_a_step_is_not_a_plan(self):
-        self.card(
-            "Step 1: Planned maintenance window is Sunday.\n"
-            "Step two: failed pods are restarted by the controller.\n"
-            "The next step: done by Friday."
-        )
-        self.assertEqual({}, kcs.card_steps(self.conn, STEP_CARD))
-        self.assertIsNone(self.gate())
+    def test_only_the_assignees_comments_count(self):
+        # The front door relays a thread reply verbatim on a needs_input card.
+        self.card("step substrate: planned")
+        self.comment("step substrate: failed - helm has no credentials")
+        self.comment("step substrate: done", author="default")
+        self.comment("step extra: planned", author="default")
+        self.assertEqual({"substrate": "failed"}, kcs.card_steps(self.conn, STEP_CARD))
+        self.assertIn("`substrate` (failed)", self.gate())
 
-    def test_a_hedged_status_is_not_done_and_a_reason_is_allowed(self):
-        self.card("step substrate: planned\nstep cluster: planned\nstep pool: planned")
-        self.comment("step substrate: done-ish except helm failed")
-        self.comment("1. step cluster: done (PR #12)\n2) step pool: done - labels set")
-        self.assertEqual(
-            {"substrate": "planned", "cluster": "done", "pool": "done"}, kcs.card_steps(self.conn, STEP_CARD)
-        )
+    def test_closing_punctuation_and_a_comma_reason_still_record_the_status(self):
+        self.card("step a: planned.\nstep b: planned\nstep c: planned\nstep d: planned")
+        self.comment("step a: done.\r\nstep b: done, see PR #12\nstep c: done; labels set\nstep d: done!")
+        self.assertEqual({"a": "done", "b": "done", "c": "done", "d": "done"}, kcs.card_steps(self.conn, STEP_CARD))
+        self.card("step e: done-ish. step f: planned..", task_id="t_hedge")
+        self.assertEqual({}, kcs.card_steps(self.conn, "t_hedge"))
 
     def test_another_cards_steps_do_not_count(self):
         self.card("Provision a cluster.")

@@ -293,8 +293,15 @@ check(
 print("the #2935 step replay:")
 
 
-def tool_comment(task_id, body):
-    out = json.loads(kt._handle_comment({"task_id": task_id, "body": body}))
+def tool_comment(task_id, body, profile="platform"):
+    # The dispatcher sets HERMES_PROFILE to the card's assignee for its worker;
+    # the handler stamps it as the comment's author. The front door is
+    # ``default``.
+    os.environ["HERMES_PROFILE"] = profile
+    try:
+        out = json.loads(kt._handle_comment({"task_id": task_id, "body": body}))
+    finally:
+        os.environ.pop("HERMES_PROFILE", None)
     if not out.get("ok"):
         raise AssertionError(f"kanban_comment failed: {out}")
 
@@ -320,6 +327,13 @@ check("the refusal names the failed step", "`substrate` (failed)" in held, held)
 check("the card stays open", status(provision) == "running", f"status={status(provision)}")
 again = tool_complete(result=INCIDENT)
 check("the refusal is not rationed: the retry is refused too", "kanban_complete refused" in again, again)
+tool_comment(provision, "step substrate: done", profile="default")
+relayed = tool_complete(result=INCIDENT)
+check(
+    "a step line the front door relays does not count",
+    "`substrate` (failed)" in relayed,
+    relayed,
+)
 blocked = tool_block("needs_input", reason="substrate not installed; cluster c1 created, delete with ...")
 check("a needs_input block is the way out", "refused" not in blocked, blocked)
 check("the card ends blocked, not done", status(provision) == "blocked", f"status={status(provision)}")

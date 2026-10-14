@@ -175,9 +175,12 @@ such run ends the card ``blocked`` by upstream's failure limit. None of those
 paths is ``done``. A card with no step line anywhere completes as before.
 Every read fails open.
 
-Who wrote a line is not checked: a comment's ``author`` is the profile name,
-and the worker and the card that filed it are usually the same profile, so it
-cannot tell them apart. The gate makes an undelivered completion an explicit
+Only the assignee's comments count. A comment's ``author`` is the writer's
+profile name, and the front door (the ``default`` profile) comments on a
+``needs_input`` card with the user's answer verbatim, so a thread reply such as
+``step substrate: done`` would otherwise rewrite the worker's record. The worker
+and the card that filed it are usually the same profile, so the gate cannot
+tell those two apart. The gate makes an undelivered completion an explicit
 false statement rather than an easy one; it does not stop a worker that writes
 ``done`` over a step it did not do.
 
@@ -234,12 +237,14 @@ MAX_LISTED_CHILDREN = 10
 #: A step line: ``step <key>: <status>``, anywhere in a card's body or a
 #: comment, one per line, optionally as a list item. The key starts with a
 #: letter and is a short slug, and the status word must end the line or be
-#: followed by a separated reason (`` - ...``, ``: ...``, `` (...)``), so prose
+#: followed by a separated reason (`` - ...``, ``: ...``, `` (...)``, ``, ...``,
+#: ``; ...``) or one closing punctuation mark, so prose
 #: such as "Step 1: Planned maintenance is Sunday" or "Step two: failed pods are
 #: restarted" is not a plan, and "done-ish" is not ``done``.
 STEP_LINE_RE = re.compile(
     r"^[ \t>*-]*(?:\d+[.)][ \t]*)?step[ \t]+([a-z][a-z0-9-]{0,39})[ \t]*:[ \t]*"
-    r"(planned|done|failed)(?=[ \t]*$|[ \t]+[-\u2013\u2014(]|[ \t]*[\u2013\u2014:(])",
+    r"(planned|done|failed)"
+    r"(?=[ \t]*[.,;!]?[ \t]*\r?$|[ \t]*[,;][ \t]|[ \t]+[-\u2013\u2014(]|[ \t]*[\u2013\u2014:(])",
     re.IGNORECASE | re.MULTILINE,
 )
 #: The one status that settles a step.
@@ -248,9 +253,16 @@ STEP_DONE = "done"
 MAX_LISTED_STEPS = 10
 
 _CARD_BODY_SQL = "SELECT COALESCE(body, '') FROM tasks WHERE id = ?"
-#: Comments in the order they were written; the id breaks a same-second tie.
+#: The card's assignee's comments in the order they were written; the id
+#: breaks a same-second tie. Only the assignee's: the front door comments on a
+#: ``needs_input`` card with the user's answer verbatim, so its lines are not
+#: the worker's record. Compared the way upstream normalizes a profile name
+#: (``normalize_profile_name``: trimmed, lowercase), since the dispatcher sets
+#: the worker's ``HERMES_PROFILE``, and so its comments' author, from that.
 _CARD_COMMENTS_SQL = (
-    "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at, id"
+    "SELECT c.body FROM task_comments c JOIN tasks t ON t.id = c.task_id"
+    " WHERE c.task_id = ? AND lower(trim(c.author)) = lower(trim(t.assignee))"
+    " ORDER BY c.created_at, c.id"
 )
 
 STEPS_REFUSAL = (
