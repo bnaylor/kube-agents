@@ -232,15 +232,18 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
-    # The above-one-replica shape. Its anchor is the leader Role's pods rule,
-    # because that rule is the only reason the fixture is registered here:
-    # every other golden is single-replica and renders it away, so without
-    # this key group C bounds the leader Role only in the shape where it holds
-    # no write verb on pods at all.
+    # The CR that asks for availability.replicas: 3. The operator caps the
+    # gateway at one replica, so this renders the single-replica shape: the
+    # gateway Deployment on Recreate and a leader Role holding leases only.
+    # No golden renders the leader Role's pods rule any more, because no
+    # install does. It stays registered so group C's bounds keep reading the
+    # one CR that would render that rule if the cap were lifted; the Recreate
+    # anchor is the cap, and losing it means the multi-replica shape is back
+    # and this key's comment is wrong.
     "golden_ha": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
         "platformagent-ha.yaml",
-        ("kind: Deployment", "kubeagents:leader:", "- pods"),
+        ("kind: Deployment", "kubeagents:leader:", "type: Recreate"),
     ),
     # C1's cross-module pair. The session fence is rendered by the operator
     # (Go module k8s-operator) and its selector has to match the labels the
