@@ -5,9 +5,9 @@ sidebar:
   order: 6
 ---
 
-kube-agents proposes changes; it never applies them. The [declarative workflow](/kube-agents/concepts/declarative-workflow/) ends at a merged pull request, and something else has to turn that merge into live infrastructure. The [reference GitOps layout](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) calls that something "the customer's CI/CD" and leaves the choice to you.
+kube-agents proposes changes; it never applies them. The [declarative workflow](/kube-agents/concepts/declarative-workflow/) ends at a merged pull request, and something else has to turn that merge into live infrastructure. The [reference GitOps layout](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) applies YAML from CI and, when you need Helm charts or workloads on a cluster created in the same pull request, recommends **Config Sync on every cluster, enrolled through Config Connector** ([Reconciler](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo#reconciler)).
 
-This page covers one such choice end to end: **ArgoCD** as the reconciler, with **Config Connector (KCC)** provisioning Google Cloud resources from the same repo. It is not the only option — Flux and Config Sync fit the same contract — but it is the one the agent's own tooling is most often pointed at, and the setup has enough sharp edges to be worth writing down.
+This page covers a different choice end to end: **ArgoCD** as the reconciler, with **Config Connector (KCC)** provisioning Google Cloud resources from the same repo. Flux fits the same contract too. The fleet audit currently traces chart workloads back to their declarations only through an Argo CD `Application` or a Flux `HelmRelease`, not yet through a Config Sync `RootSync` ([#3072](https://github.com/gke-labs/kube-agents/issues/3072)), which is a reason to pick one of those two today. The setup has enough sharp edges to be worth writing down.
 
 Nothing here is required by kube-agents. The agent is indifferent to which reconciler you run; it only needs one to exist.
 

@@ -75,7 +75,11 @@ already exists; see the end of this section for a cluster created in the same ap
 in the same pull request, add a reconciler that syncs the repository. The one this layout recommends
 is **Config Sync on every cluster, enrolled through Config Connector**: it renders Helm charts, and it
 can take on a cluster created in the same pull request, because every object that enrolls the cluster
-names it by values known before it exists (project, location and cluster name).
+names it by values known before it exists (project, location and cluster name). One gap today: the
+fleet audit traces a chart workload to its declaration only through an Argo CD `Application` or a
+Flux `HelmRelease`, so on this layout its findings on chart workloads are `manual` rather than a
+pull request until it also reads `RootSync`s
+([#3072](https://github.com/gke-labs/kube-agents/issues/3072)).
 
 Config Sync then applies each cluster's `clusters/<cluster>/namespaces/`, and the pipeline keeps
 applying everything else (`provisioning/` and `fleet/` where Config Connector runs, `agents/` and
