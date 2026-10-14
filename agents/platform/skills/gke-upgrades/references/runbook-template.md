@@ -4,14 +4,14 @@ Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME
 
 > A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
-Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`; each check step is a read command.
+Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`, except a node pool's version, which is a step for the platform operator (a `spec.version` in the repository pins a release-channel pool against auto-upgrade); each check step is a read command.
 
 ## Table of Contents
 - [Pre-flight](#pre-flight) (Line 16-35)
 - [Control plane upgrade](#control-plane-upgrade) (Line 36-47)
-- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-60)
-- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-69)
-- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 70-118)
+- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-71)
+- [Maintenance window configuration](#maintenance-window-configuration) (Line 72-80)
+- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 81-137)
 
 ## Pre-flight
 
@@ -47,7 +47,18 @@ kubectl get pods -n kube-system
 
 ## Node pool upgrade (Standard only)
 
-Propose the pool's surge settings (`spec.upgradeSettings.maxSurge: MAX_SURGE`, `spec.upgradeSettings.maxUnavailable: MAX_UNAVAILABLE`) and its version (`spec.version: TARGET_VERSION`) on its `ContainerNodePool` as a pull request. After it merges and applies:
+Propose the pool's surge settings (`spec.upgradeSettings.maxSurge: MAX_SURGE`, `spec.upgradeSettings.maxUnavailable: MAX_UNAVAILABLE`) on its `ContainerNodePool` as a pull request. The version change is not part of it: a `spec.version` in the repository pins a release-channel pool against auto-upgrade, so once the surge settings apply, the upgrade is a step for the platform operator to run, not one to run from here:
+
+```bash
+# Platform operator step (node pools upgrade through `clusters upgrade
+# --node-pool`; there is no `gcloud container node-pools upgrade` command)
+gcloud container clusters upgrade CLUSTER_NAME \
+  --node-pool NODE_POOL_NAME \
+  --cluster-version TARGET_VERSION \
+  --location LOCATION
+```
+
+Then check:
 
 ```bash
 # Monitor progress
@@ -79,11 +90,19 @@ A downgrade to `TARGET_PREVIOUS_VERSION` has no declarative path in a Config Con
 
 ### Downgrade Node Pool (Direct)
 
-Propose `spec.version: TARGET_PREVIOUS_VERSION` on the pool's `ContainerNodePool` as a pull request.
+A step for the platform operator, not a pull request: a `spec.version: TARGET_PREVIOUS_VERSION` in the repository would hold the pool at the old version indefinitely, against the release channel's patches.
+
+```bash
+# Platform operator step
+gcloud container clusters upgrade CLUSTER_NAME \
+  --node-pool NODE_POOL_NAME \
+  --cluster-version TARGET_PREVIOUS_VERSION \
+  --location LOCATION
+```
 
 ### Downgrade Node Pool (Safe migration - recommended)
 
-Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
+Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` (`spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`, no `spec.version`) as a pull request. Once it is up, the platform operator moves it to the previous version with `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME-rollback --cluster-version PREVIOUS_VERSION --location LOCATION`, for the same reason as the direct downgrade. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
 
 ```bash
 # Record current PDB state BEFORE touching anything — this file is how you put

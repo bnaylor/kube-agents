@@ -1,9 +1,9 @@
 Subject: Propose changes as a pull request instead of naming write tools
 
-Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935). A node pool's version change is the one exception: a `spec.version` in the repository pins a release-channel pool against auto-upgrade (`bench/tf/fleet/main.tf` documents the same fight in Terraform), so the patch keeps the `gcloud container clusters upgrade --node-pool` command as a step for the platform operator rather than a pull request.
 Local-Issue: #2937
 Upstream-Issue: none (specific to this repository)
-Retire-When: never; kube-agents proposes every change as a pull request
+Retire-When: never; kube-agents proposes every change as a pull request, or a node pool's version change as a platform-operator step
 
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md
@@ -12,7 +12,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  Always frame guidance around the auto-upgrade model: auto-upgrade with maintenance windows and exclusions is the preferred control mechanism.
  
-+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes. An upgrade reaches the cluster as a pull request changing the version or release-channel field (`spec.minMasterVersion` or `spec.releaseChannel.channel` on the `ContainerCluster`, `spec.version` on a `ContainerNodePool`), never as `gcloud container clusters upgrade`.
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes. A control-plane upgrade reaches the cluster as a pull request changing the version floor or release-channel field (`spec.minMasterVersion` or `spec.releaseChannel.channel` on the `ContainerCluster`). A node-pool version change (an upgrade, a downgrade or rollback, or resuming a stopped upgrade) is an operation, not desired state: write the exact `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version VERSION --location LOCATION` command as a step for the platform operator to run, not one to run from here, and never propose `spec.version` on a `ContainerNodePool`. A pool on a release channel cannot turn auto-upgrade off, so a version pinned in the repository fights it: Config Connector moves the pool back to the pin after each automatic upgrade, re-rolling its nodes, and a rollback pin holds the pool at the old version indefinitely. The pool's upgrade strategy (`spec.upgradeSettings`) is desired state and stays a pull request.
 +
  ## Context Gathering
  
@@ -33,7 +33,7 @@ diff --git a/SKILL.md b/SKILL.md
  ## Maintenance runbooks
  
 -Produce step-by-step runbooks with actual `gcloud` and `kubectl` commands. See `references/runbook-template.md` for the standard command sequences.
-+Produce step-by-step runbooks in which each change is a pull request editing the field in the GitOps repository's format and each check is an actual `gcloud` or `kubectl` read command. See `references/runbook-template.md` for the standard sequences.
++Produce step-by-step runbooks in which each change is a pull request editing the field in the GitOps repository's format, a node pool's version change is the exact `gcloud container clusters upgrade --node-pool` command as a step for the platform operator, and each check is an actual `gcloud` or `kubectl` read command. See `references/runbook-template.md` for the standard sequences.
  
 -**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by patch a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
 +**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by pull request a numbered step with its own verification, not a closing remark. A runbook that sets `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
@@ -58,7 +58,7 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
  
 +> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 +
-+Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`; each check step is a read command.
++Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`, except a node pool's version, which is a step for the platform operator (a `spec.version` in the repository pins a release-channel pool against auto-upgrade); each check step is a read command.
 +
  ## Table of Contents
 -- [Pre-flight](#pre-flight) (Line 12-31)
@@ -68,9 +68,9 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 -- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 111-151)
 +- [Pre-flight](#pre-flight) (Line 16-35)
 +- [Control plane upgrade](#control-plane-upgrade) (Line 36-47)
-+- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-60)
-+- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-69)
-+- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 70-118)
++- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-71)
++- [Maintenance window configuration](#maintenance-window-configuration) (Line 72-80)
++- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 81-137)
  
  ## Pre-flight
  
@@ -90,7 +90,7 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
  gcloud container clusters describe CLUSTER_NAME \
    --zone ZONE \
    --format="value(currentMasterVersion)"
-@@ -47,21 +47,9 @@ kubectl get pods -n kube-system
+@@ -47,21 +47,20 @@ kubectl get pods -n kube-system
  
  ## Node pool upgrade (Standard only)
  
@@ -101,20 +101,28 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 -  --zone ZONE \
 -  --max-surge-upgrade MAX_SURGE \
 -  --max-unavailable-upgrade MAX_UNAVAILABLE
--
++Propose the pool's surge settings (`spec.upgradeSettings.maxSurge: MAX_SURGE`, `spec.upgradeSettings.maxUnavailable: MAX_UNAVAILABLE`) on its `ContainerNodePool` as a pull request. The version change is not part of it: a `spec.version` in the repository pins a release-channel pool against auto-upgrade, so once the surge settings apply, the upgrade is a step for the platform operator to run, not one to run from here:
+ 
 -# Upgrade (note: node pool upgrades use `clusters upgrade --node-pool`;
 -# there is no `gcloud container node-pools upgrade` command)
--gcloud container clusters upgrade CLUSTER_NAME \
++```bash
++# Platform operator step (node pools upgrade through `clusters upgrade
++# --node-pool`; there is no `gcloud container node-pools upgrade` command)
+ gcloud container clusters upgrade CLUSTER_NAME \
 -  --zone ZONE \
--  --node-pool NODE_POOL_NAME \
+   --node-pool NODE_POOL_NAME \
 -  --cluster-version TARGET_VERSION
-+Propose the pool's surge settings (`spec.upgradeSettings.maxSurge: MAX_SURGE`, `spec.upgradeSettings.maxUnavailable: MAX_UNAVAILABLE`) and its version (`spec.version: TARGET_VERSION`) on its `ContainerNodePool` as a pull request. After it merges and applies:
++  --cluster-version TARGET_VERSION \
++  --location LOCATION
++```
++
++Then check:
  
 +```bash
  # Monitor progress
  watch 'kubectl get nodes -o wide -L cloud.google.com/gke-nodepool'
  
-@@ -72,114 +60,59 @@ kubectl get pods -A | grep -v Running | grep -v Completed
+@@ -72,114 +71,67 @@ kubectl get pods -A | grep -v Running | grep -v Completed
  
  ## Maintenance window configuration
  
@@ -178,14 +186,18 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 +A downgrade to `TARGET_PREVIOUS_VERSION` has no declarative path in a Config Connector repository (`spec.minMasterVersion` is a floor GKE upgrades past, not a downgrade), so the agent blocks rather than inventing a field.
  
  ### Downgrade Node Pool (Direct)
--```bash
--gcloud container clusters upgrade CLUSTER_NAME \
--  --zone ZONE \
--  --node-pool NODE_POOL_NAME \
--  --cluster-version TARGET_PREVIOUS_VERSION
--```
 +
-+Propose `spec.version: TARGET_PREVIOUS_VERSION` on the pool's `ContainerNodePool` as a pull request.
++A step for the platform operator, not a pull request: a `spec.version: TARGET_PREVIOUS_VERSION` in the repository would hold the pool at the old version indefinitely, against the release channel's patches.
++
+ ```bash
++# Platform operator step
+ gcloud container clusters upgrade CLUSTER_NAME \
+-  --zone ZONE \
+   --node-pool NODE_POOL_NAME \
+-  --cluster-version TARGET_PREVIOUS_VERSION
++  --cluster-version TARGET_PREVIOUS_VERSION \
++  --location LOCATION
+ ```
  
  ### Downgrade Node Pool (Safe migration - recommended)
 -```bash
@@ -199,7 +211,7 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
  
 -# Cordon old pool
 -kubectl cordon -l cloud.google.com/gke-nodepool=NODE_POOL_NAME
-+Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
++Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` (`spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`, no `spec.version`) as a pull request. Once it is up, the platform operator moves it to the previous version with `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME-rollback --cluster-version PREVIOUS_VERSION --location LOCATION`, for the same reason as the direct downgrade. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
  
 +```bash
  # Record current PDB state BEFORE touching anything — this file is how you put
@@ -400,14 +412,14 @@ diff --git a/references/troubleshooting.md b/references/troubleshooting.md
  2. **Open Support Case**: Immediately open a P1/P2 Google Cloud Support case, citing urgent certificate expiration and stockout.
  3. **Retry in Different Zone/Region**: If the cluster is regional or multi-zonal, check if you can retry the upgrade in a different zone that might have capacity, or add a temporary node pool in a different zone/region to migrate workloads.
 -4. **Credential Rotation**: Perform a control plane credential rotation to renew certificates without upgrading the GKE version.
--   ```bash
++4. **Credential Rotation**: A control plane credential rotation renews certificates without upgrading the GKE version. It has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
++5. **Enable DNS Endpoint**: If client connectivity is failing or at risk due to expired client certificates, enable the DNS-based control plane endpoint to allow IAM-based authentication: `spec.controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic` on the cluster's `ContainerCluster`, proposed as a pull request. Then get credentials using the DNS endpoint:
+    ```bash
 -   gcloud container clusters update CLUSTER_NAME --start-credential-rotation --zone ZONE
 -   # Follow standard GKE documentation to complete the rotation.
 -   ```
 -5. **Enable DNS Endpoint**: If client connectivity is failing or at risk due to expired client certificates, enable the DNS-based control plane endpoint to allow IAM-based authentication.
-+4. **Credential Rotation**: A control plane credential rotation renews certificates without upgrading the GKE version. It has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
-+5. **Enable DNS Endpoint**: If client connectivity is failing or at risk due to expired client certificates, enable the DNS-based control plane endpoint to allow IAM-based authentication: `spec.controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic` on the cluster's `ContainerCluster`, proposed as a pull request. Then get credentials using the DNS endpoint:
-    ```bash
+-   ```bash
 -   gcloud container clusters update CLUSTER_NAME --enable-dns-access --zone ZONE
 -   # Get credentials using DNS endpoint:
     gcloud container clusters get-credentials CLUSTER_NAME --dns-endpoint --zone ZONE
@@ -433,26 +445,28 @@ diff --git a/references/troubleshooting.md b/references/troubleshooting.md
 -     --zone ZONE \
 -     --cluster-version PREVIOUS_VERSION
 -   ```
-+3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version: `spec.version: PREVIOUS_VERSION` on its `ContainerNodePool`, proposed as a pull request.
++3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version. This is a step for the platform operator, not a pull request: a `spec.version` in the repository would hold a release-channel pool at the old version against auto-upgrade. The command for the operator: `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version PREVIOUS_VERSION --location LOCATION`.
  
  ## 10. Upgrade paused or partially completed (check auto-upgrade status)
  
-@@ -225,13 +184,7 @@ gcloud container node-pools get-upgrade-info POOL_NAME --cluster CLUSTER_NAME --
+@@ -225,12 +184,12 @@ gcloud container node-pools get-upgrade-info POOL_NAME --cluster CLUSTER_NAME --
  - `CLUSTER_DISRUPTION_BUDGET` / `CLUSTER_DISRUPTION_BUDGET_MINOR_UPGRADE` — a post-operation cooldown protecting cluster stability.
  - `SYSTEM_CONFIG` — temporarily paused by GKE for technical or business reasons. **Do not force a manual upgrade unless it is required.**
  
 -**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade:
--```bash
--gcloud container clusters upgrade CLUSTER_NAME \
++**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade. This is a step for the platform operator, not a pull request: a `spec.version` in the repository would pin a release-channel pool against auto-upgrade. The command for the operator:
+ ```bash
+ gcloud container clusters upgrade CLUSTER_NAME \
 -  --node-pool=NODE_POOL_NAME \
 -  --location=LOCATION \
 -  --cluster-version VERSION
--```
-+**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by making sure its `ContainerNodePool` holds the target `spec.version: VERSION`. If the repository already holds it, there is nothing to propose: Config Connector reconciles toward it on its own, so check its status rather than opening an empty pull request; otherwise propose the version through `gcp-config-connector`.
++  --node-pool NODE_POOL_NAME \
++  --cluster-version VERSION \
++  --location LOCATION
+ ```
  A partially-upgraded node pool runs mixed versions until you resume it or roll it back.
  
- ## 11. Upgrade too slow or too disruptive (tune blue-green soak)
-@@ -243,14 +196,7 @@ Blue-green upgrades add batch/soak controls that surge upgrades don't have. Use
+@@ -243,14 +202,7 @@ Blue-green upgrades add batch/soak controls that surge upgrades don't have. Use
  - `BATCH_SOAK_DURATION` — wait after each batch drain (default `0s`).
  - `NODE_POOL_SOAK_DURATION` — wait after all batches drain, before the blue pool is deleted (default `3600s`).
  

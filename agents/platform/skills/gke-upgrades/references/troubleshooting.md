@@ -158,7 +158,7 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
 **Fix:**
 1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, pin the node pool to the previous working driver version (e.g., `R535`) in `spec.nodeConfig.guestAccelerator[].gpuDriverInstallationConfig.gpuDriverVersion`. `guestAccelerator` is immutable on a `ContainerNodePool` (create-only in the `gcp-config-connector` skill's container catalogue), so propose a new pool with it as a pull request and move the workloads.
 2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
-3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version: `spec.version: PREVIOUS_VERSION` on its `ContainerNodePool`, proposed as a pull request.
+3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version. This is a step for the platform operator, not a pull request: a `spec.version` in the repository would hold a release-channel pool at the old version against auto-upgrade. The command for the operator: `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version PREVIOUS_VERSION --location LOCATION`.
 
 ## 10. Upgrade paused or partially completed (check auto-upgrade status)
 
@@ -184,7 +184,13 @@ gcloud container node-pools get-upgrade-info POOL_NAME --cluster CLUSTER_NAME --
 - `CLUSTER_DISRUPTION_BUDGET` / `CLUSTER_DISRUPTION_BUDGET_MINOR_UPGRADE` — a post-operation cooldown protecting cluster stability.
 - `SYSTEM_CONFIG` — temporarily paused by GKE for technical or business reasons. **Do not force a manual upgrade unless it is required.**
 
-**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by making sure its `ContainerNodePool` holds the target `spec.version: VERSION`. If the repository already holds it, there is nothing to propose: Config Connector reconciles toward it on its own, so check its status rather than opening an empty pull request; otherwise propose the version through `gcp-config-connector`.
+**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade. This is a step for the platform operator, not a pull request: a `spec.version` in the repository would pin a release-channel pool against auto-upgrade. The command for the operator:
+```bash
+gcloud container clusters upgrade CLUSTER_NAME \
+  --node-pool NODE_POOL_NAME \
+  --cluster-version VERSION \
+  --location LOCATION
+```
 A partially-upgraded node pool runs mixed versions until you resume it or roll it back.
 
 ## 11. Upgrade too slow or too disruptive (tune blue-green soak)
