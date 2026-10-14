@@ -69,8 +69,9 @@ gitops-repo/
 ## Reconciler
 
 The pipeline above applies YAML with `kubectl apply`, which renders no Helm chart, for a new cluster
-or an existing one. So a pull request on a repository applied that way can carry Kubernetes and KCC
-YAML and Terraform, but no third-party chart. When you need charts, or workloads on a cluster created
+or an existing one. So on a repository that keeps its in-cluster state as YAML, a pull request cannot
+carry a third-party chart. (A Terraform repository can, with a `helm_release`, for a cluster that
+already exists; see the end of this section for a cluster created in the same apply.) When you need charts, or workloads on a cluster created
 in the same pull request, add a reconciler that syncs the repository. The one this layout recommends
 is **Config Sync on every cluster, enrolled through Config Connector**: it renders Helm charts, and it
 can take on a cluster created in the same pull request, because every object that enrolls the cluster
@@ -173,7 +174,7 @@ spec:
     auth: none # a public chart
     values:
       crds:
-        enabled: true # cert-manager ships its CRDs as templates behind this value
+        enabled: true # chart 1.15 and later; earlier charts call it installCRDs: true
 ```
 
 Config Sync renders the chart with `helm template`, so a chart's hook and test manifests are applied
