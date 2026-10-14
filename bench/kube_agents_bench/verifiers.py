@@ -2331,9 +2331,16 @@ class _ContentLoader(yaml.BaseLoader):
     def construct_mapping(self, node, deep=False):  # noqa: D102 - yaml's own hook
         # A merge key would splice fields in that this loader does not
         # resolve, so an object could carry a field no assertion sees.
+        seen: set[str] = set()
         for key_node, _ in node.value:
             if getattr(key_node, "tag", "") == "tag:yaml.org,2002:merge" or key_node.value == "<<":
                 raise yaml.YAMLError("merge keys are not read in graded content")
+            # A repeated key keeps only its last spelling, so an earlier one
+            # (an E2 machine type before a C3 one) would never be seen.
+            if isinstance(key_node.value, str):
+                if key_node.value in seen:
+                    raise yaml.YAMLError(f"duplicate key {key_node.value!r} in graded content")
+                seen.add(key_node.value)
         return super().construct_mapping(node, deep=deep)
 
 
@@ -2403,6 +2410,16 @@ def _resolve_field(node: Any, dotted: str) -> list[Any]:
     return flat
 
 
+def _is_kubernetes_list(node: Any) -> bool:
+    """Whether a mapping node is a ``kind: List`` with a sequence of ``items``."""
+    keys = {k.value: v for k, v in node.value if isinstance(k, yaml.ScalarNode)}
+    kind, items = keys.get("kind"), keys.get("items")
+    return (
+        isinstance(kind, yaml.ScalarNode) and kind.value == "List"
+        and isinstance(items, yaml.SequenceNode)
+    )
+
+
 def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
     """``(documents, parsed)`` for one file: ``(label, mapping or None, text)``
     per document, and whether the file parsed.
@@ -2414,34 +2431,49 @@ def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
     ``---``) are nothing. A file whose only document is a scalar is not YAML in
     any useful sense (a Terraform file reads as one long plain scalar), so it
     is one raw text document with no kind, and counts as not parsed. A root
-    list's mappings are documents of their own; any other scalar or list is a
-    text document with no kind."""
+    list's mappings, and the ``items`` of a Kubernetes ``kind: List``, are
+    documents of their own, each sliced from the file; any other scalar is a
+    text document with no kind. A repeated key is refused like an alias."""
     docs: list[tuple[str, Any, str]] = []
-    nodes: list[tuple[Any, str]] = []
+    pieces: list[tuple[str, Any, str]] = []
+    top_level: list[Any] = []
     loader = _ContentLoader(text)
     try:
+        index = 0
         while loader.check_node():
             node = loader.get_node()
-            raw = text[node.start_mark.index:node.end_mark.index]
-            doc = loader.construct_document(node)
-            if doc is None or doc == "":
-                continue
-            nodes.append((doc, raw))
+            label = f"{path}#{index}"
+            # A root list, and a Kubernetes `kind: List`, hold their objects
+            # one level down; each is a document of its own, sliced from the
+            # file, so a kind-scoped check sees what the wrapper carries.
+            children = None
+            if isinstance(node, yaml.SequenceNode):
+                children = [(f"{label}.{j}", child) for j, child in enumerate(node.value)]
+            elif isinstance(node, yaml.MappingNode) and _is_kubernetes_list(node):
+                items = next(v for k, v in node.value if k.value == "items")
+                children = [(f"{label}.items.{j}", child) for j, child in enumerate(items.value)]
+            if children is None:
+                doc = loader.construct_document(node)
+                if doc is None or doc == "":
+                    continue
+                top_level.append(doc)
+                pieces.append((label, doc, text[node.start_mark.index:node.end_mark.index]))
+            else:
+                top_level.append([])
+                for child_label, child in children:
+                    doc = loader.construct_document(child)
+                    pieces.append((child_label, doc, text[child.start_mark.index:child.end_mark.index]))
+            index += 1
     except (yaml.YAMLError, RecursionError):
         # RecursionError: PyYAML composes recursively, and a few hundred nested
         # brackets in an added file would otherwise crash the verifier.
         return [(path, None, text)], False
     finally:
         loader.dispose()
-    if len(nodes) == 1 and not isinstance(nodes[0][0], (dict, list)):
+    if len(top_level) == 1 and not isinstance(top_level[0], (dict, list)):
         return [(path, None, text)], False
-    for i, (doc, raw) in enumerate(nodes):
-        if isinstance(doc, list):
-            for j, item in enumerate(doc):
-                text_of = _dump_as_written(item) if isinstance(item, dict) else str(item)
-                docs.append((f"{path}#{i}.{j}", item if isinstance(item, dict) else None, text_of))
-        else:
-            docs.append((f"{path}#{i}", doc if isinstance(doc, dict) else None, raw))
+    for label, doc, raw in pieces:
+        docs.append((label, doc if isinstance(doc, dict) else None, raw))
     return docs, True
 
 

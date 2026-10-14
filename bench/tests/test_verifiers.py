@@ -3888,6 +3888,33 @@ def test_a_terraform_file_is_raw_text_and_scoped_checks_fail_closed(token, githu
     assert _pr_check(content=[scoped]).verify(5.0).status == "fail"
 
 
+def test_a_kind_list_wrapper_does_not_hide_an_e2_pool(token, github):
+    wrapped = ("apiVersion: v1\nkind: List\nitems:\n  - kind: ContainerNodePool\n    metadata: {name: e2}\n"
+               "    spec:\n      nodeConfig: {machineType: e2-standard-4}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/pool.yaml": wrapped})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "pool.yaml#0.items.0" in res.reason
+
+
+def test_a_root_list_item_keeps_its_quoting(token, github):
+    listed = '- kind: CronJob\n  metadata: {name: j}\n  spec: {schedule: "*/5 * * * *"}\n'
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains", "value": 'schedule: "*/5 * * * *"'}
+    _content_pr(github, {f"{_CLUSTER_DIR}/l.yaml": listed})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_duplicate_key_is_refused_so_the_first_spelling_cannot_hide(token, github):
+    doc = ("kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n"
+           "    machineType: e2-standard-4\n    machineType: c3-standard-4\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
 def test_a_quantifier_on_absent_is_refused():
     with pytest.raises(ValueError):
         _pr_check(content=[{"paths": ["x"], "op": "absent", "quantifier": "any"}])
