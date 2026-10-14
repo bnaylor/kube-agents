@@ -110,8 +110,8 @@ that order stated.
 Isolate namespaces by denying all ingress and egress traffic by default.
 
 Propose this manifest, with `<target-namespace>` set to the namespace to
-isolate. It is also in
-[assets/default-deny-netpol.yaml](assets/default-deny-netpol.yaml).
+isolate. [assets/default-deny-netpol.yaml](assets/default-deny-netpol.yaml)
+holds the same policy without the `metadata.namespace` line.
 
 ```yaml
 apiVersion: networking.k8s.io/v1

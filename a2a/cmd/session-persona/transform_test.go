@@ -494,6 +494,23 @@ func TestConsoleTranscriptOfAReadIsNotMarked(t *testing.T) {
 	}
 }
 
+// The cluster agent reads the source skills, not the session tree, and it is
+// read-only (agents/cluster/SOUL.md, Read-Only Boundary), so a source skill
+// that teaches a write fails here even though the session build would mark it.
+func TestSourceSkillsTeachNoWrites(t *testing.T) {
+	for _, name := range sessionSkills {
+		body, err := os.ReadFile(filepath.Join(repoSkillsDir, name, skillFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, l := range strings.Split(string(body), "\n") {
+			if writeCommandRE.MatchString(l) {
+				t.Errorf("%s:%d: teaches a write; propose the change instead: %s", name, i+1, strings.TrimSpace(l))
+			}
+		}
+	}
+}
+
 // A block that writes is marked as a proposal. The shipped skills teach no
 // writes any more, so this fixture is what exercises the mark.
 func TestWriteBlockIsMarkedProposeOnly(t *testing.T) {
