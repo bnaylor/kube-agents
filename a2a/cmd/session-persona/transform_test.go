@@ -162,7 +162,7 @@ func TestShippedTreeIsLoadableByClaudeCode(t *testing.T) {
 // edit that adds an unmarked write fails here.
 func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 	out := buildShipped(t)
-	writes := 0
+	blocks := 0
 	for _, name := range sessionSkills {
 		body, err := os.ReadFile(filepath.Join(out, skillsDir, name, skillFile))
 		if err != nil {
@@ -176,12 +176,12 @@ func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 			if strings.HasPrefix(trimmed, codeFence) {
 				if !inFence {
 					lastNote = precedingNote(lines, i)
+					blocks++
 				}
 				inFence = !inFence
 				continue
 			}
 			if writeCommandRE.MatchString(l) {
-				writes++
 				if !inFence {
 					t.Errorf("%s:%d: a write outside a code block, where no note marks it: %s", name, i+1, trimmed)
 				} else if lastNote != proposeOnlyNote {
@@ -193,10 +193,11 @@ func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 			}
 		}
 	}
-	// The source skills do contain writes; zero would mean the scan matched
-	// nothing, not that the skills are clean.
-	if writes == 0 {
-		t.Fatal("found no write commands at all; the scan is not reading the skills")
+	// The cluster skills teach no writes (the Cluster Agent is read-only and
+	// proposes changes in its card), so count code blocks instead: zero would
+	// mean the scan read nothing, not that the skills are clean.
+	if blocks == 0 {
+		t.Fatal("found no code blocks at all; the scan is not reading the skills")
 	}
 }
 
