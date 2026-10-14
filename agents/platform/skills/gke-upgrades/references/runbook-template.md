@@ -2,12 +2,16 @@
 
 Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME`, `ZONE`, `TARGET_VERSION`, `NODE_POOL_NAME`.
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
+Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`; each check step is a read command.
+
 ## Table of Contents
-- [Pre-flight](#pre-flight) (Line 12-31)
-- [Control plane upgrade](#control-plane-upgrade) (Line 32-47)
-- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-72)
-- [Maintenance window configuration](#maintenance-window-configuration) (Line 73-110)
-- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 111-151)
+- [Pre-flight](#pre-flight) (Line 16-35)
+- [Control plane upgrade](#control-plane-upgrade) (Line 36-47)
+- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-60)
+- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-68)
+- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 69-117)
 
 ## Pre-flight
 
@@ -31,13 +35,9 @@ kubectl get pods -A | grep -v Running | grep -v Completed
 
 ## Control plane upgrade
 
-```bash
-gcloud container clusters upgrade CLUSTER_NAME \
-  --zone ZONE \
-  --master \
-  --cluster-version TARGET_VERSION
+Propose `spec.minMasterVersion: TARGET_VERSION` on the cluster's `ContainerCluster` as a pull request. After it merges and applies, verify (wait ~10-15 min):
 
-# Verify (wait ~10-15 min)
+```bash
 gcloud container clusters describe CLUSTER_NAME \
   --zone ZONE \
   --format="value(currentMasterVersion)"
@@ -47,21 +47,9 @@ kubectl get pods -n kube-system
 
 ## Node pool upgrade (Standard only)
 
+Propose the pool's surge settings (`spec.upgradeSettings.maxSurge: MAX_SURGE`, `spec.upgradeSettings.maxUnavailable: MAX_UNAVAILABLE`) and its version (`spec.version: TARGET_VERSION`) on its `ContainerNodePool` as a pull request. After it merges and applies:
+
 ```bash
-# Configure surge settings
-gcloud container node-pools update NODE_POOL_NAME \
-  --cluster CLUSTER_NAME \
-  --zone ZONE \
-  --max-surge-upgrade MAX_SURGE \
-  --max-unavailable-upgrade MAX_UNAVAILABLE
-
-# Upgrade (note: node pool upgrades use `clusters upgrade --node-pool`;
-# there is no `gcloud container node-pools upgrade` command)
-gcloud container clusters upgrade CLUSTER_NAME \
-  --zone ZONE \
-  --node-pool NODE_POOL_NAME \
-  --cluster-version TARGET_VERSION
-
 # Monitor progress
 watch 'kubectl get nodes -o wide -L cloud.google.com/gke-nodepool'
 
@@ -72,114 +60,58 @@ kubectl get pods -A | grep -v Running | grep -v Completed
 
 ## Maintenance window configuration
 
-```bash
-# Set recurring maintenance window
-gcloud container clusters update CLUSTER_NAME \
-  --zone ZONE \
-  --maintenance-window-start YYYY-MM-DDTHH:MM:SSZ \
-  --maintenance-window-end YYYY-MM-DDTHH:MM:SSZ \
-  --maintenance-window-recurrence "FREQ=WEEKLY;BYDAY=SA"
+Each of these is proposed as a pull request on the cluster's `ContainerCluster` through `gcp-config-connector`:
 
-# Add maintenance exclusion (up to 90 days)
-gcloud container clusters update CLUSTER_NAME \
-  --zone ZONE \
-  --add-maintenance-exclusion-name="EXCLUSION_NAME" \
-  --add-maintenance-exclusion-start=START_TIME \
-  --add-maintenance-exclusion-end=END_TIME
-
-# Add persistent maintenance exclusion (until End of Support)
-gcloud container clusters update CLUSTER_NAME \
-  --zone ZONE \
-  --add-maintenance-exclusion-name="EXCLUSION_NAME" \
-  --add-maintenance-exclusion-start=START_TIME \
-  --add-maintenance-exclusion-until-end-of-support \
-  --add-maintenance-exclusion-scope=no_upgrades
-
-# Add node pool level exclusion (during creation)
-gcloud container node-pools create NODE_POOL_NAME \
-  --cluster CLUSTER_NAME \
-  --zone ZONE \
-  --add-maintenance-exclusion-until-end-of-support
-
-# Add node pool level exclusion (existing pool)
-gcloud container node-pools update NODE_POOL_NAME \
-  --cluster CLUSTER_NAME \
-  --zone ZONE \
-  --add-maintenance-exclusion-until-end-of-support
-```
+- **Recurring maintenance window**: `spec.maintenancePolicy.recurringWindow` with `startTime` and `endTime` (`YYYY-MM-DDTHH:MM:SSZ`) and `recurrence` (e.g. `FREQ=WEEKLY;BYDAY=SA`).
+- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope`.
+- **Persistent exclusion (until End of Support)** and **node pool level exclusions**: each has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
 
 ## Rollback/Downgrade guidance
 
-- **Control Plane Patches**: Can be downgraded by running the upgrade command with the target older patch version.
+- **Control Plane Patches**: Can be downgraded to the target older patch version.
 - **Control Plane Minors**: Rollback is only available during the first step of the 2-step upgrade process.
-- **Node Pools (Minor & Patch)**: Can be downgraded directly by running the node pool upgrade command targeting the older version, OR by creating a new pool at the old version and migrating workloads (safer).
+- **Node Pools (Minor & Patch)**: Can be downgraded directly by targeting the older version, OR by creating a new pool at the old version and migrating workloads (safer).
 
 ### Downgrade Control Plane (Patch or Step-1 Minor)
-```bash
-gcloud container clusters upgrade CLUSTER_NAME \
-  --master \
-  --zone ZONE \
-  --cluster-version TARGET_PREVIOUS_VERSION
-```
+
+A downgrade to `TARGET_PREVIOUS_VERSION` has no declarative path in a Config Connector repository (`spec.minMasterVersion` is a floor GKE upgrades past, not a downgrade), so the agent blocks rather than inventing a field.
 
 ### Downgrade Node Pool (Direct)
-```bash
-gcloud container clusters upgrade CLUSTER_NAME \
-  --zone ZONE \
-  --node-pool NODE_POOL_NAME \
-  --cluster-version TARGET_PREVIOUS_VERSION
-```
+
+Propose `spec.version: TARGET_PREVIOUS_VERSION` on the pool's `ContainerNodePool` as a pull request.
 
 ### Downgrade Node Pool (Safe migration - recommended)
+
+Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` at the previous version (`spec.version: PREVIOUS_VERSION`, `spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`) as a pull request. Workloads move off the old pool when a later pull request removes its `ContainerNodePool`. Before that:
+
 ```bash
-# Create replacement node pool at previous version
-gcloud container node-pools create NODE_POOL_NAME-rollback \
-  --cluster CLUSTER_NAME \
-  --zone ZONE \
-  --cluster-version PREVIOUS_VERSION \
-  --num-nodes NUM_NODES \
-  --machine-type MACHINE_TYPE
-
-# Cordon old pool
-kubectl cordon -l cloud.google.com/gke-nodepool=NODE_POOL_NAME
-
 # Record current PDB state BEFORE touching anything — this file is how you put
 # it back. Do not skip; a relaxed PDB left in place is an outage waiting for
 # the next voluntary disruption.
 kubectl get pdb -A -o yaml > /tmp/pdb-backup-$(date +%s).yaml
 kubectl get pdb -A   # ALLOWED DISRUPTIONS = 0 will block the drain
-
-# Drain old pool to migrate workloads (respects PDBs)
-kubectl drain -l cloud.google.com/gke-nodepool=NODE_POOL_NAME \
-  --ignore-daemonsets --delete-emptydir-data
 ```
 
 If a PDB blocks the drain, relax it **temporarily** and restore it as a required
 step of the same runbook — never as a follow-up someone may forget:
 
-```bash
-# 1. Relax the blocking PDB (only after confirming the replacement pool is
-#    Ready and can accept the workload)
-kubectl patch pdb PDB_NAME -n NAMESPACE \
-  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+1. Relax the blocking PDB, only after confirming the replacement pool is Ready and
+   can accept the workload: a pull request that removes `minAvailable` from its
+   manifest and sets `maxUnavailable: "100%"`.
+2. After the drain, verify workloads are Running on the replacement pool:
 
-# 2. Drain, then verify workloads are Running on the replacement pool
-kubectl get pods -o wide --field-selector spec.nodeName!='' -A | grep NODE_POOL_NAME-rollback
+   ```bash
+   kubectl get pods -o wide --field-selector spec.nodeName!='' -A | grep NODE_POOL_NAME-rollback
+   ```
 
-# 3. RESTORE the original PDB — mandatory, not optional. Patch back the value
-#    the backup records for PDB_NAME and clear the field step 1 set. Do not
-#    `kubectl apply` the backup: its stale resourceVersion is rejected with a
-#    conflict. If the PDB originally set minAvailable:
-kubectl patch pdb PDB_NAME -n NAMESPACE \
-  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
-#    If it originally set maxUnavailable:
-kubectl patch pdb PDB_NAME -n NAMESPACE \
-  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
-#    (an integer as-is, a percentage quoted, e.g. "50%")
+3. RESTORE the original PDB — mandatory, not optional: a pull request that puts back
+   the `minAvailable` or `maxUnavailable` value the backup records for `PDB_NAME` and
+   clears the field step 1 set (an integer as-is, a percentage quoted, e.g. `"50%"`).
+4. Confirm the restore took effect:
 
-# 4. Confirm the restore took effect
-kubectl get pdb -A   # ALLOWED DISRUPTIONS should match the pre-drain values
-```
+   ```bash
+   kubectl get pdb -A   # ALLOWED DISRUPTIONS should match the pre-drain values
+   ```
 
 > A rollback runbook that relaxes PDBs without restoring them has silently
 > removed the cluster's disruption protection. Always include steps 3 and 4.
