@@ -2414,10 +2414,31 @@ def _is_kubernetes_list(node: Any) -> bool:
     """Whether a mapping node is a ``kind: List`` with a sequence of ``items``."""
     keys = {k.value: v for k, v in node.value if isinstance(k, yaml.ScalarNode)}
     kind, items = keys.get("kind"), keys.get("items")
+    # `List` and the typed lists (`PodList`, `ConfigMapList`) kubectl reads
+    # the same way.
     return (
-        isinstance(kind, yaml.ScalarNode) and kind.value == "List"
+        isinstance(kind, yaml.ScalarNode) and kind.value.endswith("List")
         and isinstance(items, yaml.SequenceNode)
     )
+
+
+def _list_members(node: Any, label: str, loader: Any) -> list[tuple[str, Any]] | None:
+    """The objects a list-shaped node carries, recursively, or None when the
+    node is not one. A wrapper mapping is constructed first, so a repeated
+    or merged key in it is refused before its ``items`` are trusted."""
+    if isinstance(node, yaml.SequenceNode):
+        members = [(f"{label}.{j}", child) for j, child in enumerate(node.value)]
+    elif isinstance(node, yaml.MappingNode) and _is_kubernetes_list(node):
+        loader.construct_document(node)
+        items = next(v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == "items")
+        members = [(f"{label}.items.{j}", child) for j, child in enumerate(items.value)]
+    else:
+        return None
+    flat: list[tuple[str, Any]] = []
+    for member_label, member in members:
+        nested = _list_members(member, member_label, loader)
+        flat += nested if nested is not None else [(member_label, member)]
+    return flat
 
 
 def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
@@ -2446,12 +2467,7 @@ def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
             # A root list, and a Kubernetes `kind: List`, hold their objects
             # one level down; each is a document of its own, sliced from the
             # file, so a kind-scoped check sees what the wrapper carries.
-            children = None
-            if isinstance(node, yaml.SequenceNode):
-                children = [(f"{label}.{j}", child) for j, child in enumerate(node.value)]
-            elif isinstance(node, yaml.MappingNode) and _is_kubernetes_list(node):
-                items = next(v for k, v in node.value if k.value == "items")
-                children = [(f"{label}.items.{j}", child) for j, child in enumerate(items.value)]
+            children = _list_members(node, label, loader)
             if children is None:
                 doc = loader.construct_document(node)
                 if doc is None or doc == "":

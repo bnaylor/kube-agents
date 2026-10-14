@@ -3898,6 +3898,25 @@ def test_a_kind_list_wrapper_does_not_hide_an_e2_pool(token, github):
     assert res.status == "fail" and "pool.yaml#0.items.0" in res.reason
 
 
+def test_nested_and_typed_lists_are_unwrapped_all_the_way(token, github):
+    nested = ("kind: List\nitems:\n  - kind: ConfigMapList\n    items:\n      - kind: ContainerNodePool\n"
+              "        metadata: {name: e2}\n        spec: {nodeConfig: {machineType: e2-standard-4}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/n.yaml": nested})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "n.yaml#0.items.0.items.0" in res.reason
+
+
+def test_a_list_wrapper_with_a_repeated_items_key_is_refused(token, github):
+    doubled = ("kind: List\nitems:\n  - {kind: ConfigMap, metadata: {name: ok}}\n"
+               "items:\n  - kind: ContainerNodePool\n    spec: {nodeConfig: {machineType: e2-standard-4}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/d.yaml": doubled})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
 def test_a_root_list_item_keeps_its_quoting(token, github):
     listed = '- kind: CronJob\n  metadata: {name: j}\n  spec: {schedule: "*/5 * * * *"}\n'
     check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains", "value": 'schedule: "*/5 * * * *"'}
