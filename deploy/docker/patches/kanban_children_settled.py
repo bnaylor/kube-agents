@@ -238,15 +238,20 @@ MAX_LISTED_CHILDREN = 10
 #: comment, one per line, optionally as a list item. The key starts with a
 #: letter and is a short slug, and the status word must end the line or be
 #: followed by a separated reason (`` - ...``, ``: ...``, `` (...)``, ``, ...``,
-#: ``; ...``) or one closing punctuation mark, so prose
+#: ``; ...``) or up to three closing marks (``.``, ``!``, an emoji), so prose
 #: such as "Step 1: Planned maintenance is Sunday" or "Step two: failed pods are
-#: restarted" is not a plan, and "done-ish" is not ``done``.
+#: restarted" is not a plan, and "done-ish" is not ``done``. A list item may be
+#: a checklist box (``- [ ] step ...``). Backticks and ``*`` are stripped before
+#: matching (:data:`STEP_MARKUP_RE`), so ``step `substrate`: **done**`` reads as
+#: ``step substrate: done``.
 STEP_LINE_RE = re.compile(
-    r"^[ \t>*-]*(?:\d+[.)][ \t]*)?step[ \t]+([a-z][a-z0-9-]{0,39})[ \t]*:[ \t]*"
+    r"^[ \t>*-]*(?:\d+[.)][ \t]*)?(?:\[[ xX]\][ \t]*)?step[ \t]+([a-z][a-z0-9-]{0,39})[ \t]*:[ \t]*"
     r"(planned|done|failed)"
-    r"(?=[ \t]*[.,;!]?[ \t]*\r?$|[ \t]*[,;][ \t]|[ \t]+[-\u2013\u2014(]|[ \t]*[\u2013\u2014:(])",
+    r"(?=[ \t]*[^\w\s-]{0,3}[ \t]*\r?$|[ \t]*[,;][ \t]|[ \t]+[-\u2013\u2014(]|[ \t]*[\u2013\u2014:(])",
     re.IGNORECASE | re.MULTILINE,
 )
+#: Markdown emphasis and code marks a model wraps around a key or a status.
+STEP_MARKUP_RE = re.compile(r"[`*]")
 #: The one status that settles a step.
 STEP_DONE = "done"
 #: How many unfinished steps the refusal names.
@@ -269,8 +274,8 @@ STEPS_REFUSAL = (
     "kanban_complete refused: {count} step(s) this card declared are not "
     "done — {listing}. A card closes `done` only when every step it names "
     "was delivered; completing now would tell the requester it was. Either "
-    "finish the step and record it with "
-    "kanban_comment(body=\"step <key>: done\"), or end the card with "
+    "finish the step and record it with exactly this line, the key as listed: "
+    "kanban_comment(body=\"step {example}: done\"), or end the card with "
     "kanban_block(kind=\"needs_input\") whose `reason` names what was not "
     "delivered and, for anything already created, the resource, its state and "
     "how to remove it. There is no way to skip a step: one that turned out "
@@ -592,7 +597,7 @@ def card_steps(conn, task_id: str) -> dict[str, str]:
     texts = [row[0] if row else ""]
     texts += [r[0] or "" for r in conn.execute(_CARD_COMMENTS_SQL, (task_id,)).fetchall()]
     for text in texts:
-        for key, status in STEP_LINE_RE.findall(str(text)):
+        for key, status in STEP_LINE_RE.findall(STEP_MARKUP_RE.sub("", str(text))):
             steps[key.lower()] = status.lower()
     return steps
 
@@ -632,7 +637,7 @@ def require_steps_settled(task_id, connect, result=None) -> str | None:
         )
         return None
     listing = ", ".join(
-        f"`{step}` ({status})" for step, status in unfinished[:MAX_LISTED_STEPS]
+        f"{step} ({status})" for step, status in unfinished[:MAX_LISTED_STEPS]
     )
     overflow = len(unfinished) - MAX_LISTED_STEPS
     if overflow > 0:
@@ -641,4 +646,4 @@ def require_steps_settled(task_id, connect, result=None) -> str | None:
         "kanban_children_settled: refused completing %s with %d step(s) not done",
         key, len(unfinished),
     )
-    return STEPS_REFUSAL.format(count=len(unfinished), listing=listing)
+    return STEPS_REFUSAL.format(count=len(unfinished), listing=listing, example=unfinished[0][0])

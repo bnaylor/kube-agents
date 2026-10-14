@@ -323,7 +323,7 @@ tool_comment(provision, "step substrate: failed - the sandbox has no cluster cre
 INCIDENT = "Created the cluster; reported connection context and Agent Substrate installation status."
 held = tool_complete(result=INCIDENT)
 check("completing over a failed step is refused", "kanban_complete refused" in held, held)
-check("the refusal names the failed step", "`substrate` (failed)" in held, held)
+check("the refusal names the failed step", "substrate (failed)" in held, held)
 check("the card stays open", status(provision) == "running", f"status={status(provision)}")
 again = tool_complete(result=INCIDENT)
 check("the refusal is not rationed: the retry is refused too", "kanban_complete refused" in again, again)
@@ -331,7 +331,7 @@ tool_comment(provision, "step substrate: done", profile="default")
 relayed = tool_complete(result=INCIDENT)
 check(
     "a step line the front door relays does not count",
-    "`substrate` (failed)" in relayed,
+    "substrate (failed)" in relayed,
     relayed,
 )
 blocked = tool_block("needs_input", reason="substrate not installed; cluster c1 created, delete with ...")

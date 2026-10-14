@@ -548,8 +548,8 @@ class TestTheStepGate(unittest.TestCase):
         self.comment("step substrate: failed - helm has no credentials")
         refused = self.gate()
         self.assertIn("kanban_complete refused", refused)
-        self.assertIn("`substrate` (failed)", refused)
-        self.assertNotIn("`cluster`", refused)
+        self.assertIn("substrate (failed)", refused)
+        self.assertNotIn("cluster (", refused)
         self.assertIn('kanban_block(kind="needs_input")', refused)
 
     def test_a_refusal_preserves_the_submitted_result(self):
@@ -571,18 +571,18 @@ class TestTheStepGate(unittest.TestCase):
     def test_a_step_the_creator_declared_holds_the_card_though_the_worker_never_mentions_it(self):
         self.card("step substrate: planned")
         self.comment("Cluster created; finishing up.")
-        self.assertIn("`substrate` (planned)", self.gate())
+        self.assertIn("substrate (planned)", self.gate())
 
     def test_a_step_only_the_worker_declared_holds_the_card_too(self):
         self.card("Provision a cluster.")
         self.comment("step cluster: planned")
-        self.assertIn("`cluster` (planned)", self.gate())
+        self.assertIn("cluster (planned)", self.gate())
 
     def test_the_latest_line_wins_in_both_directions(self):
         self.card("step cluster: planned")
         self.comment("step cluster: done")
         self.comment("step cluster: failed - the node pool was deleted under us")
-        self.assertIn("`cluster` (failed)", self.gate())
+        self.assertIn("cluster (failed)", self.gate())
         self.comment("step cluster: done")
         self.assertIsNone(self.gate())
 
@@ -590,12 +590,12 @@ class TestTheStepGate(unittest.TestCase):
         self.card("step cluster: planned")
         self.comment("step cluster: done", at=5_000)
         self.comment("step cluster: failed", at=5_000)
-        self.assertIn("`cluster` (failed)", self.gate())
+        self.assertIn("cluster (failed)", self.gate())
 
     def test_there_is_no_skipped(self):
         self.card("step substrate: planned")
         self.comment("step substrate: skipped - not needed after all")
-        self.assertIn("`substrate` (planned)", self.gate())
+        self.assertIn("substrate (planned)", self.gate())
 
     def test_spelling_is_forgiving_but_keys_are_slugs(self):
         self.card("- Step Cluster: Planned\n> step substrate : planned")
@@ -636,14 +636,28 @@ class TestTheStepGate(unittest.TestCase):
         self.comment("step substrate: done", author="default")
         self.comment("step extra: planned", author="default")
         self.assertEqual({"substrate": "failed"}, kcs.card_steps(self.conn, STEP_CARD))
-        self.assertIn("`substrate` (failed)", self.gate())
+        self.assertIn("substrate (failed)", self.gate())
 
     def test_closing_punctuation_and_a_comma_reason_still_record_the_status(self):
         self.card("step a: planned.\nstep b: planned\nstep c: planned\nstep d: planned")
         self.comment("step a: done.\r\nstep b: done, see PR #12\nstep c: done; labels set\nstep d: done!")
         self.assertEqual({"a": "done", "b": "done", "c": "done", "d": "done"}, kcs.card_steps(self.conn, STEP_CARD))
-        self.card("step e: done-ish. step f: planned..", task_id="t_hedge")
+        self.card("step e: done-ish\nstep f: planned-ish.", task_id="t_hedge")
         self.assertEqual({}, kcs.card_steps(self.conn, "t_hedge"))
+
+    def test_markdown_a_model_writes_still_records_the_status(self):
+        self.card("- [ ] step a: planned\n- [ ] step b: planned\nstep c: planned\nstep d: planned\nstep e: planned")
+        self.comment("- [x] step a: done\n**step b: done**\nstep `c`: done\nstep d: `done`\nstep e: done \u2705")
+        self.assertEqual(
+            {"a": "done", "b": "done", "c": "done", "d": "done", "e": "done"}, kcs.card_steps(self.conn, STEP_CARD)
+        )
+
+    def test_the_refusal_gives_the_exact_line_and_writing_it_clears_the_step(self):
+        self.card("step substrate: planned")
+        refused = self.gate()
+        self.assertIn('kanban_comment(body="step substrate: done")', refused)
+        self.comment("step substrate: done")
+        self.assertIsNone(self.gate())
 
     def test_another_cards_steps_do_not_count(self):
         self.card("Provision a cluster.")
