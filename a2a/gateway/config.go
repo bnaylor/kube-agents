@@ -465,9 +465,10 @@ type Config struct {
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
 	// threads are free, so the principal map bounds WHO can spawn and this
 	// bounds HOW MANY - without it, one mapped user's afternoon can fill the
-	// namespace. At the cap a new delegation (or a session-routed first ask)
-	// is refused with a chat reply naming the numbers; nothing queues,
-	// nothing drops silently.
+	// namespace. At the cap the session pod idle longest is evicted to make
+	// room, and its conversation told; only with none idle is the new
+	// delegation (or session-routed turn) refused, with a chat reply naming
+	// the numbers. Nothing queues, nothing drops silently.
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// requests (250m/512Mi) ten concurrent sessions hold 2.5 CPU / 5Gi, which
