@@ -185,8 +185,8 @@ const (
 	replicasLimitedConditionType = "ReplicasLimited"
 	replicasLimitedReason        = "HighAvailabilityNotSupported"
 	// replicasLimitedMessageFormat takes the requested count.
-	replicasLimitedMessageFormat = "spec.deployment.availability.replicas is %d, and the operator runs the gateway as " +
-		"a single replica: high availability is not supported yet. Above one replica the gateway's platform-agent " +
+	replicasLimitedMessageFormat = "spec.deployment.availability.replicas is %d, and the operator runs the gateway at " +
+		"one replica at most: high availability is not supported yet. Above one replica the gateway's platform-agent " +
 		"container runs leader_elect.py, which needs an in-cluster ServiceAccount token that container deliberately " +
 		"does not have (the Pod sets automountServiceAccountToken: false), so it exits at startup. The data volumes " +
 		"an install creates at one replica are also ReadWriteOnce, so a replica scheduled on another node cannot " +
@@ -235,8 +235,10 @@ const (
 	// that is running, because the template is the whole of what this
 	// controller observes. reconcileWorkload server-side-applies it and
 	// returns once the API server has accepted it; nothing waits on the
-	// rollout. With spec.deployment.availability.replicas > 1 the strategy is
-	// RollingUpdate at maxUnavailable 1, so Pods from the revision before it --
+	// rollout. The gateway runs as one replica under Recreate today
+	// (supportedGatewayReplicas), which shrinks this window to the replacement;
+	// above one replica the strategy would be RollingUpdate at maxUnavailable 1,
+	// so Pods from the revision before it --
 	// on an operator rolled out over a CR a pre-fix render gave real hostPath
 	// mounts, Pods that really do mount them -- keep running until the roll
 	// finishes, and indefinitely if it stalls. "Left out of the agent Pod"
@@ -1989,12 +1991,13 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	// this only says so in the operator log, once per spec generation. The
 	// ReplicasLimited condition carries the same fact on the CR.
 	if gatewayReplicasCapped(agent.Spec.Deployment) {
+		renderedReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 		capKey := client.ObjectKeyFromObject(agent)
 		if logged, ok := r.replicasLimitedLogged.Load(capKey); !ok || logged.(int64) != agent.Generation {
-			logf.FromContext(ctx).Info("spec.deployment.availability.replicas is above the supported gateway replica count; rendering the single-replica gateway",
+			logf.FromContext(ctx).Info("spec.deployment.availability.replicas is above the supported gateway replica count; rendering the gateway at one replica at most",
 				"name", agent.Name, "namespace", agent.Namespace,
 				"requestedReplicas", requestedGatewayReplicas(agent.Spec.Deployment),
-				"renderedReplicas", supportedGatewayReplicas,
+				"renderedReplicas", renderedReplicas,
 				"tracking", "https://github.com/gke-labs/kube-agents/issues/3016")
 			r.replicasLimitedLogged.Store(capKey, agent.Generation)
 		}
@@ -2004,7 +2007,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
-	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
+	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update,
+	// with one exception: the operator upgrade that introduced supportedGatewayReplicas moves a
+	// StatefulSet gateway (replicas > 1 over RWO storage) to the Deployment on its first pass.
 	// A refused spec.deployment.agentAPIAuth.resources renders the sidecar at the
 	// operator's defaults rather than withholding the gateway, so the rest of the
 	// Pod keeps flowing and updateStatusReady reports the refusal as Degraded.

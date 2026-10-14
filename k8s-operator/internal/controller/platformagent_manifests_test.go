@@ -7241,6 +7241,11 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 // carries namespace-wide pods:patch on the identity that also holds the agent's
 // Workload Identity annotation. Nothing breaks, nothing logs, and the grant is
 // only found by someone auditing RBAC.
+//
+// Under the replica cap (supportedGatewayReplicas) every row renders one replica,
+// so the pods rule and the arming are both off on every row; the agreement still
+// holds and is still checked. TestLeaderRolePodsRuleVerbsAboveOneReplica keeps
+// the verbs of the multi-replica rule pinned meanwhile.
 func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -7551,5 +7556,34 @@ func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
 	}
 	if found[0] != "9095" {
 		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
+	}
+}
+
+// TestLeaderRolePodsRuleVerbsAboveOneReplica pins the verbs of the leader Role's
+// pods rule at a multi-replica count, read from leaderRoleRules directly because
+// the replica cap keeps every spec-driven render at one replica and so renders
+// the rule nowhere. It is the agent identity's only write grant on workloads, so
+// a verb added to it is worth a red test before the cap lifts (#3016).
+func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
+	var found bool
+	for _, r := range leaderRoleRules(3) {
+		if !slices.Contains(r.Resources, "pods") {
+			continue
+		}
+		found = true
+		if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+			t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+		}
+		if !slices.Equal(r.Resources, []string{"pods"}) {
+			t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
+		}
+	}
+	if !found {
+		t.Error("no pods rule at three replicas")
+	}
+	for _, r := range leaderRoleRules(1) {
+		if slices.Contains(r.Resources, "pods") {
+			t.Errorf("a pods rule at one replica: %v", r)
+		}
 	}
 }

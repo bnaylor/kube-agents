@@ -148,7 +148,7 @@ func TestReplicasLimitedConditionFollowsTheSpec(t *testing.T) {
 	if cond.Status != metav1.ConditionTrue || cond.Reason != replicasLimitedReason {
 		t.Errorf("%s = %s/%s, want True/%s", replicasLimitedConditionType, cond.Status, cond.Reason, replicasLimitedReason)
 	}
-	for _, want := range []string{"replicas is 2", "single replica", "leader_elect.py", "ReadWriteOnce", "issues/3016"} {
+	for _, want := range []string{"replicas is 2", "one replica at most", "leader_elect.py", "ReadWriteOnce", "issues/3016"} {
 		if !strings.Contains(cond.Message, want) {
 			t.Errorf("%s message does not mention %q: %s", replicasLimitedConditionType, want, cond.Message)
 		}

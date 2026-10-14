@@ -994,8 +994,9 @@ fi
 # before it gets here.
 #
 # Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
-# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
-# rather than a volume each — every replica's gateway is an owner and several of them run
+# at availability.replicas > 1 — where the operator gave the replicas ONE ReadWriteMany PVC
+# rather than a volume each, a shape it does not render while it caps the gateway at one
+# replica — every replica's gateway is an owner and several of them run
 # this against the same file, with a rolling update overlapping new pods and old. The
 # exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
 # Concurrency section; the short version is that the reconcile wants to run once per volume,
@@ -1272,8 +1273,9 @@ sync_profile_skills() {
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
-    # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
-    # every replica the SAME PVC (ReadWriteMany; see step 2c-bis and cron_jobs_sync.py's
+    # $_dst lives on the PVC, and at availability.replicas > 1 the operator handed
+    # every replica the SAME PVC (ReadWriteMany; the operator now caps the gateway at
+    # one replica, but this stays for when that lifts; see step 2c-bis and cron_jobs_sync.py's
     # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
     # are shared names on a shared volume. The unconditional `rm -rf` below then
     # reaches into another pod's swap: pod A completes `mv skills skills.old`, so
