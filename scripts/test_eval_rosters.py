@@ -173,6 +173,7 @@ ADDED_AFTER_THE_MOVE = [
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
+    "scale-request-proposes-pr",  # the mirrored gke-* skills' pull request path, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -528,6 +529,10 @@ INJECT_LANE_REQUESTING = [
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
     "rca-remediation-pr",
+    # scale-request-proposes-pr: asked to scale a Deployment, it may propose
+    # the change as a pull request; its objective's pull_request_opened leaf
+    # allows one.
+    "scale-request-proposes-pr",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.

@@ -268,7 +268,9 @@
 # 2026-10-14 adds scale-request-proposes-pr: one case, three units, deployer:
 # noop at the 200s default, about 10 serial minutes. It is the last entry
 # below, after upgrades-audit-reports-upgrade-blocked, and makes this file
-# seventy cases (210 units) of an eighty-four-case, 252-unit matrix.
+# seventy-two cases (216 units) of an eighty-six-case, 258-unit matrix
+# (counted over the entries, not from the tally above, which was two short on
+# main).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
