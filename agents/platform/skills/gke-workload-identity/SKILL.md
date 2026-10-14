@@ -148,7 +148,7 @@ gcloud container node-pools describe "{node_pool}" --cluster "{cluster}" \
     default service account". Remediation: run the pool's workloads on the GKE
     metadata server through `spec.nodeConfig.workloadMetadataConfig.mode` on the
     pool's `ContainerNodePool`, proposed as a pull request through
-    `gcp-config-connector` (GKE updates this setting in place). This is a **node-pool configuration** problem — not a KSA
+    `gcp-config-connector` (a mutable field, so an edit to the existing pool; GKE re-creates the pool's nodes to apply it, restarting its workloads). This is a **node-pool configuration** problem — not a KSA
     annotation or IAM binding problem — so do not change KSA annotations or IAM
     bindings to fix it. When the symptom is "runs as the node default service
     account", say so explicitly: the root cause is the node pool's

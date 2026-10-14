@@ -64,7 +64,7 @@ node boot disk).
 ## Binding Manual Pools to ComputeClass
 
 Manual pools must be labeled/tainted to be eligible for a ComputeClass (unless
-it's the cluster default). These are `nodeConfig` settings, so propose a new
+it's the cluster default). `nodeConfig.labels` is immutable on an existing pool, so propose a new
 `ContainerNodePool` carrying the label `cloud.google.com/compute-class: <CLASS-NAME>`
 in `spec.nodeConfig.labels` and a `spec.nodeConfig.taint` entry with that key and
 value and the no-schedule effect, as Config Connector YAML through

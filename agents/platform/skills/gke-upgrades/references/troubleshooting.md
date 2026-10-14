@@ -156,7 +156,7 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
    ```
 
 **Fix:**
-1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, pin the node pool to the previous working driver version (e.g., `R535`) in `spec.nodeConfig.guestAccelerator[].gpuDriverInstallationConfig.gpuDriverVersion`. A `nodeConfig` setting is not edited in place: propose a new `ContainerNodePool` with it as a pull request and move the workloads.
+1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, pin the node pool to the previous working driver version (e.g., `R535`) in `spec.nodeConfig.guestAccelerator[].gpuDriverInstallationConfig.gpuDriverVersion`. `guestAccelerator` is immutable on a `ContainerNodePool` (create-only in the `gcp-config-connector` skill's container catalogue), so propose a new pool with it as a pull request and move the workloads.
 2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
 3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version: `spec.version: PREVIOUS_VERSION` on its `ContainerNodePool`, proposed as a pull request.
 

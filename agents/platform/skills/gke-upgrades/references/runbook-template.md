@@ -10,8 +10,8 @@ Each change step below is a pull request editing the cluster's `ContainerCluster
 - [Pre-flight](#pre-flight) (Line 16-35)
 - [Control plane upgrade](#control-plane-upgrade) (Line 36-47)
 - [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-60)
-- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-68)
-- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 69-117)
+- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-69)
+- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 70-118)
 
 ## Pre-flight
 
@@ -64,7 +64,8 @@ Each of these is proposed as a pull request on the cluster's `ContainerCluster` 
 
 - **Recurring maintenance window**: `spec.maintenancePolicy.recurringWindow` with `startTime` and `endTime` (`YYYY-MM-DDTHH:MM:SSZ`) and `recurrence` (e.g. `FREQ=WEEKLY;BYDAY=SA`).
 - **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope` (as the GKE API spells it: `NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`).
-- **Persistent exclusion (until End of Support)** and **node pool level exclusions**: each has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
+- **Exclusion until End of Support**: the same entry with `endTime` set to the minor version's End of Support date and `exclusionOptions.scope` `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The schema has no field that follows the End of Support date if it moves, so a later date is a new pull request moving `endTime`.
+- **Node pool level exclusions**: `ContainerNodePool` has no exclusion field (confirm with `kubectl explain`), so the agent blocks rather than inventing one.
 
 ## Rollback/Downgrade guidance
 

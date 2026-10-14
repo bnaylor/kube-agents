@@ -23,8 +23,8 @@ diff --git a/SKILL.md b/SKILL.md
  4. **Handle periods > 90 days**: If the user needs to block upgrades for more than 90 days, you MUST explain that 'No upgrades' is limited to 90 days per exclusion (max 3 per cluster, and 48 hours of maintenance availability must remain in any rolling 92-day window, preventing chaining into longer continuous freezes) and advise using scoped exclusions ('No minor or node upgrades' / 'No minor upgrades'), which have no fixed day cap and can run until the minor version's End of Support.
 -5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. Use `--add-maintenance-exclusion-until-end-of-support` for persistent exclusions.
 -6. **Correct gcloud syntax**: When providing `gcloud` commands for exclusions, you MUST use the separate flag syntax: `--add-maintenance-exclusion-name`, `--add-maintenance-exclusion-start`, `--add-maintenance-exclusion-end` (or `--add-maintenance-exclusion-until-end-of-support`), and `--add-maintenance-exclusion-scope` (do NOT use a single comma-separated `--add-maintenance-exclusion` flag).
-+5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. A persistent exclusion that runs until End of Support has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
-+6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope` (`NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`, as the GKE API spells them, not gcloud's lowercase forms).
++5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions.
++6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope` (`NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`, as the GKE API spells them, not gcloud's lowercase forms). For an exclusion that runs until End of Support, set `endTime` to the minor version's End of Support date (from the GKE release schedule) with scope `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The `ContainerCluster` schema carries a fixed `endTime` and no field for gcloud's form that follows the End of Support date if it moves (confirm with `kubectl explain` against the customer's CRD), so a later End of Support date is a new pull request moving `endTime`.
  
  ## Mandatory Upgrade Overrides
  
@@ -69,8 +69,8 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 +- [Pre-flight](#pre-flight) (Line 16-35)
 +- [Control plane upgrade](#control-plane-upgrade) (Line 36-47)
 +- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-60)
-+- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-68)
-+- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 69-117)
++- [Maintenance window configuration](#maintenance-window-configuration) (Line 61-69)
++- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 70-118)
  
  ## Pre-flight
  
@@ -114,7 +114,7 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
  # Monitor progress
  watch 'kubectl get nodes -o wide -L cloud.google.com/gke-nodepool'
  
-@@ -72,114 +60,58 @@ kubectl get pods -A | grep -v Running | grep -v Completed
+@@ -72,114 +60,59 @@ kubectl get pods -A | grep -v Running | grep -v Completed
  
  ## Maintenance window configuration
  
@@ -156,7 +156,8 @@ diff --git a/references/runbook-template.md b/references/runbook-template.md
 -```
 +- **Recurring maintenance window**: `spec.maintenancePolicy.recurringWindow` with `startTime` and `endTime` (`YYYY-MM-DDTHH:MM:SSZ`) and `recurrence` (e.g. `FREQ=WEEKLY;BYDAY=SA`).
 +- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope` (as the GKE API spells it: `NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`).
-+- **Persistent exclusion (until End of Support)** and **node pool level exclusions**: each has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
++- **Exclusion until End of Support**: the same entry with `endTime` set to the minor version's End of Support date and `exclusionOptions.scope` `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The schema has no field that follows the End of Support date if it moves, so a later date is a new pull request moving `endTime`.
++- **Node pool level exclusions**: `ContainerNodePool` has no exclusion field (confirm with `kubectl explain`), so the agent blocks rather than inventing one.
  
  ## Rollback/Downgrade guidance
  
@@ -423,7 +424,7 @@ diff --git a/references/troubleshooting.md b/references/troubleshooting.md
 -     --zone ZONE \
 -     --accelerator type=GPU_TYPE,count=COUNT,gpu-driver-version=DRIVER_VERSION
 -   ```
-+1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, pin the node pool to the previous working driver version (e.g., `R535`) in `spec.nodeConfig.guestAccelerator[].gpuDriverInstallationConfig.gpuDriverVersion`. A `nodeConfig` setting is not edited in place: propose a new `ContainerNodePool` with it as a pull request and move the workloads.
++1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, pin the node pool to the previous working driver version (e.g., `R535`) in `spec.nodeConfig.guestAccelerator[].gpuDriverInstallationConfig.gpuDriverVersion`. `guestAccelerator` is immutable on a `ContainerNodePool` (create-only in the `gcp-config-connector` skill's container catalogue), so propose a new pool with it as a pull request and move the workloads.
  2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
 -3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version:
 -   ```bash
