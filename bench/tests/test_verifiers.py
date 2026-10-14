@@ -3833,6 +3833,16 @@ def test_deep_nesting_is_unparsed_not_a_crash(token, github):
     assert res.status == "fail" and "could not parse" in res.reason
 
 
+def test_an_unparsed_file_fails_every_scoped_op_not_only_absent(token, github):
+    """An E2 pool hidden behind an alias in a second file cannot let "not E2" pass."""
+    hidden = "kind: ContainerNodePool\nmetadata: {name: e2}\nspec:\n  nodeConfig: &n {machineType: e2-standard-4}\n  x: *n\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/hidden.yaml": hidden})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "hidden.yaml" in res.reason
+
+
 def test_a_quantifier_on_absent_is_refused():
     with pytest.raises(ValueError):
         _pr_check(content=[{"paths": ["x"], "op": "absent", "quantifier": "any"}])

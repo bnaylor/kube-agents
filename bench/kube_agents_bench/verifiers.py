@@ -2463,12 +2463,12 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
             else:
                 values = [doc_text]
             kept.append((label, values))
+    # A file that could not be read structurally may hold the very object a
+    # kind- or field-scoped check is about (an E2 pool behind an alias, say),
+    # so no such check is shown over it, whatever the op.
+    if unparsed and (check.kind or check.field):
+        return f"{check.label()}: could not parse {', '.join(unparsed)} as YAML, so this is not shown"
     if check.op == "absent":
-        # Absence over a file that could not be read structurally is not
-        # shown: the object may be in it. Fail closed when the check names a
-        # kind or a field to look for.
-        if unparsed and (check.kind or check.field):
-            return f"{check.label()}: could not parse {', '.join(unparsed)} as YAML, so absence is not shown"
         present = [label for label, values in kept if values]
         if present:
             named = ", ".join(present[:_PR_CONTENT_MAX_NAMED])
