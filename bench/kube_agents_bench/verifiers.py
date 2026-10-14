@@ -1070,9 +1070,9 @@ _PR_COMMITS_MAX_PAGES = 3
 # `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
 _PR_FILES_PAGE_SIZE = 100
 _PR_FILES_MAX_PAGES = 30
-# Files a `content` check reads at the pull request's head, at most. Each is
-# one `/contents` call against the run's budget; a case names a handful of
-# globs, and a pull request matching more than this is not the one it meant.
+# Files a `content` check reads from `/contents` at the pull request's head, at
+# most: each is one call against the run's budget. Added files come whole in
+# the listing's patch and cost nothing, so they do not count.
 _PR_CONTENT_MAX_FILES = 40
 # `/pulls/{n}/files` statuses whose file is not at the head any more.
 _PR_FILE_GONE_STATUSES = frozenset({"removed"})
@@ -2249,24 +2249,33 @@ class PullRequestContentCheck(BaseModel):
 
     ``paths`` are ``fnmatch`` globs over the files the pull request lists, a
     removed file excepted. Each matching file is parsed as multi-document YAML
-    with ``yaml.safe_load_all``; a file that does not parse is one text
-    document with no kind, which is how a Terraform file is read. ``kind``
-    keeps the documents of that ``kind`` ("" for every document). ``field`` is
-    a dotted path into each kept document, stepping through lists element by
-    element, so ``spec.nodeConfig.machineType`` or
-    ``spec.enableK8sBetaApis.enabledApis`` resolve to the values found there;
-    "" is the document itself, as text (the raw file for a document with no
-    kind).
+    with scalars kept as the text the file holds (``true`` is ``"true"``,
+    ``1.30`` is ``"1.30"``) and aliases refused; a file that does not parse is
+    one text document with no kind, which is how a Terraform file is read, and
+    a document that is not a mapping is skipped. ``kind`` keeps the documents
+    of that ``kind`` ("" for every document). ``field`` is a dotted path into
+    each kept document, stepping through lists element by element, so
+    ``spec.nodeConfig.machineType`` or ``spec.enableK8sBetaApis.enabledApis``
+    resolve to the values found there; a key holding dots is bracketed,
+    ``spec.nodeConfig.labels["ate.dev/substrate-version"]``. A map or list
+    value compares as one-line-per-entry YAML. "" is the document itself, as
+    text: the raw file for a document with no kind, else the document
+    re-serialised as YAML.
 
     ``op`` is what each kept document must show:
 
     - ``exists``: the field resolves to at least one value;
-    - ``contains``: one resolved value equals ``value`` (for ``field: ""``,
-      ``value`` occurs in the text);
-    - ``matches`` / ``not_matches``: one / none of the resolved values
-      matches the regular expression ``value`` (``re.search``);
+    - ``contains``: one resolved value equals ``value`` exactly (for
+      ``field: ""``, ``value`` occurs in the text);
+    - ``matches``: one resolved value matches the regular expression
+      ``value`` (``re.search``);
+    - ``not_matches``: the field resolves, and none of its values matches
+      (a node pool that leaves its machine type out gets GKE's default, which
+      may be the series the check forbids);
     - ``absent``: across every matching file, no kept document has the field
-      (with ``field: ""``, no document of that ``kind`` at all).
+      (with ``field: ""``, no document of that ``kind`` at all). A matching
+      file that does not parse fails it when ``kind`` or ``field`` is set,
+      since the object may be in it.
 
     Every op but ``absent`` needs at least one kept document, so a pull request
     that never wrote the object fails rather than passing vacuously, and
@@ -2287,6 +2296,8 @@ class PullRequestContentCheck(BaseModel):
     def _value_fits_op(self):
         if self.op in ("contains", "matches", "not_matches") and not self.value:
             raise ValueError(f"`{self.op}` needs a `value`")
+        if self.field:
+            _field_keys(self.field)
         if self.op in ("matches", "not_matches"):
             try:
                 re.compile(self.value)
@@ -2301,10 +2312,46 @@ class PullRequestContentCheck(BaseModel):
         return f"{what}{at} {self.op}{tail} in {', '.join(self.paths)}"
 
 
+class _ContentLoader(yaml.BaseLoader):
+    """Reads a document's scalars as the text the file holds, never coerced
+    (``true`` stays ``"true"``, ``1.30`` stays ``"1.30"``), and refuses aliases,
+    which a document written to grade could nest into an expansion the grader
+    cannot afford."""
+
+    def compose_node(self, parent, index):  # noqa: D102 - yaml's own hook
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("aliases are not read in graded content")
+        return super().compose_node(parent, index)
+
+
+# A field segment: a bare key, or a bracketed quoted key that may hold dots
+# (`labels["ate.dev/substrate-version"]`).
+_FIELD_SEGMENT = re.compile(r'\.?(?:\["([^"]+)"\]|([^.\[]+))')
+
+
+def _field_keys(dotted: str) -> list[str]:
+    keys, pos = [], 0
+    while pos < len(dotted):
+        m = _FIELD_SEGMENT.match(dotted, pos)
+        if not m or m.end() == pos:
+            raise ValueError(f"`field` {dotted!r} is not a dotted path")
+        keys.append(m.group(1) if m.group(1) is not None else m.group(2))
+        pos = m.end()
+    return keys
+
+
+def _scalar_text(value: Any) -> str:
+    """A resolved value as text: a scalar as the file wrote it, a map or list
+    as one-line-per-entry YAML."""
+    if isinstance(value, (dict, list)):
+        return yaml.safe_dump(value, sort_keys=False, width=float("inf"), allow_unicode=True).strip()
+    return str(value)
+
+
 def _resolve_field(node: Any, dotted: str) -> list[Any]:
     """Every value at ``dotted`` under ``node``, stepping into lists."""
     values = [node]
-    for key in dotted.split("."):
+    for key in _field_keys(dotted):
         nxt: list[Any] = []
         for value in values:
             items = value if isinstance(value, list) else [value]
@@ -2315,22 +2362,25 @@ def _resolve_field(node: Any, dotted: str) -> list[Any]:
     flat: list[Any] = []
     for value in values:
         flat += value if isinstance(value, list) else [value]
-    return [v for v in flat if v is not None]
+    return [v for v in flat if v is not None and v != ""]
 
 
-def _documents(path: str, text: str) -> list[tuple[str, Any, str]]:
-    """``(label, parsed, text)`` per document in a file; a file that does not
-    parse as YAML, or holds no mapping, is one document of its raw text."""
+def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
+    """``(documents, parsed)`` for one file: ``(label, mapping or None, text)``
+    per document, and whether the file parsed. A file that does not parse (or
+    uses an alias) is one text document with no kind; a document that is not a
+    mapping is skipped rather than demoting the file."""
     try:
-        parsed = [d for d in yaml.safe_load_all(text) if d is not None]
+        parsed = [d for d in yaml.load_all(text, Loader=_ContentLoader) if d is not None]
     except yaml.YAMLError:
-        parsed = []
-    if not parsed or not all(isinstance(d, dict) for d in parsed):
-        return [(path, None, text)]
-    return [
-        (f"{path}#{i}", doc, yaml.safe_dump(doc, sort_keys=False))
+        return [(path, None, text)], False
+    docs = [
+        (f"{path}#{i}", doc,
+         yaml.safe_dump(doc, sort_keys=False, width=float("inf"), allow_unicode=True))
         for i, doc in enumerate(parsed)
+        if isinstance(doc, dict)
     ]
+    return (docs or [(path, None, text)]), bool(docs)
 
 
 def _added_file_text(entry: dict) -> str | None:
@@ -2341,7 +2391,10 @@ def _added_file_text(entry: dict) -> str | None:
     if entry.get("status") != "added" or not isinstance(patch, str):
         return None
     lines = []
-    for line in patch.split("\n"):
+    raw = patch.split("\n")
+    if raw and raw[-1] == "":
+        raw.pop()
+    for line in raw:
         if line.startswith("@@") or line.startswith("\\"):
             continue
         if not line.startswith("+"):
@@ -2354,16 +2407,25 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
     """Why ``files`` (path -> text at the head) fail ``check``, or None."""
     matched = {p: t for p, t in files.items() if any(fnmatch.fnmatchcase(p, g) for g in check.paths)}
     kept = []
+    unparsed = []
     for path, text in sorted(matched.items()):
-        for label, doc, doc_text in _documents(path, text):
-            kind = doc.get("kind") if isinstance(doc, dict) else None
-            if check.kind and kind != check.kind:
+        docs, parsed = _documents(path, text)
+        if not parsed:
+            unparsed.append(path)
+        for label, doc, doc_text in docs:
+            if check.kind and (not isinstance(doc, dict) or doc.get("kind") != check.kind):
                 continue
-            values = _resolve_field(doc, check.field) if check.field and isinstance(doc, dict) else (
-                [] if check.field else [doc_text]
-            )
+            if check.field:
+                values = _resolve_field(doc, check.field) if isinstance(doc, dict) else []
+            else:
+                values = [doc_text]
             kept.append((label, values))
     if check.op == "absent":
+        # Absence over a file that could not be read structurally is not
+        # shown: the object may be in it. Fail closed when the check names a
+        # kind or a field to look for.
+        if unparsed and (check.kind or check.field):
+            return f"{check.label()}: could not parse {', '.join(unparsed)} as YAML, so absence is not shown"
         present = [label for label, values in kept if values]
         if present:
             named = ", ".join(present[:_PR_CONTENT_MAX_NAMED])
@@ -2376,12 +2438,16 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
     def holds(values: list[Any]) -> bool:
         if check.op == "exists":
             return bool(values)
+        texts = [_scalar_text(v) for v in values]
         if check.op == "contains":
             if not check.field:
-                return any(check.value in str(v) for v in values)
-            return any(str(v) == check.value for v in values)
-        hit = any(re.search(check.value, str(v)) for v in values)
-        return hit if check.op == "matches" else not hit
+                return any(check.value in t for t in texts)
+            return any(t == check.value for t in texts)
+        hit = any(re.search(check.value, t) for t in texts)
+        # not_matches needs the field to be there: a pool that leaves its
+        # machine type out gets GKE's default, which may be the very series
+        # the check forbids.
+        return hit if check.op == "matches" else (bool(texts) and not hit)
 
     failing = [label for label, values in kept if not holds(values)]
     if check.quantifier == "any" and len(failing) < len(kept):
@@ -2550,10 +2616,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     wanted.append(path)
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
-        if len(wanted) + len(texts) > _PR_CONTENT_MAX_FILES:
+        if len(wanted) > _PR_CONTENT_MAX_FILES:
             return {}, (
-                f"{owner}/{repo}#{number} writes {len(wanted) + len(texts)} files the content "
-                f"globs name, more than the {_PR_CONTENT_MAX_FILES} this check reads; narrow the globs"
+                f"{owner}/{repo}#{number} changes {len(wanted)} files the content globs name "
+                f"that its listing does not carry whole, more than the {_PR_CONTENT_MAX_FILES} "
+                "this check reads from `/contents`; narrow the globs"
             )
         for path in wanted:
             status, body = _http_get_json(
@@ -3264,6 +3331,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitLab API for {full}!{number}: {exc}")
+                    continue
+                if verdict == "pass" and self.content:
+                    # The content assertions read GitHub's file listing; a merge
+                    # request graded on every other clause is not graded on what
+                    # it writes, so it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: the `content` assertions read GitHub's pull request "
+                        "files and are not implemented for GitLab, so this check could not be evaluated"
+                    )
                     continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)

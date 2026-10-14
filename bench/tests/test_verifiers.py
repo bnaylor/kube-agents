@@ -3668,6 +3668,70 @@ def test_a_modified_file_is_read_at_the_head(token, github):
     assert any("/contents/" in url for url, _ in github.calls)
 
 
+def test_not_matches_needs_the_field_to_be_there(token, github):
+    """A pool with no machine type gets GKE's default, which may be E2."""
+    bare = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig: {}\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/pool.yaml": bare})
+    assert _pr_check(content=[check]).verify(5.0).status == "fail"
+
+
+def test_scalars_compare_as_the_file_wrote_them(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableAutopilot: false\n  minMasterVersion: 1.30\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    checks = [
+        {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.enableAutopilot",
+         "op": "contains", "value": "false"},
+        {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.minMasterVersion",
+         "op": "contains", "value": "1.30"},
+    ]
+    res = _pr_check(content=checks).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_bracketed_key_reads_a_label_with_dots(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": 'spec.nodeConfig.labels["ate.dev/substrate-version"]', "op": "contains",
+             "value": "v0.4.0-gke.0"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+    assert _pr_check(content=[{**check, "value": "v0.3.0"}]).verify(5.0).status == "fail"
+
+
+def test_absent_fails_closed_on_a_file_that_does_not_parse(token, github):
+    broken = "kind: ContainerNodePool\nmetadata: {name: p}\nspec: [unclosed\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/pool.yaml": broken})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_an_alias_is_refused_not_expanded(token, github):
+    """A document built to expand on read is not parsed: absence fails closed, and an
+    op that needs the object finds none."""
+    bomb = "kind: ConfigMap\nmetadata: {name: m}\ndata:\n  a: &a [x, x]\n  b: [*a, *a]\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": bomb})
+    absent = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "op": "absent"}
+    exists = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "field": "data", "op": "exists"}
+    assert _pr_check(content=[absent]).verify(5.0).status == "fail"
+    assert _pr_check(content=[exists]).verify(5.0).status == "fail"
+
+
+def test_a_patch_ending_without_a_newline_is_rebuilt():
+    entry = {"status": "added", "patch": "@@ -0,0 +1,2 @@\n+kind: A\n+x: 1\n\\ No newline at end of file"}
+    assert verifiers._added_file_text(entry) == "kind: A\nx: 1\n"
+    entry = {"status": "added", "patch": "@@ -0,0 +1,1 @@\n+kind: A\n"}
+    assert verifiers._added_file_text(entry) == "kind: A\n"
+    assert verifiers._added_file_text({"status": "added"}) is None
+    assert verifiers._added_file_text({"status": "modified", "patch": "@@\n+a"}) is None
+
+
+def test_a_field_path_is_checked_when_the_case_loads():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "exists", "field": 'a.["unclosed'}])
+
+
 def test_unreadable_contents_are_unevaluable_not_a_fail(token, github):
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
     repo = f"https://api.github.com/repos/gke-agentic/{_PR_REPO}"
