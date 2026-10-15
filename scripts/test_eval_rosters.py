@@ -173,6 +173,7 @@ ADDED_AFTER_THE_MOVE = [
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
+    "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -517,6 +518,10 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # cluster-setting-request-proposes-pr: asked to enable Shielded Nodes, it
+    # may propose the change as a pull request; its objective's
+    # pull_request_opened leaf allows one.
+    "cluster-setting-request-proposes-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the
