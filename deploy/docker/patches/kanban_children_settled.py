@@ -278,8 +278,11 @@ STEPS_REFUSAL = (
     "kanban_comment(body=\"step {example}: done\"), or end the card with "
     "kanban_block(kind=\"needs_input\") whose `reason` names what was not "
     "delivered and, for anything already created, the resource, its state and "
-    "how to remove it. There is no way to skip a step: one that turned out "
-    "to be unneeded is a block that says so. The `result` you submitted has "
+    "how to remove it. You cannot skip a step on your own: one that turned "
+    "out to be unneeded is a block that says so. If the requester has "
+    "answered that a step is not wanted, record their answer as its outcome: "
+    "kanban_comment(body=\"step {example}: done - dropped at the requester's "
+    "request\"). The `result` you submitted has "
     "been saved on this card in the meantime."
 )
 

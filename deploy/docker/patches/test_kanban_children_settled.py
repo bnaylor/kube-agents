@@ -659,6 +659,16 @@ class TestTheStepGate(unittest.TestCase):
         self.comment("step substrate: done")
         self.assertIsNone(self.gate())
 
+    def test_a_step_the_requester_dropped_is_recorded_by_the_worker_and_closes(self):
+        self.card("step cluster: planned\nstep substrate: planned")
+        self.comment("step cluster: done")
+        refused = self.gate()
+        self.assertIn("dropped at the requester's request", refused)
+        self.comment("skip Substrate, the cluster is enough", author="default")
+        self.assertIsNotNone(self.gate())
+        self.comment("step substrate: done - dropped at the requester's request")
+        self.assertIsNone(self.gate())
+
     def test_another_cards_steps_do_not_count(self):
         self.card("Provision a cluster.")
         self.card("step other: planned", task_id="t_other")
