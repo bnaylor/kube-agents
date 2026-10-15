@@ -56,10 +56,15 @@ const (
 //   - a task that ended without its terminal on the bus, or before the
 //     adapter could tell: the pod must reach a terminal phase so the
 //     gateway's sweep closes the task, rather than sit live with it open.
-//   - a harness run that reported no session: there is nothing to resume,
-//     and a next turn run without one would have neither the conversation
-//     nor the primer. Exiting hands the next turn to a cold start, which has
-//     the primer.
+//   - a harness run that reported no session when there was none to resume
+//     either: a next turn run without one would have neither the
+//     conversation nor the primer. Exiting hands the next turn to a cold
+//     start, which has the primer. On a resumed turn (a stop before the
+//     harness's init line, say) the previous session is still there, so the
+//     loop keeps it and goes on.
+//   - a turn refused before its harness ran, for a reason in the pod's own
+//     state (turnOutcome.podBroken): every later turn here would be refused
+//     the same way, and a cold start has a clean pod.
 func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask string, firstSeq uint64, first turnOutcome) (Result, error) {
 	log := cfg.Logger
 	w := &taskWatcher{
@@ -74,14 +79,24 @@ func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask stri
 	out := first
 	for {
 		if out.launched {
-			if out.harnessSession == "" {
+			switch {
+			case out.harnessSession != "":
+				// The primer went into a harness session that said it
+				// exists, so every later run resumes it instead.
+				resume, primer = out.harnessSession, ""
+			case resume == "":
 				log.Warn("the harness reported no session to resume; exiting so the next turn starts cold with the conversation so far",
 					"task", out.lastTask(cfg))
 				return out.res, out.err
+			default:
+				log.Warn("the harness reported no session; keeping the one it was resuming", "task", out.lastTask(cfg),
+					"session", resume)
 			}
-			// The primer went into a harness session that said it exists,
-			// so every later run resumes it instead.
-			resume, primer = out.harnessSession, ""
+		}
+		if out.podBroken {
+			log.Warn("the turn was refused before its harness ran; exiting so the next turn starts on a fresh pod",
+				"task", out.lastTask(cfg))
+			return out.res, out.err
 		}
 		if out.err != nil || out.res.Evicted || ctx.Err() != nil {
 			return out.res, out.err
@@ -252,8 +267,7 @@ var errSubmissionUnproven = errors.New("cannot show the first message of a new t
 func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, error) {
 	md, err := msg.Metadata()
 	if err != nil {
-		w.log.Error("task watcher skipping a message with no metadata", "subject", msg.Subject(), "err", err)
-		return nil, 0, false, nil
+		return nil, 0, false, w.unreadable(msg.Subject(), "a message with no metadata", err)
 	}
 	seq := md.Sequence.Stream
 	if seq >= w.next {
@@ -261,8 +275,7 @@ func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, erro
 	}
 	env, err := lib.ParseEnvelope(msg.Data())
 	if err != nil {
-		w.log.Error("task watcher skipping an unparseable envelope", "subject", msg.Subject(), "err", err)
-		return nil, 0, false, nil
+		return nil, 0, false, w.unreadable(msg.Subject(), "an unparseable envelope", err)
 	}
 	if env.Kind != lib.KindMessage || w.handled[env.TaskID] {
 		return nil, 0, false, nil
@@ -286,6 +299,24 @@ func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, erro
 			env.TaskID, msg.Subject(), seq, md.NumPending, errSubmissionUnproven)
 	}
 	return env, seq, true, nil
+}
+
+// unreadable decides a message take cannot read. On a task this pod has run
+// it is a late steer or cancel, skipped. Otherwise it may be a new task's
+// submission, and the next message on its subject could be a steer that
+// nothing would tell from one, so the task id (from the subject) is refused,
+// as on NumPending: the pod ends and the next turn starts fresh.
+func (w *taskWatcher) unreadable(subject, what string, cause error) error {
+	_, taskID, _, ok := lib.ParseTaskSubject(subject)
+	if ok && w.handled[taskID] {
+		w.log.Error("task watcher skipping "+what+" for a task it has run", "subject", subject, "err", cause)
+		return nil
+	}
+	if ok {
+		w.handled[taskID] = true
+	}
+	return fmt.Errorf("the first message for task %q at %s is %s (%v), so what follows it may be a steer; refusing it, and ending this pod so the next turn starts fresh: %w",
+		taskID, subject, what, cause, errSubmissionUnproven)
 }
 
 // delegateOffForTask reports whether a task runs without the delegate tool,

@@ -506,12 +506,20 @@ type turnOutcome struct {
 	harnessSession string
 	// task is the task this outcome is for, set by the session loop.
 	task string
+	// podBroken is a turn refused after working and before its harness ran,
+	// for a reason in the pod's own state (the per-turn socket, the user
+	// settings file, the listener, the harness binary). The next turn here
+	// would be refused the same way, so a reused pod ends instead.
+	podBroken bool
 }
 
 // execute runs one task from its submission to its terminal state.
 func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
 	cfg, log := a.cfg, a.log
 	done := func(res Result, err error) turnOutcome { return turnOutcome{res: res, err: err} }
+	broken := func(res Result, err error) turnOutcome {
+		return turnOutcome{res: res, err: err, podBroken: true}
+	}
 
 	// Respawn safety: a task already terminal on the stream is not ours to
 	// re-run (the dispatcher rule, worn by the executor while there is no
@@ -622,7 +630,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 		if err != nil {
 			state := lib.StateFailed
 			ferr := a.finalize(state, "reason: delegate-socket-failed - "+err.Error(), "")
-			return done(Result{State: state}, ferr)
+			return broken(Result{State: state}, ferr)
 		}
 		var rewrote bool
 		argv, env, rewrote = withDelegateSocket(argv, env, socket)
@@ -639,7 +647,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 		if err := removeUserSettings(cfg.HarnessUserSettings); err != nil {
 			state := lib.StateFailed
 			ferr := a.finalize(state, "reason: harness-settings-failed - "+err.Error(), "")
-			return done(Result{State: state}, ferr)
+			return broken(Result{State: state}, ferr)
 		}
 	}
 
@@ -652,7 +660,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: delegate-socket-failed - "+err.Error(), "")
-		return done(Result{State: state}, ferr)
+		return broken(Result{State: state}, ferr)
 	}
 	defer stopDelegate()
 
@@ -660,7 +668,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
-		return done(Result{State: state}, ferr)
+		return broken(Result{State: state}, ferr)
 	}
 
 	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)

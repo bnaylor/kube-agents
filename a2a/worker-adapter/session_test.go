@@ -268,10 +268,10 @@ func TestASIGTERMMidTaskInAReusedPodIsAnEviction(t *testing.T) {
 	}
 }
 
-// A harness that reports no session leaves nothing to resume, and a next
-// turn with neither the session nor the primer would know nothing of the
-// conversation. The process exits after that task's terminal, so the next
-// turn starts cold, with the primer.
+// A first harness run that reports no session leaves nothing to resume, and
+// a next turn with neither the session nor the primer would know nothing of
+// the conversation. The process exits after that task's terminal, so the
+// next turn starts cold, with the primer.
 func TestAReusedPodExitsWhenTheHarnessReportsNoSession(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -279,7 +279,6 @@ func TestAReusedPodExitsWhenTheHarnessReportsNoSession(t *testing.T) {
 		tasks  int
 	}{
 		{"on the first turn", 1, 1},
-		{"on a resumed turn", 2, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			url := startServer(t)
@@ -827,4 +826,143 @@ func TestARemovalFailureRefusesTheTurn(t *testing.T) {
 	if err := removeUserSettings(""); err != nil {
 		t.Fatalf("an empty path: %v, want nil", err)
 	}
+}
+
+// A resumed turn stopped before the harness's init line has reported no
+// session, but the one it was resuming is still there: the pod keeps it and
+// the next turn resumes it, rather than paying a cold start.
+func TestAReusedPodKeepsItsSessionWhenAResumedTurnIsStoppedBeforeInit(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-shrew-k1p2"
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "noinit.2"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := recordingStub(t, dir, `if [ "$n" = 2 ]; then exec sleep 60; fi`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	submit(t, c, session, "task-k-1", "first")
+	done := runAdapter(ctx, reuseConfig(url, "task-k-1", session, harness))
+	waitState(t, c, session, "task-k-1", lib.StateCompleted)
+	submit(t, c, session, "task-k-2", "second")
+	waitState(t, c, session, "task-k-2", lib.StateWorking)
+	publishIn(t, c, session, "task-k-2", "")
+	waitState(t, c, session, "task-k-2", lib.StateCanceled)
+
+	submit(t, c, session, "task-k-3", "third")
+	waitState(t, c, session, "task-k-3", lib.StateCompleted)
+	if a := readRun(t, dir, "argv", 3); !strings.HasSuffix(strings.TrimSpace(a), harnessResumeFlag+" sess-1") {
+		t.Errorf("run 3 argv = %q, want it to resume sess-1", a)
+	}
+	select {
+	case out := <-done:
+		t.Fatalf("the adapter exited after a resumed turn stopped before init: %+v err=%v", out.res, out.err)
+	default:
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}
+
+// A turn refused before its harness runs, for a reason in the pod's own state,
+// ends the pod after that turn's terminal: a non-empty directory planted at
+// the user settings path would refuse every later turn the same way, so the
+// next one has to start on a fresh pod.
+func TestAReusedPodEndsWhenATurnIsRefusedBeforeItsHarness(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-mink-b3r4"
+	dir := t.TempDir()
+	settings := filepath.Join(dir, "config", "settings.json")
+	submit(t, c, session, "task-b-1", "first")
+	cfg := reuseConfig(url, "task-b-1", session, recordingStub(t, dir, ""))
+	cfg.HarnessUserSettings = settings
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+	waitState(t, c, session, "task-b-1", lib.StateCompleted)
+
+	if err := os.MkdirAll(filepath.Join(settings, "planted"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	submit(t, c, session, "task-b-2", "second")
+	out := waitOutcome(t, done, 30*time.Second)
+	if out.res.State != lib.StateFailed || out.res.Evicted {
+		t.Fatalf("run: %+v err=%v, want the refused turn's failed terminal", out.res, out.err)
+	}
+	if task := foldTask(t, c, session, "task-b-2"); !task.Final || task.State != lib.StateFailed {
+		t.Fatalf("task-b-2: final=%v state=%s, want failed", task.Final, task.State)
+	}
+	if n := runCount(dir); n != 1 {
+		t.Errorf("harness ran %d times, want 1", n)
+	}
+}
+
+// A message the watcher cannot read, on a task it has not run, may be that
+// task's submission, so the steer after it must not be taken as one: the
+// task is refused, as when the submission may have been evicted. On a task
+// it has run, the same message is a late steer, and is passed over.
+func TestTheWatcherRefusesATaskWhoseFirstMessageItCannotRead(t *testing.T) {
+	const session = "sess"
+	t.Run("an unparseable envelope", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			handled bool
+		}{{"on a new task", false}, {"on a task already run", true}} {
+			t.Run(tc.name, func(t *testing.T) {
+				js, cleanup := capTasksStream(t, maxPendingBehindSubmission*2)
+				defer cleanup()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if _, err := js.Publish(ctx, lib.TaskInSubject(session, "t1"), []byte("not an envelope")); err != nil {
+					t.Fatal(err)
+				}
+				publishMessage(ctx, t, js, lib.TaskInSubject(session, "t1"), "a steer")
+				w := &taskWatcher{js: js, log: slog.Default(), stem: session, addr: session, next: 1,
+					handled: map[string]bool{"t1": tc.handled}}
+				if !tc.handled {
+					if env, _, err := w.nextTask(ctx); !errors.Is(err, errSubmissionUnproven) {
+						t.Fatalf("nextTask = %v, %v; want a refusal", env, err)
+					}
+					return
+				}
+				wctx, wcancel := context.WithTimeout(ctx, 2*time.Second)
+				defer wcancel()
+				if env, _, err := w.nextTask(wctx); env != nil || !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("nextTask = %v, %v; want nothing taken on a task already run", env, err)
+				}
+			})
+		}
+	})
+	t.Run("a message with no metadata", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			handled bool
+		}{{"on a new task", false}, {"on a task already run", true}} {
+			t.Run(tc.name, func(t *testing.T) {
+				w := &taskWatcher{log: slog.Default(), addr: session, handled: map[string]bool{"t1": tc.handled}}
+				_, _, isTask, err := w.take(noMetadataMsg{subject: lib.TaskInSubject(session, "t1")})
+				if isTask {
+					t.Fatal("took a message with no metadata as a task")
+				}
+				if got := errors.Is(err, errSubmissionUnproven); got != !tc.handled {
+					t.Fatalf("take err = %v, want a refusal = %v", err, !tc.handled)
+				}
+				if !w.handled["t1"] {
+					t.Fatal("t1 is not marked handled, so its next message would be admitted")
+				}
+			})
+		}
+	})
+}
+
+// noMetadataMsg is a delivery with no JetStream metadata.
+type noMetadataMsg struct {
+	jetstream.Msg
+	subject string
+}
+
+func (m noMetadataMsg) Subject() string { return m.subject }
+func (m noMetadataMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return nil, errors.New("not a JetStream message")
 }
