@@ -270,8 +270,9 @@ func TestASIGTERMMidTaskInAReusedPodIsAnEviction(t *testing.T) {
 
 // A first harness run that reports no session leaves nothing to resume, and
 // a next turn with neither the session nor the primer would know nothing of
-// the conversation. The process exits after that task's terminal, so the
-// next turn starts cold, with the primer.
+// the conversation; a resumed run that ends without one, other than by a
+// stop, may have failed on the session it was given. The process exits after
+// that task's terminal, so the next turn starts cold, with the primer.
 func TestAReusedPodExitsWhenTheHarnessReportsNoSession(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -279,6 +280,7 @@ func TestAReusedPodExitsWhenTheHarnessReportsNoSession(t *testing.T) {
 		tasks  int
 	}{
 		{"on the first turn", 1, 1},
+		{"on a resumed turn that was not stopped", 2, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			url := startServer(t)
@@ -830,7 +832,9 @@ func TestARemovalFailureRefusesTheTurn(t *testing.T) {
 
 // A resumed turn stopped before the harness's init line has reported no
 // session, but the one it was resuming is still there: the pod keeps it and
-// the next turn resumes it, rather than paying a cold start.
+// the next turn resumes it, rather than paying a cold start. A resumed run
+// that ends without a session any other way may have failed on the session
+// itself, and the pod exits, as on a first run.
 func TestAReusedPodKeepsItsSessionWhenAResumedTurnIsStoppedBeforeInit(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
@@ -852,8 +856,10 @@ func TestAReusedPodKeepsItsSessionWhenAResumedTurnIsStoppedBeforeInit(t *testing
 
 	submit(t, c, session, "task-k-3", "third")
 	waitState(t, c, session, "task-k-3", lib.StateCompleted)
-	if a := readRun(t, dir, "argv", 3); !strings.HasSuffix(strings.TrimSpace(a), harnessResumeFlag+" sess-1") {
-		t.Errorf("run 3 argv = %q, want it to resume sess-1", a)
+	for _, n := range []int{2, 3} {
+		if a := readRun(t, dir, "argv", n); !strings.HasSuffix(strings.TrimSpace(a), harnessResumeFlag+" sess-1") {
+			t.Errorf("run %d argv = %q, want it to resume sess-1", n, a)
+		}
 	}
 	select {
 	case out := <-done:

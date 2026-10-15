@@ -56,12 +56,13 @@ const (
 //   - a task that ended without its terminal on the bus, or before the
 //     adapter could tell: the pod must reach a terminal phase so the
 //     gateway's sweep closes the task, rather than sit live with it open.
-//   - a harness run that reported no session when there was none to resume
-//     either: a next turn run without one would have neither the
-//     conversation nor the primer. Exiting hands the next turn to a cold
-//     start, which has the primer. On a resumed turn (a stop before the
-//     harness's init line, say) the previous session is still there, so the
-//     loop keeps it and goes on.
+//   - a harness run that reported no session: a next turn run without one
+//     would have neither the conversation nor the primer, and a resumed run
+//     that failed before saying may have failed on the session it was
+//     given. Exiting hands the next turn to a cold start, which has the
+//     primer. The one exception is a resumed turn stopped before the
+//     harness's init line: the previous session is still there, so the loop
+//     keeps it and goes on.
 //   - a turn refused before its harness ran, for a reason in the pod's own
 //     state (turnOutcome.podBroken): every later turn here would be refused
 //     the same way, and a cold start has a clean pod.
@@ -84,13 +85,13 @@ func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask stri
 				// The primer went into a harness session that said it
 				// exists, so every later run resumes it instead.
 				resume, primer = out.harnessSession, ""
-			case resume == "":
+			case resume != "" && out.res.State == lib.StateCanceled:
+				log.Warn("the turn was stopped before the harness reported its session; keeping the one it was resuming",
+					"task", out.lastTask(cfg), "session", resume)
+			default:
 				log.Warn("the harness reported no session to resume; exiting so the next turn starts cold with the conversation so far",
 					"task", out.lastTask(cfg))
 				return out.res, out.err
-			default:
-				log.Warn("the harness reported no session; keeping the one it was resuming", "task", out.lastTask(cfg),
-					"session", resume)
 			}
 		}
 		if out.podBroken {
