@@ -1,7 +1,7 @@
 Subject: Propose changes as a pull request instead of naming write tools
 
 Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
-Local-Issue: #2937
+Local-Issue: #3185
 Upstream-Issue: none (specific to this repository)
 Retire-When: never; kube-agents proposes every change as a pull request
 
@@ -22,7 +22,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ## When to Use
  
-@@ -78,14 +80,10 @@ gcloud container ai profiles manifests create \
+@@ -78,20 +80,17 @@ gcloud container ai profiles manifests create \
  
  ### 3. Review and Deploy
  
@@ -40,3 +40,12 @@ diff --git a/SKILL.md b/SKILL.md
  kubectl get pods -w
  kubectl logs -f <POD_NAME>
  ```
+ 
+-> Some models require Hugging Face tokens. Create a Kubernetes Secret and
+-> reference it in the manifest.
++> Some models require Hugging Face tokens. The user creates the Kubernetes
++> Secret themselves, and the proposed manifest only references it by name, so
++> the token never enters the GitOps pull request.
+ 
+ ## GPU ComputeClass for Inference
+ 

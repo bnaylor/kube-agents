@@ -1,7 +1,7 @@
 Subject: Propose changes as a pull request instead of naming write tools
 
 Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
-Local-Issue: #2937
+Local-Issue: #3185
 Upstream-Issue: none (specific to this repository)
 Retire-When: never; kube-agents proposes every change as a pull request
 
@@ -41,6 +41,19 @@ diff --git a/SKILL.md b/SKILL.md
  > **Note:** For configuring `SecretProviderClass` manifests and mounting secrets
  > as volumes inside application deployments, see the `gke-workload-security`
  > skill.
+@@ -80,10 +81,10 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
+ -   Use namespace-scoped Roles over cluster-wide ClusterRoles.
+ -   Bind to specific Groups or ServiceAccounts, never to `system:authenticated`
+     or `system:unauthenticated`.
+--   Audit permissions via MCP: `k8s:check_k8s_auth(parent="...", verb="list",
++-   Audit permissions via MCP: `check_k8s_auth(parent="...", verb="list",
+     resourceType="pods", namespace="...")` (or `kubectl auth can-i --list
+     --as=<user>`).
+--   Review bindings via MCP: `k8s:get_k8s_resource(parent="...",
++-   Review bindings via MCP: `get_k8s_resource(parent="...",
+     resourceType="clusterrolebinding")` (or `kubectl get
+     clusterrolebindings,rolebindings --all-namespaces`).
+ 
 @@ -93,31 +94,17 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
  ## Binary Authorization
  

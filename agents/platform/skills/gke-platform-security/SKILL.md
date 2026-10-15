@@ -81,10 +81,10 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
 -   Use namespace-scoped Roles over cluster-wide ClusterRoles.
 -   Bind to specific Groups or ServiceAccounts, never to `system:authenticated`
     or `system:unauthenticated`.
--   Audit permissions via MCP: `k8s:check_k8s_auth(parent="...", verb="list",
+-   Audit permissions via MCP: `check_k8s_auth(parent="...", verb="list",
     resourceType="pods", namespace="...")` (or `kubectl auth can-i --list
     --as=<user>`).
--   Review bindings via MCP: `k8s:get_k8s_resource(parent="...",
+-   Review bindings via MCP: `get_k8s_resource(parent="...",
     resourceType="clusterrolebinding")` (or `kubectl get
     clusterrolebindings,rolebindings --all-namespaces`).
 

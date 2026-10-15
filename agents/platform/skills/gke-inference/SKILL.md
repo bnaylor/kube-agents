@@ -88,8 +88,9 @@ kubectl get pods -w
 kubectl logs -f <POD_NAME>
 ```
 
-> Some models require Hugging Face tokens. Create a Kubernetes Secret and
-> reference it in the manifest.
+> Some models require Hugging Face tokens. The user creates the Kubernetes
+> Secret themselves, and the proposed manifest only references it by name, so
+> the token never enters the GitOps pull request.
 
 ## GPU ComputeClass for Inference
 
