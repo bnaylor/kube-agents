@@ -524,6 +524,35 @@ func TestASupervisorTerminalUnmarksAReusedPod(t *testing.T) {
 	}
 }
 
+// The heal's half of the same rule: a gateway that stopped between the
+// overdue terminal and its record write, whose relay never delivers that
+// terminal (here the task is not indexed), leaves the record holding the task
+// and the pod marked. The next turn's heal finds the supervisor's terminal on
+// the stream and releases the task, and unmarks the pod in the same write,
+// so that turn retires the pod and spawns fresh instead of going to it.
+func TestTheHealUnmarksAReusedPodOnASupervisorTerminal(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	pod := "chat-lynx-heal"
+	rec := overdueRecord("discord:g1/t-heal-unmark", pod, "task-heal")
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.g.publishSupervisorTerminal(ctx, pod, "task-heal", rec.ContextID, rec.ActiveTask.CorrelationID,
+		lib.StateFailed, noteTaskOverdue); err != nil {
+		t.Fatal(err)
+	}
+	spawn.setReusable(pod)
+	say(r, rec.Key, "m-heal-1", "are you there?")
+	waitFor(t, "a fresh spawn", func() bool { return len(spawn.calls()) == 1 })
+	if s := spawn.calls()[0].Session; s == pod {
+		t.Fatal("the next turn went to the pod whose task the supervisor failed")
+	}
+	if d := spawn.deleted(); !slices.Contains(d, pod) {
+		t.Fatalf("deleted %v, want the unmarked pod retired by the next turn", d)
+	}
+}
+
 // supervisorTerminal is the final the gateway wrote for a task as its
 // supervisor, or nil.
 func supervisorTerminal(t *testing.T, r *rig, addressee, taskID string) *lib.StatusUpdate {
