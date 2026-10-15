@@ -91,11 +91,11 @@ child = tool_create(title="Count pods in kubeagents-system on ka-today-rehearsal
 check("the fan-out child claims", K.claim_task(conn, child) is not None)
 out = tool_link(parent, child)
 expected = (
-    f"kanban_link refused: {child} is already running and reports back to you when "
-    f"it finishes; a link now would make it wait for {parent} and strand its run. "
+    f"kanban_link refused: {child} is already running and reports back when it "
+    f"finishes; a link now would make it wait for {parent} and strand its run. "
     f"No link is needed: wait for its result."
 )
-check("the link is refused with the instruction to wait", out.get("error") == expected, f"got {out}")
+check("the running child is refused with the instruction to wait", out.get("error") == expected, f"got {out}")
 check("no task_links row was written", not linked(parent, child))
 check("the child is still running", status(child) == "running", status(child))
 
@@ -105,9 +105,34 @@ check(
     "the child's run ends",
     K.complete_task(conn, child, result="16 pods", summary="counted"),
 )
+def started_text(card, card_status):
+    return (
+        f"kanban_link refused: {card} has already started (status: {card_status}); a "
+        f"link now would gate it behind {parent}. Leave its dependencies as they "
+        f"are; if it is blocked, it needs an unblock, not a link."
+    )
+
+
 out = tool_link(parent, child)
-check("the link is still refused", "kanban_link refused" in (out.get("error") or ""), f"got {out}")
+check("a done child is refused with the started text", out.get("error") == started_text(child, "done"), f"got {out}")
 check("no task_links row was written", not linked(parent, child))
+
+print("a blocked child:")
+blocked = tool_create(title="Drain the node pool (needs approval)")
+check("the second child claims", K.claim_task(conn, blocked) is not None)
+check(
+    "its run blocks on a question",
+    K.block_task(conn, blocked, reason="approve the drain?", kind="needs_input"),
+)
+check("it is blocked", status(blocked) == "blocked", status(blocked))
+out = tool_link(parent, blocked)
+check(
+    "it is told to unblock, not to wait",
+    out.get("error") == started_text(blocked, "blocked"),
+    f"got {out}",
+)
+check("no task_links row was written", not linked(parent, blocked))
+check("the child is still blocked", status(blocked) == "blocked", status(blocked))
 
 # --- 3. What keeps working ----------------------------------------------------
 print("unaffected:")

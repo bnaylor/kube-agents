@@ -153,42 +153,71 @@ class TestThePatchedHandler(Board):
     def link(self, parent=PARENT, child=CHILD):
         return json.loads(self.ns["_handle_link"]({"parent_id": parent, "child_id": child}))
 
+    def running_text(self, parent=PARENT):
+        return (
+            f"kanban_link refused: {CHILD} is already running and reports back when it "
+            f"finishes; a link now would make it wait for {parent} and strand its run. "
+            "No link is needed: wait for its result."
+        )
+
+    def started_text(self, status):
+        return (
+            f"kanban_link refused: {CHILD} has already started (status: {status}); a "
+            f"link now would gate it behind {PARENT}. Leave its dependencies as they "
+            "are; if it is blocked, it needs an unblock, not a link."
+        )
+
     def test_a_running_child_is_refused_with_the_exact_text(self):
         self.card(CHILD, "running", claim_lock="gw:1", run="running")
         out = self.link()
         self.assertEqual(
             out.get("error"),
             "kanban_link refused: t_bf2da8bf is already running and reports back "
-            "to you when it finishes; a link now would make it wait for t_05ea923d "
-            "and strand its run. No link is needed: wait for its result.",
+            "when it finishes; a link now would make it wait for t_05ea923d and "
+            "strand its run. No link is needed: wait for its result.",
         )
         self.assertEqual(self.links(), [])
         self.assertEqual(self.status(CHILD), "running")
 
     def test_a_claimed_child_not_yet_running_is_refused(self):
         self.card(CHILD, "ready", claim_lock="gw:1")
-        self.assertIn("kanban_link refused", self.link().get("error", ""))
+        self.assertEqual(self.link().get("error"), self.running_text())
         self.assertEqual(self.links(), [])
         self.assertEqual(self.status(CHILD), "ready")
 
     def test_running_status_alone_is_enough(self):
         self.card(CHILD, "running")
-        self.assertIn("kanban_link refused", self.link().get("error", ""))
+        self.assertEqual(self.link().get("error"), self.running_text())
         self.assertEqual(self.links(), [])
 
     def test_a_child_with_a_finished_run_is_refused(self):
         self.card(CHILD, "ready", run="timed_out")
-        self.assertIn("kanban_link refused", self.link().get("error", ""))
+        self.assertEqual(self.link().get("error"), self.started_text("ready"))
         self.assertEqual(self.links(), [])
+        self.assertEqual(self.status(CHILD), "ready")
 
     def test_a_done_child_is_refused(self):
         self.card(CHILD, "done", run="done")
-        self.assertIn("kanban_link refused", self.link().get("error", ""))
+        self.assertEqual(self.link().get("error"), self.started_text("done"))
+
+    def test_a_blocked_child_is_told_to_unblock_not_to_wait(self):
+        """A blocked card won't move until someone unblocks it, so "wait for
+        its result" would leave the caller polling a card that never moves."""
+        self.card(CHILD, "blocked", run="blocked")
+        out = self.link().get("error")
+        self.assertEqual(out, self.started_text("blocked"))
+        self.assertNotIn("wait for its result", out)
+        self.assertEqual(self.links(), [])
+        self.assertEqual(self.status(CHILD), "blocked")
+
+    def test_a_requeued_child_in_todo_is_refused(self):
+        self.card(CHILD, "todo", run="crashed")
+        self.assertEqual(self.link().get("error"), self.started_text("todo"))
 
     def test_the_parent_does_not_matter(self):
         self.card("t_other", "todo")
         self.card(CHILD, "running", claim_lock="gw:1", run="running")
-        self.assertIn("wait for t_other", self.link(parent="t_other").get("error", ""))
+        self.assertEqual(self.link(parent="t_other").get("error"), self.running_text("t_other"))
         self.assertEqual(self.links(), [])
 
     def test_a_ready_never_started_child_is_linked(self):
@@ -223,10 +252,13 @@ class TestTheGate(Board):
         """A refused model takes a suggestion literally: pointing it at
         kanban_create or parents= gets the running child's work filed twice."""
         self.card(CHILD, "running", claim_lock="gw:1", run="running")
-        out = guard.refuse_started_child_link(FakeKB, self.conn, PARENT, CHILD)
-        self.assertIn("wait for its result", out)
-        for steer in ("parents", "kanban_create", "create"):
-            self.assertNotIn(steer, out)
+        self.card("t_blocked", "blocked", run="blocked")
+        running = guard.refuse_started_child_link(FakeKB, self.conn, PARENT, CHILD)
+        stopped = guard.refuse_started_child_link(FakeKB, self.conn, PARENT, "t_blocked")
+        self.assertIn("wait for its result", running)
+        for out in (running, stopped):
+            for steer in ("parents", "kanban_create", "create"):
+                self.assertNotIn(steer, out)
 
     def test_unknown_ids_are_left_to_upstream(self):
         self.card(CHILD, "running", claim_lock="gw:1", run="running")

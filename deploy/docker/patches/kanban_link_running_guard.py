@@ -31,8 +31,9 @@ usually claimed again within seconds, and a link turns a fan-out child into
 what #2849's fold reads as a gated continuation. Gating a blocked card behind
 a prerequisite is the one thing this gives up, and filing fresh work for it
 covers that. So the handler refuses those links, whoever the parent is, and
-tells the caller to wait for the child's result. It doesn't suggest creating a card with ``parents``
-instead: a refused model would take that literally and file a second card for
+tells the caller what to do instead: wait for a running child's result, or
+leave a child that ran and stopped as it is (a blocked one needs an unblock,
+not a link). It doesn't suggest creating a card with ``parents`` instead: a refused model would take that literally and file a second card for
 the work the running child is already doing.
 
 What counts as started
@@ -68,24 +69,38 @@ logger = logging.getLogger(__name__)
 #: ``tasks.status`` for a card a worker holds (``_claim_and_open_run``).
 RUNNING_STATUS = "running"
 
-#: Steers the caller to waiting, deliberately not to creating a card with
-#: ``parents=[...]``: a refused model takes the suggestion literally and files
-#: a second card for the work the running child is already doing.
-LINK_REFUSAL = (
-    "kanban_link refused: {child} is already running and reports back to you "
-    "when it finishes; a link now would make it wait for {parent} and strand "
-    "its run. No link is needed: wait for its result."
+#: For a child that is claimed or running. Steers the caller to waiting,
+#: deliberately not to creating a card with ``parents=[...]``: a refused model
+#: takes the suggestion literally and files a second card for the work the
+#: running child is already doing.
+RUNNING_REFUSAL = (
+    "kanban_link refused: {child} is already running and reports back when it "
+    "finishes; a link now would make it wait for {parent} and strand its run. "
+    "No link is needed: wait for its result."
+)
+
+#: For a child with a run on record that isn't running now (blocked, done,
+#: back in todo/ready). "Wait for its result" would be wrong here: a blocked
+#: card won't move until someone unblocks it.
+STARTED_REFUSAL = (
+    "kanban_link refused: {child} has already started (status: {status}); a "
+    "link now would gate it behind {parent}. Leave its dependencies as they "
+    "are; if it is blocked, it needs an unblock, not a link."
 )
 
 
-def child_has_started(kb, conn, child_id: str) -> bool:
-    """Whether ``child_id`` is running, claimed, or has had any run."""
+def started_refusal_template(kb, conn, child_id: str) -> tuple[str, str] | None:
+    """``(refusal template, child status)`` for a child that has started, or
+    ``None`` when it hasn't. :data:`RUNNING_REFUSAL` when it is running or
+    claimed, :data:`STARTED_REFUSAL` when it only has a run on record."""
     task = kb.get_task(conn, child_id)
     if task is None:
-        return False
+        return None
     if task.status == RUNNING_STATUS or task.claim_lock:
-        return True
-    return kb.latest_run(conn, child_id) is not None
+        return RUNNING_REFUSAL, task.status
+    if kb.latest_run(conn, child_id) is not None:
+        return STARTED_REFUSAL, task.status
+    return None
 
 
 def refuse_started_child_link(kb, conn, parent_id: str, child_id: str) -> str | None:
@@ -95,7 +110,8 @@ def refuse_started_child_link(kb, conn, parent_id: str, child_id: str) -> str | 
     try:
         if kb.get_task(conn, parent_id) is None:
             return None  # upstream reports the unknown id
-        if not child_has_started(kb, conn, child_id):
+        started = started_refusal_template(kb, conn, child_id)
+        if started is None:
             return None
     except Exception as exc:  # noqa: BLE001 — fail open, but say so
         logger.warning(
@@ -103,8 +119,9 @@ def refuse_started_child_link(kb, conn, parent_id: str, child_id: str) -> str | 
             "is unguarded: %r", child_id, exc,
         )
         return None
+    template, status = started
     logger.warning(
         "kanban_link_running_guard: refused kanban_link %s -> %s: the child "
-        "has already started", parent_id, child_id,
+        "has already started (status %s)", parent_id, child_id, status,
     )
-    return LINK_REFUSAL.format(child=child_id, parent=parent_id)
+    return template.format(child=child_id, parent=parent_id, status=status)
