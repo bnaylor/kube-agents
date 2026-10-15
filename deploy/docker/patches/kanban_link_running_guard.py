@@ -23,11 +23,17 @@ ended as ``timed_out``, the re-claim came back ``claim_rejected
 finished. The thread got two answers, the second with no "Late result" lead,
 because #2849's fold steps aside for a child its creator has linked.
 
-A link only means something for a card that hasn't started: it's how you
-queue work to run after another card. A card that is running, claimed, or has
-already had a run has nothing left to gate, only a run to strand. So the
-handler refuses those links, whoever the parent is, and says what to do
-instead.
+A link is how you queue work to run after another card, and that only makes
+sense before the card starts. On a running or claimed card it strands the live
+run. A card that has already had a run is refused too, on purpose: it's work
+already under way, a timed-out or crashed run goes back to ``ready`` and is
+usually claimed again within seconds, and a link turns a fan-out child into
+what #2849's fold reads as a gated continuation. Gating a blocked card behind
+a prerequisite is the one thing this gives up, and filing fresh work for it
+covers that. So the handler refuses those links, whoever the parent is, and
+tells the caller to wait for the child's result. It doesn't suggest creating a card with ``parents``
+instead: a refused model would take that literally and file a second card for
+the work the running child is already doing.
 
 What counts as started
 ----------------------
@@ -56,26 +62,19 @@ which reports unknown ids and cycles itself.
 from __future__ import annotations
 
 import logging
-import os
-
-try:  # In the image, /opt/hermes is on sys.path.
-    from tools.kanban_ownership import WORKER_TASK_ENV
-except ImportError:  # Local unittest discovery: the patches dir is top-level.
-    from kanban_ownership import WORKER_TASK_ENV
 
 logger = logging.getLogger(__name__)
 
 #: ``tasks.status`` for a card a worker holds (``_claim_and_open_run``).
 RUNNING_STATUS = "running"
 
-#: Stands in for the caller's card id when the caller isn't a worker.
-UNKNOWN_OWN_CARD = "your card"
-
+#: Steers the caller to waiting, deliberately not to creating a card with
+#: ``parents=[...]``: a refused model takes the suggestion literally and files
+#: a second card for the work the running child is already doing.
 LINK_REFUSAL = (
-    "kanban_link refused: {child} is already running, and a link now would "
-    "make it wait for {parent} and strand its run. A card you want running "
-    "now needs no link; to queue work to run after yours, create it with "
-    "parents=[{own}]."
+    "kanban_link refused: {child} is already running and reports back to you "
+    "when it finishes; a link now would make it wait for {parent} and strand "
+    "its run. No link is needed: wait for its result."
 )
 
 
@@ -104,9 +103,8 @@ def refuse_started_child_link(kb, conn, parent_id: str, child_id: str) -> str | 
             "is unguarded: %r", child_id, exc,
         )
         return None
-    own = os.environ.get(WORKER_TASK_ENV, "").strip() or UNKNOWN_OWN_CARD
     logger.warning(
         "kanban_link_running_guard: refused kanban_link %s -> %s: the child "
         "has already started", parent_id, child_id,
     )
-    return LINK_REFUSAL.format(child=child_id, parent=parent_id, own=own)
+    return LINK_REFUSAL.format(child=child_id, parent=parent_id)

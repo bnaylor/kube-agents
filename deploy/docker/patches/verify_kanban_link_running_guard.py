@@ -7,7 +7,7 @@ matched. This replays the #3248 shape through the *real patched* handlers on a
 real board: a worker on the parent card fans out a child, the dispatcher
 claims the child, and the worker then links the child to its own card. Before
 the patch that link was accepted and the running child was gated behind its
-parent. After it, the link is refused with the instruction, no
+parent. After it, the link is refused with the instruction to wait, no
 ``task_links`` row is written, and the child is still running.
 
 It also checks what must keep working: a link to a card that has never
@@ -91,11 +91,11 @@ child = tool_create(title="Count pods in kubeagents-system on ka-today-rehearsal
 check("the fan-out child claims", K.claim_task(conn, child) is not None)
 out = tool_link(parent, child)
 expected = (
-    f"kanban_link refused: {child} is already running, and a link now would make "
-    f"it wait for {parent} and strand its run. A card you want running now needs no "
-    f"link; to queue work to run after yours, create it with parents=[{parent}]."
+    f"kanban_link refused: {child} is already running and reports back to you when "
+    f"it finishes; a link now would make it wait for {parent} and strand its run. "
+    f"No link is needed: wait for its result."
 )
-check("the link is refused with the instruction", out.get("error") == expected, f"got {out}")
+check("the link is refused with the instruction to wait", out.get("error") == expected, f"got {out}")
 check("no task_links row was written", not linked(parent, child))
 check("the child is still running", status(child) == "running", status(child))
 

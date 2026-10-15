@@ -4,9 +4,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
-import contextlib
 import json
-import os
 import sqlite3
 import sys
 import tempfile
@@ -119,9 +117,6 @@ class Board(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(BOARD_SCHEMA)
         self.card(PARENT, "running", claim_lock="gw:1", run="running")
-        env = mock.patch.dict(os.environ, {guard.WORKER_TASK_ENV: PARENT})
-        env.start()
-        self.addCleanup(env.stop)
 
     def card(self, task_id, status, claim_lock=None, run=None):
         self.conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", (task_id, status, claim_lock))
@@ -163,10 +158,9 @@ class TestThePatchedHandler(Board):
         out = self.link()
         self.assertEqual(
             out.get("error"),
-            "kanban_link refused: t_bf2da8bf is already running, and a link now "
-            "would make it wait for t_05ea923d and strand its run. A card you want "
-            "running now needs no link; to queue work to run after yours, create "
-            "it with parents=[t_05ea923d].",
+            "kanban_link refused: t_bf2da8bf is already running and reports back "
+            "to you when it finishes; a link now would make it wait for t_05ea923d "
+            "and strand its run. No link is needed: wait for its result.",
         )
         self.assertEqual(self.links(), [])
         self.assertEqual(self.status(CHILD), "running")
@@ -176,6 +170,11 @@ class TestThePatchedHandler(Board):
         self.assertIn("kanban_link refused", self.link().get("error", ""))
         self.assertEqual(self.links(), [])
         self.assertEqual(self.status(CHILD), "ready")
+
+    def test_running_status_alone_is_enough(self):
+        self.card(CHILD, "running")
+        self.assertIn("kanban_link refused", self.link().get("error", ""))
+        self.assertEqual(self.links(), [])
 
     def test_a_child_with_a_finished_run_is_refused(self):
         self.card(CHILD, "ready", run="timed_out")
@@ -220,17 +219,14 @@ class TestThePatchedHandler(Board):
 
 
 class TestTheGate(Board):
-    def test_the_refusal_names_the_callers_card(self):
+    def test_the_refusal_never_suggests_another_card(self):
+        """A refused model takes a suggestion literally: pointing it at
+        kanban_create or parents= gets the running child's work filed twice."""
         self.card(CHILD, "running", claim_lock="gw:1", run="running")
-        with mock.patch.dict(os.environ, {guard.WORKER_TASK_ENV: "t_caller"}):
-            out = guard.refuse_started_child_link(FakeKB, self.conn, PARENT, CHILD)
-        self.assertTrue(out.endswith("create it with parents=[t_caller]."))
-
-    def test_a_caller_with_no_card_gets_a_placeholder(self):
-        self.card(CHILD, "running", claim_lock="gw:1", run="running")
-        with mock.patch.dict(os.environ, {guard.WORKER_TASK_ENV: ""}):
-            out = guard.refuse_started_child_link(FakeKB, self.conn, PARENT, CHILD)
-        self.assertTrue(out.endswith(f"parents=[{guard.UNKNOWN_OWN_CARD}]."))
+        out = guard.refuse_started_child_link(FakeKB, self.conn, PARENT, CHILD)
+        self.assertIn("wait for its result", out)
+        for steer in ("parents", "kanban_create", "create"):
+            self.assertNotIn(steer, out)
 
     def test_unknown_ids_are_left_to_upstream(self):
         self.card(CHILD, "running", claim_lock="gw:1", run="running")
