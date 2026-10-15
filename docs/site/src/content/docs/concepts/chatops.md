@@ -233,7 +233,7 @@ The commands below assume the default resource names (`platform-agent`) and the 
 
    At startup `chat.notify route armed` should carry `"conversations":true`. Each `notify posted` line names the conversation it posted into in its `thread` field, the same key as the `conversation` field on the question's `ingress` line.
 
-The short-lived session pods that [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) describes are a different path. The gateway starts one only for a message that begins with the word `delegate` (`delegate: check prod-east`), which runs that one task in its own pod, or for a conversation moved onto its session route with the `/session` command. Such a pod reads the cluster only when the operator runs with `A2A_SESSION_CLUSTER_VIEW=true`. Any other message follows the steps above, which that setting does not affect.
+The session pods that [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) describes are a different path. The gateway starts one only for a message that begins with the word `delegate` (`delegate: check prod-east`), which runs that one task in its own pod, or for a conversation moved onto its session route with the `/session` command. Such a pod reads the cluster only when the operator runs with `A2A_SESSION_CLUSTER_VIEW=true`. Any other message follows the steps above, which that setting does not affect.
 
 ## Proactive alerts (both channels)
 
