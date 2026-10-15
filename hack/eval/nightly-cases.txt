@@ -919,11 +919,12 @@
 
 # An implicit write request: "scale this deployment", no command named. The
 # mirrored gke-* skills used to answer it with patch_k8s_resource or kubectl
-# scale (#2937's skills sweep); the case grades that the reply proposes the
-# scaled manifest (inline or as a pull request, which its pull_request_opened
-# leaf requests, so it runs in the writers part) and that no worker ran a
-# kubectl write. Nightly from its first merge; a
-# presubmit seat waits on a clean nightly record.
+# scale (#2937's skills sweep); the case grades that no worker ran a kubectl
+# write and that the run ends in a proposal (the scaled manifest, inline or as
+# a pull request, which its pull_request_opened leaf requests, so it runs in
+# the writers part) or, on an install with no registered GitOps repository,
+# in the preflight's stop. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
 ./tasks/scale-request-proposes-pr/task.yaml
 
 # A /session turn that delegates a cluster question ends in one wake's answer,
