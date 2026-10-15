@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -552,6 +554,104 @@ echo $! > "$dir/bg.$n"`)
 	}
 	cancel()
 	waitOutcome(t, done, 30*time.Second)
+}
+
+// The real harness's Bash tool spawns each command detached, in a session and
+// process group of its own, so the group kill above never reaches it. As the
+// worker container's pid 1 the adapter also kills every other process in the
+// namespace after each turn, and reaps them. A test cannot be pid 1, and
+// kill(-1) from here would reach every process the user owns, so the
+// namespace-wide kill is stood in for by one that kills the leftover the stub
+// recorded: what this shows is that a leftover outside the group survives the
+// group kill, and that the namespace-wide kill and the reap run, after the
+// harness is reaped, only when the adapter is pid 1.
+func TestAReusedPodAsInitKillsWhatLeftTheGroup(t *testing.T) {
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is needed to start a process in a session of its own")
+	}
+	for _, asInit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pid1=%v", asInit), func(t *testing.T) {
+			url := startServer(t)
+			c := testClient(t, url)
+			const session = "chat-ferret-s3d4"
+			dir := t.TempDir()
+			// setsid first, as the Bash tool's detached spawn does, then
+			// let the stub record the pid once the setsid has landed.
+			harness := recordingStub(t, dir, `/usr/bin/env perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' >/dev/null 2>&1 &
+echo $! > "$dir/bg.$n"
+sleep 0.5`)
+			var killed, reapedAll atomic.Int32
+			pidOf := func() int {
+				var pid int
+				fmt.Sscanf(strings.TrimSpace(readRun(t, dir, "bg", 1)), "%d", &pid)
+				return pid
+			}
+			prevPID, prevKill, prevReap := adapterPID, killEveryoneButMe, reapKilledChildren
+			t.Cleanup(func() { adapterPID, killEveryoneButMe, reapKilledChildren = prevPID, prevKill, prevReap })
+			if asInit {
+				adapterPID = func() int { return containerInitPID }
+			}
+			killEveryoneButMe = func() {
+				killed.Add(1)
+				if pid := pidOf(); pid > 0 {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+			reapKilledChildren = func(time.Duration) { reapedAll.Add(1) }
+
+			submit(t, c, session, "task-s-1", "start something detached")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := runAdapter(ctx, reuseConfig(url, "task-s-1", session, harness))
+			waitState(t, c, session, "task-s-1", lib.StateCompleted)
+			pid := pidOf()
+			if pid <= 0 {
+				t.Fatal("no background pid recorded")
+			}
+			t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+			alive := func() bool { return syscall.Kill(pid, 0) == nil }
+			if !asInit {
+				time.Sleep(500 * time.Millisecond)
+				if !alive() {
+					t.Fatal("a leftover in its own session died without the namespace-wide kill; this test no longer shows what the group kill misses")
+				}
+				if killed.Load() != 0 || reapedAll.Load() != 0 {
+					t.Fatalf("not pid 1, but the namespace-wide kill ran %d time(s) and the reap %d", killed.Load(), reapedAll.Load())
+				}
+			} else {
+				deadline := time.Now().Add(waitDeadline)
+				for alive() {
+					if time.Now().After(deadline) {
+						t.Fatalf("the detached leftover %d is still alive after the turn ended", pid)
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				if killed.Load() != 1 || reapedAll.Load() != 1 {
+					t.Fatalf("as pid 1: namespace-wide kill ran %d time(s), reap %d, want 1 each", killed.Load(), reapedAll.Load())
+				}
+			}
+			cancel()
+			waitOutcome(t, done, 30*time.Second)
+		})
+	}
+}
+
+// reapChildren takes every exited child and returns once there are none,
+// without waiting out its bound.
+func TestReapChildrenTakesExitedChildren(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	reapChildren(5 * time.Second)
+	if took := time.Since(start); took > 4*time.Second {
+		t.Fatalf("reapChildren waited %v with nothing left to reap", took)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("the child was still there for os/exec to wait on; reapChildren did not take it")
+	}
 }
 
 // Each turn of a reused pod has its own delegate socket, and the path goes
