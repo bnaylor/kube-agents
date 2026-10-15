@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -511,6 +512,21 @@ func truncate(s string, n int) string {
 		cut = i
 	}
 	return s[:cut] + "…"
+}
+
+// removeUserSettings deletes the harness's user settings file before a turn
+// in a reused pod (Config.HarnessUserSettings). A file that is not there is
+// the normal case. Anything that cannot be removed (a directory planted at
+// the path, a permission error) is an error, and the turn does not run over
+// it.
+func removeUserSettings(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the harness's user settings %s: %w", path, err)
+	}
+	return nil
 }
 
 // withResume is argv continuing harness session id, or argv unchanged when

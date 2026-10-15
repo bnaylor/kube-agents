@@ -110,6 +110,13 @@ type Config struct {
 	HarnessCommandNoDelegate []string
 	// HarnessEnv is the complete environment for the harness subprocess.
 	HarnessEnv []string
+	// HarnessUserSettings is the harness's user settings file
+	// ($CLAUDE_CONFIG_DIR/settings.json). The image ships none, and under
+	// SessionReuse every turn removes it before the harness starts: the
+	// config dir outlives a turn whose model had Write, and a settings file
+	// left there (hooks, env, a helper command) would run in the next turn's
+	// harness. Empty skips the removal.
+	HarnessUserSettings string
 
 	// Namespace is the pod's own namespace (POD_NAMESPACE), used only to
 	// default Scope the same way the gateway defaults its ceiling.
@@ -625,6 +632,14 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 			// path, where nothing listens in a reused pod.
 			log.Warn("the harness's --mcp-config has no delegate server entry to point at this turn's socket; the delegate tool may not reach it",
 				"socket", socket)
+		}
+	}
+
+	if cfg.SessionReuse {
+		if err := removeUserSettings(cfg.HarnessUserSettings); err != nil {
+			state := lib.StateFailed
+			ferr := a.finalize(state, "reason: harness-settings-failed - "+err.Error(), "")
+			return done(Result{State: state}, ferr)
 		}
 	}
 

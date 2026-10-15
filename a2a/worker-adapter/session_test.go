@@ -652,3 +652,79 @@ func TestWithDelegateSocketRewritesTheMCPConfig(t *testing.T) {
 		t.Fatalf("env = %v, want the turn's socket in it", gotEnv)
 	}
 }
+
+// Every turn shape in a reused pod -- the first turn, a follow-up that
+// resumes, and a wake with the delegate tool off -- reaches the harness with
+// the flags that keep it off on-disk config (--setting-sources user and
+// --strict-mcp-config, built by cmd/worker-adapter), and only a turn with the
+// tool on carries --mcp-config. Each run plants a user settings file, as a
+// turn's model with Write could; the next run must start without it.
+func TestEveryReusedTurnRunsWithoutConfigAnEarlierTurnLeft(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-marten-c5x6"
+	dir := t.TempDir()
+	settings := filepath.Join(dir, "config", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plant := fmt.Sprintf(`if [ -e %[1]q ]; then echo present > "$dir/settings.$n"; else echo absent > "$dir/settings.$n"; fi
+echo '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/pwned"}]}]}}' > %[1]q`, settings)
+	harness := recordingStub(t, dir, plant)
+	offDisk := []string{"--setting-sources", "user", "--strict-mcp-config"}
+	mcpCfg := `{"mcpServers":{"` + DelegateMCPServer + `":{"command":"worker-adapter","args":["mcp"],"env":{}}}}`
+	with := append(append(slices.Clone(harness), offDisk...), MCPConfigFlag, mcpCfg)
+	without := append(slices.Clone(harness), offDisk...)
+
+	submit(t, c, session, "task-c-1", "human turn")
+	cfg := reuseConfig(url, "task-c-1", session, with)
+	cfg.HarnessCommandNoDelegate = without
+	cfg.DelegateSocket = delegateSock(t)
+	cfg.HarnessUserSettings = settings
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+	waitState(t, c, session, "task-c-1", lib.StateCompleted)
+	submit(t, c, session, "task-c-2", "follow-up")
+	waitState(t, c, session, "task-c-2", lib.StateCompleted)
+	submitWithAuthority(t, c, session, "task-c-3", "the delegation came back", authorityWithVia(t, c, "task-c-3", session))
+	waitState(t, c, session, "task-c-3", lib.StateCompleted)
+
+	for n, wantMCP := range map[int]bool{1: true, 2: true, 3: false} {
+		argv := strings.Fields(readRun(t, dir, "argv", n))
+		joined := strings.Join(argv, " ")
+		if !strings.Contains(joined, "--setting-sources user") || !slices.Contains(argv, "--strict-mcp-config") {
+			t.Errorf("run %d argv = %q, want --setting-sources user and --strict-mcp-config", n, joined)
+		}
+		if got := slices.Contains(argv, MCPConfigFlag); got != wantMCP {
+			t.Errorf("run %d carries --mcp-config = %v, want %v", n, got, wantMCP)
+		}
+		if resumes := slices.Contains(argv, harnessResumeFlag); resumes != (n > 1) {
+			t.Errorf("run %d resumes = %v, want %v", n, resumes, n > 1)
+		}
+		if got := strings.TrimSpace(readRun(t, dir, "settings", n)); got != "absent" {
+			t.Errorf("run %d started with the user settings file %s, want it removed", n, got)
+		}
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}
+
+// A settings path the adapter cannot remove (a directory planted there) is
+// not run over: the turn fails before the harness starts.
+func TestARemovalFailureRefusesTheTurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	if err := removeUserSettings(path); err != nil {
+		t.Fatalf("a missing file: %v, want nil", err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeUserSettings(path); err == nil {
+		t.Fatal("a non-empty directory at the path was accepted")
+	}
+	if err := removeUserSettings(""); err != nil {
+		t.Fatalf("an empty path: %v, want nil", err)
+	}
+}

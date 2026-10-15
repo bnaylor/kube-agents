@@ -292,12 +292,15 @@ func (w *taskWatcher) take(msg jetstream.Msg) (*lib.Envelope, uint64, bool, erro
 // from its own submission rather than from how the pod was started: a reused
 // pod runs human turns and wakes alike, and the tool has to follow the turn.
 //
-// A wake is the one task the gateway mints on a session's behalf, and its
-// authority block says so with `via` (gateway/delegation.go, wakeSession).
-// The wake exists to report what a delegation came back with; given the tool
-// it can read an interim answer as a reason to ask again, and the chain loops
-// to the depth bound with nothing answered (#2819). Only the gateway can
-// publish a submission, so the signal is the gateway's.
+// The gateway sets `via` on the two tasks it mints for a delegation
+// (gateway/delegation.go): the delegated child, which runs on its own
+// `delegate:` pod, and the wake, which reports back to the session that
+// delegated. In a reused session pod the one that arrives is the wake. It
+// exists to report what a delegation came back with; given the tool it can
+// read an interim answer as a reason to ask again, and the chain loops to the
+// depth bound with nothing answered (#2819). The child runs without the tool
+// by the same rule. Only the gateway can publish a submission, so the signal
+// is the gateway's.
 //
 // No authority block at all is an older gateway's or a hand-run task's, and
 // is no wake. One that does not parse is treated as a wake: the tool is the
