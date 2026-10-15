@@ -252,7 +252,9 @@ func TestTheReapCountsFromTheLastUserMessage(t *testing.T) {
 	}
 }
 
-// A verified turn moves the idle clock; nothing else does.
+// A verified turn moves the idle clock; nothing else does. The negatives, for
+// the relay's and the heal's executor-terminal stamps, are in
+// TestTaskEndCountsAsActivity and TestHealedExecutorTerminalCountsAsActivity.
 func TestATurnStampsTheLastUserMessage(t *testing.T) {
 	r, spawn := startReuseRig(t)
 	conv := "discord:g1/t-stamp"
@@ -752,6 +754,28 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		}
 		if n := len(spawn.calls()); n != 0 {
 			t.Fatalf("%d spawns past a full cap of busy pods", n)
+		}
+	})
+	t.Run("a pod that turned busy after the candidate scan stays", func(t *testing.T) {
+		// evictIdleSession read this conversation idle; a turn then took and
+		// released its lock, leaving a task running. evictSession is what
+		// sees the record now, under the lock, so it is called directly:
+		// nothing between the two reads can be hooked.
+		r, spawn := startRigWithSpawnerCap(t, RouteSession, 1, reuseOn)
+		ctx := context.Background()
+		turned := idle("discord:g1/t-turned", "chat-vole-turned", time.Hour)
+		turned.ActiveTask = &ActiveTask{TaskID: "task-turned", CorrelationID: "corr-turned", SubmittedAt: now}
+		if err := r.g.reg.Put(ctx, turned); err != nil {
+			t.Fatal(err)
+		}
+		if r.g.evictSession(ctx, sessionPod{PodName: "chat-vole-turned", SessionKey: turned.Key, Reuse: true}) {
+			t.Fatal("evictSession evicted a pod whose fresh record has a task running")
+		}
+		if d := spawn.deleted(); len(d) != 0 {
+			t.Fatalf("evicted %v; a pod with a running task must stay", d)
+		}
+		if posts := r.adapter.postTextsFor(turned.Key); slices.Contains(posts, noticeSessionPaused) {
+			t.Fatalf("a conversation with a running task was told it was paused: %v", posts)
 		}
 	})
 }

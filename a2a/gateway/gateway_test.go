@@ -1639,6 +1639,10 @@ func TestTaskEndCountsAsActivity(t *testing.T) {
 	if !after.LastTaskActivity.Equal(after.LastActivity) {
 		t.Fatalf("the executor's terminal must move the task's own clock with the session's: task=%v session=%v", after.LastTaskActivity, after.LastActivity)
 	}
+	// Only a user's message moves the reap's idle clock; an answer must not.
+	if !after.LastUserMessage.Equal(before.LastUserMessage) {
+		t.Fatalf("the executor's terminal moved LastUserMessage from %v to %v", before.LastUserMessage, after.LastUserMessage)
+	}
 	held, until, err := r.g.hasSession(ctx, conv)
 	if err != nil || !held || !until.Equal(after.LastTaskActivity.Add(r.g.cfg.IdleTTL)) {
 		t.Fatalf("after the terminal the session must be held until LastTaskActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
@@ -1841,6 +1845,11 @@ func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
 	}
 	if !after.LastTaskActivity.After(stale) {
 		t.Fatalf("the healed executor terminal did not count as activity: %v", after.LastTaskActivity)
+	}
+	// The "stop" stamped LastUserMessage before the heal ran; the heal's own
+	// stamp, later, must leave it there.
+	if !after.LastUserMessage.Before(after.LastTaskActivity) {
+		t.Fatalf("the healed executor terminal moved LastUserMessage to %v (task clock %v)", after.LastUserMessage, after.LastTaskActivity)
 	}
 	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
 		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)
