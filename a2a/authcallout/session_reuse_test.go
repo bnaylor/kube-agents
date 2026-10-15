@@ -141,7 +141,12 @@ func TestAReusedSessionPodTakesItsNextTaskUnderItsOwnGrants(t *testing.T) {
 func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 	var reviews atomic.Int64
 	h := startHarness(t, sessionMap, sessionTokens(), withGrantTTL(reuseGrantTTL),
-		watchingTokenReviews(func() func() { reviews.Add(1); return func() {} }))
+		watchingTokenReviews(func(token string) func() {
+			if token == tokenPodA {
+				reviews.Add(1)
+			}
+			return func() {}
+		}))
 	ctx, cancel := context.WithTimeout(context.Background(), reuseRunTimeout)
 	defer cancel()
 	provisionTasksStream(t, h)
@@ -158,7 +163,8 @@ func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 
 	before := reviews.Load()
 	time.Sleep(reuseIdleSpan)
-	// Each re-authentication is one TokenReview. The pod's two connections
+	// Each re-authentication is one TokenReview of the pod's own token, which
+	// no other party in the fixture presents. The pod's two connections
 	// crossing the expiry at least once each is what makes this test about
 	// reconnecting rather than about a connection that happened to last.
 	if got := reviews.Load() - before; got < reuseMinReauths {
