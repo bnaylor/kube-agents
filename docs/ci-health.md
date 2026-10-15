@@ -16,6 +16,9 @@ The Brief's "What the agent saw" also quotes the agent's own words:
 repetition's final report under its grading line (`rep N report:`), the
 collector keeps it as `reps[].excerpt`, and the Brief and the run page show
 it beside the grader's reason (builds graded before 2026-09-15 carry none).
+In the same way, a `rep N timing:` line under each grading line carries the
+repetition's `agent_s` and `turn1_s`, which the Cases and Nightly pages show
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
@@ -27,7 +30,8 @@ periodics, one when a run fails or a job stops and one when it passes again
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
-before, and the wall clock, with a link to the dashboard's Nightly report
+before, the opening chat turn's p50 and p95 as advice beside the p95 < 10 s
+target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md)), and the wall clock, with a link to the dashboard's Nightly report
 (`nightly.html`); a night Prow cut short, one still running, or no night
 since the day before yesterday, says so instead of numbers.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the
@@ -190,8 +194,10 @@ also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the GitLab lane's runs too
-(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): the same matrix
-against a pool project's GitLab repository, listed in the Brief's "GitLab
+(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): on a pull request the
+forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones; the GitLab
+nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
+section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
 history or digest line.
 
@@ -266,6 +272,46 @@ minutes because 09-08 to 09-11 had been slow too), while the median rule
 fired from 2:00 PM ET and stayed quiet over 09-06 to 09-09 and the 09-12/13
 weekend. Model latency is not sampled: the per-repetition eval logs carry
 it, and reading them is not something a tick does.
+
+## Close to the deadline
+
+Prow kills `pull-kube-agents-smoke-test` at 360 minutes (`PROW_JOB_TIMEOUT`).
+Neither the slow note (which misses gradual creep because its 7-day baseline
+creeps with it) nor the `deadline_kill` OUTAGE (which waits for 3+ killed runs
+across 2+ PRs in 2 hours) warns when concluded runs approach that limit.
+
+`health.json`'s `near_deadline` is set, while the state is GREEN, when the
+slowest qualifying run finished in the trailing 24 hours took at least 300
+minutes (timeout − 60 min), and clears once the slowest qualifying run drops
+below 280 minutes (timeout − 80 min). A run qualifies if it finished in the
+window, has non-null wall clock, had no repetitions lost to infrastructure
+(`storm_reps == 0`), and either completed at least `SLOW_MIN_TASKS` tasks
+(SUCCESS or FAILURE) or was killed at the deadline with at least one task
+recorded (`run.deadline_kill and run.full`); a kill finished at or before the
+current GREEN episode began does not count. If the window has no qualifying runs
+(such as over a quiet weekend), the note holds its previous value across ticks.
+
+The poster sends one line when the note appears:
+
+```text
+⏱ *Smoke gate: close to the deadline* — slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
+```
+
+and repeats it in the daily digest for as long as it lasts:
+
+```text
+⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
+```
+
+When qualifying runs in the window include a deadline kill, the alert omits the
+"Not a break" assurance since a run was killed without an evaluation verdict.
+Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
+floored at 0 (or overrun minutes past the timeout).
+
+The timeout itself lives in `GoogleCloudPlatform/oss-test-infra` (`timeout: 360m`
+on `pull-kube-agents-smoke-test`). `data.json` does not carry the timeout; the
+warning reads `PROW_JOB_TIMEOUT` (`health.py`), which is kept in sync with the
+copies in `classify.py`, `gate_issue.py`, and `hack/ci-eval-pr.sh`.
 
 ## A backed-up pool
 
@@ -443,8 +489,8 @@ build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
-was told about passes again, on a reading only, or, for the on-merge
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on. The failed and stopped
+was told about passes again, on a reading only, or, for the postsubmit
+reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines under its
 second: a headline naming where and what stopped happening ("Eval GitOps repos:
 leftover pull requests from eval runs are not being cleaned up"); the job, what
