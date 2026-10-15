@@ -163,7 +163,9 @@ bound to `cluster-admin` that applies whatever its source holds, so it is review
 `provisioning/`: `CODEOWNERS.example` routes that directory to
 platform admins. The directory does not confine it, though: an object's namespace comes from its
 metadata, so a `RootSync` or `RepoSync` committed under any other `namespaces/<ns>/` is applied just
-the same. Review must reject one anywhere else.
+the same. Review must reject one anywhere else: the `/clusters/*/namespaces/` entry in
+`CODEOWNERS.example` tells its reviewers so, and no automated check enforces it yet
+([#3163](https://github.com/gke-labs/kube-agents/issues/3163)).
 
 ```yaml
 apiVersion: configsync.gke.io/v1beta1

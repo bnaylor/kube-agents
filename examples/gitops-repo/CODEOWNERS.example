@@ -6,7 +6,9 @@
 # Provisioning (cloud/cluster resources authored as KCC YAML or Terraform HCL)
 /clusters/*/provisioning/         @your-org/platform-admins
 
-# Tenant namespace config: RBAC, NetworkPolicy, ResourceQuota, workloads
+# Tenant namespace config: RBAC, NetworkPolicy, ResourceQuota, workloads. Under Config Sync
+# (README, "Reconciler") an object's namespace comes from its metadata, not this directory, so
+# reject a RootSync or RepoSync here: it gets a reconciler of its own. Nothing enforces this yet (#3163).
 /clusters/*/namespaces/           @your-org/cluster-admins
 
 # Config Sync's own namespace: a RootSync or RepoSync here gets a reconciler of its own (a
