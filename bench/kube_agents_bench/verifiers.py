@@ -66,7 +66,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
 import yaml
@@ -127,6 +127,11 @@ _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
+)
+_NO_TIME_WINDOW_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check has no window to read the report's times against "
+    "and refuses to grade it"
 )
 _UNREACHED_SLOT_REASON = (
     "a seeded cluster this check's patterns require a line about was not reached before the run, "
@@ -692,6 +697,224 @@ class ReportContainsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason="report contains " + ", ".join(satisfied),
+        )
+
+
+# report_times_in_window: a time the report says it observed something at.
+# A clock time: hours and minutes, seconds and a fraction of any length
+# optional (kubectl prints nanoseconds), then an optional AM or PM.
+_CLOCK = (
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2})(?:\.(?P<fraction>\d+))?)?"
+    r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?"
+)
+# A date and a clock time, `T` or a space between, then an optional zone:
+# 2026-10-15 21:38:00 UTC, 2026-10-15T21:38:00Z, 2026-10-15 21:38 +00:00.
+_STATED_DATETIME = re.compile(
+    r"(?<![\d-])(?P<date>\d{4}-\d{2}-\d{2})[T ]" + _CLOCK
+    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2}|[A-Z]{3,4})\b)?(?![\d:])"
+)
+# A clock time with no date counts only with an explicit UTC zone ("as of
+# 21:38 UTC"); a bare "21:38" is as likely a duration or a log offset.
+_STATED_CLOCK = re.compile(r"(?<![\d:.-])" + _CLOCK + r"\s*(?P<zone>Z|UTC|GMT)\b(?![\d:])")
+# The zones read as UTC. A named zone outside them ("EDT") is not converted:
+# the time is named in the reason and not graded, rather than graded on a
+# guess. The agent's pods run in UTC and its persona asks for UTC.
+_UTC_ZONES = frozenset({"", "Z", "UTC", "GMT"})
+_NUMERIC_ZONE = re.compile(r"(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2})")
+_DATE_FORMAT = "%Y-%m-%d"
+# datetime keeps microseconds: a longer fraction is cut to six digits.
+_MICROSECOND_DIGITS = 6
+_HOURS_PER_HALF_DAY = 12
+_PM_PREFIX = "p"
+# What a label line may carry after its label for the value to sit on the
+# next line instead: markup and punctuation only ("**Observed at:**").
+_LABEL_ONLY_TAIL = re.compile(r"[\s*_:|#>`-]*")
+
+
+def _zone_offset(zone: str) -> timedelta | None:
+    """The zone's offset from UTC, or ``None`` for a named zone this check does not read."""
+    if zone in _UTC_ZONES:
+        return timedelta(0)
+    numeric = _NUMERIC_ZONE.fullmatch(zone)
+    if numeric is None:
+        return None
+    offset = timedelta(hours=int(numeric["hours"]), minutes=int(numeric["minutes"]))
+    return -offset if numeric["sign"] == "-" else offset
+
+
+def _clock_of(match: re.Match) -> dt_time | None:
+    """The match's clock time, or ``None`` when it is not a valid one."""
+    hour = int(match["hour"])
+    meridiem = match["meridiem"]
+    if meridiem:
+        if not 1 <= hour <= _HOURS_PER_HALF_DAY:
+            return None
+        hour %= _HOURS_PER_HALF_DAY
+        if meridiem[0].lower() == _PM_PREFIX:
+            hour += _HOURS_PER_HALF_DAY
+    fraction = (match["fraction"] or "")[:_MICROSECOND_DIGITS].ljust(_MICROSECOND_DIGITS, "0")
+    try:
+        return dt_time(hour, int(match["minute"]), int(match["second"] or 0), int(fraction))
+    except ValueError:
+        return None
+
+
+def _stated_times(line: str, dates: list[str]) -> tuple[list[tuple[str, list[datetime]]], list[str]]:
+    """Every time ``line`` states, each with the UTC instants it can mean, and
+    the ones it could not read.
+
+    A dated time means one instant. A clock time with no date means one per
+    entry of ``dates`` (the run's start and end days), so a run that crosses
+    midnight can be read either way. Not read: a named zone other than UTC,
+    and a date or clock time that does not exist (2026-02-30, 25:00).
+    """
+    found: list[tuple[str, list[datetime]]] = []
+    unreadable: list[str] = []
+    dated_spans = []
+    for match in _STATED_DATETIME.finditer(line):
+        dated_spans.append(match.span())
+        text = match.group(0).strip()
+        offset = _zone_offset(match["zone"] or "")
+        clock = _clock_of(match)
+        try:
+            day = datetime.strptime(match["date"], _DATE_FORMAT)
+        except ValueError:
+            day = None
+        if offset is None or clock is None or day is None:
+            unreadable.append(text)
+            continue
+        local = datetime.combine(day.date(), clock)
+        found.append((text, [(local - offset).replace(tzinfo=timezone.utc)]))
+    for match in _STATED_CLOCK.finditer(line):
+        if any(start <= match.start() < end for start, end in dated_spans):
+            continue
+        clock = _clock_of(match)
+        if clock is None:
+            unreadable.append(match.group(0).strip())
+            continue
+        instants = [
+            datetime.combine(datetime.strptime(d, _DATE_FORMAT).date(), clock).replace(tzinfo=timezone.utc)
+            for d in dates
+        ]
+        found.append((match.group(0).strip(), instants))
+    return found, unreadable
+
+
+@VERIFIERS.register("report_times_in_window")
+class ReportTimesInWindowVerifier(BaseVerifier):
+    """Every observation time the report states falls inside the run.
+
+    A report that says when it looked ("Timestamp of Observation: 2026-10-15
+    21:38:00 UTC") can only have looked while the run was going, so the time
+    must fall between the run's start (``TranscriptSnapshot.started_at``) and
+    the moment this check runs, which is after the report was delivered, each
+    widened by ``max_clock_skew_sec``. A report that states no such time
+    passes: leaving the time out is the right answer when nothing produced
+    one. Written for #3256, where a Cluster Agent's audit trail stated an
+    observation time five minutes after its own post.
+
+    Which times are observation times is the case's to say, in
+    ``label_patterns``: regexes searched, case-insensitively, in each line of
+    the report. A time on a matching line is checked, and so is a time on the
+    next non-blank line when the matching line is the label and nothing more
+    (a bold label on its own line, then the value). A time on any other line
+    is not, so an event timestamp quoted from command output, which may be
+    days old, or a certificate's expiry, which is in the future, does not
+    fail a report. The window's end is the moment the check runs, not the
+    moment the report was delivered, which this check cannot see; the gap
+    between the two is part of the slack.
+
+    What it cannot catch: a made-up time that happens to land inside the
+    window, or one stated in a named zone other than UTC or as a date or
+    clock time that does not exist, which is named in the reason and not
+    graded. It proves the stated time is possible, not
+    that the agent read it.
+    """
+
+    type: Literal["report_times_in_window"]
+    label_patterns: list[str]
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    scope: Literal["final", "full"] = "final"
+
+    @field_validator("label_patterns")
+    @classmethod
+    def _label_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        if not [p for p in patterns if p.strip()]:
+            raise ValueError("label_patterns needs at least one non-blank pattern, or the check can only pass")
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as err:
+                raise ValueError(f"label pattern {pattern!r} does not compile: {err}") from err
+        return patterns
+
+    def _labelled_lines(self, raw: str) -> list[str]:
+        """The lines whose times are observation times."""
+        labels = [re.compile(p, re.IGNORECASE) for p in self.label_patterns if p.strip()]
+        lines = raw.splitlines()
+        picked: list[int] = []
+        for i, line in enumerate(lines):
+            hits = [hit for label in labels if (hit := label.search(line))]
+            if not hits:
+                continue
+            picked.append(i)
+            if _STATED_DATETIME.search(line) or _STATED_CLOCK.search(line):
+                continue
+            # The value sits on the next line only when this line is the label
+            # and nothing more ("**Observed at:**"); a sentence that merely
+            # contains a label word does not lend it the line below.
+            if not any(_LABEL_ONLY_TAIL.fullmatch(line[hit.end() :]) for hit in hits):
+                continue
+            following = next((j for j in range(i + 1, len(lines)) if lines[j].strip()), None)
+            if following is not None:
+                picked.append(following)
+        return [lines[i] for i in sorted(set(picked))]
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=_NO_TRANSCRIPT_REASON
+            )
+        if not snap.started_at:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=_NO_TIME_WINDOW_REASON
+            )
+        skew = timedelta(seconds=self.max_clock_skew_sec)
+        run_start = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        run_end = datetime.now(tz=timezone.utc)
+        earliest, latest = run_start - skew, run_end + skew
+        dates = sorted({run_start.strftime(_DATE_FORMAT), run_end.strftime(_DATE_FORMAT)})
+        raw = snap.final_message if self.scope == "final" else snap.output
+        checked, outside, unreadable = [], [], []
+        for line in self._labelled_lines(raw):
+            found, skipped = _stated_times(line, dates)
+            unreadable.extend(skipped)
+            for text, instants in found:
+                checked.append(text)
+                if not any(earliest <= instant <= latest for instant in instants):
+                    outside.append(text)
+        window = f"{earliest.isoformat(timespec='seconds')} to {latest.isoformat(timespec='seconds')}"
+        not_read = (
+            f"; not read (a named zone other than UTC, or not a real date and time): {unreadable}" if unreadable else ""
+        )
+        if outside:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"observation time(s) outside the run's window ({window}): {outside}{not_read}",
+            )
+        if not checked:
+            return VerificationResult(
+                success=True,
+                elapsed_time=time.monotonic() - start,
+                reason=f"the report states no observation time this check reads{not_read}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"{len(checked)} observation time(s) inside the run's window ({window}){not_read}",
         )
 
 
