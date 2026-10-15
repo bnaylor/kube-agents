@@ -518,7 +518,7 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
-    # cluster-setting-request-proposes-pr: asked to enable Shielded Nodes, it
+    # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
     "cluster-setting-request-proposes-pr",
