@@ -1984,10 +1984,17 @@ class WorkerCommandsVerifier(BaseVerifier):
     Sees the ROUTE a worker took rather than the answer it gave, through the
     terminal commands it typed; ``tool_called`` under ``scope: workers`` is
     the companion for the MCP tool calls it made (see its docstring).
-    Without ``after_result_pattern`` the harness reads each delegated card's
-    worker log before purging it and stashes every ``💻 $`` line as a command
-    (``transcript.worker_commands``); this verifier matches Python regular
-    expressions against those strings, ``re.search`` on each command verbatim.
+    Without ``after_result_pattern`` the harness reads the worker log of each
+    card the front agent filed before purging it and stashes every ``💻 $``
+    line as a command (``transcript.worker_commands``); the cards those
+    workers filed in turn (a Cluster Agent's card under the platform
+    worker's, and its own children) have no log read, so their commands come
+    from their tagged ``terminal`` and ``execute_code`` calls in the
+    trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
+    a log line is graded on its log lines, whether or not its calls reached
+    the trajectory, and any other card on its calls. This
+    verifier matches Python regular expressions against the union, ``re.search``
+    on each command verbatim.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -2020,8 +2027,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     JSON-escaped, so a pattern spanning a line break writes ``(?:\\n|\\\\n)``.
 
     Limits, stated so a case is not written against them: only terminal
-    commands and ``execute_code`` text are visible, not MCP tool calls; only
-    delegated workers' logs or calls are read, never the router's; and a
+    commands and ``execute_code`` text are visible, not MCP tool calls (and,
+    without ``after_result_pattern``, ``execute_code`` text only for a card
+    graded on its calls: a filed card's log shows no program text); only
+    delegated workers' logs or calls are read, never the router's, and a
+    worker-filed card is read only as far as the trajectory capture reached
+    it (``worker_capture_gaps`` makes a clean read an error only under
+    ``after_result_pattern``); and a
     command the shell resolved through an alias appears as typed. ``required_runs``
     reads each flag as the exact word, so a script a case names this way is
     built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
@@ -2101,8 +2113,13 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         window = ""
+        sources = ""
         result_hits: list[tuple[str, str]] = []
         if self.after_result_pattern is None:
+            # ``None`` stays an error even when the trajectory carries tagged calls: it
+            # means a filed card's log could not be read (or nothing was filed), and
+            # grading only the cards whose calls did arrive would pass a forbidden
+            # check on the unread card's commands -- the no-capture case is unchanged.
             if snap.worker_commands is None:
                 return VerificationResult(
                     success=False,
@@ -2111,6 +2128,29 @@ class WorkerCommandsVerifier(BaseVerifier):
                     reason=_NO_WORKER_COMMANDS_REASON,
                 )
             commands = [row.get("command", "") for row in snap.worker_commands]
+            # The logs are read for the cards the front agent filed only; a card a worker
+            # filed (a Cluster Agent's card under the platform worker's) reaches the run
+            # through its tagged calls in the trajectory alone. Neither source is complete:
+            # the trajectory can be the narrower one too (two #2959 runs had a ``helm list``
+            # in the log and no tagged terminal call), so every log line is kept whatever
+            # the trajectory holds, and the trajectory's calls join the
+            # graded set by card, not by string: a card with a log line contributes its
+            # log lines and none of its calls, so a command a filed card typed is counted
+            # once (its log line and its call need not be spelled alike) and a command
+            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # or its log showed no shell command -- contributes its tagged calls, which
+            # for a filed card can only add ``execute_code`` text the log never shows (a
+            # behaviour change for a filed card that ran only code: its program text is
+            # now graded, where it used to read as zero commands). A row with no card
+            # (a record stashed before rows carried one) cannot be joined, so such a
+            # capture keeps the logs alone rather than count every call a second time.
+            logged = {str(row.get("task") or "") for row in snap.worker_commands}
+            children = []
+            if "" not in logged:
+                children = [command for card, _, command, _, _ in _worker_terminal_calls(snap.trajectory) if card not in logged]
+            if children:
+                sources = f" ({len(commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
+            commands = commands + children
             graded = commands
         else:
             calls = _worker_terminal_calls(snap.trajectory)
@@ -2176,11 +2216,11 @@ class WorkerCommandsVerifier(BaseVerifier):
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
-                    f"across {len(commands)} command(s)"
+                    f"across {len(commands)} command(s){sources}"
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
+                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
@@ -2208,7 +2248,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
+                f"{len(commands)} worker command(s){sources}: all {len(self.required_patterns)} "
                 f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
                 f"none of {len(self.forbidden_patterns) + len(self.forbidden_result_patterns)} forbidden pattern(s) matched, "
                 f"none of {len(self.forbidden_runs)} forbidden run(s) made"
