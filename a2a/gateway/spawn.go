@@ -184,6 +184,10 @@ type spawner interface {
 	// deleted, with the conversation each belongs to: the cap eviction's
 	// candidates.
 	SessionPods(ctx context.Context) ([]sessionPod, error)
+	// PodStarted is the pod's status.startTime, when the kubelet took it
+	// (before the image pull), which is where activeDeadlineSeconds counts
+	// from. Zero for a pod not yet started or gone; neither is an error.
+	PodStarted(ctx context.Context, podName string) (time.Time, error)
 }
 
 // sessionPod is one live session pod as the cap eviction and the untracked
@@ -613,6 +617,20 @@ func (s *podSpawner) delegateToolEnv(rec *SessionRecord, taskID string) string {
 	return delegateToolFor(rec, taskID)
 }
 
+func (s *podSpawner) PodStarted(ctx context.Context, podName string) (time.Time, error) {
+	p, err := s.client.CoreV1().Pods(s.cfg.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if p.Status.StartTime == nil {
+		return time.Time{}, nil
+	}
+	return p.Status.StartTime.Time, nil
+}
+
 // Reusable reads the pod itself rather than the session record: only the API
 // knows whether the worker has exited or the kubelet is about to end it.
 // Running only, not Pending: a pod that has not started yet has no task
@@ -898,17 +916,19 @@ func (g *Gateway) sweepUntracked(ctx context.Context) {
 }
 
 // deleteIfUntracked deletes one pod if its conversation's record, read under
-// that conversation's lock, names it neither as its pod nor as its session.
-// It reports whether it did.
+// that conversation's lock, names it neither as its pod nor as the session of
+// a task still running. It reports whether it did.
 //
 // The session counts as well as the pod because the two reach the store
 // separately: startTaskWith writes the record with the new session and its
 // task before ensureSessionPod spawns, and PodName lands only in the turn's
 // final write. A record whose final write failed names the session, with the
 // task running on that pod, and no PodName; deleting there would kill the
-// task with no terminal. Every path that retires a pod on purpose either
-// moves BusSession on or deletes the pod itself, so a pod still named as the
-// session is not the leak this exists for.
+// task with no terminal. It counts only while a task is active: once that
+// task has ended, a record with no PodName can never route to the pod again
+// (reuseLivePod requires PodName), the reap cannot find it, and sparing it
+// here would leave it holding its credential and a cap slot until its
+// lifetime ends.
 func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
 	l := g.lockSession(p.SessionKey)
 	if !l.TryLock() {
@@ -916,7 +936,7 @@ func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
 	}
 	defer l.Unlock()
 	rec, err := g.reg.Get(ctx, p.SessionKey)
-	if err != nil || (rec != nil && (rec.PodName == p.PodName || rec.BusSession == p.PodName)) {
+	if err != nil || (rec != nil && (rec.PodName == p.PodName || (rec.BusSession == p.PodName && rec.ActiveTask != nil))) {
 		return false
 	}
 	if err := g.spawner.Delete(ctx, p.PodName); err != nil {

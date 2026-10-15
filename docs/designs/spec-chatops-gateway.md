@@ -276,8 +276,9 @@ Two rules keep the conversation's route coherent:
   route's contract: incarnations rotate anyway.
 - **The previous incarnation dies at delegation, deliberately.** A lingering pod from
   an earlier incarnation is deleted, not merely untracked: reap walks session records
-  and sweep sees only terminal pod phases, so an untracked Running pod would hold its
-  bus credential with nothing able to reclaim it. The active-task guard above bounds
+  and sweep takes a Running pod only when it is a reused pod its record no longer names,
+  so an untracked Running one-task pod would hold its bus credential with nothing able
+  to reclaim it. The active-task guard above bounds
   which pods this can reach: a delegation is only recognized when no task serializes
   the conversation, so the pod is either idle or running a DETACHED task - and
   detached is not closed, so the deletion rule in Session lifecycle applies and that
@@ -336,7 +337,11 @@ and the same requester.
 shaped as `lib.DelegateRequest` (`{"addressee": "platform", "text": "..."}`), its text bounded at
 `lib.DelegateTextCap` (16 KiB) - the same bound the wake's result is held to in the other
 direction. The worker adapter serves it to the harness as one MCP tool, `mcp__a2a__delegate`,
-over a stdio server the harness is started with via `--mcp-config`; calling it is what ends the
+over a stdio server the harness is started with via `--mcp-config` (every harness argv, with the
+tool or without it, also carries `--strict-mcp-config` and `--setting-sources user`, so no turn
+loads MCP servers or project settings from the scratch directory, which an earlier turn in a
+reused pod could have written; a reused pod also removes the harness's user settings file before
+each turn); calling it is what ends the
 turn - the turn's own result is the one line `delegated to platform` - before the gateway has
 even seen the request. `A2A_DELEGATE_TOOL=off` is the tool's own switch, read wherever the tool
 is advertised or served, and it governs the tool even over an explicit `A2A_ALLOWED_TOOLS`
@@ -638,7 +643,9 @@ Sweep's domain instead of holding its bus credential indefinitely. A pod that se
 conversation cannot have that bound, so its `activeDeadlineSeconds` is the session's maximum
 lifetime (`A2A_SESSION_MAX_LIFETIME`, 4 hours by default; the gateway refuses to start below the task deadline plus
 twice the grace), and the reap scan holds each of its tasks to the old bound instead: a running
-task older than the task deadline plus the same grace is closed by the gateway as its supervisor
+task older than the task deadline plus the same grace (counted from its submission, or from the
+pod's start when the pod started after it, so a first task's scheduling and image pull do not
+come out of the grace) is closed by the gateway as its supervisor
 (`failed`, on the `…supervisor` subject, unless a final is already on the stream) and the pod is
 deleted. A pod without room left in its lifetime for a whole task is not handed one, so the
 lifetime and that check never fire together. The pod's bus credential still lapses with its
@@ -681,8 +688,9 @@ session was paused to make room, and its next message starts fresh with the conv
 Only with no idle pod is the turn refused, with the notice it always had. A conversation running
 anything (a task, a stopped task finishing, a delegated child whose wake will need the pod) is
 never evicted; each candidate is re-checked under its own conversation's lock, and a lock that is
-held means busy. A reused pod that its conversation's record names neither as its pod nor as its session any
-more (a retirement whose delete failed) never exits on its own, so it goes first, with no notice,
+held means busy. A reused pod that its conversation's record names neither as its pod nor as the
+session of a running task (a retirement whose delete failed, or a turn whose last record write was
+lost and whose task has since ended) never exits on its own, so it goes first, with no notice,
 and Sweep deletes it anyway within a minute.
 
 **One rule for every pod the gateway deletes itself** (stated once here because four

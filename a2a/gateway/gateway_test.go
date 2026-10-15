@@ -1092,6 +1092,9 @@ type fakeSpawner struct {
 	orphansErr error
 	// deleteErr fails Delete (the call is still recorded).
 	deleteErr error
+	// started is each pod's start time for PodStarted; startedErr fails it.
+	started    map[string]time.Time
+	startedErr error
 }
 
 func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
@@ -1101,6 +1104,25 @@ func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) 
 		return false, s.reusableErr
 	}
 	return s.reusable[podName], nil
+}
+
+// PodStarted answers from started; a pod not in it has no start time.
+func (s *fakeSpawner) PodStarted(_ context.Context, podName string) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.startedErr != nil {
+		return time.Time{}, s.startedErr
+	}
+	return s.started[podName], nil
+}
+
+func (s *fakeSpawner) setStarted(pod string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started == nil {
+		s.started = map[string]time.Time{}
+	}
+	s.started[pod] = at
 }
 
 func (s *fakeSpawner) setReusable(pods ...string) {

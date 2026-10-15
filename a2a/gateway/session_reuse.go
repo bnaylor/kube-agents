@@ -163,10 +163,14 @@ func (g *Gateway) evictSession(ctx context.Context, p sessionPod) bool {
 
 // taskOverdue reports a running task on a reused pod past the bound a
 // one-task pod's activeDeadlineSeconds used to give it: the task deadline
-// plus the pod grace, from its submission. The adapter's own deadline fires
-// well before this, so reaching it means the adapter is wedged, or its
-// terminal never reached the gateway; a reused pod's own deadline is hours
-// away and would not save the conversation.
+// plus the pod grace, from its submission. That is the whole check for a
+// later turn, which a live adapter takes within milliseconds. A pod's first
+// task may have waited on scheduling and the image pull, which the old bound
+// did not count (it ran from the pod's start), so retireOverdue also asks
+// for the bound from the pod's start (startedOverdue). The adapter's own
+// deadline fires well before this, so reaching it means the adapter is
+// wedged, or its terminal never reached the gateway; a reused pod's own
+// deadline is hours away and would not save the conversation.
 //
 // Never without a spawner (A2A_SPAWN_SESSIONS dropped after an armed run
 // spawned the pod): the supervisor's terminal is only safe when the pod is
@@ -197,6 +201,14 @@ func (g *Gateway) retireOverdue(ctx context.Context, key string) {
 		return
 	}
 	active := rec.ActiveTask
+	started, err := g.spawner.PodStarted(ctx, rec.PodName)
+	if err != nil {
+		g.log.Error("overdue check: pod read failed; retrying next pass", "pod", rec.PodName, "err", err)
+		return
+	}
+	if !g.startedOverdue(active.SubmittedAt, started, time.Now()) {
+		return
+	}
 	task, err := g.client.TasksGet(ctx, rec.BusSession, active.TaskID)
 	if err == nil && task.Final {
 		return
@@ -231,6 +243,19 @@ func (g *Gateway) retireOverdue(ctx context.Context, key string) {
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("overdue check: record write failed", "conversation", rec.Key, "err", err)
 	}
+}
+
+// startedOverdue is the overdue bound counted from the pod's start when the
+// pod started after the task was submitted: the first task of a pod whose
+// scheduling, node scale-up or image pull came out of the submission's
+// clock. A later turn's pod started long before its submission, and a pod
+// with no start time (gone, or never scheduled) leaves the submission's
+// clock as the only one; neither changes the answer taskOverdue gave.
+func (g *Gateway) startedOverdue(submitted, started, now time.Time) bool {
+	if !started.After(submitted) {
+		return true
+	}
+	return now.Sub(started) >= g.cfg.TaskDeadline+podDeadlineGrace
 }
 
 // unmarkOnSupervisorTerminal stops a reused pod being handed another task once

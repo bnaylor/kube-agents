@@ -926,9 +926,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// A lingering previous incarnation is not this task's executor,
 			// and its task is already closed (healed or detached). Delete
 			// the pod rather than just untrack it: once PodName clears,
-			// reap can never find it again, and sweep only sees terminal
-			// phases - a wedged Running pod would hold its bus credential
-			// forever. If the task is detached, the gateway is its
+			// reap can never find it again, and the sweep takes a live pod
+			// only when it is a reused one its record no longer names
+			// (sweepUntracked) - a wedged Running one-task pod would hold
+			// its bus credential until its deadline. If the task is detached, the gateway is its
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
@@ -1542,9 +1543,10 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 
 // retireIncarnation deletes the record's lingering session pod before a
 // successor is minted or the route is left. Delete rather than just untrack:
-// once PodName clears, reap can never find the pod again, and sweep only
-// sees terminal phases - a wedged Running pod would hold its bus credential
-// forever. A detached task's supervisor terminal is owed BEFORE the delete
+// once PodName clears, reap can never find the pod again, and the sweep takes
+// a live pod only when it is a reused one its record no longer names
+// (sweepUntracked) - a wedged Running one-task pod would hold its bus
+// credential until its deadline. A detached task's supervisor terminal is owed BEFORE the delete
 // (the one deletion rule in Session lifecycle); false means that terminal
 // could not be published, a post has said so, and nothing was touched.
 // Spawner-nil is the W4-rollback shape: the record names a pod nothing can

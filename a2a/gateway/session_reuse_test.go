@@ -343,6 +343,66 @@ func overdueRecord(key, pod, taskID string) *SessionRecord {
 	}
 }
 
+// A reused pod's first task counts its bound from the pod's start when the
+// pod started after the submission, the clock a one-task pod's
+// activeDeadlineSeconds used: a slow schedule or image pull does not come out
+// of the grace that was sized for it. The same task is retired once the bound
+// from the start has passed, and a pod with no start time on record leaves
+// the submission's clock in charge.
+func TestASlowPodStartDoesNotSpendTheOverdueGrace(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	bound := defaultTaskDeadline + podDeadlineGrace
+
+	late := overdueRecord("discord:g1/t-overdue-late", "chat-lynx-late", "task-late")
+	spawn.setStarted("chat-lynx-late", time.Now().Add(-(bound - 5*time.Minute)))
+	gone := overdueRecord("discord:g1/t-overdue-gone", "chat-lynx-gone", "task-gone")
+	for _, rec := range []*SessionRecord{late, gone} {
+		if err := r.g.reg.Put(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.g.retireOverdue(ctx, late.Key)
+	if sup := supervisorTerminal(t, r, "chat-lynx-late", "task-late"); sup != nil {
+		t.Fatalf("a task whose pod started %v ago was failed as overdue: %+v", bound-5*time.Minute, sup)
+	}
+	if d := spawn.deleted(); len(d) != 0 {
+		t.Fatalf("deleted %v, want nothing while the pod's own bound runs", d)
+	}
+
+	spawn.setStarted("chat-lynx-late", time.Now().Add(-(bound + time.Minute)))
+	r.g.retireOverdue(ctx, late.Key)
+	if sup := supervisorTerminal(t, r, "chat-lynx-late", "task-late"); sup == nil || sup.Status.State != lib.StateFailed {
+		t.Fatalf("past the bound from the pod's start: supervisor terminal = %+v, want failed", sup)
+	}
+
+	r.g.retireOverdue(ctx, gone.Key)
+	if sup := supervisorTerminal(t, r, "chat-lynx-gone", "task-gone"); sup == nil || sup.Status.State != lib.StateFailed {
+		t.Fatalf("no start time: supervisor terminal = %+v, want failed on the submission's clock", sup)
+	}
+}
+
+// A pod read that fails holds the overdue check for the next pass rather
+// than guessing which clock applies.
+func TestAnOverdueCheckWaitsOutAFailedPodRead(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	rec := overdueRecord("discord:g1/t-overdue-read", "chat-lynx-read", "task-read")
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	spawn.mu.Lock()
+	spawn.startedErr = errors.New("apiserver unavailable")
+	spawn.mu.Unlock()
+	r.g.retireOverdue(ctx, rec.Key)
+	if sup := supervisorTerminal(t, r, "chat-lynx-read", "task-read"); sup != nil {
+		t.Fatalf("a supervisor terminal was published on a failed pod read: %+v", sup)
+	}
+	if d := spawn.deleted(); len(d) != 0 {
+		t.Fatalf("deleted %v, want nothing", d)
+	}
+}
+
 // A gateway with no spawner (A2A_SPAWN_SESSIONS dropped after an armed run
 // spawned the pod) leaves an overdue task alone: it cannot delete the pod, so
 // it does not write the terminal the deletion rule pairs with the delete, and
@@ -879,9 +939,14 @@ func TestTheSweepDeletesAnUntrackedReusedPod(t *testing.T) {
 		Addressee: "chat-otter-busy", BusSession: "chat-otter-busy", SessionRouted: true,
 		ActiveTask: &ActiveTask{TaskID: "task-l", CorrelationID: "corr-l", SubmittedAt: time.Now()},
 		Tasks:      []TaskRef{{ID: "task-l", Addressee: "chat-otter-busy"}}}
+	// The same shape once that task has ended: nothing can route to the
+	// pod again, so it is untracked.
+	finished := &SessionRecord{Key: "discord:g1/t-finished", ContextID: "ctx-f", Kind: "group",
+		Addressee: "chat-otter-done", BusSession: "chat-otter-done", SessionRouted: true,
+		Tasks: []TaskRef{{ID: "task-f", Addressee: "chat-otter-done"}}}
 	held := &SessionRecord{Key: "discord:g1/t-held-sweep", ContextID: "ctx-h", Kind: "group",
 		Addressee: "chat-otter-new", BusSession: "chat-otter-new", PodName: "chat-otter-new", PodReuse: true, SessionRouted: true}
-	for _, rec := range []*SessionRecord{lost, held} {
+	for _, rec := range []*SessionRecord{lost, finished, held} {
 		if err := r.g.reg.Put(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
@@ -891,6 +956,7 @@ func TestTheSweepDeletesAnUntrackedReusedPod(t *testing.T) {
 		sessionPod{PodName: "chat-otter-was", SessionKey: tracked.Key, Reuse: true},
 		sessionPod{PodName: "chat-otter-once", SessionKey: tracked.Key},
 		sessionPod{PodName: "chat-otter-busy", SessionKey: lost.Key, Reuse: true},
+		sessionPod{PodName: "chat-otter-done", SessionKey: finished.Key, Reuse: true},
 		sessionPod{PodName: "chat-otter-old", SessionKey: held.Key, Reuse: true},
 	)
 	// A conversation whose lock is held is mid-turn; its pods wait for the
@@ -898,8 +964,8 @@ func TestTheSweepDeletesAnUntrackedReusedPod(t *testing.T) {
 	l := r.g.lockSession(held.Key)
 	l.Lock()
 	r.g.sweepOnce(ctx)
-	if d := spawn.deleted(); len(d) != 1 || d[0] != "chat-otter-was" {
-		t.Fatalf("sweep deleted %v, want only the untracked reused pod", d)
+	if d := spawn.deleted(); len(d) != 2 || !slices.Contains(d, "chat-otter-was") || !slices.Contains(d, "chat-otter-done") {
+		t.Fatalf("sweep deleted %v, want only the two untracked reused pods", d)
 	}
 	l.Unlock()
 	r.g.sweepOnce(ctx)
