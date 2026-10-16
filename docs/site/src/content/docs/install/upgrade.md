@@ -358,8 +358,16 @@ for i in $(seq 90); do
 done
 ```
 
-It prints `connected` once the gateway has logged `slack connected`; then check Slack as in
-[Checking the result](#slack). If it prints nothing, the `Ready` condition's message names what the
+It prints `connected` once the gateway has logged `slack connected`. The operator then restarts
+the agent's pod once more, to add the bridge that runs the gateway's tasks, and that can take a few
+minutes if the cluster has to add a node for it. Wait for the `PlatformAgent` to report `Ready`,
+then check Slack as in [Checking the result](#slack):
+
+```bash
+kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=15m
+```
+
+If the loop prints nothing, the `Ready` condition's message names what the
 operator is waiting on, and
 [Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops)
 has the checks for the bus and the gateway. Slack stays unanswered until the gateway connects or
