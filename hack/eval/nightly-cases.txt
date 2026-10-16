@@ -1043,7 +1043,7 @@
 ./tasks/alert-config-terraform-promql-probe/task.yaml
 
 # A pod count with no events in it: the Cluster Agent's audit trail states no
-# observation time it did not read; one it states falls inside the run
-# (report_times_in_window, #3256). deployer: noop, read-only, one card on the
+# observation time it did not read; one it states falls inside the run and
+# matches a tool output (report_times_in_window, #3256). deployer: noop, read-only, one card on the
 # no-pdb-workload fixture.
 ./tasks/cluster-agent-observation-time-read/task.yaml

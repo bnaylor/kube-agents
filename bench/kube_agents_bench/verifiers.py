@@ -92,6 +92,7 @@ from kube_agents_bench import (
     onboarding,
     transcript,
 )
+from kube_agents_bench.parsing import DELEGATION_TOOL
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -132,6 +133,12 @@ _NO_TIME_WINDOW_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check has no window to read the report's times against "
     "and refuses to grade it"
+)
+# report_times_in_window, when a stated time matches no output it could read.
+_NO_WORKER_CAPTURE_GAP = "the delegated workers' tool calls were not captured"
+_UNSOURCED_WITH_GAPS_REASON = (
+    "observation time(s) {times} match no tool output this check could read, but the read "
+    "was not whole ({gaps}), so the output that shows them may be in the part it missed"
 )
 _UNREACHED_SLOT_REASON = (
     "a seeded cluster this check's patterns require a line about was not reached before the run, "
@@ -800,9 +807,144 @@ def _stated_times(line: str, dates: list[str]) -> tuple[list[tuple[str, list[dat
     return found, unreadable
 
 
+# The times a tool output in the run shows, for report_times_in_window's
+# provenance half. Beside the ISO forms _STATED_DATETIME reads: `date` and
+# `date -u` with no format ("Thu Oct 15 21:26:03 UTC 2026"), `date -R`
+# ("Thu, 15 Oct 2026 21:26:03 +0000"), and epoch seconds or milliseconds
+# (`date +%s`, a card's created_at). A ten-digit run is any instant from 2001
+# to 2286, so an id that happens to be ten digits can only widen what counts
+# as read, never narrow it.
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_DATE_DEFAULT_OUTPUT = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+(?P<zone>UTC|GMT|Z)\s+(?P<year>\d{4})\b"
+)
+_DATE_RFC_2822 = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?P<day>\d{1,2})\s+(?P<month>[A-Z][a-z]{2})\s+(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+(?P<zone>[+-]\d{4}|UTC|GMT)\b"
+)
+_EPOCH_SECONDS = re.compile(r"(?<![\d.])(?P<seconds>\d{10})(?:\.\d+)?(?![\d])")
+_EPOCH_MILLISECONDS = re.compile(r"(?<![\d.])(?P<millis>\d{13})(?![\d.])")
+_MILLIS_PER_SECOND = 1000
+# A bare clock time in an output (`date -u +%T`, a log line), with seconds,
+# so a ratio or a port pair ("8080:80") is not read as one.
+_BARE_CLOCK = re.compile(
+    r"(?<![\d:.-])(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<fraction>\d+))?"
+    r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?(?![\d:])"
+)
+_HALF_MINUTE = timedelta(seconds=30)
+# Kanban tools return cards, and a card's result is a worker's own words.
+_KANBAN_TOOL_PREFIX = "kanban_"
+# What worker_trajectory's in-pod script puts in place of a result when the
+# pod's redactor will not load (its WITHHELD), and the marker its clip ends a
+# cut result with. Both live inside that script's source, so they are
+# spelled again here; test_report_times_in_window.py pins them to it.
+_WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
+_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+
+
+def _minute(instant: datetime) -> datetime:
+    return instant.replace(second=0, microsecond=0)
+
+
+def _minutes_of(instant: datetime) -> set[datetime]:
+    """The minutes a report may write a read instant as: its own, or the next
+    when the seconds round up (21:25:59 reported as 21:26)."""
+    return {_minute(instant), _minute(instant + _HALF_MINUTE)}
+
+
+def _named_month_instant(match: re.Match) -> datetime | None:
+    month = match["month"].lower()
+    if month not in _MONTHS:
+        return None
+    offset = _zone_offset(match["zone"])
+    if offset is None:
+        return None
+    try:
+        local = datetime(
+            int(match["year"]), _MONTHS.index(month) + 1, int(match["day"]),
+            int(match["hour"]), int(match["minute"]), int(match["second"]),
+        )
+    except ValueError:
+        return None
+    return (local - offset).replace(tzinfo=timezone.utc)
+
+
+def _output_minutes(text: str, dates: list[str]) -> set[datetime]:
+    """Every UTC minute a tool output's text shows a time in. A clock time
+    with no date (`date -u +%T`, a log line's time) is read on each of
+    ``dates``, the run's start and end days, as a stated one is."""
+    found, _ = _stated_times(text, dates)
+    instants = [instant for _, candidates in found for instant in candidates]
+    dated = [span for m in _STATED_DATETIME.finditer(text) for span in [m.span()]]
+    for match in _BARE_CLOCK.finditer(text):
+        if any(start <= match.start() < end for start, end in dated):
+            continue
+        clock = _clock_of(match)
+        if clock is not None:
+            instants.extend(
+                datetime.combine(datetime.strptime(d, _DATE_FORMAT).date(), clock).replace(tzinfo=timezone.utc)
+                for d in dates
+            )
+    for pattern in (_DATE_DEFAULT_OUTPUT, _DATE_RFC_2822):
+        for match in pattern.finditer(text):
+            instant = _named_month_instant(match)
+            if instant is not None:
+                instants.append(instant)
+    instants.extend(datetime.fromtimestamp(int(m["seconds"]), tz=timezone.utc) for m in _EPOCH_SECONDS.finditer(text))
+    instants.extend(
+        datetime.fromtimestamp(int(m["millis"]) // _MILLIS_PER_SECOND, tz=timezone.utc)
+        for m in _EPOCH_MILLISECONDS.finditer(text)
+    )
+    return {minute for instant in instants for minute in _minutes_of(instant)}
+
+
+def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[set[datetime], list[str], int]:
+    """The UTC minutes the run's tool outputs show, what kept the read from
+    being whole (a result the pod withheld), and how many results it clipped.
+
+    Every entry's ``result`` counts, the front door's and each delegated
+    worker's (``worker_trajectory`` adds those, a worker-filed card's
+    included), since any of them is a time the agent read, except a kanban
+    tool's: a card's result is what a worker wrote, so a guessed time a worker
+    put on its card would otherwise come back as read. A clipped result
+    still counts for what it kept; the cut is noted, not treated as a gap,
+    because nearly every long `kubectl` output is clipped while a `date -u`
+    never is.
+    """
+    minutes: set[datetime] = set()
+    withheld: list[str] = []
+    clipped = 0
+    for entry in trajectory:
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        name = str(entry.get("name") or "")
+        if not isinstance(result, str) or name.startswith(_KANBAN_TOOL_PREFIX):
+            continue
+        if result == _WITHHELD_RESULT:
+            withheld.append(f"a {name or 'tool'} result was withheld")
+            continue
+        if _CLIPPED_RESULT.search(result):
+            clipped += 1
+        minutes |= _output_minutes(result, dates)
+    return minutes, withheld, clipped
+
+
+def _delegated_without_capture(snap: transcript.TranscriptSnapshot) -> bool:
+    """Whether the run delegated but its workers were not read: the front
+    door called ``kanban_create`` and the capture did not run. A run that
+    delegated nothing also has no capture, and is graded on what it has."""
+    if snap.worker_capture_gaps is not None:
+        return False
+    return any(
+        isinstance(e, dict) and e.get("name") == DELEGATION_TOOL and not e.get("agent") for e in snap.trajectory
+    )
+
+
 @VERIFIERS.register("report_times_in_window")
 class ReportTimesInWindowVerifier(BaseVerifier):
-    """Every observation time the report states falls inside the run.
+    """Every observation time the report states falls inside the run and was read.
 
     A report that says when it looked ("Timestamp of Observation: 2026-10-15
     21:38:00 UTC") can only have looked while the run was going, so the time
@@ -824,11 +966,27 @@ class ReportTimesInWindowVerifier(BaseVerifier):
     moment the report was delivered, which this check cannot see; the gap
     between the two is part of the slack.
 
-    What it cannot catch: a made-up time that happens to land inside the
-    window, or one stated in a named zone other than UTC or as a date or
-    clock time that does not exist, which is named in the reason and not
-    graded. It proves the stated time is possible, not
-    that the agent read it.
+    Every checked time must also have been read: its minute (UTC, seconds
+    dropped, so a time read as 21:26:03 may be reported as 21:26) must be a
+    minute some tool output in the run's trajectory shows. The outputs are
+    every entry's ``result``, the front door's and each delegated worker's,
+    a worker-filed card's included, but not a kanban tool's, whose card
+    result is a worker's own words. The forms read are ISO 8601, the output
+    of ``date``, ``date -u`` and ``date -R``, a bare clock time with seconds
+    (on the run's days), and epoch seconds or milliseconds, so a
+    ``date +%s`` matches its UTC rendering; a read time also matches the
+    next minute when its seconds round up. A time no output shows fails,
+    even inside the window: that is the guess #3256 found. When the unread
+    time could sit in a part of the run that was not read (the run delegated
+    and its workers were not captured, the capture has gaps, or a result
+    was withheld), the check is ``status: error`` naming what was missing,
+    not a fail. A clipped result is read as far as it goes and noted.
+
+    What it cannot catch: a time stated in a named zone other than UTC or as
+    a date or clock time that does not exist, which is named in the reason
+    and not graded; and a guess whose minute happens to match some other
+    time the run read, which on a run of a few minutes that printed event
+    or creation times inside it is not rare.
     """
 
     type: Literal["report_times_in_window"]
@@ -888,11 +1046,13 @@ class ReportTimesInWindowVerifier(BaseVerifier):
         dates = sorted({run_start.strftime(_DATE_FORMAT), run_end.strftime(_DATE_FORMAT)})
         raw = snap.final_message if self.scope == "final" else snap.output
         checked, outside, unreadable = [], [], []
+        stated: list[tuple[str, list[datetime]]] = []
         for line in self._labelled_lines(raw):
             found, skipped = _stated_times(line, dates)
             unreadable.extend(skipped)
             for text, instants in found:
                 checked.append(text)
+                stated.append((text, instants))
                 if not any(earliest <= instant <= latest for instant in instants):
                     outside.append(text)
         window = f"{earliest.isoformat(timespec='seconds')} to {latest.isoformat(timespec='seconds')}"
@@ -911,10 +1071,34 @@ class ReportTimesInWindowVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=f"the report states no observation time this check reads{not_read}",
             )
+        read, withheld, clipped = _read_minutes(snap.trajectory, dates)
+        unsourced = [
+            text for text, instants in stated if not any(_minute(i) in read for i in instants)
+        ]
+        if unsourced:
+            gaps = withheld + list(snap.worker_capture_gaps or [])
+            if _delegated_without_capture(snap):
+                gaps.append(_NO_WORKER_CAPTURE_GAP)
+            if gaps:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_UNSOURCED_WITH_GAPS_REASON.format(times=unsourced, gaps="; ".join(gaps)),
+                )
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"observation time(s) no tool output in the run shows, to the minute: {unsourced}"
+                    + (f" ({clipped} result(s) were clipped and read as far as they went)" if clipped else "")
+                    + not_read
+                ),
+            )
         return VerificationResult(
             success=True,
             elapsed_time=time.monotonic() - start,
-            reason=f"{len(checked)} observation time(s) inside the run's window ({window}){not_read}",
+            reason=f"{len(checked)} observation time(s) inside the run's window ({window}) and read from a tool output{not_read}",
         )
 
 
