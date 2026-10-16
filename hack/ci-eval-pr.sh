@@ -169,15 +169,43 @@ readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
 readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=7200
 readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
+# A gateway Deployment kubectl cannot find is an install that is gone, not a
+# pod rolling: on 2026-10-15 a run whose project an earlier tenant's ceiling
+# teardown had emptied retried the exec above every 30 s for the two hours,
+# per repetition (#3129). wait_platform_runs returns EVAL_GATEWAY_GONE_RC at
+# the first such answer; run_one_unit records the repetition as
+# infrastructure, never launches against the missing install, and latches
+# EVAL_INSTALL_GONE_MARKER under STATE_DIR so every later unit, streams or
+# none, records the same way without the exec.
+readonly EVAL_GATEWAY_NOT_FOUND_RE='deployments(\.apps)? "[^"]+" not found'
+readonly EVAL_GATEWAY_GONE_RC=76
+readonly EVAL_INSTALL_GONE_MARKER="install-gone"
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
+# How long each pause attempt waits for the gateway to settle (ready_gateway_pod): an
+# autoscaler scale-down at lease time replaced it in about 40s on 2026-10-15.
+readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
+# The resume runs in the EXIT trap, ahead of the artifact dump and inside Prow's
+# five-minute grace, so it waits only briefly; a gateway that is down then keeps
+# the pause, which the next lease's pause repeats anyway.
+readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
+readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
+# The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
+readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
+# The longest a unit holding a state lock (unit_state_lock) keeps its stack
+# applied: oobe-first-run-audits' own_wait plus its chain_wait
+# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
+readonly STATE_LOCK_HOLD_SECONDS=7200
+# How long a stack-bearing unit that found its state lock busy waits, with the
+# infra lock given back, before it queues for the infra lock again.
+readonly STATE_LOCK_RETRY_SECONDS=30
 
 # ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
@@ -1442,7 +1470,8 @@ release_inflight_note() { # <label> <audit-id>
 # not name PROJECT_ID, as release_inflight_note is. Called once the unit holds
 # its stream locks and before the infra lock, so no other unit on the stream
 # starts during the wait and no tofu unit queues behind it.
-# Returns 0 whatever happens; the reason it could not wait is printed.
+# Returns 0 whatever happens, the reason it could not wait printed, with one
+# exception: EVAL_GATEWAY_GONE_RC when the gateway Deployment is not found.
 wait_platform_runs() { # <label> <space-separated audit ids>
   local label="$1" streams="$2" ns ctx out rc=0
   ns="${TARGET_NAMESPACE:-}"
@@ -1477,6 +1506,10 @@ wait_platform_runs() { # <label> <space-separated audit ids>
       return 0
     fi
     [ "${rc}" -eq 124 ] && out="timed out after $((left + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))s${out:+; ${out}}"
+    if grep -Eq "${EVAL_GATEWAY_NOT_FOUND_RE}" <<<"${out}"; then
+      echo "WARNING: Platform runs (${label}): ${ns}/${AGENT_SERVICE_NAME}-gateway is gone (${out}); the install was removed from under this run, which no retry mends (#3129)" >&2
+      return "${EVAL_GATEWAY_GONE_RC}"
+    fi
     if [ "$((deadline - SECONDS))" -le 0 ]; then
       echo "WARNING: Platform runs (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); stopped waiting on ${streams} after ${EVAL_PLATFORM_RUN_WAIT_SECONDS}s" >&2
       return 0
@@ -1487,15 +1520,17 @@ wait_platform_runs() { # <label> <space-separated audit ids>
   return 0
 }
 
-# The Platform Agent's clock-started audits, paused once per lease before any unit
-# runs (#3020) and resumed from the EXIT trap. hack/ci_pause_scheduled_audits.py does
-# both in the gateway with Hermes' own `cron pause`/`cron resume`, and its header owns
-# which jobs, why the pause outlives a gateway restart, and its exit codes. A Prow
-# lease's teardown sweeps the volume anyway; the resume is for a run against an
-# install that outlives it. A pause that fails is a warning: the run goes on as it
-# did before this existed, with the audits on their clock. Pinned to
-# AGENT_CLUSTER_CONTEXT and refused for a context that does not name PROJECT_ID, as
-# wait_platform_runs is. Returns 0 whatever happens.
+# The Platform Agent's clock-started audits, paused at lease time and again right
+# before the fan-out (#3020), and resumed from the EXIT trap.
+# hack/ci_pause_scheduled_audits.py does both in the gateway with Hermes' own `cron
+# pause`/`cron resume`, and its header owns which jobs, why the pause outlives a
+# gateway restart, and its exit codes. A Prow lease's teardown sweeps the volume
+# anyway; the resume is for a run against an install that outlives it. A pause that
+# still fails after its attempts stops the run as an infrastructure failure, since a
+# scheduled audit on its clock would charge its writes to the cases; a resume that
+# fails only warns. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
+# does not name PROJECT_ID, as wait_platform_runs is; without kubectl, a context or a
+# project it returns 0 and does nothing.
 scheduled_audits() { # <pause|resume> <label>
   local mode="$1" label="$2" ns ctx out rc=0 args=()
   ns="${TARGET_NAMESPACE:-}"
@@ -1514,12 +1549,24 @@ scheduled_audits() { # <pause|resume> <label>
   # An exec that fails (a pod rolling, an API blip) is tried again, as wait_platform_runs
   # does; the script skips what is already done. Its exit 3 is a verdict a retry would
   # only repeat (unreadable inputs, a pause Hermes refused), so that one is final.
+  # Each attempt first waits for the gateway to settle and execs into one of its pods
+  # by name: `deployment/...` can pick a pod that is terminating, and a container
+  # that is still starting runs the entrypoint's cron merge, which can rewrite the
+  # store over a pause (eval-next 2110626938950258691, an autoscaler scale-down at
+  # lease time). ready_gateway_pod says what "settled" checks.
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  local attempt
+  local attempt pod wait="${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}"
+  [ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
   for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
     rc=0
-    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")" || {
+      rc=1
+      out="the ${AGENT_SERVICE_NAME}-gateway workload did not settle within ${wait}s: not all of its replicas Ready and past the entrypoint, or no such Deployment or StatefulSet"
+      [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+      continue
+    }
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "${pod}" \
       -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
       "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" ${args[@]+"${args[@]}"} \
       < "${SCRIPT_DIR}/ci_pause_scheduled_audits.py" 2>&1)" || rc=$?
@@ -1530,8 +1577,85 @@ scheduled_audits() { # <pause|resume> <label>
     [ "${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break
     [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
   done
+  if [ "${mode}" = "pause" ]; then
+    # Loud, not a warning: a scheduled audit left on its clock writes to the GitOps
+    # repository mid-run, and the writes safeguard charges them to whichever cases
+    # are running (#3020). Better an infra-red that says so than case-reds that don't.
+    echo "ERROR: Scheduled audits (${label}): pause exited ${rc} on attempt ${attempt}: ${out}" >&2
+    echo "ERROR: a scheduled audit is still on its clock, so its writes would be charged to the cases; stopping the run (infrastructure, not a case result)" >&2
+    exit 1
+  fi
   echo "WARNING: Scheduled audits (${label}): ${mode} exited ${rc} on attempt ${attempt}: ${out}; any audit not named as ${mode}d keeps its state" >&2
   return 0
+}
+
+# A pod of the gateway, once it has settled: as many Ready, non-terminating pods as
+# the workload asks for (one on every CI install; more on an HA install, where they
+# share the volume), each one past its entrypoint. Waits up to <wait> seconds, prints
+# pod/<name>, or returns 1. The workload is a Deployment, or a StatefulSet of the
+# same name on an HA install with ReadWriteOnce storage.
+#
+# Ready alone is not enough on HA: the probe there passes while nothing listens on
+# 8642 (a standby; agentAPIProbe in platformagent_manifests.go), so a new pod can be
+# Ready while its entrypoint is still merging jobs.json. The entrypoint is the
+# container's PID 1 until `exec "$@"`, so a PID 1 that is no longer
+# agent-entrypoint means the merge is done.
+ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
+  local ctx="$1" ns="$2" deadline=$((SECONDS + ${3:-${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}})) workload kind err
+  local missing selector want pods ready p cmdline settled
+  while :; do
+    # The workload, its selector and its replica count, read each round: an API
+    # blip is waited out like a pod problem. Only both kinds answering NotFound
+    # ends it at once.
+    workload="" missing=0
+    for kind in deployment statefulset; do
+      if err="$(kubectl --context "${ctx}" -n "${ns}" get "${kind}/${AGENT_SERVICE_NAME}-gateway" -o name 2>&1 >/dev/null)"; then
+        workload="${kind}/${AGENT_SERVICE_NAME}-gateway"
+        break
+      fi
+      case "${err}" in *NotFound*|*"not found"*) missing=$((missing + 1)) ;; esac
+    done
+    [ -n "${workload}" ] || [ "${missing}" -lt 2 ] || return 1
+    selector="" want=""
+    if [ -n "${workload}" ]; then
+      selector="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
+        -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null)" || selector=""
+      selector="${selector%,}"
+      want="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || want="?"
+      [ -n "${want}" ] || want=1
+      # Scaled to zero (spec.deployment.scaleToZero) has no pod to wait for.
+      [ "${want}" != 0 ] || return 1
+    fi
+    if [ -n "${selector}" ] && [ "${want}" != "?" ]; then
+      # One listing defines the pods that can be running an entrypoint: not
+      # terminating, and not in a terminal phase (an evicted pod stays Failed
+      # with no deletionTimestamp). Each line is "pod/<name> R|N", R for Ready.
+      # One read, so the count and the Ready set are of the same pods.
+      pods="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
+        -o go-template='{{range $p := .items}}{{if and (not $p.metadata.deletionTimestamp) (ne $p.status.phase "Succeeded") (ne $p.status.phase "Failed")}}{{$r := "N"}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{$r = "R"}}{{end}}{{end}}{{"pod/"}}{{$p.metadata.name}} {{$r}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)" || pods=""
+      ready="$(printf '%s\n' "${pods}" | awk '$2 == "R" {print $1}')"
+      # As many as the workload wants, all of them Ready, no more: an extra pod
+      # means a rollout is still settling, and a surge pod still starting is the
+      # one whose cron merge can rewrite the store.
+      if [ -n "${pods}" ] && [ "$(printf '%s\n' "${pods}" | grep -c .)" -eq "${want}" ] &&
+        [ "$(printf '%s\n' "${ready}" | grep -c .)" -eq "${want}" ]; then
+        settled=1
+        for p in ${ready}; do
+          cmdline="$(kubectl --context "${ctx}" -n "${ns}" exec "${p}" -c "${EVAL_GATEWAY_CONTAINER}" \
+            --request-timeout="${EVAL_PAUSE_AUDITS_PROBE_TIMEOUT}" -- cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ')" || cmdline=""
+          case "${cmdline}" in
+            ""|*agent-entrypoint*) settled=0; break ;;
+          esac
+        done
+        if [ "${settled}" -eq 1 ]; then
+          printf '%s\n' "${ready}" | head -1
+          return 0
+        fi
+      fi
+    fi
+    [ "${SECONDS}" -lt "${deadline}" ] || return 1
+    sleep "${EVAL_PAUSE_AUDITS_POD_POLL_SECONDS}"
+  done
 }
 
 if [ "${EVAL_FORGE}" = "gitlab" ]; then
@@ -2649,11 +2773,13 @@ unit_cost_hint() {
     # and the agent turn is a board read. Unmeasured; priced below the band
     # above because one card's worker is the whole of the wait.
     bootstrap-inventory-ranking-delivery) echo 600 ;;
-    # Tofu too: the unit waits for the previous repetition's audits to finish
-    # (wait_platform_runs), then the stack waits for the stage to run the four
-    # one after another (1-15 min each, #985; up to its chain_wait, 3600s).
-    # Unmeasured on CI.
-    oobe-first-run-audits) echo 2400 ;;
+    # A stack, but off the infra lock (infra_lock_exempt): the unit waits for
+    # the previous repetition's audits to finish (wait_platform_runs), then the
+    # stack waits for the stage to run the four one after another (1-15 min
+    # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
+    # nightly of 2026-10-09; the top of the list, so it launches first in each
+    # repetition round.
+    oobe-first-run-audits) echo 3000 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2667,6 +2793,9 @@ unit_cost_hint() {
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
+    # A plain chat request that runs the compliance collector's sweep (#2386):
+    # the audit band, without the ledger write.
+    security-chat-request-runs-collector) echo 900 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
@@ -2793,6 +2922,28 @@ unit_delegation_timeout() {
 # of every task's `audit_streams:`; a file that will not read stops the run,
 # since a unit that held none of its declared locks would run beside the
 # audit cases they keep out.
+#
+# A stack-bearing case listed in infra_lock_exempt runs beside the other tofu
+# units: its stack reaches the agent install through a kubeconfig of its own
+# and touches no task cluster, and run_one_unit gives the unit a private copy
+# of the shared kubeconfig, so the get-credentials devops-bench runs for the
+# stack's cluster_name output cannot move another unit's current-context.
+infra_lock_exempt() { # <task-name>
+  case "$1" in
+    oobe-first-run-audits) return 0 ;;
+  esac
+  return 1
+}
+# The agent-install state a case's stack rewrites that another case's stack
+# rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
+# markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
+# Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
+# from the others, so this lock does.
+unit_state_lock() { # <task-name>
+  case "$1" in
+    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
+  esac
+}
 TASK_NAMES=()
 TASK_REUSE=()
 TASK_HAS_STACK=()
@@ -2807,7 +2958,12 @@ for TASK in "${TASKS[@]}"; do
   TASK_STREAMS+=("$(task_streams "$(ledger_audit_id_for_task "${TASK}" 2>/dev/null)" \
     "$(printf '%s\n' "${DECLARED_STREAMS}" | awk -v c="${TASK_NAME}" '$1 == c { $1 = ""; print; exit }')")")
   TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
-  if [ -n "${TASK_STACK}" ]; then TASK_HAS_STACK+=("true"); else TASK_HAS_STACK+=(""); fi
+  # "true" means the unit takes the infra lock, so an exempt stack is left out.
+  if [ -n "${TASK_STACK}" ] && ! infra_lock_exempt "${TASK_NAME}"; then
+    TASK_HAS_STACK+=("true")
+  else
+    TASK_HAS_STACK+=("")
+  fi
   if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
     && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
     TASK_REUSE+=("true")
@@ -2845,7 +3001,7 @@ STATE_DIR="$(mktemp -d)"
 # otherwise strand every contender in a silent spin that `wait` can never
 # collect past, so acquisition carries a deadline: a unit that gives up fails
 # loudly and grades as MISSING, which is a diagnosis the gate already
-# reports. Three locks serialize what genuinely cannot overlap while noop
+# reports. Four locks serialize what genuinely cannot overlap while noop
 # units fill the lanes:
 #   per task   -- repetitions of ONE task never overlap. Concurrent reps of a
 #                 ledger-writing audit rewrite one shared ledger issue and
@@ -2853,6 +3009,13 @@ STATE_DIR="$(mktemp -d)"
 #                 task plant simultaneous incidents with no card attribution;
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
+#   per state  -- cases whose stacks rewrite the same agent-install state
+#                 (unit_state_lock) never overlap. A unit off the infra lock
+#                 takes it after its streams and wait_platform_runs; a
+#                 stack-bearing unit takes it only while it holds the infra
+#                 lock, in one try, giving the infra lock back when it is
+#                 busy. No unit holds it while queued for infra, and no unit
+#                 holds infra while waiting for it.
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label, and
@@ -2874,6 +3037,7 @@ STATE_DIR="$(mktemp -d)"
 #                 per-run isolation (own kubeconfig, gcloud config, tofu data
 #                 dir) is off, and two concurrent tofu units would race the
 #                 shared kubeconfig's current-context and their state locks.
+#                 An infra_lock_exempt case does not take it.
 lock_acquire() { # <dir> [deadline-seconds]
   local waited=0 limit="${2:-1800}"
   until mkdir "$1" 2>/dev/null; do
@@ -2936,6 +3100,23 @@ release_streams() { # <space-separated audit ids>
   local s
   # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
   for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done
+}
+
+# How long a unit waits for a state lock: every case holding it keeps its
+# stack applied for up to STATE_LOCK_HOLD_SECONDS, and a stack-bearing waiter
+# queues for the infra lock between its tries, one INFRA_LOCK_DEADLINE a case.
+state_lock_deadline() { # <lock>
+  local n=0 t
+  for t in "${TASK_NAMES[@]}"; do
+    [ "$(unit_state_lock "${t}")" = "$1" ] && n=$((n + 1))
+  done
+  echo $(( n * (INFRA_LOCK_DEADLINE + STATE_LOCK_HOLD_SECONDS) ))
+}
+
+release_state_lock() { # <task-name>
+  local lock
+  lock="$(unit_state_lock "$1")"
+  if [ -n "${lock}" ]; then lock_release "${STATE_DIR}/lock-state-${lock}"; fi
 }
 
 # ─── Per-case grading and recording, inside the fan-out ─────────────────────
@@ -3111,6 +3292,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
   fi
   release_streams "${streams}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} ${why}" >&2
   if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
@@ -3153,12 +3335,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # INFRA_LOCK_DEADLINE, because its previous rep holds the task lock while
   # queued on lock-infra, and no stream term counts that wait. The infra
   # lock keeps its default: it is taken last, after any stream wait, so it is
-  # held only while this unit's own stack is in use.
-  local audit_id lock_deadline held="" s
+  # held only while this unit's own stack is in use. A case with a state lock
+  # adds that lock's deadline, which its previous rep may wait out first.
+  local audit_id lock_deadline held="" s state_lock
   audit_id="$(ledger_audit_id_for_task "${task}")"
+  state_lock="$(unit_state_lock "${name}")"
   lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"
   if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
     lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
+  fi
+  if [ -n "${state_lock}" ]; then
+    lock_deadline=$(( lock_deadline + $(state_lock_deadline "${state_lock}") ))
   fi
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
@@ -3185,12 +3372,65 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     fi
     held="${held} ${s}"
   done
-  wait_platform_runs "${name} rep ${rep}" "${streams}"
-  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
+  # The install gone from under the run (#3129): the repetition is recorded
+  # as infrastructure and never launched, and the state is latched so the
+  # units after this one skip the exec and record the same way; the last of a
+  # case's units grades it. Unwound here rather than through skip_unit: no
+  # state or infra lock is held yet, and skip_unit releases the case's state
+  # lock, which another unit sharing it may hold at this moment.
+  local wait_rc=0 gone_reps=0
+  if [ -e "${STATE_DIR}/${EVAL_INSTALL_GONE_MARKER}" ]; then
+    wait_rc="${EVAL_GATEWAY_GONE_RC}"
+  else
+    wait_platform_runs "${name} rep ${rep}" "${streams}" || wait_rc=$?
+  fi
+  if [ "${wait_rc}" -eq "${EVAL_GATEWAY_GONE_RC}" ]; then
+    : >"${STATE_DIR}/${EVAL_INSTALL_GONE_MARKER}"
+    record_unit_not_run "${name}" "${rep}" \
+      "the gateway Deployment ${TARGET_NAMESPACE:-}/${AGENT_SERVICE_NAME:-}-gateway was not found before launch; the install is gone from the leased project (#3129)"
+    gone_reps="$(finished_rep_count "${name}")"
     release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the install's gateway is gone" >&2
+    if [ "${gone_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+      finish_case "${task}" "${name}"
+    fi
     return 0
+  fi
+  # A unit without the infra lock waits for its state lock here, once its
+  # stream waits are over, so it holds the state only while its stack is in
+  # use; a stack-bearing one takes it with the infra lock, below.
+  if [ -n "${state_lock}" ] && [ -z "${has_stack}" ] \
+    && ! lock_acquire "${STATE_DIR}/lock-state-${state_lock}" "$(state_lock_deadline "${state_lock}")"; then
+    release_streams "${streams}"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${state_lock} state lock" >&2
+    return 0
+  fi
+  # A stack-bearing unit with a state lock tries it once while it holds the
+  # infra lock and never waits on it there: a busy one sends the infra lock
+  # back to the queue, so the tofu chain does not stall behind an exempt
+  # case's stack, and no unit holds the state lock while it queues for infra.
+  if [ -n "${has_stack}" ]; then
+    local infra_deadline="${INFRA_LOCK_DEADLINE}" infra_start="${SECONDS}" infra_held=""
+    if [ -n "${state_lock}" ]; then
+      infra_deadline=$(( infra_deadline + $(state_lock_deadline "${state_lock}") ))
+    fi
+    while [ $(( infra_deadline - (SECONDS - infra_start) )) -gt 0 ] \
+      && lock_acquire "${STATE_DIR}/lock-infra" "$(( infra_deadline - (SECONDS - infra_start) ))"; do
+      if [ -z "${state_lock}" ] || mkdir "${STATE_DIR}/lock-state-${state_lock}" 2>/dev/null; then
+        infra_held="true"
+        break
+      fi
+      lock_release "${STATE_DIR}/lock-infra"
+      sleep "${STATE_LOCK_RETRY_SECONDS}"
+    done
+    if [ -z "${infra_held}" ]; then
+      release_streams "${streams}"
+      lock_release "${STATE_DIR}/lock-task-${name}"
+      echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock${state_lock:+ with the ${state_lock} state lock}" >&2
+      return 0
+    fi
   fi
   # This unit's own token, minted rather than inherited, and minted after the
   # waiting rather than before it: reps of one task serialize on the task lock,
@@ -3254,6 +3494,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     unset TF_VAR_reuse_existing_cluster
   fi
   export BENCH_NO_INFRA="false"
+  # An exempt stack runs beside the tofu units, so the context devops-bench
+  # sets for its cluster_name output goes to a copy (infra_lock_exempt).
+  if infra_lock_exempt "${name}"; then
+    local kubeconfig="${STATE_DIR}/kubeconfig-${name}-rep${rep}"
+    if ! kubectl config view --raw > "${kubeconfig}" || [ ! -s "${kubeconfig}" ]; then
+      skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}" "did not run: could not copy the kubeconfig" \
+        "the unit's private kubeconfig could not be written before launch"
+      return 0
+    fi
+    export KUBECONFIG="${kubeconfig}"
+  fi
   # Per unit, inside this subshell, so the audit units' longer ceiling never
   # leaks to a sibling lane; see unit_delegation_timeout.
   AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
@@ -3318,6 +3569,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   finished_reps="$(finished_rep_count "${name}")"
   release_streams "${streams}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   # Copied here, not in the grading pass: a Prow deadline that kills the
   # fan-out must still leave every completed unit's log in the artifacts.
@@ -3328,12 +3580,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
 }
 
+# Again, right before the fan-out: idempotent, and it catches a gateway that an
+# outside event (an autoscaler scale-down) restarted between lease setup and here.
+scheduled_audits pause "fan-out"
+
 # Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
 # serialize on the task lock, so a same-task unit launched early just parks a
 # lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
-#
+
 # Two phases on the inject lane (#2079), and since #2260 on the api lane too.
 # On the inject lane for the GitHub-write safeguard, which dates a write and
 # cannot sign it while every unit of the run writes to one repository; on
