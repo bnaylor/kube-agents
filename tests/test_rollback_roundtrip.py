@@ -17,6 +17,7 @@ announced, and nothing it does reaches the exit status.
 """
 
 import base64
+import hashlib
 import http.server
 import json
 import os
@@ -56,6 +57,13 @@ _BRIDGE = {
     ],
 }
 _OTHER_SIDECAR = {"name": "log-shipper", "image": "shipper:1", "env": [{"name": "X", "value": "y"}]}
+# The agent Deployment's selector, which the failure capture finds its pod by.
+_AGENT_POD_LABELS = {"app.kubernetes.io/instance": _CR, "app.kubernetes.io/name": "gateway"}
+# The identity map ConfigMap, and the version the simulated callout logs it
+# serves (SERVED_MAP_VERSION in FAKE_KUBECTL).
+_AUTHMAP = "platform-agent-a2a-authmap"
+_SERVED_MAP_VERSION = "0123456789abcdef"
+_AUTHMAP_DATA = json.dumps({"version": _SERVED_MAP_VERSION, "identities": []}, indent=2) + "\n"
 
 # What both drivers start from instead of the caller's environment: a shell
 # that drove the lane or the script by hand carries EVAL_MODE_NEXT, BUILD_ID,
@@ -211,6 +219,8 @@ FAKE_KUBECTL = textwrap.dedent(
         reason = "RBACIncomplete" if s.get("degraded_armed") else s["scenario"].get("degraded_baseline")
         if reason:
             cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": reason, "message": "m"})
+        if cr["spec"].get("mode") == "next":
+            cr["status"]["conditions"].append(BUS_CREDS)
 
     def reconcile(s, p):
         sc, cr, o = s["scenario"], s["cr"], s["objects"]
@@ -282,6 +292,49 @@ FAKE_KUBECTL = textwrap.dedent(
     PVC = "data-platform-agent-a2a-nats-0"
     CREDS = "platform-agent-a2a-nats-creds"
     AGENT_POD = "platform-agent-gateway-abc"
+    # The identity map version the callout logs it serves, and the condition
+    # the operator writes naming it (platformagent_a2a_buscreds.go).
+    SERVED_MAP_VERSION = "0123456789abcdef"
+    BUS_CREDS = {"type": "BusCredentialsReady", "status": "True", "reason": "CalloutServing",
+                 "message": "the auth callout is serving identity map " + SERVED_MAP_VERSION}
+    # The A2A pods a component selector finds, while their workload exists:
+    # (workload, pod names, container).
+    COMPONENT_PODS = {
+        "verifier": ("deployment/platform-agent-a2a-verifier",
+                     ["platform-agent-a2a-verifier-1", "platform-agent-a2a-verifier-2"], "verifier"),
+        "callout": ("deployment/platform-agent-a2a-callout", ["platform-agent-a2a-callout-1"], "callout"),
+        "gateway": ("deployment/platform-agent-a2a-gateway", ["platform-agent-a2a-gateway-1"], "gateway"),
+        "nats": ("statefulset/platform-agent-a2a-nats", ["platform-agent-a2a-nats-0"], "nats"),
+    }
+    OBJECTS_TABLE = ("NAME READY STATUS\n"
+                     "pod/platform-agent-a2a-verifier-1 1/1 Running\n"
+                     "endpoints/platform-agent-a2a-verifier 10.0.0.5:8443\n"
+                     "networkpolicy.networking.k8s.io/platform-agent-a2a-verifier-netpol\n")
+
+    def component_pods(s, component):
+        workload_key, names, container = COMPONENT_PODS.get(component, ("", [], ""))
+        if workload_key not in s["objects"]:
+            return []
+        restarts = s["scenario"].get("restarts", {}).get(component, 0)
+        return [{"metadata": {"name": n, "labels": {"kubeagents.x-k8s.io/a2a-component": component}},
+                 "spec": {"containers": [{"name": container}]},
+                 "status": {"phase": "Running", "containerStatuses": [{"name": container, "restartCount": restarts}]}}
+                for n in names]
+
+    def pod_log(pod, args):
+        container = args[args.index("-c") + 1]
+        lines = ["%s/%s started%s" % (pod, container, " (previous instance)" if "--previous" in args else "")]
+        if container == "callout":
+            lines.append('{"msg":"serving identity map","version":"%s"}' % SERVED_MAP_VERSION)
+        if container == "hermes-bridge":
+            # The tasks the door started, as the bridge would log taking them.
+            tasks_path = os.environ.get("FAKE_TASKS", "")
+            tasks = open(tasks_path).read().split() if tasks_path and os.path.exists(tasks_path) else []
+            for task in tasks:
+                lines.append('{"msg":"task received","task":"%s"}' % task)
+                lines.append('{"msg":"capability check failed","task":"%s"}' % task)
+        lines.append("%s/%s still running" % (pod, container))
+        return "\n".join(lines) + "\n"
     CAPACITY_MSG = ("Pod %s cannot be scheduled onto any available node: 0/3 nodes are available: "
                     "1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 Insufficient memory. "
                     "no new claims to deallocate, preemption: 0/3 nodes are available: "
@@ -382,10 +435,24 @@ FAKE_KUBECTL = textwrap.dedent(
             threading.Thread(target=pump, args=(up, conn), daemon=True).start()
 
     def main(argv):
+        # The failure capture's calls carry --request-timeout (and so does
+        # the failure report's mode read, which comes before it). capture_slow
+        # holds each one; capture_fails is an API server that cannot be
+        # reached; FAKE_CAPTURE_MARK is touched once the capture has begun.
+        bounded = any(a.startswith("--request-timeout") for a in argv)
+        if bounded and "jsonpath={.spec.mode}" not in argv and os.environ.get("FAKE_CAPTURE_MARK"):
+            open(os.environ["FAKE_CAPTURE_MARK"], "a").close()
         s = load()
+        if bounded and s["scenario"].get("capture_slow") and "patch" not in argv:
+            time.sleep(s["scenario"]["capture_slow"])
+            s = load()
         tick(s)
         s["calls"].append(argv)
-        args = list(argv)
+        if bounded and s["scenario"].get("capture_fails") and "patch" not in argv:
+            save(s)
+            sys.stderr.write("Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout\n")
+            return 1
+        args = [a for a in argv if not a.startswith("--request-timeout")]
         if args[:1] == ["--context"]:
             s["contexts"].append(args[1]); args = args[2:]
         if args[:1] == ["-n"]:
@@ -410,6 +477,8 @@ FAKE_KUBECTL = textwrap.dedent(
             # the previous generation's Ready, as on a real install.
             s["pending"] = {"at": s["tick"] + RECONCILE_TICKS, "kind": kind}
             out = "patched"
+        elif verb == "logs" and args[1].startswith("pod/"):
+            out = pod_log(args[1][len("pod/"):], args)
         elif verb == "logs":
             sidecars = s["cr"]["spec"].get("deployment", {}).get("sidecars") or []
             if s["cr"]["spec"].get("mode") == "next" and sidecars and not s["scenario"].get("bridge_silent"):
@@ -419,12 +488,22 @@ FAKE_KUBECTL = textwrap.dedent(
             name = rest[0] if rest and not rest[0].startswith("-") else ""
             ignore = "--ignore-not-found" in rest
             fmt = rest[rest.index("-o") + 1] if "-o" in rest else ""
+            selector = rest[rest.index("-l") + 1] if "-l" in rest else ""
+            labels = dict(kv.split("=", 1) for kv in selector.split(",")) if selector else {}
             if kind == "platformagent":
                 obj = s["cr"]
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
+            elif kind == "pods" and "kubeagents.x-k8s.io/a2a-component" in labels:
+                out = json.dumps({"items": component_pods(s, labels["kubeagents.x-k8s.io/a2a-component"])})
+            elif kind == "pods" and labels:
+                out = json.dumps({"items": [p for p in s["pods"] if all(p["metadata"]["labels"].get(k) == v for k, v in labels.items())]})
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
                 late_unschedulable(s)
+            elif kind == "pods,endpoints,networkpolicies":
+                out = OBJECTS_TABLE
+            elif kind == "networkpolicies":
+                out = "apiVersion: v1\nitems: []\nkind: List\n"
             elif kind == "jobs":
                 # A Job that turns Failed after leg 2's provisioning read it
                 # Complete: the second such read under next sees it Failed.
@@ -494,6 +573,8 @@ def workload(kind: str, name: str, gen: int = 1) -> dict:
 
 def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
     sidecars = [_BRIDGE] if sidecars is None else sidecars
+    agent_deployment = workload("Deployment", "platform-agent-gateway", 7)
+    agent_deployment["spec"]["selector"] = {"matchLabels": dict(_AGENT_POD_LABELS)}
     objects = {
         f"pvc/{_PVC}": {"uid": "pvc-1"},
         f"secret/{_CREDS}": {"uid": "creds-1", "data": {"bridge-password": b64("pw")}},
@@ -504,7 +585,11 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
         "deployment/platform-agent-a2a-callout": workload("Deployment", "platform-agent-a2a-callout"),
         "deployment/platform-agent-a2a-gateway": workload("Deployment", "platform-agent-a2a-gateway"),
         "deployment/platform-agent-a2a-verifier": workload("Deployment", "platform-agent-a2a-verifier"),
-        "deployment/platform-agent-gateway": workload("Deployment", "platform-agent-gateway", 7),
+        "deployment/platform-agent-gateway": agent_deployment,
+        f"configmap/{_AUTHMAP}": {
+            "metadata": {"name": _AUTHMAP, "resourceVersion": "42", "annotations": {"kubeagents.x-k8s.io/a2a-authmap-version": _SERVED_MAP_VERSION}},
+            "data": {"identities.json": _AUTHMAP_DATA},
+        },
         "pod/platform-agent-a2a-nats-0": {"spec": {"volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": _PVC}}]}},
     }
     spec: dict = {"mode": "next", "harness": {}}
@@ -513,14 +598,20 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
     cr = {
         "metadata": {"name": _CR, "generation": 4},
         "spec": spec,
-        "status": {"phase": "Ready", "conditions": [{"type": "Ready", "status": "True", "reason": "Reconciled", "message": "m", "observedGeneration": 4}]},
+        "status": {
+            "phase": "Ready",
+            "conditions": [
+                {"type": "Ready", "status": "True", "reason": "Reconciled", "message": "m", "observedGeneration": 4},
+                {"type": "BusCredentialsReady", "status": "True", "reason": "CalloutServing", "message": f"the auth callout is serving identity map {_SERVED_MAP_VERSION}"},
+            ],
+        },
     }
     if scenario.get("degraded_baseline"):
         cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": scenario["degraded_baseline"], "message": "m"})
     pods = [
         {
-            "metadata": {"name": "platform-agent-gateway-abc", "labels": {}},
-            "spec": {"nodeName": "gk3-pool-1-node-a"},
+            "metadata": {"name": "platform-agent-gateway-abc", "labels": dict(_AGENT_POD_LABELS)},
+            "spec": {"nodeName": "gk3-pool-1-node-a", "containers": [{"name": "platform-agent"}, {"name": "hermes-bridge"}]},
             "status": {"phase": "Running", "containerStatuses": [{"name": "platform-agent", "state": {"running": {}}}]},
         },
         {"metadata": {"name": "platform-agent-a2a-nats-0", "labels": {"app.kubernetes.io/part-of": "a2a-next"}}, "status": {"phase": "Running"}},
@@ -586,10 +677,17 @@ class _Door(http.server.BaseHTTPRequestHandler):
             if state["scenario"].get("door_refuses"):
                 self._reply(state["scenario"]["door_refuses"], {"error": "refused"})
                 return
+            refuses_on = state["scenario"].get("door_refuses_on")
+            if refuses_on and f"/{refuses_on}." in body.get("conversation", ""):
+                self._reply(403, {"error": "refused"})
+                return
             if auth != f"Bearer {self._door_token(state)}":
                 self._reply(401, {"error": "stale token"})
                 return
-            self._reply(200, {"taskId": "task-" + body["conversation"].split("/")[1], "conversation": "inject:" + body["conversation"]})
+            task = "task-" + body["conversation"].split("/")[1]
+            with self.cancels_path.with_name("tasks").open("a") as tasks:
+                tasks.write(f"{task}\n")
+            self._reply(200, {"taskId": task, "conversation": "inject:" + body["conversation"]})
             return
         self._reply(404, {})
 
@@ -655,6 +753,7 @@ class Sim:
                 "ROLLBACK_KUBE_CONTEXT": "gke_test_ctx",
                 "FAKE_PF_PIDS": str(self.pf_pids),
                 "FAKE_DOOR_PORT": str(self.server.server_address[1]),
+                "FAKE_TASKS": str(self.cancels.with_name("tasks")),
             }
         )
         env.update(extra)
@@ -1240,6 +1339,204 @@ class FailureTest(RoundTripTest):
         self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted")
 
 
+# What a failed run writes beside its transcript (capture_failure_window).
+_CAPTURE_FILES = {
+    "rollback-failure-verifier.log",
+    "rollback-failure-callout.log",
+    "rollback-failure-a2a-gateway.log",
+    "rollback-failure-nats.log",
+    "rollback-failure-agent.log",
+    "rollback-failure-bus-task.log",
+    "rollback-failure-identity-map.txt",
+    "rollback-failure-objects.txt",
+    "rollback-failure-capture.txt",
+}
+
+
+class FailureCaptureTest(RoundTripTest):
+    """A failed or stopped run writes its failure window's evidence beside its
+    results file, and nothing about the capture changes the exit or the FAIL
+    line. What it adds to the EXIT trap's rollback- log tails in
+    ci-eval-pr.sh: logs from the failing leg's start, the served identity map
+    against the cluster's, the bus task's own lines, and the endpoints and
+    network policies, from the script itself (periodic 2110807974292230144,
+    leg2.bus-task)."""
+
+    def capture_files(self, sim: Sim) -> dict[str, str]:
+        root = pathlib.Path(sim.dir.name)
+        return {path.name: path.read_text() for path in root.glob("rollback-failure-*")}
+
+    def capture_calls(self, state: dict) -> list[list[str]]:
+        return [call for call in state["calls"] if any(arg.startswith("--request-timeout") for arg in call)]
+
+    def test_a_failed_run_writes_the_failure_window(self) -> None:
+        # The lane's install shape: no declared sidecars, the bridge rendered.
+        result, state, sim = self.run_sim(healthy_next_state(sidecars=[], bus_task_fails_on="leg2"))
+        self.assert_fails_at(result, "leg2.bus-task", "terminal failed")
+        files = self.capture_files(sim)
+        self.assertEqual(set(files), _CAPTURE_FILES)
+        self.assertIn("failure evidence (logs since ", result.stdout)
+        # Every container of every component's pods, the agent's included.
+        self.assertIn("=== pod/platform-agent-a2a-verifier-1 container verifier, since ", files["rollback-failure-verifier.log"])
+        self.assertIn("=== pod/platform-agent-a2a-verifier-2 container verifier, since ", files["rollback-failure-verifier.log"])
+        self.assertIn("platform-agent-a2a-nats-0/nats started", files["rollback-failure-nats.log"])
+        self.assertIn("platform-agent-a2a-gateway-1/gateway started", files["rollback-failure-a2a-gateway.log"])
+        self.assertIn("=== pod/platform-agent-gateway-abc container hermes-bridge, since ", files["rollback-failure-agent.log"])
+        self.assertIn("=== pod/platform-agent-gateway-abc container platform-agent, since ", files["rollback-failure-agent.log"])
+        self.assertNotIn("previous instance", "".join(files.values()), "no container restarted")
+        # The bus task's own lines, by the id the client printed.
+        bus = files["rollback-failure-bus-task.log"]
+        self.assertIn("lines naming task task-leg2.bus-task", bus)
+        self.assertIn('{"msg":"capability check failed","task":"task-leg2.bus-task"}', bus)
+        self.assertNotIn("task-pre.bus-task", bus.splitlines()[0], "the leg's task, not the last leg's")
+        # The served map against the ConfigMap and the condition.
+        identity = files["rollback-failure-identity-map.txt"]
+        self.assertIn('"msg":"serving identity map","version":"0123456789abcdef"', identity)
+        self.assertIn("annotation kubeagents.x-k8s.io/a2a-authmap-version: 0123456789abcdef", identity)
+        self.assertIn("version inside identities.json: 0123456789abcdef", identity)
+        self.assertIn(f"sha256 of identities.json: {hashlib.sha256(_AUTHMAP_DATA.encode()).hexdigest()}", identity)
+        self.assertIn("BusCredentialsReady=True reason=CalloutServing", identity)
+        objects = files["rollback-failure-objects.txt"]
+        self.assertIn("endpoints/platform-agent-a2a-verifier", objects)
+        self.assertIn("kind: List", objects)
+        self.assertIn("Ready=True reason=Reconciled", objects)
+        self.assertIn("everything captured", files["rollback-failure-capture.txt"])
+        # Every capture call is bounded, and every log is the leg's window.
+        since = re.search(r"logs since (\S+),", files["rollback-failure-capture.txt"]).group(1)
+        self.assertRegex(since, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        log_calls = [call for call in self.capture_calls(state) if "logs" in call and "--since-time=" + since in call]
+        self.assertGreaterEqual(len(log_calls), 7, self.capture_calls(state))
+        self.assertTrue(all("--request-timeout=8s" in call for call in self.capture_calls(state)))
+        self.assertEqual([c for c in state["calls"] if "logs" in c and any(a.startswith("pod/") for a in c) and not any(a.startswith("--request-timeout") for a in c)], [])
+
+    def test_a_passing_run_writes_no_failure_files(self) -> None:
+        result, state, sim = self.run_sim(healthy_next_state(sidecars=[]))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.capture_files(sim), {})
+        self.assertEqual(self.capture_calls(state), [])
+        self.assertNotIn("failure evidence", result.stdout)
+
+    def test_a_capture_against_an_unreachable_api_keeps_the_exit_and_the_fail_line(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], bus_task_fails_on="leg2", capture_fails=True))
+        self.assert_fails_at(result, "leg2.bus-task", "terminal failed")
+        files = self.capture_files(sim)
+        capture = files["rollback-failure-capture.txt"]
+        self.assertIn("not captured:", capture)
+        self.assertIn("verifier: the pods for", capture)
+        self.assertIn("dial tcp 10.0.0.1:443: i/o timeout", capture)
+        self.assertIn("(could not be read)", files["rollback-failure-objects.txt"])
+        self.assertRegex(result.stdout, r"item\(s\) not captured, listed in ")
+
+    def test_the_capture_stops_at_its_budget(self) -> None:
+        # A slow API server: each capture call takes 2s, the budget is 1s,
+        # so the first call runs and the rest are skipped and named.
+        result, state, sim = self.run_sim(
+            healthy_next_state(sidecars=[], bus_task_fails_on="leg2", capture_slow=2), ROLLBACK_CAPTURE_BUDGET_SECONDS="1"
+        )
+        self.assert_fails_at(result, "leg2.bus-task", "terminal failed")
+        capture = self.capture_files(sim)["rollback-failure-capture.txt"]
+        self.assertIn("skipped, the 1s capture budget was spent", capture)
+        self.assertLessEqual(len(self.capture_calls(state)), 3, self.capture_calls(state))
+
+    def test_a_restarted_container_has_its_previous_log_taken(self) -> None:
+        result, state, sim = self.run_sim(healthy_next_state(sidecars=[], bus_task_fails_on="leg2", restarts={"verifier": 2}))
+        self.assert_fails_at(result, "leg2.bus-task")
+        verifier = self.capture_files(sim)["rollback-failure-verifier.log"]
+        self.assertIn("=== pod/platform-agent-a2a-verifier-1 container verifier (previous instance), since ", verifier)
+        self.assertIn("platform-agent-a2a-verifier-1/verifier started (previous instance)", verifier)
+        previous = [call for call in self.capture_calls(state) if "--previous" in call]
+        self.assertEqual(len(previous), 2, previous)
+
+    def test_a_leg_without_a_task_greps_for_the_last_one(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], today_turn_fails=True))
+        self.assert_fails_at(result, "leg1.today-turn")
+        files = self.capture_files(sim)
+        # pre's task is not leg 1's: the grep is for the last task, and says whose.
+        self.assertIn("lines naming task task-pre.bus-task", files["rollback-failure-bus-task.log"])
+        self.assertIn("failure window of leg1", files["rollback-failure-capture.txt"])
+        # Under today the A2A stack is gone: no pods, said plainly.
+        self.assertIn("(no pod matches ", files["rollback-failure-verifier.log"])
+
+    def test_a_failure_before_any_bus_task_says_so(self) -> None:
+        state = healthy_next_state(sidecars=[])
+        del state["objects"][f"pvc/{_PVC}"]
+        result, _, sim = self.run_sim(state)
+        self.assert_fails_at(result, "pre.pvc-present")
+        self.assertEqual(self.capture_files(sim)["rollback-failure-bus-task.log"], "no bus task was submitted in pre\n")
+
+    def test_a_task_that_never_started_is_not_confused_with_the_last_legs(self) -> None:
+        # Leg 2's door refuses: no task id, so the grep is for its
+        # conversation alone, never pre's task.
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], door_refuses_on="leg2"))
+        self.assert_fails_at(result, "leg2.bus-task", "refused")
+        bus = self.capture_files(sim)["rollback-failure-bus-task.log"]
+        self.assertIn("lines naming task (no id: none was started) or conversation rollback-roundtrip/leg2.bus-task/", bus)
+        self.assertNotIn("task-pre.bus-task", bus)
+
+    def test_a_death_outside_an_assertion_leaves_its_evidence_too(self) -> None:
+        # set -e ends the run with no sidecars unset: the EXIT trap still
+        # captures, with no FAIL line of its own.
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], garbled_agent_after_unset=True))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(failed(result), [])
+        files = self.capture_files(sim)
+        self.assertEqual(set(files), _CAPTURE_FILES)
+        self.assertIn("failure window of leg1", files["rollback-failure-capture.txt"])
+        self.assertIn("failure evidence (logs since ", result.stdout)
+
+    def test_without_an_artifacts_directory_nothing_is_written_and_it_says_so(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], bus_task_fails_on="leg2"), ROLLBACK_RESULTS_FILE="")
+        self.assert_fails_at(result, "leg2.bus-task")
+        self.assertEqual(self.capture_files(sim), {})
+        self.assertIn("failure evidence not written: neither ROLLBACK_ARTIFACT_DIR nor ROLLBACK_RESULTS_FILE says where", result.stdout)
+
+    def test_the_artifacts_directory_can_be_named(self) -> None:
+        sim = Sim(healthy_next_state(sidecars=[], bus_task_fails_on="leg2"))
+        self.addCleanup(sim.close)
+        elsewhere = pathlib.Path(sim.dir.name) / "artifacts"
+        result = sim.run(ROLLBACK_ARTIFACT_DIR=str(elsewhere))
+        self.assert_fails_at(result, "leg2.bus-task")
+        self.assertEqual({path.name for path in elsewhere.iterdir()}, _CAPTURE_FILES)
+        self.assertEqual(self.capture_files(sim), {})
+
+    def test_a_signal_captures_too(self) -> None:
+        sim = Sim(healthy_next_state(never_ready_on="today"))
+        self.addCleanup(sim.close)
+        proc = subprocess.Popen(["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600"))
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"]):
+            time.sleep(0.2)
+        time.sleep(1)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted")
+        files = self.capture_files(sim)
+        self.assertEqual(set(files), _CAPTURE_FILES)
+        self.assertIn("failure window of leg1", files["rollback-failure-capture.txt"])
+
+    def test_a_signal_during_the_capture_does_not_change_the_fail_line(self) -> None:
+        # The outer bound's TERM landing while a failure is being reported:
+        # the report finishes under the FAIL line it started with, inside its
+        # budget, and no second FAIL or last line is printed.
+        sim = Sim(healthy_next_state(sidecars=[], bus_task_fails_on="leg2", capture_slow=1))
+        self.addCleanup(sim.close)
+        mark = pathlib.Path(sim.dir.name) / "capture-started"
+        env = sim.env(ROLLBACK_CAPTURE_BUDGET_SECONDS="4", FAKE_CAPTURE_MARK=str(mark))
+        proc = subprocess.Popen(["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, text=True, env=env)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not mark.exists():
+            time.sleep(0.1)
+        self.assertTrue(mark.exists(), "the capture never started")
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertEqual(failed(subprocess.CompletedProcess([], 1, out, "")), ["leg2.bus-task"], out)
+        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg2.bus-task")
+        self.assertNotIn("interrupted", out)
+        self.assertIn("rollback-failure-capture.txt", " ".join(self.capture_files(sim)))
+
+
 _NATS = "platform-agent-a2a-nats"
 
 
@@ -1392,6 +1689,38 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         self.assertIn('reason = "PodUnschedulable"', _CONTROLLER.read_text())
         self.assertIn("cannot be scheduled onto any available node", _CONTROLLER.read_text())
 
+    def test_the_failure_capture_reads_what_the_operator_renders(self) -> None:
+        c = self.constants()
+        controller = _OPERATOR / "internal" / "controller"
+        authmap = (controller / "platformagent_a2a_authmap.go").read_text()
+        self.assertIn(f'return agent.Name + "{c["AUTHMAP_NAME_SUFFIX"]}"', authmap)
+        self.assertEqual(c["AUTHMAP_KEY"], self.go(controller / "platformagent_a2a_authmap.go", r'a2aAuthMapKey\s*=\s*"([^"]+)"'))
+        self.assertEqual(c["AUTHMAP_VERSION_ANNOTATION"], self.go(controller / "platformagent_a2a_authmap.go", r'a2aAuthMapVersionAnnotation\s*=\s*"([^"]+)"'))
+        self.assertEqual(c["BUS_CREDS_CONDITION"], self.go(controller / "platformagent_a2a_buscreds.go", r'busCredentialsReadyCondition\s*=\s*"([^"]+)"'))
+        self.assertEqual(c["A2A_COMPONENT_LABEL"], self.go(_A2A_MANIFESTS, r'a2aComponentLabel\s*=\s*"([^"]+)"'))
+        # Each component's value is the one its pod template carries.
+        sources = "".join(path.read_text() for path in controller.glob("platformagent_a2a_*.go") if not path.name.endswith("_test.go"))
+        components = dict(entry.split(":") for entry in c["CAPTURE_COMPONENTS"].split())
+        self.assertEqual(set(components), {"verifier", "callout", "a2a-gateway", "nats"})
+        for component in components.values():
+            self.assertRegex(sources, rf'(podLabels|labels) := a2aLabels\(agent, "{component}"\)', component)
+        # The callout's own line about the map it serves.
+        store = (_REPO_ROOT / "a2a" / "authcallout" / "store.go").read_text()
+        self.assertIn(f'"serving {c["CALLOUT_MAP_LOG_MATCH"]}"', store)
+        self.assertIn(f'"{c["CALLOUT_MAP_LOG_MATCH"]} changed"', store)
+
+    def test_the_failure_report_fits_inside_the_kill_grace(self) -> None:
+        # A stopped run's report: the mode read, the sidecars' restore, the
+        # capture's budget and the one call it lets start at its end, inside
+        # the grace ci-eval-pr.sh gives before its KILL.
+        c = self.constants()
+        grace = int(re.search(r"readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=(\d+)", ci_eval_constants()).group(1))
+        request = int(c["DEFAULT_CAPTURE_REQUEST_TIMEOUT_SECONDS"])
+        restore = int(c["RESTORE_REQUEST_TIMEOUT"].removesuffix("s"))
+        total = request + restore + int(c["DEFAULT_CAPTURE_BUDGET_SECONDS"]) + request
+        self.assertLess(total, grace)
+        self.assertIn(f"{request} + {restore} + {c['DEFAULT_CAPTURE_BUDGET_SECONDS']} + {request} = {total}s", _SCRIPT.read_text())
+
     def test_the_status_words_are_the_operators(self) -> None:
         c = self.constants()
         text = _CONTROLLER.read_text()
@@ -1433,7 +1762,7 @@ class CiEvalWiringTest(unittest.TestCase):
         artifacts = root / "artifacts"
         artifacts.mkdir()
         (root / "rollback-roundtrip.sh").write_text(
-            "echo \"stub ran: $* context=${ROLLBACK_KUBE_CONTEXT} results=${ROLLBACK_RESULTS_FILE}\"\n"
+            "echo \"stub ran: $* context=${ROLLBACK_KUBE_CONTEXT} results=${ROLLBACK_RESULTS_FILE} artifacts=${ROLLBACK_ARTIFACT_DIR}\"\n"
             "echo 'PASS pre.mode-next: x' >> \"${ROLLBACK_RESULTS_FILE}\"\n"
             f"exit {script_status}\n"
         )
@@ -1496,6 +1825,10 @@ class CiEvalWiringTest(unittest.TestCase):
         results = (artifacts / "rollback-roundtrip.txt").read_text().splitlines()
         self.assertEqual(results[1:], ["PASS pre.mode-next: x", "OUTCOME: failed (exit 1)"])
         self.assertTrue(results[0].startswith("the job started "), results[0])
+
+    def test_the_round_trip_writes_its_failure_evidence_into_the_artifacts(self) -> None:
+        result, artifacts = self.run_wiring(mode_next="1", script_status=1)
+        self.assertIn(f"artifacts={artifacts}\n", result.stdout)
 
     def test_a_passing_round_trip_is_reported(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", script_status=0)

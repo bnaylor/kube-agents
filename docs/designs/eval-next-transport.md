@@ -685,11 +685,15 @@ leaves and returns with the mode), and asserts that the JetStream PVC and the bu
 UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
 afterwards. It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
-on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
+on the job's exit status. A failed or stopped run also writes its failure window beside them
+(`rollback-failure-*`: the A2A components' and the agent pod's logs since the failing leg
+began, the identity map the callout serves against the one on the cluster, the bus task's own
+log lines, and the namespace's pods, endpoints and network policies), which the EXIT trap's
+`rollback-` snapshot of log tails does not carry. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
 the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
 log and pod diagnostics are collected before it starts, because the flip replaces the pods
-they come from.
+they come from, and the EXIT trap collects them again afterwards under a `rollback-` prefix.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.

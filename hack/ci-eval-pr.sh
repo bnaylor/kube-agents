@@ -3825,8 +3825,9 @@ run_rollback_roundtrip() {
     bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
   fi
   # Streamed as it runs, and kept whole in its own file. timeout passes a
-  # TERM it receives on to the script.
-  ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" \
+  # TERM it receives on to the script. A failed or stopped run writes its
+  # failure window's evidence beside it (rollback-failure-*).
+  ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" ROLLBACK_ARTIFACT_DIR="${ARTIFACT_DIR}" \
     ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
     > >(tee "${log}") 2>&1 &
   EVAL_ROLLBACK_PID=$!

@@ -47,6 +47,14 @@
 # Every assertion prints one PASS or FAIL line with its name. The first FAIL
 # stops the run, which exits non-zero after a line naming it. Every wait has a
 # bound, named below, that ROLLBACK_<NAME> in the environment overrides.
+#
+# A failed or stopped run first writes the failure window's evidence beside
+# its transcript: the A2A components' and the agent pod's logs since the
+# failing leg began, the identity map the callout serves against the one on
+# the cluster, the bus task's own lines, and the namespace's pods, endpoints
+# and network policies (capture_failure_window, below). ROLLBACK_ARTIFACT_DIR
+# says where; without it the files go beside ROLLBACK_RESULTS_FILE, and
+# without either they are not written.
 # ==============================================================================
 
 set -euo pipefail
@@ -199,6 +207,48 @@ readonly READ_ATTEMPTS=3
 readonly PF_LOG_TAIL_LINES=5
 readonly CLIENT_ERR_TAIL_LINES=5
 
+# ─── The failure window's evidence ───────────────────────────────────────────
+# Written by capture_failure_window on the way out of a failed or stopped run.
+# Under ci-eval-pr.sh the EXIT trap also snapshots the A2A components' and
+# the bridge's log tails once this script has exited (the rollback- prefix,
+# collect_agent_pod_diagnostics in hack/ci-env.sh); this adds what that
+# snapshot does not carry, and what a run outside the lane has none of: logs
+# from the failing leg's start, the identity map the callout serves against
+# the one on the cluster, the bus task's own lines, and the endpoints and
+# network policies. Every file is FAILURE_FILE_PREFIX<what>.
+readonly FAILURE_FILE_PREFIX="rollback-failure-"
+# The A2A pods by component, as "<file name>:<a2aComponentLabel value>"
+# (a2aLabels in platformagent_a2a_manifests.go; the verifier, callout,
+# gateway and NATS pod templates). The agent pod is read off its
+# Deployment's selector instead, and all its containers are taken: the
+# operator's rendered bridge (a2aBridgeContainerName) is not on
+# spec.deployment.sidecars, so BUS_SIDECARS does not name it.
+readonly A2A_COMPONENT_LABEL="kubeagents.x-k8s.io/a2a-component"
+readonly CAPTURE_COMPONENTS="verifier:verifier callout:callout a2a-gateway:gateway nats:nats"
+readonly CAPTURE_AGENT_FILE="agent"
+# The identity map ConfigMap, its key and its version annotation
+# (platformagent_a2a_authmap.go: a2aAuthMapName, a2aAuthMapKey,
+# a2aAuthMapVersionAnnotation); the callout's own log lines about the map it
+# serves (a2a/authcallout/store.go, Update); and the CR condition that names
+# the version the operator believes is served (busCredentialsReadyCondition).
+readonly AUTHMAP_NAME_SUFFIX="-a2a-authmap"
+readonly AUTHMAP_KEY="identities.json"
+readonly AUTHMAP_VERSION_ANNOTATION="kubeagents.x-k8s.io/a2a-authmap-version"
+readonly CALLOUT_MAP_LOG_MATCH="identity map"
+readonly BUS_CREDS_CONDITION="BusCredentialsReady"
+# Lines kept either side of each log line naming the bus task.
+readonly BUS_TASK_GREP_CONTEXT_LINES=20
+# Bounds on the capture, so a dead API server cannot hold the exit path:
+# each kubectl call's --request-timeout, and the whole capture's budget,
+# after which the calls left are skipped and named. A stopped run gets 60s
+# from ci-eval-pr.sh (EVAL_ROLLBACK_KILL_AFTER_SECONDS) before its KILL, and
+# the report spends at most: the mode read (one request timeout), the
+# sidecars' restore (RESTORE_REQUEST_TIMEOUT, 20s), the budget, and the one
+# call the budget lets start at its end (another request timeout):
+# 8 + 20 + 20 + 8 = 56s. tests/test_rollback_roundtrip.py holds the sum.
+readonly DEFAULT_CAPTURE_REQUEST_TIMEOUT_SECONDS=8
+readonly DEFAULT_CAPTURE_BUDGET_SECONDS=20
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly BENCH_DIR="${SCRIPT_DIR}/../bench"
@@ -231,6 +281,13 @@ AGENT_URL="${ROLLBACK_AGENT_URL:-}"
 INJECT_URL="${ROLLBACK_INJECT_URL:-}"
 # Optional: every PASS, FAIL and SKIP line is appended here too.
 RESULTS_FILE="${ROLLBACK_RESULTS_FILE:-}"
+# Where a failed run's evidence goes (the header).
+ARTIFACT_DIR="${ROLLBACK_ARTIFACT_DIR:-}"
+if [ -z "${ARTIFACT_DIR}" ] && [ -n "${RESULTS_FILE}" ]; then
+  ARTIFACT_DIR="$(dirname "${RESULTS_FILE}")"
+fi
+CAPTURE_REQUEST_TIMEOUT_SECONDS="${ROLLBACK_CAPTURE_REQUEST_TIMEOUT_SECONDS:-${DEFAULT_CAPTURE_REQUEST_TIMEOUT_SECONDS}}"
+CAPTURE_BUDGET_SECONDS="${ROLLBACK_CAPTURE_BUDGET_SECONDS:-${DEFAULT_CAPTURE_BUDGET_SECONDS}}"
 
 readonly NATS_NAME="${CR_NAME}${NATS_NAME_SUFFIX}"
 readonly NATS_PVC="${NATS_DATA_CLAIM}-${NATS_NAME}${NATS_ORDINAL_SUFFIX}"
@@ -242,6 +299,7 @@ readonly A2A_GATEWAY_NAME="${CR_NAME}${A2A_GATEWAY_SUFFIX}"
 readonly A2A_VERIFIER_NAME="${CR_NAME}${A2A_VERIFIER_SUFFIX}"
 readonly INJECT_NAME="${CR_NAME}${INJECT_NAME_SUFFIX}"
 readonly AGENT_DEPLOYMENT="${CR_NAME}${AGENT_DEPLOYMENT_SUFFIX}"
+readonly AUTHMAP_NAME="${CR_NAME}${AUTHMAP_NAME_SUFFIX}"
 
 # State the failure report reads. SIDECARS_FILE is set while this run has the
 # CR's sidecars unset, and cleared once they are declared again.
@@ -255,8 +313,23 @@ SIDECAR_NAMES=""
 BUS_DOWN=""
 PF_PID=""
 PF_LOG=""
+# What the failure capture reads: when the current leg began (its logs'
+# --since-time), and the last bus task's conversation and task id, which its
+# grep looks for.
+LEG_STARTED_AT=""
+BUS_TASK_CONVERSATION=""
+BUS_TASK_ID=""
 
 # ─── Output ──────────────────────────────────────────────────────────────────
+utc_now() {
+  date -u +'%Y-%m-%dT%H:%M:%SZ'
+}
+
+begin_leg() {
+  CURRENT_LEG="$1"
+  LEG_STARTED_AT="$(utc_now)"
+}
+
 record() {
   if [ -n "${RESULTS_FILE}" ]; then
     printf '%s\n' "$*" >>"${RESULTS_FILE}" || true
@@ -264,7 +337,7 @@ record() {
 }
 
 note() {
-  echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
+  echo "[$(utc_now)] $*"
 }
 
 pass() {
@@ -305,9 +378,14 @@ fail() {
 # describes, so the saved list stays in its file and the line says where.
 STATE_REPORTED=""
 report_state_at_failure() {
-  local mode
   STATE_REPORTED=1
-  mode="$(k get platformagent "${CR_NAME}" -o jsonpath='{.spec.mode}' 2>/dev/null || true)"
+  report_install_state
+  capture_failure_window || true
+}
+
+report_install_state() {
+  local mode
+  mode="$(k get platformagent "${CR_NAME}" -o jsonpath='{.spec.mode}' --request-timeout="${CAPTURE_REQUEST_TIMEOUT_SECONDS}s" 2>/dev/null || true)"
   echo "install left at spec.mode=${mode:-unset} during ${CURRENT_LEG}"
   [ -n "${SIDECARS_FILE}" ] || return 0
   if [ "${mode}" = "${MODE_NEXT}" ] && [ -z "${BUS_DOWN}" ] \
@@ -322,17 +400,25 @@ report_state_at_failure() {
 
 # On every exit. A run that dies outside fail() and on_signal (a set -e
 # death) has not been through the failure report, and may still have the
-# sidecars unset: it goes through it here.
+# sidecars unset: it goes through it here. One with nothing to hand back
+# still leaves its evidence.
 cleanup() {
   local status=$?
   stop_port_forward
   if [ -n "${SIDECARS_FILE}" ] && [ -z "${STATE_REPORTED}" ]; then
     echo "the run exited with status ${status} outside an assertion"
     report_state_at_failure
+  elif [ "${status}" -ne 0 ]; then
+    STATE_REPORTED=1
+    capture_failure_window || true
   fi
 }
 
+# A signal that lands while a failure is already being reported (the outer
+# bound's TERM during the capture) is not a second failure: the report
+# finishes inside its own bounds, under the FAIL line it started with.
 on_signal() {
+  [ -z "${STATE_REPORTED}" ] || return 0
   echo "FAIL ${CURRENT_LEG}.interrupted: the run was stopped by a signal (an outer bound, or by hand)"
   record "FAIL ${CURRENT_LEG}.interrupted: the run was stopped by a signal"
   report_state_at_failure
@@ -341,6 +427,286 @@ on_signal() {
 }
 trap cleanup EXIT
 trap on_signal TERM INT
+
+# ─── The failure window's evidence ───────────────────────────────────────────
+# Written once, on the way out of a run that failed after its first leg
+# began, into ARTIFACT_DIR as FAILURE_FILE_PREFIX<what>:
+#   <component>.log   every container's log, since the failing leg began,
+#                     for each A2A component in CAPTURE_COMPONENTS and the
+#                     agent pod, with the previous instance's where a
+#                     container restarted
+#   bus-task.log      the lines of those logs that name the last bus task
+#                     (its task id or conversation), with context
+#   identity-map.txt  the map version each callout logged it serves, the
+#                     authmap ConfigMap's version and content hash now, and
+#                     the CR's BusCredentialsReady
+#   objects.txt       the namespace's pods, endpoints and network policies,
+#                     and the CR's status conditions
+#   capture.txt       the window, and what could not be captured and why
+# Nothing here changes the run's exit status or its FAIL line: every call is
+# bounded (capture_k) and every failure is written down and passed over.
+FAILURE_CAPTURED=""
+CAPTURE_DEADLINE=0
+CAPTURE_MISSED=""
+CAPTURE_TMP=""
+CAPTURE_ERR=""
+CAPTURE_CR=""
+
+# The containers of every pod in a pod list on stdin, one "<pod> <container>
+# <restarts>" per line, init containers (the native sidecars) first.
+readonly PY_POD_CONTAINERS='
+import json, sys
+for pod in json.load(sys.stdin).get("items") or []:
+    name = (pod.get("metadata") or {}).get("name", "?")
+    spec, st = pod.get("spec") or {}, pod.get("status") or {}
+    statuses = (st.get("initContainerStatuses") or []) + (st.get("containerStatuses") or [])
+    restarts = {cs.get("name"): cs.get("restartCount", 0) for cs in statuses}
+    names = [c.get("name", "?") for c in (spec.get("initContainers") or []) + (spec.get("containers") or [])]
+    for container in names or list(restarts):
+        print(name, container, restarts.get(container, 0))
+'
+# A Deployment's pod selector, from the object on stdin, as "k=v,k=v".
+readonly PY_MATCH_LABELS='
+import json, sys
+labels = ((json.load(sys.stdin).get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+print(",".join("%s=%s" % kv for kv in sorted(labels.items())))
+'
+# The identity map ConfigMap on stdin: its version annotation, the version
+# inside the map (what the callout logs it serves), and the content hash of
+# the key, so a capture taken later can tell whether the data moved.
+readonly PY_AUTHMAP='
+import hashlib, json, sys
+key, annotation = sys.argv[1:3]
+cm = json.load(sys.stdin)
+meta = cm.get("metadata") or {}
+raw = (cm.get("data") or {}).get(key)
+print("  resourceVersion: %s" % meta.get("resourceVersion", "(none)"))
+print("  annotation %s: %s" % (annotation, (meta.get("annotations") or {}).get(annotation, "(none)")))
+if raw is None:
+    print("  no %s key" % key)
+    sys.exit()
+try:
+    version = (json.loads(raw) or {}).get("version", "(none)")
+except (ValueError, AttributeError) as exc:
+    version = "(the map does not parse: %s)" % exc
+print("  version inside %s: %s" % (key, version))
+print("  sha256 of %s: %s" % (key, hashlib.sha256(raw.encode()).hexdigest()))
+'
+# The CR on stdin: its phase and every status condition, or only the one
+# named.
+readonly PY_CONDITIONS='
+import json, sys
+want = sys.argv[1] if len(sys.argv) > 1 else ""
+cr = json.load(sys.stdin)
+status = cr.get("status") or {}
+if not want:
+    print("  phase %s at generation %s" % (status.get("phase", "(none)"), (cr.get("metadata") or {}).get("generation", "?")))
+conds = [c for c in status.get("conditions") or [] if not want or c.get("type") == want]
+for c in conds:
+    print("  %s=%s reason=%s observedGeneration=%s since %s: %s" % (c.get("type"), c.get("status"), c.get("reason"),
+          c.get("observedGeneration", "-"), c.get("lastTransitionTime", "-"), c.get("message", "")))
+if not conds:
+    print("  (no %s condition)" % (want or "status"))
+'
+
+# One kubectl call for the capture, its output into the file named second:
+# bounded by CAPTURE_REQUEST_TIMEOUT_SECONDS, and skipped once the budget is
+# spent. A call that fails or is skipped is named in CAPTURE_MISSED.
+capture_k() {
+  local what="$1" out="$2"
+  shift 2
+  if [ "${SECONDS}" -ge "${CAPTURE_DEADLINE}" ]; then
+    CAPTURE_MISSED="${CAPTURE_MISSED}${what}: skipped, the ${CAPTURE_BUDGET_SECONDS}s capture budget was spent"$'\n'
+    return 1
+  fi
+  if ! k "$@" --request-timeout="${CAPTURE_REQUEST_TIMEOUT_SECONDS}s" </dev/null >"${out}" 2>"${CAPTURE_ERR}"; then
+    CAPTURE_MISSED="${CAPTURE_MISSED}${what}: $(tail -n 1 "${CAPTURE_ERR}" 2>/dev/null || true)"$'\n'
+    return 1
+  fi
+}
+
+# One container's log, since the window opened, appended to a component's
+# file under a header naming it.
+append_container_log() {
+  local file="$1" name="$2" pod="$3" container="$4" since="$5" previous="${6:-}"
+  local label="pod/${pod} container ${container}${previous:+ (previous instance)}"
+  echo "=== ${label}, since ${since} ===" >>"${file}"
+  if capture_k "${name}: ${label}" "${CAPTURE_TMP}" logs "pod/${pod}" -c "${container}" --timestamps --since-time="${since}" ${previous:+--previous}; then
+    cat "${CAPTURE_TMP}" >>"${file}"
+  else
+    echo "(not captured; ${FAILURE_FILE_PREFIX}capture.txt says why)" >>"${file}"
+  fi
+}
+
+# Every container's log of the pods a selector matches, into
+# FAILURE_FILE_PREFIX<name>.log.
+capture_pod_logs() {
+  local name="$1" selector="$2" since="$3" file containers pod container restarts
+  file="${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}${name}.log"
+  if ! : >"${file}" 2>/dev/null; then
+    CAPTURE_MISSED="${CAPTURE_MISSED}${name} logs: ${file} could not be written"$'\n'
+    return 0
+  fi
+  if ! capture_k "${name}: the pods for ${selector}" "${CAPTURE_TMP}" get pods -l "${selector}" -o json; then
+    echo "(the pods for ${selector} could not be listed; ${FAILURE_FILE_PREFIX}capture.txt says why)" >>"${file}"
+    return 0
+  fi
+  if ! containers="$(python3 -c "${PY_POD_CONTAINERS}" <"${CAPTURE_TMP}" 2>/dev/null)"; then
+    CAPTURE_MISSED="${CAPTURE_MISSED}${name}: the pod list for ${selector} did not parse"$'\n'
+    return 0
+  fi
+  if [ -z "${containers}" ]; then
+    echo "(no pod matches ${selector})" >>"${file}"
+    return 0
+  fi
+  while read -r pod container restarts; do
+    [ -n "${pod}" ] || continue
+    append_container_log "${file}" "${name}" "${pod}" "${container}" "${since}"
+    if [[ "${restarts}" =~ ^[0-9]+$ ]] && [ "${restarts}" -gt 0 ]; then
+      append_container_log "${file}" "${name}" "${pod}" "${container}" "${since}" previous
+    fi
+  done <<<"${containers}"
+}
+
+# The lines of the captured logs that name the last bus task, with context.
+capture_bus_task() {
+  local file="${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}bus-task.log" log
+  local -a patterns=()
+  [ -z "${BUS_TASK_ID}" ] || patterns+=(-e "${BUS_TASK_ID}")
+  [ -z "${BUS_TASK_CONVERSATION}" ] || patterns+=(-e "${BUS_TASK_CONVERSATION}")
+  # Gathered into CAPTURE_TMP first: the logs it reads match the name it
+  # is written under.
+  {
+    if [ "${#patterns[@]}" -eq 0 ]; then
+      echo "no bus task was submitted in ${CURRENT_LEG}"
+    else
+      echo "lines naming task ${BUS_TASK_ID:-(no id: none was started)} or conversation ${BUS_TASK_CONVERSATION}, ${BUS_TASK_GREP_CONTEXT_LINES} lines either side"
+      for log in "${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}"*.log; do
+        [ -f "${log}" ] && [ "$(basename "${log}")" != "$(basename "${file}")" ] || continue
+        echo "=== $(basename "${log}") ==="
+        grep -n -F -C "${BUS_TASK_GREP_CONTEXT_LINES}" "${patterns[@]}" "${log}" || echo "(none)"
+      done
+    fi
+  } >"${CAPTURE_TMP}" 2>/dev/null && cp "${CAPTURE_TMP}" "${file}" 2>/dev/null \
+    || CAPTURE_MISSED="${CAPTURE_MISSED}bus task lines: ${file} could not be written"$'\n'
+}
+
+# The map each callout logged it serves, against the ConfigMap it watches
+# and the CR's BusCredentialsReady. The callout logs the version once at
+# start and again on each change, so each pod's log is read from its start
+# for those lines, as well as in the window.
+capture_identity_map() {
+  local file="${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}identity-map.txt" selector containers pod container restarts
+  selector="${A2A_PART_OF_LABEL}=${A2A_PART_OF_VALUE},${A2A_COMPONENT_LABEL}=callout"
+  {
+    echo "=== what each callout logged about the map it serves, from its start ==="
+    if capture_k "identity map: the callout pods" "${CAPTURE_TMP}" get pods -l "${selector}" -o json \
+      && containers="$(python3 -c "${PY_POD_CONTAINERS}" <"${CAPTURE_TMP}" 2>/dev/null)"; then
+      while read -r pod container restarts; do
+        [ -n "${pod}" ] || continue
+        echo "pod/${pod} container ${container} (restarts ${restarts}):"
+        if capture_k "identity map: pod/${pod} container ${container}" "${CAPTURE_TMP}" logs "pod/${pod}" -c "${container}" --timestamps; then
+          grep -F "${CALLOUT_MAP_LOG_MATCH}" "${CAPTURE_TMP}" || echo "  (no line naming the ${CALLOUT_MAP_LOG_MATCH})"
+        fi
+      done <<<"${containers}"
+    else
+      echo "(the callout pods could not be listed)"
+    fi
+    echo "=== configmap/${AUTHMAP_NAME} now ==="
+    if capture_k "identity map: configmap/${AUTHMAP_NAME}" "${CAPTURE_TMP}" get configmap "${AUTHMAP_NAME}" -o json; then
+      python3 -c "${PY_AUTHMAP}" "${AUTHMAP_KEY}" "${AUTHMAP_VERSION_ANNOTATION}" <"${CAPTURE_TMP}" || echo "(the ConfigMap did not parse)"
+    else
+      echo "(could not be read)"
+    fi
+    echo "=== platformagent/${CR_NAME} ${BUS_CREDS_CONDITION} ==="
+    if [ -s "${CAPTURE_CR}" ]; then
+      python3 -c "${PY_CONDITIONS}" "${BUS_CREDS_CONDITION}" <"${CAPTURE_CR}" || echo "(the CR did not parse)"
+    else
+      echo "(the CR could not be read)"
+    fi
+  } >"${file}" 2>/dev/null || CAPTURE_MISSED="${CAPTURE_MISSED}identity map: ${file} could not be written"$'\n'
+}
+
+# The namespace's pods, endpoints and network policies, and the CR's status.
+capture_objects() {
+  local file="${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}objects.txt"
+  {
+    echo "=== pods, endpoints and network policies in ${NAMESPACE} ==="
+    if capture_k "objects: pods, endpoints and network policies" "${CAPTURE_TMP}" get pods,endpoints,networkpolicies -o wide; then
+      cat "${CAPTURE_TMP}"
+    else
+      echo "(could not be read)"
+    fi
+    echo "=== network policies, whole ==="
+    if capture_k "objects: network policies" "${CAPTURE_TMP}" get networkpolicies -o yaml; then
+      cat "${CAPTURE_TMP}"
+    else
+      echo "(could not be read)"
+    fi
+    echo "=== platformagent/${CR_NAME} status ==="
+    if [ -s "${CAPTURE_CR}" ]; then
+      python3 -c "${PY_CONDITIONS}" <"${CAPTURE_CR}" || echo "(the CR did not parse)"
+    else
+      echo "(the CR could not be read)"
+    fi
+  } >"${file}" 2>/dev/null || CAPTURE_MISSED="${CAPTURE_MISSED}objects: ${file} could not be written"$'\n'
+}
+
+capture_failure_window() {
+  local since="${LEG_STARTED_AT}" entry selector index
+  [ -z "${FAILURE_CAPTURED}" ] || return 0
+  FAILURE_CAPTURED=1
+  # Before the first leg nothing on the install has been read or changed.
+  [ -n "${since}" ] || return 0
+  if [ -z "${ARTIFACT_DIR}" ]; then
+    echo "failure evidence not written: neither ROLLBACK_ARTIFACT_DIR nor ROLLBACK_RESULTS_FILE says where"
+    return 0
+  fi
+  if ! mkdir -p "${ARTIFACT_DIR}" 2>/dev/null || ! CAPTURE_TMP="$(mktemp)" || ! CAPTURE_ERR="$(mktemp)" || ! CAPTURE_CR="$(mktemp)"; then
+    echo "failure evidence not written: ${ARTIFACT_DIR} or a temporary file could not be created"
+    return 0
+  fi
+  CAPTURE_DEADLINE=$((SECONDS + CAPTURE_BUDGET_SECONDS))
+  CAPTURE_MISSED=""
+  # The few calls first, then the logs, so a slow API server spends the
+  # budget on the logs and still leaves the objects and the map; the agent
+  # pod and the verifier lead the logs, being the two ends of a task's
+  # capability check.
+  capture_k "the CR" "${CAPTURE_CR}" get platformagent "${CR_NAME}" -o json || : >"${CAPTURE_CR}"
+  capture_objects
+  capture_identity_map
+  selector=""
+  if capture_k "agent: deployment/${AGENT_DEPLOYMENT}" "${CAPTURE_TMP}" get deployment "${AGENT_DEPLOYMENT}" -o json; then
+    selector="$(python3 -c "${PY_MATCH_LABELS}" <"${CAPTURE_TMP}" 2>/dev/null || true)"
+    [ -n "${selector}" ] || CAPTURE_MISSED="${CAPTURE_MISSED}agent: deployment/${AGENT_DEPLOYMENT} has no selector to find its pods by"$'\n'
+  fi
+  if [ -n "${selector}" ]; then
+    capture_pod_logs "${CAPTURE_AGENT_FILE}" "${selector}" "${since}"
+  else
+    echo "(the agent pod was not found: deployment/${AGENT_DEPLOYMENT} or its selector could not be read)" \
+      >"${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}${CAPTURE_AGENT_FILE}.log" 2>/dev/null || true
+  fi
+  for entry in ${CAPTURE_COMPONENTS}; do
+    capture_pod_logs "${entry%%:*}" "${A2A_PART_OF_LABEL}=${A2A_PART_OF_VALUE},${A2A_COMPONENT_LABEL}=${entry#*:}" "${since}"
+  done
+  capture_bus_task
+  index="${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}capture.txt"
+  {
+    echo "failure window of ${CURRENT_LEG}: logs since ${since}, captured at $(utc_now)"
+    if [ -n "${CAPTURE_MISSED}" ]; then
+      echo "not captured:"
+      printf '%s' "${CAPTURE_MISSED}" | sed 's/^/  /'
+    else
+      echo "everything captured"
+    fi
+  } >"${index}" 2>/dev/null || true
+  rm -f "${CAPTURE_TMP}" "${CAPTURE_ERR}" "${CAPTURE_CR}"
+  if [ -n "${CAPTURE_MISSED}" ]; then
+    echo "failure evidence (logs since ${since}) in ${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}*; $(printf '%s' "${CAPTURE_MISSED}" | grep -c '') item(s) not captured, listed in ${index}"
+  else
+    echo "failure evidence (logs since ${since}) in ${ARTIFACT_DIR}/${FAILURE_FILE_PREFIX}*"
+  fi
+}
 
 # ─── kubectl ─────────────────────────────────────────────────────────────────
 k() {
@@ -906,6 +1272,9 @@ assert_bus_task() {
   token="$(secret_value "${INJECT_NAME}" "${INJECT_TOKEN_FIELD}")" || fail "${name}" "secret/${INJECT_NAME} could not be read"
   [ -n "${token}" ] || fail "${name}" "secret/${INJECT_NAME} has no ${INJECT_TOKEN_FIELD}: the install has no inject door (A2A_INJECT_BACKEND=true on the operator)"
   conversation="${BUS_TASK_CONVERSATION_PREFIX}/${name}/$(date -u +%s)"
+  # For the failure capture's grep: this task's, not the last leg's.
+  BUS_TASK_CONVERSATION="${conversation}"
+  BUS_TASK_ID=""
   line="no attempt ran"
   for ((attempt = 1; attempt <= BUS_TASK_ATTEMPTS; attempt++)); do
     url="${INJECT_URL}"
@@ -921,6 +1290,11 @@ assert_bus_task() {
     line="$(python3 -c "${PY_BUS_TASK}" "${BENCH_DIR}" "${url}" "${token}" "${conversation}" \
       "${BUS_TASK_PROMPT}" "${BUS_TASK_TIMEOUT}" "${BUS_TASK_UNREACHABLE_STATUS}" 2>"${err}")" || rc=$?
     stop_port_forward
+    # The client names a task it started first: "task <id> on ..." or
+    # "task <id>: ..." (PY_BUS_TASK).
+    if [[ "${line}" =~ ^task\ ([^\ :]+) ]]; then
+      BUS_TASK_ID="${BASH_REMATCH[1]}"
+    fi
     if [ "${rc}" -eq 0 ]; then
       rm -f "${err}"
       pass "${name}" "${line}"
@@ -1001,7 +1375,7 @@ note "rollback round trip on platformagent/${CR_NAME} in ${NAMESPACE}${ROLLBACK_
 note "kept across the flip: pvc/${NATS_PVC}, secret/${CREDS_SECRET}"
 
 # Leg 0: a healthy next install, and the two objects as they are now.
-CURRENT_LEG="pre"
+begin_leg "pre"
 read_cr_state || fail "pre.cr-readable" "platformagent/${CR_NAME} could not be read in ${NAMESPACE}"
 [ "${CR_MODE}" = "${MODE_NEXT}" ] || fail "pre.mode-next" "spec.mode is ${CR_MODE}; the round trip starts from a next install"
 pass "pre.mode-next" "spec.mode is next"
@@ -1018,7 +1392,7 @@ CREDS_UID="${ASSERTED_UID}"
 assert_bus_task "pre.bus-task"
 
 # Leg 1: next -> today.
-CURRENT_LEG="leg1"
+begin_leg "leg1"
 CR_JSON="$(k_read get platformagent "${CR_NAME}" -o json)" || fail "leg1.cr-readable" "platformagent/${CR_NAME} could not be read"
 SIDECAR_SPLIT="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}")"
 UNSET_SIDECARS="$(printf '%s\n' "${SIDECAR_SPLIT}" | sed -n 1p)"
@@ -1048,7 +1422,7 @@ assert_not_degraded "leg1.not-degraded"
 assert_today_turn "leg1.today-turn"
 
 # Leg 2: today -> next, on the kept objects.
-CURRENT_LEG="leg2"
+begin_leg "leg2"
 # The bring-up, in the deploy's order (hack/ci-deploy.sh, the mode patch):
 # NATS, the callout, the provisioning Job, then the agent and the CR's Ready.
 # Under next the operator reports Ready only once every split workload is,
