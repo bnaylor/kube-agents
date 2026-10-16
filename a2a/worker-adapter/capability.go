@@ -58,6 +58,15 @@ func (a *adapter) capabilityRefusal(ctx context.Context, nc *nats.Conn, origin *
 	// here when that wait is what let the check through.
 	client.Log = a.log.With("task", a.cfg.TaskID)
 	if err := client.Check(ctx, ref, capability.VerbTaskExecute, a.cfg.Scope); err != nil {
+		// A check ended by its caller (a SIGTERM inside the window) never
+		// heard from the verifier either way, and Check reports that as
+		// unreachable. Logged as what happened, so an eviction doesn't read
+		// as a verifier outage; the caller decides the outcome.
+		if ctx.Err() != nil {
+			a.log.Info("capability check stopped before the verifier answered",
+				"task", a.cfg.TaskID, "verb", capability.VerbTaskExecute, "cause", context.Cause(ctx))
+			return "reason: capability-refused - " + capability.Reason(err)
+		}
 		// capability.Reason carries the rule the verifier named, which
 		// never quotes anything the caller supplied.
 		a.log.Warn("capability refused this task",

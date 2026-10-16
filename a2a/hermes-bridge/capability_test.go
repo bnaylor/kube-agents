@@ -714,3 +714,48 @@ func TestACheckEndedByACancelLeavesTheTerminalToTheCancel(t *testing.T) {
 		t.Fatal("the worker finalized a run whose cancel owns the terminal")
 	}
 }
+
+// A check its caller ended is logged as stopped, not as a refusal: the live
+// run on next-dev-3 (2026-10-16) showed a cancelled task logging "capability
+// refused this task ... the verifier could not be reached" at WARN, which
+// reads as a verifier outage.
+func TestACheckEndedByItsCallerIsNotLoggedAsARefusal(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var buf lockedBuffer
+	b, err := New(ctx, Config{
+		NATSURL:      url,
+		Command:      noCommand,
+		TaskDeadline: 20 * time.Second,
+		KillGrace:    500 * time.Millisecond,
+		Scope:        capability.NamespaceScope(""),
+		Logger:       slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err != nil {
+		t.Fatalf("bridge new: %v", err)
+	}
+	t.Cleanup(b.close)
+
+	const taskID = "task-bridge-cap-stopped-log"
+	contextID := "ctx-" + taskID
+	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID,
+		messagePayload(t, taskID, contextID, "do the thing"),
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, capability.Ref{Key: "root." + taskID, Revision: 1})))
+	if err != nil {
+		t.Fatalf("submission envelope: %v", err)
+	}
+	checkCtx, stop := context.WithCancel(ctx)
+	time.AfterFunc(200*time.Millisecond, stop)
+	if reason := b.capabilityRefusal(checkCtx, env); reason == "" {
+		t.Fatal("a check with no verifier passed")
+	}
+	logged := buf.String()
+	if strings.Contains(logged, "capability refused this task") {
+		t.Errorf("a check its caller ended was logged as a refusal:\n%s", logged)
+	}
+	if !strings.Contains(logged, "capability check stopped before the verifier answered") {
+		t.Errorf("the stopped check was not logged:\n%s", logged)
+	}
+}

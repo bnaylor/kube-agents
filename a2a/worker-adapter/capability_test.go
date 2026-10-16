@@ -1,9 +1,12 @@
 package workeradapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -330,7 +333,10 @@ func TestASIGTERMInsideTheVerifyWindowIsAnEvictionNotARefusal(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runAdapter(ctx, adapterConfig(url, taskID, session, noHarness))
+	cfg := adapterConfig(url, taskID, session, noHarness)
+	var logged lockedBuffer
+	cfg.Logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	done := runAdapter(ctx, cfg)
 
 	// Cancel on the state, not on a clock: `submitted` on the stream means
 	// the adapter is past every step before the check and into the window
@@ -354,6 +360,29 @@ func TestASIGTERMInsideTheVerifyWindowIsAnEvictionNotARefusal(t *testing.T) {
 	if strings.Contains(text, "capability-refused") {
 		t.Fatalf("the eviction was published as a capability refusal: %q", text)
 	}
+	if log := logged.String(); strings.Contains(log, "capability refused this task") ||
+		!strings.Contains(log, "capability check stopped before the verifier answered") {
+		t.Errorf("the stopped check was logged as a refusal, or not at all:\n%s", log)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for the adapter's goroutines to write
+// while the test reads.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // verifierGap is how long the verifier is absent in the reconnect-gap test:
