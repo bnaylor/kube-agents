@@ -67,9 +67,11 @@ const (
 	// permitted to subscribe to a subject join any QUEUE GROUP on it, so
 	// `web` could join `cap-verifier` and take a share of the verify
 	// requests — not to answer them, which it cannot (no publish under
-	// `a2a.cap.reply.>`), but to swallow them. Check reads the resulting
-	// timeout as a denial, by design, so a browser credential would have
-	// rejected a proportion of every task on the bus. A subscriber on a
+	// `a2a.cap.reply.>`), but to swallow them. Check asks again after a
+	// swallowed ask, inside its reach window, so each one costs a task a
+	// timeout of delay, and a task whose asks are all swallowed for the
+	// window is refused: a browser credential would have slowed every
+	// task on the bus and rejected some of them. A subscriber on a
 	// request subject intercepts; it does not merely watch.
 	//
 	// So `web` is denied `a2a.cap.>` outright (webIdentity, in
@@ -214,8 +216,8 @@ func clip(s string) string {
 // established on the server. It exists in this shape so a caller can know the
 // verifier is listening before it lets anything ask: a request that races the
 // subscription gets no answer, and a client that gets none for its whole
-// reach window reads that as a denial. Pair it with DrainAndCancel at shutdown; the context
-// handed here is the one that ordering is about.
+// reach window reads that as a denial. Pair it with DrainAndCancel at
+// shutdown; the context handed here is the one that ordering is about.
 func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscription, error) {
 	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
 		s.handle(ctx, m)
@@ -405,10 +407,42 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	reach, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
+	// The reply subject is spelled here rather than taken from the
+	// connection's inbox prefix. Answers ride their own namespace, not
+	// _INBOX (see ReplyPrefix), so nats.Request would ask from a subject
+	// the verifier drops — and the client would read the drop as the
+	// verifier being down, a fail-closed bug that would take a deployment
+	// out silently.
+	//
+	// One reply subject and one subscription serve every ask of this
+	// check, so an answer that arrives after its own ask timed out still
+	// counts: a slow verifier's late verdict is used, not dropped and asked
+	// for again.
+	reply, err := ReplySubject(c.self)
+	if err != nil {
+		return err
+	}
+	var sub *nats.Subscription
+	defer func() {
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	}()
+
 	start := time.Now()
 	backoff := reachBackoffInitial
 	for attempt := 1; ; attempt++ {
-		err := c.ask(reach, timeout, b)
+		if sub == nil {
+			// Subscribed here rather than once above so a subscribe the
+			// connection refuses is retried like any other unreachable ask.
+			if s, err := c.nc.SubscribeSync(reply); err == nil {
+				sub = s
+			}
+		}
+		err := errUnreachable
+		if sub != nil {
+			err = c.ask(reach, timeout, reply, sub, b)
+		}
 		if !errors.Is(err, errUnreachable) {
 			if attempt > 1 && c.Log != nil {
 				c.Log.Info("capability check reached the verifier after a retry",
@@ -432,26 +466,12 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	}
 }
 
-// ask is one request and its answer. errUnreachable means nothing answered;
-// any other error is the verifier's verdict or an answer that did not parse.
-func (c *Client) ask(ctx context.Context, timeout time.Duration, body []byte) error {
+// ask is one request and its answer, on the check's reply subscription.
+// errUnreachable means nothing answered; any other error is the verifier's
+// verdict or an answer that did not parse.
+func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// The reply subject is spelled here rather than taken from the
-	// connection's inbox prefix. Answers ride their own namespace, not
-	// _INBOX (see ReplyPrefix), so nats.Request would ask from a subject
-	// the verifier drops — and the client would read the drop as the
-	// verifier being down, a fail-closed bug that would take a deployment
-	// out silently.
-	reply, err := ReplySubject(c.self)
-	if err != nil {
-		return err
-	}
-	sub, err := c.nc.SubscribeSync(reply)
-	if err != nil {
-		return errUnreachable
-	}
-	defer func() { _ = sub.Unsubscribe() }()
 	if err := c.nc.PublishRequest(c.subject, reply, body); err != nil {
 		return errUnreachable
 	}

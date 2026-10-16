@@ -25,8 +25,9 @@ import (
 //
 // Every failure is a refusal, including the ones that are not the caller's
 // fault: a malformed block, a verifier that cannot be reached for the
-// client's whole reach window, an answer that does not parse. The verifier being down stops work; that is the cost of the
-// control and it is named in the deployment's runbook.
+// client's whole reach window, an answer that does not parse. The verifier
+// being down stops work; that is the cost of the control and it is named in
+// the deployment's runbook.
 
 // capabilityRefusal returns the reason this task must be refused, or "" to
 // proceed. It is called before the prompt is looked at: an executor that

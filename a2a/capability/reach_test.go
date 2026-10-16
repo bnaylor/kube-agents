@@ -302,3 +302,34 @@ func TestAClosedConnectionIsNotWaitedOn(t *testing.T) {
 		t.Errorf("waited %s on a closed connection", elapsed)
 	}
 }
+
+// slowAnswer is how long the slow verifier takes to answer the first ask:
+// longer than one ask's timeout, inside the window.
+const slowAnswer = shortAsk + 100*time.Millisecond
+
+// A verifier that answers after the ask's own timeout still gets its verdict
+// used. Every ask of one check shares a reply subscription, so the late answer
+// to the first ask is read while the second is waiting, rather than dropped
+// with the first ask's subscription and asked for again from a verifier that
+// may be slow because it is loaded.
+func TestALateAnswerToAnEarlierAskIsUsed(t *testing.T) {
+	nc := runServer(t)
+	var asks atomic.Int32
+	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
+		if asks.Add(1) != 1 {
+			return // only the first ask is ever answered, and late
+		}
+		reply := m.Reply
+		time.AfterFunc(slowAnswer, func() { _ = nc.Publish(reply, []byte(`{"allowed":true}`)) })
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	c := clientAs(t, nc, podB)
+	c.Timeout, c.ReachWindow = shortAsk, shortWindow
+
+	if err := c.Check(context.Background(), Ref{Key: "root.task-x", Revision: 1}, VerbTaskExecute, "project/P"); err != nil {
+		t.Fatalf("the late answer to the first ask was dropped (%d asks): %v", asks.Load(), err)
+	}
+}

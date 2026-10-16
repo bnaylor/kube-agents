@@ -1576,6 +1576,72 @@ func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 	}
 }
 
+// boundaryCancelMargin is how long past one ask's timeout the turn-boundary
+// cancel test waits before counting asks: long enough for a second ask to
+// have gone out had the check kept going.
+const boundaryCancelMargin = 500 * time.Millisecond
+
+// A cancel while a follow-up's capability is being checked at a turn boundary
+// ends that check: the task reaches its terminal promptly rather than after
+// the check's reach window, and the verifier is not asked again on behalf of a
+// task that is over. Unlike a pending submission, whose cancel handleCancel
+// finalizes at once, here the terminal waits on the worker, so a check that
+// ignored the cancel would hold it for the whole window.
+func TestAPI_ACancelDuringTheBoundaryCheckEndsIt(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	asks := countingVerifier(t, url)
+	stub, in, release := holdingStub(t)
+	startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.CapabilityOptional = true // the opening runs unchecked
+		cfg.TaskDeadline = time.Minute
+	})
+	c := gatewayClient(t, url)
+	const taskID = "task-api-boundary-cancel"
+	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-boundary-cancel", "corr-"+taskID,
+		messagePayload(t, taskID, "ctx-boundary-cancel", "long question"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), origin); err != nil {
+		t.Fatal(err)
+	}
+	<-in
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, taskID, "ctx-boundary-cancel", "follow-up"),
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, capability.Ref{Key: "root." + taskID, Revision: 1})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), steer); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, taskID)) == 1 })
+	release()
+	waitFor(t, capability.DefaultTimeout, "the boundary check's first ask", func() bool { return asks.Load() >= 1 })
+
+	start := time.Now()
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID,
+		origin.CorrelationID, lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), cancelEnv); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*capability.DefaultReachWindow, "terminal", func() bool {
+		got, err := c.TasksGet(testCtx(t), "platform", taskID)
+		return err == nil && got.Final
+	})
+	if elapsed := time.Since(start); elapsed >= capability.DefaultTimeout {
+		t.Errorf("the terminal came %s after the cancel; the boundary check did not end", elapsed)
+	}
+	time.Sleep(capability.DefaultTimeout + boundaryCancelMargin)
+	if n := asks.Load(); n != 1 {
+		t.Errorf("the verifier was asked %d times; the boundary check kept asking after the cancel", n)
+	}
+}
+
 // The verdict is cached for one turn boundary only: each follow-up that
 // runs was checked at the boundary before its own turn, so a capability
 // revoked between two turns stops the next one.

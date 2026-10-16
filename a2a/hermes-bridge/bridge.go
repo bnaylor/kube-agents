@@ -306,8 +306,8 @@ type taskRun struct {
 	cancelReq context.CancelFunc
 	// cancelCheck ends the capability check in flight for this run
 	// (checkContext); nil outside one. Under mu. The check can wait out
-	// capability.DefaultReachWindow for a verifier it cannot reach, and a
-	// cancel should not wait behind that.
+	// capability.DefaultReachWindow for a verifier it cannot reach; a
+	// cancel ends that wait rather than leaving a worker on it.
 	cancelCheck context.CancelFunc
 
 	// steers are the follow-ups waiting for the current turn to end, oldest
@@ -489,8 +489,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	// publishes on a2a.cap.verify.<profile> and subscribes to
 	// a2a.cap.reply.<profile>.*. NATS refuses either asynchronously, and nats.go
 	// delivers that -ERR only to the async handler -- with none installed it is
-	// dropped on the floor. Check then simply times out, and the bridge
-	// publishes "the verifier could not be reached" as the task's terminal
+	// dropped on the floor. Check then times out on every ask for its reach
+	// window, and the bridge publishes "the verifier could not be reached" as
+	// the task's terminal
 	// reason. So a bridge missing or mis-spelling one of its two verify grants
 	// refuses every task while every log line and every terminal event blames
 	// the verifier Deployment, which is the wrong team's pager and the wrong
@@ -917,11 +918,11 @@ func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
 // none to run and the caller's answer is the deliverable; anything still
 // queued is refused task-ended by the caller's finalize.
 //
-// One call is one turn boundary, and it asks the verifier once per distinct
+// One call is one turn boundary, and it runs one check per distinct
 // capability reference (boundaryVerdicts): the follow-ups of a task usually
 // carry the same one, and the previous turn's answer waits unposted while
-// they are checked, so a verifier that hangs would otherwise cost one
-// timeout per queued follow-up. The verdicts die with the call, so the
+// they are checked, so a verifier that is away or hangs would otherwise cost
+// one reach window (capability.DefaultReachWindow) per queued follow-up. The verdicts die with the call, so the
 // follow-up that runs was still checked at the boundary just before its
 // own turn.
 func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope, string) {
@@ -1359,9 +1360,12 @@ func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
 
 // checkContext is ctx for one capability check on run, ended early by a cancel
 // of the run. The check rides out an unreachable verifier for up to
-// capability.DefaultReachWindow, and a requester who cancels inside that wait
-// should get the cancel, not the wait. release must be called when the check
-// returns.
+// capability.DefaultReachWindow. For a pending submission handleCancel writes
+// the terminal at once either way, so what this buys there is the worker: it
+// stops asking and takes the next task instead of holding its slot for the
+// rest of the window. At a turn boundary the terminal itself waits on the
+// worker, so there it is also the difference between a prompt cancel and one
+// the window holds back. release must be called when the check returns.
 //
 // handleCancel sets canceled before it takes mu to look for cancelCheck, and
 // this looks at canceled under mu, so a cancel either finds the check
