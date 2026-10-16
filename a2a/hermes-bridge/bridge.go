@@ -304,6 +304,11 @@ type taskRun struct {
 	// cancelReq ends the API executor's request (api.go); nil outside one.
 	// Under mu like proc, which it is the counterpart of.
 	cancelReq context.CancelFunc
+	// cancelCheck ends the capability check in flight for this run
+	// (checkContext); nil outside one. Under mu. The check can wait out
+	// capability.DefaultReachWindow for a verifier it cannot reach, and a
+	// cancel should not wait behind that.
+	cancelCheck context.CancelFunc
 
 	// steers are the follow-ups waiting for the current turn to end, oldest
 	// first. steersQueued counts every follow-up this run has queued, the
@@ -725,6 +730,9 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	if run.state == stateRunning && run.cancelReq != nil {
 		run.cancelReq()
 	}
+	if run.cancelCheck != nil {
+		run.cancelCheck()
+	}
 	run.mu.Unlock()
 	if pending {
 		// Not yet spawned: terminal now; the worker skips done runs.
@@ -923,7 +931,9 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 		if steer == nil {
 			return nil, ""
 		}
-		reason := verdicts.refusal(ctx, b, steer)
+		checkCtx, release := b.checkContext(ctx, run)
+		reason := verdicts.refusal(checkCtx, b, steer)
+		release()
 		if reason == "" {
 			if b.nextSteer(run) != steer {
 				// Canceled, past the deadline or stopping during the
@@ -934,9 +944,10 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 			prompt, _ := promptFromMessage(steer.Payload) // text was checked when it was queued
 			return steer, prompt
 		}
-		if ctx.Err() != nil {
-			// Stopping, not refused (capabilityPermits says why the two
-			// differ): left queued, for finalize to refuse task-ended.
+		if ctx.Err() != nil || run.canceled.Load() {
+			// Stopping or canceled, not refused (capabilityPermits says
+			// why the two differ): left queued, for finalize to refuse
+			// task-ended.
 			return nil, ""
 		}
 		run.noticeMu.Lock()
@@ -1300,9 +1311,10 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 // is invoked and before a model is called, so nothing about what is refused
 // changes. What changes is who waits: accept runs on the bridge's one durable
 // consumer callback, which is serial and which also carries the KindCancel
-// envelopes for tasks that are already running. Check blocks for
-// capability.DefaultTimeout when nothing answers on the verify subject, so a
-// verifier outage made every cancel queue behind 5s per pending submission —
+// envelopes for tasks that are already running. Check blocks for up to
+// capability.DefaultReachWindow when nothing answers on the verify subject,
+// so on the callback a verifier outage would make every cancel queue behind
+// that much per pending submission —
 // a user unable to stop a running hermes subprocess because of an outage in
 // the thing that authorizes new ones. The session executor has always checked
 // in its own process for the same reason (a2a/worker-adapter/adapter.go).
@@ -1310,15 +1322,24 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 // The cost of the move: a submission now occupies a queue slot while it is
 // being verified, so a verifier outage long enough to queue taskQueueCapacity
 // of them ends in bridge-queue-overflow rather than capability-refused. At
-// Concurrency workers and one DefaultTimeout each that is thousands of
+// Concurrency workers and one DefaultReachWindow each that is thousands of
 // submissions inside one outage on a single-profile bridge, which is the
 // "fault, not load" the capacity already stands for.
 //
 // Returns false when it finalized the task; the caller must not run it.
 func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
-	reason := b.capabilityRefusal(ctx, run.origin)
+	checkCtx, release := b.checkContext(ctx, run)
+	reason := b.capabilityRefusal(checkCtx, run.origin)
+	release()
 	if reason == "" {
 		return true
+	}
+	// A cancel that landed during the check ended it (checkContext), and
+	// handleCancel writes that terminal: canceled-before-start, which is
+	// what happened. Finalizing here would race it with a capability
+	// reason for a task its requester stopped.
+	if run.canceled.Load() {
+		return false
 	}
 	// "The verifier could not be reached" and "we stopped asking" are
 	// different facts, and Check cannot tell them apart: it turns any
@@ -1334,6 +1355,32 @@ func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
 	}
 	b.finalize(run, lib.StateRejected, reason, nil)
 	return false
+}
+
+// checkContext is ctx for one capability check on run, ended early by a cancel
+// of the run. The check rides out an unreachable verifier for up to
+// capability.DefaultReachWindow, and a requester who cancels inside that wait
+// should get the cancel, not the wait. release must be called when the check
+// returns.
+//
+// handleCancel sets canceled before it takes mu to look for cancelCheck, and
+// this looks at canceled under mu, so a cancel either finds the check
+// registered or the check finds the cancel: none falls between the two.
+func (b *Bridge) checkContext(ctx context.Context, run *taskRun) (context.Context, func()) {
+	checkCtx, cancel := context.WithCancel(ctx)
+	run.mu.Lock()
+	if run.canceled.Load() {
+		cancel()
+	} else {
+		run.cancelCheck = cancel
+	}
+	run.mu.Unlock()
+	return checkCtx, func() {
+		run.mu.Lock()
+		run.cancelCheck = nil
+		run.mu.Unlock()
+		cancel()
+	}
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {

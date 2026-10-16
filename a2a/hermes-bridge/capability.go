@@ -55,6 +55,10 @@ func (b *Bridge) capabilityRefusal(ctx context.Context, env *lib.Envelope) strin
 	if err != nil {
 		return "reason: capability-refused - this executor has no verify subject of its own"
 	}
+	// The client rides out a verifier it cannot reach for its reach
+	// window (capability.DefaultReachWindow) before refusing, and says so
+	// here when that wait is what let the check through.
+	client.Log = b.cfg.Logger.With("task", env.TaskID)
 	if err := client.Check(ctx, ref, capability.VerbTaskExecute, b.cfg.Scope); err != nil {
 		// capability.Reason carries the rule the verifier named, which
 		// never quotes anything the caller supplied.

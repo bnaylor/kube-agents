@@ -1474,7 +1474,9 @@ func TestPromptFromMessage_BlankRunes(t *testing.T) {
 }
 
 // countingVerifier holds the verify subject and never replies, counting the
-// checks it is sent: each one blocks its caller for capability.DefaultTimeout.
+// asks it is sent. One check against it asks once per capability.DefaultTimeout
+// until its reach window (capability.DefaultReachWindow) is spent, so it
+// blocks its caller for the window and sends asksPerSilentCheck asks.
 func countingVerifier(t *testing.T, url string) *atomic.Int32 {
 	t.Helper()
 	nc, err := nats.Connect(url, nats.Name("cap-verifier-counting"))
@@ -1493,11 +1495,15 @@ func countingVerifier(t *testing.T, url string) *atomic.Int32 {
 	return &n
 }
 
+// asksPerSilentCheck is how many asks one capability check sends a verifier
+// that never answers: one per ask timeout, inside the reach window.
+var asksPerSilentCheck = int32(capability.DefaultReachWindow / capability.DefaultTimeout)
+
 // gh#2723 item 1: a turn boundary asks the verifier once per distinct
 // capability, not once per queued follow-up. Four follow-ups carrying the
 // task's one capability, behind a verifier that never answers, cost one
-// verifier timeout before turn 1's answer posts, not four; all four are
-// refused capability on that one verdict.
+// check (its reach window) before turn 1's answer posts, not four; all four
+// are refused capability on that one verdict.
 func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 	_, url := startServerNoVerifier(t)
 	checks := countingVerifier(t, url)
@@ -1536,7 +1542,7 @@ func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 	start := time.Now()
 	release()
 	var task *lib.Task
-	waitFor(t, 6*capability.DefaultTimeout, "terminal", func() bool {
+	waitFor(t, 3*capability.DefaultReachWindow, "terminal", func() bool {
 		got, err := c.TasksGet(testCtx(t), "platform", taskID)
 		if err != nil || !got.Final {
 			return false
@@ -1545,11 +1551,12 @@ func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 		return true
 	})
 	elapsed := time.Since(start)
-	if n := checks.Load(); n != 1 {
-		t.Errorf("%d verifier checks at one boundary, want 1 for one distinct capability", n)
+	if n := checks.Load(); n != asksPerSilentCheck {
+		t.Errorf("%d verifier asks at one boundary, want %d: one check for one distinct capability",
+			n, asksPerSilentCheck)
 	}
-	if bound := capability.DefaultTimeout + 3*time.Second; elapsed > bound {
-		t.Errorf("turn 1's answer took %s to post, want under %s (one verifier timeout)", elapsed, bound)
+	if bound := capability.DefaultReachWindow + 3*time.Second; elapsed > bound {
+		t.Errorf("turn 1's answer took %s to post, want under %s (one check's reach window)", elapsed, bound)
 	}
 	if task.State != lib.StateCompleted {
 		t.Fatalf("state %s (%q), want completed", task.State, terminalText(t, url, taskID))

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -569,4 +570,96 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+const (
+	// bridgeVerifierGap is how long the bridge's verifier is absent in the
+	// reconnect-gap test: about what gke-labs/kube-agents#3270 saw between
+	// the executor and the verifiers coming back, inside the reach window.
+	bridgeVerifierGap = 3 * time.Second
+	// cancelInsideCheck is when the cancel lands in the cancel-during-wait
+	// test: after the worker has started asking, well inside the window.
+	cancelInsideCheck = 500 * time.Millisecond
+)
+
+// The #3270 gap, through the default install's executor: the bus is back and
+// the bridge is on it, but no verifier is yet, and a submission lands. It must
+// wait for the verifier rather than end rejected. noCommand makes the task fail
+// once it passes the check, which is how this tells "waited and was
+// permitted" from "refused".
+func TestTheBridgeWaitsOutAVerifierReconnectGap(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	startBridge(t, url, noCommand)
+	c := gatewayClient(t, url)
+
+	const taskID = "task-bridge-cap-gap"
+	submit(t, c, taskID, "do the thing")
+	time.Sleep(bridgeVerifierGap)
+	startVerifier(t, url)
+
+	task := waitTerminal(t, c, taskID)
+	text := terminalText(t, url, taskID)
+	if task.State == lib.StateRejected || strings.Contains(text, "capability-refused") {
+		t.Fatalf("state = %s (%q): the submission was refused in the gap instead of waiting for the verifier",
+			task.State, text)
+	}
+}
+
+// A cancel while the check is waiting for an unreachable verifier is the
+// requester's word: the task ends canceled now, not as a capability refusal,
+// and the worker stops asking on its behalf rather than spending the rest of
+// the reach window on a task that is already over.
+//
+// The verifier here is subscribed and silent, so each ask waits out
+// capability.DefaultTimeout instead of getting no-responders back at once:
+// that makes the asks countable. A worker that kept asking after the cancel
+// would ask a second time once the first ask timed out.
+func TestACancelDuringTheVerifierWaitEndsTheCheck(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-silent-counting"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	var asks atomic.Int32
+	if _, err := nc.QueueSubscribe(capability.VerifySubscribe, capability.VerifyQueue,
+		func(*nats.Msg) { asks.Add(1) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	startBridge(t, url, noCommand)
+	c := gatewayClient(t, url)
+
+	const taskID = "task-bridge-cap-wait-cancel"
+	origin := submit(t, c, taskID, "do the thing")
+	waitFor(t, capability.DefaultTimeout, "the first ask", func() bool { return asks.Load() >= 1 })
+	start := time.Now()
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID,
+		origin.CorrelationID, lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), cancelEnv); err != nil {
+		t.Fatal(err)
+	}
+
+	task := waitTerminal(t, c, taskID)
+	elapsed := time.Since(start)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("state = %s (%q), want canceled", task.State, terminalText(t, url, taskID))
+	}
+	if text := terminalText(t, url, taskID); !strings.Contains(text, "canceled-before-start") {
+		t.Errorf("the terminal event is not the cancel's: %q", text)
+	}
+	if elapsed >= capability.DefaultTimeout {
+		t.Errorf("the cancel took %s to reach a terminal", elapsed)
+	}
+	// Past the point the first ask would have timed out and a second gone
+	// out, had the check kept going.
+	time.Sleep(capability.DefaultTimeout + cancelInsideCheck)
+	if n := asks.Load(); n != 1 {
+		t.Errorf("the verifier was asked %d times; the check kept asking after the task was canceled", n)
+	}
 }

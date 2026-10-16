@@ -24,8 +24,8 @@ import (
 // invite a supervisor retry against a capability that will refuse it again.
 //
 // Every failure is a refusal, including the ones that are not the caller's
-// fault: a malformed block, a verifier that cannot be reached, an answer that
-// does not parse. The verifier being down stops work; that is the cost of the
+// fault: a malformed block, a verifier that cannot be reached for the
+// client's whole reach window, an answer that does not parse. The verifier being down stops work; that is the cost of the
 // control and it is named in the deployment's runbook.
 
 // capabilityRefusal returns the reason this task must be refused, or "" to
@@ -52,6 +52,10 @@ func (a *adapter) capabilityRefusal(ctx context.Context, nc *nats.Conn, origin *
 	if err != nil {
 		return "reason: capability-refused - this executor has no verify subject of its own"
 	}
+	// The client rides out a verifier it cannot reach for its reach
+	// window (capability.DefaultReachWindow) before refusing, and says so
+	// here when that wait is what let the check through.
+	client.Log = a.log.With("task", a.cfg.TaskID)
 	if err := client.Check(ctx, ref, capability.VerbTaskExecute, a.cfg.Scope); err != nil {
 		// capability.Reason carries the rule the verifier named, which
 		// never quotes anything the caller supplied.

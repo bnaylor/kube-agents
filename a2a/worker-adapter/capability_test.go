@@ -281,8 +281,8 @@ func TestAVerifierThatCannotBeReachedRefusesTheTask(t *testing.T) {
 	submit(t, c, session, taskID, "do the thing")
 
 	cfg := adapterConfig(url, taskID, session, noHarness)
-	// The default is five seconds; the task is refused either way, but the
-	// suite should not wait for it.
+	// Refused once the client's reach window (capability.DefaultReachWindow)
+	// is spent with nothing answering.
 	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
 	if out.res.State != lib.StateRejected {
 		t.Fatalf("state %q err %v; an unreachable verifier did not fail closed", out.res.State, out.err)
@@ -292,10 +292,11 @@ func TestAVerifierThatCannotBeReachedRefusesTheTask(t *testing.T) {
 	}
 }
 
-// silentVerifier subscribes to the verify subject and never answers. Without
-// it there is no window to cancel inside: core NATS answers a request with no
-// responder immediately, so "the verifier is absent" and "the verifier is
-// wedged" are different fixtures and only the second one holds the check open.
+// silentVerifier subscribes to the verify subject and never answers, so one
+// ask stays open for its whole timeout. "The verifier is absent" and "the
+// verifier is wedged" are different fixtures: core NATS answers a request with
+// no responder immediately, and the client asks again inside its reach window,
+// whereas a silent subscriber holds a single ask open.
 func silentVerifier(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url, nats.Name("cap-verifier-silent"))
@@ -352,5 +353,33 @@ func TestASIGTERMInsideTheVerifyWindowIsAnEvictionNotARefusal(t *testing.T) {
 	}
 	if strings.Contains(text, "capability-refused") {
 		t.Fatalf("the eviction was published as a capability refusal: %q", text)
+	}
+}
+
+// verifierGap is how long the verifier is absent in the reconnect-gap test:
+// about what gke-labs/kube-agents#3270 saw between an executor and the
+// verifiers coming back after a bus restart, inside the reach window.
+const verifierGap = 3 * time.Second
+
+// The #3270 gap, through the session executor: the bus is up and the adapter
+// is on it, but no verifier is yet. The check waits for the verifier rather
+// than refusing on the first no-responders reply. noHarness makes the task
+// fail once it passes the check, which is how this tells "waited and was
+// permitted" from "refused".
+func TestTheExecutorWaitsOutAVerifierReconnectGap(t *testing.T) {
+	url := startServerNoVerifier(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-ibex-cap16", "task-cap-reconnect-gap"
+	submit(t, c, session, taskID, "do the thing")
+
+	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, noHarness))
+	time.Sleep(verifierGap)
+	startVerifier(t, url)
+
+	out := waitOutcome(t, done, 30*time.Second)
+	text := terminalText(t, url, session, taskID)
+	if out.res.State == lib.StateRejected || strings.Contains(text, "capability-refused") {
+		t.Fatalf("state %q (%q): the task was refused in the gap instead of waiting for the verifier",
+			out.res.State, text)
 	}
 }
