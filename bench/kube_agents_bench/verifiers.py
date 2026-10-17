@@ -2407,7 +2407,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
-    card's chain in full and a front-filed card's as rendered.
+    card's call as one string with its newlines and operators intact and a
+    front-filed card's as rendered: a ``^``-anchored pattern written against
+    the rendering can miss a worker-filed card's command behind a ``cd ... &&``
+    or on a second line, and a capture gap on such a card does not change the
+    result (#3406).
     ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
     for every card.
 
