@@ -151,6 +151,10 @@ ANNOTATION_RESTORED_NOTE = (
 )
 LEDGER_KEY_SEPARATOR = "|"
 CONDITIONAL_SUFFIX = " (conditional)"
+# The two public principals: a role bound to either is held by every account,
+# the agent's included, so it is named for each checked account and marked.
+PUBLIC_MEMBERS = frozenset({"allusers", "allauthenticatedusers"})
+PUBLIC_SUFFIX = " (public)"
 #: Over-cap projects a scope note names before counting the rest.
 MAX_PROJECTS_IN_NOTE = 8
 UNRESOLVED_SCOPE_NOTE = "folder, organisation or selector members the reconcile has not resolved are not checked"
@@ -303,7 +307,9 @@ def roles_beyond_read_only(policy: dict, emails: set[str]) -> dict[str, set[str]
     """Per account, each role bound to it that the read-only set lacks. A
     conditional binding is marked as one, since the grant then holds only
     where the condition does; its title is free text whoever sets the policy
-    writes, so it stays out of a line chat posts."""
+    writes, so it stays out of a line chat posts. A role bound to ``allUsers``
+    or ``allAuthenticatedUsers`` is held by every account, so it is named for
+    each checked account and marked public."""
     allowed = set(READ_ONLY_ROLES)
     members = {(SERVICE_ACCOUNT_MEMBER_PREFIX + e).lower(): e for e in emails}
     found: dict[str, set[str]] = {}
@@ -313,6 +319,10 @@ def roles_beyond_read_only(policy: dict, emails: set[str]) -> dict[str, set[str]
             continue
         label = f"{role}{CONDITIONAL_SUFFIX}" if binding.get("condition") else role
         for member in binding.get("members") or []:
+            if str(member).lower() in PUBLIC_MEMBERS:
+                for email in emails:
+                    found.setdefault(email, set()).add(label + PUBLIC_SUFFIX)
+                continue
             email = members.get(str(member).lower())
             if email:
                 found.setdefault(email, set()).add(label)
@@ -383,7 +393,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         # The ledger's rows are kept as they are: nothing was read.
         text = failure_text(exc)
         if state.get("check_error") != text:
-            lines.append(f"{CHECK_FAILED_PREFIX} {text}")
+            lines.append(f"{CHECK_FAILED_PREFIX} `{text}`")
         state["check_error"] = text
         state["updated_at"] = now
         if not dry_run:
@@ -472,7 +482,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     old_errors = state.get("project_errors") or {}
     for project, text in sorted(errors.items()):
         if old_errors.get(project) != text:
-            lines.append(f"{PROJECT_UNREAD_PREFIX} `{project}`: {text}")
+            lines.append(f"{PROJECT_UNREAD_PREFIX} `{project}`: `{text}`")
     recovered = sorted(p for p in old_errors if p not in errors and p in futures)
     if recovered:
         lines.append(f"{PROJECT_RECOVERED_PREFIX} {code_list(recovered)}.")

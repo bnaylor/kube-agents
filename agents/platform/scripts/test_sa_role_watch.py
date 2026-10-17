@@ -114,6 +114,16 @@ class ReadOnlyIsQuiet(WatchTest):
         self.assertEqual([], self.tick(FakeSandbox(policies={MANAGEMENT: policy})))
 
 
+    def test_a_public_binding_is_held_by_this_account_too(self):
+        for principal in ("allUsers", "allAuthenticatedUsers"):
+            with self.subTest(principal=principal):
+                policy = read_only_policy()
+                policy["bindings"].append({"role": "roles/container.admin", "members": [principal]})
+                lines = self.tick(FakeSandbox(policies={MANAGEMENT: policy}))
+                self.assertEqual(1, len(lines), lines)
+                self.assertIn("roles/container.admin (public)", lines[0])
+                self.state.unlink(missing_ok=True)
+
 class DriftIsReportedOnChange(WatchTest):
     def admin_policy(self, *roles):
         policy = read_only_policy()
@@ -245,7 +255,9 @@ class DriftIsReportedOnChange(WatchTest):
         lines = self.tick(noisy)
         self.assertNotIn("`\\n`", lines[0])
         self.assertEqual(1, lines[0].count("\n") + 1)
-        self.assertEqual(2, lines[0].count("`"))
+        # The project's span and the error text's span: `**now**` stays inside one.
+        self.assertEqual(4, lines[0].count("`"))
+        self.assertRegex(lines[0], r"`[^`]*\*\*now\*\*[^`]*`")
 
     def test_dry_run_writes_no_ledger(self):
         self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner")}), dry_run=True)
