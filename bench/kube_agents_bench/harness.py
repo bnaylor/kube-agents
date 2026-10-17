@@ -932,12 +932,10 @@ def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str
 
     The worker is a separate hermes session; its log records each terminal
     command it executed, as hermes rendered it, and that rendering is what
-    the ``worker_commands`` verifier grades for these cards. Its tool calls as
-    typed reach ``result.trajectory`` through :func:`worker_trajectory.capture`,
-    which :meth:`_settle` runs after this read; ``tool_called`` grades those,
-    and ``worker_commands`` grades them for a card with no log line here (a
-    card a worker filed) and, under ``after_result_pattern``, for every card.
-    Only terminal commands are in the log; MCP tool calls are not.
+    the ``worker_commands`` verifier grades. Its tool calls as typed reach
+    ``result.trajectory`` through :func:`worker_trajectory.capture`, which
+    :meth:`_settle` runs after this read; ``tool_called`` grades those. Only
+    terminal commands are in the log; MCP tool calls are not.
 
     ``None`` when :func:`_worker_logs` read nothing or failed on any card: a
     capture that failed, or a run that delegated nothing, is not a run whose

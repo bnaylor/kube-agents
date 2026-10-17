@@ -328,17 +328,13 @@ in quoted material. `worker_commands` reads the route a worker took through its 
 commands, not its MCP tool calls, and only for cards the run delegated (a card a worker
 filed is read from the trajectory, as far as the capture reached it) — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. For a card the front agent filed it reads the one-line rendering hermes writes to the
-card log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or
-`||` arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a
-pattern never sees a command chained behind another on that card. For a card with no log line
-(one a worker filed) it reads the tagged `terminal` and `execute_code` calls on the trajectory,
-the command as typed, graded whole and segment by segment (split at a newline, `&&`, `||`, `;`,
-`|`, `&` or a parenthesis), so a `^`-anchored pattern meets each command of a chain and each line
-of a multi-line call. A capture gap that may hide such a card (one naming a card no log covers or
-no card at all, or a cap that clipped the read) makes a clean read `status: "error"`. Either way
-the quotes stay, so a listed word the command splits with an empty quote inside it is one word to
-the shell and none to the pattern. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. What it reads is the one-line rendering hermes writes to the card log, not the command
+as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
+command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
+chained behind another, and the quotes stay, so a listed word the command splits with an empty
+quote inside it is one word to the shell and none to the pattern; the command as typed is on the
+trajectory, tagged with the worker's profile, and reading it from there, split into words, is the
+verifier change that closes both gaps. `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
