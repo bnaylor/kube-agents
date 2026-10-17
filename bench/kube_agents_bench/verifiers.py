@@ -1864,6 +1864,17 @@ _PARTIAL_WORKER_CAPTURE_REASON = (
     "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
     "cannot clear the forbidden pattern(s): a retry may sit in the part it did not read"
 )
+# The default path's counterpart: a gap the read logged about a card no log covers (a worker-filed
+# card), or a cap that clipped it, means a card's commands may be missing from the graded set.
+_UNREAD_WORKER_CARD_REASON = (
+    "the worker-trajectory capture missed part of what the cards with no log line ran ({gaps}), "
+    "so the commands it did read cannot clear the forbidden pattern(s): a worker-filed card's "
+    "command may sit in the part it did not read"
+)
+# The card a capture gap names (``worker_trajectory``: "card X: ...", "card X is not on the
+# board", "no session found for card X"); a gap that names no card (a session store, the board)
+# cannot be pinned to a card a log covers.
+_GAP_CARD_RE = re.compile(r"\bcard ([^\s:]+)")
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
 _SHOWN_COMMAND_CHARS = 120
@@ -2290,6 +2301,32 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
+def _shell_text_segments(command: str) -> list[str]:
+    """The segments of a command line as text: split where the shell starts a new command (a
+    bare newline, ``&&``, ``||``, ``;``, ``|``, ``&``, a parenthesis; :func:`_read_shell_line`
+    tells a bare operator from a quoted one), each with its surrounding whitespace stripped and its
+    quotes, substitutions and redirects as typed. Comments and line continuations come off as
+    the shell drops them. Approximate where that reader is (an unclosed quote runs to the
+    line's end), which costs nothing here: the segments are read beside the whole command,
+    never instead of it."""
+    line, spans, operators = _read_shell_line(command)
+    segments: list[str] = []
+    current: list[str] = []
+    for piece in re.split(r"( \x00O\d+\x00 )", line):
+        mark = _OPERATOR_MARK_RE.match(piece.strip(" "))
+        if mark is None:
+            current.append(piece)
+            continue
+        operator = operators[int(mark.group(1))]
+        if operator == _SHELL_LINE_END or set(operator) <= _SHELL_OPERATOR_CHARS:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(operator)
+    segments.append("".join(current))
+    return [text for text in (_unfold_substitutions(s, spans).strip() for s in segments) if text.strip()]
+
+
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
     """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
@@ -2407,7 +2444,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
-    card's chain in full and a front-filed card's as rendered.
+    card's chain in full and a front-filed card's as rendered. Each tagged
+    call is also graded segment by segment (:func:`_shell_text_segments`:
+    split at a bare newline, ``&&``, ``||``, ``;``, ``|``, ``&`` or a
+    parenthesis, leading whitespace stripped), so a ``^``-anchored pattern
+    written against the rendering meets ``gcloud`` in ``cd /tmp && gcloud
+    ...`` and the second line of a two-line call; a call counts once
+    however many segments it has, and a hit on a segment names the call.
     ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
     for every card.
 
@@ -2465,8 +2508,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     graded on its calls: a filed card's log shows no program text); only
     delegated workers' logs or calls are read, never the router's, and a
     worker-filed card is read only as far as the trajectory capture reached
-    it (``worker_capture_gaps`` makes a clean read an error only under
-    ``after_result_pattern``); and a
+    it: without ``after_result_pattern``, a clean read (or a missing
+    required command) is ``status="error"`` when ``worker_capture_gaps``
+    holds a gap that names a card no log covers, names no card, or is a cap
+    that clipped the read, and a gap about a logged card changes nothing;
+    under ``after_result_pattern`` any gap does; and a
     command the shell resolved through an alias appears as typed; and a
     pattern reads the characters on the line, so a word the command splits
     with an empty quote or a backslash inside it (``compute''Metadata``) is
@@ -2558,6 +2604,10 @@ class WorkerCommandsVerifier(BaseVerifier):
         window = ""
         sources = ""
         result_hits: list[tuple[str, str]] = []
+        # Index into ``typed`` (and ``windowed``) to the shell segments of a command read as
+        # typed, graded beside the whole command; empty for a log line, which is one line.
+        segments: dict[int, list[str]] = {}
+        unread_gaps: list[str] = []
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -2604,6 +2654,23 @@ class WorkerCommandsVerifier(BaseVerifier):
                     sources = f" ({len(logged_commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
             typed = logged_commands + children
             windowed = typed
+            # A tagged call is the command as typed, chain and line breaks intact, while the
+            # patterns are written against the log's one-line rendering, which starts at the
+            # chain's first real command: each segment of a call is graded beside the call, so
+            # a ``^`` meets ``gcloud`` in ``cd /tmp && gcloud ...`` and the second line of a
+            # two-line call. Existence checks only gain from the extra text; counts stay calls.
+            for index in range(len(logged_commands), len(typed)):
+                parts = [part for part in _shell_text_segments(typed[index]) if part != typed[index]]
+                if parts:
+                    segments[index] = parts
+            # A worker-filed card is read from the trajectory alone, so a gap the read logged
+            # about a card no log covers, a gap that names no card, or a cap that clipped the
+            # read leaves a card's commands possibly unread; a gap about a logged card does not.
+            clips = set(worker_trajectory.CLIP_GAPS.values())
+            for gap in snap.worker_capture_gaps or []:
+                named = _GAP_CARD_RE.search(gap)
+                if gap in clips or named is None or named.group(1) not in logged:
+                    unread_gaps.append(gap)
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -2657,12 +2724,21 @@ class WorkerCommandsVerifier(BaseVerifier):
         # of the line is what the forbidden list reads, and a command an
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
-        commands = [c for c in typed if self._without_exempt_text(c) == c]
+        kept = [i for i, c in enumerate(typed) if self._without_exempt_text(c) == c]
+        commands = [typed[i] for i in kept]
         exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
-        graded = [(c, self._without_exempt_text(c)) for c in windowed]
-        missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
-        hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
-        hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
+        views = [view for i in kept for view in [typed[i], *segments.get(i, [])]]
+        missing = [p for p in self.required_patterns if not any(re.search(p, view) for view in views)]
+        # One hit per pattern and command: the whole command, else its first matching segment.
+        hits: list[tuple[str, str, str, str]] = []
+        for p in self.forbidden_patterns:
+            for i, c in enumerate(windowed):
+                for view in [c, *segments.get(i, [])]:
+                    rest = self._without_exempt_text(view)
+                    if re.search(p, rest):
+                        hits.append((p, c, view, rest))
+                        break
+        hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         argvs = [argv for c in commands for argv in _shell_argvs(c)]
         typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
@@ -2670,7 +2746,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
-        partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        # Without a window, only a gap that can hide a card no log covers counts (``unread_gaps``).
+        partial = (self.after_result_pattern is not None and snap.worker_capture_gaps) or unread_gaps
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
             if missing:
@@ -2684,11 +2761,12 @@ class WorkerCommandsVerifier(BaseVerifier):
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
+                    + (f" at its segment {view[:_SHOWN_COMMAND_CHARS]!r}" if view != c else "")
                     + (
                         f" (graded with its exempt part removed: {rest.strip()[:_SHOWN_COMMAND_CHARS]!r})"
-                        if rest != c else ""
+                        if rest != view else ""
                     )
-                    for p, c, rest in hits[:_MAX_NAMED_COMMANDS]
+                    for p, c, view, rest in hits[:_MAX_NAMED_COMMANDS]
                 )
                 more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")
@@ -2703,11 +2781,15 @@ class WorkerCommandsVerifier(BaseVerifier):
             )
         if partial:
             unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+            if self.after_result_pattern is None:
+                gap_reason = _UNREAD_WORKER_CARD_REASON.format(gaps="; ".join(unread_gaps))
+            else:
+                gap_reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps))
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
+                reason=gap_reason + unseen + window,
             )
         return VerificationResult(
             success=True,
