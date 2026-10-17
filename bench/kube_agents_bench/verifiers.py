@@ -2143,13 +2143,22 @@ class WorkerCommandsVerifier(BaseVerifier):
             # behaviour change for a filed card that ran only code: its program text is
             # now graded, where it used to read as zero commands). A row with no card
             # (a record stashed before rows carried one) cannot be joined, so such a
-            # capture keeps the logs alone rather than count every call a second time.
+            # capture grades the plain union, every tagged call beside every log line:
+            # each check here is an existence check, so a command counted twice can only
+            # inflate the count, while dropping the calls could hide a filed card's write.
             logged = {str(row.get("task") or "") for row in snap.worker_commands}
-            children = []
-            if "" not in logged:
-                children = [command for card, _, command, _, _ in _worker_terminal_calls(snap.trajectory) if card not in logged]
-            if children:
-                sources = f" ({len(commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
+            calls = _worker_terminal_calls(snap.trajectory)
+            if "" in logged:
+                children = [command for _, _, command, _, _ in calls]
+                if children:
+                    sources = (
+                        f" ({len(commands)} from the filed cards' logs and {len(children)} tagged calls,"
+                        " unjoined because a log row names no card, so a command may be counted twice)"
+                    )
+            else:
+                children = [command for card, _, command, _, _ in calls if card not in logged]
+                if children:
+                    sources = f" ({len(commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
             commands = commands + children
             graded = commands
         else:

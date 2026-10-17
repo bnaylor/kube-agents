@@ -856,14 +856,26 @@ def test_worker_commands_a_log_line_with_no_trajectory_call_still_counts():
 
 def test_worker_commands_a_filed_card_with_no_log_line_is_graded_on_its_calls():
     # A filed card that ran only code has no log line; its execute_code text is now graded
-    # (it used to read as zero commands). A row with no card cannot be joined: logs alone.
+    # (it used to read as zero commands). A row with no card cannot be joined, so the
+    # plain union is graded: the write still fails the check, and a pass says it was unjoined.
     code = _execute_code("import subprocess\nsubprocess.run(['gcloud', 'container', 'clusters', 'update', 'x'])", task="t_3")
     transcript.set("ok", _TRAJECTORY + [code], worker_commands=[{"task": "t_1", "command": "ls"}])
     res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"'clusters', 'update'"]).verify(5.0)
     assert res.status == "fail" and "subprocess.run" in res.reason
     transcript.set("ok", _TRAJECTORY + [code], worker_commands=[{"command": "ls"}])
     res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"'clusters', 'update'"]).verify(5.0)
-    assert res.status == "pass" and res.reason.startswith("1 worker command(s): ")
+    assert res.status == "fail" and "subprocess.run" in res.reason
+    res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+    assert res.status == "pass" and "unjoined because a log row names no card" in res.reason
+
+
+def test_worker_commands_unjoined_rows_still_see_a_child_cards_write():
+    # The review's fixture: a log row with no card id beside a tagged child terminal call
+    # that matches a forbidden pattern. Dropping the trajectory here would pass the write.
+    child = _terminal("gcloud container clusters update c --enable-shielded-nodes", agent="cluster-ka-today-1", task="t_2")
+    transcript.set("ok", _TRAJECTORY + [child], worker_commands=[{"command": "ls"}])
+    res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"clusters update"]).verify(5.0)
+    assert res.status == "fail", res
 
 
 def test_worker_commands_a_required_pattern_met_by_a_child_card_passes():
