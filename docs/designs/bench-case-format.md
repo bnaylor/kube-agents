@@ -328,13 +328,14 @@ in quoted material. `worker_commands` reads the route a worker took through its 
 commands, not its MCP tool calls, and only for cards the run delegated (a card a worker
 filed is read from the trajectory, as far as the capture reached it) — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. What it reads is the one-line rendering hermes writes to the card log, not the command
-as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
-command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
-chained behind another, and the quotes stay, so a listed word the command splits with an empty
-quote inside it is one word to the shell and none to the pattern; the command as typed is on the
-trajectory, tagged with the worker's profile, and reading it from there, split into words, is the
-verifier change that closes both gaps. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
+log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
+never sees a command chained behind another, and the quotes stay, so a listed word the command
+splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
+worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
+written against the rendering can miss that card's command behind a `cd … &&` or on a second
+line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
