@@ -1,4 +1,4 @@
-"""Pins that the mirrored gke-* skills #2996 swept teach no write path.
+"""Pins that the mirrored gke-* skills #2996 and #2998 swept teach no write path.
 
     python3 -m unittest tests/test_skill_read_only_text.py
 
@@ -69,7 +69,9 @@ SWEPT_SKILLS = (
 MCP_TOOLS_RE = re.compile(
     r"^> \*\*MCP Tools:\*\*(.*(?:\n>[^\n]*\S[^\n]*)*)", re.MULTILINE
 )
-BACKTICKED_RE = re.compile(r"`(?:gke:)?([a-z][a-z0-9_]*)`")
+# Any `server:` prefix is stripped, so a tool behind one (upstream writes
+# `k8s:apply_k8s_manifest`) still reaches the comparison with the list.
+BACKTICKED_RE = re.compile(r"`(?:[a-z][a-z0-9_-]*:)?([a-z][a-z0-9_]*)`")
 WRITE_TOOL_CALL_RE = re.compile(
     r"\b(?:create|update|delete|patch|apply|scale)_[a-z0-9_]+\("
 )
@@ -96,12 +98,17 @@ def fence_writes(content: str, preceding: str) -> list[str]:
         return [m.group(0) for m in WRITE_COMMAND_RE.finditer(content)]
     commands = "\n".join(
         line for line in content.splitlines() if not line.lstrip().startswith("#")
-    )
-    return [
-        m.group(0)
-        for m in WRITE_COMMAND_RE.finditer(commands)
-        if not OPERATOR_STEP_WRITE_RE.fullmatch(m.group(0))
-    ]
+    ).replace("\\\n", " ")
+    writes = []
+    for m in WRITE_COMMAND_RE.finditer(commands):
+        # Only a node-pool upgrade is the operator's step; a control-plane
+        # upgrade is a pull request on spec.minMasterVersion.
+        end = commands.find("\n", m.end())
+        rest = commands[m.end() : end if end != -1 else len(commands)]
+        if OPERATOR_STEP_WRITE_RE.fullmatch(m.group(0)) and "--node-pool" in rest:
+            continue
+        writes.append(m.group(0))
+    return writes
 
 
 def shell_fences(text: str):
@@ -194,8 +201,24 @@ class FenceWritesTest(unittest.TestCase):
         names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
         self.assertEqual(names - read_tools(), {"patch_k8s_resource"})
 
+    def test_mcp_tools_line_any_prefix_does_not_hide_a_write_tool(self):
+        text = "> **MCP Tools:** `gke:get_cluster`, `k8s:apply_k8s_manifest`\n"
+        names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
+        self.assertEqual(names - read_tools(), {"apply_k8s_manifest"})
+
     def test_marked_operator_step_allows_clusters_upgrade(self):
         self.assertEqual(fence_writes(self.UPGRADE, self.OPERATOR), [])
+
+    def test_unmarked_fence_still_refuses_clusters_upgrade(self):
+        self.assertEqual(
+            fence_writes(self.UPGRADE, ""), ["gcloud container clusters upgrade"]
+        )
+
+    def test_marked_operator_step_refuses_a_control_plane_upgrade(self):
+        fence = "gcloud container clusters upgrade CLUSTER_NAME --master\n"
+        self.assertEqual(
+            fence_writes(fence, self.OPERATOR), ["gcloud container clusters upgrade"]
+        )
 
     def test_marked_operator_step_still_refuses_clusters_update(self):
         fence = self.UPGRADE + "gcloud container clusters update CLUSTER_NAME\n"
