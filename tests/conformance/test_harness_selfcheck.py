@@ -16,13 +16,16 @@ suite rather than about the product:
   * every expected failure is registered with an invariant and a reference
   * the bucket-2 scenarios are skipped for the stated reason and not because
     they failed to load
+  * every mutation in hack/conformance-mutations.py still finds the text it
+    edits, so none goes STALE unnoticed
 """
 
 from __future__ import annotations
 
-import os
 import importlib
+import os
 import pkgutil
+import sys
 import unittest
 from pathlib import Path
 
@@ -381,7 +384,7 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         applies before it mutates. must_survive controls included, since a
         stale control passes for the wrong reason.
         """
-        if os.environ.get("CONFORMANCE_MUTATION_RUN"):
+        if os.environ.get("CONFORMANCE_MUTATION_RUN") == "1":
             self.skipTest("inside hack/conformance-mutations.py, which checks each anchor itself and removes it on purpose")
         import ast
 
@@ -400,7 +403,21 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
                 stale.append(f"{mutation_id}: {path.relative_to(repo)} does not exist")
             elif old not in path.read_text():
                 stale.append(f"{mutation_id}: the text it edits is not in {path.relative_to(repo)}")
-        self.assertGreater(seen, 60, "the mutation set failed to parse")
+        # Every mutation the harness runs, not just the ones written as a
+        # literal Mutation(...) call: loading the script by path is cheap here
+        # and catches a helper or alias that would hide a mutation from the walk.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("conformance_mutations", source)
+        harness = importlib.util.module_from_spec(spec)
+        # dataclasses looks the defining module up in sys.modules.
+        sys.modules[spec.name] = harness
+        try:
+            spec.loader.exec_module(harness)
+        finally:
+            sys.modules.pop(spec.name, None)
+        self.assertEqual(seen, len(harness.MUTATIONS),
+                         "a mutation is built some way other than a literal Mutation(...) call")
         self.assertEqual(stale, [], "rewrite these mutations against the current source")
 
     def test_every_bucket_one_assertion_is_named_by_a_mutation(self) -> None:
