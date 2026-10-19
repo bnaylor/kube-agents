@@ -115,8 +115,8 @@ def refuse_started_child_link(kb, conn, parent_id: str, child_id: str) -> str | 
             return None
     except Exception as exc:  # noqa: BLE001 — fail open, but say so
         logger.warning(
-            "kanban_link_running_guard: could not read %s, so the link to it "
-            "is unguarded: %r", child_id, exc,
+            "kanban_link_running_guard: could not read %s or %s, so the link "
+            "%s -> %s is unguarded: %r", parent_id, child_id, parent_id, child_id, exc,
         )
         return None
     template, status = started
