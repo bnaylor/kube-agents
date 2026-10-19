@@ -12,13 +12,20 @@ ship it. This reads the shipped text instead:
 
 - every tool named on a `**MCP Tools:**` line is in the `gke` server's
   `tools.include` in deploy/shared/defaults/config.yaml, parsed rather than
-  copied, so a tool the list drops is caught here too;
+  copied, so a tool the list drops is caught here too (a `gke:` server prefix,
+  as `gke-observability` writes it, is stripped first);
 - no file calls an MCP write tool (`patch_k8s_resource(`, `create_cluster(`);
-- no shell or unlabelled fence runs a `kubectl` or `gcloud container` write.
+- no shell or unlabelled fence runs a `kubectl`, `gcloud` or `helm` write.
 
-The skills are the eleven #2996 swept. `gke-cluster-creation` is #2937's and
-the other mirrored skills are #2998's; each joins SWEPT_SKILLS when its sweep
-lands.
+One write is allowed: `gke-upgrades` writes a node-pool version change as the
+exact `gcloud container clusters upgrade --node-pool` command for the platform
+operator to run (an operation, not desired state, so it has no pull request).
+A fence counts as that step only when the paragraph right before it says it is
+"a step for the platform operator", and then only `clusters upgrade` passes;
+its comment lines are skipped, and any other write in it still fails.
+
+The skills are the eleven #2996 swept and the ten #2998 swept.
+`gke-cluster-creation` is #2937's and joins SWEPT_SKILLS when its sweep lands.
 """
 
 import re
@@ -44,6 +51,17 @@ SWEPT_SKILLS = (
     "gke-platform-security",
     "gke-reliability",
     "gke-storage",
+    # #2998
+    "gke-backup-dr",
+    "gke-cluster-autoscaler",
+    "gke-compute-classes",
+    "gke-cost-analysis",
+    "gke-observability",
+    "gke-tpu-dynamic-slices-monitoring",
+    "gke-upgrades",
+    "gke-workload-identity",
+    "gke-workload-scaling",
+    "gke-workload-security",
 )
 
 # A `> **MCP Tools:**` line and its blockquote continuation, up to the first
@@ -51,20 +69,54 @@ SWEPT_SKILLS = (
 MCP_TOOLS_RE = re.compile(
     r"^> \*\*MCP Tools:\*\*(.*(?:\n>[^\n]*\S[^\n]*)*)", re.MULTILINE
 )
-BACKTICKED_RE = re.compile(r"`([a-z][a-z0-9_]*)`")
+BACKTICKED_RE = re.compile(r"`(?:gke:)?([a-z][a-z0-9_]*)`")
 WRITE_TOOL_CALL_RE = re.compile(
     r"\b(?:create|update|delete|patch|apply|scale)_[a-z0-9_]+\("
 )
 WRITE_COMMAND_RE = re.compile(
-    r"\bkubectl\s+(?:apply|patch|scale|delete|edit|create|replace|set|label|annotate)\b"
+    r"\bkubectl\s+(?:apply|patch|scale|delete|edit|create|replace|set|label|annotate|drain|run)\b"
     r"|\bgcloud\s+container\s+(?:clusters|node-pools)\s+(?:create|create-auto|update|delete|resize|upgrade)\b"
+    r"|\bgcloud\s+projects\s+add-iam-policy-binding\b"
+    r"|\bhelm\s+install\b"
 )
 SHELL_FENCES = {"", "bash", "sh", "shell", "console", "zsh"}
+# The gke-upgrades marker: the paragraph right before the fence says so.
+OPERATOR_STEP_MARKER = "a step for the platform operator"
+OPERATOR_STEP_WRITE_RE = re.compile(r"\bgcloud\s+container\s+clusters\s+upgrade\b")
 
 
 def read_tools() -> set[str]:
     config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     return set(config["mcp_servers"]["gke"]["tools"]["include"])
+
+
+def fence_writes(content: str, preceding: str) -> list[str]:
+    """The writes a shell fence runs, less a marked platform operator step."""
+    if OPERATOR_STEP_MARKER not in preceding.lower():
+        return [m.group(0) for m in WRITE_COMMAND_RE.finditer(content)]
+    commands = "\n".join(
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    )
+    return [
+        m.group(0)
+        for m in WRITE_COMMAND_RE.finditer(commands)
+        if not OPERATOR_STEP_WRITE_RE.fullmatch(m.group(0))
+    ]
+
+
+def shell_fences(text: str):
+    """Yield (token, preceding paragraph text) for each shell fence."""
+    tokens = MarkdownIt().parse(text)
+    for i, token in enumerate(tokens):
+        if (
+            token.type != "fence"
+            or token.info.strip().split(" ")[0] not in SHELL_FENCES
+        ):
+            continue
+        preceding = ""
+        if i >= 2 and tokens[i - 1].type == "paragraph_close":
+            preceding = tokens[i - 2].content
+        yield token, preceding
 
 
 def skill_files():
@@ -93,9 +145,9 @@ class SweptSkillsTeachNoWritesTest(unittest.TestCase):
                         offered,
                         f"not in the gke server's tools.include: {sorted(names - offered)}",
                     )
-        # Ten swept SKILL.md files and core-concepts.md carry one; a regex that
-        # stopped matching would otherwise pass on nothing.
-        self.assertGreaterEqual(lines, 11)
+        # Eleven swept SKILL.md files and core-concepts.md carry one; a regex
+        # that stopped matching would otherwise pass on nothing.
+        self.assertGreaterEqual(lines, 12)
 
     def test_no_mcp_write_tool_is_called(self):
         for path, text in skill_files():
@@ -103,23 +155,73 @@ class SweptSkillsTeachNoWritesTest(unittest.TestCase):
                 self.assertEqual(WRITE_TOOL_CALL_RE.findall(text), [])
 
     def test_no_shell_fence_runs_a_write(self):
-        md = MarkdownIt()
-        fences = 0
+        fences = operator_steps = 0
         for path, text in skill_files():
-            for token in md.parse(text):
-                if (
-                    token.type != "fence"
-                    or token.info.strip().split(" ")[0] not in SHELL_FENCES
-                ):
-                    continue
+            for token, preceding in shell_fences(text):
                 fences += 1
+                if OPERATOR_STEP_MARKER in preceding.lower():
+                    operator_steps += 1
                 with self.subTest(
                     path=str(path.relative_to(REPO_ROOT)), line=token.map[0] + 1
                 ):
-                    self.assertIsNone(
-                        WRITE_COMMAND_RE.search(token.content), token.content
+                    self.assertEqual(
+                        fence_writes(token.content, preceding), [], token.content
                     )
         self.assertGreater(fences, 0)
+        # gke-upgrades' three node-pool version steps; the allowance is no
+        # wider than they need.
+        self.assertEqual(operator_steps, 3)
+
+
+class FenceWritesTest(unittest.TestCase):
+    """Each pattern and allowance, on fixtures rather than shipped skills."""
+
+    OPERATOR = "A step for the platform operator, not a pull request."
+    UPGRADE = (
+        "# Platform operator step\n"
+        "gcloud container clusters upgrade CLUSTER_NAME \\\n"
+        "  --node-pool NODE_POOL_NAME --cluster-version VERSION\n"
+    )
+
+    def test_mcp_tools_line_accepts_the_gke_prefix(self):
+        text = "> **MCP Tools:** `gke:get_cluster`, `gke:list_k8s_events`\n"
+        names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
+        self.assertEqual(names, {"get_cluster", "list_k8s_events"})
+        self.assertLessEqual(names, read_tools())
+
+    def test_mcp_tools_line_prefix_does_not_hide_a_write_tool(self):
+        text = "> **MCP Tools:** `gke:get_cluster`, `gke:patch_k8s_resource`\n"
+        names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
+        self.assertEqual(names - read_tools(), {"patch_k8s_resource"})
+
+    def test_marked_operator_step_allows_clusters_upgrade(self):
+        self.assertEqual(fence_writes(self.UPGRADE, self.OPERATOR), [])
+
+    def test_marked_operator_step_still_refuses_clusters_update(self):
+        fence = self.UPGRADE + "gcloud container clusters update CLUSTER_NAME\n"
+        self.assertEqual(
+            fence_writes(fence, self.OPERATOR), ["gcloud container clusters update"]
+        )
+
+    def test_widened_writes(self):
+        for command in (
+            "gcloud projects add-iam-policy-binding PROJECT_ID --member=M --role=R",
+            "kubectl drain NODE --ignore-daemonsets",
+            "kubectl run debug --image=busybox -- sleep 3600",
+            "helm install RELEASE CHART -n NAMESPACE",
+        ):
+            with self.subTest(command=command):
+                self.assertNotEqual(fence_writes(command + "\n", ""), [])
+
+    def test_neighbouring_reads_pass(self):
+        for command in (
+            "gcloud projects get-iam-policy PROJECT_ID",
+            "kubectl describe node NODE",
+            "kubectl get pods --field-selector=status.phase=Running",
+            "helm list -n NAMESPACE",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(fence_writes(command + "\n", ""), [])
 
 
 if __name__ == "__main__":
