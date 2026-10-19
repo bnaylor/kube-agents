@@ -71,9 +71,17 @@ SWEPT_SKILLS = (
 MCP_TOOLS_RE = re.compile(
     r"^> \*\*MCP Tools:\*\*(.*(?:\n>[^\n]*\S[^\n]*)*)", re.MULTILINE
 )
-# Any `server:` prefix is stripped, so a tool behind one (upstream writes
-# `k8s:apply_k8s_manifest`) still reaches the comparison with the list.
-BACKTICKED_RE = re.compile(r"`(?:[a-z][a-z0-9_-]*:)?([a-z][a-z0-9_]*)`")
+# Every backticked token is taken whole and its `server:` prefix stripped
+# afterwards, so a tool behind any prefix (upstream writes
+# `k8s:apply_k8s_manifest`), or one in a shape no pattern expects, still reaches
+# the comparison with the list and fails there rather than being skipped.
+BACKTICKED_RE = re.compile(r"`([^`\s]+)`")
+
+
+def tool_names(text: str) -> set[str]:
+    return {token.rpartition(":")[2] for token in BACKTICKED_RE.findall(text)}
+
+
 WRITE_TOOL_CALL_RE = re.compile(
     r"\b(?:create|update|delete|patch|apply|scale)_[a-z0-9_]+\("
 )
@@ -146,7 +154,7 @@ class SweptSkillsTeachNoWritesTest(unittest.TestCase):
         for path, text in skill_files():
             for match in MCP_TOOLS_RE.finditer(text):
                 lines += 1
-                names = set(BACKTICKED_RE.findall(match.group(1))) - {"gke"}
+                names = tool_names(match.group(1)) - {"gke"}
                 with self.subTest(path=str(path.relative_to(REPO_ROOT))):
                     self.assertTrue(names, "an MCP Tools line with no tool names")
                     self.assertLessEqual(
@@ -194,19 +202,24 @@ class FenceWritesTest(unittest.TestCase):
 
     def test_mcp_tools_line_accepts_the_gke_prefix(self):
         text = "> **MCP Tools:** `gke:get_cluster`, `gke:list_k8s_events`\n"
-        names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
+        names = tool_names(MCP_TOOLS_RE.search(text).group(1))
         self.assertEqual(names, {"get_cluster", "list_k8s_events"})
         self.assertLessEqual(names, read_tools())
 
     def test_mcp_tools_line_prefix_does_not_hide_a_write_tool(self):
         text = "> **MCP Tools:** `gke:get_cluster`, `gke:patch_k8s_resource`\n"
-        names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
+        names = tool_names(MCP_TOOLS_RE.search(text).group(1))
         self.assertEqual(names - read_tools(), {"patch_k8s_resource"})
 
     def test_mcp_tools_line_any_prefix_does_not_hide_a_write_tool(self):
         text = "> **MCP Tools:** `gke:get_cluster`, `k8s:apply_k8s_manifest`\n"
-        names = set(BACKTICKED_RE.findall(MCP_TOOLS_RE.search(text).group(1)))
+        names = tool_names(MCP_TOOLS_RE.search(text).group(1))
         self.assertEqual(names - read_tools(), {"apply_k8s_manifest"})
+
+    def test_mcp_tools_line_unparseable_token_fails_rather_than_vanishing(self):
+        text = "> **MCP Tools:** `gke:get_cluster`, `gke:Patch_K8s_Resource`\n"
+        names = tool_names(MCP_TOOLS_RE.search(text).group(1))
+        self.assertEqual(names - read_tools(), {"Patch_K8s_Resource"})
 
     def test_marked_operator_step_allows_clusters_upgrade(self):
         self.assertEqual(fence_writes(self.UPGRADE, self.OPERATOR), [])
