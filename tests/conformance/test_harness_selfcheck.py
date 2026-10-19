@@ -20,6 +20,7 @@ suite rather than about the product:
 
 from __future__ import annotations
 
+import os
 import importlib
 import pkgutil
 import unittest
@@ -380,6 +381,8 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         applies before it mutates. must_survive controls included, since a
         stale control passes for the wrong reason.
         """
+        if os.environ.get("CONFORMANCE_MUTATION_RUN"):
+            self.skipTest("inside hack/conformance-mutations.py, which checks each anchor itself and removes it on purpose")
         import ast
 
         repo = Path(__file__).resolve().parents[2]

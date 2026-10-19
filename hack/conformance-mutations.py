@@ -2368,7 +2368,12 @@ def _run_suite() -> tuple[set[str], set[str]]:
         capture_output=True,
         text=True,
         timeout=300,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        # CONFORMANCE_MUTATION_RUN: the suite's anchor self-check
+        # (test_every_mutation_still_finds_the_text_it_edits) skips itself
+        # here. A mutation removes its own anchor by design, so that check
+        # would fire on every mutated tree and read every verdict as NOISY or
+        # OVERSHOT; this script checks the anchor itself before mutating.
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CONFORMANCE_MUTATION_RUN": "1"},
     )
     output = process.stdout + process.stderr
     failed = set(re.findall(r"^(?:FAIL|ERROR): (\S+)", output, re.MULTILINE))
