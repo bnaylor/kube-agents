@@ -12,8 +12,9 @@ ship it. This reads the shipped text instead:
 
 - every tool named on a `**MCP Tools:**` line is in the `gke` server's
   `tools.include` in deploy/shared/defaults/config.yaml, parsed rather than
-  copied, so a tool the list drops is caught here too (a `gke:` server prefix,
-  as `gke-observability` writes it, is stripped first);
+  copied, so a tool the list drops is caught here too (any `server:` prefix,
+  as `gke-observability` writes `gke:` and upstream writes `k8s:`, is stripped
+  first);
 - no file calls an MCP write tool (`patch_k8s_resource(`, `create_cluster(`);
 - no shell or unlabelled fence runs a `kubectl`, `gcloud` or `helm` write.
 
@@ -21,8 +22,9 @@ One write is allowed: `gke-upgrades` writes a node-pool version change as the
 exact `gcloud container clusters upgrade --node-pool` command for the platform
 operator to run (an operation, not desired state, so it has no pull request).
 A fence counts as that step only when the paragraph right before it says it is
-"a step for the platform operator", and then only `clusters upgrade` passes;
-its comment lines are skipped, and any other write in it still fails.
+"a step for the platform operator", and then only a `clusters upgrade` with
+`--node-pool` on the same command passes; its comment lines are skipped, and any
+other write in it, a control-plane upgrade included, still fails.
 
 The skills are the eleven #2996 swept and the ten #2998 swept.
 `gke-cluster-creation` is #2937's and joins SWEPT_SKILLS when its sweep lands.
@@ -215,7 +217,11 @@ class FenceWritesTest(unittest.TestCase):
         )
 
     def test_marked_operator_step_refuses_a_control_plane_upgrade(self):
-        fence = "gcloud container clusters upgrade CLUSTER_NAME --master\n"
+        # Beside a node-pool upgrade, so the --node-pool search must stop at the
+        # end of its own command.
+        fence = (
+            self.UPGRADE + "gcloud container clusters upgrade CLUSTER_NAME --master\n"
+        )
         self.assertEqual(
             fence_writes(fence, self.OPERATOR), ["gcloud container clusters upgrade"]
         )
