@@ -49,7 +49,7 @@ script.
 **Command:**
 
 ```bash
-scripts/audit_cluster.sh <cluster-name> <region> <project-id>
+/opt/data/profiles/platform/skills/gke-workload-security/scripts/audit_cluster.sh <cluster-name> <region> <project-id>
 ```
 
 ### 2. Configure Workload Identity (legacy GSA impersonation)
