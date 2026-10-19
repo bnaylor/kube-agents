@@ -301,13 +301,13 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-197 mutations: 167 KILLED, 27 NOISY, three `must_survive` controls
+206 mutations: 175 KILLED, 28 NOISY, three `must_survive` controls
 (`A3-fastpath-redundant`, `B1-denylist-rule` and
 `B1-gke-mcp-overlay-copy-redundant`), zero genuine survivors, zero stale.
-Measured 2026-10-16 on `main` at `2e76511b` plus #3261's re-aimed
+Measured 2026-10-19 on `main` at `1b783dac` plus #3261's re-aimed
 `A3-session-sends-a-notify`. Re-run the harness rather than trusting these
 numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 194 of the 197: a
+Note that the summary line the harness prints accounts for 203 of the 206: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
