@@ -39,7 +39,7 @@ func validTaskState(s TaskState) bool {
 	return false
 }
 
-// Reserved artifact names. The set of names is open; only these six carry
+// Reserved artifact names. The set of names is open; only these carry
 // reserved semantics.
 const (
 	ArtifactResult   = "result"
@@ -58,7 +58,26 @@ const (
 	// completes; it is never the deliverable (spec-a2a-payloads.md,
 	// "Reserved artifact names").
 	ArtifactTurn = "turn"
+	// ArtifactNotice is a message the task posts on its own, beside its
+	// live message and its answer (a PR it opened): a text part, optionally
+	// with a chat message. Each one posts once and is never edited
+	// (spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactNotice = "notice"
+	// ArtifactHandoff says a completed task handed work to kanban cards,
+	// which report into the task's conversation themselves: one text part,
+	// HandoffCards. The hermes-bridge's API executor publishes it ahead of the
+	// terminal of such a task whenever the conversation route was recorded
+	// (Slack or Google Chat); the gateway never
+	// renders it and reads it as a delegated child's cards-pending signal
+	// beside the terminal's chat mark, which the bridge sets only on Slack
+	// with KAGE_SLACK_UX on (#3258; spec-a2a-payloads.md, "Reserved artifact
+	// names").
+	ArtifactHandoff = "handoff"
 )
+
+// HandoffCards is the ArtifactHandoff text part: the work went to kanban
+// cards.
+const HandoffCards = "cards"
 
 // DelegateRequest is the ArtifactDelegate data part's shape: one child task
 // to mint, addressee and the task text. It is also the wire shape the

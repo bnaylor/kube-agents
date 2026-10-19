@@ -225,8 +225,9 @@ func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
 }
 
 // One broker body yields every counter the broker feeds: the tool invocations
-// summed over the counted statuses and the proposals opened, which is the
-// version-control counter under verb proposal-create and status success alone.
+// summed over the counted statuses, the proposals opened, which is the
+// version-control counter under verb proposal-create and status success alone,
+// and the proposals merged, read whole.
 func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE kubeagents_tool_invocations_total counter",
@@ -237,6 +238,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 		`kubeagents_vcs_requests_total{verb="proposal-create",status="blocked"} 1`,
 		`kubeagents_vcs_requests_total{verb="proposal-list",status="success"} 9`,
 		`kubeagents_vcs_requests_total{verb="issue-create",status="success"} 5`,
+		"# TYPE kubeagents_vcs_proposals_merged_total counter",
+		"kubeagents_vcs_proposals_merged_total 2",
 		"# TYPE process_start_time_seconds gauge",
 		"process_start_time_seconds 1759400000.25",
 		"",
@@ -246,14 +249,73 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterRemediationsProposed] != 3 {
-		t.Fatalf("samples = %v, want 4 tool executions and 3 proposals", reading.Samples)
+	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 {
+		t.Fatalf("samples = %v, want 4 tool executions, 3 proposals and 2 merged", reading.Samples)
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
 		t.Errorf("start time = %v", reading.StartTime)
 	}
 	if reading.Clusters != nil {
 		t.Errorf("a broker body yielded a cluster reading: %+v", reading.Clusters)
+	}
+}
+
+// The A2A gateway's body carries the chat counter under its own family name:
+// the fold names it as the chat counter's sibling and sums it the same way,
+// and a body carrying neither family yields zero, not a failure.
+func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="slack"} 2`,
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="other"} 0`,
+		"# TYPE kubeagents_a2a_gateway_task_terminals_total counter",
+		`kubeagents_a2a_gateway_task_terminals_total{state="completed",source="executor"} 9`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400100.5",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 7 {
+		t.Fatalf("samples = %v, want 7 inbound messages from the A2A gateway's family alone", reading.Samples)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1759400100.5 {
+		t.Fatalf("start time = %v, want the gateway's", reading.StartTime)
+	}
+	empty := serveBody(t, http.StatusOK, "# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 1\n")
+	reading, err = newPodUsageSource().Scrape(context.Background(), empty, usageChatCounters)
+	if err != nil || reading.Samples[usageCounterChatMessagesInbound] != 0 {
+		t.Fatalf("a body with neither family: %v, %v; want 0 and no error", reading.Samples, err)
+	}
+}
+
+// The gateway's chat listener serves one family, summed over its platform
+// label, and no cluster gauge: the chat body is the platform-agent container's,
+// not the watcher's.
+func TestPodUsageSource_SumsTheChatListenerOverPlatforms(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_chat_messages_inbound_total counter",
+		`kubeagents_chat_messages_inbound_total{platform="googlechat"} 4`,
+		`kubeagents_chat_messages_inbound_total{platform="slack"} 2`,
+		`kubeagents_chat_messages_inbound_total{platform="other"} 1`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 7 {
+		t.Fatalf("samples = %v, want 7 inbound messages", reading.Samples)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("the chat body yielded a cluster reading: %+v", reading.Clusters)
 	}
 }
 

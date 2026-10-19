@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -84,13 +85,24 @@ def roster_block() -> str:
     return lifted_block(r"^BLOCKING_ROSTER_ENTRIES=.*?^export BOOTSTRAP_ADMITTED=[^\n]*")
 
 
+# The variables that shape the matrix, scrubbed from the developer's
+# environment under every lifted-shell run, so a shell with one of them
+# exported (EVAL_FORGE=gitlab for a local GitLab eval, say) does not turn the
+# default-matrix assertions into the lane's.
+MATRIX_SHAPING = ("AGENT_TRANSPORT", "EVAL_TIER", "EVAL_NIGHTLY_PART", "BOOTSTRAP_ADMITTED", "EVAL_FORGE")
+
+
+def clean_env(env: dict | None = None) -> dict:
+    return {**{k: v for k, v in os.environ.items() if k not in MATRIX_SHAPING}, **(env or {})}
+
+
 def run_bash(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + body],
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, **(env or {})},
+        env=clean_env(env),
     )
 
 
@@ -233,6 +245,163 @@ class RefusalTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "NIGHTLY"), nightly_entries())
 
 
+class GitLabLaneTest(unittest.TestCase):
+    """Under EVAL_FORGE=gitlab a presubmit runs the GitLab lane's file, a
+    nightly the whole catalogue; the roster export keeps only the lane's
+    cases, and an empty export is said, not stopped (kube-agents#2394)."""
+
+    def lane_entries(self) -> list[str]:
+        return [f"./tasks/{name}/task.yaml" for name in eval_rosters.gitlab_cases()]
+
+    def test_a_gitlab_presubmit_runs_the_lanes_file_and_says_what_it_left_out(self):
+        result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
+        self.assertIn("EVAL_FORGE=gitlab: the GitLab lane runs 3 case(s) on the presubmit tier", result.stdout)
+        self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
+        # pdb-remediation-pr was the lane's one roster case from 2026-10-14
+        # (#2016) until its demotion to the nightly on 2026-10-17 (#3120), so
+        # the roster intersected with the lane is empty: all three seats are
+        # held out, the export is empty, and the log says rung 4 is disarmed.
+        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
+        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+
+    def test_a_roster_case_in_the_lane_arms_the_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            # Two roster cases, listed out of roster order; the real lane holds
+            # none since pdb-remediation-pr's demotion (2026-10-17, #3120).
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/reliability-pdb-probe/task.yaml\n")
+            result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "ROSTER"), ["reliability-pdb-probe,agent-kanban-smoke"], "the roster intersected with the lane, in roster order")
+        self.assertNotIn("rung 4 is disarmed", result.stdout)
+
+    def test_the_inject_guard_still_fires_on_the_lane(self):
+        """A lane whose only roster case is inject-excluded, run under the
+        inject transport, must stop as the GitHub lane would, not run with
+        rung 4 disarmed under the "no roster case in the lane" line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            # agent-kanban-smoke is the lane's only roster case and is
+            # inject-excluded; vcs-spent-branch-reuse is held out.
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/vcs-spent-branch-reuse/task.yaml\n")
+            result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("every blocking-roster case in eval/gitlab-cases.txt is excluded on the inject lane", result.stderr)
+        self.assertIn("Seat another roster case there", result.stderr)
+        self.assertNotIn("rung 4 is disarmed", result.stdout)
+
+    def test_a_roster_free_lane_with_an_excluded_held_out_case_is_not_stopped(self):
+        """The guard asks whether the exclusion list emptied the roster, not
+        whether the lane holds no roster case: a lane whose cases are all
+        held out, one of them inject-excluded, runs with rung 4 disarmed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            # Built here rather than read from the real lane (roster-free
+            # again since 2026-10-17, #3120, but with no inject-excluded
+            # case): two held-out seats, one of them inject-excluded.
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/vcs-spent-branch-reuse/task.yaml\n./tasks/vcs-review-feedback-read-back/task.yaml\n")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\nvcs-review-feedback-read-back\n")
+            result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-spent-branch-reuse/task.yaml"])
+        self.assertNotIn("excluded on the inject lane", result.stderr)
+        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+
+    def test_a_gitlab_nightly_runs_the_same_lane_list(self):
+        """The GitLab nightly is the lane's list once a night, not the
+        catalogue: nothing else grades the forge, and the roster export is
+        the lane's (empty since pdb-remediation-pr's demotion of 2026-10-17,
+        #3120; it held the lane's one roster line from 2026-10-14)."""
+        result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
+        self.assertIn("the GitLab lane runs 3 case(s) on the nightly tier", result.stdout)
+        self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
+        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+
+    def test_the_github_nightlys_part_split_is_refused_on_the_gitlab_lane(self):
+        section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+        part_switch = lifted_block(r'^EVAL_NIGHTLY_PART="\$\{EVAL_NIGHTLY_PART:-all\}"\n.*?^esac$')
+        body = "\n".join([f'SCRIPT_DIR="{HACK_DIR}"', roster_constants(), section, part_switch, 'echo "PART_OK"'])
+        refused = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("is the GitHub nightly's split; the GitLab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
+        allowed = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "all"})
+        self.assertIn("PART_OK", allowed.stdout, allowed.stderr)
+        github = run_bash(body, {"EVAL_FORGE": "github", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        self.assertIn("PART_OK", github.stdout, github.stderr)
+
+    def test_the_gitlab_lane_never_appends_to_the_evidence_store(self):
+        """The recorder decision, lifted as written: a GitLab periodic reads
+        the store like a presubmit and never records, since a case's record
+        is per case and version key, not per forge."""
+        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
+        body = decision + '\necho "MAIN_RUN=${EVAL_IS_MAIN_RUN}"'
+        self.assertIn("MAIN_RUN=true", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "github"}).stdout)
+        self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "gitlab"}).stdout)
+        self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "presubmit", "EVAL_FORGE": "github"}).stdout)
+
+    def test_the_github_presubmit_is_untouched(self):
+        result = load_matrix({"EVAL_FORGE": "github"})
+        self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries())
+        self.assertNotIn("GitLab lane", result.stdout)
+        # And a developer's exported EVAL_FORGE does not reach the loaders.
+        with mock.patch.dict(os.environ, {"EVAL_FORGE": "gitlab"}):
+            self.assertEqual(lines_tagged(load_matrix(), "TASK"), presubmit_entries())
+
+    def test_the_env_override_of_the_roster_still_wins_on_the_lane(self):
+        result = load_matrix({"EVAL_FORGE": "gitlab", "BOOTSTRAP_ADMITTED": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("rung 4 is disarmed", result.stdout, "an explicit empty override is the stated way to mean it")
+
+    def refused(self, text: str, *needles):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            if text is None:
+                (hack / "eval" / "gitlab-cases.txt").unlink()
+            else:
+                (hack / "eval" / "gitlab-cases.txt").write_text(text)
+            result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("TASK ", result.stdout)
+        for needle in needles:
+            self.assertIn(needle, result.stderr)
+
+    def test_a_nightly_case_is_a_valid_lane_entry_and_an_unregistered_one_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/obtainability-planted-pdb/task.yaml\n")
+            result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/obtainability-planted-pdb/task.yaml"])
+        # A real case directory that neither roster file names is not registered.
+        unregistered = next(d.name for d in sorted(TASKS_DIR.iterdir()) if d.is_dir() and d.name not in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases())
+        self.refused(f"./tasks/{unregistered}/task.yaml\n", "gitlab-cases.txt", unregistered, "registered cases only")
+
+    def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
+        self.refused("# nothing\n", "gitlab-cases.txt names no case")
+        self.refused(None, "gitlab-cases.txt is missing")
+        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-cases.txt", "registered cases only")
+
+    def test_the_lane_file_does_not_change_the_github_run_when_broken(self):
+        # The file is read only under gitlab, so a GitHub presubmit is not
+        # stopped by it; the roster test pins the file's content on main.
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "gitlab-cases.txt").unlink()
+            result = load_matrix({"EVAL_FORGE": "github"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class ArrayHygieneTest(unittest.TestCase):
     def test_the_files_are_disjoint(self):
         # An entry in both runs twice per nightly: six repetitions graded as
@@ -268,6 +437,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
+            "upgrades-audit-reports-upgrade-blocked",
         ):
             with self.subTest(audit=audit):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {audit}")
@@ -277,6 +447,16 @@ class ArrayHygieneTest(unittest.TestCase):
                     600,
                     f"{audit} is audit-shaped and must carry an explicit unit_cost_hint in the 600-1300s band, not the 200s default",
                 )
+
+    def test_the_refusal_case_is_priced_at_its_measured_cost(self):
+        # stop-on-permission-refusal is a noop, transcript-only case that runs
+        # the worker to its retries on main: measured 13-28 minutes a
+        # repetition on a dev install (2026-10-09). At the 200s default it
+        # would launch in the last cost tier, the one a deadline cut truncates.
+        hint_fn = lifted_block(r"^unit_cost_hint\(\) \{.*?^\}$")
+        result = run_bash(f"{hint_fn}\nunit_cost_hint stop-on-permission-refusal")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(int(result.stdout.strip()), 900)
 
     def test_the_version_control_cases_are_priced_above_the_default(self):
         # None is audit-shaped, so the check above does not reach them, and
@@ -504,10 +684,7 @@ def load_matrix_through_the_part(
             PRINT_ARRAYS,
         ]
     )
-    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "EVAL_TIER", "EVAL_NIGHTLY_PART", "BOOTSTRAP_ADMITTED")}
-    return subprocess.run(
-        ["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, check=False, env={**clean, **(env or {})}
-    )
+    return subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, check=False, env=clean_env(env))
 
 
 class NightlyPartTest(unittest.TestCase):
@@ -546,8 +723,10 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(len(self.nightly_matrix()) - len(expected), len(INJECT_LANE_REQUESTING))
         left_out = ",".join(pathlib.Path(e).parent.name for e in self.nightly_matrix() if self.is_writer(e))
         self.assertIn(f"Nightly part: main ({len(expected)} of {len(self.nightly_matrix())} cases); left out: {left_out}\n", result.stdout)
-        # Every roster case is in the main part, so its export is the file's.
-        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
+        # A roster case in the writers part (pdb-remediation-pr 2026-10-14 to
+        # 2026-10-17; none since its demotion, #3120) leaves the main part's
+        # export: the other part grades it.
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c not in INJECT_LANE_REQUESTING)])
 
     def test_writers_is_exactly_the_requesting_cases_in_matrix_order(self):
         result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
@@ -556,9 +735,11 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(tasks, [e for e in self.nightly_matrix() if self.is_writer(e)])
         self.assertEqual(sorted(pathlib.Path(t).parent.name for t in tasks), INJECT_LANE_REQUESTING)
         self.assertIn(f"Nightly part: writers ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
-        # No roster case runs, so the export names none: a roster name the
-        # suite never grades would trip bench-gate's misspelled-roster banner.
-        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
+        # The export is the roster intersected with the part: a roster name
+        # the suite never grades would trip bench-gate's misspelled-roster
+        # banner, so only requesting cases on the roster are named (none since
+        # pdb-remediation-pr's demotion of 2026-10-17, #3120: an empty export).
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in INJECT_LANE_REQUESTING)])
 
     def test_the_two_parts_cover_the_nightly_once(self):
         main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
@@ -568,10 +749,11 @@ class NightlyPartTest(unittest.TestCase):
 
     def test_writers_on_the_inject_lane_does_not_trip_the_lanes_roster_guard(self):
         # The guard stops a lane whose exclusions empty the export; a
-        # writers night empties it by design.
+        # writers night narrows it to the part's roster cases by design, and
+        # none of them is inject-excluded.
         result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers", "AGENT_TRANSPORT": "inject"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in INJECT_LANE_REQUESTING)])
 
     def test_an_unknown_part_is_refused(self):
         for tier in ("nightly", "presubmit"):

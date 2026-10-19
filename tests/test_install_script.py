@@ -1367,6 +1367,263 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertNotEqual(proc4.returncode, 0)
         self.assertIn("--migrate-node-pools must be either true or false.", proc4.stderr + proc4.stdout)
 
+    def test_parse_args_openai_compatible_flags(self):
+        cmd = (
+            "parse_args --model-provider=openai_compatible --model-default-name=m "
+            "--openai-compatible-api-base=https://llm.internal/v1 --openai-compatible-target-port=8000 "
+            "--openai-compatible-egress-cidrs=10.8.0.0/24,10.9.0.0/24 --openai-compatible-ca-secret-name=llm-ca "
+            "--openai-compatible-api-key=k; "
+            'echo "P=$PARAM_MODEL_PROVIDER M=$PARAM_MODEL_DEFAULT_NAME/$PARAM_MODEL_DEFAULT_NAME_PASSED '
+            "B=$PARAM_OPENAI_COMPATIBLE_API_BASE T=$PARAM_OPENAI_COMPATIBLE_TARGET_PORT "
+            "C=$PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS CA=$PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME "
+            'K=$PARAM_OPENAI_COMPATIBLE_API_KEY"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            "P=openai_compatible M=m/true B=https://llm.internal/v1 T=8000 "
+            "C=10.8.0.0/24,10.9.0.0/24 CA=llm-ca K=k",
+            proc.stdout,
+        )
+
+    def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
+        # The chart cannot render without these, and the operator drops the
+        # whole egress rule over one bad CIDR, so the installer stops before
+        # anything is built.
+        svc = "http://llm.models.svc.cluster.local/v1"
+        for args, message in (
+            (f'openai_compatible "" {svc} 8000 "" ""', "has no default model"),
+            ('openai_compatible m "" 8000 "" ""', "needs the server's base URL"),
+            ('openai_compatible m llm.models.svc/v1 8000 "" ""', "is not an http:// or https:// URL"),
+            ('openai_compatible m ftp://llm/v1 8000 "" ""', "is not an http:// or https:// URL"),
+            ('openai_compatible m http://user:pw@llm.internal/v1 "" 10.0.0.0/24 ""', "no userinfo"),
+            ('openai_compatible m "http://llm.internal?x=1" "" 10.0.0.0/24 ""', "no userinfo"),
+            ('openai_compatible m http://llm.internal:80x/v1 "" 10.0.0.0/24 ""', "is not an http://"),
+            ('openai_compatible m https://10.8.0.12/v1 "" "" ""', "names a private or IPv6 address"),
+            ('openai_compatible m https://100.64.0.1/v1 "" "" ""', "names a private or IPv6 address"),
+            ('openai_compatible m "https://[2001:db8::1]/v1" "" "" ""', "names a private or IPv6 address"),
+            ('openai_compatible m http://llm.internal:99999/v1 "" 10.0.0.0/24 ""', "is not an http://"),
+            (f'openai_compatible m {svc} "" "" ""', "names an in-cluster Service"),
+            ('openai_compatible m http://llm/v1 "" "" ""', "names an in-cluster Service"),
+            (f'openai_compatible m {svc} 8000/TCP "" ""', "is not a port"),
+            (f'openai_compatible m {svc} 70000 "" ""', "is not a port"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" "" ""', "set --openai-compatible-egress-cidrs"),
+            ('openai_compatible m http://llm.corp.example.com/v1 "" "" ""', "set --openai-compatible-egress-cidrs"),
+            ('openai_compatible m https://llm.corp.example.com:8443/v1 "" "" ""', "reached on port 8443"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 10.8.0.12 ""', "is not in CIDR form"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 10.0.0.0/8 ""', "is broader than /12"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 0.0.0.0/0 ""', "is broader than /12"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 169.254.169.254/32 ""', "overlaps link-local"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 169.240.0.0/12 ""', "overlaps link-local"),
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 10.0.0.0/24,300.0.0.0/24 ""', "is not an IPv4 CIDR"),
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" fe80::/64 ""', "overlaps IPv6 link-local"),
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" ::/0 ""', "is broader than /48"),
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" fd20:ce::/48 ""', "holds the IPv6 metadata server"),
+            # The chart refuses the metadata server's whole /48, not only the
+            # ranges holding fd20:ce::254, and every IPv4-mapped block.
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" fd20:ce:0:1::/64 ""', "is inside fd20:ce::/48"),
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" ::ffff:a00:0/120 ""', "IPv4-mapped"),
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" ::ffff:0:0/80 ""', "IPv4-mapped"),
+            # Go's parser, and so the operator, refuses a leading zero in an octet.
+            ('openai_compatible m http://10.8.0.12:8000/v1 "" 010.8.0.0/24 ""', "is not in CIDR form"),
+            # A trailing dot leaves an empty namespace label: not a Service.
+            ('openai_compatible m http://llm./v1 8000 "" ""', "OPENAI_COMPATIBLE_TARGET_PORT is not used"),
+            # The chart counts the empty label too, so this is a two-label host.
+            ('openai_compatible m https://llm./v1 8000 "" ""', "write it as <svc>.<ns>.svc"),
+            # Any host that is not a Service ignores a target port.
+            ('openai_compatible m https://vllm.corp.internal/v1 8000 "" ""', "OPENAI_COMPATIBLE_TARGET_PORT is not used"),
+            # Ends like a Service name, but has no namespace.
+            ('openai_compatible m https://vllm.svc/v1 "" "" ""', "ends like an in-cluster Service name"),
+            ('openai_compatible m https://llm.models.svc.k8s.cluster.local/v1 "" "" ""', "ends like an in-cluster Service name"),
+            # A lone trailing colon leaves an empty hextet the chart refuses.
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" fd00::1:/64 ""', "is not an IPv6 CIDR"),
+            # Two labels are a hostname, not <svc>.<ns>, even with a target port,
+            # and the refusal points at the .svc spelling of a Service.
+            ('openai_compatible m http://vllm.inference:8000/v1 "" "" ""',
+             "If this is an in-cluster Service, write it as <svc>.<ns>.svc (vllm.inference.svc)."),
+            ('openai_compatible m http://vllm.inference:8000/v1 8000 "" ""',
+             "write it as <svc>.<ns>.svc (vllm.inference.svc)"),
+            # On 443 too: the target port says a Service was meant.
+            ('openai_compatible m https://vllm.inference/v1 8443 "" ""',
+             "is a hostname, not an in-cluster Service"),
+            ('openai_compatible m "http://[fd00::5]:8000/v1" "" 1::2::3/64 ""', "is not an IPv6 CIDR"),
+            ('openai_compatible m https://llm.corp.example.com/v1 "" "" Bad_Name', "is not a valid Kubernetes Secret name"),
+            ('openai_compatible m https://llm.corp.example.com/v1 abc "" ""', "is not a port"),
+        ):
+            with self.subTest(args=args):
+                proc = self._run_install_func(f"{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs {args}")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(message, proc.stderr + proc.stdout)
+
+    def test_only_a_two_label_host_gets_the_svc_hint(self):
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs openai_compatible m http://llm.corp.example.com/v1 "" "" ""'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("<svc>.<ns>.svc", proc.stderr + proc.stdout)
+
+    def test_a_host_already_ending_in_svc_gets_no_svc_hint(self):
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs openai_compatible m http://vllm.svc:8000/v1 "" "" ""'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ends like an in-cluster Service name", proc.stderr + proc.stdout)
+        self.assertNotIn("vllm.svc.svc", proc.stderr + proc.stdout)
+
+    def test_plain_http_outside_the_cluster_warns_but_passes(self):
+        warning = "is plain http to a server outside the cluster"
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs openai_compatible m http://10.8.0.12:8000/v1 "" 10.8.0.0/24 ""'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(warning, proc.stderr + proc.stdout)
+        for args in (
+            'openai_compatible m http://llm.models.svc:80/v1 8000 "" ""',
+            'openai_compatible m https://llm.example.com/v1 "" "" ""',
+        ):
+            with self.subTest(args=args):
+                proc = self._run_install_func(f"{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs {args}")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn(warning, proc.stderr + proc.stdout)
+
+    def test_validate_openai_compatible_inputs_refuses_more_cidrs_than_the_operator_takes(self):
+        cidrs = ",".join(f"10.{i}.0.0/24" for i in range(51))
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs openai_compatible m http://10.0.0.1/v1 "" "{cidrs}" ""'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("lists 51 CIDRs", proc.stderr + proc.stdout)
+
+    def test_validate_openai_compatible_inputs_accepts_each_egress_shape_and_ignores_other_providers(self):
+        for args in (
+            # An in-cluster Service, in each shape the chart reads one.
+            'openai_compatible m http://llm.models.svc.cluster.local/v1 8000 "" ""',
+            'openai_compatible m http://llm.models.svc:80/v1 8000 "" ""',
+            'openai_compatible m http://llm/v1 8000 "" ""',
+            # The absolute spelling of a Service, with its trailing dot.
+            'openai_compatible m https://llm.models.svc.cluster.local./v1 8443 "" ""',
+            # A private address, reached through the CIDRs.
+            'openai_compatible m http://10.8.0.12:8000/v1 "" "10.8.0.0/24, 10.9.0.0/24" ""',
+            'openai_compatible m "http://[fd00::5]:8000/v1" "" fd00::/64 ""',
+            # A public endpoint on 443 rides the gateway's existing rule.
+            'openai_compatible m https://llm.example.com/v1 "" "" llm-ca',
+            'openai_compatible m http://llm.example.com:443/v1 "" "" ""',
+            'openai_compatible m https://8.8.8.8/v1 "" "" ""',
+            # A two-label host is a hostname, so a public one on 443 needs nothing.
+            'openai_compatible m https://openrouter.ai/api/v1 "" "" ""',
+            # A zero-padded port is the number, as the chart's atoi reads it.
+            'openai_compatible m https://llm.example.com:0443/v1 "" "" ""',
+            'openai_compatible m http://10.0.0.5:000080/v1 "" 10.0.0.0/24 ""',
+            'openai_compatible m https://example.ai./v1 "" "" ""',
+            # The chart lowercases the host before reading a namespace off it.
+            'openai_compatible m http://LLM.Models.svc.cluster.local/v1 8000 "" ""',
+            'gemini "" "" "" "" ""',
+        ):
+            with self.subTest(args=args):
+                proc = self._run_install_func(
+                    f"{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs {args}; echo rc=$?"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_the_openai_compatible_interview_asks_what_the_url_needs(self):
+        # prompt_read stubbed to echo each question with what "[default: …]"
+        # would show, and to keep the current value.
+        stub = ('prompt_read() { echo "ASK: $1 [${5:-${3:-}}]"; }\n'
+                f"{_SOURCE_INSTALLER_COMMON}")
+        for url, asked, not_asked in (
+            ("http://llm.models.svc.cluster.local/v1", "Server pod port", "Private ranges"),
+            ("https://llm.corp.example.com/v1", "Private ranges", "Server pod port"),
+            ("https://openrouter.ai/api/v1", "Private ranges", "Server pod port"),
+        ):
+            with self.subTest(url=url):
+                proc = self._run_install_func(
+                    stub + f'm=model u="{url}" p="" c="" k="sk-recorded" ca=""; '
+                    "prompt_openai_compatible_settings m u p c k ca"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(asked, proc.stdout)
+                self.assertNotIn(not_asked, proc.stdout)
+                # A recorded key is not echoed as the default.
+                self.assertIn("Server API key (optional) [the current key]", proc.stdout)
+                self.assertNotIn("sk-recorded", proc.stdout)
+
+    def test_the_interview_clears_the_egress_value_the_url_does_not_use(self):
+        # A target port kept from a Service URL would fail validation behind a
+        # prompt that is never shown once the URL is a hostname, and the other
+        # way round for CIDRs.
+        stub = ('prompt_read() { :; }\n'
+                f"{_SOURCE_INSTALLER_COMMON}")
+        for url, expected in (
+            ("https://openrouter.ai/api/v1", "p=[] c=[10.0.0.0/24]"),
+            ("http://llm.models.svc/v1", "p=[8000] c=[]"),
+        ):
+            with self.subTest(url=url):
+                proc = self._run_install_func(
+                    stub + f'm=model u="{url}" p=8000 c=10.0.0.0/24 k="" ca=""; '
+                    'prompt_openai_compatible_settings m u p c k ca; echo "p=[$p] c=[$c]"'
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(expected, proc.stdout)
+
+    def test_a_two_label_host_on_443_passes_with_the_svc_warning(self):
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs openai_compatible m https://llm.models/v1 "" "" ""'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("write it as <svc>.<ns>.svc (llm.models.svc)", proc.stdout + proc.stderr)
+
+    def test_a_url_carrying_userinfo_is_refused_without_echoing_it(self):
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}validate_openai_compatible_inputs openai_compatible m http://svc:sk-do-not-print@llm.models.svc/v1 8000 "" ""'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no userinfo", proc.stdout + proc.stderr)
+        self.assertNotIn("sk-do-not-print", proc.stdout + proc.stderr)
+
+    def test_the_interview_clear_answer_empties_a_recorded_optional_value(self):
+        # prompt_read stubbed to answer "-" to every optional question.
+        stub = ('prompt_read() { case "$1" in *optional*|*Private*) printf -v "$2" %s -;; esac; }\n'
+                f"{_SOURCE_INSTALLER_COMMON}")
+        proc = self._run_install_func(
+            stub + 'm=model u=https://llm.example.com/v1 p="" c=10.0.0.0/24 k=sk-old ca=llm-ca; '
+            'prompt_openai_compatible_settings m u p c k ca; echo "c=[$c] k=[$k] ca=[$ca]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # The key has no clear answer: the generator recovers an empty key from
+        # the live Secret, so "-" is kept as typed rather than promising a clear.
+        self.assertIn("c=[] k=[-] ca=[]", proc.stdout)
+
+    def test_only_a_recorded_other_provider_drops_the_model_name(self):
+        cases = (
+            # A model from the environment with no provider recorded is kept.
+            ("openai_compatible qwen false ''", "[qwen]"),
+            # A model pinned for another recorded provider is dropped...
+            ("openai_compatible gemini-3.7-flash false gemini", "[]"),
+            # ...unless --model-default-name was typed this run.
+            ("openai_compatible qwen true gemini", "[qwen]"),
+            # A re-run of a recorded openai_compatible install keeps its model.
+            ("openai_compatible qwen false openai_compatible", "[qwen]"),
+            # Other providers are untouched.
+            ("gemini gemini-3.7-flash false openai_compatible", "[gemini-3.7-flash]"),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                proc = self._run_install_func(f'echo "[$(openai_compatible_model_for_run {args})]"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(expected, proc.stdout)
+
+    def test_step_7_validates_openai_compatible_before_the_apply(self):
+        # Fail fast means before step 12 builds anything, on both paths that
+        # can switch the provider.
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {\n")
+        check = text.index("validate_openai_compatible_inputs", text.index('print_step "7. AI Model Provider', main_start))
+        self.assertLess(check, text.index('print_step "12. Applying the Install', main_start))
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        menu_check = text.index("validate_openai_compatible_inputs", arm)
+        self.assertLess(menu_check, text.index("save_env_var PROJECT_ID", arm))
+
     def test_validate_existing_cluster_opt_in_flags_accepts_valid_values(self):
         cmd = 'parse_args --enable-network-policy=true --migrate-node-pools=false; validate_existing_cluster_opt_in_flags'
         proc = self._run_install_func(cmd)
@@ -4993,6 +5250,59 @@ class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
         self.assertLess(exported, bootstrap)
 
 
+class AlertDailyLimitsRecordedInInstallEnvTest(unittest.TestCase):
+    """A first install records all four ALERT_DAILY_LIMIT_* keys, empty included.
+
+    No flag sets them, so the file is the only route. An empty line shows the
+    operator where to set a ceiling, and a key exported only for the first run
+    then also applies on every later upgrade.sh.
+    """
+
+    _KEYS = (
+        "ALERT_DAILY_LIMIT_CRITICAL",
+        "ALERT_DAILY_LIMIT_WARNING",
+        "ALERT_DAILY_LIMIT_INFO",
+        "ALERT_DAILY_LIMIT_DRIFT",
+    )
+
+    def _bootstrap(self, exported):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "new.install.env"
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("")
+            loaded.chmod(0o600)
+            env = get_isolated_test_env(overrides={
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            })
+            # A developer's own exported value must not stand in for the test's.
+            for key in self._KEYS:
+                env.pop(key, None)
+            env.update(exported)
+            proc = subprocess.run(
+                ["bash", "-c",
+                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 'source scripts/installer/installer_common.sh\n'
+                 'resolve_shared_defaults\n'
+                 'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+                 f'bootstrap_install_env_file "{dest}" some-tag >/dev/null'],
+                capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            return dest.read_text()
+
+    def test_the_first_install_records_all_four_keys_empty(self):
+        text = self._bootstrap({})
+        for key in self._KEYS:
+            with self.subTest(key=key):
+                self.assertRegex(text, re.compile(rf"^{key}=''$", re.MULTILINE))
+
+    def test_an_exported_key_is_recorded_with_its_value(self):
+        text = self._bootstrap({"ALERT_DAILY_LIMIT_DRIFT": "20"})
+        self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_DRIFT=20$", re.MULTILINE))
+        self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_WARNING=''$", re.MULTILINE))
+
+
 class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
     """The same walk for the LITELLM_REDACTION_* keys: the first run records
     what main() exported, the next run's parameter block and environment read
@@ -5396,7 +5706,7 @@ class PlatformAgentModeTest(unittest.TestCase):
                     self.assertIn("install.sh records --mode only where install.env assigns no PLATFORM_AGENT_MODE", out)
                     self.assertIn(
                         f"Set PLATFORM_AGENT_MODE={flag} in {path}, and re-run without --mode. "
-                        "On a running install that is a mode switch: docs/designs/spec-mode-switch.md.",
+                        "On a running install that is a mode switch: https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode.",
                         out,
                     )
                     # Not a key the Day-2 menu saves, so the menu is not offered.
@@ -5802,6 +6112,431 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
+    """#2812 on install.sh. A run whose mode is next (--mode=next, or
+    PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
+    hands Slack to the A2A gateway. It refuses an email in the allowlist, a
+    home channel that is not a channel id, or a list of bot tokens.
+
+    The step-6 call refuses as soon as the chat interview has settled those
+    values, before the generator, install.env or any apply. A second call
+    after the generator catches a bot token recovered from the live Secret,
+    still before install.env and the apply. The menu's apply checks before
+    it saves and again after its generator. The check itself is
+    refuse_next_slack_gateway_settings (tests/test_installer_common.py)."""
+
+    _CALL = (
+        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        '"$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" '
+        'flags || exit 1'
+    )
+    _STEP6_END = "\n  fi\n"
+    _ENV_CALL_MAIN = "  elif ! refuse_next_slack_gateway_settings_from_env flags; then\n"
+    _ENV_WARN_MAIN = '    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"\n'
+    _ENV_CALL_MENU = "        refuse_next_slack_gateway_settings_from_env || return 1\n"
+    _ENV_CALL_MENU_AFTER = "        if ! refuse_next_slack_gateway_settings_from_env; then\n"
+    _GENERATOR = (
+        "  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n"
+        "    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n"
+        '    write_tfvars_from_state "$tfvars_file" "$image_tag"\n'
+    )
+    _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
+    _MENU_ARM = '      6)\n        print_step "Saving & Re-applying Configuration State"\n'
+    _CHAT_STEP = '  print_step "6. Chat & Messaging Integrations Setup"\n'
+
+    _env = staticmethod(PlatformAgentModeTest._env)
+    _run = PlatformAgentModeTest._run
+    _file = PlatformAgentModeTest._file
+
+    def _chat_step(self):
+        """main()'s step 6 through the refusal, as a function: the real
+        interview code, run non-interactively, then the check."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CHAT_STEP, main_start)
+        end = text.index(self._STEP6_END, text.index(self._CALL, start)) + len(self._STEP6_END)
+        return f"_chat_step() {{\n{text[start:end]}\n}}\n"
+
+    def _step(self, flags, content):
+        stubs = (
+            "has_controlling_tty() { return 1; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            proc = self._run(
+                f"{stubs}{self._chat_step()}parse_args --non-interactive {flags}\n"
+                # As main's step 2 runs them.
+                "resolve_shared_defaults\n"
+                "validate_platform_agent_mode || exit 1\n"
+                "check_flags_against_install_env || exit 1\n"
+                # Set by steps 4 and 5; the no-chat arm prints them.
+                "project_id=p region=r cluster_name=c\n"
+                '_chat_step; echo "went on"',
+                install_env=path,
+            )
+            after = path.read_text()
+        self.assertEqual(after, content, "the refusal rewrote install.env")
+        return proc
+
+    def test_next_with_slack_on_the_gateway_refuses_each_setting_before_anything_is_written(self):
+        token = "xoxb-1-secretpart"
+        for flags, content, says in (
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,alice@example.com", "",
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\"U0123ABCD, alice@example.com\"\n",
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ("--mode=next --enable-slack --slack-home-channel=D0123ABCD", "",
+             "SLACK_HOME_CHANNEL is 'D0123ABCD', which is not a Slack channel id (C... or G...)."),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_HOME_CHANNEL=U0123ABCD\n",
+             "SLACK_HOME_CHANNEL is 'U0123ABCD', which is not a Slack channel id (C... or G...)."),
+            (f"--mode=next --enable-slack --slack-bot-token={token},{token}", "",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
+            ("", f"PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN={token},{token}\n",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
+        ):
+            with self.subTest(flags=flags.replace("secretpart", "*"), content=content.replace("secretpart", "*")):
+                proc = self._step(flags, content)
+                out = proc.stdout + proc.stderr
+                self.assertNotIn("went on", proc.stdout, out)
+                self.assertEqual(proc.returncode, 1, out)
+                self.assertIn(says, out)
+                self.assertIn("in install.env or --slack-", out)
+                self.assertNotIn("secretpart", out)
+
+    def test_the_cases_the_refusal_leaves_alone_go_on(self):
+        for flags, content in (
+            # next with member IDs, a channel id and one token.
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,W0456EFGH --slack-home-channel=C0123ABCD", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U0123ABCD\nSLACK_HOME_CHANNEL=G0123ABCD\n"),
+            # today: this change leaves the today path as it was.
+            ("--enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
+            ("", "PLATFORM_AGENT_MODE=today\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
+            # next without Slack: the Slack keys are inert.
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\nSLACK_ALLOWED_USERS=alice@example.com\n"),
+            # next with Chat and Slack: Chat holds the gateway, so Slack stays
+            # on the today path.
+            ("--mode=next --enable-google-chat --enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nGOOGLE_CHAT_ENABLED=true\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
+        ):
+            with self.subTest(flags=flags, content=content):
+                proc = self._step(flags, content)
+                out = proc.stdout + proc.stderr
+                self.assertIn("went on", proc.stdout, out)
+                self.assertNotIn("look like emails", out)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("SLACK_BOT_TOKEN holds", out)
+
+    def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        self.assertEqual(text.count(self._CALL), 1)
+        self.assertEqual(text.count(self._ENV_CALL_MAIN), 1)
+        self.assertEqual(text.count(self._ENV_WARN_MAIN), 1)
+        call = text.index(self._CALL, main_start)
+        # After the Slack prompts settle the values, so an interactive answer
+        # is checked too.
+        self.assertLess(text.index("      _prompt_slack_settings\n      ;;\n    4)", main_start), call)
+        self.assertLess(call, text.index('print_step "7. AI Model Provider Credentials"', main_start))
+        # The second call follows the generator's Secret recovery.
+        recovery = text.index("\n  require_slack_tokens_after_recovery\n", main_start)
+        env_call = text.index(self._ENV_CALL_MAIN, main_start)
+        self.assertLess(text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start), env_call)
+        self.assertLess(recovery, env_call)
+        for later in (
+            'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"',
+            "\n  record_flags_into_install_env\n",
+            "\n    record_flags_into_install_env\n",
+            'print_step "12. Applying the Install (Terraform + Helm)"',
+        ):
+            with self.subTest(later=later):
+                self.assertLess(call, text.index(later, main_start))
+                self.assertLess(env_call, text.index(later, main_start))
+
+    def test_the_menu_apply_refuses_before_it_saves_and_after_its_generator(self):
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        self.assertEqual(text.count(self._ENV_CALL_MENU), 1)
+        self.assertEqual(text.count(self._ENV_CALL_MENU_AFTER), 1)
+        first = text.index(self._ENV_CALL_MENU, arm)
+        second = text.index(self._ENV_CALL_MENU_AFTER, arm)
+        # After the export of the two toggles the menu edits, so the check
+        # reads them.
+        self.assertLess(text.index('export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"', arm), first)
+        self.assertLess(first, text.index("save_env_var PROJECT_ID", arm))
+        generator = text.index('write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"', arm)
+        self.assertLess(generator, second)
+        self.assertLess(second, text.index('run_lifecycle_apply "$repo_dir"', arm))
+
+
+    # ── the interview re-asks rather than refusing after it ──
+
+    def _interview(self, flags, content, answers, choice="2"):
+        """Step 6 on an interactive run: prompt_menu picks `choice`, and
+        prompt_read answers from `answers` in order, echoing each prompt."""
+        stubs = (
+            "has_controlling_tty() { return 0; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+            f'prompt_menu() {{ local v="${{!#}}"; printf -v "$v" "%s" "{choice}"; }}\n'
+            "ANSWERS=()\n"
+            + "".join(f"ANSWERS+=({shlex.quote(a)})\n" for a in answers)
+            + "ASKED=0\n"
+            # The default is echoed as prompt_read prints it ("[default: …]",
+            # the label over the value), so a secret shown there is caught.
+            # An answer of "<enter>" takes the default, as an empty one does.
+            'prompt_read() { echo "PROMPT: $1 [default: ${5:-${3:-}}]"; local a="${ANSWERS[$ASKED]}"; '
+            '[ "$a" = "<enter>" ] && a="${3:-}"; printf -v "$2" "%s" "$a"; ASKED=$((ASKED + 1)); }\n'
+        )
+        # The values are main()'s locals, so they are echoed inside the slice.
+        body, tail = self._chat_step().rsplit("\n}\n", 1)
+        step = (
+            body + '\n  echo "USERS=[$slack_allowed_users] HOME=[$slack_home_channel] '
+            'TOKENS=$(slack_bot_token_list_count "$slack_bot_token")"\n}\n' + tail
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            proc = self._run(
+                f"{stubs}{step}parse_args {flags}\n"
+                "resolve_shared_defaults\n"
+                "validate_platform_agent_mode || exit 1\n"
+                "check_flags_against_install_env || exit 1\n"
+                "project_id=p region=r cluster_name=c\n"
+                '_chat_step; echo "went on ASKED=$ASKED"',
+                install_env=path,
+            )
+        return proc
+
+    def test_the_interview_asks_for_what_the_gateway_takes_and_re_asks_a_bad_answer(self):
+        # Bot token, app token, allowlist, home channel, home name, with a
+        # bad answer before each of the three the gateway checks.
+        answers = ["xoxb-1-secretpart,xoxb-2-secretpart", "xoxb-1-secretpart", "xapp-1",
+                   "U0123ABCD,alice@example.com", "U0123ABCD", "D0123ABCD", "C0123ABCD", "#ops"]
+        proc = self._interview("--mode=next", "", answers)
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=8", proc.stdout, out)
+        self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
+        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
+        self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789)", out)
+        self.assertNotIn("User IDs / Emails", out)
+        self.assertNotIn("comma-separated for several workspaces", out)
+        # Each bad answer is named and asked again, once.
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one.", out)
+        self.assertIn("These look like emails: alice@example.com.", out)
+        self.assertIn("'D0123ABCD' is not a Slack channel id (C... or G...).", out)
+        self.assertEqual(out.count("PROMPT: Slack Bot Token"), 2)
+        self.assertEqual(out.count("PROMPT: Allowed Slack member IDs"), 2)
+        self.assertEqual(out.count("PROMPT: Slack Home Channel ID"), 2)
+        self.assertNotIn("secretpart", out)
+
+    def test_a_re_ask_offers_only_a_default_it_shows(self):
+        # Bot token: a stray comma, then one token. Allowlist: emails, then
+        # Enter, which keeps the refused list (an empty one would admit
+        # everyone) under a default that shows it, then IDs. Home channel: a
+        # DM, then Enter, which clears it.
+        answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
+                   "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
+                   "D0123ABCD", "<enter>", "#ops"]
+        proc = self._interview("--mode=next", "", answers)
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
+        self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
+        self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
+        self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
+                      "[default: U0123ABCD,alice@example.com]", out)
+        self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
+        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
+        self.assertNotIn("secretpart", out)
+
+    def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
+        answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
+        for flags, choice in (("", "2"), ("--mode=next", "3")):
+            with self.subTest(flags=flags, choice=choice):
+                chat = ["", "", "", ""] if choice == "3" else []
+                proc = self._interview(flags, "", chat + answers, choice=choice)
+                out = proc.stdout + proc.stderr
+                self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
+                # The today prompt (#2787's wording), not the gateway's.
+                self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)", out)
+                self.assertIn("PROMPT: Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)", out)
+                self.assertNotIn("look like emails", out)
+
+    # ── after the generator's Secret recovery ──
+
+    def _after_generator(self, keys, dry_run=False):
+        """main()'s run from the generator through "Terraform input saved",
+        with the generator stubbed to write the tfvars and recover a bot
+        token list from the live Secret, then a marker for the apply."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._GENERATOR, main_start)
+        end = text.index(self._SAVED, start) + len(self._SAVED)
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars = pathlib.Path(tmp) / "terraform.tfvars"
+            exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+            script = (
+                "write_tfvars_from_state() { echo 'slack_bot_token = \"xoxb-a,xoxb-b\"' > \"$1\"; "
+                "export SLACK_BOT_TOKEN='xoxb-1-secretpart,xoxb-2-secretpart'; "
+                "print_info \"Recovered SLACK_BOT_TOKEN from the live Secret\"; }\n"
+                f"{exports}"
+                f'tfvars_file="{tfvars}" image_tag=0.9.0 PARAM_MEMORY_EXPLICIT=true PARAM_DRY_RUN={"true" if dry_run else "false"}\n'
+                f"_after() {{\n{text[start:end]}\n}}\n"
+                '_after; echo "APPLIED"\n'
+            )
+            proc = self._run(script)
+            exists = tfvars.exists()
+        return proc, exists
+
+    def test_a_token_list_recovered_from_the_secret_is_refused_before_the_apply(self):
+        proc, exists = self._after_generator({
+            "PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "false",
+            "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": "",
+        })
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("Recovered SLACK_BOT_TOKEN", out)
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertIn("in install.env or --slack-bot-token and run again", out)
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("secretpart", out)
+        # The tfvars rendered the refused token, so it is removed rather than
+        # left for a --generate-only handoff or a manual lifecycle.sh apply.
+        self.assertFalse(exists)
+        self.assertIn("which carried the refused settings", out)
+
+    def test_a_recovered_single_token_or_chat_holding_the_gateway_goes_on(self):
+        for keys in (
+            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true"},
+        ):
+            with self.subTest(keys=keys):
+                proc, exists = self._after_generator({**keys, "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": ""})
+                out = proc.stdout + proc.stderr
+                self.assertIn("APPLIED", proc.stdout, out)
+                self.assertTrue(exists)
+
+    def test_a_dry_run_warns_instead_of_refusing(self):
+        proc, exists = self._after_generator({
+            "PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": "",
+            "SLACK_ALLOWED_USERS": "alice@example.com",
+        }, dry_run=True)
+        out = proc.stdout + proc.stderr
+        self.assertIn("APPLIED", proc.stdout, out)
+        self.assertIn("An applying run would be refused: SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertIn("An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails", out)
+        self.assertTrue(exists)
+
+    def test_a_dry_run_is_not_refused_at_the_interview(self):
+        proc = self._step("--dry-run --mode=next --enable-slack --slack-allowed-users=alice@example.com", "")
+        self.assertIn("went on", proc.stdout, proc.stdout + proc.stderr)
+
+    # ── the menu's Save & Apply ──
+
+    _MENU_GENERATOR_RECOVERS_A_LIST = (
+        "write_tfvars_from_state() { echo generated > \"$1\"; "
+        "export SLACK_BOT_TOKEN='xoxb-1-secretpart,xoxb-2-secretpart'; }\n"
+    )
+
+    def _menu_apply(self, generator, call='rc=0; _menu_apply || rc=$?; echo "rc=$rc"\n'):
+        """The menu's Save & Apply arm, run as a function with `generator`
+        standing in for write_tfvars_from_state. mktemp records each file it
+        makes, so a copy of install.env left behind can be found (macOS's
+        mktemp ignores TMPDIR when given no template)."""
+        text = _INSTALL_SH.read_text()
+        start = text.index(self._MENU_ARM) + len("      6)\n")
+        end = text.index("\n        ;;\n", start)
+        names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
+                 "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
+                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
+                 "openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
+                 "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id region "
+                 "repo_dir vertex_location vertex_project_id").split()
+        stubs = (
+            "resolve_effective_image_tag() { :; }\nvalidate_immutable_ref() { :; }\nverify_local_source_ref() { :; }\n"
+            "tf_compose_dir() { printf '%s' \"$TF_DIR\"; }\n"
+            f"{generator}"
+            "check_service_account_ownership() { :; }\ngke_dns_endpoint_flag() { :; }\ngcloud() { :; }\n"
+            "refuse_apply_over_undeclared_scope() { :; }\nrefuse_apply_dropping_live_gitops() { :; }\n"
+            "announce_platform_agent_mode_for_apply() { :; }\n"
+            "check_scope_container_access() { :; }\nenable_scope_selector_apis() { :; }\n"
+            'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle_apply() { echo "APPLIED terraform"; }\n'
+        )
+        content = "PROJECT_ID=p\nREGION=r\nPLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nGOOGLE_CHAT_ENABLED=false\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            tf_dir = pathlib.Path(tmp) / "tf"
+            tf_dir.mkdir()
+            made = pathlib.Path(tmp) / "mktemp.log"
+            made.touch()
+            script = (
+                f"{stubs}"
+                + "".join(f"{n}=v-{n}\n" for n in names)
+                + 'permission_set=read-only slack_enabled=true google_chat_enabled=false\n'
+                # An App ID is the App's number; the menu refuses anything else.
+                + 'github_app_id=12345\n'
+                f'TF_DIR="{tf_dir}" SLACK_BOT_TOKEN=""\n'
+                f'mktemp() {{ local p; p="$(command mktemp "$@")" || return; echo "$p" >>"{made}"; printf "%s\\n" "$p"; }}\n'
+                f"_menu_apply() {{\n{text[start:end]}\n}}\n"
+                f"{call}"
+            )
+            proc = self._run(script, install_env=path)
+            result = {
+                "content": content,
+                "after": path.read_text(),
+                "mode": stat.S_IMODE(path.stat().st_mode),
+                "tfvars_left": (tf_dir / "terraform.tfvars").exists(),
+                "leftovers": [m for m in made.read_text().split() if pathlib.Path(m).exists()],
+                "made": made.read_text().split(),
+            }
+        return proc, result
+
+    def test_the_menu_puts_install_env_back_when_the_check_after_its_generator_refuses(self):
+        proc, r = self._menu_apply(self._MENU_GENERATOR_RECOVERS_A_LIST)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("secretpart", out)
+        self.assertEqual(r["after"], r["content"], "install.env was left with the refused Save & Apply's keys")
+        self.assertEqual(r["mode"], 0o600)
+        self.assertFalse(r["tfvars_left"])
+        self.assertEqual(r["leftovers"], [], "the copy of install.env was left behind")
+        self.assertIn("put back as it was before this Save & Apply", out)
+
+    def test_the_menu_leaves_no_copy_of_install_env_when_its_generator_fails(self):
+        # The generator's own failures (no memory answer, say) exit through
+        # on_error, past both of the arm's clean-up paths. Called bare, as
+        # the menu calls it: under `||` the ERR trap would not fire.
+        proc, r = self._menu_apply("write_tfvars_from_state() { return 1; }\n",
+                                   call='_menu_apply; echo "rc=$?"\n')
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("rc=0", proc.stdout, out)
+        self.assertEqual(len(r["made"]), 1, out)
+        self.assertEqual(r["leftovers"], [], "the copy of install.env, with its credentials, was left behind")
+
+    def test_the_menu_leaves_no_copy_of_install_env_when_writing_it_fails(self):
+        # A full $TMPDIR: mktemp succeeds and the write fails. The trap is
+        # armed before the write, so the empty copy goes too.
+        failing_cat = ('cat() { if [ "$#" -eq 1 ] && [ "$1" = "$INSTALL_ENV_FILE" ]; then return 1; fi; '
+                       'command cat "$@"; }\n')
+        proc, r = self._menu_apply(failing_cat + "write_tfvars_from_state() { echo generated > \"$1\"; }\n",
+                                   call='_menu_apply; echo "rc=$?"\n')
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("APPLIED", out)
+        self.assertEqual(len(r["made"]), 1, out)
+        self.assertEqual(r["leftovers"], [], "the copy of install.env was left behind")
+
+    def test_the_menu_leaves_no_copy_of_install_env_after_a_clean_apply(self):
+        proc, r = self._menu_apply("write_tfvars_from_state() { echo generated > \"$1\"; }\n")
+        out = proc.stdout + proc.stderr
+        self.assertIn("APPLIED terraform", out)
+        self.assertEqual(r["leftovers"], [], out)
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""
@@ -5948,6 +6683,19 @@ class ChatInterviewInheritsAndStillAsksTest(unittest.TestCase):
         # And "None" is still what a non-interactive run with nothing
         # configured gets, rather than option 1.
         self.assertIn('chat_choice="${chat_choice:-4}"', chat_block)
+
+    def test_choosing_both_says_google_chat_holds_the_next_gateway(self):
+        """Under spec.mode next, Google Chat holds the A2A gateway when both
+        are enabled, so Slack is not on the gateway at all. The menu's "Both"
+        arm is where an installer who added Slack to the pre-selected Google
+        Chat makes that choice."""
+        arms = self._SOURCE.split('case "$chat_choice" in', 1)
+        self.assertEqual(2, len(arms), "the chat_choice case statement moved")
+        both_arm = arms[1].split("    3)\n", 1)[1].split(";;", 1)[0]
+        self.assertIn('slack_enabled="true"', both_arm)
+        self.assertIn('google_chat_enabled="true"', both_arm)
+        self.assertIn("Google Chat holds the A2A gateway", both_arm)
+        self.assertIn("choose Slack alone", both_arm)
 
 
 class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
@@ -6358,6 +7106,38 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         proc = self._warn("MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "4096"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
+
+    def test_a_switch_to_openai_compatible_names_its_keys_the_file_lacks(self):
+        """A file written for gemini never records the OPENAI_COMPATIBLE_* keys.
+
+        Skipping them as "not carried" told the operator to update only
+        MODEL_PROVIDER and MODEL_DEFAULT_NAME, and the next upgrade.sh then
+        stopped asking for the base URL the warning never mentioned.
+        """
+        proc = self._warn(
+            "MODEL_PROVIDER=gemini\nMODEL_DEFAULT_NAME=gemini-2.5-pro\n",
+            {
+                "MODEL_PROVIDER": "openai_compatible",
+                "MODEL_DEFAULT_NAME": "served-model",
+                "OPENAI_COMPATIBLE_API_BASE": "http://vllm.models.svc:8000/v1",
+                "OPENAI_COMPATIBLE_TARGET_PORT": "8000",
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("does not record", combined)
+        self.assertIn("MODEL_PROVIDER=openai_compatible", combined)
+        self.assertIn("OPENAI_COMPATIBLE_API_BASE=http://vllm.models.svc:8000/v1", combined)
+        self.assertIn("OPENAI_COMPATIBLE_TARGET_PORT=8000", combined)
+        self.assertIn("OPENAI_COMPATIBLE_EGRESS_CIDRS=", combined)
+        self.assertIn("OPENAI_COMPATIBLE_CA_SECRET_NAME=", combined)
+
+    def test_another_provider_switch_does_not_name_openai_compatible_keys(self):
+        proc = self._warn("MODEL_PROVIDER=gemini\n", {"MODEL_PROVIDER": "openai"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("MODEL_PROVIDER=openai", combined)
+        self.assertNotIn("OPENAI_COMPATIBLE_", combined)
 
     def test_settings_with_no_interview_question_are_not_listed(self):
         """ENABLE_GKE_BACKUP_PLAN and GVISOR_POOL_NAME are deliberately kept out
@@ -9866,6 +10646,24 @@ class DomainScopedFlagsTest(unittest.TestCase):
         self.assertIn("--slack-bot-token=TOKENS", help_text)
         self.assertRegex(help_text, r"Comma-separated Slack bot tokens")
 
+    def test_the_help_text_says_next_takes_one_bot_token(self):
+        """Under spec.mode next the A2A gateway authenticates one bot token, so
+        a list fails there with nothing in the PlatformAgent's status. The help
+        text is where a caller choosing the tokens reads the flag."""
+        proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        help_text = " ".join((proc.stdout + proc.stderr).split())
+        self.assertIn(
+            "Under --mode=next the A2A gateway serves one workspace: pass one token",
+            help_text,
+        )
+
 
 class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
     """--enable-slack with nobody to ask for the tokens is refused.
@@ -10775,12 +11573,15 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # (Y/n/g) prompt, where its route is known, so the g answer is the same
         # choice as the flag and a Y still refuses before step 12.
         gate_end = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
+        # The sink preflight rides the same route, one line under each call.
         preflight = self.text.index(
             'if [ "$PARAM_DRY_RUN" != "true" ]; then\n'
             '    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n'
             '      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n'
+            '      check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"\n'
             '    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then\n'
             '      check_scope_container_access || exit 1\n'
+            '      check_scope_export_sink_access || exit 1\n'
             '    fi\n'
             '  fi\n')
         summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
@@ -10788,9 +11589,9 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(preflight, summary)
         prompt = self.text.index('prompt_read "\\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)"')
         yes = self.text.index('      [Yy])\n', prompt)
-        yes_check = self.text.index('check_scope_container_access || exit 1', yes)
+        yes_check = self.text.index('check_scope_container_access || exit 1\n        check_scope_export_sink_access || exit 1\n', yes)
         g = self.text.index('      [Gg])\n', prompt)
-        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"', g)
+        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n        check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"\n', g)
         step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
         self.assertLess(summary, prompt)
         self.assertLess(yes, yes_check)
@@ -10820,11 +11621,13 @@ class ScopeCheckWiringTest(unittest.TestCase):
         fetch = menu.index('gcloud container clusters get-credentials "$cluster_name" --location "$REGION"')
         check = menu.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
         preflight = menu.index('check_scope_container_access || exit 1')
+        sinks = menu.index('check_scope_export_sink_access || exit 1')
         crds = menu.index('apply_crd_upgrades "$repo_dir"')
         apply = menu.index('run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-')
         self.assertLess(fetch, check)
         self.assertLess(check, preflight)
-        self.assertLess(preflight, crds)
+        self.assertLess(preflight, sinks)
+        self.assertLess(sinks, crds)
         self.assertLess(crds, apply)
 
     def test_the_selector_apis_are_enabled_where_the_apply_is_about_to_run(self):
@@ -10839,7 +11642,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(handoff, step12)
         self.assertLess(step12, enable)
         self.assertLess(enable, apply)
-        menu_check = self.text.index('        check_scope_container_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
+        menu_check = self.text.index('        check_scope_container_access || exit 1\n        check_scope_export_sink_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
         self.assertLess(menu_check, handoff)
 
     def test_the_dry_run_skips_its_plan_while_a_selector_api_is_off(self):
