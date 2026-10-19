@@ -16,7 +16,9 @@ ship it. This reads the shipped text instead:
   as `gke-observability` writes `gke:` and upstream writes `k8s:`, is stripped
   first);
 - no file calls an MCP write tool (`patch_k8s_resource(`, `create_cluster(`);
-- no shell or unlabelled fence runs a `kubectl`, `gcloud` or `helm` write.
+- no shell or unlabelled fence runs one of the `kubectl`, `gcloud` and `helm`
+  writes `WRITE_COMMAND_RE` names (a denylist: a verb or spelling it does not
+  list passes, so widen it when a sweep removes a new one; see #3483).
 
 One write is allowed: `gke-upgrades` writes a node-pool version change as the
 exact `gcloud container clusters upgrade --node-pool` command for the platform
