@@ -315,6 +315,9 @@ to run.
   commit, or a release the script does not itself carry. It is not part of upgrading to a published
   release. Mutable refs such as `latest`, `main` and `HEAD` are rejected, so the scripts and the
   container images always name the same revision.
+  A commit on `main` carries the chart's unstamped placeholder version, `0.1.0`, so
+  `helm history` and the plan show the chart moving from your release to `kube-agents-0.1.0`.
+  That is the placeholder, not a downgrade: only the release pipeline stamps the version.
 - `--keep-image-tag` upgrades everything except the images, leaving them on the tag the install
   already serves. It refuses `--image-tag`, because the two ask for opposite things — and since a
   release copy already carries a version, it refuses this flag as well. Run it from a checkout,
@@ -440,7 +443,9 @@ unsupported development stack. A file with no such line means `today`. Of `upgra
 full applies the key; a re-run of `install.sh` applies it too. Only the `install.sh` and
 `upgrade.sh` of releases after 0.9.0 read it, so upgrade to such a release first.
 [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
-has the rules for the key. This section covers what a switch does to chat: Google Chat first, then
+has the rules for the key, and
+[`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md)
+what a switch changes inside the install. This section covers what a switch does to chat: Google Chat first, then
 Slack, in order.
 
 ### Google Chat
@@ -527,8 +532,11 @@ It does not stop to ask. To stay on `today`, press Ctrl-C at that warning and se
 
 `--upgrade-mode=harness` and `--upgrade-mode=operator` leave the mode as it is and say that a full
 upgrade would switch it. If the run says instead that the `PlatformAgent` carries a `spec.mode` set
-outside the installer, the resource was patched by hand and the key cannot move it; the message
-says what to do.
+outside the installer, the resource was patched by hand (`kubectl patch`, as 0.9.0 needed). That
+mode survives upgrades, because Helm sees no change in a value the release already renders, so the
+run leaves the resource as it is. To bring the two together, patch `spec.mode` on the resource to
+the mode you want, or apply once with `PLATFORM_AGENT_MODE` set to the mode the resource carries and
+then again with the one you want.
 
 ### During the switch
 
@@ -595,7 +603,7 @@ kubectl get platformagent platform-agent -n kubeagents-system \
   DM or from any channel other than the home channel posts nothing after it: the gateway refuses
   the post and, with a home channel set, logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
   in a home-channel thread still posts its progress and report there. Either way its buttons stop
-  working, because the gateway does not take button clicks.
+  working: the gateway answers only the buttons it drew itself.
 - **The home channel only from `install.env`**, as in step 2 above.
 
 Slash commands, buttons, cards and the other Slack features that do not carry over are listed in
@@ -603,22 +611,13 @@ Slash commands, buttons, cards and the other Slack features that do not carry ov
 
 ### After the switch: the Slack app
 
-Once a DM gets an answer as in [Checking the result](#slack), change the app at
-<https://api.slack.com/apps> by hand:
-
-1. **Slash Commands**: delete every command.
-2. **Interactivity & Shortcuts**: turn **Interactivity** off.
-3. Check the app against the list under
-   [Slack app setup → Create the app](/kube-agents/install/slack-app/#create-the-app): the
-   **Messages** tab on, and the four `message.*` events with their history scopes. Leave other
-   events and scopes: the gateway acknowledges an event it does not use and ignores it. If you add
-   a scope, reinstall the app; Slack grants new scopes only on install.
-
-Do not paste the `next` manifest over the app: a manifest replaces the app's whole configuration,
-including its name and description. Change the app after the switch rather than before, because
-the `today` listener uses the slash commands and buttons until then. Between the switch and these
-changes, a slash command or a button gets Slack's timeout error, because the gateway does not
-acknowledge them.
+Once a DM gets an answer as in [Checking the result](#slack), edit the app as
+[Slack app setup → Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
+describes: delete the slash commands from its manifest and leave interactivity on, since the gateway
+answers the buttons it draws. Edit the app rather than pasting the `next` manifest over it: a
+manifest replaces the app's whole configuration, including its name. Do it after the switch rather
+than before, because the `today` listener answers slash commands until then. Until you do, a slash
+command gets Slack's timeout error.
 
 ### Switching back to `today`
 
@@ -642,7 +641,7 @@ acknowledge them.
    It prints `connected` once the broker has connected to Slack. If it prints nothing, read the
    broker's log as in [Checking the result](#slack).
 
-3. Put the slash commands and interactivity back. Print the `today` manifest:
+3. Put the slash commands back. Print the `today` manifest:
 
    ```bash
    kubectl exec deploy/platform-agent-gateway -c platform-agent -n kubeagents-system -- \
@@ -661,12 +660,37 @@ Conversations and cards started under `next` do not carry back, for the same rea
 To roll back to an older release, switch to `today` first:
 [Rolling back a release](/kube-agents/deploy/rollback/#before-you-start) says why.
 
+## The gateway's own ServiceAccount
+
+From the release in which the gateway Pod runs as its own ServiceAccount, an upgrade moves the
+gateway from the agent ServiceAccount (`spec.security.serviceAccountName`, `kubeagents-platform-agent`
+by default) to `<name>-gateway-agent`, which the operator creates with no annotation. The agent
+ServiceAccount, its Workload Identity annotation and its IAM binding stay where they are, with the
+credential broker, so neither Terraform nor IAM changes. The new ServiceAccount is bound to the same
+read-only `kubeagents:minimal` ClusterRole and the `kubeagents:local` and `kubeagents:leader` Roles
+the gateway already used.
+
+Two things an install may have added by hand do not follow the gateway:
+
+- **RBAC bound to your own ServiceAccount.** If you set `serviceAccountName` and bound extra roles to
+  it expecting the gateway to use them, the gateway no longer runs as it. Bind them to
+  `<name>-gateway-agent` if the gateway needs them; the broker keeps whatever is bound to yours.
+- **IAM granted to the gateway's Kubernetes identity directly.** A `principal://…/subject/ns/<ns>/sa/<sa>`
+  or namespace-wide `principalSet://` grant reaches whichever Pod runs as that ServiceAccount, and the
+  gateway's metadata path is closed, so such a grant no longer reaches the gateway. Anything in the
+  gateway that needs Google goes through the broker.
+
+To check: `kubectl get deployment platform-agent-gateway -n kubeagents-system -o
+jsonpath='{.spec.template.spec.serviceAccountName}'` prints `platform-agent-gateway-agent` for the
+chart's default name.
+
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first four are
-settled before the run touches the cluster at all. The last five need the cluster: they are settled
-after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
-skips those — but still before any CRD, chart or Terraform change of the new release.
+settled before the run touches the cluster at all. The last six need the cluster: they are settled
+after `kubectl` has been pointed at it, and except for the breaking-change check, after a real run's
+pre-flight Secret backfills — a plan skips those — but still before any CRD, chart or Terraform
+change of the new release.
 
 - **The sources do not match the release.** The checkout's `HEAD` is not the release's commit, the
   tree has uncommitted changes, or an unpacked tree names a release other than the one asked for —
@@ -687,6 +711,13 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   [Recovering `install.env`](#recovering-installenv).
 - **`GITHUB_APP_ID` is not a number.** The token minter needs the GitHub App's numeric ID, the "App
   ID" on the App's General settings page, not its name or slug. `--dry-run` refuses it too.
+- **The move leaves behind a commit marked as a breaking change.** When the target does not
+  contain the installed commit — a rollback to an older release, or a commit build moved to a
+  release that lacks some of its commits — the run reads the commits the target lacks. It stops
+  before the Secret backfills if any has a `type!:` subject or a `BREAKING CHANGE:` footer, and
+  names each one. Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan`
+  warns instead. A move between two release tags to the newer one is not checked, and neither is a
+  run whose tag is read off the install. See [Rolling back a release](/kube-agents/deploy/rollback/).
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store
