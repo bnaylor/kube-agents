@@ -494,7 +494,9 @@ gateway.
      channel only. A home channel set from Slack with `/sethome` is kept in the Planning Agent's
      profile, not in `install.env`, so it does not carry over. A DM ID (`D…`) or a channel name
      turns off the gateway's notify route, and with it the reports of board cards
-     ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)).
+     ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
+     channel those posts are dropped while conversations keep working: the run warns, and the
+     `PlatformAgent` carries the `HomeChannelUnset` condition.
 
 3. Check the board for cards in flight:
 
