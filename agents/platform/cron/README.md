@@ -288,9 +288,11 @@ runs the agent and broker pods as. The ServiceAccount's
 `iam.gke.io/gcp-service-account` annotation is the account the agent
 container's own credentials resolve to; the CR's
 `spec.security.workloadIdentityFederation`, when both its fields are set, is the
-one the broker impersonates instead, and both are checked. An absent annotation
-is said once, since the agent container then has no Google credential of its
-own. Then `gcloud projects get-iam-policy` runs for the management project and
+one the broker impersonates instead, and both are checked. With federation
+armed, an absent annotation is said once, since the agent container then has no
+Google credential of its own; with neither, there is no account to check and the
+job reports a check failure, once. A role bound to the ServiceAccount's own
+Workload Identity principal is not checked (#3450). Then `gcloud projects get-iam-policy` runs for the management project and
 each project in the resolved `spec.scope` (`fleet_scope_targets`), four at a
 time, and every role bound to one of those accounts that is not in the script's
 `READ_ONLY_ROLES` is a finding. `tests/test_agent_iam_ceiling.py` holds that

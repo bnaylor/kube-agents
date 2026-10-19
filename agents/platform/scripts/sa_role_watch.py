@@ -21,8 +21,10 @@ no model. Each tick:
    ``spec.security.workloadIdentityFederation`` names the one the credential
    broker impersonates when federation is armed. Without federation the broker
    runs on the annotation's account too, because both pods share the
-   ServiceAccount. An annotation that is absent is said once: the agent
-   container then has no Google credential of its own;
+   ServiceAccount. With federation armed, an absent annotation is said once:
+   the agent container then has no Google credential of its own. With neither
+   the annotation nor federation there is no account to check, and the tick
+   reports a check failure, once;
 2. lists the projects: the management project and the resolved
    ``spec.scope`` set the cluster-agent reconcile snapshots
    (``fleet_scope_targets``), or the management project alone when no scope is
@@ -46,7 +48,9 @@ mutates anything.
 What it cannot see. ``projects get-iam-policy`` returns the bindings on the
 project itself. A role granted on a folder or the organisation above it, or to
 a group the account is a member of, is not in that answer, and reading those
-would take verbs the broker does not allow. A ``custom`` permission set chosen
+would take verbs the broker does not allow. A role bound to the ServiceAccount's
+own Workload Identity principal (``principal://.../subject/ns/<ns>/sa/<ksa>``)
+is in the answer but not checked: only Google service accounts are (#3450). A ``custom`` permission set chosen
 on purpose is reported like any other grant beyond ``read-only``: nothing at
 runtime knows which roles the installer was given.
 """
@@ -297,7 +301,8 @@ def projects_to_check(management: str) -> tuple[list[str], str | None, bool]:
         notes.append(UNRESOLVED_SCOPE_NOTE)
         complete = False
     if over_cap:
-        shown = code_list(over_cap[:MAX_PROJECTS_IN_NOTE])
+        # Plain text: the note is posted inside the failure line's code span.
+        shown = ", ".join(sorted(over_cap[:MAX_PROJECTS_IN_NOTE]))
         rest = len(over_cap) - MAX_PROJECTS_IN_NOTE
         notes.append(f"{len(over_cap)} project(s) past the scope's maxProjects are not checked: {shown}" + (f" and {rest} more" if rest > 0 else ""))
     return list(dict.fromkeys(checked)), "; ".join(notes) or None, complete

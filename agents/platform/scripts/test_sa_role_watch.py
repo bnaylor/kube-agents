@@ -199,6 +199,9 @@ class DriftIsReportedOnChange(WatchTest):
         self.assertEqual(1, len(lines), lines)
         self.assertIn(f"{len(over)} project(s) past the scope's maxProjects", lines[0])
         self.assertIn("and 2 more", lines[0])
+        # The note sits inside the failure line's code span, so it carries no backticks of its own.
+        self.assertEqual(0, lines[0].count("`") % 2, lines[0])
+        self.assertRegex(lines[0], r"`[^`]*over-0[^`]*and 2 more`")
         self.assertEqual([], self.tick(sandbox))
 
     def test_a_numeric_management_project_is_read_once(self):
