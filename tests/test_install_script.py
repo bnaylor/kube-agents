@@ -1386,6 +1386,58 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             proc.stdout,
         )
 
+    def test_parse_args_litellm_env_secret_flag(self):
+        cmd = (
+            "parse_args --model-provider=sap --litellm-env-secret=sap-aicore; "
+            'echo "P=$PARAM_MODEL_PROVIDER S=$PARAM_LITELLM_ENV_SECRET_NAME"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("P=sap S=sap-aicore", proc.stdout)
+
+    def test_the_slug_prompt_gives_up_without_a_tty_instead_of_looping(self):
+        # Without a tty prompt_read answers with the default every time, so a
+        # prompt that waited for a valid answer would never return; the
+        # function returns 1 and leaves the caller's variables alone. Interactive,
+        # a typo is asked again (the pty case lives with the other prompt tests).
+        cmd = (
+            'source_provisioning_helpers "$PWD" >/dev/null; '
+            'PARAM_NON_INTERACTIVE="false"; has_controlling_tty() { return 1; }; '
+            'model_provider="v-llm"; model_default_name="m"; litellm_env_secret_name="s"; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC=${rc:-0} P=$model_provider M=$model_default_name S=$litellm_env_secret_name"; '
+            'model_provider="azure"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC2=${rc:-0} P2=$model_provider M2=[$model_default_name]"; '
+            'model_provider="sap"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC3=${rc:-0} P3=$model_provider M3=$model_default_name"; '
+            # A keyed table provider typed at the slug prompt belongs to its own
+            # entry: refused, variables untouched. prompt_read is stubbed to type
+            # it, since the seed for a recorded gemini is sap.
+            'typed() { case "$1" in *slug*) printf -v "$2" %s gemini;; *) printf -v "$2" %s "$3";; esac; }; '
+            'real_prompt_read=$(declare -f prompt_read); eval "${real_prompt_read/prompt_read/orig_prompt_read}"; '
+            'prompt_read() { typed "$@"; }; '
+            'model_provider="gemini"; model_default_name="m"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC4=${rc:-0} P4=$model_provider M4=$model_default_name"; '
+            'eval "${real_prompt_read}"; '
+            # A Secret name Kubernetes would refuse: refused here, variables untouched.
+            'model_provider="sap"; model_default_name="m"; litellm_env_secret_name="SAP-AICore"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC5=${rc:-0} P5=$model_provider M5=$model_default_name S5=$litellm_env_secret_name"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=1 P=v-llm M=m S=s", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("is not a LiteLLM provider slug", proc.stdout + proc.stderr)
+        self.assertIn("RC2=1 P2=azure M2=[]", proc.stdout)
+        self.assertIn("A model name is required", proc.stdout + proc.stderr)
+        self.assertIn("RC3=0 P3=sap M3=anthropic--claude-4.5-sonnet", proc.stdout)
+        self.assertIn("RC4=1 P4=gemini M4=m", proc.stdout)
+        self.assertIn("has its own entry in the provider menu", proc.stdout + proc.stderr)
+        self.assertIn("RC5=1 P5=sap M5=m S5=SAP-AICore", proc.stdout)
+        self.assertIn("is not a valid Kubernetes Secret name", proc.stdout + proc.stderr)
+
     def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
         # The chart cannot render without these, and the operator drops the
         # whole egress rule over one bad CIDR, so the installer stops before
@@ -6769,11 +6821,12 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
 
     # ── the interview re-asks rather than refusing after it ──
 
-    def _interview(self, flags, content, answers, choice="2"):
+    def _interview(self, flags, content, answers, choice="2", locale=None):
         """Step 6 on an interactive run: prompt_menu picks `choice`, and
         prompt_read answers from `answers` in order, echoing each prompt."""
         stubs = (
-            "has_controlling_tty() { return 0; }\n"
+            (f"export LC_ALL={locale}\n" if locale else "")
+            + "has_controlling_tty() { return 0; }\n"
             "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
             "tf_state_chat_subscription_name() { :; }\n"
             f'prompt_menu() {{ local v="${{!#}}"; printf -v "$v" "%s" "{choice}"; }}\n'
@@ -6866,6 +6919,22 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # A home channel given at once is not questioned.
         proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
         self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
+
+    def test_a_home_channel_of_unicode_space_under_next_is_confirmed(self):
+        # The operator trims with strings.TrimSpace, so such an answer is no
+        # home channel at all; [[:space:]] misses it in the C locale.
+        for locale in ("C", "en_US.UTF-8"):
+            with self.subTest(locale=locale, platform="slack"):
+                lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+                proc = self._interview("--mode=next", "", lead + ["\u00a0", "n", "C0123ABCD", "#ops"], locale=locale)
+                out = proc.stdout + proc.stderr
+                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+            with self.subTest(locale=locale, platform="google_chat"):
+                proc = self._interview("--mode=next", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
+                out = proc.stdout + proc.stderr
+                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("went on ASKED=5", proc.stdout, out)
 
     def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
         # #3320 on Chat, which holds the gateway whenever it is enabled under
@@ -6985,8 +7054,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         end = text.index("\n        ;;\n", start)
         names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
                  "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
-                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
-                 "openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
+                 "google_chat_home_channel image_tag kms_key kms_keyring litellm_env_secret_name model_default_name "
+                 "model_provider openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
                  "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id region "
                  "repo_dir vertex_location vertex_project_id").split()
         stubs = (
