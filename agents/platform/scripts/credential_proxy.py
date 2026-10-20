@@ -100,7 +100,10 @@ HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
 # reported it missing from the fleet (#3371, #3375). So a NotFound or an empty
 # answer to such a read gets one line naming the cluster it ran on. Appended to
 # stderr, so stdout -- often parsed as JSON -- is untouched; the exit code is
-# never changed; and a read that found something gets nothing.
+# never changed; and any other result is returned as it came. The trigger is
+# the output's shape, not the cluster's state, so a partial NotFound
+# (`get ns a b`, one missing) or an existing pod with no logs gets the line too;
+# it only says where the read went, which is true either way.
 #
 # The wording is a plain statement of where the read went. It must stay clear
 # of what the refusal stop reads (deploy/docker/patches/permission_refusal_stop.py:
@@ -3424,8 +3427,8 @@ def _kubectl_output_is_empty(stdout: str) -> bool:
     """Did a successful kubectl read print nothing, or a list with no items?
 
     "No resources found" goes to stderr, leaving stdout empty; `-o json` and
-    `-o yaml` print an empty `List` instead. Anything longer than an empty list
-    can be is not parsed.
+    `-o yaml` print an empty `List` instead, and `-o jsonpath='{.items}'` a
+    bare `[]`. Anything longer than an empty list can be is not parsed.
     """
     text = stdout.strip()
     if not text:
@@ -3438,6 +3441,8 @@ def _kubectl_output_is_empty(stdout: str) -> bool:
         document = json.loads(text)
     except ValueError:
         return False
+    if document == []:
+        return True
     return (
         isinstance(document, dict)
         and document.get(KUBECTL_LIST_ITEMS_KEY) == []

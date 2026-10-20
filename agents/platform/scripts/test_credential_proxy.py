@@ -5747,6 +5747,49 @@ class ContextlessKubectlHostHintTest(unittest.TestCase):
 
         self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
 
+    def test_other_empty_list_shapes_get_the_line(self):
+        for stdout in (
+            "apiVersion: v1\nitems: []\nkind: List\nmetadata:\n  resourceVersion: \"\"\n",
+            "[]",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "pods", "-o", "yaml"])
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_an_object_with_an_empty_items_field_is_not_an_empty_list(self):
+        for stdout in (
+            json.dumps({"kind": "Widget", "items": []}),
+            "apiVersion: example.com/v1\nitems: []\nkind: Widget\n",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "widget", "w", "-o", "yaml"])
+                self.assertEqual("", result.stderr)
+
+    def test_a_verb_that_is_not_a_lookup_is_unchanged(self):
+        # api-resources and version print nothing about objects on a cluster.
+        for argv in (
+            ["kubectl", "api-resources", "--api-group=nope"],
+            ["kubectl", "auth", "can-i", "get", "pods"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor()
+                result = executor.execute(argv)
+                self.assertEqual("", result.stderr)
+
+    def test_a_cut_or_timed_out_result_is_unchanged(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+        for field in ("truncated", "timed_out", "abandoned"):
+            with self.subTest(field=field):
+                came = credential_proxy.ExecutionResult(
+                    exit_code=1, stdout="", stderr=_KUBECTL_NOT_FOUND_STDERR,
+                    duration_ms=1, truncated=False, timed_out=False,
+                )
+                came = replace(came, **{field: True})
+                self.assertIs(came, executor._with_host_hint(["kubectl", "get", "ns", "x"], came))
+
     def test_a_failure_that_is_not_not_found_is_unchanged(self):
         stderr = 'error: the server doesn\'t have a resource type "pdbx"'
         executor = self.executor(stderr=stderr, exit_code=1)
