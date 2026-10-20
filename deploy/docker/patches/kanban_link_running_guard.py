@@ -63,6 +63,7 @@ which reports unknown ids and cycles itself.
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,17 @@ RUNNING_REFUSAL = (
     "kanban_link refused: {child} is already running and reports back when it "
     "finishes; a link now would make it wait for {parent} and strand its run. "
     "No link is needed: wait for its result."
+)
+
+#: For the caller's own card as the child (``HERMES_KANBAN_TASK`` is the
+#: child): a worker that wants its card to wait for a helper. The link would
+#: make ``complete_task`` fail on its own card mid-run, and the way to wait is
+#: to keep the card open and poll the helper, as SOUL section 0 says.
+OWN_CARD_REFUSAL = (
+    "kanban_link refused: {child} is your own card and it is already running, "
+    "so a link would make it wait for {parent} and refuse your own completion. "
+    "To wait for {parent}, keep your card open and check it with kanban_show "
+    "until it settles."
 )
 
 #: For a child with a run on record that isn't running now (blocked, done,
@@ -120,6 +132,8 @@ def refuse_started_child_link(kb, conn, parent_id: str, child_id: str) -> str | 
         )
         return None
     template, status = started
+    if template == RUNNING_REFUSAL and os.environ.get("HERMES_KANBAN_TASK") == child_id:
+        template = OWN_CARD_REFUSAL
     logger.warning(
         "kanban_link_running_guard: refused kanban_link %s -> %s: the child "
         "has already started (status %s)", parent_id, child_id, status,

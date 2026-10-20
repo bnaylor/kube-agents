@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 
 import ast
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -178,6 +179,31 @@ class TestThePatchedHandler(Board):
         )
         self.assertEqual(self.links(), [])
         self.assertEqual(self.status(CHILD), "running")
+
+    def test_the_callers_own_card_as_child_is_told_to_poll_the_parent(self):
+        # Round 3 of review: kanban_link(parent=<helper>, child=<own card>)
+        # is refused like any running child, but "wait for its result" would
+        # tell the worker to wait for itself.
+        self.card(CHILD, "running", claim_lock="gw:1", run="running")
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": CHILD}):
+            out = self.link()
+        self.assertEqual(
+            out.get("error"),
+            f"kanban_link refused: {CHILD} is your own card and it is already running, "
+            f"so a link would make it wait for {PARENT} and refuse your own completion. "
+            f"To wait for {PARENT}, keep your card open and check it with kanban_show "
+            "until it settles.",
+        )
+        self.assertEqual(self.links(), [])
+        self.assertEqual(self.status(CHILD), "running")
+
+    def test_a_worker_linking_someone_elses_running_card_gets_the_running_text(self):
+        self.card(CHILD, "running", claim_lock="gw:1", run="running")
+        for env in ({"HERMES_KANBAN_TASK": PARENT}, {}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=False):
+                if not env:
+                    os.environ.pop("HERMES_KANBAN_TASK", None)
+                self.assertEqual(self.link().get("error"), self.running_text())
 
     def test_a_claimed_child_not_yet_running_is_refused(self):
         self.card(CHILD, "ready", claim_lock="gw:1")
