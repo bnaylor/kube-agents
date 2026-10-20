@@ -75,9 +75,11 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     API_RELAY_PREFIX,
+    CONTEXT_FLAG,
     END_OF_FLAGS,
     KUBECONFIG_FLAG,
     ClusterTarget,
+    kubectl_context_flag,
     parse_gke_context,
     read_current_context,
 )
@@ -90,6 +92,47 @@ SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 # request that names no cluster resolves to this rather than to whatever the
 # base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# A kubectl read that names no cluster -- no `--context`, no `--kubeconfig`, no
+# KUBECONFIG forwarded by the shim -- runs on the host cluster through the
+# broker's default kubeconfig. When it finds nothing, the caller cannot tell
+# "absent" from "absent on the host": a worker read a namespace on the host and
+# reported it missing from the fleet (#3371, #3375). So a NotFound or an empty
+# answer to such a read gets one line naming the cluster it ran on. Appended to
+# stderr, so stdout -- often parsed as JSON -- is untouched; the exit code is
+# never changed; and a read that found something gets nothing.
+#
+# The wording is a plain statement of where the read went. It must stay clear
+# of what the refusal stop reads (deploy/docker/patches/permission_refusal_stop.py:
+# the action boundary notice, the `policy rule:`/`policy verb:` lines, and the
+# API-denial shapes), so the hint is never counted as a refusal or a halt.
+# test_credential_proxy.ContextlessKubectlHostHintTest holds it to that.
+KUBECTL_HOST_HINT_VERBS = frozenset({"get", "describe", "events", "logs", "top"})
+# kubectl's prefix for a server NotFound, the only "nothing there" a failed read
+# carries. A client-side "not found" (an unknown resource type, a context the
+# kubeconfig lacks) is a different fault and gets no hint.
+KUBECTL_NOT_FOUND_MARKER = "Error from server (NotFound)"
+# An empty list in `-o json`/`-o yaml` is a few hundred bytes; anything longer
+# has items and is not parsed at all.
+KUBECTL_EMPTY_LIST_PROBE_BYTES = 4096
+# Only a list kind counts, so an object that happens to carry an `items` field
+# of its own is never read as an empty answer.
+KUBECTL_LIST_ITEMS_KEY = "items"
+KUBECTL_LIST_KIND_KEY = "kind"
+KUBECTL_LIST_KIND_SUFFIX = "List"
+KUBECTL_EMPTY_YAML_ITEMS_RE = re.compile(r"^items: \[\]\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_KIND_RE = re.compile(r"^kind: \S*List\s*$", re.MULTILINE)
+KUBECTL_HOST_HINT_PREFIX = "[credential-proxy] "
+KUBECTL_HOST_HINT_NAMED = (
+    "This kubectl named no cluster, so it read the host cluster {cluster}"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
+KUBECTL_HOST_HINT_UNNAMED = (
+    "This kubectl named no cluster, so it read this install's host cluster"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
 
 # Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
 # control plane that is down, private or firewalled parks a broker worker for
@@ -3377,6 +3420,31 @@ def _is_get_credentials(argv: list[str]) -> bool:
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
 
 
+def _kubectl_output_is_empty(stdout: str) -> bool:
+    """Did a successful kubectl read print nothing, or a list with no items?
+
+    "No resources found" goes to stderr, leaving stdout empty; `-o json` and
+    `-o yaml` print an empty `List` instead. Anything longer than an empty list
+    can be is not parsed.
+    """
+    text = stdout.strip()
+    if not text:
+        return True
+    if len(text) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
+        return False
+    if KUBECTL_EMPTY_YAML_ITEMS_RE.search(text) and KUBECTL_YAML_LIST_KIND_RE.search(text):
+        return True
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return False
+    return (
+        isinstance(document, dict)
+        and document.get(KUBECTL_LIST_ITEMS_KEY) == []
+        and str(document.get(KUBECTL_LIST_KIND_KEY, "")).endswith(KUBECTL_LIST_KIND_SUFFIX)
+    )
+
+
 def _kubectl_runs_long(argv: list[str]) -> bool:
     """Is this a kubectl that is meant to block, rather than a one-shot read?
 
@@ -6041,7 +6109,7 @@ class CommandExecutor:
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
-        return self._execute(
+        result = self._execute(
             command,
             stdin=stdin,
             cwd=cwd,
@@ -6049,6 +6117,47 @@ class CommandExecutor:
             timeout_seconds=kubectl_deadline,
             caller=caller,
         )
+        # Read off the caller's argv, not `command`: the request timeout added
+        # above is not the caller's, and a rerouted `--kubeconfig` is already
+        # in `flag_kubeconfig`.
+        if (
+            executable == "kubectl"
+            and flag_kubeconfig is None
+            and not kubeconfig_context
+            and kubectl_context_flag(argv) is None
+        ):
+            return self._with_host_hint(argv, result)
+        return result
+
+    def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
+        """`result`, plus a line naming the host when a context-less read found nothing.
+
+        See KUBECTL_HOST_HINT_VERBS. Only a read verb, only a server NotFound or
+        an empty answer, and never a result that was cut, timed out or
+        abandoned: what those say about the cluster is unknown. stdout and the
+        exit code are returned as they came.
+        """
+        if result.truncated or result.timed_out or result.abandoned:
+            return result
+        verb, _ = command_policy._kubectl_verb_and_flag(argv)
+        if not verb or verb[0] not in KUBECTL_HOST_HINT_VERBS:
+            return result
+        if result.exit_code == 0:
+            found_nothing = _kubectl_output_is_empty(result.stdout)
+        else:
+            found_nothing = KUBECTL_NOT_FOUND_MARKER in result.stderr
+        if not found_nothing:
+            return result
+        target = self._ambient_target()
+        hint = (
+            KUBECTL_HOST_HINT_NAMED.format(cluster=target.context_name)
+            if target is not None
+            else KUBECTL_HOST_HINT_UNNAMED
+        )
+        stderr = result.stderr
+        if stderr and not stderr.endswith("\n"):
+            stderr += "\n"
+        return replace(result, stderr=f"{stderr}{KUBECTL_HOST_HINT_PREFIX}{hint}\n")
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None

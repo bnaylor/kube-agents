@@ -5616,6 +5616,179 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIn("exit code 9", logged)
 
 
+# The refusal stop the hint must never trip, loaded from its file: it ships in
+# the agent image, not beside this module.
+_REFUSAL_STOP_PATH = (
+    Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches" / "permission_refusal_stop.py"
+)
+# What kubectl prints for the reads below.
+_KUBECTL_NOT_FOUND_STDERR = 'Error from server (NotFound): namespaces "seeded-reliability" not found'
+_KUBECTL_NO_RESOURCES_STDERR = "No resources found in seeded-reliability namespace."
+_KUBECTL_EMPTY_JSON_LIST = '{"apiVersion": "v1", "items": [], "kind": "List", "metadata": {"resourceVersion": ""}}'
+_KUBECTL_FOUND_STDOUT = "NAME     READY   STATUS    RESTARTS   AGE\ncheckout-gateway-0   1/1   Running   0   3d\n"
+
+
+class ContextlessKubectlHostHintTest(unittest.TestCase):
+    """A context-less kubectl read that finds nothing says it read the host (#3375)."""
+
+    HOST = "gke_demo-project_us-central1_host-cluster"
+    OTHER = "gke_demo-project_us-central1-a_seeded-a"
+
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_dir = Path(temp_dir.name)
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+
+    def executor(self, stdout="", stderr="", exit_code=0):
+        """An executor whose kubectl prints `stdout`/`stderr` and exits `exit_code`.
+
+        The pool is off, so no kubeconfig is regenerated; `host_context` is the
+        operator's name for the host, which is what the hint reads.
+        """
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(self.temp_dir / "state"),
+            scoped_pool=None,
+        )
+        executor.host_context = self.HOST
+        stub_dir = self.temp_dir / "bin"
+        stub_dir.mkdir(exist_ok=True)
+        (stub_dir / "stdout").write_text(stdout, encoding="utf-8")
+        (stub_dir / "stderr").write_text(stderr, encoding="utf-8")
+        stub = stub_dir / "kubectl"
+        stub.write_text(
+            f'#!/bin/bash\ncat "{stub_dir}/stdout"\ncat "{stub_dir}/stderr" >&2\nexit {exit_code}\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def hint_named(self, cluster):
+        return credential_proxy.KUBECTL_HOST_HINT_PREFIX + credential_proxy.KUBECTL_HOST_HINT_NAMED.format(
+            cluster=cluster
+        )
+
+    def test_a_contextless_get_that_is_not_found_names_the_host_cluster(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+
+        result = executor.execute(["kubectl", "get", "namespace", "seeded-reliability"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertIn("--context <name>", result.stderr)
+        self.assertEqual(1, result.exit_code)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(
+            f"{_KUBECTL_NOT_FOUND_STDERR}\n{self.hint_named(self.HOST)}\n", result.stderr
+        )
+
+    def test_a_contextless_list_with_no_resources_gets_the_line(self):
+        executor = self.executor(stderr=_KUBECTL_NO_RESOURCES_STDERR + "\n")
+
+        result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("", result.stdout)
+        self.assertTrue(result.stderr.startswith(_KUBECTL_NO_RESOURCES_STDERR + "\n"))
+        self.assertTrue(result.stderr.endswith(self.hint_named(self.HOST) + "\n"))
+
+    def test_a_contextless_empty_json_list_keeps_its_stdout_and_gets_the_line(self):
+        executor = self.executor(stdout=_KUBECTL_EMPTY_JSON_LIST)
+
+        result = executor.execute(["kubectl", "get", "pdb", "-A", "-o", "json"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(_KUBECTL_EMPTY_JSON_LIST, result.stdout)
+        self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_contextless_read_that_found_something_is_unchanged(self):
+        executor = self.executor(stdout=_KUBECTL_FOUND_STDOUT, stderr="Warning: something\n")
+
+        result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(_KUBECTL_FOUND_STDOUT, result.stdout)
+        self.assertEqual("Warning: something\n", result.stderr)
+
+    def test_a_non_empty_json_list_is_unchanged(self):
+        listed = json.dumps({"kind": "List", "items": [{"kind": "Pod"}]})
+        executor = self.executor(stdout=listed)
+
+        result = executor.execute(["kubectl", "get", "pods", "-o", "json"])
+
+        self.assertEqual(listed, result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_a_read_with_context_that_is_not_found_is_unchanged(self):
+        for argv in (
+            ["kubectl", "--context", self.OTHER, "get", "namespace", "seeded-reliability"],
+            ["kubectl", f"--context={self.OTHER}", "get", "namespace", "seeded-reliability"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+                result = executor.execute(argv)
+                self.assertEqual(1, result.exit_code)
+                self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
+
+    def test_a_read_through_a_forwarded_kubeconfig_is_unchanged(self):
+        # The shim sends KUBECONFIG (or the shell's pin, or a GKE `--context`)
+        # as `kubeconfig_context`; that read named its cluster.
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+
+        with mock.patch.object(executor, "_resolve_kubeconfig", return_value=None):
+            result = executor.execute(
+                ["kubectl", "get", "namespace", "seeded-reliability"], kubeconfig_context=self.OTHER
+            )
+
+        self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
+
+    def test_a_failure_that_is_not_not_found_is_unchanged(self):
+        stderr = 'error: the server doesn\'t have a resource type "pdbx"'
+        executor = self.executor(stderr=stderr, exit_code=1)
+
+        result = executor.execute(["kubectl", "get", "pdbx"])
+
+        self.assertEqual(stderr, result.stderr)
+
+    def test_without_a_host_name_the_line_still_says_where_it_read(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+        executor.host_context = ""
+
+        result = executor.execute(["kubectl", "describe", "namespace", "seeded-reliability"])
+
+        self.assertIn(
+            credential_proxy.KUBECTL_HOST_HINT_PREFIX + credential_proxy.KUBECTL_HOST_HINT_UNNAMED,
+            result.stderr,
+        )
+
+    def test_the_line_is_never_read_as_a_refusal_or_a_halt(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("permission_refusal_stop", _REFUSAL_STOP_PATH)
+        stop = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stop)
+        command = {"command": "kubectl get namespace seeded-reliability"}
+        for hint in (self.hint_named(self.HOST), credential_proxy.KUBECTL_HOST_HINT_PREFIX
+                     + credential_proxy.KUBECTL_HOST_HINT_UNNAMED):
+            for text in (hint, f"{_KUBECTL_NOT_FOUND_STDERR}\n{hint}\n",
+                         json.dumps({"output": f"{_KUBECTL_NOT_FOUND_STDERR}\n{hint}\n", "exit_code": 1})):
+                with self.subTest(text=text):
+                    for failed in (True, False):
+                        self.assertIsNone(stop.classify_refusal(command, text, failed=failed))
+                    self.assertIsNone(stop.definitive_block(text))
+                    for pattern in (stop._POLICY_ACTION_RE, stop._RULE_LINE_RE, stop._VERB_LINE_RE,
+                                    stop._RENDER_LINE_RE, stop._API_DENIED_RE):
+                        self.assertIsNone(pattern.search(text), pattern.pattern)
+            # Nor in the proxy's own refusal vocabulary.
+            for word in ("refus", "denied", "forbidden", "not permitted", "blocked"):
+                self.assertNotIn(word, hint.lower())
+
+
 class GkeContextTest(unittest.TestCase):
     """`parse_gke_context` is the whole trust boundary for kubeconfig content.
 
