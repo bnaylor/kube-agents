@@ -31,8 +31,17 @@ PROSE_ROOTS = (REPO_ROOT / "agents", REPO_ROOT / "docs")
 PROSE_SUFFIX = ".md"
 MIN_FILE_CHARS = 1000
 
-# The clause both personas carry, word for word, kubeconfig named.
-NO_SELF_PATCH = "copying, editing or monkeypatching a shipped skill or script, or pointing a command at another path or kubeconfig"
+# The clause each persona carries, kubeconfig named and scoped to the refused
+# command (a worker reaching a card's cluster through its profile kubeconfig is
+# routine and must stay allowed).
+NO_SELF_PATCH_PLATFORM = (
+    "no copying, editing or monkeypatching a shipped skill or script, "
+    "and no re-running a refused command against another path or kubeconfig"
+)
+NO_SELF_PATCH_CLUSTER = (
+    "nor by copying, editing or monkeypatching a shipped skill or script, "
+    "or by pointing it at another path or kubeconfig"
+)
 # The §3 item 1 sentence the platform clause extends, by its lead and its end.
 SECOND_ROUTE_LEAD = "Never look for a credential, token, key or second route to the same effect:"
 SENTENCE_END = ". "
@@ -68,11 +77,11 @@ class RefusalNoSelfPatchTest(unittest.TestCase):
         soul = _read(PLATFORM_SOUL)
         start = soul.index(SECOND_ROUTE_LEAD)
         sentence = soul[start : soul.index(SENTENCE_END, start)]
-        self.assertIn(NO_SELF_PATCH, sentence, "§3 item 1's second-route list lost the self-patching clause")
+        self.assertIn(NO_SELF_PATCH_PLATFORM, sentence, "§3 item 1's second-route list lost the self-patching clause")
         self.assertIn(DENIALS_TERMINAL, soul, "§1 lost its Authorization Denials Are Terminal rule")
 
     def test_cluster_persona_carries_the_same_clause(self):
-        self.assertIn(NO_SELF_PATCH, _read(CLUSTER_SOUL), "agents/cluster/SOUL.md lost the self-patching clause")
+        self.assertIn(NO_SELF_PATCH_CLUSTER, _read(CLUSTER_SOUL), "agents/cluster/SOUL.md lost the self-patching clause")
 
     def test_fleet_audit_skill_says_a_refusal_is_an_answer(self):
         skill = _read(FLEET_AUDIT_SKILL)
