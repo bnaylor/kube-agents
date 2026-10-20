@@ -115,9 +115,39 @@ def test_a_clock_time_with_utc_and_no_date_is_read():
     assert _run(f"As of {now.strftime('%H:%M:%S')} UTC, 2 pods.", read=[_date_u(now)]).success
 
 
-def test_the_value_on_the_line_after_a_bare_label_is_checked():
+def test_a_value_on_the_line_after_a_label_is_not_read():
+    # The check grades a label's own line only (#3266, round 2): the rules
+    # for lending the next line kept growing, so they were cut.
     future = datetime.now(tz=timezone.utc) + OUTSIDE
-    assert not _run(f"**Time of observation**\n\n{_stamp(future)}\n").success
+    outcome = _run(f"**Time of observation**\n\n{_stamp(future)}\n")
+    assert outcome.success, outcome.reason
+    assert "states no observation time" in outcome.reason
+
+
+def test_a_capitalised_word_after_a_dated_time_is_not_a_zone():
+    # Round 2: "GKE" after a time was read as a named zone, and the time was
+    # left ungraded. A dated time with no zone is read as UTC.
+    future = datetime.now(tz=timezone.utc) + OUTSIDE
+    outcome = _run(f"As of {future.strftime('%Y-%m-%d %H:%M:%S')} GKE reports 2 pods")
+    assert not outcome.success, outcome.reason
+
+
+def test_a_log_line_time_followed_by_a_level_is_read():
+    # Round 2: "2026-10-15 21:38:00 INFO probe ok" dropped out of the read set.
+    now = datetime.now(tz=timezone.utc) - timedelta(minutes=1)
+    log = f"{now.strftime('%Y-%m-%d %H:%M:%S')} INFO probe ok"
+    outcome = _run(f"Observed at {_stamp(now)}", read=[log])
+    assert outcome.success, outcome.reason
+
+
+def test_a_tool_output_that_echoes_a_report_label_is_not_read():
+    # Round 2: a worker that echoes or cats its own draft gets its guessed
+    # time back as a tool output. A line carrying a report label is the
+    # report echoed, so it is not credited as read.
+    now = datetime.now(tz=timezone.utc) - timedelta(minutes=1)
+    echoed = f"Timestamp of Observation: {_stamp(now)}"
+    outcome = _run(echoed, read=[echoed])
+    assert not outcome.success, outcome.reason
 
 
 def test_a_time_on_an_unlabelled_line_is_not_checked():
@@ -127,13 +157,6 @@ def test_a_time_on_an_unlabelled_line_is_not_checked():
     future = datetime.now(tz=timezone.utc) + timedelta(days=30)
     report = f"- Last BackOff event: {_stamp(old)}\n- Certificate expires {_stamp(future)}\n"
     assert _run(report).success
-
-
-def test_a_named_zone_is_named_and_not_graded():
-    future = datetime.now(tz=timezone.utc) + OUTSIDE
-    outcome = _run(f"Observed at {future.strftime('%Y-%m-%d %H:%M:%S')} EDT")
-    assert outcome.success, outcome.reason
-    assert "a named zone other than UTC" in outcome.reason
 
 
 def test_the_skew_widens_the_window():
@@ -205,21 +228,6 @@ def test_a_sentence_with_a_label_word_does_not_lend_the_next_line():
     old = datetime.now(tz=timezone.utc) - timedelta(days=14)
     report = f"Nothing in this observation needs action.\n- Pod created: {_stamp(old)}\n"
     assert _run(report).success
-
-
-def test_a_markdown_heading_does_not_lend_its_next_line():
-    # Round 1 of review: "## Observation" is a section title, and the line
-    # under it is often quoted evidence with an old event time.
-    old = datetime.now(tz=timezone.utc) - timedelta(days=3)
-    assert _run(f"## Observation\n- Last event: {_stamp(old)} Scheduled checkout-gateway\n").success
-
-
-def test_a_label_with_a_bracketed_qualifier_lends_its_next_line():
-    # Round 1 of review: "Timestamp of Observation (UTC):" with the value on
-    # the next line was skipped, so a made-up time passed unread.
-    future = datetime.now(tz=timezone.utc) + OUTSIDE
-    outcome = _run(f"Timestamp of Observation (UTC):\n{_stamp(future)}\n")
-    assert not outcome.success, outcome.reason
 
 
 def test_a_label_line_followed_by_a_labelled_line_is_read_once():

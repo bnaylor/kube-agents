@@ -758,18 +758,19 @@ _CLOCK = (
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2})(?:\.(?P<fraction>\d+))?)?"
     r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?"
 )
-# A date and a clock time, `T` or a space between, then an optional zone:
-# 2026-10-15 21:38:00 UTC, 2026-10-15T21:38:00Z, 2026-10-15 21:38 +00:00.
+# A date and a clock time, `T` or a space between, then an optional UTC or
+# numeric zone: 2026-10-15 21:38:00 UTC, 2026-10-15T21:38:00Z,
+# 2026-10-15 21:38 +00:00. There is no named-zone alternative: an all-caps
+# word after a time ("GKE", "INFO") is not a zone, and a dated time with no
+# zone is read as UTC, which the agent's pods and persona both use.
 _STATED_DATETIME = re.compile(
     r"(?<![\d-])(?P<date>\d{4}-\d{2}-\d{2})[T ]" + _CLOCK
-    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2}|[A-Z]{3,4})\b)?(?![\d:])"
+    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2})\b)?(?![\d:])"
 )
 # A clock time with no date counts only with an explicit UTC zone ("as of
 # 21:38 UTC"); a bare "21:38" is as likely a duration or a log offset.
 _STATED_CLOCK = re.compile(r"(?<![\d:.-])" + _CLOCK + r"\s*(?P<zone>Z|UTC|GMT)\b(?![\d:])")
-# The zones read as UTC. A named zone outside them ("EDT") is not converted:
-# the time is named in the reason and not graded, rather than graded on a
-# guess. The agent's pods run in UTC and its persona asks for UTC.
+# The zones read as UTC.
 _UTC_ZONES = frozenset({"", "Z", "UTC", "GMT"})
 _NUMERIC_ZONE = re.compile(r"(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2})")
 _DATE_FORMAT = "%Y-%m-%d"
@@ -777,20 +778,10 @@ _DATE_FORMAT = "%Y-%m-%d"
 _MICROSECOND_DIGITS = 6
 _HOURS_PER_HALF_DAY = 12
 _PM_PREFIX = "p"
-# What a label line may carry after its label for the value to sit on the
-# next line instead: markup and punctuation, and at most one bracketed
-# qualifier ("**Observed at:**", "Timestamp of Observation (UTC):").
-_LABEL_QUALIFIER_MAX = 24
-_LABEL_ONLY_TAIL = re.compile(
-    r"[\s*_:|#>`-]*(?:\([^()\n]{1,%d}\)[\s*_:|#>`-]*)?" % _LABEL_QUALIFIER_MAX
-)
-# A Markdown heading line ("## Observation"): a section title, so the line
-# after it is the section's content, not the label's value.
-_MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 
 
 def _zone_offset(zone: str) -> timedelta | None:
-    """The zone's offset from UTC, or ``None`` for a named zone this check does not read."""
+    """The zone's offset from UTC, or ``None`` for one this check does not read."""
     if zone in _UTC_ZONES:
         return timedelta(0)
     numeric = _NUMERIC_ZONE.fullmatch(zone)
@@ -823,8 +814,9 @@ def _stated_times(line: str, dates: list[str]) -> tuple[list[tuple[str, list[dat
 
     A dated time means one instant. A clock time with no date means one per
     entry of ``dates`` (the run's start and end days), so a run that crosses
-    midnight can be read either way. Not read: a named zone other than UTC,
-    and a date or clock time that does not exist (2026-02-30, 25:00).
+    midnight can be read either way. A dated time with no zone is read as
+    UTC. Not read: a date or clock time that does not exist (2026-02-30,
+    25:00).
     """
     found: list[tuple[str, list[datetime]]] = []
     unreadable: list[str] = []
@@ -950,7 +942,20 @@ def _output_minutes(text: str, dates: list[str]) -> set[datetime]:
     return {minute for instant in instants for minute in _minutes_of(instant)}
 
 
-def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[set[datetime], list[str], int]:
+def _compiled_labels(patterns: list[str]) -> list[re.Pattern]:
+    return [re.compile(p, re.IGNORECASE) for p in patterns if p.strip()]
+
+
+def _unlabelled(text: str, labels: list[re.Pattern]) -> str:
+    """``text`` without the lines that carry a report label: a tool output
+    that prints "Observed at ..." is the report echoed (a drafted file, an
+    `echo`), not something the agent read."""
+    return "\n".join(line for line in text.splitlines() if not any(label.search(line) for label in labels))
+
+
+def _read_minutes(
+    trajectory: list[dict[str, Any]], dates: list[str], labels: list[re.Pattern] = ()
+) -> tuple[set[datetime], list[str], int]:
     """The UTC minutes the run's tool outputs show, what kept the read from
     being whole (a result the pod withheld), and how many results it clipped.
 
@@ -978,7 +983,7 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             continue
         if _CLIPPED_RESULT.search(result):
             clipped += 1
-        minutes |= _output_minutes(result, dates)
+        minutes |= _output_minutes(_unlabelled(result, labels), dates)
     return minutes, withheld, clipped
 
 
@@ -1022,7 +1027,9 @@ class ReportTimesInWindowVerifier(BaseVerifier):
     minute some tool output in the run's trajectory shows. The outputs are
     every entry's ``result``, the front door's and each delegated worker's,
     a worker-filed card's included, but not a kanban tool's, whose card
-    result is a worker's own words. The forms read are ISO 8601, the output
+    result is a worker's own words, and not an output line that carries one
+    of the report's labels, which is the report echoed back (a drafted file
+    it cats, an ``echo``). The forms read are ISO 8601, the output
     of ``date``, ``date -u`` and ``date -R``, a bare clock time with seconds
     (on the run's days), and epoch seconds or milliseconds, so a
     ``date +%s`` matches its UTC rendering; a read time also matches the
@@ -1033,11 +1040,17 @@ class ReportTimesInWindowVerifier(BaseVerifier):
     was withheld), the check is ``status: error`` naming what was missing,
     not a fail. A clipped result is read as far as it goes and noted.
 
-    What it cannot catch: a time stated in a named zone other than UTC or as
-    a date or clock time that does not exist, which is named in the reason
-    and not graded; and a guess whose minute happens to match some other
-    time the run read, which on a run of a few minutes that printed event
-    or creation times inside it is not rare.
+    Only a time on a label's own line is graded, with a date or an explicit
+    UTC zone; a value on the line after a label is not read, and a dated
+    time with no zone is read as UTC (#3266 cut the next-line and named-zone
+    rules after they kept growing).
+
+    What it cannot catch: a time on the line after its label; a time stated
+    in another zone, which is read as UTC; a date or clock time that does
+    not exist, which is named in the reason and not graded; and a guess
+    whose minute happens to match some other time the run read, which on a
+    run of a few minutes that printed event or creation times inside it is
+    not rare.
     """
 
     type: Literal["report_times_in_window"]
@@ -1058,28 +1071,12 @@ class ReportTimesInWindowVerifier(BaseVerifier):
         return patterns
 
     def _labelled_lines(self, raw: str) -> list[str]:
-        """The lines whose times are observation times."""
-        labels = [re.compile(p, re.IGNORECASE) for p in self.label_patterns if p.strip()]
-        lines = raw.splitlines()
-        picked: list[int] = []
-        for i, line in enumerate(lines):
-            hits = [hit for label in labels if (hit := label.search(line))]
-            if not hits:
-                continue
-            picked.append(i)
-            if _STATED_DATETIME.search(line) or _STATED_CLOCK.search(line):
-                continue
-            # The value sits on the next line only when this line is the label
-            # and nothing more ("**Observed at:**"); a sentence that merely
-            # contains a label word does not lend it the line below.
-            if not any(_LABEL_ONLY_TAIL.fullmatch(line[hit.end() :]) for hit in hits):
-                continue
-            if _MARKDOWN_HEADING.match(line):
-                continue
-            following = next((j for j in range(i + 1, len(lines)) if lines[j].strip()), None)
-            if following is not None:
-                picked.append(following)
-        return [lines[i] for i in sorted(set(picked))]
+        """The lines whose times are observation times: a label's own line,
+        and nothing else. A value on the line after a label is not read; the
+        rules for lending a line were the part of this check that kept
+        growing (#3266's review rounds), and a nightly guard can give it up."""
+        labels = _compiled_labels(self.label_patterns)
+        return [line for line in raw.splitlines() if any(label.search(line) for label in labels)]
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1110,7 +1107,7 @@ class ReportTimesInWindowVerifier(BaseVerifier):
                     outside.append(text)
         window = f"{earliest.isoformat(timespec='seconds')} to {latest.isoformat(timespec='seconds')}"
         not_read = (
-            f"; not read (a named zone other than UTC, or not a real date and time): {unreadable}" if unreadable else ""
+            f"; not read (not a real date and time): {unreadable}" if unreadable else ""
         )
         if outside:
             return VerificationResult(
@@ -1124,7 +1121,7 @@ class ReportTimesInWindowVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=f"the report states no observation time this check reads{not_read}",
             )
-        read, withheld, clipped = _read_minutes(snap.trajectory, dates)
+        read, withheld, clipped = _read_minutes(snap.trajectory, dates, _compiled_labels(self.label_patterns))
         unsourced = [
             text for text, instants in stated if not any(_minute(i) in read for i in instants)
         ]
