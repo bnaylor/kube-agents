@@ -10,9 +10,13 @@ phase:
    kanban stop gate that runs only in the text-response phase
    (``agent/turn_stop_gates.py``). Nudge the worker to finish on the board and
    return ``_verdict("continue")`` instead.
-2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, the funnel
-   every exit without a failed result passes through, for the six sibling exits that leak the
-   same way and for the halt path when its nudges are spent. A
+2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, which most
+   exits without a failed result pass through, for the six sibling exits that leak the
+   same way and for the halt path when its nudges are spent. Not every such
+   exit does: a phase that returns ``_compression_deferred_result``
+   (``failed=False, compression_deferred=True``) and the ``codex_app_server``
+   early return leave ``run_conversation`` without reaching it, and a kanban
+   worker on those exits still ends ``rc=0`` (a known gap, not this patch's). A
    retries-exhausted exit whose last failure was a rate limit is blocked with
    the provider's text instead of being charged a ``timed_out``. Either write
    is conditioned on the worker's own run inside its transaction: the block
