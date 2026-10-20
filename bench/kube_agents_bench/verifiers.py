@@ -778,8 +778,15 @@ _MICROSECOND_DIGITS = 6
 _HOURS_PER_HALF_DAY = 12
 _PM_PREFIX = "p"
 # What a label line may carry after its label for the value to sit on the
-# next line instead: markup and punctuation only ("**Observed at:**").
-_LABEL_ONLY_TAIL = re.compile(r"[\s*_:|#>`-]*")
+# next line instead: markup and punctuation, and at most one bracketed
+# qualifier ("**Observed at:**", "Timestamp of Observation (UTC):").
+_LABEL_QUALIFIER_MAX = 24
+_LABEL_ONLY_TAIL = re.compile(
+    r"[\s*_:|#>`-]*(?:\([^()\n]{1,%d}\)[\s*_:|#>`-]*)?" % _LABEL_QUALIFIER_MAX
+)
+# A Markdown heading line ("## Observation"): a section title, so the line
+# after it is the section's content, not the label's value.
+_MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 
 
 def _zone_offset(zone: str) -> timedelta | None:
@@ -1066,6 +1073,8 @@ class ReportTimesInWindowVerifier(BaseVerifier):
             # and nothing more ("**Observed at:**"); a sentence that merely
             # contains a label word does not lend it the line below.
             if not any(_LABEL_ONLY_TAIL.fullmatch(line[hit.end() :]) for hit in hits):
+                continue
+            if _MARKDOWN_HEADING.match(line):
                 continue
             following = next((j for j in range(i + 1, len(lines)) if lines[j].strip()), None)
             if following is not None:

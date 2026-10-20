@@ -207,6 +207,21 @@ def test_a_sentence_with_a_label_word_does_not_lend_the_next_line():
     assert _run(report).success
 
 
+def test_a_markdown_heading_does_not_lend_its_next_line():
+    # Round 1 of review: "## Observation" is a section title, and the line
+    # under it is often quoted evidence with an old event time.
+    old = datetime.now(tz=timezone.utc) - timedelta(days=3)
+    assert _run(f"## Observation\n- Last event: {_stamp(old)} Scheduled checkout-gateway\n").success
+
+
+def test_a_label_with_a_bracketed_qualifier_lends_its_next_line():
+    # Round 1 of review: "Timestamp of Observation (UTC):" with the value on
+    # the next line was skipped, so a made-up time passed unread.
+    future = datetime.now(tz=timezone.utc) + OUTSIDE
+    outcome = _run(f"Timestamp of Observation (UTC):\n{_stamp(future)}\n")
+    assert not outcome.success, outcome.reason
+
+
 def test_a_label_line_followed_by_a_labelled_line_is_read_once():
     now = datetime.now(tz=timezone.utc) - timedelta(minutes=1)
     outcome = _run(f"**Observation**\n- Checked at {_stamp(now)}\n", read=[_date_u(now)])
