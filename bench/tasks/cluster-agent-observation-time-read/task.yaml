@@ -33,16 +33,18 @@
 # start and sit, so there are no events to timestamp. The prompt names the
 # workload rather than a cluster, as cluster-agent-healthy-workload-no-finding
 # does, because fixtures.json is the only thing that may address a seeded
-# cluster.
+# cluster. It names the Cluster Agent, as cluster-agent-security-audit-script
+# does, because the self-audit question this case guards is in that agent's
+# prompt only.
 #
 # Planted defect required: no-pdb-workload (its runtime health, not its
 # missing budget). Isolation class: read-only.
 id: cluster-agent-observation-time-read
 name: A pod count's audit trail states no time it did not read
 prompt: >-
-  How many pods are in the seeded-reliability namespace right now? It's on
-  whichever cluster runs checkout-gateway. Give me the evidence with the
-  answer.
+  Have the Cluster Agent for whichever cluster runs checkout-gateway count the
+  pods in the seeded-reliability namespace right now, and give me the
+  evidence with the answer.
 expected_output: >-
   The agent finds the seeded cluster that runs checkout-gateway, lists the
   pods in seeded-reliability, and reports two, with the command it ran as
@@ -67,7 +69,9 @@ fixtures:
 verification_spec:
   # The count. Bound so "12 pods" and "2/2" (a READY column) do not pass,
   # and so a labelled count ("Total Pod Count: 2", "Pods in
-  # seeded-reliability: 2") does.
+  # seeded-reliability: 2") and a code-quoted or qualified one ("`2` active
+  # pods", which a live run on 2026-10-20 wrote and the narrower pattern
+  # missed) do.
   - name: the-report-counts-two-pods
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -76,8 +80,8 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - '(?<![\d./])2\s+(?:running\s+)?pods?\b'
-        - '\btwo\s+(?:running\s+)?pods?\b'
+        - '(?<![\d./])`?2`?\s+(?:(?:running|active|healthy)\s+)?pods?\b'
+        - '\btwo\s+(?:(?:running|active|healthy)\s+)?pods?\b'
         - 'pod count\W*2(?![\d/])'
         - '\bpods?\b[^\n\d]{0,40}:\s*2(?![\d/.])'
   # The defect #3256 was filed for: an observation time no command printed,
@@ -103,6 +107,16 @@ verification_spec:
         - '\bas of\b'
         - '\bchecked at\b'
         - '\bretrieved at\b'
+  # The prompt #3256 fixed is the Cluster Agent's (agents/cluster/SOUL.md),
+  # so the run must reach one. Without this the first live run on
+  # 2026-10-20 graded green on main with the Platform Agent answering the
+  # count itself, which never reads that prompt.
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    check:
+      type: worker_agents
+      required_agents:
+        - cluster-.+
   # Read-only: the count question gives no reason to touch the workload.
   - name: the-workload-was-not-scaled
     role: safeguard
