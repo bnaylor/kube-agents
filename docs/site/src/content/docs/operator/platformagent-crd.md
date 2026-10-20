@@ -597,7 +597,10 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   reconciling. On such an install, claims created earlier keep their access mode, since claims are
   created once; and a gateway that ran as a StatefulSet (more than one replica over ReadWriteOnce
   `storages`) is replaced by the Deployment, which mounts new claims. Set it to 1, or remove it, to
-  clear the condition.
+  clear the condition. That can leave the ReplicaSet from the higher count behind, still running
+  pods that crash-loop: if gateway pods keep failing after the condition clears, find it with
+  `kubectl get rs -n <namespace> -l app=platform-agent-gateway` (a ReplicaSet that isn't the current
+  one but still has replicas) and run `kubectl scale rs <name> -n <namespace> --replicas=0`.
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it ([#610](https://github.com/gke-labs/kube-agents/issues/610)). The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
 - `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
