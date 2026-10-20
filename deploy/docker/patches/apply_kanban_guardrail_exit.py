@@ -49,9 +49,8 @@ phase:
    neither anchor overlaps it.
 7. ``cli.py`` — ``_run_single_query_mode``'s non-quiet branch, after
    ``chat()`` and the resume summary: exit with the code edit 5 left on the
-   CLI object, or 1 for a kanban worker whose ``chat()`` returned before any
-   turn ran (``-Q`` exits 1 for the same credential and agent-init failures).
-   Without it the chat path exits 0 for every failed turn, and a failure edit
+   CLI object. A kanban worker whose ``chat()`` returned before any turn ran
+   leaves no code and keeps exit 0 (gke-labs/kube-agents#3505). Without it the chat path exits 0 for every failed turn, and a failure edit
    5 could not record is booked as a protocol violation.
 
 The inserts mirror code that is already in the tree: edit 1 copies the shape of

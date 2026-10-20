@@ -175,7 +175,7 @@ leaving on a rate limit:
   ``_run_quiet_single_query`` (the one that maps ``rate_limit`` to exit 75),
   while the non-quiet ``chat -q`` path every normal worker takes renders its
   turn through ``_chat_render_turn`` in ``hermes_cli/cli_chat_turn_mixin.py``
-  and returns with exit 0, never reaching that block. The live run on
+  and, unpatched, returns with exit 0, never reaching that block. The live run on
   2026-09-12 showed the second is the storm's path, so the block also sits in
   ``_chat_render_turn``, ahead of the response panel, where the failed result
   is last in hand. And
@@ -426,9 +426,8 @@ FAILED_TURN_COMMENT_MAX_CHARS = 1000
 PROFILE_ENV = "HERMES_PROFILE"
 FAILED_TURN_COMMENT_AUTHOR = DETECTOR
 
-#: The attributes the chat-render site leaves on the CLI object for the
-#: single-query exit in ``cli.py``: the exit code, and whether a turn result
-#: reached the site at all.
+#: The attribute the chat-render site leaves on the CLI object for the
+#: single-query exit in ``cli.py``: the exit code.
 EXIT_CODE_ATTR = "_kube_kanban_exit_code"
 
 _HALT_SUFFIX = (
@@ -968,7 +967,22 @@ def record_failed_turn(
     comment on a card a newer run now owns. A comment that fails to write
     leaves the charge standing, which is why ``FAILED_TURN_ERROR`` does not
     promise one.
+
+    With no run id (``HERMES_KANBAN_RUN_ID`` unset or unparseable, so a
+    hand-launched or misconfigured worker) nothing is written. Without it
+    neither the read nor ``_record_task_failure``'s ``expected_run_id`` can
+    tell this worker's run from another's, and the charge would book whichever
+    run is current and release another worker's claim, putting two workers on
+    one card. The exit falls back to the reaper, as without this patch.
     """
+    if run_id is None:
+        logger.warning(
+            "kanban: task %s's turn failed in a worker with no run id "
+            "(HERMES_KANBAN_RUN_ID unset or unparseable); not charging it, "
+            "so the reaper settles the exit",
+            task_id,
+        )
+        return False
     conn = connect()
     try:
         if not task_is_still_running(conn, task_id, run_id):

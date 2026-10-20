@@ -1219,6 +1219,22 @@ class CloseFailedChatTurnTest(unittest.TestCase):
         self.assertIn("AuthenticationError", body)
         self.assertEqual(rec.calls[0][1]["error"], kge.FAILED_TURN_ERROR)
 
+    def test_a_worker_with_no_run_id_charges_nothing_and_leaves_the_run_alone(self):
+        # Round 3 of review: with no run id the charge could not tell this
+        # worker's run from another's, and would book another worker's
+        # running card as crashed and release its claim.
+        no_run = {k: v for k, v in WORKER_ENV.items() if k != "HERMES_KANBAN_RUN_ID"}
+        for env in (no_run, dict(WORKER_ENV, HERMES_KANBAN_RUN_ID="not-a-number")):
+            with self.subTest(run_id=env.get("HERMES_KANBAN_RUN_ID")):
+                connected = []
+                code, com, rec = self._close(
+                    AUTH_RESULT, environ=env,
+                    rows=(("t_80ff98c9", "running", 61),),  # another worker's run
+                    connect=lambda: connected.append(True),
+                )
+                self.assertEqual(code, 1, "the exit still falls back to the reaper")
+                self.assertEqual((com.calls, rec.calls, connected), ([], [], []))
+
     def test_billing_is_charged_and_exits_1(self):
         code, _, rec = self._close({"failed": True, "failure_reason": "billing", "error": "402"})
         self.assertEqual(code, 1)
