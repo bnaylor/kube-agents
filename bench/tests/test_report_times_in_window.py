@@ -378,6 +378,24 @@ def test_the_window_still_fails_a_time_that_was_read():
     assert "outside the run's window" in outcome.reason
 
 
+@pytest.mark.parametrize("form", ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%H:%M UTC"])
+def test_a_time_followed_by_a_colon_is_graded(form):
+    # lapis2002 on #3266: "Observed at <time>: 2 pods running" passed ungraded.
+    future = datetime.now(tz=timezone.utc) + OUTSIDE
+    outcome = _run(f"Observed at {future.strftime(form)}: 2 pods running")
+    assert not outcome.success
+    assert "outside the run's window" in outcome.reason
+
+
+@pytest.mark.parametrize("label", ["_Observed at_", "*Observed at*", "**Observed at:**", "`as of`"])
+def test_emphasis_around_a_label_still_marks_the_line(label):
+    # lapis2002 on #3266: `\b` has no boundary next to `_`, so "_Observed at_" read as no label.
+    future = datetime.now(tz=timezone.utc) + OUTSIDE
+    outcome = _run(f"{label} {_stamp(future)}")
+    assert not outcome.success
+    assert "outside the run's window" in outcome.reason
+
+
 def test_the_markers_match_the_in_pod_script():
     from kube_agents_bench import verifiers, worker_trajectory
 

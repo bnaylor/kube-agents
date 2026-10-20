@@ -762,14 +762,15 @@ _CLOCK = (
 # numeric zone: 2026-10-15 21:38:00 UTC, 2026-10-15T21:38:00Z,
 # 2026-10-15 21:38 +00:00. There is no named-zone alternative: an all-caps
 # word after a time ("GKE", "INFO") is not a zone, and a dated time with no
-# zone is read as UTC, which the agent's pods and persona both use.
+# zone is read as UTC, which the agent's pods and persona both use. A colon
+# may follow ("Observed at 2026-10-15 21:38:00: 2 pods running").
 _STATED_DATETIME = re.compile(
     r"(?<![\d-])(?P<date>\d{4}-\d{2}-\d{2})[T ]" + _CLOCK
-    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2})\b)?(?![\d:])"
+    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2})\b)?(?!\d)"
 )
 # A clock time with no date counts only with an explicit UTC zone ("as of
 # 21:38 UTC"); a bare "21:38" is as likely a duration or a log offset.
-_STATED_CLOCK = re.compile(r"(?<![\d:.-])" + _CLOCK + r"\s*(?P<zone>Z|UTC|GMT)\b(?![\d:])")
+_STATED_CLOCK = re.compile(r"(?<![\d:.-])" + _CLOCK + r"\s*(?P<zone>Z|UTC|GMT)\b(?!\d)")
 # The zones read as UTC.
 _UTC_ZONES = frozenset({"", "Z", "UTC", "GMT"})
 _NUMERIC_ZONE = re.compile(r"(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2})")
@@ -1065,9 +1066,12 @@ class ReportTimesInWindowVerifier(BaseVerifier):
         """The lines whose times are observation times: a label's own line,
         and nothing else. A value on the line after a label is not read; the
         rules for lending a line were the part of this check that kept
-        growing (#3266's review rounds), and a nightly guard can give it up."""
+        growing (#3266's review rounds), and a nightly guard can give it up.
+        The labels are searched on the line with its Markdown emphasis
+        stripped, as ``report_contains`` searches, since `\\b` finds no
+        boundary between `_` and a word ("_Observed at_")."""
         labels = _compiled_labels(self.label_patterns)
-        return [line for line in raw.splitlines() if any(label.search(line) for label in labels)]
+        return [line for line in raw.splitlines() if any(label.search(_normalize(line)) for label in labels)]
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
