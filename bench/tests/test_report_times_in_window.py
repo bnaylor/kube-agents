@@ -140,16 +140,6 @@ def test_a_log_line_time_followed_by_a_level_is_read():
     assert outcome.success, outcome.reason
 
 
-def test_a_tool_output_that_echoes_a_report_label_is_not_read():
-    # Round 2: a worker that echoes or cats its own draft gets its guessed
-    # time back as a tool output. A line carrying a report label is the
-    # report echoed, so it is not credited as read.
-    now = datetime.now(tz=timezone.utc) - timedelta(minutes=1)
-    echoed = f"Timestamp of Observation: {_stamp(now)}"
-    outcome = _run(echoed, read=[echoed])
-    assert not outcome.success, outcome.reason
-
-
 def test_a_time_on_an_unlabelled_line_is_not_checked():
     # An event timestamp quoted from command output may be days old; a
     # certificate's expiry is in the future. Neither is an observation time.

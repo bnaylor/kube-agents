@@ -946,16 +946,7 @@ def _compiled_labels(patterns: list[str]) -> list[re.Pattern]:
     return [re.compile(p, re.IGNORECASE) for p in patterns if p.strip()]
 
 
-def _unlabelled(text: str, labels: list[re.Pattern]) -> str:
-    """``text`` without the lines that carry a report label: a tool output
-    that prints "Observed at ..." is the report echoed (a drafted file, an
-    `echo`), not something the agent read."""
-    return "\n".join(line for line in text.splitlines() if not any(label.search(line) for label in labels))
-
-
-def _read_minutes(
-    trajectory: list[dict[str, Any]], dates: list[str], labels: list[re.Pattern] = ()
-) -> tuple[set[datetime], list[str], int]:
+def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[set[datetime], list[str], int]:
     """The UTC minutes the run's tool outputs show, what kept the read from
     being whole (a result the pod withheld), and how many results it clipped.
 
@@ -983,7 +974,7 @@ def _read_minutes(
             continue
         if _CLIPPED_RESULT.search(result):
             clipped += 1
-        minutes |= _output_minutes(_unlabelled(result, labels), dates)
+        minutes |= _output_minutes(result, dates)
     return minutes, withheld, clipped
 
 
@@ -1025,9 +1016,11 @@ class ReportTimesInWindowVerifier(BaseVerifier):
     minute some tool output in the run's trajectory shows. The outputs are
     every entry's ``result``, the front door's and each delegated worker's,
     a worker-filed card's included, but not a kanban tool's, whose card
-    result is a worker's own words, and not an output line that carries one
-    of the report's labels, which is the report echoed back (a drafted file
-    it cats, an ``echo``). The forms read are ISO 8601, the output
+    result is a worker's own words. A worker's own words echoed back through
+    another tool (an ``echo``, a drafted file it cats) do count as read; an
+    exclusion by label was tried and removed, because a captured worker
+    result arrives as one JSON line, so a label word anywhere in it dropped
+    the whole result. The forms read are ISO 8601, the output
     of ``date``, ``date -u`` and ``date -R``, a bare clock time with seconds
     (on the run's days), and epoch seconds or milliseconds, so a
     ``date +%s`` matches its UTC rendering; a read time also matches the
@@ -1119,7 +1112,7 @@ class ReportTimesInWindowVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=f"the report states no observation time this check reads{not_read}",
             )
-        read, withheld, clipped = _read_minutes(snap.trajectory, dates, _compiled_labels(self.label_patterns))
+        read, withheld, clipped = _read_minutes(snap.trajectory, dates)
         unsourced = [
             text for text, instants in stated if not any(_minute(i) in read for i in instants)
         ]
