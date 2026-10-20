@@ -300,7 +300,10 @@ list equal to `read_only_roles` in the full-install composition.
 
 It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
 `stall-watch` does, so chat hears a role on the tick it first appears and again
-when it goes, and an unchanged account prints nothing. That is why it can run
+when it goes. A role still held is said again once a day, on the first tick from
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
+grant said once in a busy channel can be missed, and nothing else would raise it
+again. Any other tick on an unchanged account prints nothing. That is why it can run
 hourly: a fresh install or a new grant is named within the hour, and a quiet
 hour costs one `kubectl` pair and one policy read per project, no model turn. A
 project whose policy cannot be read keeps its last answer and its failure is
@@ -310,7 +313,7 @@ scope is said once. Losing the shell sandbox mid-tick is one failure line, not
 one per project. It reads project-level bindings only: a role granted on a folder,
 the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
-is reported like any other grant, once.
+is reported like any other grant, and repeated daily like one.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 

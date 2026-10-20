@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,6 +88,11 @@ class WatchTest(unittest.TestCase):
         scope = patch.object(fleet_scope_targets, "declared_scope_targets", side_effect=lambda: self.scope)
         scope.start()
         self.addCleanup(scope.stop)
+        # Before the reminder hour unless a test moves it, so a held role stays quiet.
+        self.clock = datetime(2026, 10, 20, 9, 25, tzinfo=timezone.utc)
+        clock = patch.object(sa_role_watch, "utc_now", side_effect=lambda: self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def tick(self, sandbox, *, dry_run=False):
         with patch.object(sa_role_watch, "run_sandbox", sandbox):
@@ -265,6 +271,53 @@ class DriftIsReportedOnChange(WatchTest):
     def test_dry_run_writes_no_ledger(self):
         self.tick(FakeSandbox(policies={MANAGEMENT: self.admin_policy("roles/owner")}), dry_run=True)
         self.assertFalse(self.state.exists())
+
+
+class HeldDriftIsRepeatedDaily(WatchTest):
+    def admin_sandbox(self):
+        policy = read_only_policy()
+        policy["bindings"].append(binding("roles/container.admin", AGENT_GSA))
+        return FakeSandbox(policies={MANAGEMENT: policy})
+
+    def at(self, day, hour):
+        self.clock = datetime(2026, 10, day, hour, 25, tzinfo=timezone.utc)
+
+    def test_a_held_role_is_said_again_once_a_day_from_the_reminder_hour(self):
+        sandbox = self.admin_sandbox()
+        self.at(20, 9)
+        self.assertEqual(1, len(self.tick(sandbox)))
+        self.at(20, 11)
+        self.assertEqual([], self.tick(sandbox))
+        self.at(20, 12)
+        self.assertEqual([], self.tick(sandbox), "said at 09:25 today, so not repeated today")
+        self.at(21, 11)
+        self.assertEqual([], self.tick(sandbox))
+        self.at(21, 12)
+        lines = self.tick(sandbox)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn(sa_role_watch.DRIFT_PREFIX, lines[0])
+        self.assertIn("still holds `roles/container.admin`", lines[0])
+        self.assertIn(f"project `{MANAGEMENT}`", lines[0])
+        self.at(21, 13)
+        self.assertEqual([], self.tick(sandbox))
+        self.at(22, 14)
+        self.assertEqual(1, len(self.tick(sandbox)), "a missed reminder tick is made up later that day")
+
+    def test_a_ledger_without_reminder_dates_reminds_at_the_hour(self):
+        sandbox = self.admin_sandbox()
+        self.tick(sandbox)
+        state = json.loads(self.state.read_text())
+        del state["said_on"]
+        self.state.write_text(json.dumps(state))
+        self.at(20, 12)
+        self.assertEqual(1, len(self.tick(sandbox)))
+
+    def test_a_cleared_role_is_not_repeated(self):
+        self.tick(self.admin_sandbox())
+        self.tick(FakeSandbox())
+        self.at(21, 12)
+        self.assertEqual([], self.tick(FakeSandbox()))
+        self.assertEqual({}, json.loads(self.state.read_text())["said_on"])
 
 
 class FailuresHoldTheirRows(WatchTest):

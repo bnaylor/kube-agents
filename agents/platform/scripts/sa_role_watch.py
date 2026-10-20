@@ -32,8 +32,11 @@ no model. Each tick:
 3. per project, reads ``gcloud projects get-iam-policy`` and keeps every role
    bound to one of those accounts that is not in ``READ_ONLY_ROLES``;
 4. diffs that against the ledger the previous tick left. Chat hears a role on
-   the tick it first appears and again when it goes; a tick on which nothing
-   changed prints nothing. A project whose policy could not be read keeps its
+   the tick it first appears and again when it goes, and a role still held is
+   said again once a day, on the first tick from ``REMIND_HOUR_UTC``, the way
+   ``kanban-board-health`` names a card still blocked: a grant said once can be
+   missed, and one line in chat should not be the only word on it. Any other
+   tick on which nothing changed prints nothing. A project whose policy could not be read keeps its
    last answer, since absence of evidence is not removal, and its failure is
    said once and its recovery once.
 
@@ -161,6 +164,10 @@ PUBLIC_MEMBERS = frozenset({"allusers", "allauthenticatedusers"})
 PUBLIC_SUFFIX = " (public)"
 #: Over-cap projects a scope note names before counting the rest.
 MAX_PROJECTS_IN_NOTE = 8
+# A role still held is said again on the first tick from this hour each UTC
+# day. 12:00 for the reason kanban-board-health fires at 12:35: an earlier UTC
+# hour is the middle of the night in the US.
+REMIND_HOUR_UTC = 12
 UNRESOLVED_SCOPE_NOTE = "folder, organisation or selector members the reconcile has not resolved are not checked"
 #: What an account read off the ServiceAccount or the CR must look like before
 #: it is checked or named in chat: those values are whatever whoever can patch
@@ -350,6 +357,7 @@ def empty_state() -> dict:
     return {
         "version": STATE_SCHEMA_VERSION,
         "roles": {},
+        "said_on": {},
         "project_errors": {},
         "check_error": None,
         "annotation": None,
@@ -389,8 +397,15 @@ def code_list(items) -> str:
 # --------------------------------------------------------------------------
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def tick(state_path: Path, *, dry_run: bool) -> list[str]:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    clock = utc_now()
+    now = clock.isoformat(timespec="seconds")
+    today = clock.date().isoformat()
+    remind = clock.hour >= REMIND_HOUR_UTC
     state = load_state(state_path)
     lines: list[str] = []
 
@@ -441,6 +456,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     if scope_note:
         errors[SCOPE_ERROR_KEY] = scope_note
     held = state.get("roles") or {}
+    said_on = state.get("said_on") or {}
     roles: dict[str, list[str]] = {}
     for project, future in futures.items():
         try:
@@ -464,6 +480,14 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
                 )
             if gone:
                 lines.append(f"{CLEARED_PREFIX} `{email}` ({via}) no longer holds {code_list(gone)} in project `{project}`.")
+            if added:
+                said_on[key] = today
+            elif now_held and remind and said_on.get(key) != today:
+                lines.append(
+                    f"{DRIFT_PREFIX} `{email}` ({via}) still holds {code_list(now_held)} in project `{project}`. "
+                    f"{DRIFT_ADVICE}"
+                )
+                said_on[key] = today
             if now_held:
                 roles[key] = now_held
     # A recorded drift whose account or project is no longer checked (the
@@ -495,6 +519,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         lines.append(SCOPE_RECOVERED_LINE)
 
     state["roles"] = roles
+    state["said_on"] = {key: day for key, day in said_on.items() if key in roles}
     state["project_errors"] = errors
     state["updated_at"] = now
     if not dry_run:
