@@ -18,6 +18,7 @@ Run:
 
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -101,11 +102,17 @@ class RefusalNoSelfPatchTest(unittest.TestCase):
                 self.assertIn(phrase, sop, f"the AI security audit SOP lost {phrase!r}")
 
     def test_no_prose_names_a_real_looking_example_repository(self):
+        # Tracked files only: an installed docs site puts thousands of
+        # vendored .md files under docs/site/node_modules.
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z", "--", *(str(r.relative_to(REPO_ROOT)) for r in PROSE_ROOTS)],
+            cwd=REPO_ROOT, capture_output=True, check=True,
+        ).stdout.decode().split("\0")
         offenders = [
-            str(path.relative_to(REPO_ROOT))
-            for root in PROSE_ROOTS
-            for path in sorted(root.rglob(f"*{PROSE_SUFFIX}"))
-            if REAL_LOOKING_EXAMPLE in path.read_text(encoding="utf-8")
+            name
+            for name in sorted(tracked)
+            if name.endswith(PROSE_SUFFIX)
+            and REAL_LOOKING_EXAMPLE in (REPO_ROOT / name).read_text(encoding="utf-8")
         ]
         self.assertEqual([], offenders, f"prose still names {REAL_LOOKING_EXAMPLE}")
 
