@@ -1013,10 +1013,8 @@ class ReportTimesInWindowVerifier(BaseVerifier):
 
     Which times are observation times is the case's to say, in
     ``label_patterns``: regexes searched, case-insensitively, in each line of
-    the report. A time on a matching line is checked, and so is a time on the
-    next non-blank line when the matching line is the label and nothing more
-    (a bold label on its own line, then the value). A time on any other line
-    is not, so an event timestamp quoted from command output, which may be
+    the report. A time on a matching line is checked. A time on any other
+    line is not, including one on the line after a label, so an event timestamp quoted from command output, which may be
     days old, or a certificate's expiry, which is in the future, does not
     fail a report. The window's end is the moment the check runs, not the
     moment the report was delivered, which this check cannot see; the gap
