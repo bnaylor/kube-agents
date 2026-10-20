@@ -5790,6 +5790,52 @@ class ContextlessKubectlHostHintTest(unittest.TestCase):
                 came = replace(came, **{field: True})
                 self.assertIs(came, executor._with_host_hint(["kubectl", "get", "ns", "x"], came))
 
+    def test_an_empty_context_value_names_no_cluster(self):
+        # `--context "$CTX"` with CTX unset: kubectl reads current-context, the host.
+        for argv in (
+            ["kubectl", "--context=", "get", "namespace", "seeded-reliability"],
+            ["kubectl", "--context", "", "get", "namespace", "seeded-reliability"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+                result = executor.execute(argv)
+                self.assertIn(self.hint_named(self.HOST), result.stderr)
+                self.assertEqual(1, result.exit_code)
+
+    def test_a_found_object_whose_kind_ends_in_list_is_not_an_empty_answer(self):
+        # A CRD kind like AllowList with a top-level `items` field of its own.
+        for stdout in (
+            json.dumps({"apiVersion": "example.com/v1", "kind": "AllowList", "items": []}),
+            "apiVersion: example.com/v1\nitems: []\nkind: AllowList\n",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "allowlist", "default-allow", "-o", "json"])
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_header_only_custom_columns_read_gets_the_line(self):
+        for flag in (
+            ["-o", "custom-columns=NAME:.metadata.name"],
+            ["-ocustom-columns=NAME:.metadata.name"],
+            ["--output=custom-columns=NAME:.metadata.name"],
+        ):
+            with self.subTest(flag=flag):
+                executor = self.executor(stdout="NAME\n")
+                result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability", *flag])
+                self.assertEqual("NAME\n", result.stdout)
+                self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_custom_columns_read_with_rows_or_a_plain_one_line_read_is_unchanged(self):
+        for argv, stdout in (
+            (["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name"], "NAME\ncheckout-0\n"),
+            (["kubectl", "get", "pod", "checkout-0", "-o", "name"], "pod/checkout-0\n"),
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(argv)
+                self.assertEqual("", result.stderr)
+
     def test_a_failure_that_is_not_not_found_is_unchanged(self):
         stderr = 'error: the server doesn\'t have a resource type "pdbx"'
         executor = self.executor(stderr=stderr, exit_code=1)

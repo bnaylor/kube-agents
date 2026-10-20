@@ -118,13 +118,27 @@ KUBECTL_NOT_FOUND_MARKER = "Error from server (NotFound)"
 # An empty list in `-o json`/`-o yaml` is a few hundred bytes; anything longer
 # has items and is not parsed at all.
 KUBECTL_EMPTY_LIST_PROBE_BYTES = 4096
-# Only a list kind counts, so an object that happens to carry an `items` field
-# of its own is never read as an empty answer.
+# Only kubectl's own list wrapper counts: `kubectl get <type>` prints
+# `apiVersion: v1, kind: List` for every resource type, built-in or custom. A
+# found object is never that pair -- the core group has no `List` resource, and
+# a custom kind (`AllowList`) carries its own group in `apiVersion` -- so an
+# object with an `items` field of its own is never read as an empty answer. A
+# typed list (`PodList`) only comes from `get --raw` and gets no line, which is
+# today's behaviour.
 KUBECTL_LIST_ITEMS_KEY = "items"
 KUBECTL_LIST_KIND_KEY = "kind"
-KUBECTL_LIST_KIND_SUFFIX = "List"
+KUBECTL_LIST_API_VERSION_KEY = "apiVersion"
+KUBECTL_LIST_KIND = "List"
+KUBECTL_LIST_API_VERSION = "v1"
 KUBECTL_EMPTY_YAML_ITEMS_RE = re.compile(r"^items: \[\]\s*$", re.MULTILINE)
-KUBECTL_YAML_LIST_KIND_RE = re.compile(r"^kind: \S*List\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_KIND_RE = re.compile(r"^kind: List\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_API_VERSION_RE = re.compile(r"^apiVersion: v1\s*$", re.MULTILINE)
+# `-o custom-columns` prints its header row even over an empty list, and the
+# generic printer it goes through prints no "No resources found", so a header
+# alone is the empty answer in that mode. Matched on the output flag's value,
+# in every spelling kubectl takes; the last one wins, as in kubectl.
+KUBECTL_OUTPUT_FLAGS = ("-o", "--output")
+KUBECTL_CUSTOM_COLUMNS_PREFIX = "custom-columns"
 KUBECTL_HOST_HINT_PREFIX = "[credential-proxy] "
 KUBECTL_HOST_HINT_NAMED = (
     "This kubectl named no cluster, so it read the host cluster {cluster}"
@@ -3423,19 +3437,50 @@ def _is_get_credentials(argv: list[str]) -> bool:
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
 
 
-def _kubectl_output_is_empty(stdout: str) -> bool:
+def _kubectl_output_format(argv: list[str]) -> str:
+    """The value of the last `-o`/`--output` in a kubectl argv, or ""."""
+    value = ""
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == END_OF_FLAGS:
+            break
+        if argument in KUBECTL_OUTPUT_FLAGS and index + 1 < len(argv):
+            value = argv[index + 1]
+            index += 2
+            continue
+        for flag in KUBECTL_OUTPUT_FLAGS:
+            if argument.startswith(f"{flag}="):
+                value = argument.partition("=")[2]
+                break
+        else:
+            short = KUBECTL_OUTPUT_FLAGS[0]
+            if argument.startswith(short) and not argument.startswith("--"):
+                value = argument[len(short):]
+        index += 1
+    return value
+
+
+def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
     """Did a successful kubectl read print nothing, or a list with no items?
 
     "No resources found" goes to stderr, leaving stdout empty; `-o json` and
-    `-o yaml` print an empty `List` instead, and `-o jsonpath='{.items}'` a
-    bare `[]`. Anything longer than an empty list can be is not parsed.
+    `-o yaml` print kubectl's empty `List` instead, `-o jsonpath='{.items}'` a
+    bare `[]`, and `-o custom-columns` its header row alone. Anything longer
+    than an empty list can be is not parsed.
     """
     text = stdout.strip()
     if not text:
         return True
     if len(text) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
         return False
-    if KUBECTL_EMPTY_YAML_ITEMS_RE.search(text) and KUBECTL_YAML_LIST_KIND_RE.search(text):
+    if _kubectl_output_format(argv).startswith(KUBECTL_CUSTOM_COLUMNS_PREFIX):
+        return len(text.splitlines()) == 1
+    if (
+        KUBECTL_EMPTY_YAML_ITEMS_RE.search(text)
+        and KUBECTL_YAML_LIST_KIND_RE.search(text)
+        and KUBECTL_YAML_LIST_API_VERSION_RE.search(text)
+    ):
         return True
     try:
         document = json.loads(text)
@@ -3446,7 +3491,8 @@ def _kubectl_output_is_empty(stdout: str) -> bool:
     return (
         isinstance(document, dict)
         and document.get(KUBECTL_LIST_ITEMS_KEY) == []
-        and str(document.get(KUBECTL_LIST_KIND_KEY, "")).endswith(KUBECTL_LIST_KIND_SUFFIX)
+        and document.get(KUBECTL_LIST_KIND_KEY) == KUBECTL_LIST_KIND
+        and document.get(KUBECTL_LIST_API_VERSION_KEY) == KUBECTL_LIST_API_VERSION
     )
 
 
@@ -6129,7 +6175,9 @@ class CommandExecutor:
             executable == "kubectl"
             and flag_kubeconfig is None
             and not kubeconfig_context
-            and kubectl_context_flag(argv) is None
+            # An empty value (`--context "$UNSET"`) names nothing: kubectl
+            # reads current-context, the host.
+            and not kubectl_context_flag(argv)
         ):
             return self._with_host_hint(argv, result)
         return result
@@ -6148,7 +6196,7 @@ class CommandExecutor:
         if not verb or verb[0] not in KUBECTL_HOST_HINT_VERBS:
             return result
         if result.exit_code == 0:
-            found_nothing = _kubectl_output_is_empty(result.stdout)
+            found_nothing = _kubectl_output_is_empty(argv, result.stdout)
         else:
             found_nothing = KUBECTL_NOT_FOUND_MARKER in result.stderr
         if not found_nothing:
