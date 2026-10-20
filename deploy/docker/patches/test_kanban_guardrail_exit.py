@@ -1267,31 +1267,6 @@ class CloseFailedChatTurnTest(unittest.TestCase):
         self.assertEqual(com.calls[0][1], kge.FAILED_TURN_COMMENT_AUTHOR)
 
 
-class SingleQueryExitCodeTest(unittest.TestCase):
-    """The cli.py exit: the render site's code, or 1 when no turn ran."""
-
-    def _code(self, code=None, turn_seen=False, environ=None, **over):
-        kwargs = dict(environ=WORKER_ENV if environ is None else environ, cron_run=False, delegated_child=False)
-        kwargs.update(over)
-        return kge.single_query_exit_code(code, turn_seen=turn_seen, **kwargs)
-
-    def test_the_render_sites_code_wins(self):
-        self.assertEqual(self._code(code=75, turn_seen=True), 75)
-
-    def test_no_turn_on_a_worker_exits_1_as_the_quiet_path_does(self):
-        self.assertEqual(self._code(), kge.NO_TURN_EXIT_CODE)
-
-    def test_a_turn_that_did_not_fail_keeps_exit_0(self):
-        self.assertIsNone(self._code(turn_seen=True))
-
-    def test_a_non_worker_keeps_its_exit(self):
-        self.assertIsNone(self._code(environ={}))
-
-    def test_the_exclusions_apply(self):
-        self.assertIsNone(self._code(delegated_child=True))
-        self.assertIsNone(self._code(environ=dict(WORKER_ENV, HERMES_KANBAN_GOAL_MODE="1")))
-
-
 # The applier is exercised against a miniature of the five real files, in the
 # shape v2026.9.14 gives them: the turn loop's phases are helpers that return a
 # verdict, and the loop copies the verdict's fields back into its locals. The
@@ -1879,16 +1854,16 @@ class ApplierTest(unittest.TestCase):
             self.assertEqual(len(charges.calls), 1, "the worker charges its own failure")
             self.assertEqual(charges.calls[0][1]["expected_run_id"], 28)
 
-            # A worker whose chat() returned before any turn exits 1 too.
+            # A worker whose chat() returned before any turn keeps exit 0:
+            # an exit 1 with no board write would reach the reaper's burst
+            # breaker (see the module docstring).
             class NoTurnCLI(CLI):
                 def chat(self, query, images=None):
                     return None
 
             no_turn = NoTurnCLI()
             with mock.patch.dict(os.environ, WORKER_ENV):
-                with self.assertRaises(SystemExit) as ctx:
-                    cli_mod._run_single_query_mode(no_turn, "work kanban task t_80ff98c9", None, False, False)
-            self.assertEqual(ctx.exception.code, 1)
+                cli_mod._run_single_query_mode(no_turn, "work kanban task t_80ff98c9", None, False, False)
             self.assertTrue(no_turn.finalized)
 
             # A worker whose turn succeeded keeps exit 0.
@@ -1928,8 +1903,6 @@ class ApplierTest(unittest.TestCase):
         files = self._apply_all()
         self.assertIn(f"self.{kge.EXIT_CODE_ATTR} = ", files["chat"])
         self.assertIn(f'getattr(cli, "{kge.EXIT_CODE_ATTR}", None)', files["cli"])
-        self.assertIn(f"self.{kge.TURN_SEEN_ATTR} = True", files["chat"])
-        self.assertIn(f'getattr(cli, "{kge.TURN_SEEN_ATTR}", False)', files["cli"])
 
     def test_a_raising_rate_limit_block_does_not_skip_the_exit(self):
         """Separate try blocks: one failing hook must not swallow the other."""

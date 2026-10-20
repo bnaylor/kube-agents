@@ -1390,22 +1390,10 @@ if len(exits) == 1:
         owner is not None and "_finalize_single_query" in ast.unparse(owner.finalbody),
     )
     check(
-        "and it asks single_query_exit_code, so a worker with no turn exits 1",
-        "_kube_single_query_exit_code(" in "\n".join(calls)
-        and "_kube_kanban_turn_seen" in "\n".join(calls),
+        "and nothing there makes a worker with no turn exit non-zero",
+        "single_query_exit_code" not in "\n".join(calls)
+        and "_kube_kanban_turn_seen" not in "\n".join(calls),
     )
-
-check(
-    "the module and the inserts agree on the turn-seen marker",
-    getattr(GUARD, "TURN_SEEN_ATTR", None) == "_kube_kanban_turn_seen",
-)
-_sqe = getattr(GUARD, "single_query_exit_code", None)
-check(
-    "a kanban worker whose chat() returned before any turn exits 1, as -Q does",
-    _sqe is not None
-    and _sqe(None, turn_seen=False, environ={"HERMES_KANBAN_TASK": "t_x"}, cron_run=False, delegated_child=False) == 1
-    and _sqe(None, turn_seen=True, environ={"HERMES_KANBAN_TASK": "t_x"}, cron_run=False, delegated_child=False) is None,
-)
 
 
 class _Turn:

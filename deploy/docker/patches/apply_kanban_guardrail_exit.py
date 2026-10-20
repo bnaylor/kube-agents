@@ -308,7 +308,6 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
         # after the summary.
         # See hermes_cli/kanban_guardrail_exit.py.
         if turn.result and os.environ.get("HERMES_KANBAN_TASK"):
-            self._kube_kanban_turn_seen = True
             try:
                 from hermes_cli.kanban_guardrail_exit import (
                     block_rate_limited_worker as _kube_block_rate_limited_chat,
@@ -357,20 +356,9 @@ SINGLE_QUERY_INSERT = '''        # kube-agents patch: a kanban worker whose turn
         # _chat_render_turn set the code after recording the failure; if that
         # record was refused, this exit is what the reaper counts instead of
         # booking a protocol violation. A worker whose chat() returned before
-        # any turn (credentials or agent init failed) exits 1, as -Q does.
+        # any turn keeps exit 0 (see the module docstring for why).
         # See hermes_cli/kanban_guardrail_exit.py.
         _kube_kanban_exit_code = getattr(cli, "_kube_kanban_exit_code", None)
-        try:
-            from hermes_cli.kanban_guardrail_exit import (
-                single_query_exit_code as _kube_single_query_exit_code,
-            )
-
-            _kube_kanban_exit_code = _kube_single_query_exit_code(
-                _kube_kanban_exit_code,
-                turn_seen=getattr(cli, "_kube_kanban_turn_seen", False),
-            )
-        except Exception:
-            logger.debug("kanban single-query exit check failed", exc_info=True)
         if _kube_kanban_exit_code:
             sys.exit(_kube_kanban_exit_code)
 '''

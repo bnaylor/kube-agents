@@ -261,9 +261,11 @@ children for up to that long. The old process also stops counting toward the
 dispatcher's concurrency limits once its claim is released.
 
 A worker whose ``chat()`` returns before any turn runs (credentials
-unresolved, the agent failed to initialise) exits 1 as well
-(``single_query_exit_code``), as the ``-Q`` branch does. There is no result
-to record, so the reaper books it.
+unresolved, the agent failed to initialise) still exits 0, as upstream's chat
+path does. An exit 1 with no board write there would reach the reaper's burst
+breaker, and those failures are fleet-wide by nature, so every card spawned in
+that tick would give up on its first attempt. Parity with the ``-Q`` branch
+for that case is gke-labs/kube-agents#3505.
 
 No board write reaches chat without feeding the guard: ``commented`` is not a
 kind the notifier posts. The ``crashed`` event the charge writes is, and it is
@@ -428,12 +430,6 @@ FAILED_TURN_COMMENT_AUTHOR = DETECTOR
 #: single-query exit in ``cli.py``: the exit code, and whether a turn result
 #: reached the site at all.
 EXIT_CODE_ATTR = "_kube_kanban_exit_code"
-TURN_SEEN_ATTR = "_kube_kanban_turn_seen"
-
-#: What a kanban worker exits with when ``chat()`` returned before any turn,
-#: mirroring the ``-Q`` branch's ``sys.exit(1)  # credentials or agent init
-#: failed``.
-NO_TURN_EXIT_CODE = 1
 
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
@@ -1083,37 +1079,3 @@ def close_failed_chat_turn(
     except Exception:
         logger.debug("failed-turn charge for task %s failed", env.get(TASK_ENV), exc_info=True)
     return code
-
-
-def single_query_exit_code(
-    code,
-    *,
-    turn_seen,
-    environ=None,
-    goal_mode=None,
-    cron_run=None,
-    delegated_child=None,
-):
-    """The exit code ``_run_single_query_mode`` leaves with on the chat path.
-
-    ``code`` is what the chat-render site left (``close_failed_chat_turn``),
-    and ``turn_seen`` says whether that site saw a turn result at all. A
-    kanban worker whose ``chat()`` returned before any turn ran (runtime
-    credentials unresolved, the agent failed to initialise) exits
-    ``NO_TURN_EXIT_CODE``, as the ``-Q`` branch does for the same cases
-    ("credentials or agent init failed"). Nothing is written to the board for
-    it: there is no result to describe, so the reaper books the exit. ``None``
-    leaves the exit alone, with the same exclusions as the rest of the module.
-    """
-    if code:
-        return code
-    env = os.environ if environ is None else environ
-    if turn_seen or not env.get(TASK_ENV):
-        return None
-    if goal_mode is None:
-        goal_mode = env.get(GOAL_MODE_ENV) == GOAL_MODE_ON
-    if card_is_somebody_elses(
-        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
-    ):
-        return None
-    return NO_TURN_EXIT_CODE
