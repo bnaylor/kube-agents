@@ -1,0 +1,100 @@
+"""A refusal ends the action; the agent does not patch its own tooling to retry it.
+
+Refused by the credential proxy for a repository its install does not manage, a
+fleet-audit worker copied the skill and the shared scripts into `*_override`
+directories, stubbed the managed-repository lookup to the skill's own example
+name and ran the copy, 72 times (gke-labs/kube-agents#3444). Workers have also
+re-pointed KUBECONFIG at another file to retry a refused `kubectl delete`. The
+example name it used, `acme/platform/infra`, read like a configured repository.
+
+The rule lives in prose, in the personas, the fleet-audit skill and the AI
+security audit SOP, and nothing executes it, so these tests pin the phrases it
+is made of: a rewording that keeps the rule keeps them; one that drops it fails
+here before it fails an overnight audit.
+
+Run:
+  python3 -m unittest discover -s tests -p 'test_persona_refusal_no_self_patch.py' -v
+"""
+
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PLATFORM_SOUL = REPO_ROOT / "agents/platform/SOUL.md"
+CLUSTER_SOUL = REPO_ROOT / "agents/cluster/SOUL.md"
+FLEET_AUDIT_SKILL = REPO_ROOT / "agents/platform/skills/fleet-audit/SKILL.md"
+FLEET_AUDIT_LIFECYCLE = REPO_ROOT / "agents/platform/skills/fleet-audit/references/lifecycle.md"
+AI_SECURITY_SOP = REPO_ROOT / "agents/platform/governance/ai_security_audit_sop.md"
+PROSE_ROOTS = (REPO_ROOT / "agents", REPO_ROOT / "docs")
+PROSE_SUFFIX = ".md"
+MIN_FILE_CHARS = 1000
+
+# The clause both personas carry, word for word, kubeconfig named.
+NO_SELF_PATCH = "copying, editing or monkeypatching a shipped skill or script, or pointing a command at another path or kubeconfig"
+# The §3 item 1 sentence the platform clause extends, by its lead and its end.
+SECOND_ROUTE_LEAD = "Never look for a credential, token, key or second route to the same effect:"
+SENTENCE_END = ". "
+# §1's rule stays as it is.
+DENIALS_TERMINAL = "**Authorization Denials Are Terminal:**"
+# The skill side: a refusal is an answer, and the override copy is named.
+SKILL_RULE = "**Never work around a refusal from the credential proxy or the broker.**"
+OVERRIDE_DIR = "`*_override` directory"
+STOP = "and stop"
+# The SOP: its data-source list is exhaustive and covers the proxy's routes,
+# and the install's own components are not targets to explore.
+SOP_NO_IN_CLUSTER_CALLS = "no script or HTTP call of your own against an in-cluster service, the credential proxy's routes included"
+SOP_EXHAUSTIVE = "The list is exhaustive."
+SOP_OWN_COMPONENTS = "The install's own components (the platform agent, the credential proxy and the gateway) are not targets to explore"
+# An example repository that reads like a configured one.
+REAL_LOOKING_EXAMPLE = "acme/platform/infra"
+
+
+def _read(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    if len(text) < MIN_FILE_CHARS:
+        raise AssertionError(f"{path} read back suspiciously short ({len(text)} chars)")
+    return text
+
+
+class RefusalNoSelfPatchTest(unittest.TestCase):
+    # The files are tens of thousands of characters; print the message, not the file.
+    longMessage = False
+
+    def test_platform_second_route_sentence_names_self_patching(self):
+        soul = _read(PLATFORM_SOUL)
+        start = soul.index(SECOND_ROUTE_LEAD)
+        sentence = soul[start : soul.index(SENTENCE_END, start)]
+        self.assertIn(NO_SELF_PATCH, sentence, "§3 item 1's second-route list lost the self-patching clause")
+        self.assertIn(DENIALS_TERMINAL, soul, "§1 lost its Authorization Denials Are Terminal rule")
+
+    def test_cluster_persona_carries_the_same_clause(self):
+        self.assertIn(NO_SELF_PATCH, _read(CLUSTER_SOUL), "agents/cluster/SOUL.md lost the self-patching clause")
+
+    def test_fleet_audit_skill_says_a_refusal_is_an_answer(self):
+        for path in (FLEET_AUDIT_SKILL, FLEET_AUDIT_LIFECYCLE):
+            text = _read(path)
+            with self.subTest(path=path.name):
+                self.assertIn(OVERRIDE_DIR, text, f"{path.name} does not name the override copy")
+                self.assertIn(STOP, text, f"{path.name} does not say to stop")
+        self.assertIn(SKILL_RULE, _read(FLEET_AUDIT_SKILL), "fleet-audit SKILL.md lost its refusal rule")
+
+    def test_sop_data_sources_are_exhaustive_and_own_components_are_not_targets(self):
+        sop = _read(AI_SECURITY_SOP)
+        for phrase in (SOP_NO_IN_CLUSTER_CALLS, SOP_EXHAUSTIVE, SOP_OWN_COMPONENTS):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, sop, f"the AI security audit SOP lost {phrase!r}")
+
+    def test_no_prose_names_a_real_looking_example_repository(self):
+        offenders = [
+            str(path.relative_to(REPO_ROOT))
+            for root in PROSE_ROOTS
+            for path in sorted(root.rglob(f"*{PROSE_SUFFIX}"))
+            if REAL_LOOKING_EXAMPLE in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual([], offenders, f"prose still names {REAL_LOOKING_EXAMPLE}")
+
+
+if __name__ == "__main__":
+    unittest.main()
