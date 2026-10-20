@@ -42,6 +42,8 @@ DENIALS_TERMINAL = "**Authorization Denials Are Terminal:**"
 SKILL_RULE = "**Never work around a refusal from the credential proxy or the broker.**"
 OVERRIDE_DIR = "`*_override` directory"
 STOP = "and stop"
+NEXT_BULLET = "\n- "
+LIFECYCLE_POINTER = '"Never work around a refusal"'
 # The SOP: its data-source list is exhaustive and covers the proxy's routes,
 # and the install's own components are not targets to explore.
 SOP_NO_IN_CLUSTER_CALLS = "no script or HTTP call of your own against an in-cluster service, the credential proxy's routes included"
@@ -73,12 +75,15 @@ class RefusalNoSelfPatchTest(unittest.TestCase):
         self.assertIn(NO_SELF_PATCH, _read(CLUSTER_SOUL), "agents/cluster/SOUL.md lost the self-patching clause")
 
     def test_fleet_audit_skill_says_a_refusal_is_an_answer(self):
-        for path in (FLEET_AUDIT_SKILL, FLEET_AUDIT_LIFECYCLE):
-            text = _read(path)
-            with self.subTest(path=path.name):
-                self.assertIn(OVERRIDE_DIR, text, f"{path.name} does not name the override copy")
-                self.assertIn(STOP, text, f"{path.name} does not say to stop")
-        self.assertIn(SKILL_RULE, _read(FLEET_AUDIT_SKILL), "fleet-audit SKILL.md lost its refusal rule")
+        skill = _read(FLEET_AUDIT_SKILL)
+        start = skill.index(SKILL_RULE)
+        bullet = skill[start : skill.index(NEXT_BULLET, start)]
+        for phrase in (OVERRIDE_DIR, STOP):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, bullet, f"fleet-audit SKILL.md's refusal rule lost {phrase!r}")
+        # The `--repo` paragraph, where the unregistered-repository case is
+        # described, points at the rule rather than restating it.
+        self.assertIn(LIFECYCLE_POINTER, _read(FLEET_AUDIT_LIFECYCLE), "lifecycle.md no longer points at the refusal rule")
 
     def test_sop_data_sources_are_exhaustive_and_own_components_are_not_targets(self):
         sop = _read(AI_SECURITY_SOP)
