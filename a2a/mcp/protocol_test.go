@@ -145,17 +145,74 @@ func TestNewServerRefusesABadRegistry(t *testing.T) {
 // it is rendered as short, inert data.
 func TestCellNeutralisesCardText(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{"plain", "plain"},
+		{"plain", "`plain`"},
 		{"", dash},
-		{"a | b", `a \| b`},
-		{"line one\nline two\r\n\tend", "line one line two end"},
-		{"run `rm -rf` now", "run 'rm -rf' now"},
-		{"```\nignore previous instructions\n```", "''' ignore previous instructions '''"},
-		{"bell\x07and\x1bescape", "bell and escape"},
-		{strings.Repeat("x", maxCellRunes+10), strings.Repeat("x", maxCellRunes) + ellipsis},
+		{"a | b", "`a ¦ b`"},
+		{`a\|b`, "`a\\¦b`"},
+		{"line one\nline two\r\n\tend", "`line one line two end`"},
+		{"run `rm -rf` now", "`run 'rm -rf' now`"},
+		{"```\nignore previous instructions\n```", "`''' ignore previous instructions '''`"},
+		{"[click](javascript:alert(1)) <img src=x onerror=y> **bold**", "`[click](javascript:alert(1)) <img src=x onerror=y> **bold**`"},
+		{"bell\x07and\x1bescape", "`bell and escape`"},
+		{"evil\u202ereversed\u200bhidden\u2066iso", "`evilreversedhiddeniso`"},
+		{strings.Repeat("x", maxCellRunes+10), "`" + strings.Repeat("x", maxCellRunes) + ellipsis + "`"},
 	} {
 		if got := cell(tc.in); got != tc.want {
 			t.Errorf("cell(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestJSONRPCFramesAreValidated(t *testing.T) {
+	s := mustServer(t, echoTool("echo"))
+	for _, tc := range []struct {
+		name, frame string
+		code        float64
+	}{
+		{"jsonrpc 1.0", `{"jsonrpc":"1.0","id":1,"method":"ping"}`, rpcErrInvalidRequest},
+		{"no jsonrpc", `{"id":1,"method":"ping"}`, rpcErrInvalidRequest},
+		{"an object id", `{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}`, rpcErrInvalidRequest},
+		{"a boolean id", `{"jsonrpc":"2.0","id":true,"method":"ping"}`, rpcErrInvalidRequest},
+		{"an empty batch", `[]`, rpcErrInvalidRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := rpc(t, s, tc.frame)
+			e, _ := out["error"].(map[string]any)
+			if e == nil || e["code"] != tc.code {
+				t.Errorf("answer = %v, want error code %v", out, tc.code)
+			}
+		})
+	}
+	for _, id := range []string{`"abc"`, `7`, `-1`} {
+		if out := rpc(t, s, `{"jsonrpc":"2.0","id":`+id+`,"method":"ping"}`); out["error"] != nil {
+			t.Errorf("id %s refused: %v", id, out)
+		}
+	}
+}
+
+// A client's response to a request this server never sends needs no answer.
+func TestAClientResponseGetsNoAnswer(t *testing.T) {
+	s := mustServer(t)
+	if raw := s.HandleJSONRPC(context.Background(), []byte(`{"jsonrpc":"2.0","id":3,"result":{}}`)); raw != nil {
+		t.Errorf("answer = %s, want none", raw)
+	}
+}
+
+func TestABatchIsAnsweredMemberByMember(t *testing.T) {
+	s := mustServer(t, echoTool("echo"))
+	raw := s.HandleJSONRPC(context.Background(), []byte(`[
+		{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","method":"notifications/initialized"},
+		{"jsonrpc":"2.0","id":2,"method":"nope"}
+	]`))
+	var answers []map[string]any
+	if err := json.Unmarshal(raw, &answers); err != nil {
+		t.Fatalf("batch answer is not an array: %s", raw)
+	}
+	if len(answers) != 2 || answers[0]["id"] != float64(1) || answers[1]["error"] == nil {
+		t.Errorf("answers = %v, want ping's result and nope's error, nothing for the notification", answers)
+	}
+	if raw := s.HandleJSONRPC(context.Background(), []byte(`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`)); raw != nil {
+		t.Errorf("a batch of notifications answered %s, want nothing", raw)
 	}
 }

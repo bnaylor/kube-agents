@@ -57,20 +57,42 @@ func TestTheGrantsAreTheRenderedOnes(t *testing.T) {
 		t.Fatal("the rendered conf has no console user")
 	}
 	block := conf[start:]
-	block = block[:strings.Index(block, "\n      }\n")]
-	for _, g := range append(append([]string{}, consolePublish...), consoleSubscribe...) {
-		if !strings.Contains(block, `"`+g+`"`) {
-			t.Errorf("grant %q is not in the rendered console user; update the test's copy", g)
+	// allowList returns the quoted entries of the first `<kind> { allow = [`
+	// list in block, in order.
+	allowList := func(kind string) []string {
+		t.Helper()
+		i := strings.Index(block, kind+" {")
+		if i < 0 {
+			t.Fatalf("the console user has no %s block", kind)
 		}
+		rest := block[i:]
+		open := strings.Index(rest, "allow = [")
+		end := strings.Index(rest, "]")
+		if open < 0 || end < open {
+			t.Fatalf("the console user's %s block has no allow list", kind)
+		}
+		var out []string
+		for _, f := range strings.Split(rest[open+len("allow = ["):end], ",") {
+			if f = strings.Trim(strings.TrimSpace(f), `"`); f != "" {
+				out = append(out, f)
+			}
+		}
+		return out
 	}
-	if got, want := strings.Count(block, `"`)/2-1, len(consolePublish)+len(consoleSubscribe); got != want {
-		t.Errorf("the rendered console user has %d quoted values beside its password, the test has %d grants", got, want)
+	for kind, want := range map[string][]string{"publish": consolePublish, "subscribe": consoleSubscribe} {
+		got := allowList(kind)
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Errorf("the rendered console %s list is\n  %v\nthe test has\n  %v\nupdate the test's copy", kind, got, want)
+		}
 	}
 }
 
 const (
 	testUser = "console"
 	testPass = "pw-console"
+	// directoryMaxConsumers is the cap the operator provisions DIRECTORY
+	// with.
+	directoryMaxConsumers = 64
 )
 
 // testBus starts a JetStream server with the operator's message streams and
@@ -114,7 +136,10 @@ func testBus(t *testing.T) (string, jetstream.JetStream) {
 	} {
 		cfg := jetstream.StreamConfig{Name: name, Subjects: subjects, MaxBytes: 1 << 20}
 		if name == streamDirectory {
+			// As the operator provisions it (--max-consumers=64), so a read
+			// that leaks consumers runs into the cap here as on a cluster.
 			cfg.MaxMsgsPerSubject = 1
+			cfg.MaxConsumers = directoryMaxConsumers
 		}
 		if _, err := js.CreateStream(ctx, cfg); err != nil {
 			t.Fatalf("stream %s: %v", name, err)
@@ -188,12 +213,12 @@ func TestStatusReadsTheBusAsTheConsole(t *testing.T) {
 	if len(st.Problems) != 1 || !strings.Contains(st.Problems[0], consumerBridgePlatform) {
 		t.Errorf("problems = %v, want the missing bridge consumer named", st.Problems)
 	}
-	if len(st.AgentCards) != 2 || st.AgentCards["platform"].text(cardName) != "Platform agent" || st.AgentCards["cluster-a"] == nil {
+	if len(st.AgentCards) != 2 || st.AgentCards["platform"].Name != "Platform agent" || st.AgentCards["cluster-a"].Name != "Cluster A" {
 		t.Errorf("cards = %v, want platform and cluster-a (retired closed its card)", st.AgentCards)
 	}
 
 	md := FormatBusStatusMarkdown(st)
-	for _, want := range []string{"`kubeagents-system/platform-agent`", "| `platform` | Platform agent | does \\| things well |", "consumer TASKS/" + consumerBridgePlatform} {
+	for _, want := range []string{"`kubeagents-system/platform-agent`", "| `platform` | `Platform agent` | `does ¦ things well` |", "consumer TASKS/" + consumerBridgePlatform} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown does not contain %q:\n%s", want, md)
 		}
@@ -253,5 +278,68 @@ func TestACardUnderAnInvalidProfileIsDropped(t *testing.T) {
 	addCard(cards, lib.AgentSubject("good-profile"), data)
 	if len(cards) != 1 {
 		t.Errorf("a valid profile was not added: %v", cards)
+	}
+}
+
+func directoryConsumers(t *testing.T, js jetstream.JetStream) int {
+	t.Helper()
+	s, err := js.Stream(context.Background(), streamDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.CachedInfo().State.Consumers
+}
+
+// Each read of the directory costs one consumer, which the server reaps when
+// idle, and a caller polling faster than the cache costs none: never the two
+// per read an ordered consumer leaves behind (its replacement, and the
+// original it cannot delete under the console grant), which filled
+// DIRECTORY's cap after 32 calls.
+func TestStatusReadsDoNotExhaustTheDirectoryCap(t *testing.T) {
+	url, js := testBus(t)
+	publishCard(t, js, "platform", map[string]any{"name": "Platform agent"})
+	b := dial(t, url)
+
+	for i := 0; i < 2*directoryMaxConsumers; i++ {
+		st := b.Status(context.Background())
+		if len(st.AgentCards) != 1 || strings.Contains(strings.Join(st.Problems, ";"), "agent cards") {
+			t.Fatalf("call %d: problems %v cards %v", i, st.Problems, st.AgentCards)
+		}
+	}
+	if got := directoryConsumers(t, js); got != 1 {
+		t.Errorf("%d rapid calls left %d consumers, want 1: the cache answers them", 2*directoryMaxConsumers, got)
+	}
+
+	clock := time.Now()
+	b.now = func() time.Time { clock = clock.Add(statusCacheTTL + time.Second); return clock }
+	const reads = directoryMaxConsumers / 2
+	for i := 0; i < reads; i++ {
+		st := b.Status(context.Background())
+		for _, p := range st.Problems {
+			if strings.Contains(p, "agent cards") {
+				t.Fatalf("read %d: %s", i, p)
+			}
+		}
+	}
+	if got := directoryConsumers(t, js); got != reads+1 {
+		t.Errorf("%d uncached reads left %d consumers, want %d: one per read", reads, got, reads+1)
+	}
+}
+
+// A status read is bounded by its own timeout and the caller's, whatever the
+// bus does: here the caller's context is already done.
+func TestStatusHonoursTheCallersDeadline(t *testing.T) {
+	url, js := testBus(t)
+	publishCard(t, js, "platform", map[string]any{"name": "Platform agent"})
+	b := dial(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	st := b.Status(ctx)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("a cancelled read took %s", elapsed)
+	}
+	if len(st.Problems) == 0 {
+		t.Error("a cancelled read reported no problems")
 	}
 }

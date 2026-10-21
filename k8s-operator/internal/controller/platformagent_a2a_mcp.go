@@ -94,6 +94,9 @@ const (
 	a2aMCPMemoryLimit   = "128Mi"
 )
 
+// a2aMCPFenceIndex is the fence's place in a2aMCPObjects.
+const a2aMCPFenceIndex = 2
+
 // a2aMCPDoorEnabled reports whether the operator was deployed with the MCP
 // flag.
 func a2aMCPDoorEnabled() bool {
@@ -286,7 +289,7 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 		}
 		token, err := randomA2AInjectToken()
 		if err != nil {
-			return err
+			return fmt.Errorf("mint the MCP server's token: %w", err)
 		}
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}
@@ -299,7 +302,7 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 	}
 	token, err := randomA2AInjectToken()
 	if err != nil {
-		return err
+		return fmt.Errorf("mint the MCP server's token: %w", err)
 	}
 	secret := &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -336,21 +339,48 @@ func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *ag
 	return nil
 }
 
-// removeA2AMCP takes the MCP server away, the Deployment first and its fence
-// after it, and the token Secret with it: a token left behind for a server
-// that no longer exists is a credential nobody is reading.
+// removeA2AMCP takes the MCP server away: the Deployment, its Service and
+// its token (a token left behind for a server that no longer exists is a
+// credential nobody is reading), and the fence once no pod of it is left.
+// Delete returns before the pod exits, so the fence waits for a later pass
+// rather than leaving the terminating pod unfenced, the console fence's
+// reason (a2aBusTeardown); a fence over nothing denies nothing and costs
+// nothing in the meantime. The pod list runs only while a fence stands, so
+// an install that never set the flag pays a cached read for it.
 func (r *PlatformAgentReconciler) removeA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	for _, entry := range r.a2aMCPObjects(agent) {
+	objs := r.a2aMCPObjects(agent)
+	fence := objs[a2aMCPFenceIndex]
+	for i, entry := range objs {
+		if i == a2aMCPFenceIndex {
+			continue
+		}
 		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
 			return fmt.Errorf("failed to remove the MCP server's %T: %w", entry.obj, err)
 		}
 	}
+	if err := fence.reader.Get(ctx, client.ObjectKeyFromObject(fence.obj), fence.obj); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	pods := &corev1.PodList{}
+	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace),
+		client.MatchingLabels{"app": a2aMCPName(agent)}); err != nil {
+		return fmt.Errorf("failed to list the MCP server's pods: %w", err)
+	}
+	if len(pods.Items) > 0 {
+		return nil
+	}
+	if err := r.deleteOwnedA2AObject(ctx, agent, fence.obj, fence.reader); err != nil {
+		return fmt.Errorf("failed to remove the MCP server's fence: %w", err)
+	}
 	return nil
 }
 
-// a2aMCPObjects names the MCP server's objects in removal order: the server,
-// its Service, its fence once the server is going, then its token, read
-// uncached like every Secret here.
+// a2aMCPObjects names the MCP server's objects: the server, its Service, its
+// fence (at a2aMCPFenceIndex), then its token, read uncached like every
+// Secret here.
 func (r *PlatformAgentReconciler) a2aMCPObjects(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	ns := agent.Namespace
 	return []a2aTeardownEntry{

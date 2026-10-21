@@ -48,11 +48,12 @@ func TestConfigFromEnvRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 	token, pass := file(t, "tok"), file(t, "pw")
 	base := map[string]string{envBusURL: "tls://bus:4222", envTokenFile: token, envPasswordFile: pass}
 	for name, override := range map[string]map[string]string{
-		"no bus URL":         {envBusURL: ""},
-		"a missing token":    {envTokenFile: filepath.Join(t.TempDir(), "absent")},
-		"an empty token":     {envTokenFile: file(t, " \n")},
-		"a missing password": {envPasswordFile: filepath.Join(t.TempDir(), "absent")},
-		"an empty password":  {envPasswordFile: file(t, "\n")},
+		"no bus URL":          {envBusURL: ""},
+		"a plaintext bus URL": {envBusURL: "nats://bus:4222"},
+		"a missing token":     {envTokenFile: filepath.Join(t.TempDir(), "absent")},
+		"an empty token":      {envTokenFile: file(t, " \n")},
+		"a missing password":  {envPasswordFile: filepath.Join(t.TempDir(), "absent")},
+		"an empty password":   {envPasswordFile: file(t, "\n")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := map[string]string{}

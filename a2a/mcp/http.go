@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 const (
@@ -55,20 +56,22 @@ func ReadToken(path string) (string, error) {
 // from tokenFile on every request, so a rotated Secret takes effect without a
 // restart, and a file that becomes unreadable or empty refuses every request.
 func Handler(s *Server, tokenFile string, log *slog.Logger) http.Handler {
+	tl := &tokenLog{log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+HealthPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(headerContentType, contentTypeJSON)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "name": ServerName, "version": ServerVersion})
 	})
 	mux.HandleFunc("POST "+Path, func(w http.ResponseWriter, r *http.Request) {
-		// MCP clients are programs, not pages. A browser always sends Origin,
-		// so refusing it closes the DNS-rebinding door a port-forward to
-		// localhost would otherwise leave open.
+		// MCP clients are programs, not pages, and a browser sends Origin on
+		// every POST ("null" included). The bearer token is what keeps a
+		// DNS-rebinding page out, since a browser never attaches it on its
+		// own; this refuses such a page before it reaches the token check.
 		if r.Header.Get(headerOrigin) != "" {
 			http.Error(w, msgNoBrowsers, http.StatusForbidden)
 			return
 		}
-		if !authorized(r, tokenFile, log) {
+		if !authorized(r, tokenFile, tl) {
 			http.Error(w, msgUnauthorized, http.StatusUnauthorized)
 			return
 		}
@@ -88,16 +91,45 @@ func Handler(s *Server, tokenFile string, log *slog.Logger) http.Handler {
 	return mux
 }
 
-// authorized reports whether r carries the server's token.
-func authorized(r *http.Request, tokenFile string, log *slog.Logger) bool {
+// authorized reports whether r carries the server's token. The scheme is
+// matched without regard to case, as RFC 7235 has it.
+func authorized(r *http.Request, tokenFile string, log *tokenLog) bool {
 	want, err := ReadToken(tokenFile)
+	log.note(tokenFile, err)
 	if err != nil {
-		log.Error("mcp token unreadable; refusing every request", "file", tokenFile, "err", err)
 		return false
 	}
-	got, ok := strings.CutPrefix(r.Header.Get(headerAuthorization), bearerPrefix)
-	if !ok {
+	h := r.Header.Get(headerAuthorization)
+	if len(h) < len(bearerPrefix) || !strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(want)) == 1
+	got := strings.TrimSpace(h[len(bearerPrefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// tokenLog reports the token file going bad, and recovering, once each
+// rather than on every request, so unauthenticated traffic cannot flood the
+// log.
+type tokenLog struct {
+	log  *slog.Logger
+	mu   sync.Mutex
+	last string
+}
+
+func (l *tokenLog) note(file string, err error) {
+	state := ""
+	if err != nil {
+		state = err.Error()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if state == l.last {
+		return
+	}
+	l.last = state
+	if err != nil {
+		l.log.Error("mcp token unreadable; refusing every request", "file", file, "err", err)
+	} else {
+		l.log.Info("mcp token readable again", "file", file)
+	}
 }

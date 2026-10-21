@@ -296,3 +296,62 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 		t.Error("the MCP token survived the flag going off")
 	}
 }
+
+// The fence outlives the pod it fences: removal leaves it while an MCP pod is
+// still terminating and takes it on a later pass.
+func TestTheMCPFenceWaitsForThePodToGo(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	r, cl := mcpTestReconciler(t)
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}, stored); err != nil {
+		t.Fatal(err)
+	}
+	np := buildA2AMCPNetworkPolicy(agent)
+	if err := ctrl.SetControllerReference(stored, np, r.Scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, np); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent) + "-x", Namespace: agent.Namespace,
+		Labels: map[string]string{"app": a2aMCPName(agent)}}}
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	fenceKey := types.NamespacedName{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}
+
+	if err := r.removeA2AMCP(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, fenceKey, &networkingv1.NetworkPolicy{}); err != nil {
+		t.Fatalf("the fence went while an MCP pod was still there: %v", err)
+	}
+
+	if err := cl.Delete(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.removeA2AMCP(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, fenceKey, &networkingv1.NetworkPolicy{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the fence survived its pod: %v", err)
+	}
+}
+
+// Nothing else carries a credential into the pod: no env from a Secret, no
+// second container, no init container, no ServiceAccount of its own.
+func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
+	pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
+	if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 || len(pod.EphemeralContainers) != 0 {
+		t.Errorf("containers %d, init %d, ephemeral %d; want one container", len(pod.Containers), len(pod.InitContainers), len(pod.EphemeralContainers))
+	}
+	if pod.ServiceAccountName != "" {
+		t.Errorf("serviceAccountName = %q, want the namespace default with no token mounted", pod.ServiceAccountName)
+	}
+	for _, c := range pod.Containers {
+		if len(c.EnvFrom) != 0 {
+			t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
+		}
+	}
+}

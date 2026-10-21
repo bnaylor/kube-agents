@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -27,11 +28,28 @@ const (
 	consumerBridgePlatform = "bridge-platform"
 	gatewayRelayDurable    = "gateway-relay"
 
-	// directoryReadTimeout bounds one status call's read of the agent cards.
-	// The stream holds one message per agent, so it is a short read or a
-	// stalled bus, and the status reports either.
-	directoryReadTimeout = 3 * time.Second
-	directoryFetchBatch  = 256
+	// statusTimeout bounds one status read end to end, whatever the caller's
+	// context allows: a stalled bus answers with the parts it read and a
+	// problem naming the rest, not with a hung request.
+	statusTimeout = 8 * time.Second
+	// statusCacheTTL is how long one read answers every call. A caller that
+	// polls (an IDE agent checking every few seconds) then costs the bus one
+	// read, and one short-lived consumer, per window rather than per call.
+	statusCacheTTL = 5 * time.Second
+
+	// The DIRECTORY read: one plain pull consumer per read, with no acks, in
+	// memory, which the server deletes itself once it has been idle for
+	// directoryConsumerIdle. Not an ordered consumer: that one replaces its
+	// consumer on its first fetch and deletes the old one, a delete the
+	// console grant refuses, so every read would leave two behind against
+	// DIRECTORY's consumer cap. directoryFetchWait bounds each fetch.
+	directoryConsumerIdle = 5 * time.Second
+	directoryFetchWait    = 2 * time.Second
+	minFetchWait          = 100 * time.Millisecond
+	directoryFetchBatch   = 256
+	// maxAgentCards bounds what one read keeps; DIRECTORY holds one card per
+	// profile, so more than this is a directory gone wrong, and is reported.
+	maxAgentCards = 512
 )
 
 // statusStreams are the streams the console principal may read the info of,
@@ -70,6 +88,13 @@ type Bus interface {
 type NATSBus struct {
 	client *lib.Client
 	cfg    BusConfig
+
+	// mu serialises status reads, so concurrent callers share one read
+	// rather than each opening a consumer, and guards the cached answer.
+	mu       sync.Mutex
+	cached   BusStatus
+	cachedAt time.Time
+	now      func() time.Time
 }
 
 // DialBus connects to the bus. It fails if the first connect does, so a
@@ -87,16 +112,28 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
 	}
-	return &NATSBus{client: client, cfg: cfg}, nil
+	return &NATSBus{client: client, cfg: cfg, now: time.Now}, nil
 }
 
 // Close drops the connection.
 func (b *NATSBus) Close() { b.client.Close() }
 
-// Status reads the bus's state now. Every part is read fresh and every part
-// that fails is named in Problems rather than failing the whole report, so a
-// half-working bus still tells the caller which half.
+// Status reports the bus's state, read at most statusCacheTTL ago. Every
+// part that fails is named in Problems rather than failing the whole report,
+// so a half-working bus still tells the caller which half.
 func (b *NATSBus) Status(ctx context.Context) BusStatus {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.cachedAt.IsZero() && b.now().Sub(b.cachedAt) < statusCacheTTL {
+		return b.cached
+	}
+	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
+	defer cancel()
+	b.cached, b.cachedAt = b.read(ctx), b.now()
+	return b.cached
+}
+
+func (b *NATSBus) read(ctx context.Context) BusStatus {
 	st := BusStatus{
 		Deployment: b.cfg.Deployment,
 		URL:        b.cfg.URL,
@@ -152,37 +189,47 @@ func (b *NATSBus) Status(ctx context.Context) BusStatus {
 	return st
 }
 
-// agentCards reads the latest card of every agent off DIRECTORY with an
-// ordered consumer, which the console grant allows and which the server
-// removes itself when it goes idle. A closed card removes the agent.
+// agentCards reads the latest card of every agent off DIRECTORY. A closed
+// card removes the agent. It stops at ctx's deadline with what it has read.
 func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) {
-	ctx, cancel := context.WithTimeout(ctx, directoryReadTimeout)
-	defer cancel()
-	js := b.client.JetStream()
-	s, err := js.Stream(ctx, streamDirectory)
+	s, err := b.client.JetStream().Stream(ctx, streamDirectory)
 	if err != nil {
 		return nil, err
 	}
-	pending := s.CachedInfo().State.Msgs
 	cards := map[string]AgentCard{}
-	if pending == 0 {
+	if s.CachedInfo().State.Msgs == 0 {
 		return cards, nil
 	}
-	cons, err := s.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{directorySubjects},
-		DeliverPolicy:  jetstream.DeliverLastPerSubjectPolicy,
+	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		FilterSubject:     directorySubjects,
+		DeliverPolicy:     jetstream.DeliverLastPerSubjectPolicy,
+		AckPolicy:         jetstream.AckNonePolicy,
+		MemoryStorage:     true,
+		InactiveThreshold: directoryConsumerIdle,
 	})
 	if err != nil {
 		return nil, err
 	}
+	seen := 0
 	for {
-		batch, err := cons.Fetch(directoryFetchBatch, jetstream.FetchMaxWait(directoryReadTimeout))
+		wait := directoryFetchWait
+		if dl, ok := ctx.Deadline(); ok {
+			wait = min(wait, time.Until(dl))
+		}
+		if wait < minFetchWait {
+			return cards, fmt.Errorf("read %d of the directory before the deadline", seen)
+		}
+		batch, err := cons.Fetch(directoryFetchBatch, jetstream.FetchMaxWait(wait))
 		if err != nil {
 			return cards, err
 		}
 		n := 0
 		for msg := range batch.Messages() {
 			n++
+			seen++
+			if seen > maxAgentCards {
+				return cards, fmt.Errorf("DIRECTORY holds more than %d cards; showing the first %d", maxAgentCards, maxAgentCards)
+			}
 			addCard(cards, msg.Subject(), msg.Data())
 			if md, err := msg.Metadata(); err == nil && md.NumPending == 0 {
 				return cards, nil
@@ -193,6 +240,9 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 		}
 		if n == 0 {
 			return cards, nil
+		}
+		if ctx.Err() != nil {
+			return cards, ctx.Err()
 		}
 	}
 }

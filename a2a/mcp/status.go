@@ -14,11 +14,13 @@ import (
 const ToolConnectionStatus = "connection_status"
 
 const (
-	dash            = "—"
-	cardName        = "name"
-	cardDescription = "description"
-	byteUnit        = 1024
-	byteUnits       = "KMGTPE"
+	dash = "—"
+	// tablePipe stands in for "|" in card text: a table cell ends at a pipe
+	// even inside a code span, and an escape the text could undo is no
+	// escape at all.
+	tablePipe = "¦"
+	byteUnit  = 1024
+	byteUnits = "KMGTPE"
 
 	// maxCellRunes caps one card field in the table. Card text is written by
 	// whoever publishes the card and read by a model in the caller's editor,
@@ -27,9 +29,12 @@ const (
 	ellipsis     = "…"
 )
 
-// AgentCard is an agent's A2A card as it sits on DIRECTORY. The server shows
-// a couple of its fields and passes the rest through.
-type AgentCard map[string]any
+// AgentCard is the part of an agent's A2A card the status shows. The rest of
+// the card is not kept.
+type AgentCard struct {
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+}
 
 // StreamHealth is one stream's size and consumer count.
 type StreamHealth struct {
@@ -130,28 +135,23 @@ func FormatBusStatusMarkdown(st BusStatus) string {
 				names = append(names, n)
 			}
 			sort.Strings(names)
-			sb.WriteString("Names and descriptions are as each agent published them, shortened and with markdown neutralised.\n\n")
+			sb.WriteString("Names and descriptions are as each agent published them: shown as code, shortened, without line breaks or invisible characters.\n\n")
 			sb.WriteString("| Profile | Name | Description |\n| :--- | :--- | :--- |\n")
 			for _, n := range names {
 				c := st.AgentCards[n]
-				fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", n, cell(c.text(cardName)), cell(c.text(cardDescription)))
+				fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", n, cell(c.Name), cell(c.Description))
 			}
 		}
 	}
 	return sb.String()
 }
 
-func (c AgentCard) text(key string) string {
-	if s, ok := c[key].(string); ok {
-		return s
-	}
-	return ""
-}
-
-// cell renders untrusted text as one inert markdown table cell: control
-// characters and line breaks become spaces, backticks become quotes so the
-// text cannot open a code span, a pipe cannot end the cell, and the result is
-// capped at maxCellRunes.
+// cell renders untrusted text as one inert table cell: a code span, which
+// markdown renders verbatim, so links, images, HTML and emphasis are shown as
+// text. Backticks become quotes so the text cannot close the span, pipes
+// become tablePipe so it cannot end the cell, control and format characters
+// (line breaks, bidi overrides, zero-width marks) go, and the result is capped
+// at maxCellRunes.
 func cell(s string) string {
 	s = strings.Map(func(r rune) rune {
 		switch {
@@ -159,14 +159,19 @@ func cell(s string) string {
 			return '\''
 		case unicode.IsControl(r):
 			return ' '
+		case unicode.Is(unicode.Cf, r):
+			return -1
 		}
 		return r
 	}, s)
-	s = strings.Join(strings.Fields(s), " ")
+	s = strings.ReplaceAll(strings.Join(strings.Fields(s), " "), "|", tablePipe)
 	if r := []rune(s); len(r) > maxCellRunes {
 		s = string(r[:maxCellRunes]) + ellipsis
 	}
-	return orDash(strings.ReplaceAll(s, "|", `\|`))
+	if s == "" {
+		return dash
+	}
+	return "`" + s + "`"
 }
 
 func orDash(s string) string {

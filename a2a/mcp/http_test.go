@@ -50,6 +50,7 @@ func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
 	}{
 		{"the right token", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("Bearer " + testToken), http.StatusOK},
 		{"the right token with a trailing newline in the file", func(t *testing.T) string { return writeToken(t, testToken+"\n") }, bearer("Bearer " + testToken), http.StatusOK},
+		{"the scheme in another case", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("bearer " + testToken), http.StatusOK},
 		{"no Authorization header", func(t *testing.T) string { return writeToken(t, testToken) }, nil, http.StatusUnauthorized},
 		{"an empty bearer", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("Bearer "), http.StatusUnauthorized},
 		{"the wrong token", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("Bearer nope"), http.StatusUnauthorized},

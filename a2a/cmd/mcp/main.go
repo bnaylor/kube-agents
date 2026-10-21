@@ -38,13 +38,19 @@ const (
 	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-password" // #nosec G101 -- a path, not a credential
 
 	networkTCP = "tcp"
+	busScheme  = "tls://"
 	// lineEndings are trimmed off the password file; a Secret written with
 	// `kubectl create secret --from-file` keeps the trailing newline.
 	lineEndings = "\r\n"
 
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 60 * time.Second
-	shutdownGrace     = 5 * time.Second
+	// writeTimeout bounds one response. Every answer here is one JSON
+	// document, and the slowest, connection_status, bounds its own read
+	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
+	// has to revisit this.
+	writeTimeout  = 30 * time.Second
+	shutdownGrace = 5 * time.Second
 	// dialTimeout bounds the first connect to the bus.
 	dialTimeout = 30 * time.Second
 )
@@ -83,6 +89,12 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	url := strings.TrimSpace(getenv(envBusURL))
 	if url == "" {
 		return settings{}, fmt.Errorf("%s is required", envBusURL)
+	}
+	// TLS by construction: the server sends the console password at
+	// connect, so a plaintext URL is refused rather than left to the bus to
+	// upgrade.
+	if !strings.HasPrefix(url, busScheme) {
+		return settings{}, fmt.Errorf("%s must be a %s URL, got %q", envBusURL, busScheme, url)
 	}
 	tokenFile := or(envTokenFile, defaultTokenFile)
 	if _, err := mcp.ReadToken(tokenFile); err != nil {
@@ -143,7 +155,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 
 // serve runs until ctx is done or the server fails.
 func serve(ctx context.Context, log *slog.Logger, ln net.Listener, h http.Handler) error {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout, WriteTimeout: writeTimeout}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	log.Info("mcp serving", "addr", ln.Addr().String(), "path", mcp.Path)

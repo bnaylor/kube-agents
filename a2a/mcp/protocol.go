@@ -14,6 +14,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,9 @@ const (
 
 	msgInvalidFrame   = "invalid JSON-RPC frame"
 	msgMissingMethod  = "missing method"
+	msgNotJSONRPC2    = "not a JSON-RPC 2.0 request"
+	msgBadID          = "an id must be a string, a number or null"
+	msgEmptyBatch     = "empty batch"
 	msgNeedsToolName  = "tools/call requires a tool name"
 	msgUnknownMethod  = "unknown method %q"
 	msgUnknownTool    = "unknown tool %q"
@@ -62,6 +66,10 @@ type rpcRequest struct {
 	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
+	// Result and Error mark a frame as a response from the client, which
+	// this server sends no requests to and so answers with nothing.
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  json.RawMessage `json:"error,omitempty"`
 }
 
 type rpcResponse struct {
@@ -128,12 +136,47 @@ func NewServer(tools ...Tool) (*Server, error) {
 	return s, nil
 }
 
-// HandleJSONRPC answers one JSON-RPC frame. A notification (no id) gets no
-// answer, which the caller reports as nil.
+// HandleJSONRPC answers one JSON-RPC frame or batch. A notification (no id)
+// and a client's response get no answer, which the caller reports as nil; a
+// batch is answered with the array of the answers its members get.
 func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var frames []json.RawMessage
+		if err := json.Unmarshal(trimmed, &frames); err != nil {
+			return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+		}
+		if len(frames) == 0 {
+			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgEmptyBatch)
+		}
+		var answers []json.RawMessage
+		for _, f := range frames {
+			if a := s.handleOne(ctx, f); a != nil {
+				answers = append(answers, a)
+			}
+		}
+		if len(answers) == 0 {
+			return nil
+		}
+		b, _ := json.Marshal(answers)
+		return b
+	}
+	return s.handleOne(ctx, trimmed)
+}
+
+func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 	var req rpcRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+	}
+	if !validID(req.ID) {
+		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgBadID)
+	}
+	if req.JSONRPC != jsonRPCVersion {
+		return marshalRPCError(idOrNull(req.ID), rpcErrInvalidRequest, msgNotJSONRPC2)
+	}
+	if req.Method == "" && (len(req.Result) > 0 || len(req.Error) > 0) {
+		return nil
 	}
 	if len(req.ID) == 0 || string(req.ID) == "null" {
 		if req.Method == "" {
@@ -200,6 +243,27 @@ func (s *Server) CallTool(ctx context.Context, name string, args json.RawMessage
 		return CallToolResult{Content: []TextContent{{Type: contentTypeText, Text: msg}}, IsError: true}
 	}
 	return CallToolResult{Content: []TextContent{{Type: contentTypeText, Text: text}}}
+}
+
+// validID reports whether id is absent or a JSON string, number or null, the
+// only kinds JSON-RPC allows.
+func validID(id json.RawMessage) bool {
+	if len(id) == 0 {
+		return true
+	}
+	switch c := id[0]; {
+	case c == '"', c == '-', c >= '0' && c <= '9':
+		return true
+	default:
+		return string(id) == "null"
+	}
+}
+
+func idOrNull(id json.RawMessage) json.RawMessage {
+	if len(id) == 0 {
+		return json.RawMessage("null")
+	}
+	return id
 }
 
 func marshalRPCResult(id json.RawMessage, result any) []byte {
