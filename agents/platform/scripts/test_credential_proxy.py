@@ -5836,6 +5836,25 @@ class ContextlessKubectlHostHintTest(unittest.TestCase):
                 result = executor.execute(argv)
                 self.assertEqual("", result.stderr)
 
+    def test_a_no_headers_custom_columns_read_with_one_row_is_unchanged(self):
+        # --no-headers drops the header, so one line is a found row (lapis2002 on #3557).
+        for no_headers in (["--no-headers"], ["--no-headers=true"]):
+            with self.subTest(no_headers=no_headers):
+                stdout = "v1.35.8-gke.1\n"
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(
+                    ["kubectl", "get", "node", "x", "-o", "custom-columns=V:.status.nodeInfo.kubeletVersion", *no_headers]
+                )
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_no_headers_false_custom_columns_read_still_reads_a_lone_header(self):
+        executor = self.executor(stdout="NAME\n")
+        result = executor.execute(
+            ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name", "--no-headers=false"]
+        )
+        self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
     def test_a_failure_that_is_not_not_found_is_unchanged(self):
         stderr = 'error: the server doesn\'t have a resource type "pdbx"'
         executor = self.executor(stderr=stderr, exit_code=1)

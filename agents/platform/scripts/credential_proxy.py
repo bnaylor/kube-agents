@@ -139,6 +139,7 @@ KUBECTL_YAML_LIST_API_VERSION_RE = re.compile(r"^apiVersion: v1\s*$", re.MULTILI
 # in every spelling kubectl takes; the last one wins, as in kubectl.
 KUBECTL_OUTPUT_FLAGS = ("-o", "--output")
 KUBECTL_CUSTOM_COLUMNS_PREFIX = "custom-columns"
+KUBECTL_NO_HEADERS_FLAG = "--no-headers"
 KUBECTL_HOST_HINT_PREFIX = "[credential-proxy] "
 KUBECTL_HOST_HINT_NAMED = (
     "This kubectl named no cluster, so it read the host cluster {cluster}"
@@ -3461,6 +3462,18 @@ def _kubectl_output_format(argv: list[str]) -> str:
     return value
 
 
+def _kubectl_no_headers(argv: list[str]) -> bool:
+    """Does argv turn off kubectl's header row? `--no-headers` is a boolean
+    flag, so `--no-headers=false` keeps the header and the last setting wins."""
+    no_headers = False
+    for arg in argv:
+        if arg == KUBECTL_NO_HEADERS_FLAG:
+            no_headers = True
+        elif arg.startswith(KUBECTL_NO_HEADERS_FLAG + "="):
+            no_headers = arg.split("=", 1)[1].strip().lower() not in ("false", "0", "f")
+    return no_headers
+
+
 def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
     """Did a successful kubectl read print nothing, or a list with no items?
 
@@ -3475,7 +3488,9 @@ def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
     if len(text) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
         return False
     if _kubectl_output_format(argv).startswith(KUBECTL_CUSTOM_COLUMNS_PREFIX):
-        return len(text.splitlines()) == 1
+        # With --no-headers the one line is a found row, not a header; an
+        # empty read already returned above.
+        return not _kubectl_no_headers(argv) and len(text.splitlines()) == 1
     if (
         KUBECTL_EMPTY_YAML_ITEMS_RE.search(text)
         and KUBECTL_YAML_LIST_KIND_RE.search(text)
