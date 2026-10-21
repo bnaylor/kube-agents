@@ -892,6 +892,11 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The front door's "what can you do?" calls a per-cluster agent "the <cluster>
+# cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
+# one front-door turn with no card: +3 units.
+./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # Gemini setup it failed about 30% of repetitions on unrelated pull requests
 # and on main's eval-next (37 of 126 across 42 runs; the store's record
