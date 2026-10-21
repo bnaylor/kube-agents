@@ -37,6 +37,29 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	}
 }
 
+// The bus CA comes from NATS_CA_FILE, the one name the operator sets on every
+// bus client, and has no default: unset, an https bus URL is refused by
+// console.NewHandler rather than verified against some other CA.
+func TestConfigFromEnvReadsTheBusCA(t *testing.T) {
+	s, err := configFromEnv(env(map[string]string{
+		"CONSOLE_BUS_URL": "https://nats.ns.svc:9222",
+		"NATS_CA_FILE":    "/etc/a2a-nats-ca/ca.crt",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.console.CAFile != "/etc/a2a-nats-ca/ca.crt" {
+		t.Errorf("CA file = %q, want NATS_CA_FILE's value", s.console.CAFile)
+	}
+	s, err = configFromEnv(env(map[string]string{"CONSOLE_BUS_URL": "https://nats.ns.svc:9222"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.console.CAFile != "" {
+		t.Errorf("CA file = %q with NATS_CA_FILE unset, want none", s.console.CAFile)
+	}
+}
+
 func TestConfigFromEnvRequiresTheBusURL(t *testing.T) {
 	if _, err := configFromEnv(env(nil)); err == nil {
 		t.Error("no CONSOLE_BUS_URL was accepted")

@@ -10,6 +10,9 @@
 package console
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,17 +80,26 @@ const (
 	msgWrongHost     = "this console only answers on %s - port-forward to that local port"
 	msgWebsocketOnly = "websocket only"
 	msgBusDown       = "the bus did not answer"
+	msgNoCA          = "the CA file %s holds no PEM certificate"
 	msgNoCredential  = "no console credential at %s"
 	healthBody       = "ok\n"
 )
 
-// Config is everything the server needs. Every field is required.
+// Config is everything the server needs. Every field is required, except
+// CAFile for a plain http:// bus.
 type Config struct {
 	// StaticDir holds the built page (index.html and its assets).
 	StaticDir string
-	// BusURL is the bus's websocket listener as an http:// URL, because the
-	// proxy dials HTTP and upgrades. Its path is sent as-is.
+	// BusURL is the bus's websocket listener as an https:// URL (http:// for
+	// a plain local nats-server), because the proxy dials HTTP and upgrades.
+	// Its path is sent as-is, and its host is the name the bus's certificate
+	// is verified under.
 	BusURL *url.URL
+	// CAFile holds the PEM CA an https:// bus is verified against, and the
+	// only one: the system roots never vouch for the bus. It is read on every
+	// dial, so a CA bundle the kubelet updates in place takes effect without
+	// a restart.
+	CAFile string
 	// User is the NATS user the page connects as.
 	User string
 	// PasswordFile holds that user's password. It is read on every request,
@@ -101,6 +113,13 @@ func (c Config) validate() error {
 	var errs []error
 	if c.BusURL == nil || (c.BusURL.Scheme != schemeHTTP && c.BusURL.Scheme != schemeHTTPS) || c.BusURL.Host == "" {
 		errs = append(errs, errors.New("the bus URL must be http:// or https:// with a host"))
+	}
+	if c.BusURL != nil && c.BusURL.Scheme == schemeHTTPS {
+		if c.CAFile == "" {
+			errs = append(errs, errors.New("an https bus URL needs a CA file to verify the bus against"))
+		} else if _, err := loadBusCA(c.CAFile); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if c.User == "" {
 		errs = append(errs, errors.New("no user"))
@@ -212,14 +231,48 @@ func configHandler(cfg Config, log *slog.Logger) http.HandlerFunc {
 // connection once the upgrade completes: ResponseHeaderTimeout stops timing
 // after the response headers arrive, and the proxy hijacks the connection
 // from there.
-func busTransport() *http.Transport {
+//
+// An https bus is dialled with TLS verified against cfg.CAFile alone, under
+// the bus URL's host name. HTTP/1.1 only: a websocket upgrade is an HTTP/1.1
+// mechanism, and the default transport would otherwise offer h2 over TLS.
+func busTransport(cfg Config) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.DialContext = (&net.Dialer{Timeout: busDialTimeout}).DialContext
+	dialer := &net.Dialer{Timeout: busDialTimeout}
+	t.DialContext = dialer.DialContext
 	t.ResponseHeaderTimeout = busResponseHeaderTimeout
 	// The bus is in-cluster. An HTTP_PROXY in the pod's environment must not
 	// route the websocket out through it.
 	t.Proxy = nil
+	if cfg.BusURL.Scheme == schemeHTTPS {
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			roots, err := loadBusCA(cfg.CAFile)
+			if err != nil {
+				return nil, err
+			}
+			d := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{
+				RootCAs:    roots,
+				ServerName: cfg.BusURL.Hostname(),
+				MinVersion: tls.VersionTLS12,
+			}}
+			return d.DialContext(ctx, network, addr)
+		}
+	}
 	return t
+}
+
+// loadBusCA reads the PEM CA the bus is verified against.
+func loadBusCA(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("the bus CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf(msgNoCA, path)
+	}
+	return pool, nil
 }
 
 // busHandler proxies the page's websocket to the bus. The browser's Origin
@@ -227,7 +280,7 @@ func busTransport() *http.Transport {
 // not the proxy. A refusal from the bus (403) is copied back as it came.
 func busHandler(cfg Config, log *slog.Logger) http.Handler {
 	proxy := &httputil.ReverseProxy{
-		Transport: busTransport(),
+		Transport: busTransport(cfg),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(cfg.BusURL)
 			// SetURL joins the target path with /bus. The bus URL names the
