@@ -1,0 +1,164 @@
+// The a2a MCP server: a Model Context Protocol endpoint for one `next`
+// install, as a console client of its bus. The operator renders it in its own
+// Deployment only when the install opts in, behind a ClusterIP Service, and a
+// person reaches it with kubectl port-forward. See package mcp.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/mcp"
+)
+
+const (
+	exitFailure = 1
+
+	envListen       = "MCP_LISTEN"
+	envTokenFile    = "MCP_TOKEN_FILE"
+	envBusURL       = "NATS_URL"
+	envBusUser      = "MCP_BUS_USER"
+	envPasswordFile = "MCP_BUS_PASSWORD_FILE"
+	envAgent        = "MCP_AGENT_NAME"
+	envNamespace    = "MCP_NAMESPACE"
+	envCluster      = "MCP_CLUSTER_NAME"
+
+	defaultListen       = ":8089"
+	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
+	defaultBusUser      = "console"
+	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-password" // #nosec G101 -- a path, not a credential
+
+	networkTCP = "tcp"
+	// lineEndings are trimmed off the password file; a Secret written with
+	// `kubectl create secret --from-file` keeps the trailing newline.
+	lineEndings = "\r\n"
+
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+	shutdownGrace     = 5 * time.Second
+	// dialTimeout bounds the first connect to the bus.
+	dialTimeout = 30 * time.Second
+)
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	slog.SetDefault(log)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := realMain(ctx, log, os.Getenv); err != nil {
+		return exitFailure
+	}
+	return 0
+}
+
+type settings struct {
+	listen    string
+	tokenFile string
+	bus       mcp.BusConfig
+}
+
+// configFromEnv reads the settings and the bus password. The token file is
+// checked here too, so a pod without one fails at start, visibly, rather
+// than serving 401s to everyone.
+func configFromEnv(getenv func(string) string) (settings, error) {
+	or := func(key, def string) string {
+		if v := strings.TrimSpace(getenv(key)); v != "" {
+			return v
+		}
+		return def
+	}
+	url := strings.TrimSpace(getenv(envBusURL))
+	if url == "" {
+		return settings{}, fmt.Errorf("%s is required", envBusURL)
+	}
+	tokenFile := or(envTokenFile, defaultTokenFile)
+	if _, err := mcp.ReadToken(tokenFile); err != nil {
+		return settings{}, fmt.Errorf("%s: %w", envTokenFile, err)
+	}
+	passwordFile := or(envPasswordFile, defaultPasswordFile)
+	raw, err := os.ReadFile(passwordFile)
+	if err != nil {
+		return settings{}, fmt.Errorf("%s: %w", envPasswordFile, err)
+	}
+	password := strings.TrimRight(string(raw), lineEndings)
+	if password == "" {
+		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, passwordFile)
+	}
+	return settings{
+		listen:    or(envListen, defaultListen),
+		tokenFile: tokenFile,
+		bus: mcp.BusConfig{
+			URL:      url,
+			User:     or(envBusUser, defaultBusUser),
+			Password: password,
+			Deployment: mcp.Deployment{
+				Agent:     getenv(envAgent),
+				Namespace: getenv(envNamespace),
+				Cluster:   getenv(envCluster),
+			},
+		},
+	}, nil
+}
+
+func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	s, err := configFromEnv(getenv)
+	if err != nil {
+		log.Error("mcp config", "err", err)
+		return err
+	}
+	s.bus.Logger = log
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	bus, err := mcp.DialBus(dialCtx, s.bus)
+	cancel()
+	if err != nil {
+		log.Error("mcp bus", "err", err)
+		return err
+	}
+	defer bus.Close()
+	srv, err := mcp.NewServer(mcp.ConnectionStatusTool(bus))
+	if err != nil {
+		log.Error("mcp server", "err", err)
+		return err
+	}
+	ln, err := net.Listen(networkTCP, s.listen)
+	if err != nil {
+		log.Error("mcp listen", "addr", s.listen, "err", err)
+		return err
+	}
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+}
+
+// serve runs until ctx is done or the server fails.
+func serve(ctx context.Context, log *slog.Logger, ln net.Listener, h http.Handler) error {
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	log.Info("mcp serving", "addr", ln.Addr().String(), "path", mcp.Path)
+
+	select {
+	case err := <-errc:
+		log.Error("mcp server stopped", "err", err)
+		return err
+	case <-ctx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error("mcp shutdown", "err", err)
+		return err
+	}
+	return nil
+}
