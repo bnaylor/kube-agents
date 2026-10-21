@@ -54,11 +54,16 @@ OVERRIDE_DIR = "`*_override` directory"
 STOP = "and stop"
 NEXT_BULLET = "\n- "
 LIFECYCLE_POINTER = '"Never work around a refusal"'
+# A proxy that did not answer is not a refusal: step 1 and finish.md re-run
+# the same command, and the rule must not tell a worker mid-`finish` to stop
+# (toshiowang on #3552).
+BROKER_UNAVAILABLE_CARVE_OUT = "A `BROKER UNAVAILABLE` line is not that"
+RERUN = "re-run the same command"
 # The SOP: its data-source list is exhaustive and covers the proxy's routes,
 # and the install's own components are not targets to explore.
 SOP_NO_IN_CLUSTER_CALLS = "no script or HTTP call of your own against an in-cluster service, the credential proxy's routes included"
 SOP_EXHAUSTIVE = "The list is exhaustive."
-SOP_OWN_COMPONENTS = "The install's own components (the platform agent, the credential proxy and the gateway) are not targets to explore"
+SOP_OWN_COMPONENTS = "The install's own components (the platform agent, the credential proxy and the gateway, `platform-agent-gateway`) are not targets to explore"
 # An example repository that reads like a configured one.
 REAL_LOOKING_EXAMPLE = "acme/platform/infra"
 
@@ -88,7 +93,7 @@ class RefusalNoSelfPatchTest(unittest.TestCase):
         skill = _read(FLEET_AUDIT_SKILL)
         start = skill.index(SKILL_RULE)
         bullet = skill[start : skill.index(NEXT_BULLET, start)]
-        for phrase in (OVERRIDE_DIR, STOP):
+        for phrase in (OVERRIDE_DIR, STOP, BROKER_UNAVAILABLE_CARVE_OUT, RERUN):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, bullet, f"fleet-audit SKILL.md's refusal rule lost {phrase!r}")
         # The `--repo` paragraph, where the unregistered-repository case is
