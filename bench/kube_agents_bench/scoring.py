@@ -132,8 +132,8 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: restore 39 units). At 30 units the side is exactly
 #: DEFAULT_AGGREGATE_MIN_SCORED below, so one infra or blocked repetition
 #: leaves the aggregate advisory on that run, and on the inject lane (nine
-#: roster cases, 27 units, agent-kanban-smoke excluded) it cannot block at
-#: all. The aggregate is not armed by default
+#: roster cases, 27 units, agent-kanban-smoke excluded), which the presubmit
+#: runs since #3156, it cannot block at all. The aggregate is not armed by default
 #: (EVAL_AGGREGATE_ARMED); re-check these counts, and that floor, before
 #: arming it.
 DEFAULT_AGGREGATE_MARGIN = 0.10
