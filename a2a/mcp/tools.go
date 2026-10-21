@@ -24,7 +24,6 @@ const (
 
 	defaultWaitSeconds = 60
 	maxWaitSeconds     = 300
-	taskPollEvery      = 2 * time.Second
 
 	// maxAnswerBytes caps the answer shown in one result; the full answer
 	// stays on the task.
@@ -32,14 +31,18 @@ const (
 )
 
 // MaxTurnWait is the longest a turn tool holds a request: the wait for the
-// gateway's submission plus the longest answer wait a caller may ask for.
-const MaxTurnWait = submissionWait + maxWaitSeconds*time.Second
+// lock and the gateway's submission, plus the longest answer wait a caller
+// may ask for. Every turn call is held to it, whatever the client allows.
+const MaxTurnWait = submissionWait + noticeGrace + maxWaitSeconds*time.Second
 
 // TurnBus is what the turn tools need from the bus.
 type TurnBus interface {
-	SendTurn(ctx context.Context, convs *Conversations, token, text string) (TurnResult, error)
-	ReadTask(ctx context.Context, taskID string) (*lib.Task, error)
-	WaitForTask(ctx context.Context, taskID string, wait, every time.Duration) (*lib.Task, error)
+	SendTurn(ctx context.Context, convs *Conversations, token, text string) (TurnResult, *turnWatch, error)
+	WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, wait time.Duration) (TurnOutcome, error)
+	SendStop(ctx context.Context, convs *Conversations, token string) (TurnResult, error)
+	ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error)
+	WaitForTask(ctx context.Context, ref TaskRef, wait time.Duration) (*lib.Task, error)
+	ResolveAddressee(ctx context.Context, taskID string) (string, error)
 }
 
 type sendMessageArgs struct {
@@ -56,7 +59,7 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 		Definition: ToolDefinition{
 			Name: ToolSendMessage,
 			Description: "Send a message to this kube-agents install, as a console user, and wait for the answer. " +
-				"A turn that is still running when the wait ends returns its task id; read it later with task_control.",
+				"A turn still running when the wait ends returns its task; read it later with task_control.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"text"},
@@ -69,6 +72,8 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			},
 		},
 		Call: func(ctx context.Context, raw json.RawMessage) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, MaxTurnWait)
+			defer cancel()
 			var a sendMessageArgs
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
@@ -77,25 +82,25 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			if err != nil {
 				return "", err
 			}
-			res, err := bus.SendTurn(ctx, convs, token, a.Text)
+			res, w, err := bus.SendTurn(ctx, convs, token, a.Text)
 			if err != nil {
 				return "", err
 			}
 			var sb strings.Builder
 			writeConversation(&sb, a.Conversation, token)
 			writeNotices(&sb, res.Notices)
-			if res.TaskID == "" {
+			if res.Task == nil {
 				if len(res.Notices) == 0 {
-					sb.WriteString("The gateway answered with no task.\n")
+					sb.WriteString("The gateway answered with no task and no notice.\n")
 				}
 				return sb.String(), nil
 			}
-			task, err := bus.WaitForTask(ctx, res.TaskID, waitFor(a.WaitSeconds), taskPollEvery)
+			out, err := bus.WaitForTurn(ctx, w, *res.Task, waitFor(a.WaitSeconds))
 			if err != nil {
-				fmt.Fprintf(&sb, "Task `%s` was submitted, but reading it failed: %v\n", res.TaskID, err)
+				fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
 				return sb.String(), nil
 			}
-			writeTask(&sb, res.TaskID, task)
+			writeOutcome(&sb, out)
 			return sb.String(), nil
 		},
 	}
@@ -103,7 +108,7 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 
 type taskControlArgs struct {
 	Action            string `json:"action"`
-	TaskID            string `json:"task_id"`
+	Task              string `json:"task"`
 	Conversation      string `json:"conversation"`
 	ConversationToken string `json:"conversation_token"`
 	WaitSeconds       int    `json:"wait_seconds"`
@@ -114,14 +119,14 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 	return Tool{
 		Definition: ToolDefinition{
 			Name: ToolTaskControl,
-			Description: "Read a task's state and answer by id (action get, optionally waiting for it to finish), " +
+			Description: "Read a task's state and answer (action get, optionally waiting for it to finish), " +
 				"or stop the running task of a conversation (action stop).",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"action"},
 				"properties": map[string]any{
 					"action":             map[string]any{"type": "string", "enum": []string{actionGet, actionStop}},
-					"task_id":            map[string]any{"type": "string", "description": "The task to read (get)."},
+					"task":               map[string]any{"type": "string", "description": "The task to read (get): <addressee>/<task-id> as send_message reports it, or a task id alone."},
 					"conversation":       map[string]any{"type": "string", "description": "The conversation whose task to stop (stop). Default: " + DefaultConversation + "."},
 					"conversation_token": map[string]any{"type": "string", "description": "The conversation, by token (stop)."},
 					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("For get: wait up to this long for the task to finish, %d at most. Default 0.", maxWaitSeconds)},
@@ -129,34 +134,36 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 			},
 		},
 		Call: func(ctx context.Context, raw json.RawMessage) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, MaxTurnWait)
+			defer cancel()
 			var a taskControlArgs
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
 			switch a.Action {
 			case actionGet:
-				if a.TaskID == "" {
-					return "", errors.New("get needs a task_id")
+				ref, err := resolveTask(ctx, bus, a.Task)
+				if err != nil {
+					return "", err
 				}
 				var task *lib.Task
-				var err error
 				if a.WaitSeconds > 0 {
-					task, err = bus.WaitForTask(ctx, a.TaskID, waitFor(a.WaitSeconds), taskPollEvery)
+					task, err = bus.WaitForTask(ctx, ref, waitFor(a.WaitSeconds))
 				} else {
-					task, err = bus.ReadTask(ctx, a.TaskID)
+					task, err = bus.ReadTask(ctx, ref)
 				}
 				if err != nil {
 					return "", err
 				}
 				var sb strings.Builder
-				writeTask(&sb, a.TaskID, task)
+				writeTask(&sb, ref, task)
 				return sb.String(), nil
 			case actionStop:
 				token, err := convs.Resolve(a.Conversation, a.ConversationToken)
 				if err != nil {
 					return "", err
 				}
-				res, err := bus.SendTurn(ctx, convs, token, stopText)
+				res, err := bus.SendStop(ctx, convs, token)
 				if err != nil {
 					return "", err
 				}
@@ -170,6 +177,25 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 			}
 		},
 	}
+}
+
+// resolveTask reads a task reference, resolving a bare id's addressee from its
+// submission.
+func resolveTask(ctx context.Context, bus TurnBus, task string) (TaskRef, error) {
+	if task == "" {
+		return TaskRef{}, errors.New("get needs a task")
+	}
+	if strings.Contains(task, taskRefSep) {
+		return ParseTaskRef(task, "")
+	}
+	if !lib.ValidSubjectToken(task) {
+		return TaskRef{}, fmt.Errorf("%q is not a task id", task)
+	}
+	addressee, err := bus.ResolveAddressee(ctx, task)
+	if err != nil {
+		return TaskRef{}, err
+	}
+	return ParseTaskRef(task, addressee)
 }
 
 func orEmptyObject(raw json.RawMessage) json.RawMessage {
@@ -210,12 +236,12 @@ func writeNotices(sb *strings.Builder, notices []string) {
 // writeTask renders a task's state and, once it has one, its answer. The
 // answer is the agents' own markdown, shown as written: it is what the
 // caller asked for. Progress shows while the task runs.
-func writeTask(sb *strings.Builder, taskID string, t *lib.Task) {
+func writeTask(sb *strings.Builder, ref TaskRef, t *lib.Task) {
 	if t == nil {
-		fmt.Fprintf(sb, "Task `%s`: no events yet.\n", taskID)
+		fmt.Fprintf(sb, "Task `%s`: no events yet.\n", ref)
 		return
 	}
-	fmt.Fprintf(sb, "Task `%s`: **%s**", taskID, t.State)
+	fmt.Fprintf(sb, "Task `%s`: **%s**", ref, t.State)
 	if !t.Final {
 		sb.WriteString(" (still running; read it again with task_control get)")
 	}
@@ -230,6 +256,40 @@ func writeTask(sb *strings.Builder, taskID string, t *lib.Task) {
 		}
 	} else if p := artifactText(t, lib.ArtifactProgress); p != "" && !t.Final {
 		fmt.Fprintf(sb, "Progress: %s\n", cell(lastLine(p)))
+	}
+}
+
+// writeOutcome renders a turn: its task, the tasks delegated from it, and the
+// answer from whichever of them holds it.
+func writeOutcome(sb *strings.Builder, out TurnOutcome) {
+	if len(out.Followed) == 0 || out.AnswerFrom == nil || *out.AnswerFrom == out.Root {
+		writeTask(sb, out.Root, out.Task)
+		writeFollowed(sb, out.Followed)
+		return
+	}
+	state := "no events yet"
+	if out.Task != nil {
+		state = string(out.Task.State)
+	}
+	fmt.Fprintf(sb, "Task `%s`: **%s**; the answer came from a delegated task.\n\n", out.Root, state)
+	writeTask(sb, *out.AnswerFrom, out.Answer)
+	writeFollowed(sb, out.Followed)
+}
+
+func writeFollowed(sb *strings.Builder, followed []FollowedTask) {
+	if len(followed) == 0 {
+		return
+	}
+	sb.WriteString("\nDelegated tasks:\n")
+	for _, f := range followed {
+		switch {
+		case f.Err != nil:
+			fmt.Fprintf(sb, "- `%s`: not read (%s)\n", f.Ref, cell(f.Err.Error()))
+		case f.Task == nil:
+			fmt.Fprintf(sb, "- `%s`: no events yet\n", f.Ref)
+		default:
+			fmt.Fprintf(sb, "- `%s`: %s\n", f.Ref, f.Task.State)
+		}
 	}
 }
 
