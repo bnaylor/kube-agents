@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -188,4 +189,17 @@ func TestTheRenderedWebsocketListenerServesTLS(t *testing.T) {
 			t.Fatal("TLS verified under localhost; the serving certificate names the Service alone")
 		}
 	})
+}
+
+// The console dials the bus by a name its serving certificate carries, or the
+// proxy's verification refuses every page load.
+func TestTheConsoleDialsTheBusByANameItsCertificateCarries(t *testing.T) {
+	agent := a2aTestAgent()
+	u, err := url.Parse(a2aNATSWebSocketURL(agent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(a2aNATSDNSNames(agent), u.Hostname()) {
+		t.Errorf("the console dials %q, which is not among the serving certificate's names %v", u.Hostname(), a2aNATSDNSNames(agent))
+	}
 }

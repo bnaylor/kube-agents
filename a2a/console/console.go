@@ -81,6 +81,7 @@ const (
 	msgWebsocketOnly = "websocket only"
 	msgBusDown       = "the bus did not answer"
 	msgNoCA          = "the CA file %s holds no PEM certificate"
+	msgBusUnverified = "the bus's certificate did not verify against the bus CA"
 	msgNoCredential  = "no console credential at %s"
 	healthBody       = "ok\n"
 )
@@ -100,6 +101,11 @@ type Config struct {
 	// dial, so a CA bundle the kubelet updates in place takes effect without
 	// a restart.
 	CAFile string
+	// ServerName overrides the name the bus's certificate is verified under.
+	// Empty means the bus URL's host, which in a pod is the Service name the
+	// certificate carries; a console run locally against a port-forwarded bus
+	// dials loopback and names the Service here instead.
+	ServerName string
 	// User is the NATS user the page connects as.
 	User string
 	// PasswordFile holds that user's password. It is read on every request,
@@ -233,8 +239,9 @@ func configHandler(cfg Config, log *slog.Logger) http.HandlerFunc {
 // from there.
 //
 // An https bus is dialled with TLS verified against cfg.CAFile alone, under
-// the bus URL's host name. HTTP/1.1 only: a websocket upgrade is an HTTP/1.1
-// mechanism, and the default transport would otherwise offer h2 over TLS.
+// cfg.ServerName or else the bus URL's host name. HTTP/1.1 only, stated
+// rather than left to the custom dial: a websocket upgrade is an HTTP/1.1
+// mechanism, so h2 is switched off here as well as never offered in ALPN.
 func busTransport(cfg Config) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	dialer := &net.Dialer{Timeout: busDialTimeout}
@@ -251,9 +258,13 @@ func busTransport(cfg Config) *http.Transport {
 			if err != nil {
 				return nil, err
 			}
+			name := cfg.ServerName
+			if name == "" {
+				name = cfg.BusURL.Hostname()
+			}
 			d := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{
 				RootCAs:    roots,
-				ServerName: cfg.BusURL.Hostname(),
+				ServerName: name,
 				MinVersion: tls.VersionTLS12,
 			}}
 			return d.DialContext(ctx, network, addr)
@@ -290,6 +301,14 @@ func busHandler(cfg Config, log *slog.Logger) http.Handler {
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("bus proxy failed", "bus", cfg.BusURL.Redacted(), "err", err)
+			// A bus that answered with a certificate the CA does not vouch
+			// for is a different fault from one that did not answer, and
+			// the person reading the page should be told which.
+			var verify *tls.CertificateVerificationError
+			if errors.As(err, &verify) {
+				http.Error(w, msgBusUnverified, http.StatusBadGateway)
+				return
+			}
 			http.Error(w, msgBusDown, http.StatusBadGateway)
 		},
 	}

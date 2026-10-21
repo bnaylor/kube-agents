@@ -37,6 +37,9 @@ const (
 	// operator sets for all of them; it has no default, because a CA the
 	// operator did not mount is not one to trust.
 	envCAFile = lib.EnvNATSCAFile
+	// envTLSServerName is the port-forwarded-tooling override every bus
+	// client honours; the operator never sets it.
+	envTLSServerName = lib.EnvNATSTLSServerName
 
 	defaultListen       = ":8080"
 	defaultStaticDir    = "/srv/console"
@@ -108,6 +111,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 			StaticDir:    or(envStaticDir, defaultStaticDir),
 			BusURL:       bus,
 			CAFile:       getenv(envCAFile),
+			ServerName:   getenv(envTLSServerName),
 			User:         or(envUser, defaultUser),
 			PasswordFile: or(envPasswordFile, defaultPasswordFile),
 			AllowedHosts: hosts,

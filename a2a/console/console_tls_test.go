@@ -8,12 +8,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,7 +159,40 @@ func TestATLSBusUnderAnotherCAIsA502(t *testing.T) {
 
 	resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
 	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want 502: the bus's certificate is not from the trusted CA", resp.StatusCode)
+		t.Fatalf("status = %d, want 502: the bus's certificate is not from the trusted CA", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if !strings.Contains(string(body), msgBusUnverified) {
+		t.Errorf("body %q does not say the certificate failed to verify; a bus that answered is not a bus that is down", body)
+	}
+}
+
+// ServerName stands in for the URL's host when the console dials a
+// port-forwarded bus by its loopback address, which the certificate does not
+// name.
+func TestServerNameOverridesTheBusURLsHost(t *testing.T) {
+	ca := newTestCA(t)
+	bus := wssBus(t, ca)
+	loopback := *bus
+	loopback.Host = "127.0.0.1:" + bus.Port()
+
+	for _, tc := range []struct {
+		serverName string
+		want       int
+	}{
+		{"", http.StatusBadGateway},
+		{busServerName, http.StatusSwitchingProtocols},
+	} {
+		cfg := fixture(t, "x")
+		cfg.BusURL = &loopback
+		cfg.CAFile = ca.writeCA(t)
+		cfg.ServerName = tc.serverName
+		ts := httptest.NewServer(handler(t, cfg))
+		resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
+		ts.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("server name %q: status = %d, want %d", tc.serverName, resp.StatusCode, tc.want)
+		}
 	}
 }
 
