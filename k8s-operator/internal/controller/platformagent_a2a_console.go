@@ -200,16 +200,13 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							}},
 							Optional: ptr.To(true),
 						}},
-					}, {
+					},
 						// The bus CA the proxy verifies the websocket
 						// listener against. Not optional: without it the
 						// server refuses to start rather than dial the bus
 						// unverified.
-						Name: a2aNATSCABundleVolume,
-						VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSCABundleName(agent)},
-						}},
-					}},
+						a2aNATSCABundleVolume(agent),
+					},
 					Containers: []corev1.Container{{
 						Name:  a2aConsoleContainer,
 						Image: a2aConsoleImage(),
@@ -224,18 +221,14 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: a2aConsoleEnvUser, Value: a2aConsoleConfUser},
 							{Name: a2aConsoleEnvPasswordFile, Value: path.Join(a2aConsoleMountDir, a2aConsolePasswordKey)},
 							{Name: a2aConsoleEnvAllowedHosts, Value: strings.Join(a2aConsoleHosts(), a2aConsoleHostSep)},
-							{Name: a2aNATSCAFileEnv, Value: a2aNATSCAFile()},
+							a2aNATSCAFileEnvVar(),
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aConsolePortName, ContainerPort: a2aConsolePort}},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name:      a2aConsoleKeyVolume,
 							MountPath: a2aConsoleMountDir,
 							ReadOnly:  true,
-						}, {
-							Name:      a2aNATSCABundleVolume,
-							MountPath: a2aNATSCABundleMountDir,
-							ReadOnly:  true,
-						}},
+						}, a2aNATSCABundleMount()},
 						// /healthz is the one path the server answers for any
 						// Host. The kubelet sends the pod IP, which the Host
 						// check would refuse everywhere else.
