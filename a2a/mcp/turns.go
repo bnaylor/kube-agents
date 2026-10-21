@@ -43,8 +43,8 @@ const (
 	conversationTokenPrefix = "mcp"
 	conversationTokenBytes  = 12
 	messageIDBytes          = 8
-	// maxConversations bounds the alias and send-lock tables; past it a new
-	// conversation is refused rather than the tables left to grow.
+	// maxConversations bounds the alias table; past it the least recently
+	// used alias is forgotten.
 	maxConversations = 1024
 
 	// submissionWait bounds the wait for the gateway to publish the turn.
@@ -92,15 +92,31 @@ type submissionAuthority struct {
 // text, is what tells a turn's own submission from the conversation's next.
 // Callers share one bearer token and so one alias namespace: two callers that
 // use the same name share a conversation.
+//
+// Neither table can be filled for good: an alias table at maxConversations
+// forgets its least recently used alias (whose conversation stays reachable
+// by its token), and a send lock exists only while a send holds or waits on
+// it.
 type Conversations struct {
 	mu      sync.Mutex
-	byAlias map[string]string
-	sending map[string]chan struct{}
+	byAlias map[string]*aliasEntry
+	sending map[string]*sendLock
+	clock   uint64
+}
+
+type aliasEntry struct {
+	token string
+	used  uint64
+}
+
+type sendLock struct {
+	ch   chan struct{}
+	refs int
 }
 
 // NewConversations returns an empty alias table.
 func NewConversations() *Conversations {
-	return &Conversations{byAlias: map[string]string{}, sending: map[string]chan struct{}{}}
+	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}}
 }
 
 // Resolve returns the console token for a call: token when the caller names
@@ -118,39 +134,61 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if t, ok := c.byAlias[alias]; ok {
-		return t, nil
+	c.clock++
+	if e, ok := c.byAlias[alias]; ok {
+		e.used = c.clock
+		return e.token, nil
 	}
 	if len(c.byAlias) >= maxConversations {
-		return "", fmt.Errorf("this server already holds %d conversations; continue one by its token", maxConversations)
+		c.forgetOldestLocked()
 	}
 	b := make([]byte, conversationTokenBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	t := conversationTokenPrefix + hex.EncodeToString(b)
-	c.byAlias[alias] = t
+	c.byAlias[alias] = &aliasEntry{token: t, used: c.clock}
 	return t, nil
+}
+
+func (c *Conversations) forgetOldestLocked() {
+	oldest, at := "", uint64(0)
+	for a, e := range c.byAlias {
+		if oldest == "" || e.used < at {
+			oldest, at = a, e.used
+		}
+	}
+	delete(c.byAlias, oldest)
 }
 
 // lock takes the conversation's send lock, or gives up when ctx does.
 func (c *Conversations) lock(ctx context.Context, token string) (func(), error) {
 	c.mu.Lock()
-	ch, ok := c.sending[token]
+	l, ok := c.sending[token]
 	if !ok {
-		if len(c.sending) >= maxConversations {
-			c.mu.Unlock()
-			return nil, fmt.Errorf("this server is already sending on %d conversations", maxConversations)
-		}
-		ch = make(chan struct{}, 1)
-		c.sending[token] = ch
+		l = &sendLock{ch: make(chan struct{}, 1)}
+		c.sending[token] = l
 	}
+	l.refs++
 	c.mu.Unlock()
 	select {
-	case ch <- struct{}{}:
-		return func() { <-ch }, nil
+	case l.ch <- struct{}{}:
+		return func() {
+			<-l.ch
+			c.release(token, l)
+		}, nil
 	case <-ctx.Done():
+		c.release(token, l)
 		return nil, fmt.Errorf("another turn is being sent on this conversation: %w", ctx.Err())
+	}
+}
+
+// release drops one holder or waiter, and the lock with the last of them.
+func (c *Conversations) release(token string, l *sendLock) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if l.refs--; l.refs == 0 && c.sending[token] == l {
+		delete(c.sending, token)
 	}
 }
 
