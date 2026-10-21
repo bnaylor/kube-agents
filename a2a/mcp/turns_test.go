@@ -470,3 +470,43 @@ func TestReadTaskOfAnUnknownTask(t *testing.T) {
 		t.Errorf("err = %v, want ErrTaskNotFound", err)
 	}
 }
+
+// Neither table fills for good: aliases past the cap forget the least
+// recently used, and a send lock goes when its last holder releases it.
+func TestConversationTablesCannotBeFilled(t *testing.T) {
+	c := NewConversations()
+	keep, err := c.Resolve("keep", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2*maxConversations; i++ {
+		if _, err := c.Resolve(fmt.Sprintf("a%d", i), ""); err != nil {
+			t.Fatalf("alias %d refused: %v", i, err)
+		}
+		if i%100 == 0 {
+			if again, _ := c.Resolve("keep", ""); again != keep {
+				t.Fatal("a recently used alias was forgotten")
+			}
+		}
+	}
+	if len(c.byAlias) > maxConversations {
+		t.Errorf("alias table holds %d, cap %d", len(c.byAlias), maxConversations)
+	}
+	for i := 0; i < 2*maxConversations; i++ {
+		unlock, err := c.lock(context.Background(), fmt.Sprintf("tok%d", i))
+		if err != nil {
+			t.Fatalf("lock %d refused: %v", i, err)
+		}
+		unlock()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	held, _ := c.lock(context.Background(), "busy")
+	if _, err := c.lock(ctx, "busy"); err == nil {
+		t.Fatal("a cancelled waiter took a held lock")
+	}
+	held()
+	if len(c.sending) != 0 {
+		t.Errorf("%d send locks remain with nothing holding them", len(c.sending))
+	}
+}
