@@ -405,7 +405,8 @@ Layout:
   inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
-  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
+  ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
+  encryption") with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -931,7 +932,7 @@ clear; a client that dials `nats://` is told to upgrade, and one that cannot ver
 certificate is refused. Every client the operator renders is handed `tls://` on the NATS
 Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
 health and stats, not payloads or tokens. The websocket listener on 9222, the console's
-door, is still rendered plain (`no_tls: true`).
+door, serves the same certificate from the same files (below).
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
