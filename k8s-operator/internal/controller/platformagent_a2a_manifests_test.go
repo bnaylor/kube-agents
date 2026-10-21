@@ -1656,6 +1656,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
+	mcp := buildA2AMCPDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1668,6 +1669,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
 		{"verifier", "buildA2AVerifierDeployment", verifier.Spec.Template.Spec},
 		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
+		{"mcp", "buildA2AMCPDeployment", mcp.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1739,6 +1741,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
+	mcp := buildA2AMCPDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1799,6 +1802,11 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// dir and credential file by absolute path and writes nothing, so
 		// traversable is enough.
 		{render: "console", builder: "buildA2AConsoleDeployment", container: "console", spec: console.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The MCP server runs from the console image, so the same base and
+		// the same reasoning: it reads its token and credential files by
+		// absolute path and writes nothing.
+		{render: "mcp", builder: "buildA2AMCPDeployment", container: "mcp", spec: mcp.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -2133,12 +2141,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// created and the "it is gone after cleanup" row below asserts the
 	// absence of an object the render never made.
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	// The teardown list carries the two doors' four objects each, which
-	// render only under their operator flags; set both, so the precondition
-	// below covers them rather than failing on objects the render was told
-	// not to make.
+	// The teardown list carries the two doors' four objects each and the
+	// MCP server's, which render only under their operator flags; set all
+	// three, so the precondition below covers them rather than failing on
+	// objects the render was told not to make.
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	t.Setenv(a2aAgentDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "true")
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
@@ -2674,15 +2683,17 @@ func TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean(t *testing.T) {
 	// pair under the other flag, 8 -> 9 when the console fence did, for
 	// the same reason again, and 9 -> 10 when the gateway's own fence did
 	// (#2473: it now renders on every next gateway, and the same
-	// hand-deleted pair leaves it alone); the fences are Owns kinds, so those
-	// six reads come from the cache and only the two Secrets are uncached.
+	// hand-deleted pair leaves it alone), and 10 -> 11 when the MCP server's
+	// fence did, for the console fence's reason (#3653); the fences are Owns
+	// kinds, so those seven reads come from the cache and only the two
+	// Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 10 {
-		t.Errorf("Gets = %d, want 10 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 11 {
+		t.Errorf("Gets = %d, want 11 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -4148,6 +4159,20 @@ func TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip(t *testing.T) {
 		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
 			return types.NamespacedName{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}
 		}, nil)
+}
+
+// The MCP server's fence, under its flag, is the console fence's twin: a
+// hand-deleted NATS and session fence pair must leave it to drive the flip,
+// not behind.
+func TestAHandDeletedPairLeavesTheMCPFenceToDriveTheFlip(t *testing.T) {
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	handDeletedFenceFlip(t, false,
+		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+			return types.NamespacedName{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}
+		},
+		func(agent *agentv1alpha1.PlatformAgent) []types.NamespacedName {
+			return []types.NamespacedName{{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}
+		})
 }
 
 // handDeletedFenceFlip refuses a next CR, deletes the NATS and session fences
@@ -7645,7 +7670,8 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 
 	// Without this the test passes vacuously on a list that lost its fences
 	// entirely, which is a worse bug than the one it is written to catch.
-	if want := 7; fences != want {
+	// 8 since the MCP server's fence (#3653), which sits above the console's.
+	if want := 8; fences != want {
 		t.Fatalf("the teardown walks %d NetworkPolicies, want %d — if a fence was added or removed, "+
 			"re-read the ordering argument above before changing this number", fences, want)
 	}
