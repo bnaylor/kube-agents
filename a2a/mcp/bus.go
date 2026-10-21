@@ -210,6 +210,10 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 	if err != nil {
 		return nil, err
 	}
+	pending := cons.CachedInfo().NumPending
+	if pending == 0 {
+		return cards, nil
+	}
 	seen := 0
 	for {
 		wait := directoryFetchWait
@@ -219,7 +223,9 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 		if wait < minFetchWait {
 			return cards, fmt.Errorf("read %d of the directory before the deadline", seen)
 		}
-		batch, err := cons.Fetch(directoryFetchBatch, jetstream.FetchMaxWait(wait))
+		// Sized to what is pending, so the fetch returns as soon as it has
+		// it rather than waiting out FetchMaxWait for a batch that cannot fill.
+		batch, err := cons.Fetch(int(min(pending, directoryFetchBatch)), jetstream.FetchMaxWait(wait))
 		if err != nil {
 			return cards, err
 		}
@@ -231,8 +237,10 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 				return cards, fmt.Errorf("DIRECTORY holds more than %d cards; showing the first %d", maxAgentCards, maxAgentCards)
 			}
 			addCard(cards, msg.Subject(), msg.Data())
-			if md, err := msg.Metadata(); err == nil && md.NumPending == 0 {
-				return cards, nil
+			if md, err := msg.Metadata(); err == nil {
+				if pending = md.NumPending; pending == 0 {
+					return cards, nil
+				}
 			}
 		}
 		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
