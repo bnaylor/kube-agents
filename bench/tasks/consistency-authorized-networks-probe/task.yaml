@@ -4,9 +4,9 @@
 # 429s, #3399, and real misses where the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} as
 # configured or open); `consistency` is on the coverage allowlist in
-# docs/designs/domains.yaml until it returns, after #3448 merges, an
-# agent-side fix lands and the case passes the roster's bar on the Gemini
-# nightly.
+# docs/designs/domains.yaml until it returns, after #3448 merges, the
+# agent-side fix (#3605) lands and the case passes the roster's bar on the
+# Gemini nightly.
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on

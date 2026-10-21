@@ -175,10 +175,8 @@ with a filed issue naming the exit condition:
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
   list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal leaves
   `consistency` with no presubmit case, so the domain is on the `domains.yaml` allowlist until
-  it returns. Enters again when #3448 has merged, an agent-side fix has landed (peer-comparison
-  questions routed to the drift collector, or a normalized per-cluster authorized-networks
-  ON/OFF value from the compliance collector), and the case passes the roster's bar, 90% over
-  20 runs, on the Gemini nightly (#3598).
+  it returns. Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
+  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
