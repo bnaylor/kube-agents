@@ -1457,8 +1457,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # placeholder, its tool_calls kept so each still pairs with its result;
 # state.db keeps the original. The rule is hermes_cli/unstructured_reasoning.py,
 # copied in below. The Hermes bridge withholds such a reply from the user when
-# it is the answer (a2a/hermes-bridge/reasoning_leak.go), and the chat cron
-# relay withholds such a report (deploy/docker/plugins/chat/adapter.py). See the module
+# it is the answer (a2a/hermes-bridge/reasoning_leak.go). See the module
 # docstrings in deploy/docker/patches/apply_unstructured_reasoning_replay.py
 # and deploy/docker/patches/unstructured_reasoning.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \

@@ -773,7 +773,7 @@ only the gateway's grant reaches (the 9/9 split), never on its `…events`. The 
 every task this rule reaches is detached, and detached means a `stop` already
 published a cancel, so the gateway is finishing the cancel the requester asked for
 rather than reporting an error. That keeps assertion 13's enumeration intact
-(`canceled`, or `completed` if the race was lost) and keeps replay able to tell a
+(`canceled`, or the race-lost outcomes it lists) and keeps replay able to tell a
 stopped task from one that broke. Deleting first strands the task
 non-terminal for the whole retention window - the adapter's deadline dies with the
 process, and a deleted pod never reaches the terminal phase Sweep watches for - which

@@ -3,9 +3,7 @@
 Installed into the image as ``hermes_cli/unstructured_reasoning.py``. The two
 statements ``apply_unstructured_reasoning_replay.py`` inserts into Hermes, one
 in each place the main loop builds a model call's messages, call
-``replace_unstructured_reasoning`` on every outgoing message. The chat cron
-relay (``deploy/docker/plugins/chat/adapter.py``) imports
-``opens_with_unstructured_reasoning`` to withhold such a report. This file is
+``replace_unstructured_reasoning`` on every outgoing message. This file is
 the one place the rule is written down on the Python side. The Hermes bridge's copy
 of the same rule is ``opensWithUnstructuredReasoning`` in
 ``a2a/hermes-bridge/reasoning_leak.go``; the two must agree.

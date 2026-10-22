@@ -317,22 +317,6 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
     return sorted(handled)
 
 
-def _opens_with_unstructured_reasoning(report: str) -> bool:
-    """The #3206 rule, from the module the image installs as
-    ``hermes_cli/unstructured_reasoning.py`` (source:
-    ``deploy/docker/patches/unstructured_reasoning.py``). Imported here, not at
-    the top, so this module still loads where hermes_cli is absent (its unit
-    tests run outside the image). If it is missing the report
-    is relayed as before, with a warning: a packaging slip must not stop every
-    cron delivery."""
-    try:
-        from hermes_cli.unstructured_reasoning import opens_with_unstructured_reasoning
-    except ImportError:
-        logger.warning("chat relay: hermes_cli.unstructured_reasoning is missing; reasoning check skipped")
-        return False
-    return opens_with_unstructured_reasoning(report)
-
-
 def is_silent_report(report: str) -> bool:
     """Should this report be swallowed rather than relayed?
 
@@ -513,23 +497,6 @@ async def standalone_send(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
         )
         return {"success": True, "platform": PLATFORM_NAME, "skipped": "empty_report"}
-
-    # A report that is the model's own reasoning (a first line `thought` or
-    # `thought:`, #3206) is not relayed. Cron is where this showed up most:
-    # Gemini writes its reasoning as plain text, and the A2A bridge's guard
-    # never sees a cron delivery. Returned as an `error` so the run record's
-    # `last_delivery_error` says so, rather than the report vanishing.
-    if _opens_with_unstructured_reasoning(report):
-        logger.warning(
-            "chat relay: report for job_id=%s withheld — it opened with unstructured "
-            "model reasoning (%d chars)", job_id or "?", len(report),
-        )
-        return {
-            "error": (
-                "chat relay: the report was withheld because it contained unstructured "
-                "model reasoning instead of a report; nothing was posted"
-            )
-        }
 
     api_key = (os.getenv(API_KEY_ENV, "") or "").strip()
     if not api_key:
