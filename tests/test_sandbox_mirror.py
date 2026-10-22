@@ -232,6 +232,69 @@ class HomeEnumeration(unittest.TestCase):
             self.assertEqual(sm.home_relative_paths(pathlib.Path(tmp)), [""])
 
 
+class OneProfile(unittest.TestCase):
+    """--profile: a scaffold pushes its own profile's layout, not every home (#3701)."""
+
+    def drive(self, *extra, profiles=("platform", "cluster-a", "cluster-b")):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        build_home(root, profiles=profiles)
+        config = root / "managed.yaml"
+        config.write_text("terminal:\n  backend: ssh\n  ssh_host: sandbox.invalid\n")
+        pushed = {"skeleton": [], "identities": []}
+        self.logged = []
+        patches = [
+            unittest.mock.patch.object(
+                sm, "remote", lambda ssh, command, check=True: subprocess.CompletedProcess([], 0, "", "")
+            ),
+            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: True),
+            unittest.mock.patch.object(sm, "push_skeleton", lambda ssh, rr, homes: pushed["skeleton"].append(homes)),
+            unittest.mock.patch.object(
+                sm, "push_cluster_identities", lambda ssh, ah, rr, homes: pushed["identities"].append(homes)
+            ),
+            unittest.mock.patch.object(sm, "log", self.logged.append),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        code = sm.main(["--agent-home", str(root), "--config", str(config), *extra])
+        return code, pushed
+
+    def test_a_named_profile_pushes_that_home_alone(self):
+        code, pushed = self.drive("--skeleton-only", "--profile", "cluster-b")
+        self.assertEqual(code, sm.EXIT_OK)
+        self.assertEqual(pushed["skeleton"], [["profiles/cluster-b"]])
+        self.assertEqual(pushed["identities"], [["profiles/cluster-b"]])
+
+    def test_the_pushed_set_does_not_grow_with_the_profiles_on_the_volume(self):
+        many = ("platform", *(f"cluster-{i:03d}" for i in range(50)))
+        _, pushed = self.drive("--skeleton-only", "--profile", "cluster-049", profiles=many)
+        self.assertEqual(pushed["skeleton"], [["profiles/cluster-049"]])
+
+    def test_without_profile_every_home_is_still_pushed(self):
+        _, pushed = self.drive("--skeleton-only")
+        self.assertEqual(
+            pushed["skeleton"], [["", "profiles/cluster-a", "profiles/cluster-b", "profiles/platform"]]
+        )
+
+    def test_profile_without_skeleton_only_refuses_and_pushes_nothing(self):
+        # The migration reads every home; a partial set would copy part of the
+        # model's files and then write the marker that stops the rest.
+        code, pushed = self.drive("--profile", "cluster-b")
+        self.assertEqual(code, sm.EXIT_OK)
+        self.assertEqual(pushed, {"skeleton": [], "identities": []})
+        self.assertTrue(any("needs --skeleton-only" in m for m in self.logged))
+
+    def test_a_name_that_is_not_one_profile_directory_is_skipped_and_named(self):
+        for bad in ("../platform", "cluster-a/workspace", ".hidden", "no-such", ""):
+            with self.subTest(name=bad):
+                code, pushed = self.drive("--skeleton-only", "--profile", bad)
+                self.assertEqual(code, sm.EXIT_OK)
+                self.assertEqual(pushed, {"skeleton": [], "identities": []})
+                self.assertTrue(any("no such profile" in m for m in self.logged))
+
+
 class Candidates(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

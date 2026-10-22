@@ -601,6 +601,26 @@ def home_relative_paths(agent_home: Path) -> list[str]:
     return homes
 
 
+def named_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[str], list[str]]:
+    """The homes for ``--profile``: (profiles/<name> for each that exists, the rest).
+
+    A scaffold passes the one profile it just made, so the skeleton and identity
+    pushes touch that home alone instead of every profile on the volume: with
+    every home, each new profile re-sent the whole set, and onboarding N
+    clusters cost O(N^2) (#3701; 200 profiles went from 2.6 s to 12 s apiece).
+    A name is a single path component, as Hermes makes it, and has to be a
+    directory under profiles/ already; anything else is reported, not guessed at.
+    """
+    homes: list[str] = []
+    rejected: list[str] = []
+    for name in names:
+        if not name or "/" in name or name.startswith(".") or not (agent_home / PROFILES_DIR / name).is_dir():
+            rejected.append(name)
+        else:
+            homes.append(f"{PROFILES_DIR}/{name}")
+    return homes, rejected
+
+
 def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
     """Make every home's working directories exist, whatever is there now.
 
@@ -974,6 +994,14 @@ def main(argv: list[str] | None = None) -> int:
         help="create the directory layout and skip the one-shot migration",
     )
     parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="push the layout for this profile only (repeatable); needs --skeleton-only. "
+        "Without it every home is pushed, as the entrypoint does at start",
+    )
+    parser.add_argument(
         "--force-migrate",
         action="store_true",
         help="migrate even if the sandbox already carries the marker",
@@ -999,7 +1027,19 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     ssh = ssh_base_command(terminal)
-    homes = home_relative_paths(agent_home)
+    if args.profile:
+        # The migration reads every home, so a partial set there would copy part
+        # of the model's files and then write the marker that stops the rest.
+        if not args.skeleton_only:
+            log("--profile pushes one profile's layout and needs --skeleton-only; refusing")
+            return EXIT_OK
+        homes, rejected = named_profile_homes(agent_home, args.profile)
+        if rejected:
+            log(f"no such profile under {agent_home / PROFILES_DIR}: {', '.join(rejected)}; skipped")
+        if not homes:
+            return EXIT_OK
+    else:
+        homes = home_relative_paths(agent_home)
 
     if args.dry_run:
         include, skipped = migration_candidates(agent_home, homes)
