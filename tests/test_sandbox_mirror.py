@@ -282,15 +282,19 @@ class OneProfile(unittest.TestCase):
         # The migration reads every home; a partial set would copy part of the
         # model's files and then write the marker that stops the rest.
         code, pushed = self.drive("--profile", "cluster-b")
-        self.assertEqual(code, sm.EXIT_OK)
+        # Non-zero, so the scaffold logs that nothing was pushed rather than "pushed".
+        self.assertEqual(code, sm.EXIT_RETRY)
         self.assertEqual(pushed, {"skeleton": [], "identities": []})
         self.assertTrue(any("needs --skeleton-only" in m for m in self.logged))
 
     def test_a_name_that_is_not_one_profile_directory_is_skipped_and_named(self):
-        for bad in ("../platform", "cluster-a/workspace", ".hidden", "no-such", ""):
+        # ".hidden" exists on the volume here, so only the leading-dot rule rejects it.
+        for bad in ("../platform", "cluster-a/workspace", ".hidden", ".", "..", "no-such", ""):
             with self.subTest(name=bad):
-                code, pushed = self.drive("--skeleton-only", "--profile", bad)
-                self.assertEqual(code, sm.EXIT_OK)
+                code, pushed = self.drive(
+                    "--skeleton-only", "--profile", bad, profiles=("platform", "cluster-a", ".hidden")
+                )
+                self.assertEqual(code, sm.EXIT_RETRY)
                 self.assertEqual(pushed, {"skeleton": [], "identities": []})
                 self.assertTrue(any("no such profile" in m for m in self.logged))
 

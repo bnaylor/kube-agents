@@ -607,7 +607,7 @@ def named_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[str], 
     A scaffold passes the one profile it just made, so the skeleton and identity
     pushes touch that home alone instead of every profile on the volume: with
     every home, each new profile re-sent the whole set, and onboarding N
-    clusters cost O(N^2) (#3701; 200 profiles went from 2.6 s to 12 s apiece).
+    clusters cost O(N^2) (#3701).
     A name is a single path component, as Hermes makes it, and has to be a
     directory under profiles/ already; anything else is reported, not guessed at.
     """
@@ -660,8 +660,9 @@ def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
 def push_cluster_identities(
     ssh: list[str], agent_home: Path, remote_root: str, homes: list[str]
 ) -> None:
-    """Put every Cluster Agent's identity file on the sandbox's volume.
+    """Put each given Cluster Agent's identity file on the sandbox's volume.
 
+    Every one at start; on a scaffold, only the scaffolded profile's (``--profile``).
     Runs alongside the skeleton, on every start and on every scaffold, because
     both are cases where the sandbox has a profile home and nothing in it: a
     recreated sandbox volume, a profile created after the last start, a
@@ -1030,14 +1031,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.profile:
         # The migration reads every home, so a partial set there would copy part
         # of the model's files and then write the marker that stops the rest.
+        # EXIT_RETRY, not EXIT_OK, on both refusals here: the scaffold reads a zero
+        # exit as "pushed" and logs it, and only the scaffold passes --profile.
         if not args.skeleton_only:
             log("--profile pushes one profile's layout and needs --skeleton-only; refusing")
-            return EXIT_OK
+            return EXIT_RETRY
         homes, rejected = named_profile_homes(agent_home, args.profile)
         if rejected:
             log(f"no such profile under {agent_home / PROFILES_DIR}: {', '.join(rejected)}; skipped")
         if not homes:
-            return EXIT_OK
+            return EXIT_RETRY
     else:
         homes = home_relative_paths(agent_home)
 
