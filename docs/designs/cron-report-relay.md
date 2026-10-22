@@ -659,6 +659,12 @@ and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
+adapter also withholds a report whose first non-empty line is `thought` or
+starts with `thought:` (the model's own reasoning, #3206), using
+`opens_with_unstructured_reasoning` from `hermes_cli/unstructured_reasoning.py`,
+and returns that as the delivery error so the run record says why nothing was
+posted. The Slack sender doesn't carry this check, and neither do the direct
+legs a job on `"all"` or a named platform uses. The
 scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
 sender and carries no such guard; no roster job uses `"all"`.
 
@@ -802,7 +808,9 @@ only when `last_run_at` has changed since the last tick, so a half-hourly tick
 over a daily job counts runs (a job that runs more often than the watcher is
 under-counted, never over-counted); a failing run adds one, a clean run resets to zero,
 and a silent run, recognised from the job's newest file under `cron/output/`,
-moves the high-water mark and changes nothing else. Failures are graded from the
+moves the high-water mark and changes nothing else. A report the relay withheld
+as unstructured model reasoning is treated the same way: the relay refused it
+before trying any leg, so it's a model fault and says nothing about delivery. Failures are graded from the
 strings this design produces: `hard` when the report reached no platform (a 502,
 an unreachable relay, no key), `partial` when it landed somewhere but not on the
 platforms the `undelivered` field names, `degraded` when it posted but the relay

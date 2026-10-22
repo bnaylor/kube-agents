@@ -39,6 +39,8 @@ obviously, delivered nothing: a run whose answer was ``[SILENT]`` clears it
 too. "Failed for N consecutive runs" therefore needs state this job keeps
 itself, advancing a job's streak only when a *new* run has appeared, and
 treating a silent run as no evidence either way rather than as a recovery.
+A report the relay withheld as unstructured model reasoning (#3206) is no
+evidence too: the relay refused it before trying any leg.
 
 Grading. A hard failure means the report reached no platform: the relay
 answered 502 (``composed but not delivered to <platforms>``), was unreachable,
@@ -137,6 +139,10 @@ FAILURE_MARKERS = (
     "failed:",
 )
 DEGRADED_MARKER = "chat relay degraded:"
+# The relay's answer when it withholds a report that is the model's own reasoning
+# (#3206, `deploy/docker/plugins/chat/adapter.py`). Nothing was posted, but the
+# leg was never tried, so it is a model fault and says nothing about delivery.
+WITHHELD_REASONING_MARKER = "the report was withheld because it contained unstructured model reasoning"
 # Silence, as the scheduler recognises it (`cron/scheduler.py::_is_cron_silence_response`):
 # one of these tokens as the whole first or last line of the response, compared
 # case-insensitively, or a response that starts with `[SILENT]`. The saved
@@ -387,6 +393,10 @@ def advance(entry: dict, job: dict, *, silent: bool, has_output: bool = True) ->
     error = job.get("last_delivery_error")
     if error and is_delivered_note(str(error)):
         error = None
+    if error and WITHHELD_REASONING_MARKER in str(error):
+        # The relay withheld a reasoning-only report without trying the leg:
+        # no evidence either way, like a silent run.
+        return updated
     if error:
         error = str(error)
         updated["streak"] = int(entry.get("streak") or 0) + 1

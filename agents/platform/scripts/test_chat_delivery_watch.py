@@ -59,6 +59,10 @@ HARD_ERROR = (
     "delivery error: chat relay answered HTTP 502: chat relay failed: composed but not "
     "delivered to slack, google_chat (target chat:cron-reports)"
 )
+WITHHELD_ERROR = (
+    "delivery error: chat relay: the report was withheld because it contained unstructured "
+    "model reasoning instead of a report; nothing was posted"
+)
 UNREACHABLE_ERROR = "delivery error: chat relay unreachable: URLError: [Errno 111] Connection refused"
 # Written by the scheduler before any adapter runs; both seen live on gkedemos on 2026-09-10.
 NOT_CONFIGURED_ERROR = "platform 'google_chat' not configured/enabled"
@@ -301,6 +305,10 @@ class GradingTest(unittest.TestCase):
         adapter = (REPO_ROOT / "deploy" / "docker" / "plugins" / "chat" / "adapter.py").read_text(encoding="utf-8")
         self.assertIn("chat relay partial: the report did not reach {undelivered}.", adapter)
         self.assertIn("chat relay degraded: ", adapter)
+        # The withheld-report sentence spans two literals in the adapter.
+        self.assertIn('"chat relay: the report was withheld because it contained unstructured "', adapter)
+        self.assertIn('"model reasoning instead of a report; nothing was posted"', adapter)
+        self.assertIn(cdw.WITHHELD_REASONING_MARKER, WITHHELD_ERROR)
         relay = (REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py").read_text(encoding="utf-8")
         self.assertIn("composed but not delivered to ", relay)
 
@@ -367,6 +375,13 @@ class AdvanceTest(unittest.TestCase):
         entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
         entry = cdw.advance(entry, job("a", RUN_2), silent=True)
         self.assertEqual((entry["streak"], entry["last_seen_run_at"]), (1, RUN_2))
+
+    def test_a_withheld_reasoning_report_neither_advances_nor_resets(self) -> None:
+        entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
+        entry = cdw.advance(entry, job("a", RUN_2, WITHHELD_ERROR), silent=False)
+        self.assertEqual((entry["streak"], entry["last_seen_run_at"]), (1, RUN_2))
+        fresh = cdw.advance(cdw.new_entry(), job("a", RUN_1, WITHHELD_ERROR), silent=False)
+        self.assertEqual((fresh["streak"], fresh["grade"]), (0, None))
 
     def test_no_run_at_is_no_evidence(self) -> None:
         entry = cdw.new_entry()

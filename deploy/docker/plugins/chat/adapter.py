@@ -317,7 +317,6 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
     return sorted(handled)
 
 
-
 def _opens_with_unstructured_reasoning(report: str) -> bool:
     """The #3206 rule, from the module the image installs as
     ``hermes_cli/unstructured_reasoning.py`` (source:
@@ -332,6 +331,7 @@ def _opens_with_unstructured_reasoning(report: str) -> bool:
         logger.warning("chat relay: hermes_cli.unstructured_reasoning is missing; reasoning check skipped")
         return False
     return opens_with_unstructured_reasoning(report)
+
 
 def is_silent_report(report: str) -> bool:
     """Should this report be swallowed rather than relayed?
