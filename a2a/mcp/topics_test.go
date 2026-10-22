@@ -595,6 +595,7 @@ func TestAJournalTopicBehindTheWindowShowsItsLatest(t *testing.T) {
 	for i := 0; i <= journalScanWindow; i++ {
 		publishTopic(t, js, busy, fmt.Sprintf("i%d", i), nil)
 	}
+	before := topicConsumers(t, js, lib.StreamTopicsJournal)
 	r, err := b.ReadTopic(context.Background(), "annotations")
 	if err != nil {
 		t.Fatal(err)
@@ -604,6 +605,10 @@ func TestAJournalTopicBehindTheWindowShowsItsLatest(t *testing.T) {
 	}
 	mustContain(t, FormatTopicMarkdown(r), "this is the topic's latest entry", "important note")
 	mustNotContain(t, FormatTopicMarkdown(r), "no entries yet")
+	// The window read and the fallback read: two consumers, and no more.
+	if got := topicConsumers(t, js, lib.StreamTopicsJournal) - before; got != 2 {
+		t.Errorf("a fallback read opened %d consumers, want 2 (the window, then the latest)", got)
+	}
 	slotsFree(t, b)
 }
 

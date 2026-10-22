@@ -52,6 +52,12 @@ const (
 	// read looks, in stream messages, so a read costs the same on a journal
 	// thirty days deep as on an empty one.
 	journalScanWindow = 1024
+	// journalPublishSlack is how many messages may land on a journal
+	// stream between reading its info and creating the read's consumer
+	// without failing the read: the window is sized from the info, the
+	// consumer counts what is pending when it exists, and the ring keeps
+	// only the newest maxJournalEntries either way.
+	journalPublishSlack = 256
 	// maxTopicEntryBytes caps each part of one entry as shown (its summary
 	// and its data), so a read is at most about
 	// maxJournalEntries*2*maxTopicEntryBytes.
@@ -312,8 +318,9 @@ func (b *NATSBus) ListTopics(ctx context.Context) (TopicList, error) {
 // ReadTopic reads one provisioned topic: the latest entry of a state topic,
 // or the newest maxJournalEntries of a journal topic within the last
 // journalScanWindow messages of its stream. One consumer, none when the
-// stream is empty. name is resolved against the registry; the subject read
-// is the registry's.
+// stream is empty, and a second when a journal topic has nothing in the
+// window and falls back to its latest entry; each takes its own reader slot.
+// name is resolved against the registry; the subject read is the registry's.
 func (b *NATSBus) ReadTopic(ctx context.Context, name string) (TopicRead, error) {
 	if !validTopicName(name) {
 		return TopicRead{}, errTopicName
@@ -344,7 +351,7 @@ func (b *NATSBus) ReadTopic(ctx context.Context, name string) (TopicRead, error)
 			r.Earlier = true
 		}
 		cfg.DeliverPolicy, cfg.OptStartSeq = jetstream.DeliverByStartSequencePolicy, start
-		limit = journalScanWindow
+		limit = journalScanWindow + journalPublishSlack
 	}
 	keep := func(msg jetstream.Msg) {
 		u, ok := topicUpdate(msg)
