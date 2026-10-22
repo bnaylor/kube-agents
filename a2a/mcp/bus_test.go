@@ -342,4 +342,18 @@ func TestStatusHonoursTheCallersDeadline(t *testing.T) {
 	if len(st.Problems) == 0 {
 		t.Error("a cancelled read reported no problems")
 	}
+	// Nor is the cut-short read anyone else's answer: the next caller,
+	// inside the cache's lifetime, reads the bus.
+	next := b.Status(context.Background())
+	if strings.Contains(strings.Join(next.Problems, "\n"), context.Canceled.Error()) || len(next.AgentCards) != 1 {
+		t.Errorf("the next caller got the cancelled read: problems %v, cards %v", next.Problems, next.AgentCards)
+	}
+}
+
+// A card read that fails is not an empty directory.
+func TestAFailedCardReadIsNotNoCards(t *testing.T) {
+	md := FormatBusStatusMarkdown(BusStatus{Connected: true, Problems: []string{"agent cards: context canceled"}})
+	if strings.Contains(md, "No agent cards on DIRECTORY") || !strings.Contains(md, "could not be read") {
+		t.Errorf("a failed card read renders as:\n%s", md)
+	}
 }

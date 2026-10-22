@@ -132,9 +132,15 @@ func (b *NATSBus) Status(ctx context.Context) BusStatus {
 	if !b.cachedAt.IsZero() && b.now().Sub(b.cachedAt) < statusCacheTTL {
 		return b.cached
 	}
-	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
+	rctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	defer cancel()
-	b.cached, b.cachedAt = b.read(ctx), b.now()
+	st := b.read(rctx)
+	// A read the caller cut short (a client that disconnected) answers that
+	// caller only: cached, its cancellation would be every caller's answer.
+	if ctx.Err() != nil {
+		return st
+	}
+	b.cached, b.cachedAt = st, b.now()
 	return b.cached
 }
 
@@ -189,6 +195,10 @@ func (b *NATSBus) read(ctx context.Context) BusStatus {
 	cards, err := b.agentCards(ctx)
 	if err != nil {
 		st.Problems = append(st.Problems, fmt.Sprintf("agent cards: %v", err))
+		if len(cards) == 0 {
+			// Nil, not empty: a failed read must not report "no cards".
+			cards = nil
+		}
 	}
 	st.AgentCards = cards
 	return st

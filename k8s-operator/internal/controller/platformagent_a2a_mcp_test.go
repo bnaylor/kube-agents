@@ -230,6 +230,22 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		}
 	})
 
+	t.Run("an owned Secret with no token is filled", func(t *testing.T) {
+		empty := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
+			Data: map[string][]byte{a2aMCPAccessKey: {}}}
+		if err := ctrl.SetControllerReference(agent, empty, setupScheme()); err != nil {
+			t.Fatal(err)
+		}
+		r, cl := mcpTestReconciler(t, empty)
+		if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		filled, err := readMCPToken(t, cl)
+		if err != nil || len(filled.Data[a2aMCPAccessKey]) == 0 {
+			t.Fatalf("the owned, empty token Secret was not filled: %v", err)
+		}
+	})
+
 	t.Run("an unowned Secret is refused", func(t *testing.T) {
 		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
 			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
