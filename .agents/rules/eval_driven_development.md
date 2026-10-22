@@ -19,6 +19,18 @@ projects, the seeded fleet, Prow and the workflows. Exempt: docs, CI, that infra
 bench harness itself (`bench/kube_agents_bench/`, `hack/ci-eval-pr.sh`). An exempt change says so
 in one line under **Live validation** in the pull request body.
 
+Two kinds of agent-behaviour change are also exempt, because no case can test them:
+
+- a **deterministic guard** whose behaviour unit tests pin completely: code that holds, refuses or
+  rewrites an output by rule, without asking the model to behave differently;
+- a fix for a failure that **can't be reproduced deterministically**, so no case can be made red
+  on demand (a rare model-output leak, for example).
+
+Wording meant to change what the model does (a prompt, an SOP, refusal or reply text) is not
+exempt and still needs a case. A change exempt under these two records, under **Live
+validation**, its unit tests, a live or replay check against an install, and why no case can be
+made red. That's more than the one line the exemptions above take.
+
 The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)),
 refreshed to the commit under test: build the images with `deploy/docker/cloudbuild-ci.yaml`
 (`gcloud builds submit` in your project, as `hack/ci-deploy.sh` does), then point the install at
@@ -148,7 +160,8 @@ is this loop and nothing less:
 - red: the install and the `main` commit it ran against, the failing check and its reason, one
   line of the agent's report;
 - green: the three runs (directories or a one-line summary each) against the branch's build;
-- where the case is registered, or the one-line exemption.
+- where the case is registered, or the exemption (one line, or the fuller record the two
+  agent-behaviour exemptions take).
 
 ## What does not count
 
