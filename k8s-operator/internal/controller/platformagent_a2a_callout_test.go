@@ -286,7 +286,7 @@ func nothingA2ALabelledSurvivesAFlipToToday(t *testing.T, mcpOn bool) {
 	if mcpOn {
 		for name, obj := range map[string]client.Object{
 			a2aMCPName(agent):      &appsv1.Deployment{},
-			a2aMCPTokenName(agent): &corev1.Secret{},
+			a2aMCPAccessName(agent): &corev1.Secret{},
 		} {
 			if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, obj); err != nil {
 				t.Fatalf("the MCP server's %s was not rendered under its flag, so sweeping it proves nothing: %v", name, err)

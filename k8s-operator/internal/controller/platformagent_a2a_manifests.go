@@ -4796,6 +4796,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	}...)
 	env = append(env, chatEnv...)
 	env = append(env, injectEnv...)
+	env = append(env, a2aMCPGatewayEnv()...)
 	env = append(env, clusterViewEnv...)
 	env = append(env, a2aTargetAllowlistEnv(agent)...)
 
@@ -4926,7 +4927,9 @@ type a2aProvisionState struct {
 // secrets with get only, and a cached Get would start a cluster-wide
 // informer whose LIST is forbidden.
 func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
-	if a2aInjectBackendEnabled() || a2aAgentDoorEnabled() {
+	// The MCP server is a console client: with its flag on, the gateway is
+	// rendered for its console door even with no chat backend.
+	if a2aInjectBackendEnabled() || a2aAgentDoorEnabled() || a2aMCPDoorEnabled() {
 		return true, "", nil
 	}
 	// Before the Secret read: the answer is on the CR, and a Chat or Slack
@@ -6051,7 +6054,7 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// with it. Its fence goes later, beside the console's.
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPTokenName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like

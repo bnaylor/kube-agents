@@ -68,11 +68,15 @@ type ConsoleInFrame struct {
 	Text      string `json:"text"`
 }
 
-// ConsoleOutFrame is a gateway notice (gateway.ConsoleOutFrame).
+// ConsoleOutFrame is a frame the gateway posts to a console conversation
+// (gateway.ConsoleOutFrame). Kind is unset on its notices about a turn; a
+// frame with a kind reports something else (a task's terminal result, a
+// proactive notification) and is not a notice about the turn being sent.
 type ConsoleOutFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
 	Edit      bool   `json:"edit,omitempty"`
+	Kind      string `json:"kind,omitempty"`
 }
 
 // submissionAuthority is the part of a submission's authority block that says
@@ -394,9 +398,12 @@ func (b *NATSBus) publishFrame(token, text string) error {
 	return b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
 }
 
+// noticeText is a frame's text when it is a gateway notice about a turn, and
+// "" otherwise: an earlier task's result posted to the conversation must not
+// read as an answer to the turn being sent.
 func noticeText(m *nats.Msg) string {
 	var f ConsoleOutFrame
-	if json.Unmarshal(m.Data, &f) != nil {
+	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" {
 		return ""
 	}
 	return strings.TrimSpace(f.Text)
