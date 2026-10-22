@@ -12,7 +12,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -37,8 +36,6 @@ const (
 	// topicReadTimeout bounds one call end to end, whatever the caller's
 	// context allows.
 	topicReadTimeout = 10 * time.Second
-	topicFetchBatch  = 64
-	topicFetchWait   = 2 * time.Second
 
 	// maxTopicNameBytes is longer than any topic subject the registry can
 	// hold (a2a.topics.agent.{63}.{63}); a longer name is refused unread.
@@ -379,62 +376,6 @@ func (b *NATSBus) ReadTopic(ctx context.Context, name string) (TopicRead, error)
 // the consumers it opens, as it is for status.
 func (b *NATSBus) AgentCards(ctx context.Context) (map[string]AgentCard, error) {
 	return b.agentCards(ctx)
-}
-
-// drainConsumer reads what one plain pull consumer on s has pending when it
-// is created, and stops: no acks, in memory, reaped by the server once idle
-// (taskConsumerIdle), never an ordered consumer, whose reset deletes a
-// consumer the console grant cannot. It takes one reader slot, held until the
-// consumer it creates is reaped, or handed back at once when the server
-// refused to create one (consumerMayExist), and it sizes each fetch to
-// what is left, bounds each fetch by ctx's deadline, and reads at most limit
-// messages, failing after them if more were pending.
-func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jetstream.ConsumerConfig, limit int, each func(jetstream.Msg)) (int, error) {
-	release, err := b.readerSlot()
-	if err != nil {
-		return 0, err
-	}
-	cfg.AckPolicy = jetstream.AckNonePolicy
-	cfg.MemoryStorage = true
-	cfg.InactiveThreshold = taskConsumerIdle
-	cons, err := s.CreateConsumer(ctx, cfg)
-	if err != nil {
-		release(consumerMayExist(err))
-		return 0, err
-	}
-	defer release(true)
-	pending := cons.CachedInfo().NumPending
-	want := min(pending, uint64(limit))
-	var seen uint64
-	for seen < want {
-		wait := topicFetchWait
-		if dl, ok := ctx.Deadline(); ok {
-			wait = min(wait, time.Until(dl))
-		}
-		if wait < minFetchWait {
-			return int(seen), fmt.Errorf("read %d messages before the deadline: %w", seen, context.DeadlineExceeded)
-		}
-		batch, err := cons.Fetch(int(min(want-seen, topicFetchBatch)), jetstream.FetchMaxWait(wait))
-		if err != nil {
-			return int(seen), err
-		}
-		n := 0
-		for msg := range batch.Messages() {
-			n++
-			seen++
-			each(msg)
-		}
-		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-			return int(seen), err
-		}
-		if n == 0 {
-			break
-		}
-	}
-	if pending > want {
-		return int(seen), fmt.Errorf("more than %d messages to read; read the first %d", limit, limit)
-	}
-	return int(seen), nil
 }
 
 // topicUpdate parses one topic message, dropping what checkTopicPublish
