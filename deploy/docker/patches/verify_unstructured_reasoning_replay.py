@@ -43,7 +43,7 @@ import patchlib
 
 HERMES = Path(os.environ.get("HERMES_ROOT", "/opt/hermes"))
 MARKER = "kube-agents patch: unstructured_reasoning_replay"
-PLACEHOLDER = "[earlier reply omitted: contained unstructured model reasoning]"
+PLACEHOLDER = "[omitted]"
 RULE_PACKAGE = "hermes_cli"
 RULE_MODULE = "hermes_cli.unstructured_reasoning"
 RULE_RELATIVE = "hermes_cli/unstructured_reasoning.py"

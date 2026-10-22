@@ -30,7 +30,11 @@ from __future__ import annotations
 
 from typing import Any
 
-PLACEHOLDER = "[earlier reply omitted: contained unstructured model reasoning]"
+# A bare marker, on purpose: it removes a bad example from the history without
+# adding wording the model reads. A sentence saying why the reply was omitted
+# would itself be guidance about reasoning (.agents/rules/eval_driven_development.md,
+# "When it applies").
+PLACEHOLDER = "[omitted]"
 
 # The token that opens a reasoning reply, and the separator that may follow it
 # on the same line.
