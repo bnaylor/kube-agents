@@ -60,7 +60,9 @@ mcp.yaml                MCP servers the persona needs, by reference to brokered 
 ```
 
 A thin **adapter** per harness runs at task start, in the worker, and writes that harness's
-own configuration into the task's fresh workspace. Claude Code and Antigravity get the first
+own configuration into a **per-task configuration directory outside the task's workspace**, so
+the agent, which can write its working directory, can't change the configuration it runs
+under (the Claude Code adapter in `a2a/lib/persona/claudecode` does this). Claude Code and Antigravity get the first
 two adapters. An adapter only maps: anything a harness can't express is dropped with a
 warning, never a hard failure, so no persona can depend on one harness's feature. Task
 parameters (for example the target cluster) reach the agent as a preamble the dispatcher
@@ -78,14 +80,13 @@ changes nothing that outlives the task.
 
 `harness.image` is the worker image, set per profile, so a profile can point at a base image
 built on the standard harness. But tools baked into a harness image have to be rebuilt for
-every harness. So `AgentProfile` gains a **`tools`** list of OCI images, each pinned by digest,
-mounted read-only and appended to `PATH` after the harness's own entries, in the same way
-`AgentPlugin` mounts image volumes. One tools image then serves every harness, and
+every harness. So `AgentProfile` has a **`tools`** list of OCI images (shipped in #3694; the
+field's doc comment is authoritative): each is mounted read-only at `/opt/tools/<name>` with
+its `bin/` on `PATH` in list order, so one tools image serves every harness, and
 `harness.image` stays the escape hatch. Where image volumes aren't available (Autopilot, or
-Kubernetes below 1.35), tools are staged the way `AgentPlugin` stages images, with two
-differences: the staged directory is mounted read-only into the worker, and it is re-staged
-whenever the worker's per-task reset runs (or the pod restarts), so a task can't replace a
-tool for the next one.
+Kubernetes below 1.35), tools are staged by an init container. The requirement this spec adds
+for warm pools: the staged copy is read-only to the worker and re-staged whenever the
+per-task reset runs (or the pod restarts), so a task can't replace a tool for the next one.
 
 ```yaml
 spec:
@@ -95,8 +96,10 @@ spec:
     image: registry/kube-agents/harness-claude-code:0.17
     model: claude-sonnet
   tools:
-    - image: registry/kube-agents/tools/terraform@sha256:...
-    - image: registry/kube-agents/tools/helm-kustomize@sha256:...
+    - name: terraform
+      image: registry/kube-agents/tools/terraform@sha256:...
+    - name: helm-kustomize
+      image: registry/kube-agents/tools/helm-kustomize@sha256:...
 ```
 
 Tools that need credentials (`kubectl` or `gcloud` against the fleet, `gh` against a forge)
@@ -142,8 +145,13 @@ limits in check:
   has its own rate cap.
 
 Very wide work fans out in layers: a coordinator profile (per project or region) above the
-cluster agents, each layer a different profile. A profile may start children of its own
-profile only one level deep (decided 2026-10-22), so a `child` queue never feeds itself.
+cluster agents, each layer a different profile. Precisely (decided 2026-10-22, worded here
+to close the gaps review found): only a **`top`** task may start children of its own profile,
+and **no profile appears twice on a task's ancestor chain** otherwise. So a `child` task never
+starts a child of its own profile, and A → B → A cycles are refused. The gateway checks the
+chain when it mints a child. A waiting parent's time cap stays the backstop, and resource
+cycles across separate chains (two chains each waiting on the other's profile) are left to
+the dispatcher's plan (#3655).
 
 The model-quota ceiling, and replicas or sharding for the gateway, NATS, LiteLLM and the
 credential proxy, belong to the sizing workstream. Profiles take their concurrency caps from
@@ -165,9 +173,11 @@ its budget function; until it exists, a fixed conservative default behind a knob
 3. **Fan-out with a wait.** A profile can start several child tasks and wait on their
    results. **Children are gateway-minted**, as attenuated children of the parent's grant:
    tier and scope can only narrow, never widen, and the gateway stays the only publisher of
-   submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and a
-   profile may nest children of its own profile only one level deep, so deeper layers cross
-   profiles (see [Scale rules](#scale-rules)). Width is bounded by the dispatcher's caps.
+   submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
+   ancestor-chain rule in [Scale rules](#scale-rules) applies (only a `top` task nests its own
+   profile; no profile repeats otherwise). A child task's grant is a fresh root the gateway
+   mints for the child's profile; entries a broker adds to a grant chain never change the
+   profile. Width is bounded by the dispatcher's caps.
 4. **Stop.** One stop cancels the conversation's whole task tree, enforced by the dispatcher,
    keeping the user-facing behaviour of #3263 and #3379.
 5. **No "run after" dependencies.** Kanban's `kanban_link` is dropped on purpose. Fan-out plus
@@ -343,11 +353,13 @@ The build PRs amend these; this list is what they must cover.
 
 ## Order of work
 
-1. **Cluster agent** with tools through the broker (#1699). It replaces the per-cluster Hermes
+1. **The GKE Support Agent (`tse`, #3492)**, the first AgentProfile adopted from outside our
+   team. It lands as a temporary in-pod profile and moves onto dispatch first.
+2. **Cluster agent** with tools through the broker (#1699). It replaces the per-cluster Hermes
    profiles.
-2. **Chat:** the gateway reads its own `chat` AgentProfile.
-3. **One unattended investigation profile**, to exercise the unattended tier early.
-4. Rewrite `platform`'s instructions and skills off `kanban_*`.
+3. **Chat:** the gateway reads its own `chat` AgentProfile.
+4. **One unattended investigation profile**, to exercise the unattended tier early.
+5. Rewrite `platform`'s instructions and skills off `kanban_*`.
 
 Each step moves its share of delegation off kanban as it lands. The kanban patches and guards
 are deleted once nothing files cards. There is no big-bang switch.
