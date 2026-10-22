@@ -612,44 +612,24 @@ func (b *NATSBus) ResolveAddressee(ctx context.Context, taskID string) (string, 
 	if !lib.ValidSubjectToken(taskID) {
 		return "", fmt.Errorf("%q is not a task id", taskID)
 	}
-	release, err := b.readerSlot()
-	if err != nil {
-		return "", err
-	}
-	created := false
-	defer func() { release(created) }()
 	ctx, cancel := context.WithTimeout(ctx, taskReadTimeout)
 	defer cancel()
 	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
 		return "", err
 	}
-	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
-		FilterSubject:     fmt.Sprintf("a2a.tasks.*.%s.%s", taskID, lib.TaskClassIn),
-		DeliverPolicy:     jetstream.DeliverAllPolicy,
-		AckPolicy:         jetstream.AckNonePolicy,
-		MemoryStorage:     true,
-		InactiveThreshold: taskConsumerIdle,
-	})
-	created = err == nil || consumerMayExist(err)
-	if err != nil {
-		return "", err
-	}
-	pending := cons.CachedInfo().NumPending
-	if pending == 0 {
-		return "", ErrTaskNotFound
-	}
-	batch, err := cons.Fetch(int(min(pending, taskFetchBatch)), jetstream.FetchMaxWait(taskFetchWait))
-	if err != nil {
-		return "", err
-	}
 	addressees := map[string]bool{}
-	for msg := range batch.Messages() {
+	if _, err := b.drainConsumer(ctx, s, jetstream.ConsumerConfig{
+		FilterSubject: fmt.Sprintf("a2a.tasks.*.%s.%s", taskID, lib.TaskClassIn),
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+	}, maxTaskEvents, func(msg jetstream.Msg) {
 		parts := strings.Split(msg.Subject(), ".")
 		if len(parts) != submissionSubjectParts || agreedEnvelope(msg.Subject(), msg.Data()) == nil {
-			continue
+			return
 		}
 		addressees[parts[submissionAddressee]] = true
+	}); err != nil {
+		return "", err
 	}
 	switch len(addressees) {
 	case 0:
