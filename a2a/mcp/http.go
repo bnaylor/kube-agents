@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,12 @@ const (
 	msgBodyTooLarge = "request body too large or unreadable"
 	msgNoToken      = "the token file %s is empty"
 )
+
+// requestBudget bounds one request, every member of a batch together, inside
+// the server's write timeout (MaxTurnWait plus a margin, cmd/mcp). A member
+// that starts with little of it left waits that much: a turn returns its task
+// still running, and one with none left is refused with the context error.
+var requestBudget = MaxTurnWait
 
 // errEmptyToken is a token file that holds nothing, which authenticates no one.
 var errEmptyToken = errors.New("empty token")
@@ -80,7 +87,11 @@ func Handler(s *Server, tokenFile string, log *slog.Logger) http.Handler {
 			http.Error(w, msgBodyTooLarge, http.StatusRequestEntityTooLarge)
 			return
 		}
-		resp := s.HandleJSONRPC(r.Context(), body)
+		// One budget for the whole request: a batch's members share it, so
+		// the response always lands inside the server's write timeout.
+		ctx, cancel := context.WithTimeout(r.Context(), requestBudget)
+		defer cancel()
+		resp := s.HandleJSONRPC(ctx, body)
 		if len(resp) == 0 {
 			w.WriteHeader(http.StatusAccepted)
 			return

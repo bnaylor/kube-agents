@@ -546,3 +546,80 @@ func TestReaderSlotsBoundConsumersHeld(t *testing.T) {
 		t.Errorf("TASKS holds %d consumers, more than the %d slots", got, maxTaskReaders)
 	}
 }
+
+// A slot whose read made no consumer goes back at once; one whose read may
+// have made one stays taken until that consumer would be reaped. A refusal
+// by the server made nothing; any other failure may have.
+func TestASlotWithNothingToReapGoesBackAtOnce(t *testing.T) {
+	b := &NATSBus{readers: make(chan struct{}, maxTaskReaders), reapDelay: time.Hour}
+	for i := 0; i < 2*maxTaskReaders; i++ {
+		release, err := b.readerSlot()
+		if err != nil {
+			t.Fatalf("slot %d refused after every earlier one made nothing: %v", i, err)
+		}
+		release(false)
+	}
+	for i := 0; i < maxTaskReaders; i++ {
+		release, err := b.readerSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		release(true)
+	}
+	if _, err := b.readerSlot(); err != errReadersBusy {
+		t.Errorf("a slot came back before its consumer's reap: err = %v", err)
+	}
+	if consumerMayExist(&jetstream.APIError{Code: 400, ErrorCode: jetstream.JSErrCodeConsumerCreate}) {
+		t.Error("a server refusal counted as a consumer that may exist")
+	}
+	if !consumerMayExist(context.DeadlineExceeded) {
+		t.Error("a timed-out create counted as one that made nothing")
+	}
+}
+
+// A wait with less left than one fetch's floor still returns what it read,
+// not an error: the read's end is a deadline like any other.
+func TestAShortWaitKeepsWhatItRead(t *testing.T) {
+	url, js := testBus(t)
+	publishSubmission(t, js, fakeAddressee, "task-short", "console:x", "q", "")
+	publishStatus(t, js, fakeAddressee, "task-short", lib.StateWorking, false)
+	b := dial(t, url)
+	got, err := b.WaitForTask(context.Background(), TaskRef{Addressee: fakeAddressee, TaskID: "task-short"}, 50*time.Millisecond)
+	if err != nil || got == nil {
+		t.Fatalf("a 50ms wait on a running task: task %v, err %v", got, err)
+	}
+	if got.Final {
+		t.Error("the running task folded as final")
+	}
+}
+
+// A turn the gateway settles with a notice listens to its notices alone, not
+// to every addressee's submissions, which nothing would drain.
+func TestASettledTurnTakesNoSubmissions(t *testing.T) {
+	url, _ := testBus(t)
+	b := dial(t, url)
+	before := b.client.Conn().NumSubscriptions()
+	w, err := b.openTurn("tok", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := b.client.Conn().NumSubscriptions() - before; got != 1 {
+		t.Errorf("a settled turn holds %d subscriptions, want 1 (its notices)", got)
+	}
+	w.close()
+
+	// And a stop, the settled turn the tools send, opens it that way.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = b.SendStop(ctx, NewConversations(), "tok-stop") }()
+	deadline := time.Now().Add(5 * time.Second)
+	for b.client.Conn().NumSubscriptions() == before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := b.client.Conn().NumSubscriptions() - before
+	cancel()
+	<-done
+	if got != 1 {
+		t.Errorf("a stop waiting on its notice holds %d subscriptions, want 1", got)
+	}
+}

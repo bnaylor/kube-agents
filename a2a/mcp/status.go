@@ -127,7 +127,9 @@ func FormatBusStatusMarkdown(st BusStatus) string {
 
 	if st.Connected {
 		sb.WriteString("### Agents on DIRECTORY\n\n")
-		if len(st.AgentCards) == 0 {
+		if st.AgentCards == nil {
+			sb.WriteString("_The agent cards could not be read; see Problems._\n")
+		} else if len(st.AgentCards) == 0 {
 			sb.WriteString("_No agent cards on DIRECTORY._\n")
 		} else {
 			names := make([]string, 0, len(st.AgentCards))
