@@ -96,9 +96,10 @@ type NATSBus struct {
 	cachedAt time.Time
 	now      func() time.Time
 
-	// readers holds one token per TASKS consumer this server has open
-	// (maxTaskReaders).
-	readers chan struct{}
+	// readers holds one token per consumer this server may still hold
+	// (maxTaskReaders); reapDelay is how long a released slot stays taken.
+	readers   chan struct{}
+	reapDelay time.Duration
 }
 
 // DialBus connects to the bus. It fails if the first connect does, so a
@@ -116,7 +117,7 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
 	}
-	return &NATSBus{client: client, cfg: cfg, now: time.Now, readers: make(chan struct{}, maxTaskReaders)}, nil
+	return &NATSBus{client: client, cfg: cfg, now: time.Now, readers: make(chan struct{}, maxTaskReaders), reapDelay: taskConsumerIdle}, nil
 }
 
 // Close drops the connection.

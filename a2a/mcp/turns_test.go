@@ -514,3 +514,35 @@ func TestConversationTablesCannotBeFilled(t *testing.T) {
 		t.Errorf("%d send locks remain with nothing holding them", len(c.sending))
 	}
 }
+
+// A released reader slot stays taken until the read's consumer would be
+// reaped, so rapid reads cannot hold more consumers than the cap: past it a
+// read is refused at once rather than piled up against the stream.
+func TestReaderSlotsBoundConsumersHeld(t *testing.T) {
+	url, js := testBus(t)
+	publishSubmission(t, js, fakeAddressee, "task-s", "console:x", "q", "")
+	publishRun(t, js, fakeAddressee, "task-s", answerText, true)
+	b := dial(t, url)
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-s"}
+	ok, busy := 0, 0
+	for i := 0; i < 2*maxTaskReaders; i++ {
+		switch _, err := b.ReadTask(context.Background(), ref); err {
+		case nil:
+			ok++
+		case errReadersBusy:
+			busy++
+		default:
+			t.Fatalf("read %d: %v", i, err)
+		}
+	}
+	if ok != maxTaskReaders || busy != maxTaskReaders {
+		t.Errorf("%d reads succeeded and %d were refused, want %d and %d", ok, busy, maxTaskReaders, maxTaskReaders)
+	}
+	s, err := js.Stream(context.Background(), lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.CachedInfo().State.Consumers; got > maxTaskReaders {
+		t.Errorf("TASKS holds %d consumers, more than the %d slots", got, maxTaskReaders)
+	}
+}
