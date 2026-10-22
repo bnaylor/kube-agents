@@ -82,7 +82,10 @@ every harness. So `AgentProfile` gains a **`tools`** list of OCI images, each pi
 mounted read-only and appended to `PATH` after the harness's own entries, in the same way
 `AgentPlugin` mounts image volumes. One tools image then serves every harness, and
 `harness.image` stays the escape hatch. Where image volumes aren't available (Autopilot, or
-Kubernetes below 1.35), tools use the same staging fallback `AgentPlugin` uses.
+Kubernetes below 1.35), tools are staged the way `AgentPlugin` stages images, with two
+differences: the staged directory is mounted read-only into the worker, and it is re-staged
+whenever the worker's per-task reset runs (or the pod restarts), so a task can't replace a
+tool for the next one.
 
 ```yaml
 spec:
@@ -138,8 +141,9 @@ limits in check:
   first, so one incident gets one investigation, not one per affected cluster. Each trigger
   has its own rate cap.
 
-Very wide work fans out in layers (group coordinators per project or region, each fanning out
-to its clusters), within the delegation depth cap below.
+Very wide work fans out in layers: a coordinator profile (per project or region) above the
+cluster agents, each layer a different profile. A profile may start children of its own
+profile only one level deep (decided 2026-10-22), so a `child` queue never feeds itself.
 
 The model-quota ceiling, and replicas or sharding for the gateway, NATS, LiteLLM and the
 credential proxy, belong to the sizing workstream. Profiles take their concurrency caps from
@@ -148,7 +152,10 @@ its budget function; until it exists, a fixed conservative default behind a knob
 ## Replacing kanban's plumbing
 
 1. **Results back to chat.** The gateway relays results from any profile and any number of
-   children to the asking conversation. This retires #2734's card-report use of `chat.notify`.
+   children. A top-level task's result goes to the asking conversation. A child's terminal goes
+   to its **parent task**, as a child-result input on the parent's own per-task reader, so a
+   parent that waits by staying open receives what its children found. It never goes to the
+   conversation directly. This retires #2734's card-report use of `chat.notify`.
    `chat.notify` itself stays: it is the chatops spec's route for proactive posts (cron
    reports, alerts to the home channel).
 2. **Progress.** Profile workers publish progress on the task's event stream as a new
@@ -158,8 +165,9 @@ its budget function; until it exists, a fixed conservative default behind a knob
 3. **Fan-out with a wait.** A profile can start several child tasks and wait on their
    results. **Children are gateway-minted**, as attenuated children of the parent's grant:
    tier and scope can only narrow, never widen, and the gateway stays the only publisher of
-   `.in` submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today).
-   Width is bounded by the dispatcher's caps.
+   submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and a
+   profile may nest children of its own profile only one level deep, so deeper layers cross
+   profiles (see [Scale rules](#scale-rules)). Width is bounded by the dispatcher's caps.
 4. **Stop.** One stop cancels the conversation's whole task tree, enforced by the dispatcher,
    keeping the user-facing behaviour of #3263 and #3379.
 5. **No "run after" dependencies.** Kanban's `kanban_link` is dropped on purpose. Fan-out plus
@@ -229,99 +237,109 @@ Gaps on main that the build closes (#3659):
    2. it checks that the target is in scope (`spec.scope`, including `exclude.clusters`);
    3. it mints the task's grant against the **resolved** profile, with the requester's tier
       and the target cluster in the grant's scope;
-   4. it publishes the task on `a2a.tasks.<profile>.<tier>.<kind>.<task>.in`, where `<kind>` is
-      `top` for a task a client asked for and `child` for a task another task started. The
-      target cluster is a task parameter rather than a subject token, so queues are per
-      profile, tier and kind, never per cluster.
+   4. it publishes the submission on `a2a.tasks.<profile>.<tier>.<kind>.<task>.submit`, where
+      `<kind>` is `top` for a task a client asked for and `child` for a task another task
+      started. The target cluster is a task parameter rather than a subject token, so queues are
+      per profile, tier and kind, never per cluster.
 
-### Admission and queueing
+**Subjects (decided 2026-10-22).** Only new submissions use the `.submit` subject, and only it
+carries the tier and kind tokens, because they exist to route queues. Follow-ups and cancels
+for a running task stay on the task's own `a2a.tasks.<profile>.<task>.in`, read by the
+task's per-task reader, and `.events` and `.supervisor` keep their per-task shape. Addressees
+that aren't profiles (`platform`, sessions) keep today's subjects.
 
-- **New submissions** go through **one shared durable consumer per (profile, tier, kind)**, on
-  `a2a.tasks.<profile>.<tier>.<kind>.*.in`, created and owned by the operator. (Decided
-  2026-10-22, replacing an earlier "one durable per profile": one consumer cannot give
-  children their own cap or keep one tier's pool from taking another tier's tasks.) Workers
-  (or the Job dispatcher) are **bind-only** on their durable: they may fetch and acknowledge,
-  but may not create, update or delete it, so one pod can never rewrite another's consumer.
-  `max_ack_pending` is per consumer, so each durable caps its own in-flight count. A durable
-  per worker would deliver every task to every worker, because the TASKS stream is
-  limits-based.
-- **Follow-ups and cancels** for a running task do not go through the shared durables. They
-  keep the payload spec's per-task reader (and the supervisor path for cancel), so they always
-  reach the worker that owns the task, even when `max_ack_pending` is full.
-- A worker holds a task unacknowledged for the task's whole life, with **periodic in-progress
-  acks** and a worker-side deadline (`lifecycle.activeDeadlineSeconds` applies to Jobs; warm
-  workers enforce the same limit themselves). A long fixed ack wait is not used, because a
-  dead worker would leak its slot until it expired. The shared client library acknowledges on
-  handler return today, so this is library work.
-- **Redelivery is not a re-run, and not proof of death.** A message can be redelivered while
-  its executor is still alive (a missed in-progress ack, a NATS reconnect, or a restart of the
-  Job dispatcher holding messages for Jobs that are still running). So whatever executes a task
-  renews a **liveness lease** for it in a KV bucket, keyed by task. A receiver of a redelivered
-  task checks the lease: if it is still live, it leaves the task alone (and a restarted
-  dispatcher re-adopts a running Job rather than failing it); only if the lease has expired
-  and the task had started does it publish a terminal failure with the reason. A task is never
-  re-run automatically, which keeps the subagent spec's rule for LLM tasks.
-- A task beyond the cap waits in the queue. The dispatcher fails a task that has waited longer
-  than `spec.queueTimeoutSeconds` (default 3600) with a visible notice. It checks the
-  message's age itself, because the stream's age limit is stream-wide.
+### Admission and holding
+
+**The dispatcher is the only fetcher and holder** (decided 2026-10-22), on both execution
+paths:
+
+- There is **one shared durable consumer per (profile, tier, kind)** on
+  `a2a.tasks.<profile>.<tier>.<kind>.*.submit`, created and owned by the operator. The
+  dispatcher is its only reader. `max_ack_pending` is per consumer, so each durable caps its own
+  in-flight count, and a `child` durable has its own cap separate from its profile's `top`
+  durable.
+- The dispatcher fetches a submission, asks the verifier (with a new verb) whether the grant
+  permits running the resolved profile at tier T for the target in scope, checks the tier
+  against the profile's allowed tiers, and checks the message's age against
+  `spec.queueTimeoutSeconds` (default 3600; the stream's own age limit is stream-wide). It
+  fails a task that fails any check with a visible notice.
+- It then **holds the message unacknowledged for the task's whole life**, with periodic
+  in-progress acks, and hands the task to an executor: a warm worker for interactive tiers, a
+  Job for the unattended tier. Workers get tasks only from the dispatcher; they have no fetch
+  grant on the durables and no verifier grant.
+- **The executor renews a liveness lease** for the task in a KV bucket, keyed by task, and the
+  dispatcher enforces a deadline (`lifecycle.activeDeadlineSeconds` on Jobs, the same limit
+  for warm workers). When the lease expires, the dispatcher publishes a terminal failure with
+  the reason. A task is never re-run automatically, which keeps the subagent spec's rule for
+  LLM tasks.
+- **After a dispatcher restart**, its held messages are redelivered to the new instance. For
+  each one it checks the lease: a live lease means the executor is still running, so it
+  re-adopts the task and keeps holding; an expired lease on a started task becomes a terminal
+  failure; a task that never started is dispatched normally.
 - **Caps:** `spec.concurrency` is the profile's own ceiling. The sizing budget, once it exists,
   sets the effective value, which never exceeds `spec.concurrency`. An install-wide ceiling on
-  the PlatformAgent caps the total across profiles, and reserves
-  `max(1, ceil(ceiling / 3))` slots for interactive tiers, so unattended work cannot starve
-  users. Each `child` durable has its own cap, separate from its profile's `top` durable. Caps must be dynamic, from
-  10 clusters to 10,000.
-- Each (profile, tier, kind) durable counts against the TASKS consumer budget (#2077), so that
-  formula includes them.
+  the PlatformAgent caps the total across profiles, and reserves `max(1, ceil(ceiling / 3))`
+  slots for interactive tiers, so unattended work cannot starve users. Caps must be dynamic,
+  from 10 clusters to 10,000.
+- Each durable counts against the TASKS consumer budget (#2077), so that formula includes them.
 
 ### Execution
 
 - **Interactive profiles (the cluster agent, chat) run as warm pools:** a small always-on set
-  of worker pods per (profile, tier), pulling from that tier's `top` and `child` durables. A
-  pod's ServiceAccount is fixed, so **each (profile, tier) pair gets its own ServiceAccount,
-  RBAC binding and callout identity entry** (decided 2026-10-22), and a pool serves one tier. The replica count comes from the budget.
-  Between tasks **every writable path the task can reach** (workspace, `HOME`, `/tmp`, caches)
-  is reset, or the container restarts, and credentials are reissued for the next task's scope,
-  so one task's state can't reach the next. A warm pool is a fixed, predictable footprint,
-  which also suits Autopilot.
+  of worker pods per (profile, tier), taking tasks from the dispatcher. A pod's
+  ServiceAccount is fixed, so **each (profile, tier) pair gets its own ServiceAccount, RBAC
+  binding and callout identity entry** (decided 2026-10-22), and a pool serves one tier. The
+  replica count comes from the budget. Between tasks every writable path the task can reach
+  (workspace, `HOME`, `/tmp`, caches, staged tools) is reset, or the container restarts, and
+  credentials are reissued for the next task's scope, so one task's state can't reach the
+  next. A warm pool is a fixed, predictable footprint, which also suits Autopilot.
 - **The unattended tier runs a Job per task:** it is bursty and latency-insensitive, and each
   run gets a clean pod.
-- **Placement:** AgentProfile CRs stay in the PlatformAgent's namespace, so a profile still binds
-  to the PlatformAgent in its namespace as today. The profile ServiceAccounts and worker pods
-  live in a dedicated profile namespace with its own quota, rendered there by the operator, so
-  profile work can never take `/session` slots (the session quota counts every pod in its
-  namespace). The operator renders the
-  ServiceAccounts, bus credentials, tier RBAC and the NetworkPolicy that lets that namespace
-  reach NATS, LiteLLM and the credential proxy.
+- **Placement:** AgentProfile CRs stay in the PlatformAgent's namespace, so a profile still
+  binds to the PlatformAgent in its namespace as today. The profile ServiceAccounts and worker
+  pods live in a dedicated profile namespace with its own quota, rendered there by the
+  operator, so profile work can never take `/session` slots (the session quota counts every
+  pod in its namespace). The operator also renders the bus credentials, tier RBAC and the
+  NetworkPolicy that lets that namespace reach NATS, LiteLLM and the credential proxy.
 
 ### Results and stop
 
-- Results and progress go back through the gateway relay to the asking conversation, whichever
-  door it came in on.
+- A top-level task's results and progress go back through the gateway relay to the asking
+  conversation, whichever door it came in on. A child's terminal goes to its parent task.
 - Stop on a conversation cancels its task tree through the supervisor path: the dispatcher
   tells warm workers to abandon the task (and resets them) or deletes the Job.
+
+### What this spec leaves to the build
+
+This document stops at the decisions. Further queue and dispatcher mechanics (ack timing
+details, lease intervals, restart and reconnect edge cases, grant shapes) are settled in the
+dispatcher's plan and PRs (#3655), with tests, rather than added here. Where a build PR finds
+a decision above doesn't hold, it comes back to this spec as a change, not a workaround.
 
 ## Changes to companion specs
 
 The build PRs amend these; this list is what they must cover.
 
-- **`spec-subagent-profiles.md`:** the execution model (warm pools beside Jobs), queue mechanics
-  (the shared operator-owned durable, held delivery with in-progress acks instead of "ack after
-  Job create", redelivery as terminal failure), the persona format replacing per-profile SOUL
-  files, the allowed-tiers list on the CR, the worker namespace separate from the CR's (the
-  binding rule itself is unchanged), and the CRD doc comments (persona contents, `clusterRef`
-  usage, lifecycle on warm pools).
-- **`spec-nats-deployment.md`:** the shared durables per (profile, tier, kind) (operator-created,
-  bind-only for workers) replacing per-pod consumer narrowing for new submissions, and their
-  `max_ack_pending`; and a KV bucket for per-task liveness leases.
-- **`spec-a2a-payloads.md`:** the task subject gains `<tier>` and `<kind>` tokens
-  (`a2a.tasks.<profile>.<tier>.<kind>.<task>.in`); children of a profile task are
-  gateway-minted (the gateway stays the only `.in` author); follow-ups and cancel keep their
-  per-task reader.
+- **`spec-subagent-profiles.md`:** the execution model (warm pools beside Jobs, with the
+  dispatcher as the only fetcher and holder), held delivery with in-progress acks instead of
+  "ack after Job create", the liveness lease and re-adoption after a restart, the persona
+  format replacing per-profile SOUL files, the allowed-tiers list on the CR, the worker
+  namespace separate from the CR's (the binding rule itself is unchanged), and the CRD doc
+  comments (persona contents, `clusterRef` usage, lifecycle on warm pools).
+- **`spec-nats-deployment.md`:** the shared durables per (profile, tier, kind) on the `.submit`
+  subjects, operator-created and read only by the dispatcher, replacing per-pod consumer
+  narrowing for new submissions, and their `max_ack_pending`; and a KV bucket for per-task
+  liveness leases.
+- **`spec-a2a-payloads.md`:** the new submission subject
+  `a2a.tasks.<profile>.<tier>.<kind>.<task>.submit`, with follow-ups and cancels staying on
+  the per-task `.in`; children of a profile task are gateway-minted (the gateway stays the only
+  author of submissions); a child's terminal is delivered to its parent task.
 - **`spec-chatops-gateway.md`:** delegation to any profile (not only `platform`), multiple
-  children, and the depth cap; `chat.notify` keeps its proactive-post role.
+  children, the depth cap and the same-profile nesting limit; `chat.notify` keeps its
+  proactive-post role.
 - **Callout narrowing** (`profile_narrowing.go`) and the CRD's identity rendering: one
-  ServiceAccount and identity-map entry per (profile, tier), with bind-only grants on that
-  tier's durables.
+  ServiceAccount and identity-map entry per (profile, tier); workers get no fetch grant on the
+  shared durables and no verifier grant; the dispatcher gets both.
 
 ## Order of work
 
