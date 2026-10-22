@@ -144,6 +144,10 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			return
 		}
 		i := n.Add(1)
+		// An earlier task's terminal, posted to the conversation as the
+		// console relay does (kind "result"), is not a notice about this
+		// turn and must not be taken for one.
+		_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "r-task-earlier", Text: "an earlier answer", Kind: "result"}))
 		notice("Working on it…")
 		root := fmt.Sprintf("task-root%d", i)
 		text := f.Text
@@ -226,7 +230,7 @@ func TestSendMessageAnswersFromTheTurnsOwnTask(t *testing.T) {
 	}
 	text := res.Content[0].Text
 	mustContain(t, text, fakeAddressee+"/task-root1", "completed", answerText, "Working on it")
-	mustNotContain(t, text, "task-other1", "task-child1", "task-late1", "task-running")
+	mustNotContain(t, text, "task-other1", "task-child1", "task-late1", "task-running", "an earlier answer")
 }
 
 // A delegate turn is matched under its stripped text, and the answer is taken
