@@ -250,7 +250,7 @@ type turnWatch struct {
 
 // openTurn subscribes to the conversation's submissions and notices, live on
 // the server before it returns so that nothing published after is missed.
-func (b *NATSBus) openTurn(token string, texts []string) (*turnWatch, error) {
+func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*turnWatch, error) {
 	nc := b.client.Conn()
 	w := &turnWatch{
 		conversation: fmt.Sprintf(consoleConversationOf, token),
@@ -260,16 +260,30 @@ func (b *NATSBus) openTurn(token string, texts []string) (*turnWatch, error) {
 		known:        map[string]bool{},
 		stop:         make(chan struct{}),
 	}
-	sub, err := nc.ChanSubscribe(submissionSubjects, w.subs)
-	if err != nil {
-		return nil, err
+	// Submissions are every addressee's .in traffic, drained by the turn's
+	// matcher and then its follower. A settled turn has neither, and an
+	// undrained subscription on a busy install is a slow consumer on the
+	// connection every tool shares, so it takes the notices alone.
+	var sub *nats.Subscription
+	if submissions {
+		var err error
+		if sub, err = nc.ChanSubscribe(submissionSubjects, w.subs); err != nil {
+			return nil, err
+		}
 	}
 	nsub, err := nc.ChanSubscribe(fmt.Sprintf(consoleOutSubject, token), w.notices)
 	if err != nil {
-		_ = sub.Unsubscribe()
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
 		return nil, err
 	}
-	w.unsubscribe = func() { _ = sub.Unsubscribe(); _ = nsub.Unsubscribe() }
+	w.unsubscribe = func() {
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+		_ = nsub.Unsubscribe()
+	}
 	if err := nc.Flush(); err != nil {
 		w.unsubscribe()
 		return nil, err
@@ -304,7 +318,7 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	if err := ctx.Err(); err != nil {
 		return res, nil, err
 	}
-	w, err := b.openTurn(token, texts)
+	w, err := b.openTurn(token, texts, true)
 	if err != nil {
 		return res, nil, err
 	}
@@ -365,7 +379,7 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}
-	w, err := b.openTurn(token, nil)
+	w, err := b.openTurn(token, nil, false)
 	if err != nil {
 		return res, err
 	}
@@ -546,7 +560,11 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 			}
 			ft, ferr := b.WaitForTask(ctx, ref, time.Until(deadlineOf(ctx)))
 			read[ref.TaskID] = FollowedTask{Ref: ref, Task: ft, Err: ferr}
-			progressed = true
+			// A read that failed fast (every reader slot busy, say) is
+			// retried after the pause below, not at once.
+			if ferr == nil {
+				progressed = true
+			}
 			if ferr == nil && ft != nil && ft.Final && ft.Artifact(lib.ArtifactResult) != nil {
 				r := ref
 				out.AnswerFrom, out.Answer = &r, ft
@@ -598,7 +616,8 @@ func (b *NATSBus) ResolveAddressee(ctx context.Context, taskID string) (string, 
 	if err != nil {
 		return "", err
 	}
-	defer release()
+	created := false
+	defer func() { release(created) }()
 	ctx, cancel := context.WithTimeout(ctx, taskReadTimeout)
 	defer cancel()
 	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
@@ -612,6 +631,7 @@ func (b *NATSBus) ResolveAddressee(ctx context.Context, taskID string) (string, 
 		MemoryStorage:     true,
 		InactiveThreshold: taskConsumerIdle,
 	})
+	created = err == nil || consumerMayExist(err)
 	if err != nil {
 		return "", err
 	}

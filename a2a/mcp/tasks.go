@@ -79,18 +79,34 @@ func ParseTaskRef(ref, addressee string) (TaskRef, error) {
 }
 
 // readerSlot takes one of the server's reader slots, or reports them all busy
-// without waiting. Release hands the slot back once the consumer the read
-// created has had time to be reaped (taskConsumerIdle), not at once.
-func (b *NATSBus) readerSlot() (release func(), err error) {
+// without waiting. Release hands the slot back: once the consumer the read
+// created has had time to be reaped (taskConsumerIdle) when created says the
+// read may have left one, and at once when it cannot have.
+func (b *NATSBus) readerSlot() (release func(created bool), err error) {
 	select {
 	case b.readers <- struct{}{}:
 		var once sync.Once
-		return func() {
-			once.Do(func() { time.AfterFunc(b.reapDelay, func() { <-b.readers }) })
+		return func(created bool) {
+			once.Do(func() {
+				if !created {
+					<-b.readers
+					return
+				}
+				time.AfterFunc(b.reapDelay, func() { <-b.readers })
+			})
 		}, nil
 	default:
 		return nil, errReadersBusy
 	}
+}
+
+// consumerMayExist reports whether a failed CreateConsumer can still have left
+// a consumer on the server. A JetStream API error is the server's refusal, so
+// nothing was made; anything else (a timeout, a dropped connection) may have
+// been answered after the client stopped waiting.
+func consumerMayExist(err error) bool {
+	var refused *jetstream.APIError
+	return !errors.As(err, &refused)
 }
 
 // ReadTask folds a task from TASKS as it stands now.
@@ -150,7 +166,7 @@ type taskWatch struct {
 	events  []*lib.Envelope
 	seen    int
 	pending uint64
-	release func()
+	release func(created bool)
 }
 
 func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error) {
@@ -160,7 +176,7 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 	}
 	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
-		release()
+		release(false)
 		return nil, err
 	}
 	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
@@ -171,13 +187,13 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		InactiveThreshold: taskConsumerIdle,
 	})
 	if err != nil {
-		release()
+		release(consumerMayExist(err))
 		return nil, err
 	}
 	return &taskWatch{ref: ref, cons: cons, pending: cons.CachedInfo().NumPending, release: release}, nil
 }
 
-func (w *taskWatch) close() { w.release() }
+func (w *taskWatch) close() { w.release(true) }
 
 // next fetches what is pending, or waits up to taskFetchWait for the next
 // event when nothing is.
@@ -186,9 +202,12 @@ func (w *taskWatch) next(ctx context.Context) error {
 	if dl, ok := ctx.Deadline(); ok {
 		wait = min(wait, time.Until(dl))
 	}
-	if wait < minFetchWait {
-		return context.DeadlineExceeded
-	}
+	// Never below the fetch's floor, even with less than that left: what is
+	// pending still arrives at once, and an empty fetch ends just past the
+	// deadline, which the caller then sees as ctx done and keeps what it has
+	// folded. Refusing the fetch instead would end the read on an error
+	// with ctx not yet done, and drop the fold.
+	wait = max(wait, minFetchWait)
 	batch, err := w.cons.Fetch(int(max(1, min(w.pending, taskFetchBatch))), jetstream.FetchMaxWait(wait))
 	if err != nil {
 		return err
