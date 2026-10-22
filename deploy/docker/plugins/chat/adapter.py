@@ -322,7 +322,8 @@ def _opens_with_unstructured_reasoning(report: str) -> bool:
     """The #3206 rule, from the module the image installs as
     ``hermes_cli/unstructured_reasoning.py`` (source:
     ``deploy/docker/patches/unstructured_reasoning.py``). Imported here, not at
-    the top, like this file's other Hermes imports. If it is missing the report
+    the top, so this module still loads where hermes_cli is absent (its unit
+    tests run outside the image). If it is missing the report
     is relayed as before, with a warning: a packaging slip must not stop every
     cron delivery."""
     try:

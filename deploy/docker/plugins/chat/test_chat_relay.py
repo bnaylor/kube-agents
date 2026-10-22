@@ -1009,9 +1009,6 @@ class TestRegistration(unittest.TestCase):
         self.assertEqual(captured["max_message_length"], 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class UnstructuredReasoningIsWithheld(unittest.TestCase):
     """#3206: a cron report that is the model's reasoning is not relayed."""
@@ -1054,3 +1051,8 @@ class UnstructuredReasoningIsWithheld(unittest.TestCase):
         result, requests = self._send("Audit complete: 2 findings.\nThe thought behind finding 1 is ...")
         self.assertTrue(result.get("success"), result)
         self.assertEqual(1, len(requests))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

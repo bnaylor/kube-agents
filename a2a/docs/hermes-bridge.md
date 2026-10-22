@@ -443,9 +443,11 @@ cancel raced the end of the turn too: a withheld answer ends `failed`, not `comp
 `opensWithUnstructuredReasoning` in `reasoning_leak.go`. The image patch
 `apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
 model on later calls, and the `deliver: "chat"` cron relay (`deploy/docker/plugins/chat/adapter.py`)
-withholds a cron report that opens the same way. Other output that never passes the bridge is not
-guarded: a kanban card's result posted by the notifier, and a `today`-mode reply from Hermes's own
-gateway platforms; there the history patch only lowers the rate. A
+withholds a cron report that opens the same way. Other output that never passes the bridge or the relay is not
+guarded: a kanban card's result posted by the notifier, a `today`-mode reply from Hermes's own
+gateway platforms, and a cron job on `deliver: "all"` (or a named platform), whose scheduler posts
+the raw report to each home channel itself, beside the relay's copy; there the history patch only
+lowers the rate. A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it
