@@ -52,7 +52,13 @@ func topicBus(t *testing.T, maxConsumers int) (*NATSBus, jetstream.JetStream) {
 			t.Fatalf("stream %s: %v", cfg.Name, err)
 		}
 	}
-	return dial(t, url), js
+	b := dial(t, url)
+	// A slot normally stays taken until its consumer's reap (taskConsumerIdle);
+	// these tests are about which reads take a slot and that each gives it
+	// back, so the hold is made immediate. TestATopicReadHoldsItsSlotUntilTheReap
+	// runs with a real hold.
+	b.reapDelay = 0
+	return b, js
 }
 
 func publishTopic(t *testing.T, js jetstream.JetStream, subject, summary string, data any) {
@@ -99,10 +105,17 @@ func violations(b *NATSBus) func() []string {
 	}
 }
 
+// slotsFree waits for every reader slot to come back. Release is asynchronous
+// (it runs after reapDelay, zero in these tests), so it is polled, not read once.
 func slotsFree(t *testing.T, b *NATSBus) {
 	t.Helper()
-	if n := len(b.readers); n != 0 {
-		t.Errorf("%d reader slots still held after the call", n)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(b.readers) != 0 {
+		if time.Now().After(deadline) {
+			t.Errorf("%d reader slots still held after the call", len(b.readers))
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -416,6 +429,22 @@ func TestAFailedTopicReadReleasesItsSlot(t *testing.T) {
 		if _, err := b.ReadTopic(context.Background(), "blueprint"); err == nil || errors.Is(err, errReadersBusy) {
 			t.Fatalf("read %d: err = %v, want the stream's consumer cap", i, err)
 		}
+		slotsFree(t, b)
+	}
+}
+
+// A topic read draws on the server-wide reader pool like a task read: its slot
+// stays taken until the consumer it opened has had time to be reaped, so a
+// burst of reads cannot open more consumers than the pool allows.
+func TestATopicReadHoldsItsSlotUntilTheReap(t *testing.T) {
+	b, js := topicBus(t, topicStreamMaxConsumers)
+	b.reapDelay = 300 * time.Millisecond
+	publishTopic(t, js, subjBlueprint, "bp", nil)
+	if _, err := b.ReadTopic(context.Background(), "blueprint"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(b.readers); n != 1 {
+		t.Fatalf("%d slots held right after a read, want 1 (held until the reap)", n)
 	}
 	slotsFree(t, b)
 }
