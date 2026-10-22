@@ -64,7 +64,7 @@ func unstructuredReasoningReason(sessionID string, turn int) string {
 // withholdUnstructuredReasoning logs a withheld answer for an operator: the
 // task, the session and the answer's size, never its text.
 func (b *Bridge) withholdUnstructuredReasoning(run *taskRun, sessionID string, turn int, answer string) {
-	b.cfg.Logger.Warn("answer withheld: it opens with a bare thought line (unstructured model reasoning)",
+	b.cfg.Logger.Warn("answer withheld: it opens with a thought line (unstructured model reasoning)",
 		"task", run.origin.TaskID, "session", sessionID, "turn", turn, "bytes", len(answer),
 		"reason", unstructuredReasoningToken)
 }

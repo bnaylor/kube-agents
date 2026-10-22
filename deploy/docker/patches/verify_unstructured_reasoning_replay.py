@@ -8,7 +8,11 @@ and behave:
 
 - in ``agent/turn_context.py``'s ``build_api_messages``, the marked import and
   its call sit directly in the per-message loop, between the ``api_msg`` clone
-  and the reasoning-field copy (so after the ``api_content`` replay);
+  and the reasoning-field copy. That they also follow the ``api_content``
+  replay is not checked: v2026.9.14 puts the replay between those two, and a
+  bump that moved it below the copy would pass here. Hermes stamps that
+  sidecar only on user messages in this tree, so no assistant message reaches
+  the gap today;
 - in ``agent/chat_completion_helpers.py``'s ``_iteration_summary_api_messages``,
   they sit directly in its loop between ``substitute_api_content(api_msg)`` and
   the ``append``;
