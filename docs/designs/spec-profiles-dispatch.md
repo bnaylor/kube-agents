@@ -327,6 +327,12 @@ details, lease intervals, restart and reconnect edge cases, grant shapes) are se
 dispatcher's plan and PRs (#3655), with tests, rather than added here. Where a build PR finds
 a decision above doesn't hold, it comes back to this spec as a change, not a workaround.
 
+**Cross-chain admission cycles (decided 2026-10-22, "a for now").** Parents keep waiting by
+staying open. If the dispatcher's tests or live runs show cross-chain cycles happening in
+practice, switching to finish-and-wake (a waiting parent gives up its slot and is woken when
+its children finish), which closes the whole class, is the agreed next step, and comes back
+here as a spec change.
+
 ## Changes to companion specs
 
 The build PRs amend these; this list is what they must cover.
