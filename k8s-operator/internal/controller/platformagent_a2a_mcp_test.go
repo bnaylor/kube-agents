@@ -355,3 +355,37 @@ func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
 		}
 	}
 }
+
+// The MCP server's turns go through the gateway's console door, so its flag
+// keeps the gateway rendered on an install with no chat backend, and tells the
+// gateway to start on the console door alone. Without the flag neither changes.
+func TestTheMCPDoorKeepsTheGatewayRendered(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	r, _ := mcpTestReconciler(t)
+	gatewayEnv := func() map[string]string {
+		env := map[string]string{}
+		for _, c := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers {
+			for _, e := range c.Env {
+				env[e.Name] = e.Value
+			}
+		}
+		return env
+	}
+
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	if ok, _, err := r.a2aGatewayBackend(ctx, agent); err != nil || ok {
+		t.Fatalf("with no backend and no flag the gateway has a backend: %v %v", ok, err)
+	}
+	if _, set := gatewayEnv()[a2aMCPGatewayConsoleDoorEnv]; set {
+		t.Errorf("the gateway carries %s with the MCP flag off", a2aMCPGatewayConsoleDoorEnv)
+	}
+
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if ok, _, err := r.a2aGatewayBackend(ctx, agent); err != nil || !ok {
+		t.Errorf("with the MCP flag on the gateway is not rendered: %v %v", ok, err)
+	}
+	if got := gatewayEnv()[a2aMCPGatewayConsoleDoorEnv]; got != "true" {
+		t.Errorf("%s = %q with the MCP flag on, want true", a2aMCPGatewayConsoleDoorEnv, got)
+	}
+}
