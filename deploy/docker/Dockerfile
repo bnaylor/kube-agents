@@ -1445,9 +1445,25 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # agent's container used a few percent of its own limit. The sample now uses the
 # container's cgroup v2 limit when one is set. See the module docstring in
 # deploy/docker/patches/apply_cgroup_memory_sample.py.
+#
+# unstructured_reasoning_replay rides it too (#3206): Gemini through LiteLLM
+# sometimes writes its reasoning as plain assistant content under a first line
+# `thought` or `thought:`, with reasoning_content empty, and once a session's
+# history holds one such reply the model imitates it on later calls. One call
+# is inserted in each place a model call's messages are built,
+# agent/turn_context.py's build_api_messages (every turn) and
+# agent/chat_completion_helpers.py's _iteration_summary_api_messages (the
+# iteration-limit summary), and sends such a reply to the model as a fixed
+# placeholder, its tool_calls kept so each still pairs with its result;
+# state.db keeps the original. The rule is hermes_cli/unstructured_reasoning.py,
+# copied in below. The Hermes bridge withholds such a reply from the user when
+# it is the answer (a2a/hermes-bridge/reasoning_leak.go). See the module
+# docstrings in deploy/docker/patches/apply_unstructured_reasoning_replay.py
+# and deploy/docker/patches/unstructured_reasoning.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      deploy/docker/patches/permission_refusal_stop.py \
+     deploy/docker/patches/unstructured_reasoning.py \
      /opt/hermes/hermes_cli/
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
@@ -1470,6 +1486,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/apply_permission_refusal_stop.py \
      deploy/docker/patches/verify_permission_refusal_stop.py \
+     deploy/docker/patches/apply_unstructured_reasoning_replay.py \
+     deploy/docker/patches/verify_unstructured_reasoning_replay.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1482,6 +1500,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cluster_dns_not_local.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cgroup_memory_sample.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_permission_refusal_stop.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_unstructured_reasoning_replay.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kube_observe_refusal(" /opt/hermes/agent/tool_guardrails.py && \
@@ -1499,6 +1518,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
     grep -q 'kube-agents patch: cluster-dns-not-local' /opt/hermes/agent/model_metadata.py && \
     grep -q 'kube-agents patch: cgroup-memory-sample' /opt/hermes/gateway/lifecycle_ledger.py && \
+    grep -q 'kube-agents patch: unstructured_reasoning_replay' /opt/hermes/agent/turn_context.py && \
+    grep -q 'kube-agents patch: unstructured_reasoning_replay' /opt/hermes/agent/chat_completion_helpers.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1510,6 +1531,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cgroup_memory_sample.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_permission_refusal_stop.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_unstructured_reasoning_replay.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
