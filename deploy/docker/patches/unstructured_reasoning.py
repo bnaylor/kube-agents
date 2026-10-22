@@ -40,12 +40,28 @@ REASONING_SEPARATOR = ":"
 ASSISTANT_ROLE = "assistant"
 
 
+# Go's strings.TrimSpace trims unicode.IsSpace; Python's str.strip also trims
+# the four information separators U+001C..U+001F. Leaving those in keeps the
+# two sides of the rule in agreement on every input.
+_NOT_TRIMMED_BY_GO = frozenset("\x1c\x1d\x1e\x1f")
+
+
+def _trim(line: str) -> str:
+    """``line`` with surrounding whitespace dropped as Go's ``strings.TrimSpace`` drops it."""
+    start, end = 0, len(line)
+    while start < end and line[start].isspace() and line[start] not in _NOT_TRIMMED_BY_GO:
+        start += 1
+    while end > start and line[end - 1].isspace() and line[end - 1] not in _NOT_TRIMMED_BY_GO:
+        end -= 1
+    return line[start:end]
+
+
 def opens_with_unstructured_reasoning(content: Any) -> bool:
     """True when ``content``'s first non-empty line is ``thought`` or starts with ``thought:``, in any case."""
     if not isinstance(content, str):
         return False
     for line in content.split("\n"):
-        line = line.strip()
+        line = _trim(line)
         if not line:
             continue
         lowered = line.lower()

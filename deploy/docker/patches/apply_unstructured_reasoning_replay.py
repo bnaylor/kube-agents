@@ -9,7 +9,8 @@ and the model keeps imitating it: long cron audit sessions on one lane held
 99-220 such replies each.
 
 This breaks that loop on the wire copy only. Two anchored insertions, one in
-each place Hermes v2026.9.14 builds the messages list for a model call, run
+each place Hermes v2026.9.14 builds the main loop's messages list for a model
+call, run
 ``hermes_cli.unstructured_reasoning.replace_unstructured_reasoning`` (shipped
 beside this file as ``unstructured_reasoning.py``, where the rule is written
 down) on every outgoing message:
@@ -21,6 +22,14 @@ down) on every outgoing message:
 - ``agent/chat_completion_helpers.py``'s ``_iteration_summary_api_messages``,
   the summary call a turn makes when it reaches its iteration limit, after its
   own ``api_content`` substitution.
+
+Not covered, as data rather than as an assistant turn: context compression
+serialises stored replies into its summary prompt (``context_compressor``,
+``micro_compaction``), and a delegated subagent's final reply comes back to the
+parent as a ``tool`` row. Both reach a model as text to read, not as its own
+earlier turn, so the imitation risk is lower; a compressed session's summary
+can still quote the reasoning. Only string content is checked; Hermes stores
+assistant content as a string.
 
 Both loops work on a copy of each stored message, so ``messages``, and with it
 state.db, is untouched; the placeholder replaces only the content, so

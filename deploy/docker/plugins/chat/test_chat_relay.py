@@ -1011,3 +1011,46 @@ class TestRegistration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnstructuredReasoningIsWithheld(unittest.TestCase):
+    """#3206: a cron report that is the model's reasoning is not relayed."""
+
+    def setUp(self) -> None:
+        import importlib.util
+        import sys
+        import types
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(here, "..", "..", "patches", "unstructured_reasoning.py")
+        spec = importlib.util.spec_from_file_location("hermes_cli.unstructured_reasoning", src)
+        rule = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rule)
+        pkg = types.ModuleType("hermes_cli")
+        pkg.unstructured_reasoning = rule
+        self._mods = patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.unstructured_reasoning": rule})
+        self._mods.start()
+        self.addCleanup(self._mods.stop)
+
+    def _send(self, report: str) -> tuple:
+        with RecordingRelay() as relay:
+            env = {
+                "SESSION_KV_API_KEY": "k",
+                "CRON_REPORT_RELAY_URL": relay.url,
+                "HERMES_HOME": "/opt/data/profiles/platform",
+            }
+            with patch.dict(os.environ, env):
+                result = asyncio.run(mod.standalone_send(None, "cron-reports", wrapped("Audit", "audit", report)))
+            return result, list(relay.requests)
+
+    def test_a_thought_report_is_withheld_and_recorded(self) -> None:
+        for report in ("thought\nThe user wants an audit...", "thought:\nLet me check", "thought:The user asked"):
+            with self.subTest(report=report):
+                result, requests = self._send(report)
+                self.assertIn("unstructured model reasoning", result.get("error", ""))
+                self.assertEqual([], requests, "a withheld report reached the relay")
+
+    def test_a_real_report_still_relays(self) -> None:
+        result, requests = self._send("Audit complete: 2 findings.\nThe thought behind finding 1 is ...")
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(1, len(requests))

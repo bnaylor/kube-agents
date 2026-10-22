@@ -172,6 +172,8 @@ class RuleTest(unittest.TestCase):
             "My thought: it is 1.33.",
             "The answer.\nthought: more",
             "thought\rplan",
+            # Go's TrimSpace keeps the information separators; so does the rule here.
+            "\x1cthought\nplan",
             "",
             "\n  \n",
             None,

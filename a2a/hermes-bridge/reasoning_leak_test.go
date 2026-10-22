@@ -47,6 +47,8 @@ func TestOpensWithUnstructuredReasoning(t *testing.T) {
 		{"Thought about it, the cluster runs 1.33.", false},
 		{"My thought: the cluster runs 1.33.", false},
 		{"thoughts\nthe plan", false},
+		// TrimSpace keeps U+001C..U+001F; the Python side of the rule matches it.
+		{"\x1cthought\nthe plan", false},
 		{"thoughtful answer", false},
 		{"thought :the plan", false},
 		{"thought about it\nthe plan", false},
