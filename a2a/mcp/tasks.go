@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -25,11 +26,14 @@ const (
 	// reported as too large to read here rather than read without limit.
 	maxTaskEvents = 4096
 
-	// maxTaskReaders bounds the TASKS consumers this server holds at once,
-	// across every caller: each read or watch holds one for its length. The
-	// stream's consumer cap is shared with the gateway, the bridges and
-	// every session pod, so this server's share is small and fixed.
-	maxTaskReaders = 4
+	// maxTaskReaders bounds the consumers this server holds at once, across
+	// every caller and every reader (tasks, topics). A slot is held for a
+	// read or watch and then for taskConsumerIdle after it, which is how
+	// long the server keeps the consumer before reaping it: the console
+	// grant cannot delete one, so a slot freed at the end of the read would
+	// let rapid reads pile consumers up against the stream's cap, which the
+	// gateway, the bridges, every session pod and the console page share.
+	maxTaskReaders = 8
 
 	// gatewaySupervisor is the gateway's session on the bus, the writer the
 	// supervisor subject is checked against, as the gateway's own fold does.
@@ -45,7 +49,7 @@ const (
 var ErrTaskNotFound = errors.New("no such task on the bus")
 
 // errReadersBusy is every task reader slot in use.
-var errReadersBusy = fmt.Errorf("this server is already reading %d tasks; try again shortly", maxTaskReaders)
+var errReadersBusy = fmt.Errorf("this server already holds its %d bus readers; try again in a few seconds", maxTaskReaders)
 
 // TaskRef names a task as the bus does: by the addressee it was submitted to
 // and its id. The addressee is part of the name on purpose: events for the
@@ -74,12 +78,16 @@ func ParseTaskRef(ref, addressee string) (TaskRef, error) {
 	return r, nil
 }
 
-// readerSlot takes one of the server's task reader slots, or reports them
-// all busy without waiting.
+// readerSlot takes one of the server's reader slots, or reports them all busy
+// without waiting. Release hands the slot back once the consumer the read
+// created has had time to be reaped (taskConsumerIdle), not at once.
 func (b *NATSBus) readerSlot() (release func(), err error) {
 	select {
 	case b.readers <- struct{}{}:
-		return func() { <-b.readers }, nil
+		var once sync.Once
+		return func() {
+			once.Do(func() { time.AfterFunc(b.reapDelay, func() { <-b.readers }) })
+		}, nil
 	default:
 		return nil, errReadersBusy
 	}

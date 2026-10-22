@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
@@ -1080,4 +1081,33 @@ func TestFromEnvConsoleDoor(t *testing.T) {
 			t.Errorf("Backend() = %q; the console door must not displace a real backend", cfg.Backend())
 		}
 	})
+}
+
+// A gateway whose only ingress is the console door attributes to the console,
+// never "": New's default must say what the backend is.
+func TestNewDefaultsAConsoleOnlyGatewayToTheConsole(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	cfg := &Config{
+		NATSURL:          url,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
+		ConsoleDoor:      true,
+	}
+	g, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.backend != consoleBackend {
+		t.Fatalf("a console-only gateway attributes to %q, want %q", g.backend, consoleBackend)
+	}
 }
