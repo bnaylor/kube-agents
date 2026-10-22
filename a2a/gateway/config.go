@@ -741,7 +741,7 @@ func FromEnv() (*Config, error) {
 			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN, A2A_CONSOLE_DOOR) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
