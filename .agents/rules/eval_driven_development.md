@@ -21,15 +21,18 @@ in one line under **Live validation** in the pull request body.
 
 Two kinds of agent-behaviour change are also exempt, because no case can test them:
 
-- a **deterministic guard** whose behaviour unit tests pin completely: code that holds, refuses or
-  rewrites an output by rule, without asking the model to behave differently;
-- a fix for a failure that **can't be reproduced deterministically**, so no case can be made red
-  on demand (a rare model-output leak, for example).
+- a **deterministic guard**: code that holds, drops or rewrites an output by a fixed rule, with
+  no model call in its path and no text that reaches the model (no re-prompt, no retry
+  instruction, no tool or skill text). Its unit tests cover every input class it acts on, plus
+  pass-through. The fixed text a guard emits is part of the guard;
+- a fix for a failure that **didn't turn red on demand**: a case written for it (or a replay of
+  the captured failing request) ran at least three times against `main` without failing.
 
-Wording meant to change what the model does (a prompt, an SOP, refusal or reply text) is not
-exempt and still needs a case. A change exempt under these two records, under **Live
-validation**, its unit tests, a live or replay check against an install, and why no case can be
-made red. That's more than the one line the exemptions above take.
+Neither exemption covers wording the model reads (a prompt, an SOP, a skill, or reply or
+refusal guidance in any of them); that still needs a case. A change exempt under these two
+records, under **Live validation**: its unit tests; a live or replay check against an install
+(for a replay, what was replayed and against which build); and, for the second, the case or
+replay it tried and those runs. That's more than the one line the exemptions above take.
 
 The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)),
 refreshed to the commit under test: build the images with `deploy/docker/cloudbuild-ci.yaml`
@@ -164,6 +167,8 @@ is this loop and nothing less:
   agent-behaviour exemptions take).
 
 ## What does not count
+
+Outside the two agent-behaviour exemptions in "When it applies":
 
 - A unit test with a mocked model. That is a test; it goes where
   [`AGENTS.md`](../../AGENTS.md) "Where Tests Go" says, and it does not replace the case.

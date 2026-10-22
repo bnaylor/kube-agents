@@ -42,7 +42,7 @@ Tests live in many places. **Decide by whether a model call is in the loop:**
 - **Yes, and you plant the defect it has to find** — it is an eval in
   `bench/tasks/<name>/task.yaml` and runs in CI. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract (`make bench-case-check`, `scripts/test_task_registration.py`). **A change to
-  agent behaviour starts from one:** red locally, implement, green three times, registered:
+  agent behaviour starts from one:** red, implement, three greens, registered, or exempt:
   [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey in
   `bench/cuj/` ([`bench/cuj/README.md`](bench/cuj/README.md)). Manual by design: it grades a live
