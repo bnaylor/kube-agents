@@ -601,6 +601,14 @@ def home_relative_paths(agent_home: Path) -> list[str]:
     return homes
 
 
+# Homes every --profile run pushes as well as the named ones: the machine home and the
+# platform profile, the two the sandbox's own entrypoint creates as roots
+# (SANDBOX_HOME_ROOTS) without their working directories. Two homes, so a scaffold stays
+# O(1), and a sandbox volume recreated under a running agent pod gets them back from the
+# reconcile's next re-scaffold, as it did when every scaffold pushed every home.
+FIXED_HOMES = ("", f"{PROFILES_DIR}/platform")
+
+
 def named_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[str], list[str]]:
     """The homes for ``--profile``: (profiles/<name> for each that exists, the rest).
 
@@ -1036,11 +1044,16 @@ def main(argv: list[str] | None = None) -> int:
         if not args.skeleton_only:
             log("--profile pushes one profile's layout and needs --skeleton-only; refusing")
             return EXIT_RETRY
-        homes, rejected = named_profile_homes(agent_home, args.profile)
+        named, rejected = named_profile_homes(agent_home, args.profile)
         if rejected:
-            log(f"no such profile under {agent_home / PROFILES_DIR}: {', '.join(rejected)}; skipped")
-        if not homes:
+            log(
+                f"not a profile directory under {agent_home / PROFILES_DIR} (one path "
+                f"component, no leading dot, already scaffolded): {', '.join(rejected)}; skipped"
+            )
+        if not named:
             return EXIT_RETRY
+        fixed = [h for h in FIXED_HOMES if h == "" or (agent_home / h).is_dir()]
+        homes = fixed + [h for h in named if h not in fixed]
     else:
         homes = home_relative_paths(agent_home)
 

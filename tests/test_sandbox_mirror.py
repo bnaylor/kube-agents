@@ -261,16 +261,19 @@ class OneProfile(unittest.TestCase):
         code = sm.main(["--agent-home", str(root), "--config", str(config), *extra])
         return code, pushed
 
-    def test_a_named_profile_pushes_that_home_alone(self):
+    def test_a_named_profile_pushes_that_home_and_the_fixed_homes_only(self):
+        # The machine home and platform ride along: the sandbox creates them as bare
+        # roots, so a volume recreated under a running agent pod gets their working
+        # directories back from the reconcile's next re-scaffold.
         code, pushed = self.drive("--skeleton-only", "--profile", "cluster-b")
         self.assertEqual(code, sm.EXIT_OK)
-        self.assertEqual(pushed["skeleton"], [["profiles/cluster-b"]])
-        self.assertEqual(pushed["identities"], [["profiles/cluster-b"]])
+        self.assertEqual(pushed["skeleton"], [["", "profiles/platform", "profiles/cluster-b"]])
+        self.assertEqual(pushed["identities"], [["", "profiles/platform", "profiles/cluster-b"]])
 
     def test_the_pushed_set_does_not_grow_with_the_profiles_on_the_volume(self):
         many = ("platform", *(f"cluster-{i:03d}" for i in range(50)))
         _, pushed = self.drive("--skeleton-only", "--profile", "cluster-049", profiles=many)
-        self.assertEqual(pushed["skeleton"], [["profiles/cluster-049"]])
+        self.assertEqual(pushed["skeleton"], [["", "profiles/platform", "profiles/cluster-049"]])
 
     def test_without_profile_every_home_is_still_pushed(self):
         _, pushed = self.drive("--skeleton-only")
@@ -296,7 +299,7 @@ class OneProfile(unittest.TestCase):
                 )
                 self.assertEqual(code, sm.EXIT_RETRY)
                 self.assertEqual(pushed, {"skeleton": [], "identities": []})
-                self.assertTrue(any("no such profile" in m for m in self.logged))
+                self.assertTrue(any("not a profile directory" in m for m in self.logged))
 
 
 class Candidates(unittest.TestCase):
