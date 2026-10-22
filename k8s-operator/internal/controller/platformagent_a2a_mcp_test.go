@@ -131,7 +131,7 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 		}
 		mounts[m.MountPath] = m.Name
 	}
-	for _, key := range []string{a2aMCPEnvTokenFile, a2aMCPEnvPasswordFile, a2aNATSCAFileEnv} {
+	for _, key := range []string{a2aMCPEnvAccessFile, a2aMCPEnvPasswordFile, a2aNATSCAFileEnv} {
 		if _, ok := mounts[path.Dir(env[key])]; !ok {
 			t.Errorf("%s = %q is not under any mount %v", key, env[key], mounts)
 		}
@@ -155,7 +155,7 @@ func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
 	if len(secrets) != 2 {
 		t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
 	}
-	for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPTokenName(agent): a2aMCPTokenKey} {
+	for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
 		src := secrets[name]
 		if src == nil {
 			t.Errorf("no volume from Secret %s", name)
@@ -198,7 +198,7 @@ func readMCPToken(t *testing.T, cl client.Client) (*corev1.Secret, error) {
 	t.Helper()
 	agent := a2aTestAgent()
 	s := &corev1.Secret{}
-	err := cl.Get(context.Background(), types.NamespacedName{Name: a2aMCPTokenName(agent), Namespace: agent.Namespace}, s)
+	err := cl.Get(context.Background(), types.NamespacedName{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}, s)
 	return s, err
 }
 
@@ -215,7 +215,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 			t.Fatal(err)
 		}
 		first, err := readMCPToken(t, cl)
-		if err != nil || len(first.Data[a2aMCPTokenKey]) == 0 {
+		if err != nil || len(first.Data[a2aMCPAccessKey]) == 0 {
 			t.Fatalf("no token minted: %v %v", err, first.Data)
 		}
 		if !metav1.IsControlledBy(first, agent) {
@@ -225,14 +225,14 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 			t.Fatal(err)
 		}
 		second, _ := readMCPToken(t, cl)
-		if string(second.Data[a2aMCPTokenKey]) != string(first.Data[a2aMCPTokenKey]) {
+		if string(second.Data[a2aMCPAccessKey]) != string(first.Data[a2aMCPAccessKey]) {
 			t.Error("the operator rotated a token that was there")
 		}
 	})
 
 	t.Run("an unowned Secret is refused", func(t *testing.T) {
-		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPTokenName(agent), Namespace: agent.Namespace},
-			Data: map[string][]byte{a2aMCPTokenKey: []byte("chosen-by-someone-else")}}
+		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
+			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
 		r, _ := mcpTestReconciler(t, squatter)
 		if err := r.ensureA2AMCPToken(ctx, agent); err == nil {
 			t.Error("adopted an unowned Secret as the MCP token")
@@ -274,7 +274,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 	if err := r.Create(ctx, np); err != nil {
 		t.Fatal(err)
 	}
-	if !present(&appsv1.Deployment{}, a2aMCPName(agent)) || !present(&corev1.Service{}, a2aMCPName(agent)) || !present(&corev1.Secret{}, a2aMCPTokenName(agent)) {
+	if !present(&appsv1.Deployment{}, a2aMCPName(agent)) || !present(&corev1.Service{}, a2aMCPName(agent)) || !present(&corev1.Secret{}, a2aMCPAccessName(agent)) {
 		t.Fatal("the MCP server's objects are not all there with the flag on")
 	}
 
@@ -292,7 +292,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 	if present(&networkingv1.NetworkPolicy{}, a2aMCPNetpolName(agent)) {
 		t.Error("the MCP fence survived the flag going off")
 	}
-	if present(&corev1.Secret{}, a2aMCPTokenName(agent)) {
+	if present(&corev1.Secret{}, a2aMCPAccessName(agent)) {
 		t.Error("the MCP token survived the flag going off")
 	}
 }

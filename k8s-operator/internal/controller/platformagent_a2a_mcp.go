@@ -54,7 +54,7 @@ const (
 	a2aMCPContainer    = "mcp"
 	a2aMCPNameSuffix   = "-a2a-mcp"
 	a2aMCPNetpolSuffix = "-a2a-mcp-netpol"
-	a2aMCPTokenSuffix  = "-a2a-mcp-token"
+	a2aMCPAccessSuffix = "-a2a-mcp-token"
 	// a2aMCPNetpolComponent labels the MCP pod's deny-all NetworkPolicy.
 	a2aMCPNetpolComponent = a2aMCPComponent + "-netpol"
 
@@ -67,16 +67,16 @@ const (
 
 	// The bearer token callers present, minted by the operator into its own
 	// Secret and mounted as a directory so a rotated token reaches the pod.
-	a2aMCPTokenKey      = "token"
-	a2aMCPTokenVolume   = "mcp-token"
-	a2aMCPTokenMountDir = "/var/run/secrets/a2a-mcp"
+	a2aMCPAccessKey      = "token"
+	a2aMCPAccessVolume   = "mcp-token"
+	a2aMCPAccessMountDir = "/var/run/secrets/a2a-mcp"
 	// The console password, one key of the creds Secret, mounted the way the
 	// console server mounts it.
 	a2aMCPBusKeyVolume   = "bus-key"
 	a2aMCPBusKeyMountDir = "/var/run/secrets/a2a-mcp-bus"
 
 	// The binary's environment (a2a/cmd/mcp).
-	a2aMCPEnvTokenFile    = "MCP_TOKEN_FILE"
+	a2aMCPEnvAccessFile   = "MCP_TOKEN_FILE"
 	a2aMCPEnvBusUser      = "MCP_BUS_USER"
 	a2aMCPEnvPasswordFile = "MCP_BUS_PASSWORD_FILE"
 	a2aMCPEnvAgent        = "MCP_AGENT_NAME"
@@ -111,8 +111,8 @@ func a2aMCPNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + a2aMCPNetpolSuffix
 }
 
-func a2aMCPTokenName(agent *agentv1alpha1.PlatformAgent) string {
-	return agent.Name + a2aMCPTokenSuffix
+func a2aMCPAccessName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + a2aMCPAccessSuffix
 }
 
 // a2aMCPNATSPeers is the MCP pod as a 4222 peer of the bus fence, under the
@@ -178,12 +178,12 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							}},
 						}},
 					}, {
-						Name: a2aMCPTokenVolume,
+						Name: a2aMCPAccessVolume,
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-							SecretName: a2aMCPTokenName(agent),
+							SecretName: a2aMCPAccessName(agent),
 							Items: []corev1.KeyToPath{{
-								Key:  a2aMCPTokenKey,
-								Path: a2aMCPTokenKey,
+								Key:  a2aMCPAccessKey,
+								Path: a2aMCPAccessKey,
 								Mode: ptr.To(a2aConsoleCredsFileMode),
 							}},
 						}},
@@ -199,7 +199,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							a2aNATSCAFileEnvVar(),
 							{Name: a2aMCPEnvBusUser, Value: a2aConsoleConfUser},
 							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsolePasswordKey)},
-							{Name: a2aMCPEnvTokenFile, Value: path.Join(a2aMCPTokenMountDir, a2aMCPTokenKey)},
+							{Name: a2aMCPEnvAccessFile, Value: path.Join(a2aMCPAccessMountDir, a2aMCPAccessKey)},
 							{Name: a2aMCPEnvListen, Value: fmt.Sprintf(":%d", a2aMCPPort)},
 							{Name: a2aMCPEnvAgent, Value: agent.Name},
 							{Name: a2aMCPEnvNamespace, Value: agent.Namespace},
@@ -207,7 +207,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Ports: []corev1.ContainerPort{{Name: a2aMCPPortName, ContainerPort: a2aMCPPort}},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: a2aMCPBusKeyVolume, MountPath: a2aMCPBusKeyMountDir, ReadOnly: true},
-							{Name: a2aMCPTokenVolume, MountPath: a2aMCPTokenMountDir, ReadOnly: true},
+							{Name: a2aMCPAccessVolume, MountPath: a2aMCPAccessMountDir, ReadOnly: true},
 							a2aNATSCABundleMount(),
 						},
 						// /healthz is unauthenticated and says nothing but
@@ -277,14 +277,14 @@ func buildA2AMCPNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.
 // editing the Secret, and the server reads it per request. An unowned Secret
 // of that name is refused, as the door token's is.
 func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	name := types.NamespacedName{Name: a2aMCPTokenName(agent), Namespace: agent.Namespace}
+	name := types.NamespacedName{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
 		if !metav1.IsControlledBy(existing, agent) {
 			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the MCP server's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
 		}
-		if len(existing.Data[a2aMCPTokenKey]) > 0 {
+		if len(existing.Data[a2aMCPAccessKey]) > 0 {
 			return nil
 		}
 		token, err := randomA2AInjectToken()
@@ -294,7 +294,7 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}
 		}
-		existing.Data[a2aMCPTokenKey] = []byte(token)
+		existing.Data[a2aMCPAccessKey] = []byte(token)
 		return r.Update(ctx, existing)
 	}
 	if !errors.IsNotFound(err) {
@@ -307,7 +307,7 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 	secret := &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{Name: name.Name, Namespace: name.Namespace, Labels: a2aLabels(agent, a2aMCPComponent)},
-		Data:       map[string][]byte{a2aMCPTokenKey: []byte(token)},
+		Data:       map[string][]byte{a2aMCPAccessKey: []byte(token)},
 	}
 	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
 		return err
@@ -387,6 +387,6 @@ func (r *PlatformAgentReconciler) a2aMCPObjects(agent *agentv1alpha1.PlatformAge
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: ns}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: ns}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: ns}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPTokenName(agent), Namespace: ns}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: ns}}, r.a2aReader()},
 	}
 }
