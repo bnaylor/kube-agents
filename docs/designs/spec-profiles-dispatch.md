@@ -171,13 +171,14 @@ its budget function; until it exists, a fixed conservative default behind a knob
    `subtask` kind. It extends today's `progress` artifact. Desktop clients and the chat
    adapters both render it.
 3. **Fan-out with a wait.** A profile can start several child tasks and wait on their
-   results. **Children are gateway-minted**, as attenuated children of the parent's grant:
-   tier and scope can only narrow, never widen, and the gateway stays the only publisher of
-   submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
+   results. **Each child gets a fresh root grant, minted by the gateway** for the child's
+   profile. It is not an attenuated copy of the parent's grant. The gateway enforces the
+   narrowing when it mints: the child's tier equals the parent's (and the child's profile must
+   allow it), and the child's scope must lie inside the parent's. The gateway stays the only
+   publisher of submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
    ancestor-chain rule in [Scale rules](#scale-rules) applies (only a `top` task nests its own
-   profile; no profile repeats otherwise). A child task's grant is a fresh root the gateway
-   mints for the child's profile; entries a broker adds to a grant chain never change the
-   profile. Width is bounded by the dispatcher's caps.
+   profile; no profile repeats otherwise). Entries a broker adds to a grant chain never change
+   the profile. Width is bounded by the dispatcher's caps.
 4. **Stop.** One stop cancels the conversation's whole task tree, enforced by the dispatcher,
    keeping the user-facing behaviour of #3263 and #3379.
 5. **No "run after" dependencies.** Kanban's `kanban_link` is dropped on purpose. Fan-out plus
@@ -347,6 +348,26 @@ The build PRs amend these; this list is what they must cover.
 - **`spec-chatops-gateway.md`:** delegation to any profile (not only `platform`), multiple
   children, the depth cap and the same-profile nesting limit; `chat.notify` keeps its
   proactive-post role.
+- **`docs/architecture/02-agent-personas.md`:** §2.3 ("no agent blocks waiting on another";
+  coordination only through durable state) is superseded for profile tasks: a parent may wait
+  on its children, and agents fan out to other agents through the gateway. §§4-5 and §10's
+  persona-per-scope model (a Cluster Admin agent per cluster, a Developer Team agent per
+  namespace) is superseded by one generic profile per role with the target as a parameter.
+- **`docs/architecture/06-api-and-data-contracts.md`:** §1's tier-discriminated `Agent` CR
+  (`platform | cluster-admin | developer-team`, one per cluster or namespace) and §2's
+  per-tier canonical KSA are superseded by AgentProfiles plus CR-defined tiers (Read and
+  Unattended to start), with an identity per (profile, tier).
+- **`docs/designs/agent-communication.md`:** guiding principle 1 ("no agent-to-agent
+  prompting… when delegating, through the kanban board") is superseded by gateway-minted
+  delegation to profiles. Its known gap about card bodies as untrusted input carries over:
+  a child's result is untrusted input to its parent.
+- **What leaves with kanban:** the daily **Kanban Board Health** chat report
+  (`agents/platform/cron/jobs.json`, `kanban_board_health.py`) goes when nothing files cards,
+  replaced by dispatcher health (queue depth, held tasks, expired leases). The CRD field
+  **`spec.harness.tuning.maxInProgress`** (kanban's in-progress limit, default 6) is replaced
+  by the install-wide profile ceiling: while both exist, the ceiling defaults to
+  `maxInProgress`'s value so an install's footprint doesn't jump, and `maxInProgress` is
+  deprecated once `platform` is off kanban.
 - **Callout narrowing** (`profile_narrowing.go`) and the CRD's identity rendering: one
   ServiceAccount and identity-map entry per (profile, tier); workers get no fetch grant on the
   shared durables and no verifier grant; the dispatcher gets both.
