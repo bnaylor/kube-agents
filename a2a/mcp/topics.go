@@ -374,22 +374,19 @@ func (b *NATSBus) ReadTopic(ctx context.Context, name string) (TopicRead, error)
 	return r, err
 }
 
-// AgentCards reads the agent cards on DIRECTORY, holding a reader slot for
-// the consumer the read opens.
+// AgentCards reads the agent cards on DIRECTORY. Like the status read's card
+// lookup it takes no reader slot: the tool's 5s answer cache is what bounds
+// the consumers it opens, as it is for status.
 func (b *NATSBus) AgentCards(ctx context.Context) (map[string]AgentCard, error) {
-	release, err := b.readerSlot()
-	if err != nil {
-		return nil, err
-	}
-	defer release()
 	return b.agentCards(ctx)
 }
 
 // drainConsumer reads what one plain pull consumer on s has pending when it
 // is created, and stops: no acks, in memory, reaped by the server once idle
 // (taskConsumerIdle), never an ordered consumer, whose reset deletes a
-// consumer the console grant cannot. It holds one reader slot while it reads
-// (the consumer itself lasts until the server reaps it), sizes each fetch to
+// consumer the console grant cannot. It takes one reader slot, held until the
+// consumer it creates is reaped, or handed back at once when the server
+// refused to create one (consumerMayExist), and it sizes each fetch to
 // what is left, bounds each fetch by ctx's deadline, and reads at most limit
 // messages, failing after them if more were pending.
 func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jetstream.ConsumerConfig, limit int, each func(jetstream.Msg)) (int, error) {
@@ -397,14 +394,15 @@ func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jet
 	if err != nil {
 		return 0, err
 	}
-	defer release()
 	cfg.AckPolicy = jetstream.AckNonePolicy
 	cfg.MemoryStorage = true
 	cfg.InactiveThreshold = taskConsumerIdle
 	cons, err := s.CreateConsumer(ctx, cfg)
 	if err != nil {
+		release(consumerMayExist(err))
 		return 0, err
 	}
+	defer release(true)
 	pending := cons.CachedInfo().NumPending
 	want := min(pending, uint64(limit))
 	var seen uint64

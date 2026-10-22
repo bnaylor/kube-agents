@@ -385,7 +385,7 @@ func TestTopicReadsTakeAndReleaseAReaderSlot(t *testing.T) {
 	publishTopic(t, js, subjBlueprint, "bp", nil)
 	publishCard(t, js, "platform", map[string]any{"name": "Platform agent"})
 
-	var held []func()
+	var held []func(bool)
 	for i := 0; i < maxTaskReaders; i++ {
 		release, err := b.readerSlot()
 		if err != nil {
@@ -396,14 +396,11 @@ func TestTopicReadsTakeAndReleaseAReaderSlot(t *testing.T) {
 	if _, err := b.ReadTopic(context.Background(), "blueprint"); !errors.Is(err, errReadersBusy) {
 		t.Errorf("read with every slot held: %v, want errReadersBusy", err)
 	}
-	if _, err := b.AgentCards(context.Background()); !errors.Is(err, errReadersBusy) {
-		t.Errorf("cards with every slot held: %v, want errReadersBusy", err)
-	}
 	if got := topicConsumers(t, js, lib.StreamTopicsState); got != 0 {
 		t.Errorf("a refused read opened %d consumers", got)
 	}
 	for _, release := range held {
-		release()
+		release(true)
 	}
 	if _, err := b.ReadTopic(context.Background(), "blueprint"); err != nil {
 		t.Fatal(err)
@@ -419,8 +416,11 @@ func TestTopicReadsTakeAndReleaseAReaderSlot(t *testing.T) {
 
 func TestAFailedTopicReadReleasesItsSlot(t *testing.T) {
 	// One consumer allowed, and an admin durable already holds it: the
-	// read's consumer create fails after its slot is taken.
+	// read's consumer create fails after its slot is taken. The server
+	// refused, so nothing was made and the slot comes back at once, even
+	// with a real reap delay: none of these reads should wait for one.
 	b, js := topicBus(t, 1)
+	b.reapDelay = time.Minute
 	publishTopic(t, js, subjBlueprint, "bp", nil)
 	if _, err := js.CreateOrUpdateConsumer(context.Background(), lib.StreamTopicsState, jetstream.ConsumerConfig{Durable: "holder"}); err != nil {
 		t.Fatal(err)
