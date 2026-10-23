@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -701,28 +702,51 @@ func (f *fakeTopicsBus) AgentCards(context.Context) (map[string]AgentCard, error
 	return map[string]AgentCard{}, errors.New("read 0 of the directory before the deadline")
 }
 
-// A list that reports problems is answered but not kept: the next caller reads
-// again rather than being handed a list with topics marked not read.
-func TestAnIncompleteListIsNotKept(t *testing.T) {
-	f := &fakeTopicsBus{problems: []string{"stream TOPICS-STATE: context canceled"}}
+// A list that reports problems is kept for the window like any other answer:
+// the read is not the caller's, so the problem is the bus's, and reading again
+// per call would only open more consumers on a bus already in trouble.
+func TestAProblemListIsKeptForTheWindow(t *testing.T) {
+	f := &fakeTopicsBus{problems: []string{"stream TOPICS-STATE: read 256 messages, more pending"}}
 	tool := readTopicsTool(f, time.Now)
+	for i := 0; i < 3; i++ {
+		text, err := tool.Call(context.Background(), []byte(`{"action":"list"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustContain(t, text, "more pending")
+	}
+	if f.lists != 1 {
+		t.Errorf("three calls inside the window read %d times, want 1", f.lists)
+	}
+}
+
+// An answer is stamped when its read ends, so a read slower than the window is
+// still served from the cache to the caller right behind it.
+func TestASlowReadIsServedForTheFullWindow(t *testing.T) {
+	clock := time.Now()
+	var mu sync.Mutex
+	now := func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	f := &slowTopicsBus{advance: func() { mu.Lock(); clock = clock.Add(statusCacheTTL + time.Second); mu.Unlock() }}
+	tool := readTopicsTool(f, now)
 	for i := 0; i < 2; i++ {
 		if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if f.lists != 2 {
-		t.Errorf("an incomplete list was read %d times by two calls, want 2", f.lists)
+	if f.lists != 1 {
+		t.Errorf("a slow read was read %d times by two back-to-back calls, want 1", f.lists)
 	}
-	f.problems = nil
-	for i := 0; i < 2; i++ {
-		if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if f.lists != 3 {
-		t.Errorf("a complete list was read %d more times by two calls, want 1", f.lists-2)
-	}
+}
+
+// slowTopicsBus is a list read that takes longer than the cache window.
+type slowTopicsBus struct {
+	fakeTopicsBus
+	advance func()
+}
+
+func (f *slowTopicsBus) ListTopics(ctx context.Context) (TopicList, error) {
+	f.advance()
+	return f.fakeTopicsBus.ListTopics(ctx)
 }
 
 // The read runs detached from its caller, under its own budget: a caller that
@@ -779,5 +803,51 @@ func TestAnEmptyJournalTopicInADeepStreamOpensOneConsumer(t *testing.T) {
 	if got := topicConsumers(t, js, lib.StreamTopicsJournal) - before; got != 1 {
 		t.Errorf("an empty topic's read opened %d consumers, want 1", got)
 	}
+	slotsFree(t, b)
+}
+
+// A deeply nested data part is shown raw and capped, never indented first:
+// indenting costs two spaces per level per line, so a small payload nested ten
+// thousand deep would grow to hundreds of megabytes before the cap.
+func TestADeeplyNestedDataPartIsCappedBeforeIndenting(t *testing.T) {
+	const depth = 10000
+	deep := json.RawMessage(strings.Repeat("[", depth) + strings.Repeat("]", depth))
+	r := TopicRead{Topic: lib.TopicEntry{Topic: "blueprint"}, Entries: []TopicUpdate{{Summary: "deep", Data: deep}}}
+	md := FormatTopicMarkdown(r)
+	if len(md) > 4*maxTopicEntryBytes {
+		t.Fatalf("a %d-byte nested part rendered as %d bytes, want it capped near %d", len(deep), len(md), maxTopicEntryBytes)
+	}
+	mustContain(t, md, "(shortened)")
+	mustNotContain(t, md, "[\n  [")
+}
+
+// A list that stops short on a wildcard-provisioned stream with more topics
+// than one list reads shows the topics it did not reach as not read, with the
+// stream named under Problems, rather than as never written.
+func TestAListCutShortShowsTopicsAsNotRead(t *testing.T) {
+	b, js := topicBus(t, topicStreamMaxConsumers)
+	if _, err := js.UpdateStream(context.Background(), jetstream.StreamConfig{
+		Name: lib.StreamTopicsState, Subjects: []string{subjUpgrade, subjBlueprint, subjProbe, lib.TopicAgentSubject("load", "*")},
+		MaxMsgsPerSubject: topicStateMaxMsgsPerSubject, MaxConsumers: topicStreamMaxConsumers, AllowDirect: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= maxTopicsListed; i++ {
+		publishTopic(t, js, lib.TopicAgentSubject("load", fmt.Sprintf("t%03d", i)), "s", nil)
+	}
+	l, err := b.ListTopics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	notRead := 0
+	for _, tp := range l.Topics {
+		if tp.NotRead {
+			notRead++
+		}
+	}
+	if notRead == 0 || len(l.Problems) == 0 {
+		t.Fatalf("not read = %d, problems = %v: want the unreached topics marked and the stream named", notRead, l.Problems)
+	}
+	mustContain(t, FormatTopicsMarkdown(l), "_not read; see Problems_", "stream "+lib.StreamTopicsState)
 	slotsFree(t, b)
 }

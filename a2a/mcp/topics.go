@@ -129,13 +129,14 @@ type readTopicsArgs struct {
 // topicCache answers a repeated call from the last read for statusCacheTTL,
 // as the status does, and runs one read at a time. Each read opens consumers
 // the console cannot delete, which the server reaps only after
-// taskConsumerIdle; the reader slots bound reads in flight, not consumers
-// held, so without this a caller polling fast fills the topic streams'
-// consumer caps, which the web console shares. With it, a window costs at
+// taskConsumerIdle. The shared reader slots are held until that reap, but
+// AgentCards takes none, and the slots are shared with task reads, so this is
+// what keeps a caller polling fast from filling the topic streams' and
+// DIRECTORY's consumer caps, which the web console shares. With it, a window costs at
 // most two consumers per distinct answer: the list, the cards, and each
-// spelling of each provisioned topic. Only a complete answer is kept: a read
-// that failed, or one that reports problems (a stream not read, a card read
-// cut short), is answered but read again by the next caller.
+// spelling of each provisioned topic. A failed read is not kept; an answer
+// that reports problems is, since the read is not the caller's (below), so a
+// problem is the bus's and the next caller would only meet it again.
 //
 // The read runs detached from its caller, under its own topicReadTimeout
 // starting once the lock is held, as the status read does: a caller that
@@ -152,7 +153,7 @@ type topicAnswer struct {
 	text string
 }
 
-func (c *topicCache) answer(ctx context.Context, key string, read func(context.Context) (string, bool, error)) (string, error) {
+func (c *topicCache) answer(ctx context.Context, key string, read func(context.Context) (string, error)) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
@@ -166,13 +167,13 @@ func (c *topicCache) answer(ctx context.Context, key string, read func(context.C
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), topicReadTimeout)
 	defer cancel()
-	text, complete, err := read(rctx)
+	text, err := read(rctx)
 	if err != nil {
 		return "", err
 	}
-	if complete {
-		c.entries[key] = topicAnswer{at: now, text: text}
-	}
+	// Stamped when the read ends, so a slow read is still served for the
+	// full window.
+	c.entries[key] = topicAnswer{at: c.now(), text: text}
 	return text, nil
 }
 
@@ -183,12 +184,12 @@ func ReadTopicsTool(bus TopicsBus) Tool { return readTopicsTool(bus, time.Now) }
 
 func readTopicsTool(bus TopicsBus, now func() time.Time) Tool {
 	cache := &topicCache{now: now, entries: map[string]topicAnswer{}}
-	list := func(ctx context.Context) (string, bool, error) {
+	list := func(ctx context.Context) (string, error) {
 		l, err := bus.ListTopics(ctx)
 		if err != nil {
-			return "", false, err
+			return "", err
 		}
-		return FormatTopicsMarkdown(l), len(l.Problems) == 0, nil
+		return FormatTopicsMarkdown(l), nil
 	}
 	return Tool{
 		Definition: ToolDefinition{
@@ -236,20 +237,20 @@ func readTopicsTool(bus TopicsBus, now func() time.Time) Tool {
 				if !validTopicName(topic) {
 					return "", errTopicName
 				}
-				return cache.answer(ctx, topicActionRead+topicSep+topic, func(ctx context.Context) (string, bool, error) {
+				return cache.answer(ctx, topicActionRead+topicSep+topic, func(ctx context.Context) (string, error) {
 					r, err := bus.ReadTopic(ctx, topic)
 					if err != nil {
-						return "", false, err
+						return "", err
 					}
-					return FormatTopicMarkdown(r), true, nil
+					return FormatTopicMarkdown(r), nil
 				})
 			case topicActionCards:
-				return cache.answer(ctx, topicActionCards, func(ctx context.Context) (string, bool, error) {
+				return cache.answer(ctx, topicActionCards, func(ctx context.Context) (string, error) {
 					cards, err := bus.AgentCards(ctx)
 					if err != nil && cards == nil {
-						return "", false, err
+						return "", err
 					}
-					return formatCardsMarkdown(cards, err), err == nil, nil
+					return formatCardsMarkdown(cards, err), nil
 				})
 			default:
 				return "", fmt.Errorf("unknown read_topics action %q; use %s, %s or %s", action, topicActionList, topicActionRead, topicActionCards)
@@ -529,7 +530,7 @@ func writeTopicUpdate(sb *strings.Builder, u TopicUpdate) {
 	if len(u.Data) > 0 {
 		var pretty bytes.Buffer
 		data := string(u.Data)
-		if json.Indent(&pretty, u.Data, "", "  ") == nil {
+		if len(u.Data) <= maxTopicEntryBytes && json.Indent(&pretty, u.Data, "", "  ") == nil {
 			data = pretty.String()
 		}
 		sb.WriteString("Data:\n\n")
