@@ -23,6 +23,14 @@ import sys
 import urllib.request
 from pathlib import Path
 
+CHAT_PATH = "/v1/chat/completions"
+# The in-cluster gateway takes any bearer; the header only satisfies the client.
+AUTH_HEADER = "Bearer none"
+TIMEOUT_S = 300
+DEFAULT_GATEWAY = "http://127.0.0.1:8080"  # a port-forward of svc/inference-gateway
+DEFAULT_MODEL = "model-default"
+DEFAULT_RUNS = 3
+
 PATCHES = Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches"
 sys.path.insert(0, str(PATCHES))
 import unstructured_reasoning  # noqa: E402  (the rule the image patch installs)
@@ -39,11 +47,11 @@ def request_body(fixture: dict, arm: str, model: str) -> dict:
 
 def call(gateway: str, body: dict) -> dict:
     req = urllib.request.Request(
-        gateway.rstrip("/") + "/v1/chat/completions",
+        gateway.rstrip("/") + CHAT_PATH,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer none"},
+        headers={"Content-Type": "application/json", "Authorization": AUTH_HEADER},
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
         return json.load(resp)
 
 
@@ -51,9 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("fixture", type=Path)
     parser.add_argument("--arm", choices=("main", "patched"), required=True)
-    parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--gateway", default="http://127.0.0.1:8080")
-    parser.add_argument("--model", default="model-default")
+    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
+    parser.add_argument("--gateway", default=DEFAULT_GATEWAY)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     args = parser.parse_args(argv)
 
     body = request_body(json.loads(args.fixture.read_text()), args.arm, args.model)

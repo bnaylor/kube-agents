@@ -444,9 +444,11 @@ cancel raced the end of the turn too: a withheld answer ends `failed`, not `comp
 `apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
 model on later calls. Output that never passes the bridge is not guarded: a kanban card's result
 posted by the notifier, a `today`-mode reply from Hermes's own gateway platforms, and cron
-deliveries on every leg. A fleet-audit job's chat report is already immune, because the relay
-posts the record the run's `finish` wrote, not its final message
-(`docs/designs/cron-report-relay.md`). For the rest the history patch only lowers the rate. A
+deliveries on every leg, `report_to_chat` included. The scheduled `deliver: "chat"` report of a
+fleet-audit job the image ships is already immune, because the relay posts the record the run's
+`finish` wrote, not its final message; a fleet-audit job created at runtime still posts its final
+message (`docs/designs/cron-report-relay.md`). For the rest the history patch only lowers the
+rate. A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it

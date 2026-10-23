@@ -8,8 +8,16 @@ prompt, then a clean tool call and its result, then a reply whose content opens
 with `thought` (Gemini's reasoning written as content) and its tool result. The
 leaked reply is the latest assistant turn before a tool result, which is the
 shape that makes Gemini imitate it (see README.md). Nothing in it comes from a
-cluster. Hermes source is parsed with ast (and one pure-data module executed),
-never imported.
+cluster. Hermes source is parsed with ast: constants are literal-evaluated, and
+f-string or concatenation expressions over them are evaluated with no builtins.
+Nothing from it is imported.
+
+The system prompt approximates the agent's, it does not reproduce it. The
+skills index takes each description from a one-line frontmatter read, so a
+description written as a YAML block scalar renders as `>-` or not at all, and
+the memory block, MCP tools and kanban tools are left out. The recorded red and
+green were made on this prompt. The planted reply drives the result: swapping
+the system prompt, the user turn or the tool results for other text kept it red.
 """
 import ast
 import json
@@ -66,6 +74,7 @@ def hermes_constants(rel, names):
 
 
 def frontmatter(text):
+    # One-line `key: value` reads only; see the module docstring for what that drops.
     m = re.match(r"---\n(.*?)\n---\n", text, re.S)
     out = {}
     if m:
