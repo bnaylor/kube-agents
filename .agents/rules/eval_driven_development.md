@@ -7,7 +7,8 @@ description: "Eval-driven development workflow: running the red-to-green devops-
 # Eval-driven development
 
 [`AGENTS.md`](../../AGENTS.md) owns the rule: a change to what an agent does starts from a
-failing eval case and ends with that case passing and registered. This file holds the mechanics.
+failing eval case and ends with that case passing and registered, unless an exemption below
+applies. This file holds the mechanics.
 Change the rule in `AGENTS.md`; change how it is done here.
 
 ## When it applies
@@ -51,10 +52,10 @@ against GitHub also need the runner's read token
 ([`bench/CUSTOM-TASKS.md`](../../bench/CUSTOM-TASKS.md#grading-a-fleet-audit)). Without any of
 them the run cannot clone, mint or read, which is broken, not red. A stock install sandboxes the
 agent, which the harness's `kubectl port-forward` cannot reach;
-[`bench/README.md`](../../bench/README.md#sandboxed-installs) has the ways round that. There is no
-path around the loop: a pull request that changes agent
-behaviour without eval evidence is not ready for review; being one change in a stack is not an
-exception, and "What does not count" says why.
+[`bench/README.md`](../../bench/README.md#sandboxed-installs) has the ways round that. Outside the
+two agent-behaviour exemptions above there is no path around the loop: a pull request that changes
+agent behaviour without eval evidence or an exemption record is not ready for review; being one
+change in a stack is not an exception, and "What does not count" says why.
 
 ## The loop
 
@@ -157,7 +158,7 @@ you are about to close.
 ## What the pull request records
 
 Under **Testing → Live validation** in the template, which for a change to agent behaviour
-is this loop and nothing less:
+is this loop and nothing less, unless one of the two agent-behaviour exemptions applies:
 
 - the case id, and whether it is new or existing;
 - red: the install and the `main` commit it ran against, the failing check and its reason, one
