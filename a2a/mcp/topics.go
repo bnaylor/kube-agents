@@ -537,7 +537,7 @@ func writeFenced(sb *strings.Builder, info, s string) {
 		}
 		return r
 	}, s)
-	s = capBytes(s, maxTopicEntryBytes)
+	s = capEntryBytes(s, maxTopicEntryBytes)
 	run, longest := 0, 0
 	for _, r := range s {
 		if r == '`' {
@@ -551,8 +551,8 @@ func writeFenced(sb *strings.Builder, info, s string) {
 	fmt.Fprintf(sb, "%s%s\n%s\n%s\n\n", fence, info, s, fence)
 }
 
-// capBytes shortens s to at most n bytes on a rune boundary, saying so.
-func capBytes(s string, n int) string {
+// capEntryBytes shortens s to at most n bytes on a rune boundary, saying so.
+func capEntryBytes(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
