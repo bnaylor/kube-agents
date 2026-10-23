@@ -140,6 +140,11 @@ func (b *NATSBus) WaitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 		return nil, err
 	}
 	defer w.close()
+	// A task with no events is not found now, as ReadTask says: waiting on
+	// it would hold a reader for the whole wait to say the same.
+	if w.pending == 0 {
+		return nil, ErrTaskNotFound
+	}
 	for {
 		t, ferr := w.fold()
 		if ferr == nil && t.Final {

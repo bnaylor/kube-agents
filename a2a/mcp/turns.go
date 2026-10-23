@@ -109,6 +109,9 @@ type Conversations struct {
 	mu      sync.Mutex
 	byAlias map[string]*aliasEntry
 	sending map[string]*sendLock
+	// running is each conversation's turn task last seen unfinished, which
+	// its next turn waits on; at most maxConversations are kept.
+	running map[string]TaskRef
 	clock   uint64
 }
 
@@ -122,9 +125,16 @@ type sendLock struct {
 	refs int
 }
 
+// ErrConversationBusy is a send that gave up waiting for the conversation's
+// running turn to end: busy, not broken. A turn sent while another runs would
+// be steered into the running task, which may refuse it and still answer
+// with the earlier turn's answer, so turns on one conversation are sent one
+// at a time.
+var ErrConversationBusy = errors.New("conversation busy: a turn is still running")
+
 // NewConversations returns an empty alias table.
 func NewConversations() *Conversations {
-	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}}
+	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}, running: map[string]TaskRef{}}
 }
 
 // Resolve returns the console token for a call: token when the caller names
@@ -205,8 +215,51 @@ func (c *Conversations) lock(ctx context.Context, token string) (func(), error) 
 		}, nil
 	case <-ctx.Done():
 		c.release(token, l)
-		return nil, fmt.Errorf("another turn is being sent on this conversation: %w", ctx.Err())
+		return nil, c.busy(token, ctx.Err())
 	}
+}
+
+// busy is the error for a send that gave up waiting on the conversation's
+// running turn, naming its task when it is known.
+func (c *Conversations) busy(token string, cause error) error {
+	if ref, ok := c.runningTask(token); ok {
+		return fmt.Errorf("%w (task %s); send again once it ends, or stop it with task_control: %v", ErrConversationBusy, ref, cause)
+	}
+	return fmt.Errorf("%w; send again once it ends, or stop it with task_control: %v", ErrConversationBusy, cause)
+}
+
+// setRunning records ref as the conversation's unfinished turn task, or,
+// with ref nil, that its turns are done.
+func (c *Conversations) setRunning(token string, ref *TaskRef) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ref == nil {
+		delete(c.running, token)
+		return
+	}
+	if _, ok := c.running[token]; !ok && len(c.running) >= maxConversations {
+		for t := range c.running {
+			delete(c.running, t)
+			break
+		}
+	}
+	c.running[token] = *ref
+}
+
+// clearRunning forgets the conversation's unfinished task if it is still ref.
+func (c *Conversations) clearRunning(token string, ref TaskRef) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running[token] == ref {
+		delete(c.running, token)
+	}
+}
+
+func (c *Conversations) runningTask(token string) (TaskRef, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ref, ok := c.running[token]
+	return ref, ok
 }
 
 // release drops one holder or waiter, and the lock with the last of them.
@@ -263,6 +316,12 @@ type turnWatch struct {
 	subs         chan *nats.Msg
 	notices      chan *nats.Msg
 	unsubscribe  func()
+	// release hands back the conversation's send lock. A turn holds it from
+	// before it is sent until the watch closes, after its answer is read, so
+	// a second turn on the conversation is sent only once this one is done:
+	// sent while this one ran, the gateway would steer it into this turn's
+	// task, and its answer would be this turn's (or, refused, nothing).
+	release func()
 
 	// mu guards followed and known, which the follower goroutine fills
 	// from the conversation's submissions once the turn's task is known.
@@ -319,8 +378,10 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 // gateway's answer to it: the task carrying the turn (a new one, or a running
 // one the text was sent into), or, when the gateway answers with notices
 // alone (a status question, a refusal), those. The returned watch keeps
-// following the turn's delegations until it is closed.
-func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, text string) (TurnResult, *turnWatch, error) {
+// following the turn's delegations until it is closed. A turn still running
+// on the conversation, in another call or left by an earlier one, is waited
+// on for up to wait first; past it the send fails with ErrConversationBusy.
+func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, text string, wait time.Duration) (TurnResult, *turnWatch, error) {
 	res := TurnResult{Token: token}
 	if strings.TrimSpace(text) == "" {
 		return res, nil, errors.New("empty message")
@@ -333,19 +394,29 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		res, err := b.sendSettled(ctx, convs, token, text)
 		return res, nil, err
 	}
-	unlock, err := convs.lock(ctx, token)
+	queued, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	unlock, err := convs.lock(queued, token)
 	if err != nil {
 		return res, nil, err
 	}
-	defer unlock()
 	// A caller that gave up while waiting for the lock must not send.
 	if err := ctx.Err(); err != nil {
+		unlock()
+		return res, nil, err
+	}
+	if err := b.awaitRunningTurn(queued, convs, token); err != nil {
+		unlock()
 		return res, nil, err
 	}
 	w, err := b.openTurn(token, texts, true)
 	if err != nil {
+		unlock()
 		return res, nil, err
 	}
+	// From here the watch holds the lock, and closing it releases it.
+	var once sync.Once
+	w.release = func() { once.Do(unlock) }
 	if err := b.publishFrame(token, text); err != nil {
 		w.close()
 		return res, nil, err
@@ -359,6 +430,7 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		case m := <-w.subs:
 			if ref, ok := w.ownSubmission(m); ok {
 				res.Task = &ref
+				convs.setRunning(token, &ref)
 				go w.follow()
 				return res, w, nil
 			}
@@ -385,9 +457,42 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	}
 }
 
+// awaitRunningTurn waits, within ctx, for the conversation's unfinished turn
+// task, if it has one, to finish.
+func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, token string) error {
+	ref, ok := convs.runningTask(token)
+	if !ok {
+		return nil
+	}
+	t, err := b.WaitForTask(ctx, ref, time.Until(deadlineOf(ctx)))
+	switch {
+	case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
+		convs.clearRunning(token, ref)
+		return nil
+	case ctx.Err() != nil:
+		return convs.busy(token, ctx.Err())
+	case errors.Is(err, context.DeadlineExceeded):
+		// The read's own deadline, ctx's, passed a moment before ctx's did.
+		return convs.busy(token, err)
+	case err != nil:
+		return fmt.Errorf("reading the conversation's running task %s: %w", ref, err)
+	}
+	return convs.busy(token, context.DeadlineExceeded)
+}
+
 // SendStop sends the console door's stop word.
 func (b *NATSBus) SendStop(ctx context.Context, convs *Conversations, token string) (TurnResult, error) {
 	return b.sendSettled(ctx, convs, token, stopText)
+}
+
+// isStopText reports whether text is the console door's stop word, alone or
+// as a /session stop.
+func isStopText(text string) bool {
+	t := strings.TrimSpace(text)
+	if rest, ok := chattext.IsSessionCommand(t); ok {
+		t = strings.TrimSpace(rest)
+	}
+	return chattext.IsStop(t)
 }
 
 // sendSettled sends a turn the gateway answers with a notice and no task (a
@@ -395,11 +500,15 @@ func (b *NATSBus) SendStop(ctx context.Context, convs *Conversations, token stri
 // notice, or nothing if none arrives within noticeGrace.
 func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, text string) (TurnResult, error) {
 	res := TurnResult{Token: token}
-	unlock, err := convs.lock(ctx, token)
-	if err != nil {
-		return res, err
+	// A stop does not wait for the conversation's turn to end: stopping
+	// that turn is what it is for.
+	if !isStopText(text) {
+		unlock, err := convs.lock(ctx, token)
+		if err != nil {
+			return res, err
+		}
+		defer unlock()
 	}
-	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}
@@ -438,10 +547,11 @@ func (b *NATSBus) publishFrame(token, text string) error {
 
 // noticeText is a frame's text when it is a gateway notice about a turn, and
 // "" otherwise: an earlier task's result posted to the conversation must not
-// read as an answer to the turn being sent.
+// read as an answer to the turn being sent, nor an edit of the gateway's
+// rolling status line, since every notice answering a turn is a fresh post.
 func noticeText(m *nats.Msg) string {
 	var f ConsoleOutFrame
-	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" {
+	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" || f.Edit {
 		return ""
 	}
 	return strings.TrimSpace(f.Text)
@@ -453,6 +563,9 @@ func (w *turnWatch) close() {
 	}
 	if w.unsubscribe != nil {
 		w.unsubscribe()
+	}
+	if w.release != nil {
+		w.release()
 	}
 	select {
 	case <-w.stop:
@@ -537,6 +650,20 @@ type TurnOutcome struct {
 	// task that wakes the delegator), else the root.
 	AnswerFrom *TaskRef
 	Answer     *lib.Task
+}
+
+// Unfinished is a task of the turn last read as not yet final, the one the
+// conversation's next turn waits on, or nil when the turn is done.
+func (o TurnOutcome) Unfinished() *TaskRef {
+	if o.Task != nil && !o.Task.Final {
+		return &o.Root
+	}
+	for i := len(o.Followed) - 1; i >= 0; i-- {
+		if f := o.Followed[i]; f.Task == nil || !f.Task.Final {
+			return &f.Ref
+		}
+	}
+	return nil
 }
 
 // FollowedTask is one delegated task as last read.
