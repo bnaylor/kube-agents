@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -556,7 +557,7 @@ func capBytes(s string, n int) string {
 		return s
 	}
 	cut := n
-	for cut > 0 && !utf8RuneStart(s[cut]) {
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
 	return s[:cut] + "\n" + ellipsis + "(shortened)"
