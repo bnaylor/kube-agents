@@ -50,10 +50,11 @@ READER = "_extract_reasoning"
 # to it by name or attribute reads the same channel.
 READER_HELPER = "extract_reasoning"
 READER_NAMES = frozenset({READER, READER_HELPER})
-# file -> enclosing function of each caller allowed to remain.
+# (file, enclosing function) -> how many direct calls it may hold. A count, not a set, so a
+# second call added inside an allowed function fails too.
 ALLOWED_READERS = {
-    ("agent/chat_completion_helpers.py", "_assistant_reasoning_text"),
-    (TERMINAL_FILE, TERMINAL_FUNCTION),
+    ("agent/chat_completion_helpers.py", "_assistant_reasoning_text"): 1,
+    (TERMINAL_FILE, TERMINAL_FUNCTION): 1,
 }
 SCANNED_ROOT_FILES = ("run_agent.py",)
 SCANNED_DIR = "agent"
@@ -118,20 +119,27 @@ def check_readers() -> None:
     files = list(SCANNED_ROOT_FILES) + sorted(
         str(p.relative_to(HERMES)) for p in (HERMES / SCANNED_DIR).rglob("*.py")
     )
-    seen: set[tuple[str, str]] = set()
+    seen: dict[tuple[str, str], list[int]] = {}
     for relative in files:
         tree = _parse(relative)
         if tree is None:
             continue
         for enclosing, line in _reader_calls(tree):
-            seen.add((relative, enclosing))
+            seen.setdefault((relative, enclosing), []).append(line)
             if (relative, enclosing) not in ALLOWED_READERS:
                 fail(
                     f"{relative}:{line} ({enclosing}) calls {READER}; read it, and if it can make the "
                     f"reasoning a reply, extend apply_reasoning_not_reply.py, else add it to ALLOWED_READERS"
                 )
-    for relative, enclosing in sorted(ALLOWED_READERS - seen):
-        fail(f"no {READER} call left in {relative} ({enclosing}); upstream moved it, re-derive ALLOWED_READERS")
+    for (relative, enclosing), expected in sorted(ALLOWED_READERS.items()):
+        lines = seen.get((relative, enclosing), [])
+        if not lines:
+            fail(f"no {READER} call left in {relative} ({enclosing}); upstream moved it, re-derive ALLOWED_READERS")
+        elif len(lines) != expected:
+            fail(
+                f"{relative} ({enclosing}) calls {READER} {len(lines)} times (lines {lines}), {expected} expected; "
+                f"read the new call, and if it can make the reasoning a reply, extend apply_reasoning_not_reply.py"
+            )
 
 
 def main() -> int:

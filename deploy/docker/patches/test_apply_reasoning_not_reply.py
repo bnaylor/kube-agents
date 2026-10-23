@@ -255,6 +255,15 @@ class VerifierTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(any("agent/new_fallback.py:3 (surface)" in f for f in failures), failures)
 
+    def test_a_second_call_inside_an_allowed_function_fails(self):
+        root = stage(empty=EMPTY_RESPONSE_STUB.replace(
+            '        return "(empty)"\n',
+            '        return "(empty)"\n    extra = agent._extract_reasoning(assistant_message)\n'))
+        apply(root)
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("_terminal_empty) calls _extract_reasoning 2 times" in f for f in failures), failures)
+
     def test_an_allowed_reader_that_moved_fails(self):
         root = stage(helpers="def _assistant_reasoning_text(agent, assistant_message):\n    return None\n")
         apply(root)
