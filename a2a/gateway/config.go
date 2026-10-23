@@ -240,9 +240,10 @@ type Config struct {
 	// on its own: a gateway with no chat backend and no other door starts
 	// for it rather than refusing. The console adapter runs whenever the
 	// gateway runs; this only lets it be the gateway's whole ingress. The
-	// operator sets it where a console client needs the gateway, the MCP
-	// server among them. Like the doors it is not a backend in the
-	// one-real-backend sense: it consumes nothing and competes for nothing.
+	// operator sets it on every next gateway, so an install with no chat
+	// backend still runs one for the console page and the MCP server. Like
+	// the doors it is not a backend in the one-real-backend sense: it
+	// consumes nothing and competes for nothing.
 	ConsoleDoor bool
 
 	// A2ADoorToken is the bearer token the door requires on every RPC
@@ -567,8 +568,8 @@ type Config struct {
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when a side door (inject, A2A, or both) is the only way
-// in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) or the console
+// door alone is the only way in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //

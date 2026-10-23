@@ -289,7 +289,8 @@ client is handed so it can set its inbox prefix - is `platformagent_a2a_identiti
 before the callout those three lived in a config string, a Secret and a container env
 block with nothing but review connecting them. The one static block not in that file is
 the callout's own, rendered in the AUTH account template in
-`platformagent_a2a_manifests.go`.
+`platformagent_a2a_manifests.go` from `a2aCalloutConfIdentity` in
+`platformagent_a2a_confusers.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
@@ -599,7 +600,8 @@ Layout:
   with its own bearer token (`<agent>-a2a-mcp-token`, minted by the operator), never with a
   bus credential, and reach it only through `kubectl port-forward`: the Service is ClusterIP
   and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
-  access gate is the Secret's RBAC plus `pods/portforward`, as with the console.
+  access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
+  not have: its pod hands the password to whoever forwards to it.
 
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in

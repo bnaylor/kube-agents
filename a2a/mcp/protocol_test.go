@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -83,7 +84,6 @@ func TestToolsCall(t *testing.T) {
 		wantError             bool
 	}{
 		{"runs the tool", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"x":1}}}`, `echo:{"x":1}`, false},
-		{"an unknown tool is a tool error, not an RPC error", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope"}}`, `unknown tool "nope"`, true},
 		{"a failing tool keeps its partial text and names itself", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fails"}}`, "partial\n\n**Error in `fails`**: boom", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,6 +174,16 @@ func TestJSONRPCFramesAreValidated(t *testing.T) {
 		{"an object id", `{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}`, rpcErrInvalidRequest},
 		{"a boolean id", `{"jsonrpc":"2.0","id":true,"method":"ping"}`, rpcErrInvalidRequest},
 		{"an empty batch", `[]`, rpcErrInvalidRequest},
+		// Valid JSON that is not a request object is an invalid request,
+		// not a parse error.
+		{"a bare string", `"x"`, rpcErrInvalidRequest},
+		{"a number", `7`, rpcErrInvalidRequest},
+		// An id and no method is no method, not an unknown one.
+		{"an id and no method", `{"jsonrpc":"2.0","id":1}`, rpcErrInvalidRequest},
+		// A null id is refused out loud, not taken for a notification.
+		{"a null id", `{"jsonrpc":"2.0","id":null,"method":"ping"}`, rpcErrInvalidRequest},
+		// An unknown tool is a protocol error the host sees, per the MCP spec.
+		{"an unknown tool", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope"}}`, rpcErrInvalidParams},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := rpc(t, s, tc.frame)
@@ -191,6 +201,24 @@ func TestJSONRPCFramesAreValidated(t *testing.T) {
 }
 
 // A client's response to a request this server never sends needs no answer.
+// Batch members that are valid JSON but not objects are each an invalid
+// request, as JSON-RPC 2.0's own example has it.
+func TestABatchOfNonObjectsIsInvalidRequests(t *testing.T) {
+	s := mustServer(t)
+	var out []map[string]any
+	if err := json.Unmarshal(s.HandleJSONRPC(context.Background(), []byte(`[1,2,3]`)), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("answers = %v, want three", out)
+	}
+	for _, a := range out {
+		if e, _ := a["error"].(map[string]any); e == nil || e["code"] != float64(rpcErrInvalidRequest) {
+			t.Errorf("answer = %v, want an invalid request", a)
+		}
+	}
+}
+
 func TestAClientResponseGetsNoAnswer(t *testing.T) {
 	s := mustServer(t)
 	if raw := s.HandleJSONRPC(context.Background(), []byte(`{"jsonrpc":"2.0","id":3,"result":{}}`)); raw != nil {
@@ -214,5 +242,36 @@ func TestABatchIsAnsweredMemberByMember(t *testing.T) {
 	}
 	if raw := s.HandleJSONRPC(context.Background(), []byte(`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`)); raw != nil {
 		t.Errorf("a batch of notifications answered %s, want nothing", raw)
+	}
+}
+
+// A batch is bounded: at the cap it is answered member by member; past it, a
+// whole body of tiny malformed members (the shape that would be answered
+// tens of times over its size) gets one small error, without holding a copy
+// of every member first.
+func TestABatchIsBounded(t *testing.T) {
+	s := mustServer(t)
+	batch := func(n int) string {
+		return "[" + strings.TrimSuffix(strings.Repeat(`{"jsonrpc":"2.0","id":1,"method":"ping"},`, n), ",") + "]"
+	}
+	var answers []map[string]any
+	if err := json.Unmarshal(s.HandleJSONRPC(context.Background(), []byte(batch(maxBatchFrames))), &answers); err != nil || len(answers) != maxBatchFrames {
+		t.Fatalf("a batch at the cap: %d answers, err %v", len(answers), err)
+	}
+	if out := rpc(t, s, batch(maxBatchFrames+1)); out["error"] == nil || out["error"].(map[string]any)["code"] != float64(rpcErrInvalidRequest) {
+		t.Errorf("a batch past the cap = %v, want one invalid-request error", out)
+	}
+
+	huge := "[" + strings.TrimSuffix(strings.Repeat("7,", (maxBodyBytes-2)/2), ",") + "]"
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	raw := s.HandleJSONRPC(context.Background(), []byte(huge))
+	runtime.ReadMemStats(&after)
+	if len(raw) > 256 {
+		t.Errorf("a 4 MiB batch of bare numbers was answered with %d bytes, want one error", len(raw))
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+		t.Errorf("answering it allocated %d MiB; it must stop at the cap, not hold every member", grew>>20)
 	}
 }

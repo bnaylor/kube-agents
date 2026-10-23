@@ -46,9 +46,11 @@ const (
 
 	msgInvalidFrame   = "invalid JSON-RPC frame"
 	msgMissingMethod  = "missing method"
+	msgNullID         = "a request id may not be null"
 	msgNotJSONRPC2    = "not a JSON-RPC 2.0 request"
 	msgBadID          = "an id must be a string, a number or null"
 	msgEmptyBatch     = "empty batch"
+	msgBatchTooLong   = "a batch may hold at most %d requests"
 	msgNeedsToolName  = "tools/call requires a tool name"
 	msgUnknownMethod  = "unknown method %q"
 	msgUnknownTool    = "unknown tool %q"
@@ -142,9 +144,12 @@ func NewServer(tools ...Tool) (*Server, error) {
 func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var frames []json.RawMessage
-		if err := json.Unmarshal(trimmed, &frames); err != nil {
+		frames, tooLong, err := batchFrames(trimmed)
+		if err != nil {
 			return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+		}
+		if tooLong {
+			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, fmt.Sprintf(msgBatchTooLong, maxBatchFrames))
 		}
 		if len(frames) == 0 {
 			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgEmptyBatch)
@@ -165,9 +170,14 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 }
 
 func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
+	// Unparseable JSON is a parse error; valid JSON that is not an object
+	// (a number, a string, an array inside a batch) is an invalid request.
+	if !json.Valid(raw) {
+		return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+	}
 	var req rpcRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgInvalidFrame)
 	}
 	if !validID(req.ID) {
 		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgBadID)
@@ -178,10 +188,15 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 	if req.Method == "" && (len(req.Result) > 0 || len(req.Error) > 0) {
 		return nil
 	}
-	if len(req.ID) == 0 || string(req.ID) == "null" {
-		if req.Method == "" {
-			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgMissingMethod)
-		}
+	if req.Method == "" {
+		return marshalRPCError(idOrNull(req.ID), rpcErrInvalidRequest, msgMissingMethod)
+	}
+	// MCP forbids a null id, and JSON-RPC answers one rather than treating
+	// it as a notification, so it is refused out loud, not dropped.
+	if string(req.ID) == "null" {
+		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgNullID)
+	}
+	if len(req.ID) == 0 {
 		return nil
 	}
 
@@ -215,6 +230,11 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, msgNeedsToolName)
+		}
+		// An unknown tool is a protocol error, as the MCP spec has it, so the
+		// host sees it, not the model as a tool that ran and failed.
+		if _, ok := s.tools[params.Name]; !ok {
+			return marshalRPCError(req.ID, rpcErrInvalidParams, fmt.Sprintf(msgUnknownTool, params.Name))
 		}
 		return marshalRPCResult(req.ID, s.CallTool(ctx, params.Name, params.Arguments))
 	// Neither is a capability this server declares; an empty list is the
@@ -277,4 +297,39 @@ func marshalRPCResult(id json.RawMessage, result any) []byte {
 func marshalRPCError(id json.RawMessage, code int, msg string) []byte {
 	b, _ := json.Marshal(rpcResponse{JSONRPC: jsonRPCVersion, ID: id, Error: &rpcError{Code: code, Message: msg}})
 	return b
+}
+
+// maxBatchFrames bounds a JSON-RPC batch. Every member is answered before
+// anything is written, and a malformed member's answer outweighs the member
+// (a two-byte `7` gets an 85-byte error), so an unbounded batch inside the
+// body cap would be answered tens of times over its own size. The 2025-06-18
+// revision this server prefers dropped batching; older clients batch a
+// handful of requests at most.
+const maxBatchFrames = 64
+
+// batchFrames splits a batch into its members as a stream, stopping once it
+// holds more than maxBatchFrames, so a long batch is refused without first
+// holding a copy of every member.
+func batchFrames(raw []byte) (frames []json.RawMessage, tooLong bool, err error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if _, err := dec.Token(); err != nil {
+		return nil, false, err
+	}
+	for dec.More() {
+		if len(frames) == maxBatchFrames {
+			return nil, true, nil
+		}
+		var f json.RawMessage
+		if err := dec.Decode(&f); err != nil {
+			return nil, false, err
+		}
+		frames = append(frames, f)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, false, err
+	}
+	if dec.More() {
+		return nil, false, errors.New("trailing data after the batch")
+	}
+	return frames, false, nil
 }
