@@ -133,7 +133,14 @@ type readTopicsArgs struct {
 // held, so without this a caller polling fast fills the topic streams'
 // consumer caps, which the web console shares. With it, a window costs at
 // most two consumers per distinct answer: the list, the cards, and each
-// spelling of each provisioned topic. Failed reads are not kept.
+// spelling of each provisioned topic. Only a complete answer is kept: a read
+// that failed, or one that reports problems (a stream not read, a card read
+// cut short), is answered but read again by the next caller.
+//
+// The read runs detached from its caller, under its own topicReadTimeout
+// starting once the lock is held, as the status read does: a caller that
+// hangs up, or one that queued behind a slow read, cannot make the shared
+// answer a short one.
 type topicCache struct {
 	mu      sync.Mutex
 	now     func() time.Time
@@ -145,7 +152,7 @@ type topicAnswer struct {
 	text string
 }
 
-func (c *topicCache) answer(key string, read func() (string, error)) (string, error) {
+func (c *topicCache) answer(ctx context.Context, key string, read func(context.Context) (string, bool, error)) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
@@ -157,11 +164,15 @@ func (c *topicCache) answer(key string, read func() (string, error)) (string, er
 	if a, ok := c.entries[key]; ok {
 		return a.text, nil
 	}
-	text, err := read()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), topicReadTimeout)
+	defer cancel()
+	text, complete, err := read(rctx)
 	if err != nil {
 		return "", err
 	}
-	c.entries[key] = topicAnswer{at: now, text: text}
+	if complete {
+		c.entries[key] = topicAnswer{at: now, text: text}
+	}
 	return text, nil
 }
 
@@ -172,14 +183,12 @@ func ReadTopicsTool(bus TopicsBus) Tool { return readTopicsTool(bus, time.Now) }
 
 func readTopicsTool(bus TopicsBus, now func() time.Time) Tool {
 	cache := &topicCache{now: now, entries: map[string]topicAnswer{}}
-	list := func(ctx context.Context) func() (string, error) {
-		return func() (string, error) {
-			l, err := bus.ListTopics(ctx)
-			if err != nil {
-				return "", err
-			}
-			return FormatTopicsMarkdown(l), nil
+	list := func(ctx context.Context) (string, bool, error) {
+		l, err := bus.ListTopics(ctx)
+		if err != nil {
+			return "", false, err
 		}
+		return FormatTopicsMarkdown(l), len(l.Problems) == 0, nil
 	}
 	return Tool{
 		Definition: ToolDefinition{
@@ -204,8 +213,6 @@ func readTopicsTool(bus TopicsBus, now func() time.Time) Tool {
 			},
 		},
 		Call: func(ctx context.Context, raw json.RawMessage) (string, error) {
-			ctx, cancel := context.WithTimeout(ctx, topicReadTimeout)
-			defer cancel()
 			var a readTopicsArgs
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
@@ -220,29 +227,29 @@ func readTopicsTool(bus TopicsBus, now func() time.Time) Tool {
 			}
 			switch action {
 			case topicActionList:
-				return cache.answer(topicActionList, list(ctx))
+				return cache.answer(ctx, topicActionList, list)
 			case topicActionRead:
 				if topic == "" {
 					// As #3653: a read with no topic lists them.
-					return cache.answer(topicActionList, list(ctx))
+					return cache.answer(ctx, topicActionList, list)
 				}
 				if !validTopicName(topic) {
 					return "", errTopicName
 				}
-				return cache.answer(topicActionRead+topicSep+topic, func() (string, error) {
+				return cache.answer(ctx, topicActionRead+topicSep+topic, func(ctx context.Context) (string, bool, error) {
 					r, err := bus.ReadTopic(ctx, topic)
 					if err != nil {
-						return "", err
+						return "", false, err
 					}
-					return FormatTopicMarkdown(r), nil
+					return FormatTopicMarkdown(r), true, nil
 				})
 			case topicActionCards:
-				return cache.answer(topicActionCards, func() (string, error) {
+				return cache.answer(ctx, topicActionCards, func(ctx context.Context) (string, bool, error) {
 					cards, err := bus.AgentCards(ctx)
 					if err != nil && cards == nil {
-						return "", err
+						return "", false, err
 					}
-					return formatCardsMarkdown(cards, err), nil
+					return formatCardsMarkdown(cards, err), err == nil, nil
 				})
 			default:
 				return "", fmt.Errorf("unknown read_topics action %q; use %s, %s or %s", action, topicActionList, topicActionRead, topicActionCards)
@@ -373,7 +380,16 @@ func (b *NATSBus) ReadTopic(ctx context.Context, name string) (TopicRead, error)
 		return r, nil
 	}
 	// Nothing for this topic in the window, which other journal topics may
-	// have filled: its latest entry, wherever it is, rather than "none".
+	// have filled: its latest entry, wherever it is, rather than "none". A
+	// topic with no messages at all costs no second consumer.
+	info, err := s.Info(ctx, jetstream.WithSubjectFilter(e.Subject))
+	if err != nil {
+		return r, err
+	}
+	if info.State.Subjects[e.Subject] == 0 {
+		r.Earlier = false
+		return r, nil
+	}
 	r.Fallback = true
 	_, err = b.drainConsumer(ctx, s, jetstream.ConsumerConfig{FilterSubject: e.Subject, DeliverPolicy: jetstream.DeliverLastPerSubjectPolicy}, 1, keep)
 	return r, err
@@ -572,7 +588,11 @@ func formatCardsMarkdown(cards map[string]AgentCard, err error) string {
 		writeProblems(&sb, []string{fmt.Sprintf("agent cards: %v", err)})
 	}
 	if len(cards) == 0 {
-		sb.WriteString("_No agent cards on DIRECTORY._\n")
+		if err != nil {
+			sb.WriteString("_The agent cards could not be read; see Problems._\n")
+		} else {
+			sb.WriteString("_No agent cards on DIRECTORY._\n")
+		}
 		return sb.String()
 	}
 	names := make([]string, 0, len(cards))

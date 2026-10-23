@@ -671,3 +671,113 @@ func TestRapidCallsDoNotFillTheTopicCaps(t *testing.T) {
 	}
 	slotsFree(t, b)
 }
+
+// fakeTopicsBus answers read_topics without a bus, counting reads and keeping
+// the context each read was handed.
+type fakeTopicsBus struct {
+	mu       sync.Mutex
+	lists    int
+	problems []string
+	ctxErr   error
+	deadline time.Duration
+}
+
+func (f *fakeTopicsBus) ListTopics(ctx context.Context) (TopicList, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lists++
+	f.ctxErr = ctx.Err()
+	if dl, ok := ctx.Deadline(); ok {
+		f.deadline = time.Until(dl)
+	}
+	return TopicList{Problems: f.problems}, nil
+}
+
+func (f *fakeTopicsBus) ReadTopic(context.Context, string) (TopicRead, error) {
+	return TopicRead{}, errors.New("not used")
+}
+
+func (f *fakeTopicsBus) AgentCards(context.Context) (map[string]AgentCard, error) {
+	return map[string]AgentCard{}, errors.New("read 0 of the directory before the deadline")
+}
+
+// A list that reports problems is answered but not kept: the next caller reads
+// again rather than being handed a list with topics marked not read.
+func TestAnIncompleteListIsNotKept(t *testing.T) {
+	f := &fakeTopicsBus{problems: []string{"stream TOPICS-STATE: context canceled"}}
+	tool := readTopicsTool(f, time.Now)
+	for i := 0; i < 2; i++ {
+		if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.lists != 2 {
+		t.Errorf("an incomplete list was read %d times by two calls, want 2", f.lists)
+	}
+	f.problems = nil
+	for i := 0; i < 2; i++ {
+		if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.lists != 3 {
+		t.Errorf("a complete list was read %d more times by two calls, want 1", f.lists-2)
+	}
+}
+
+// The read runs detached from its caller, under its own budget: a caller that
+// has already gone does not cut short the answer the next caller is handed.
+func TestAReadOutlivesItsCaller(t *testing.T) {
+	f := &fakeTopicsBus{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := readTopicsTool(f, time.Now).Call(ctx, []byte(`{"action":"list"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if f.ctxErr != nil {
+		t.Errorf("the read was handed the caller's cancelled context: %v", f.ctxErr)
+	}
+	if f.deadline <= 0 || f.deadline > topicReadTimeout {
+		t.Errorf("the read's budget was %v, want at most %v", f.deadline, topicReadTimeout)
+	}
+}
+
+// A card read that failed before its first card says so, and is not kept; it
+// does not claim the directory is empty.
+func TestAFailedTopicsCardReadIsNotNoCards(t *testing.T) {
+	text, err := readTopicsTool(&fakeTopicsBus{}, time.Now).Call(context.Background(), []byte(`{"action":"cards"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustContain(t, text, "_The agent cards could not be read; see Problems._", "read 0 of the directory")
+	mustNotContain(t, text, "No agent cards on DIRECTORY")
+}
+
+// A journal topic with no messages at all, in a stream deep enough to need the
+// window, reads as never written and opens one consumer, not a second for a
+// latest entry that does not exist.
+func TestAnEmptyJournalTopicInADeepStreamOpensOneConsumer(t *testing.T) {
+	b, js := topicBus(t, topicStreamMaxConsumers)
+	busy := lib.TopicSharedSubject("incidents")
+	if _, err := js.UpdateStream(context.Background(), jetstream.StreamConfig{
+		Name: lib.StreamTopicsJournal, Subjects: []string{subjAnnotations, busy},
+		MaxBytes: 1 << 24, MaxConsumers: topicStreamMaxConsumers, AllowDirect: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= journalScanWindow; i++ {
+		publishTopic(t, js, busy, fmt.Sprintf("i%d", i), nil)
+	}
+	before := topicConsumers(t, js, lib.StreamTopicsJournal)
+	r, err := b.ReadTopic(context.Background(), "annotations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Fallback || len(r.Entries) != 0 || r.Earlier {
+		t.Fatalf("read = %+v, want an empty topic", r)
+	}
+	if got := topicConsumers(t, js, lib.StreamTopicsJournal) - before; got != 1 {
+		t.Errorf("an empty topic's read opened %d consumers, want 1", got)
+	}
+	slotsFree(t, b)
+}
