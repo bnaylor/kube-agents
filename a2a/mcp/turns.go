@@ -464,7 +464,7 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 	if !ok {
 		return nil
 	}
-	t, err := b.WaitForTask(ctx, ref, time.Until(deadlineOf(ctx)))
+	t, err := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
 	switch {
 	case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
 		convs.clearRunning(token, ref)
@@ -655,7 +655,8 @@ type TurnOutcome struct {
 // Unfinished is a task of the turn last read as not yet final, the one the
 // conversation's next turn waits on, or nil when the turn is done.
 func (o TurnOutcome) Unfinished() *TaskRef {
-	if o.Task != nil && !o.Task.Final {
+	// A root read as nothing yet has not started, not ended.
+	if o.Task == nil || !o.Task.Final {
 		return &o.Root
 	}
 	for i := len(o.Followed) - 1; i >= 0; i-- {
@@ -689,7 +690,7 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	out := TurnOutcome{Root: root}
-	t, err := b.WaitForTask(ctx, root, wait)
+	t, err := b.waitForSubmittedTask(ctx, root, wait)
 	if err != nil && !errors.Is(err, ErrTaskNotFound) {
 		return out, err
 	}
@@ -710,7 +711,7 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 			if _, ok := read[ref.TaskID]; !ok {
 				order = append(order, ref)
 			}
-			ft, ferr := b.WaitForTask(ctx, ref, time.Until(deadlineOf(ctx)))
+			ft, ferr := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
 			read[ref.TaskID] = FollowedTask{Ref: ref, Task: ft, Err: ferr}
 			// A read that failed fast (every reader slot busy, say) is
 			// retried after the pause below, not at once.
