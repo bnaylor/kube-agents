@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -411,7 +412,7 @@ func TestACallerThatGivesUpOnTheLockDoesNotSend(t *testing.T) {
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() {
-		_, _, err := b.SendTurn(ctx, convs, token, "queued")
+		_, _, err := b.SendTurn(ctx, convs, token, "queued", time.Minute)
 		errc <- err
 	}()
 	select {
@@ -454,6 +455,7 @@ func TestTurnFate(t *testing.T) {
 		"/session look at pods":     {false, []string{"look at pods"}},
 		"/feedback":                 {true, nil},
 		"/feedback the bot is slow": {false, []string{"/feedback the bot is slow"}},
+		"/feedback summary":         {true, nil},
 	} {
 		settled, texts := turnFate(text)
 		if settled != want.settled || strings.Join(texts, "|") != strings.Join(want.texts, "|") {
@@ -653,4 +655,232 @@ func TestASettledTurnTakesNoSubmissions(t *testing.T) {
 	if got != 1 {
 		t.Errorf("a stop waiting on its notice holds %d subscriptions, want 1", got)
 	}
+}
+
+// A caller already out of time when it asks for a free lock gets its own
+// context error, not one that reads as another turn holding the conversation.
+func TestALockAskedForTooLateSaysSo(t *testing.T) {
+	c := NewConversations()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 50; i++ {
+		_, err := c.lock(ctx, "tok")
+		if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "another turn") {
+			t.Fatalf("lock with a done context and no holder: %v", err)
+		}
+	}
+	if len(c.sending) != 0 {
+		t.Errorf("%d send locks left behind", len(c.sending))
+	}
+}
+
+// A conversation resumed by its token is named by the token, not as the
+// default conversation, which is another conversation.
+func TestAResumedConversationIsNamedByItsToken(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "mcpresumed01", "wait_seconds": 10})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, "Conversation by token `mcpresumed01`")
+	mustNotContain(t, res.Content[0].Text, "Conversation `default`")
+}
+
+// emptyFetchConsumer is a consumer whose every fetch comes back empty, as a
+// stalled read's would.
+type emptyFetchConsumer struct{ jetstream.Consumer }
+
+func (emptyFetchConsumer) Fetch(int, ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
+	return emptyBatch{}, nil
+}
+
+type emptyBatch struct{}
+
+func (emptyBatch) Messages() <-chan jetstream.Msg {
+	c := make(chan jetstream.Msg)
+	close(c)
+	return c
+}
+func (emptyBatch) Error() error { return nil }
+
+// A task read whose fetch comes back empty while events are still pending
+// is an error, not the task's end folded from what was read so far.
+func TestAStalledTaskReadIsAnError(t *testing.T) {
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, cons: emptyFetchConsumer{}, pending: 5, release: func(bool) {}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.next(ctx); err == nil || !strings.Contains(err.Error(), "still pending") {
+		t.Errorf("a stalled fetch with 5 pending returned %v, want the stall reported", err)
+	}
+	w.pending = 0
+	if err := w.next(ctx); err != nil {
+		t.Errorf("an empty fetch with nothing pending (waiting for new events) returned %v", err)
+	}
+}
+
+// A second message on a conversation whose turn is still running waits for
+// it rather than being steered into it, and says the conversation is busy,
+// naming the running task, when its wait runs out first. Once the task ends
+// the next message goes.
+func TestASecondMessageWaitsForTheRunningTurn(t *testing.T) {
+	s, js, n, _ := turnServer(t, gatewayScenario{})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "long job", "wait_seconds": 2})
+	if res.IsError || !strings.Contains(res.Content[0].Text, "still running") {
+		t.Fatalf("first turn = %+v", res)
+	}
+	ref := fakeAddressee + "/task-root1"
+	start := time.Now()
+	res = callTool(t, s, ToolSendMessage, map[string]any{"text": "and another thing", "wait_seconds": 2})
+	if !res.IsError {
+		t.Fatalf("a message behind a running turn was sent: %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "conversation busy: a turn is still running", ref)
+	if took := time.Since(start); took < 2*time.Second {
+		t.Errorf("the busy message came after %s, before the wait ran out", took)
+	}
+	if n.Load() != 1 {
+		t.Errorf("the gateway got %d turns, want 1", n.Load())
+	}
+
+	go func() {
+		time.Sleep(time.Second)
+		publishResult(t, js, fakeAddressee, "task-root1", answerText)
+		publishStatus(t, js, fakeAddressee, "task-root1", lib.StateCompleted, true)
+	}()
+	res = callTool(t, s, ToolSendMessage, map[string]any{"text": "and another thing", "wait_seconds": 4})
+	if res.IsError || !strings.Contains(res.Content[0].Text, fakeAddressee+"/task-root2") {
+		t.Fatalf("the message after the running turn ended = %+v", res)
+	}
+	if n.Load() != 2 {
+		t.Errorf("the gateway got %d turns, want 2", n.Load())
+	}
+}
+
+// A message sent while another call's turn on the conversation is still
+// being waited on queues behind it, and gives up as busy, naming its task.
+func TestAConcurrentMessageQueuesBehindTheTurn(t *testing.T) {
+	s, _, n, _ := turnServer(t, gatewayScenario{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		callTool(t, s, ToolSendMessage, map[string]any{"text": "long job", "wait_seconds": 6})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "and another thing", "wait_seconds": 1})
+	if !res.IsError {
+		t.Fatalf("a message behind a turn being waited on was sent: %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "conversation busy", fakeAddressee+"/task-root1")
+	<-done
+	if n.Load() != 1 {
+		t.Errorf("the gateway got %d turns, want 1", n.Load())
+	}
+}
+
+// task_control get on a reference with no events says so at once, rather
+// than holding a reader for the whole wait.
+func TestWaitingOnAnUnknownTaskEndsAtOnce(t *testing.T) {
+	url, _ := testBus(t)
+	start := time.Now()
+	_, err := dial(t, url).WaitForTask(context.Background(), TaskRef{Addressee: fakeAddressee, TaskID: "task-typo"}, time.Minute)
+	if err != ErrTaskNotFound {
+		t.Errorf("err = %v, want ErrTaskNotFound", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("took %s", took)
+	}
+}
+
+// An edit of the gateway's rolling status line is not a notice about the
+// turn; a fresh post is.
+func TestAnEditIsNotANotice(t *testing.T) {
+	edit := &nats.Msg{Data: mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⚙️ **working**", Edit: true})}
+	if got := noticeText(edit); got != "" {
+		t.Errorf("an edit read as the notice %q", got)
+	}
+	post := &nats.Msg{Data: mustJSON(t, ConsoleOutFrame{MessageID: "n2", Text: "🛑 cancel sent"})}
+	if got := noticeText(post); got != "🛑 cancel sent" {
+		t.Errorf("a post read as %q", got)
+	}
+}
+
+// A notice is shown whole, line breaks, backticks and all: for a settled turn
+// it is the answer.
+func TestANoticeIsShownWhole(t *testing.T) {
+	notice := "```\nusage summary\n" + strings.Repeat("usage: counter `x` 12345\n", 20) + "```\nhttps://gke-labs.github.io/kube-agents/feedback"
+	var sb strings.Builder
+	writeNotices(&sb, []string{notice})
+	for _, line := range strings.Split(notice, "\n") {
+		mustContain(t, sb.String(), "> "+line+"\n")
+	}
+}
+
+// A finished turn leaves nothing for the next to wait on, and a turn read as
+// finished since is forgotten by the next send.
+func TestAFinishedTurnIsForgotten(t *testing.T) {
+	url, js := testBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{})
+	b := dial(t, url)
+	convs := NewConversations()
+	s := mustServer(t, SendMessageTool(b, convs))
+	token, _ := convs.Resolve("", "")
+	callTool(t, s, ToolSendMessage, map[string]any{"text": "long job", "wait_seconds": 2})
+	if ref, ok := convs.runningTask(token); !ok || ref.TaskID != "task-root1" {
+		t.Fatalf("running = %v %v, want task-root1", ref, ok)
+	}
+	publishResult(t, js, fakeAddressee, "task-root1", answerText)
+	publishStatus(t, js, fakeAddressee, "task-root1", lib.StateCompleted, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.awaitRunningTurn(ctx, convs, token); err != nil {
+		t.Fatal(err)
+	}
+	if ref, ok := convs.runningTask(token); ok {
+		t.Errorf("a finished task is still waited on: %v", ref)
+	}
+
+	url2, js2 := testBus(t)
+	runFakeGateway(t, url2, js2, gatewayScenario{finish: true})
+	b2 := dial(t, url2)
+	convs2 := NewConversations()
+	s2 := mustServer(t, SendMessageTool(b2, convs2))
+	token2, _ := convs2.Resolve("", "")
+	callTool(t, s2, ToolSendMessage, map[string]any{"text": "quick", "wait_seconds": 10})
+	if ref, ok := convs2.runningTask(token2); ok {
+		t.Errorf("a finished turn left %v to wait on", ref)
+	}
+}
+
+// A sent turn holds the conversation's send lock until its watch closes, so
+// no send slips in between its submission and its answer being read.
+func TestATurnHoldsTheLockUntilItsWatchCloses(t *testing.T) {
+	url, js := testBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{finish: true})
+	b := dial(t, url)
+	convs := NewConversations()
+	token, _ := convs.Resolve("c", "")
+	_, w, err := b.SendTurn(context.Background(), convs, token, "hi", time.Minute)
+	if err != nil || w == nil {
+		t.Fatalf("SendTurn = %v, %v", w, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if unlock, err := convs.lock(ctx, token); !errors.Is(err, ErrConversationBusy) {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatalf("lock while the turn's watch is open: %v, want busy", err)
+	}
+	w.close()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	unlock, err := convs.lock(ctx2, token)
+	if err != nil {
+		t.Fatalf("lock after the watch closed: %v", err)
+	}
+	unlock()
 }
