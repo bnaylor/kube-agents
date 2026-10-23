@@ -115,6 +115,9 @@ type gatewayScenario struct {
 	delegate bool // the root delegates; a child runs and a wake task carries the answer
 	handoff  bool // the root acknowledges and hands its work to kanban cards (no wake task ever)
 	decoys   bool // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	// lateStart delays the root's first event after its submission, as an
+	// executor's cold start does.
+	lateStart time.Duration
 }
 
 // runFakeGateway answers console frames the way the console door does: a
@@ -182,6 +185,7 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishResult(t, js, fakeAddressee, root, ackText)
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 		default:
+			time.Sleep(sc.lateStart)
 			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
 		}
 	})
@@ -883,4 +887,25 @@ func TestATurnHoldsTheLockUntilItsWatchCloses(t *testing.T) {
 		t.Fatalf("lock after the watch closed: %v", err)
 	}
 	unlock()
+}
+
+// A turn whose first event trails its submission, as a cold executor's does,
+// is waited on, not reported as having no events and forgotten.
+func TestATurnWhoseFirstEventIsLateIsWaitedOn(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, lateStart: time.Second})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "wait_seconds": 10})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, answerText)
+	mustNotContain(t, res.Content[0].Text, "no events yet")
+}
+
+// A turn whose task was read as nothing yet is still the conversation's
+// running turn.
+func TestAnUnreadRootIsUnfinished(t *testing.T) {
+	root := TaskRef{Addressee: fakeAddressee, TaskID: "task-root1"}
+	if got := (TurnOutcome{Root: root}).Unfinished(); got == nil || *got != root {
+		t.Errorf("Unfinished() = %v, want the root", got)
+	}
 }
