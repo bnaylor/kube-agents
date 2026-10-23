@@ -10,14 +10,15 @@ once each; this proves what the patch is for, read from the patched tree with
   the ``/reasoning show`` refusal and the prepend, are proved by the marker
   and the applier's anchors alone);
 - ``_terminal_empty`` returns nothing built from the reasoning;
-- the only callers of ``_extract_reasoning`` (or the ``extract_reasoning``
+- the only direct calls of ``_extract_reasoning`` (or the ``extract_reasoning``
   helper it forwards to) left under ``agent/`` and in ``run_agent.py`` are the
   two known not to make a reply of it: the one that stores the reasoning on the
   assistant message, and ``_terminal_empty``, which logs it. A Hermes bump that
-  adds a caller there fails here, so the new site gets read before the image
-  ships: if it can turn reasoning into reply text, it needs the same treatment.
-  Code that reads ``reasoning_content`` off a message directly is not seen;
-  the gate narrows the search, it does not replace reading a bump's diff.
+  adds a direct call there fails here, so the new site gets read before the
+  image ships: if it can turn reasoning into reply text, it needs the same
+  treatment. Not seen: a call through an alias, a callback or ``getattr``, and
+  code that reads ``reasoning_content`` off a message directly. The gate
+  narrows the search, it does not replace reading a bump's diff.
 
 Usage::
 

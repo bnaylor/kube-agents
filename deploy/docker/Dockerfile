@@ -1454,8 +1454,8 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # as the explanation). Each now takes the path a model without reasoning
 # takes. The gateway's display of reasoning goes too: /reasoning show is
 # refused, and the prepend of the last reasoning block to a reply never fires.
-# Its verifier also fails the build on a new _extract_reasoning (or
-# extract_reasoning) caller under agent/ or in run_agent.py, so a Hermes bump
+# Its verifier also fails the build on a new direct call of _extract_reasoning
+# (or extract_reasoning) under agent/ or in run_agent.py, so a Hermes bump
 # that adds a fourth such site gets read. See the module
 # docstring in deploy/docker/patches/apply_reasoning_not_reply.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
