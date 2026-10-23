@@ -26,14 +26,19 @@ Two kinds of agent-behaviour change are also exempt, because no case can test th
   no model call in its path and no text that reaches the model (no re-prompt, no retry
   instruction, no tool or skill text). Its unit tests cover every input class it acts on, plus
   pass-through. The fixed text a guard emits is part of the guard;
-- a fix for a failure that **didn't turn red on demand**: a case written for it (or a replay of
-  the captured failing request) ran at least three times against `main` without failing.
+- a fix for a failure that **didn't turn red on demand**: a case written for it ran at least
+  three times against `main` without failing (a replay of the captured failing request can stand
+  in for those runs), and the nightly and prow records were checked first. Three runs miss a rare
+  failure, so a failure those records show on `main` is red on demand through them and takes the
+  loop against that lane instead. Either way the case is registered in
+  `hack/eval/nightly-cases.txt`, so the nightly keeps measuring it after the fix.
 
 Neither exemption covers wording the model reads (a prompt, an SOP, a skill, or reply or
 refusal guidance in any of them); that still needs a case. A change exempt under these two
 records, under **Live validation**: its unit tests; a live or replay check against an install
-(for a replay, what was replayed and against which build); and, for the second, the case or
-replay it tried and those runs. That's more than the one line the exemptions above take.
+(for a replay, what was replayed and against which build); and, for the second, the case,
+where it is registered, the runs (or the replay), and the nightly or prow record checked. That's
+more than the one line the exemptions above take.
 
 The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)),
 refreshed to the commit under test: build the images with `deploy/docker/cloudbuild-ci.yaml`
