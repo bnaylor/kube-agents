@@ -132,7 +132,7 @@ type readTopicsArgs struct {
 // taskConsumerIdle; the reader slots bound reads in flight, not consumers
 // held, so without this a caller polling fast fills the topic streams'
 // consumer caps, which the web console shares. With it, a window costs at
-// most one consumer per distinct answer: the list, the cards, and each
+// most two consumers per distinct answer: the list, the cards, and each
 // spelling of each provisioned topic. Failed reads are not kept.
 type topicCache struct {
 	mu      sync.Mutex
