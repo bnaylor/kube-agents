@@ -34,13 +34,26 @@ def _function(name):
     return match.group(0)
 
 
+def _extract_line(pattern):
+    text = _CI_EVAL_PR.read_text(encoding="utf-8")
+    match = re.search(pattern, text, re.M)
+    assert match, f"could not find {pattern} in hack/ci-eval-pr.sh"
+    return match.group(0)
+
+
 _HARNESS = r"""
 set -euo pipefail
 LOG="$1"; LOCK="$2/lock-infra"
 # Task table: index -> name, stack flag, how long the run takes (seconds).
-TASK_NAMES=(stack-a stack-b stack-c plain-1 plain-2 plain-3 plain-4 plain-5 plain-6 oobe-first-run-audits)
-TASK_HAS_STACK=(true true true "" "" "" "" "" "" true)
-RUN_SECONDS=(1.0 1.0 1.0 0.6 0.6 0.6 0.6 0.6 0.6 0.4)
+TASK_NAMES=(stack-a stack-b stack-c plain-1 plain-2 plain-3 plain-4 plain-5 plain-6 oobe-first-run-audits stack-stalls stack-dies)
+# As the script builds it: "true" only for a stack off infra_lock_exempt, so the
+# exempt oobe-first-run-audits is empty.
+TASK_HAS_STACK=(true true true "" "" "" "" "" "" "" true true)
+RUN_SECONDS=(1.0 1.0 1.0 0.6 0.6 0.6 0.6 0.6 0.6 0.4 0.4 0.3)
+# Before it queues on lock-infra: stack-stalls waits 2s on something else (a
+# busy task, stream or state lock).
+PRE_SECONDS=(0 0 0 0 0 0 0 0 0 0 2.0 0)
+STATE_DIR="$2"
 TASKS=("${TASK_NAMES[@]}"); TASK_REUSE=(); TASK_STREAMS=()
 for i in "${!TASK_NAMES[@]}"; do TASK_REUSE[i]=""; TASK_STREAMS[i]=""; done
 EVAL_REPETITIONS=1
@@ -52,12 +65,20 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <stre
     if [ "${TASK_NAMES[i]}" = "${name}" ]; then break; fi
   done
   got="${start}"
-  if [ -n "$5" ] && ! infra_lock_exempt "${name}"; then
-    until mkdir "${LOCK}" 2>/dev/null; do /bin/sleep 0.05; done
+  /bin/sleep "${PRE_SECONDS[i]}"
+  if [ -n "$5" ]; then
+    local tries=0
+    until mkdir "${LOCK}" 2>/dev/null; do
+      /bin/sleep 0.05; tries=$((tries + 1))
+      if [ "${tries}" -ge 200 ]; then echo "${name} gaveup 0 0" >> "${LOG}"; return 0; fi
+    done
+    # As run_one_unit does: record the holder's job pid in the lock.
+    sh -c 'echo "${PPID}"' > "${LOCK}/owner"
     got="$(now)"
   fi
   /bin/sleep "${RUN_SECONDS[i]}"
-  if [ -n "$5" ] && ! infra_lock_exempt "${name}"; then rmdir "${LOCK}"; fi
+  # stack-dies exits holding the lock, as a unit killed mid-run would.
+  if [ -n "$5" ] && [ "${name}" != "stack-dies" ]; then rm -f "${LOCK}/owner"; rmdir "${LOCK}"; fi
   # One write per unit, under 512 bytes, so concurrent appends stay whole lines.
   printf '%s %s %s %s\n' "${name}" "${start}" "${got}" "$(now)" >> "${LOG}"
 }
@@ -81,6 +102,9 @@ class InfraSlotTest(unittest.TestCase):
                 _HARNESS,
                 _function("infra_lock_exempt"),
                 _function("unit_takes_infra_lock"),
+                _function("lock_release"),
+                _function("release_stale_infra_lock"),
+                _extract_line(r"^INFRA_IN_FLIGHT_MAX=\d+$"),
                 _function("launch_units"),
                 "QUEUE=\"$(printf '1 0 %s\\n' " + " ".join(str(i) for i in queue_indexes) + ")\"",
                 f'launch_units "${{QUEUE}}" {parallelism} 0 > /dev/null',
@@ -95,29 +119,57 @@ class InfraSlotTest(unittest.TestCase):
             rows = []
             for line in log.read_text().splitlines():
                 name, start, got, end = line.split()
+                if start == "gaveup":
+                    rows.append((name, None, None, None))
+                    continue
                 rows.append((name, float(start), float(got), float(end)))
             return rows
 
-    def test_no_unit_waits_in_its_slot_for_the_infra_lock(self):
+    def test_at_most_one_unit_waits_in_a_slot_for_the_infra_lock(self):
         # Three stack-bearing units at the head of the queue, as a cost-sorted
-        # queue puts them: before this rule two of them would park in slots.
-        rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=3)
-        self.assertEqual(sorted(r[0] for r in rows), sorted(["stack-a", "stack-b", "stack-c"] + [f"plain-{n}" for n in range(1, 7)]))
-        waits = {name: got - start for name, start, got, _ in rows}
-        for name in ("stack-a", "stack-b", "stack-c"):
-            self.assertLess(waits[name], 0.3, f"{name} waited {waits[name]:.2f}s in its slot for lock-infra")
+        # queue puts them: before this rule all three took slots and two parked
+        # on the lock at once.
+        rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4)
+        stack = [(start, got) for name, start, got, _ in rows if name.startswith("stack-")]
+        self.assertEqual(len(stack), 3)
+        events = sorted([(start, 1) for start, got in stack if got - start > 0.3] + [(got, -1) for start, got in stack if got - start > 0.3])
+        waiting = peak = 0
+        for _, delta in events:
+            waiting += delta
+            peak = max(peak, waiting)
+        self.assertLessEqual(peak, 1, "two units were parked on lock-infra at once")
 
-    def test_at_most_one_lock_taking_unit_is_in_flight(self):
-        rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=3)
-        stack = sorted((start, end) for name, start, _, end in rows if name.startswith("stack-"))
-        for (s1, e1), (s2, _e2) in zip(stack, stack[1:]):
-            self.assertGreaterEqual(s2, e1 - 0.05, "a second lock-taking unit launched while the first was in flight")
+    def test_no_more_than_the_limit_of_lock_takers_is_in_flight(self):
+        rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4)
+        stack = [(start, end) for name, start, _, end in rows if name.startswith("stack-")]
+        events = sorted([(s_, 1) for s_, _ in stack] + [(e - 0.05, -1) for _, e in stack])
+        running = peak = 0
+        for _, delta in events:
+            running += delta
+            peak = max(peak, running)
+        self.assertLessEqual(peak, 2)
 
     def test_the_freed_slots_go_to_units_that_do_not_take_the_lock(self):
-        rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=3)
+        rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4)
         first_stack_end = min(end for name, _, _, end in rows if name.startswith("stack-"))
         started_meanwhile = [name for name, start, _, _ in rows if name.startswith("plain-") and start < first_stack_end]
         self.assertGreaterEqual(len(started_meanwhile), 2, f"only {started_meanwhile} started while the first stack unit ran")
+
+    def test_a_holder_waiting_on_another_lock_does_not_stall_the_chain(self):
+        # stack-stalls is in flight but waits 2s on something else before it
+        # queues on lock-infra; the staged stack-a takes lock-infra meanwhile.
+        rows = self._run([10, 0, 3], parallelism=4)
+        got = {name: g for name, _, g, _ in rows}
+        self.assertLess(got["stack-a"], got["stack-stalls"], "the chain waited behind a holder that was not on lock-infra")
+
+    def test_a_lock_left_by_a_dead_holder_is_released(self):
+        # stack-dies exits holding lock-infra, as a unit killed mid-run would.
+        # Its owner file names a job that is no longer running, so the
+        # dispatcher releases the lock and the units behind it run, rather
+        # than each waiting out the deadline (the stub gives up after ~10s).
+        rows = self._run([11, 0, 1], parallelism=2)
+        gave_up = {name for name, start, _, _ in rows if start is None}
+        self.assertEqual(gave_up, set(), f"{sorted(gave_up)} waited out a lock its dead holder left")
 
     def test_parallelism_is_still_the_ceiling(self):
         rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=3)
@@ -128,10 +180,10 @@ class InfraSlotTest(unittest.TestCase):
             peak = max(peak, running)
         self.assertLessEqual(peak, 3)
 
-    def test_an_infra_lock_exempt_stack_runs_beside_a_lock_holder(self):
-        # oobe-first-run-audits has a stack but is infra_lock_exempt: it must not
-        # be held back behind a lock-taking unit.
-        rows = self._run([0, 9, 3], parallelism=3)
+    def test_an_infra_lock_exempt_stack_is_not_held_back(self):
+        # oobe-first-run-audits has a stack but is infra_lock_exempt, so its
+        # TASK_HAS_STACK is empty: it launches beside two lock takers.
+        rows = self._run([0, 1, 9], parallelism=4)
         starts = {name: start for name, start, _, _ in rows}
         ends = {name: end for name, _, _, end in rows}
         self.assertLess(starts["oobe-first-run-audits"], ends["stack-a"])
