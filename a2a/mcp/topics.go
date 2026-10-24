@@ -63,8 +63,6 @@ const (
 	// and its data), so a read is at most about
 	// maxJournalEntries*2*maxTopicEntryBytes.
 	maxTopicEntryBytes = 2 * 1024
-	// minFenceLen is the shortest markdown code fence.
-	minFenceLen = 3
 )
 
 // errTopicName is a topic name refused before the bus is asked.
