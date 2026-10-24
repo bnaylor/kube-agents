@@ -4023,16 +4023,62 @@ UNIT_QUEUE_WRITERS="$(
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
+# Whether a unit takes lock-infra: a stack-bearing case off infra_lock_exempt,
+# the same test run_one_unit makes before it queues on the lock.
+unit_takes_infra_lock() { # <task-index>
+  [ -n "${TASK_HAS_STACK[$1]:-}" ] && ! infra_lock_exempt "${TASK_NAMES[$1]}"
+}
+
 # One phase's units, launched in queue order at the given parallelism, each
 # after the given pause. The caller `wait`s between phases; UNIT_SEQ carries
 # across them.
+#
+# At most one unit that takes lock-infra is in flight at a time (#3384). The
+# lock lets one such unit run anyway, and a second one launched while the
+# first runs would sit in its slot waiting for the lock, doing nothing: on
+# 2026-10-24 the main nightly's waits held 25.7 of its ~70 slot-hours that way
+# and it ran out of time (#3821). So a lock-taking unit is held back in the
+# queue while another is in flight, and the next unit that does not take the
+# lock gets the slot instead; the held one launches as soon as the lock
+# holder's job ends. Queue order is otherwise unchanged.
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
-  while read -r REP _COST IDX; do
-    [ -n "${IDX:-}" ] || continue
+  local pending=() line i pick infra_pid=""
+  while read -r line; do
+    [ -n "${line}" ] && pending+=("${line}")
+  done <<EOF_UNIT_QUEUE
+${queue}
+EOF_UNIT_QUEUE
+  while [ "${#pending[@]}" -gt 0 ]; do
     while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
       sleep 3
     done
+    # In a command substitution, as the slot count above, since `jobs` in a
+    # pipeline runs in a subshell with no job table.
+    if [ -n "${infra_pid}" ]; then
+      case " $(jobs -rp | tr '\n' ' ') " in
+        *" ${infra_pid} "*) ;;
+        *) infra_pid="" ;;
+      esac
+    fi
+    pick=""
+    for i in "${!pending[@]}"; do
+      read -r REP _COST IDX <<<"${pending[i]}"
+      if [ -z "${infra_pid}" ] || ! unit_takes_infra_lock "${IDX}"; then
+        pick="${i}"
+        break
+      fi
+    done
+    if [ -z "${pick}" ]; then
+      # Only lock-taking units are left and one is in flight: wait for it.
+      sleep 3
+      continue
+    fi
+    read -r REP _COST IDX <<<"${pending[pick]}"
+    unset 'pending[pick]'
+    if [ "${#pending[@]}" -gt 0 ]; then
+      pending=("${pending[@]}")
+    fi
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
     # in the second phase the pause is the lane's writer pause instead (the
@@ -4041,9 +4087,10 @@ launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before e
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
-  done <<EOF_UNIT_QUEUE
-${queue}
-EOF_UNIT_QUEUE
+    if unit_takes_infra_lock "${IDX}"; then
+      infra_pid=$!
+    fi
+  done
 }
 
 profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
