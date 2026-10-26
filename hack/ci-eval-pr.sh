@@ -3393,9 +3393,12 @@ for TASK in "${TASKS[@]}"; do
 done
 
 # How long a stack-bearing unit waits for lock-infra before giving up. The
-# lock is held for a unit's whole invocation and the queue launches every
-# repetition-1 unit within the first few lanes, so with N stack-bearing
-# tasks the last waiter has to outlast N-1 holders in a row: at 1800s flat
+# lock is held for a unit's whole invocation. launch_units now keeps at most
+# INFRA_IN_FLIGHT_MAX lock takers in flight, so a waiter outlasts one holder;
+# this figure was sized when every repetition-1 unit launched at once and,
+# with N stack-bearing tasks, the last waiter outlasted N-1 holders in a
+# row. Too long only slows recovery from a stall, so it stays until a
+# measured night resizes it (#3821). Then, at 1800s flat
 # the third and fourth contenders in a four-tofu nightly cannot, and which
 # one loses is the mkdir race (the #1103 presubmit run showed it at N=2, a
 # 2279s audit rep starving its sibling). 1800s a contender keeps the
