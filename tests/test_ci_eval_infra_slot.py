@@ -4,14 +4,18 @@ A stack-bearing unit runs under lock-infra, one at a time. Before this rule
 `launch_units` gave every unit a parallelism slot as soon as one was free, so a
 second stack-bearing unit launched while the first ran sat in its slot waiting
 for the lock: on the 2026-10-24 main nightly those waits held 25.7 of ~70
-slot-hours and the run timed out. Now at most one lock-taking unit is in
-flight, and the slots it would have parked go to units that do not take the
-lock.
+slot-hours and the run timed out. Now at most INFRA_IN_FLIGHT_MAX (two)
+lock-taking units are in flight, one holding the lock and one staged behind
+it, and the slots the rest would have parked go to units that do not take the
+lock. A lock whose owner job has died is released.
 
-`launch_units`, `unit_takes_infra_lock` and `infra_lock_exempt` are extracted
-from the script and run with `run_one_unit` stubbed: the stub takes a real
-`mkdir` lock for a stack-bearing unit, as the script does, and records when
-each unit started, got the lock and ended. A `sleep` executable first on PATH
+`launch_units`, `unit_takes_infra_lock`, `lock_release`,
+`release_stale_infra_lock` and `INFRA_IN_FLIGHT_MAX` are extracted from the
+script and run with `run_one_unit` stubbed: the stub takes a real `mkdir` lock
+for a stack-bearing unit and writes its owner file, as the script does, and
+records when each unit started, got the lock and ended. That the real
+`run_one_unit` writes the owner `launch_units` tracks is
+scripts/test_ci_eval_fanout.py's job. A `sleep` executable first on PATH
 turns the dispatcher's 3s polls into a tenth of a second (a shell function
 named `sleep` breaks background jobs under bash 3.2).
 """
@@ -29,7 +33,8 @@ _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 def _function(name):
     text = _CI_EVAL_PR.read_text(encoding="utf-8")
-    match = re.search(rf"^{name}\(\) \{{.*?^\}}\n", text, re.S | re.M)
+    # A one-line function ends on its own line; a block ends at a bare `}`.
+    match = re.search(rf"^{name}\(\) \{{[^\n]*\}}\n|^{name}\(\) \{{.*?^\}}\n", text, re.S | re.M)
     assert match, f"could not find {name}() in hack/ci-eval-pr.sh"
     return match.group(0)
 
@@ -100,7 +105,6 @@ class InfraSlotTest(unittest.TestCase):
             fake_sleep.chmod(0o755)
             script = "\n".join([
                 _HARNESS,
-                _function("infra_lock_exempt"),
                 _function("unit_takes_infra_lock"),
                 _function("lock_release"),
                 _function("release_stale_infra_lock"),
