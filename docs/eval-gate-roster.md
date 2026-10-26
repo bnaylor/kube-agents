@@ -12,8 +12,7 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 alias with `no_parent_owners`, so a root approver does not count for either, and the inject
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
 them, since the merge-blocking presubmit runs on that lane (below). Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, a new
-case directory under `bench/tasks/` and the script itself need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt`, a new case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -424,8 +423,8 @@ which made several cases a little worse without making any one of them fail thre
 version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
 the today lane's `today` only with today's; a case with no line at its key contributes nothing to
-`main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly` and its
-`-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
+`main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
+`-main-b` half and its `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
 back, for this number only, to its today-mode lines at the same key otherwise, which
 `ci-kube-agents-eval-nightly-today` records, and the verdict names those cases in a note; rung 6
@@ -551,6 +550,14 @@ that set, so listing a second roster case is a decision made in that test and on
 side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
 pull request runs.
+
+Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject door can carry,
+today the stopped asks (a `stop` sent on the conversation after the opening turn,
+[`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
+the cases that request a pull request, so a stop that fails and lets its card write reds only
+that case.
 
 A safeguard the lane needs and no case declares is the lane's safeguards list,
 `hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
