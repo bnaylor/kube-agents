@@ -4,15 +4,18 @@ A stack-bearing unit runs under lock-infra, one at a time. Before this rule
 `launch_units` gave every unit a parallelism slot as soon as one was free, so a
 second stack-bearing unit launched while the first ran sat in its slot waiting
 for the lock: on the 2026-10-24 main nightly those waits held 25.7 of ~70
-slot-hours and the run timed out. Now at most INFRA_IN_FLIGHT_MAX (two)
-lock-taking units are in flight, one holding the lock and one staged behind
-it, and the slots the rest would have parked go to units that do not take the
-lock.
+slot-hours and the run timed out. Now at most INFRA_IN_FLIGHT_MAX (two) lock
+takers without a state lock are in flight, one holding the lock and one staged
+behind it, and the slots the rest would have parked go to other units. Lock
+takers with a state lock are not counted, so they cannot fill the limit while
+an exempt case holds their state. INFRA_LOCK_DEADLINE is sized in holds
+rather than per stack-bearing task.
 
-`launch_units`, `unit_takes_infra_lock` and `INFRA_IN_FLIGHT_MAX` are
-extracted from the script and run with `run_one_unit` stubbed: the stub takes
-a real `mkdir` lock for a stack-bearing unit, as the script does, and records
-when each unit started, got the lock and ended. A `sleep` executable first on PATH
+`launch_units`, `unit_state_lock`, `unit_takes_infra_lock`,
+`unit_counts_toward_infra_limit` and `INFRA_IN_FLIGHT_MAX` are extracted from
+the script and run with `run_one_unit` stubbed: the stub takes real `mkdir`
+locks (lock-infra, and a state lock where the case has one) as the script
+does, and records when each unit started, got the lock and ended. A `sleep` executable first on PATH
 turns the dispatcher's 3s polls into a tenth of a second (a shell function
 named `sleep` breaks background jobs under bash 3.2).
 """
@@ -167,9 +170,9 @@ class InfraSlotTest(unittest.TestCase):
 
     def test_the_freed_slots_go_to_units_that_do_not_take_the_lock(self):
         # Four slots and three stack units at the head of the queue: before
-        # this rule the third stack unit took the fourth slot's neighbour and
-        # one plain unit started at once; now the third waits in the queue
-        # and two plain units start at once.
+        # this rule the three stack units and one plain unit took the four
+        # slots; now the third stack unit waits in the queue and two plain
+        # units start at once.
         rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4)
         first = min(start for _, start, _, _ in rows)
         at_once = [name for name, start, _, _ in rows if name.startswith("plain-") and start < first + 0.3]
@@ -228,21 +231,31 @@ class InfraSlotTest(unittest.TestCase):
         self.assertLess(ends[2] - starts[0], 3.5)
 
     def test_the_infra_lock_deadline_does_not_scale_with_stack_bearing_tasks(self):
-        # A waiter outlasts at most two holds, however many stack-bearing
-        # tasks the run has; a per-task figure would multiply what a dead
-        # holder costs (one deadline per pair of waiters).
+        # A counted waiter outlasts two holds plus one per lock taker with a
+        # state lock, however many other stack-bearing tasks the run has; a
+        # per-task figure would multiply what a dead holder costs (one
+        # deadline per pair of waiters).
         text = _CI_EVAL_PR.read_text(encoding="utf-8")
         hold = int(re.search(r"^readonly INFRA_LOCK_LONGEST_HOLD_SECONDS=(\d+)$", text, re.M).group(1))
         block = re.search(r"^STACK_CONTENDERS=0\n.*?^INFRA_LOCK_DEADLINE=.*?\n", text, re.S | re.M).group(0)
-        deadlines = set()
-        for n in (0, 2, 25):
-            flags = " ".join(["true"] * n)
-            out = subprocess.run(
-                ["bash", "-c", f"INFRA_LOCK_LONGEST_HOLD_SECONDS={hold}; TASK_HAS_STACK=({flags})\n{block}echo $INFRA_LOCK_DEADLINE"],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
-            deadlines.add(int(out))
-        self.assertEqual(deadlines, {2 * hold})
+        bootstrap = ["bootstrap-discovery-fanout", "bootstrap-inventory-ranking-delivery", "bootstrap-inventory-posture-scope"]
+
+        def deadline(plain_stacks, names_with_state):
+            names = [f"stack-{i}" for i in range(plain_stacks)] + names_with_state
+            script = "\n".join([
+                "set -euo pipefail",
+                _function("unit_state_lock"),
+                f"INFRA_LOCK_LONGEST_HOLD_SECONDS={hold}",
+                "TASK_NAMES=(" + " ".join(names) + ")",
+                "TASK_HAS_STACK=(" + " ".join(["true"] * len(names)) + ")",
+                block + "echo $INFRA_LOCK_DEADLINE",
+            ])
+            return int(subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout.strip())
+
+        # (At least one stack-bearing task: bash 3.2 under `set -u` rejects an
+        # empty array, and the script never builds one.)
+        self.assertEqual({deadline(n, []) for n in (1, 2, 25)}, {2 * hold})
+        self.assertEqual({deadline(n, bootstrap) for n in (0, 25)}, {5 * hold})
         # The longest lock-infra hold measured (2279s, the #1103 audit rep).
         self.assertGreaterEqual(hold, 2279)
 
