@@ -3472,7 +3472,7 @@ lock_acquire() { # <dir> [deadline-seconds]
     fi
   done
 }
-lock_release() { rm -f "$1/owner" 2>/dev/null; rmdir "$1" 2>/dev/null || true; }
+lock_release() { rmdir "$1" 2>/dev/null || true; }
 
 # How many cases in this run hold the given stream's lock, by writing its
 # ledger or declaring it (task_streams): 1 for an empty id or a case alone on
@@ -3841,9 +3841,6 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     fi
     while [ $(( infra_deadline - (SECONDS - infra_start) )) -gt 0 ] \
       && lock_acquire "${STATE_DIR}/lock-infra" "$(( infra_deadline - (SECONDS - infra_start) ))"; do
-      # The holder's pid (this unit's job, $! in launch_units; bash 3.2 has no
-      # BASHPID), so the fan-out can release a lock-infra its holder died with.
-      sh -c 'echo "${PPID}"' > "${STATE_DIR}/lock-infra/owner" 2>/dev/null || true
       if [ -z "${state_lock}" ] || mkdir "${STATE_DIR}/lock-state-${state_lock}" 2>/dev/null; then
         infra_held="true"
         break
@@ -4115,21 +4112,6 @@ INFRA_IN_FLIGHT_MAX=2
 # is held back in the queue and the next unit that does not take the lock gets
 # the slot; the held one launches as soon as a lock taker's job ends. Queue
 # order is otherwise unchanged.
-#
-# A lock-infra whose holder (its owner file, written by run_one_unit) is no
-# longer running was left by a unit that died holding it (lock_release never
-# ran), so it is released here, while units are still queued and after, until
-# no lock taker is left. Before, every waiter ran out INFRA_LOCK_DEADLINE
-# side by side; with lock takers launched one or two at a time each would
-# otherwise wait it out in turn.
-release_stale_infra_lock() { # <running job pids, space-padded>
-  local owner
-  owner="$(cat "${STATE_DIR:-/nonexistent}/lock-infra/owner" 2>/dev/null || true)"
-  case "${owner}" in ''|*[!0-9]*) return 0 ;; esac
-  case "$1" in *" ${owner} "*) return 0 ;; esac
-  echo "WARNING: lock-infra is held by ${owner}, which is no longer running; releasing it" >&2
-  lock_release "${STATE_DIR}/lock-infra"
-}
 
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
@@ -4150,7 +4132,6 @@ EOF_UNIT_QUEUE
     for pid in ${infra_pids}; do
       case "${running}" in *" ${pid} "*) alive="${alive} ${pid}" ;; esac
     done
-    release_stale_infra_lock "${running}"
     infra_pids="${alive}"
     pick=""
     for i in "${!pending[@]}"; do
@@ -4181,19 +4162,6 @@ EOF_UNIT_QUEUE
     if unit_takes_infra_lock "${IDX}"; then
       infra_pids="${infra_pids} $!"
     fi
-  done
-  # Every unit is launched; keep watching for a dead holder while lock takers
-  # may still be queued on lock-infra. The caller waits for the rest.
-  while :; do
-    running=" $(jobs -rp | tr '\n' ' ') "
-    alive=""
-    for pid in ${infra_pids}; do
-      case "${running}" in *" ${pid} "*) alive="${alive} ${pid}" ;; esac
-    done
-    infra_pids="${alive}"
-    [ -n "${infra_pids}" ] || break
-    release_stale_infra_lock "${running}"
-    sleep 3
   done
 }
 
