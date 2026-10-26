@@ -3393,20 +3393,22 @@ for TASK in "${TASKS[@]}"; do
 done
 
 # How long a stack-bearing unit waits for lock-infra before giving up. The
-# lock is held for a unit's whole invocation. launch_units now keeps at most
-# INFRA_IN_FLIGHT_MAX lock takers in flight, so a waiter outlasts one holder;
-# this figure was sized when every repetition-1 unit launched at once and,
-# with N stack-bearing tasks, the last waiter outlasted N-1 holders in a
-# row. Too long only slows recovery from a stall, so it stays until a
-# measured night resizes it (#3821). Then, at 1800s flat
-# the third and fourth contenders in a four-tofu nightly cannot, and which
-# one loses is the mkdir race (the #1103 presubmit run showed it at N=2, a
-# 2279s audit rep starving its sibling). 1800s a contender keeps the
-# holder-died guard the flat figure was for, scaled to the matrix; the
-# presubmit, with no stack-bearing task, keeps the flat 1800s.
+# lock is held for a unit's whole invocation, and launch_units keeps the
+# lock takers it counts to INFRA_IN_FLIGHT_MAX in flight, so a waiter outlasts
+# the holder and, at worst, one unit that slipped in ahead of it (a lock taker
+# with a state lock, which launch_units does not count): two holds, not one
+# per stack-bearing task. The longest hold is the longest devops-bench run of
+# a lock taker: 2068s (autoops-quiet-followup rep 3) in the 2026-10-24 main
+# and today nightlies, 2279s for the audit rep in the #1103 presubmit run.
+# 2300s covers both, and twice that is the deadline. It no longer scales with
+# the number of stack-bearing tasks: when lock takers launched all at once the
+# last of N had to outlast N-1 holders, and now a holder that dies holding
+# the lock costs one deadline per pair of waiters, which a per-task figure
+# would multiply.
+readonly INFRA_LOCK_LONGEST_HOLD_SECONDS=2300
 STACK_CONTENDERS=0
 for HAS in "${TASK_HAS_STACK[@]}"; do [ -n "${HAS}" ] && STACK_CONTENDERS=$((STACK_CONTENDERS + 1)); done
-INFRA_LOCK_DEADLINE=$(( 1800 * (STACK_CONTENDERS > 1 ? STACK_CONTENDERS : 1) ))
+INFRA_LOCK_DEADLINE=$(( 2 * INFRA_LOCK_LONGEST_HOLD_SECONDS ))
 echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to ${INFRA_LOCK_DEADLINE}s for lock-infra"
 
 # One unit, in a background subshell: its exports stay local, its output goes
@@ -4092,27 +4094,35 @@ unit_takes_infra_lock() { # <task-index>
   [ -n "${TASK_HAS_STACK[$1]:-}" ]
 }
 
-# How many lock-taking units may be in flight at once: one holding lock-infra
-# and one staged behind it. One alone would stall the tofu chain whenever the
-# holder waits on something other than lock-infra (its task or stream lock,
-# wait_platform_runs, a busy state lock, which sends lock-infra back to the
-# queue); two let the staged unit take lock-infra in that window, at the cost
-# of at most one slot parked on the lock.
+# Whether a unit counts toward INFRA_IN_FLIGHT_MAX: a lock taker without a
+# state lock. One with a state lock (unit_state_lock) can spend hours giving
+# lock-infra back while an exempt case holds that state, as the bootstrap
+# cases do behind oobe-first-run-audits' "onboarding"; counted, two of them
+# would fill the limit and idle lock-infra for the whole chain. Uncounted,
+# each parks its slot while it waits, as every lock taker did before.
+unit_counts_toward_infra_limit() { # <task-index>
+  unit_takes_infra_lock "$1" && [ -z "$(unit_state_lock "${TASK_NAMES[$1]}")" ]
+}
+
+# How many counted lock takers may be in flight at once: one holding
+# lock-infra and one staged behind it. One alone would stall the tofu chain
+# whenever the holder waits on something other than lock-infra (its task or
+# stream lock, wait_platform_runs); two let the staged unit take lock-infra
+# in that window, at the cost of at most one slot parked on the lock.
 INFRA_IN_FLIGHT_MAX=2
 
 # One phase's units, launched in queue order at the given parallelism, each
 # after the given pause. The caller `wait`s between phases; UNIT_SEQ carries
 # across them.
 #
-# Lock-taking units are limited to INFRA_IN_FLIGHT_MAX in flight (#3384). The
+# Counted lock takers are limited to INFRA_IN_FLIGHT_MAX in flight (#3384). The
 # lock lets one run anyway, and before this every free slot went to the next
 # queued unit, so stack-bearing units piled up in slots waiting for lock-infra,
 # doing nothing: on 2026-10-24 the main nightly's waits held 25.7 of its ~70
-# slot-hours and it ran out of time (#3821). Past the limit, a lock-taking unit
-# is held back in the queue and the next unit that does not take the lock gets
-# the slot; the held one launches as soon as a lock taker's job ends. Queue
+# slot-hours and it ran out of time (#3821). Past the limit, a counted lock
+# taker is held back in the queue and the next unit that is not one gets the
+# slot; the held one launches as soon as a counted lock taker's job ends. Queue
 # order is otherwise unchanged.
-
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
   local pending=() line i pick running pid alive infra_pids=""
@@ -4125,7 +4135,7 @@ EOF_UNIT_QUEUE
     while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
       sleep 3
     done
-    # The lock takers still running. `jobs` keeps the job table inside a
+    # The counted lock takers still running. `jobs` keeps the job table inside a
     # command substitution, as the slot count above relies on.
     running=" $(jobs -rp | tr '\n' ' ') "
     alive=""
@@ -4136,13 +4146,13 @@ EOF_UNIT_QUEUE
     pick=""
     for i in "${!pending[@]}"; do
       read -r REP _COST IDX <<<"${pending[i]}"
-      if ! unit_takes_infra_lock "${IDX}" || [ "$(printf '%s\n' ${infra_pids} | grep -c .)" -lt "${INFRA_IN_FLIGHT_MAX}" ]; then
+      if ! unit_counts_toward_infra_limit "${IDX}" || [ "$(printf '%s\n' ${infra_pids} | grep -c .)" -lt "${INFRA_IN_FLIGHT_MAX}" ]; then
         pick="${i}"
         break
       fi
     done
     if [ -z "${pick}" ]; then
-      # Only lock-taking units are left and the limit is in flight: wait.
+      # Only counted lock takers are left and the limit is in flight: wait.
       sleep 3
       continue
     fi
@@ -4159,7 +4169,7 @@ EOF_UNIT_QUEUE
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
-    if unit_takes_infra_lock "${IDX}"; then
+    if unit_counts_toward_infra_limit "${IDX}"; then
       infra_pids="${infra_pids} $!"
     fi
   done

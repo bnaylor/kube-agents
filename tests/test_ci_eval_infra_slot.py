@@ -47,37 +47,54 @@ _HARNESS = r"""
 set -euo pipefail
 LOG="$1"; LOCK="$2/lock-infra"
 # Task table: index -> name, stack flag, how long the run takes (seconds).
-TASK_NAMES=(stack-a stack-b stack-c plain-1 plain-2 plain-3 plain-4 plain-5 plain-6 oobe-first-run-audits stack-stalls)
+TASK_NAMES=(stack-a stack-b stack-c plain-1 plain-2 plain-3 plain-4 plain-5 plain-6 oobe-first-run-audits stack-stalls bootstrap-discovery-fanout bootstrap-inventory-posture-scope stack-dies)
 # As the script builds it: "true" only for a stack off infra_lock_exempt, so the
 # exempt oobe-first-run-audits is empty.
-TASK_HAS_STACK=(true true true "" "" "" "" "" "" "" true)
-RUN_SECONDS=(1.0 1.0 1.0 0.6 0.6 0.6 0.6 0.6 0.6 0.4 0.4)
+TASK_HAS_STACK=(true true true "" "" "" "" "" "" "" true true true true)
+RUN_SECONDS=(1.0 1.0 1.0 0.6 0.6 0.6 0.6 0.6 0.6 3.0 0.4 0.3 0.3 0.3)
 # Before it queues on lock-infra: stack-stalls waits 2s on something else (a
-# busy task, stream or state lock).
-PRE_SECONDS=(0 0 0 0 0 0 0 0 0 0 2.0)
+# busy task or stream lock).
+PRE_SECONDS=(0 0 0 0 0 0 0 0 0 0 2.0 0 0 0)
+# How long a waiter tries for lock-infra before it gives up (the stub's
+# INFRA_LOCK_DEADLINE), in 0.05s tries.
+GIVEUP_TRIES="${GIVEUP_TRIES:-200}"
 STATE_DIR="$2"
 TASKS=("${TASK_NAMES[@]}"); TASK_REUSE=(); TASK_STREAMS=()
 for i in "${!TASK_NAMES[@]}"; do TASK_REUSE[i]=""; TASK_STREAMS[i]=""; done
 EVAL_REPETITIONS=1
 now() { python3 -c 'import time; print(f"{time.monotonic():.3f}")'; }
+# As run_one_unit does: a unit off lock-infra with a state lock waits for the
+# state; a lock taker with one takes lock-infra, tries the state once, and
+# gives lock-infra back while the state is busy; stack-dies exits holding
+# lock-infra, as a unit killed mid-run would.
 run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <streams>
-  local name="$2" start got i
+  local name="$2" start got i state tries=0
   start="$(now)"
   for i in "${!TASK_NAMES[@]}"; do
     if [ "${TASK_NAMES[i]}" = "${name}" ]; then break; fi
   done
+  state="$(unit_state_lock "${name}")"
   got="${start}"
   /bin/sleep "${PRE_SECONDS[i]}"
+  if [ -z "$5" ] && [ -n "${state}" ]; then
+    until mkdir "${STATE_DIR}/lock-state-${state}" 2>/dev/null; do /bin/sleep 0.05; done
+  fi
   if [ -n "$5" ]; then
-    local tries=0
-    until mkdir "${LOCK}" 2>/dev/null; do
+    while :; do
+      if mkdir "${LOCK}" 2>/dev/null; then
+        if [ -z "${state}" ] || mkdir "${STATE_DIR}/lock-state-${state}" 2>/dev/null; then break; fi
+        rmdir "${LOCK}"
+      fi
       /bin/sleep 0.05; tries=$((tries + 1))
-      if [ "${tries}" -ge 200 ]; then echo "${name} gaveup 0 0" >> "${LOG}"; return 0; fi
+      if [ "${tries}" -ge "${GIVEUP_TRIES}" ]; then
+        printf '%s gaveup %s %s\n' "${name}" "${start}" "$(now)" >> "${LOG}"; return 0
+      fi
     done
     got="$(now)"
   fi
   /bin/sleep "${RUN_SECONDS[i]}"
-  if [ -n "$5" ]; then rmdir "${LOCK}"; fi
+  if [ -n "$5" ] && [ "${name}" != "stack-dies" ]; then rmdir "${LOCK}"; fi
+  if [ -n "${state}" ]; then rmdir "${STATE_DIR}/lock-state-${state}"; fi
   # One write per unit, under 512 bytes, so concurrent appends stay whole lines.
   printf '%s %s %s %s\n' "${name}" "${start}" "${got}" "$(now)" >> "${LOG}"
 }
@@ -87,7 +104,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <stre
 class InfraSlotTest(unittest.TestCase):
     maxDiff = None
 
-    def _run(self, queue_indexes, parallelism):
+    def _run(self, queue_indexes, parallelism, giveup_tries=200):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)
             log = tmpdir / "units.log"
@@ -99,24 +116,27 @@ class InfraSlotTest(unittest.TestCase):
             fake_sleep.chmod(0o755)
             script = "\n".join([
                 _HARNESS,
+                _function("unit_state_lock"),
                 _function("unit_takes_infra_lock"),
+                _function("unit_counts_toward_infra_limit"),
                 _extract_line(r"^INFRA_IN_FLIGHT_MAX=\d+$"),
                 _function("launch_units"),
                 "QUEUE=\"$(printf '1 0 %s\\n' " + " ".join(str(i) for i in queue_indexes) + ")\"",
                 f'launch_units "${{QUEUE}}" {parallelism} 0 > /dev/null',
                 "wait",
             ])
-            env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+            env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}", GIVEUP_TRIES=str(giveup_tries))
             result = subprocess.run(
                 ["bash", "-c", script, "harness", str(log), str(tmpdir)],
                 capture_output=True, text=True, timeout=120, env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = []
+            self.gave_up = {}
             for line in log.read_text().splitlines():
                 name, start, got, end = line.split()
                 if start == "gaveup":
-                    rows.append((name, None, None, None))
+                    self.gave_up[name] = (float(got), float(end))
                     continue
                 rows.append((name, float(start), float(got), float(end)))
             return rows
@@ -146,10 +166,14 @@ class InfraSlotTest(unittest.TestCase):
         self.assertLessEqual(peak, 2)
 
     def test_the_freed_slots_go_to_units_that_do_not_take_the_lock(self):
+        # Four slots and three stack units at the head of the queue: before
+        # this rule the third stack unit took the fourth slot's neighbour and
+        # one plain unit started at once; now the third waits in the queue
+        # and two plain units start at once.
         rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4)
-        first_stack_end = min(end for name, _, _, end in rows if name.startswith("stack-"))
-        started_meanwhile = [name for name, start, _, _ in rows if name.startswith("plain-") and start < first_stack_end]
-        self.assertGreaterEqual(len(started_meanwhile), 2, f"only {started_meanwhile} started while the first stack unit ran")
+        first = min(start for _, start, _, _ in rows)
+        at_once = [name for name, start, _, _ in rows if name.startswith("plain-") and start < first + 0.3]
+        self.assertGreaterEqual(len(at_once), 2, f"only {at_once} started with the first units")
 
     def test_a_holder_waiting_on_another_lock_does_not_stall_the_chain(self):
         # stack-stalls is in flight but waits 2s on something else before it
@@ -175,6 +199,52 @@ class InfraSlotTest(unittest.TestCase):
         ends = {name: end for name, _, _, end in rows}
         self.assertLess(starts["oobe-first-run-audits"], ends["stack-a"])
 
+
+    def test_lock_takers_waiting_on_a_busy_state_lock_do_not_hold_up_the_chain(self):
+        # oobe-first-run-audits (exempt) holds "onboarding" for 3s; both
+        # bootstrap units take lock-infra, find the state busy and give it
+        # back. Counted, they would fill the limit and stack-a would wait for
+        # oobe; uncounted, stack-a runs at once.
+        rows = self._run([9, 11, 12, 0], parallelism=6)
+        start = {name: s for name, s, _, _ in rows}
+        got = {name: g for name, _, g, _ in rows}
+        end = {name: e for name, _, _, e in rows}
+        self.assertEqual(self.gave_up, {})
+        self.assertLess(got["stack-a"], end["oobe-first-run-audits"], "the tofu chain waited for oobe's state lock")
+        self.assertLess(start["stack-a"] - start["oobe-first-run-audits"], 1.0)
+
+    def test_a_dead_holder_costs_one_deadline_per_pair_of_waiters(self):
+        # stack-dies exits holding lock-infra and nothing releases it. The
+        # three units behind it wait two at a time (the second launches once
+        # stack-dies' job ends), each gives up after the stub's deadline (~1s),
+        # and the third launches as one of the pair ends: two deadlines in
+        # all, not one per waiter.
+        self._run([13, 0, 1, 2], parallelism=6, giveup_tries=20)
+        self.assertEqual(set(self.gave_up), {"stack-a", "stack-b", "stack-c"})
+        starts = sorted(s for s, _ in self.gave_up.values())
+        ends = sorted(e for _, e in self.gave_up.values())
+        self.assertLess(starts[1], ends[0], "the first two waiters were not in flight together")
+        self.assertGreater(starts[2], ends[0] - 0.2, "the third waiter launched before a pair ended")
+        self.assertLess(ends[2] - starts[0], 3.5)
+
+    def test_the_infra_lock_deadline_does_not_scale_with_stack_bearing_tasks(self):
+        # A waiter outlasts at most two holds, however many stack-bearing
+        # tasks the run has; a per-task figure would multiply what a dead
+        # holder costs (one deadline per pair of waiters).
+        text = _CI_EVAL_PR.read_text(encoding="utf-8")
+        hold = int(re.search(r"^readonly INFRA_LOCK_LONGEST_HOLD_SECONDS=(\d+)$", text, re.M).group(1))
+        block = re.search(r"^STACK_CONTENDERS=0\n.*?^INFRA_LOCK_DEADLINE=.*?\n", text, re.S | re.M).group(0)
+        deadlines = set()
+        for n in (0, 2, 25):
+            flags = " ".join(["true"] * n)
+            out = subprocess.run(
+                ["bash", "-c", f"INFRA_LOCK_LONGEST_HOLD_SECONDS={hold}; TASK_HAS_STACK=({flags})\n{block}echo $INFRA_LOCK_DEADLINE"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            deadlines.add(int(out))
+        self.assertEqual(deadlines, {2 * hold})
+        # The longest lock-infra hold measured (2279s, the #1103 audit rep).
+        self.assertGreaterEqual(hold, 2279)
 
 if __name__ == "__main__":
     unittest.main()
