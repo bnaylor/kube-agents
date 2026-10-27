@@ -678,6 +678,8 @@ func TestRapidCallsDoNotFillTheTopicCaps(t *testing.T) {
 type fakeTopicsBus struct {
 	mu       sync.Mutex
 	lists    int
+	reads    int
+	listErrs []error // returned by the first lists, in order
 	problems []string
 	ctxErr   error
 	deadline time.Duration
@@ -691,11 +693,20 @@ func (f *fakeTopicsBus) ListTopics(ctx context.Context) (TopicList, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		f.deadline = time.Until(dl)
 	}
+	if len(f.listErrs) > 0 {
+		err := f.listErrs[0]
+		f.listErrs = f.listErrs[1:]
+		return TopicList{}, err
+	}
 	return TopicList{Problems: f.problems}, nil
 }
 
+// ReadTopic always fails, and counts the attempts.
 func (f *fakeTopicsBus) ReadTopic(context.Context, string) (TopicRead, error) {
-	return TopicRead{}, errors.New("not used")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	return TopicRead{}, errors.New("stream TOPICS-STATE: read timed out")
 }
 
 func (f *fakeTopicsBus) AgentCards(context.Context) (map[string]AgentCard, error) {
@@ -766,8 +777,8 @@ func TestAReadOutlivesItsCaller(t *testing.T) {
 	}
 }
 
-// A card read that failed before its first card says so, and is not kept; it
-// does not claim the directory is empty.
+// A card read that failed before its first card says so, and is kept for the
+// window like a list with problems; it does not claim the directory is empty.
 func TestAFailedTopicsCardReadIsNotNoCards(t *testing.T) {
 	text, err := readTopicsTool(&fakeTopicsBus{}, time.Now).Call(context.Background(), []byte(`{"action":"cards"}`))
 	if err != nil {
@@ -850,4 +861,79 @@ func TestAListCutShortShowsTopicsAsNotRead(t *testing.T) {
 	}
 	mustContain(t, FormatTopicsMarkdown(l), "_not read; see Problems_", "stream "+lib.StreamTopicsState)
 	slotsFree(t, b)
+}
+
+// A list made while every reader slot is busy is refused with errReadersBusy,
+// not answered with every topic "not read", and opens no consumer.
+func TestAListWithEverySlotHeldIsRefused(t *testing.T) {
+	b, js := topicBus(t, topicStreamMaxConsumers)
+	publishTopic(t, js, subjBlueprint, "bp", nil)
+	publishTopic(t, js, subjAnnotations, "an", nil)
+	var held []func(bool)
+	for i := 0; i < maxTaskReaders; i++ {
+		release, err := b.readerSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, release)
+	}
+	l, err := b.ListTopics(context.Background())
+	if !errors.Is(err, errReadersBusy) {
+		t.Fatalf("list with every slot held: %v (%+v), want errReadersBusy", err, l)
+	}
+	for _, s := range []string{lib.StreamTopicsState, lib.StreamTopicsJournal} {
+		if got := topicConsumers(t, js, s); got != 0 {
+			t.Errorf("%s: %d consumers opened, want 0", s, got)
+		}
+	}
+	for _, release := range held {
+		release(false)
+	}
+}
+
+// A busy refusal is not kept: the next list, once a slot is free, reads again
+// rather than serving the refusal for the cache window.
+func TestABusyListIsNotKept(t *testing.T) {
+	f := &fakeTopicsBus{listErrs: []error{errReadersBusy}}
+	tool := readTopicsTool(f, time.Now)
+	if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); !errors.Is(err, errReadersBusy) {
+		t.Fatalf("first list: %v, want errReadersBusy", err)
+	}
+	if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
+		t.Fatalf("second list: %v", err)
+	}
+	if f.lists != 2 {
+		t.Errorf("lists = %d, want 2: the refusal was kept", f.lists)
+	}
+}
+
+// A failed topic read is not kept: two calls read twice.
+func TestAFailedTopicReadIsNotKept(t *testing.T) {
+	f := &fakeTopicsBus{}
+	tool := readTopicsTool(f, time.Now)
+	for i := 0; i < 2; i++ {
+		if _, err := tool.Call(context.Background(), []byte(`{"action":"read","topic":"blueprint"}`)); err == nil {
+			t.Fatalf("call %d: want the read's error", i+1)
+		}
+	}
+	if f.reads != 2 {
+		t.Errorf("reads = %d, want 2: the failure was kept", f.reads)
+	}
+}
+
+// A state topic that was never written, in a stream that holds others, reads
+// as empty and opens no consumer.
+func TestAnEmptyStateTopicOpensNoConsumer(t *testing.T) {
+	b, js := topicBus(t, topicStreamMaxConsumers)
+	publishTopic(t, js, subjBlueprint, "bp", nil)
+	r, err := b.ReadTopic(context.Background(), "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Entries) != 0 {
+		t.Errorf("entries = %+v, want none", r.Entries)
+	}
+	if got := topicConsumers(t, js, lib.StreamTopicsState); got != 0 {
+		t.Errorf("%d consumers opened for a topic with no entries, want 0", got)
+	}
 }

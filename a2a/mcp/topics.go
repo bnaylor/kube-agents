@@ -309,6 +309,11 @@ func (b *NATSBus) ListTopics(ctx context.Context) (TopicList, error) {
 				unreadable[msg.Subject()] = true
 			}
 		})
+		if errors.Is(err, errReadersBusy) {
+			// Refused, not read: an error is never kept, where a Problem would
+			// be served for the cache window after the pool frees up.
+			return TopicList{}, err
+		}
 		if err != nil {
 			out.Problems = append(out.Problems, fmt.Sprintf("stream %s: %v", name, err))
 			notRead[name] = true
@@ -348,6 +353,17 @@ func (b *NATSBus) ReadTopic(ctx context.Context, name string) (TopicRead, error)
 	st := s.CachedInfo().State
 	if st.Msgs == 0 {
 		return r, nil
+	}
+	if e.Class != topicClassJournal {
+		// A state topic that was never written, in a stream that holds
+		// others, costs no consumer or reader slot.
+		info, err := s.Info(ctx, jetstream.WithSubjectFilter(e.Subject))
+		if err != nil {
+			return r, err
+		}
+		if info.State.Subjects[e.Subject] == 0 {
+			return r, nil
+		}
 	}
 	cfg := jetstream.ConsumerConfig{FilterSubject: e.Subject, DeliverPolicy: jetstream.DeliverLastPerSubjectPolicy}
 	limit := 1
