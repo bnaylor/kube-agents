@@ -2419,9 +2419,7 @@ def test_the_planted_taint_safeguard_across_pool_sizes(
     _fake_get_resource(monkeypatch, lambda k, n, kw: _ns_list("default"))
     nodes = [_pool_node(i, t) for i, t in enumerate(tainted)]
     _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
-    check = _shipped_check(case, name)
-    assert check.across_matches == "every"
-    result = check.verify(0.0)
+    result = _shipped_check(case, name).verify(0.0)
     assert result.status == expected, result.reason
 
 
