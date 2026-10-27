@@ -51,23 +51,32 @@ readonly NIGHTLY_HALF_CKSUM_BIT=2
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
-# A sixth, applied on the same lane (#2079): the safeguards every case the
-# lane runs carries beside its own -- today the one that fails a repetition
-# on a GitHub write the case did not request. Appended to a copy of each
-# task file before devops-bench reads it (bench/kube_agents_bench/lane.py);
-# the files under bench/tasks/ and the api lane are untouched.
+# Its mirror (#3263): the cases every other lane does not run, because their
+# premise needs the inject door (a second message on the same conversation).
+readonly EVAL_API_LANE_EXCLUSIONS_FILE="eval/api-lane-exclusions.txt"
+# A sixth, applied on every lane despite its name (#2079, #2611): the
+# safeguards every case carries beside its own -- today the one that fails a
+# repetition on a GitHub write it made that the case did not request.
+# Appended to a copy of each task file before devops-bench reads it
+# (bench/kube_agents_bench/lane.py); the files under bench/tasks/ are
+# untouched.
 readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
 # The fan-out's launch pacing. Every unit is launched this many seconds after
 # the one before, so N units do not open their first model call in the same
 # second (burst 429s at the model quota). A unit of a case that requests a
-# pull request -- the inject lane's second phase -- waits the settle instead:
-# the lane's GitHub-write safeguard opens its window max_clock_skew_sec
-# before the repetition starts (GitHubWritesVerifier in
-# bench/kube_agents_bench/verifiers.py, whose default this equals; a test
-# pins the two), so a write in the last seconds of the unit before must be
-# older than that before the next window can open.
+# pull request -- the fan-out's second phase -- waits the settle instead:
+# the GitHub-write safeguard opens its window max_clock_skew_sec
+# before the repetition starts (the lane entry in
+# EVAL_INJECT_LANE_SAFEGUARDS_FILE sets it, and says how 30 s was measured;
+# scripts/test_ci_eval_lane_safeguards.py pins the two equal), so a write in
+# the last seconds of the unit before must be older than that before the next
+# window can open. On the 2026-10-08 presubmit each requesting unit also ran
+# 90-140 s past its last write (the delegation wait, the card's completion,
+# the checks), so the settle is not the only margin. Every second
+# here is paid once per second-phase unit: three on a presubmit, eighteen on
+# the nightly.
 readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=5
-readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
+readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=30
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -88,6 +97,24 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # STATE_DIR, holds one such record per skipped repetition.
 readonly EVAL_INFRA_FAILURE_MARKER="KUBE_AGENTS_INFRA_FAILURE"
 readonly EVAL_NOT_RUN_DIR="not-run"
+# The lease-time seeded-fleet scan (scan_lease_fixtures, after the fleet
+# kubeconfigs): hack/fleet-fixture-state.py's --report, kept as an artifact
+# under this name; the bound on the whole scan (a healthy project reads in
+# about 20 s, and every read inside it is bounded already); and the directory,
+# under STATE_DIR, where kube_agents_bench.fixture_drift writes one reason
+# file per case that needs a drifted fixture, which run_one_unit records as
+# infrastructure instead of running; and, under STATE_DIR, the list of files
+# a pull request changes, which that module reads. The hourly scan's
+# published document is copied beside the report: a role is excused only when
+# it also says the drift held on its last two scans. The lease-time scan waits
+# for a drifted role to converge as long as the pool verifier does
+# (FLEET_STATE_WAIT_SECONDS, read out of that file), on top of the bound.
+readonly EVAL_LEASE_FIXTURE_REPORT="fixture-state-lease.json"
+readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=300
+readonly EVAL_FIXTURE_STATE_PUBLISHED="gs://kube-agents-dashboards/evals/fixture-state.json"
+readonly EVAL_FIXTURE_STATE_PUBLISHED_COPY="fixture-state-published.json"
+readonly EVAL_FIXTURE_DRIFT_DIR="fixture-drift"
+readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
 readonly EVAL_TIMING_FILE="timing.json"
@@ -158,8 +185,8 @@ readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
 readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
 readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 # The round trip after the suite verdict is for a next-mode run on main: a
-# pull request's next-mode run (the merge-blocking presubmit's, or a Tide
-# batch's) skips it, since nobody reads a report-only result there and the
+# pull request's next-mode run (the merge-blocking presubmit's, or a batch's
+# that Tide ran) skips it, since nobody reads a report-only result there and the
 # today lane below proves the same path every six hours on main, and on
 # demand on a pull request.
 readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
@@ -432,7 +459,7 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # the ledger and pull-request resets close GitLab issues and merge requests
 # through hack/ci_gitlab_forge.py, and the ledger token is exported under
 # BENCH_FORGE and BENCH_GITLAB_*, the names the bench's forge-graded checks
-# and the inject lane's github_writes safeguard read, with the GitHub token
+# and the github_writes safeguard read, with the GitHub token
 # unset so nothing can read the GitHub twin repository by mistake. One token
 # pair serves the pool, in Secret Manager where the runner identities live;
 # nothing is minted per unit and nothing rotates here
@@ -887,6 +914,61 @@ write_fleet_kubeconfigs || {
 }
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
+# ─── The leased project's fixtures, in their designed state? ─────────────────
+# hack/fleet-fixture-state.py over the kubeconfigs just written, waiting for a
+# drifted role to converge as the pool verifier does, the same check the CI health bot's hourly scan runs against every
+# pool project (docs/ci-health.md, "The seeded-fleet scan"). Run here, per
+# lease, rather than read from the published fixture-state.json: that file is
+# up to an hour old in both directions, so a fixture that drifted since would
+# still red the cases on it, and one repaired since would excuse cases that
+# could have been graded. This read is of this project, now, and costs one
+# kubectl read per assertion and one describe per control-plane role.
+# Read-only: every call is a `kubectl get` through the role kubeconfigs (the
+# fleet reader's token) or a `gcloud container clusters describe` on this job's
+# own credential, which already lists the same clusters above.
+#
+# What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
+# case whose grade depends on a role the scan positively saw drifted, and the
+# hourly scan saw drifted on its last two scans (a role a
+# check reads, or the case's single `fixtures:` role), and
+# run_one_unit records that case's repetitions as infrastructure under
+# `fixture-drift:<role>` instead of running them. A role the scan could not read
+# is not drift, and a scan that fails or times out leaves no report: either way
+# every case is graded as usual and the log says why. Never fatal.
+scan_lease_fixtures() { # <report path> <published copy path>
+  local report="$1" published="$2" status=0 wait
+  local -a bound=()
+  rm -f "${report}" "${published}"
+  wait="$(sed -n 's/^FLEET_STATE_WAIT_SECONDS = \([0-9][0-9]*\)$/\1/p' "${SCRIPT_DIR}/../scripts/verify_ci_pool_project.py" 2>/dev/null || true)"
+  if [ -z "${BENCH_FLEET_KUBECONFIG_DIR:-}" ] || [ -z "${wait}" ]; then
+    echo "WARNING: no fleet kubeconfig directory, or no FLEET_STATE_WAIT_SECONDS to wait by, so the leased project's fixtures were not checked; every case is graded as usual." >&2
+    return 0
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout "$(( wait + EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS ))")
+  fi
+  gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
+  # Only a role the fresh hourly scan already holds drifted twice can be
+  # excused, so wait for convergence only then; otherwise one pass is enough.
+  if ! PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
+    wait=0
+  fi
+  ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
+    --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
+    --wait "${wait}" --report "${report}" || status=$?
+  if [ "${status}" -ne 0 ]; then
+    rm -f "${report}"
+    echo "WARNING: the lease-time fixture scan failed (exit ${status}; 124 is the bound), so nothing is known about the leased project's fixtures; every case is graded as usual." >&2
+  fi
+}
+profile_begin "fleet-fixture-state: the leased project's fixtures"
+STEP_START=$SECONDS
+mkdir -p "${ARTIFACTS:-/tmp/artifacts}"
+EVAL_LEASE_FIXTURE_REPORT_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_LEASE_FIXTURE_REPORT}"
+EVAL_FIXTURE_STATE_PUBLISHED_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_FIXTURE_STATE_PUBLISHED_COPY}"
+scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}" "${EVAL_FIXTURE_STATE_PUBLISHED_PATH}"
+echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
+
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
 # own manual sweep had already raised all 30 projects and main.tf declares the same
 # count, so the heal never fired: this job's last deliberate fleet write (#1693).
@@ -1287,7 +1369,7 @@ eval_gitops_repo() { # <project-id>
 
 eval_gitlab_project() { # <project-id>
   # The GitLab table beside it, lifted the same way; under EVAL_FORGE=gitlab
-  # this is the repository the resets and the inject lane name.
+  # this is the repository the resets and the write safeguard name.
   local body
   body="$(sed -n '/^gitlab_project_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
   [ -n "${body}" ] || return 1
@@ -1379,7 +1461,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts four), read with the YAML parser by
+# runs; oobe-first-run-audits starts five), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -2051,8 +2133,8 @@ fi
 # a pull request on a graded failure (BOOTSTRAP_ADMITTED),
 # inject-lane-exclusions.txt, read after the tier switch, is what the inject
 # lane leaves out of both (#2039), and inject-lane-safeguards.yaml, read
-# after that, is what every case on that lane carries beside its own checks
-# (#2079). The split exists
+# after that, is what every case on either lane carries beside its own
+# checks (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file and this script fall
 # through to the root approvers. Each file's header says what belongs in it;
@@ -2141,8 +2223,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14, demoted back here 2026-10-17, #3120; the
-# presubmit file's last section).
+# its roster line 2026-10-14, was demoted back here 2026-10-17, #3120, and
+# returned to the roster 2026-10-26; the presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2237,7 +2319,7 @@ esac
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
 # those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two more leased projects:
+# "main" again, so it can run as two periodics on two leased projects:
 # its length is set by the stack-bearing units, which run one at a time under
 # lock-infra, and each project has a lock of its own (#3384). The split is
 # applied after the lane step, which is what names the writers. A part
@@ -2319,30 +2401,70 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
 fi
+# The mirror (#3263): hack/eval/api-lane-exclusions.txt names the cases only
+# the inject door can carry (a stop sent as the conversation's next message,
+# bench/kube_agents_bench/stop_hook.py). Read and checked on every lane like
+# the list above; applied on every transport but inject. None of them is on
+# the blocking roster (scripts/test_eval_rosters.py), so BOOTSTRAP_ADMITTED
+# needs no drop list for them.
+API_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_API_LANE_EXCLUSIONS_FILE}"
+API_LANE_EXCLUDED="$(roster_entries "${API_LANE_EXCLUSIONS_FILE}")"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${API_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the api lane." >&2
+    exit 1
+  fi
+done <<< "${API_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_EXCLUDED}" ]; then
+  API_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: ${NAME} leaves the matrix -- it runs on the inject lane only; the reason is in ${EVAL_API_LANE_EXCLUSIONS_FILE}"
+    else
+      API_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${API_LANE_KEPT[@]+"${API_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the api lane (${EVAL_API_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
+fi
 
-# ─── The inject lane's safeguards (#2079) ────────────────────────────────────
+# ─── The lanes' safeguards (#2079) ───────────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
 # the inject door the platform persona (directly under the bridge's cli
 # executor, through a card under its default api executor) opens a pull
 # request where the chat path inlined a manifest (#2037): the first matrix run
 # through the door, under cli, left pull requests on the pool repository that
 # no case had asked for.
-# hack/eval/inject-lane-safeguards.yaml holds the entries every case on the
-# lane carries beside its own -- one, a none-wrapped `github_writes` -- and
+# hack/eval/inject-lane-safeguards.yaml holds the entries every case
+# carries beside its own -- one, a none-wrapped `github_writes` -- and
 # this step appends them to a COPY of each task file under a scratch
 # directory, `<dir>/<case>/task.yaml`, which run_one_unit hands to
 # devops-bench in place of the file under bench/tasks/ (unit_task_path). The
 # case id devops-bench records is the directory name, so it is unchanged;
 # `bench-gate case` still reads the file under bench/tasks/, and the appended
 # entry reaches it through the record's report, which is what rung 1 grades.
+# Applied on every transport, the api lane as well as the inject lane
+# (#2611), so `today` and `next` are graded against the same bar. A write
+# the safeguard charges is one the repetition's reply or creating calls name, or
+# any write in the window of a case that runs alone in the second phase
+# (GitHubWritesVerifier in bench/kube_agents_bench/verifiers.py), so a case
+# is not redded by a concurrent case's write.
 # The check reads the repository from BENCH_GITOPS_REPO, exported here from
 # the same project mapping the deploy and the ledger reset read
 # (eval_gitops_repo; EVAL_GITOPS_REPO is a local deploy's own answer), and
-# refuses to start the lane without one: a lane whose safeguard cannot name
-# its repository would grade every repetition as an errored check. Applied on
-# the inject lane only; on the api lane the copy is never made and the file
-# is read for `requesting:` alone (the second phase, below), so that lane's
-# matrix and task files stay byte for byte what they were.
+# refuses to start the run without one: a run whose safeguard cannot name
+# its repository would grade every repetition as an errored check.
+# It refuses as well, on GitHub, when the run has no read credential for
+# the check: with no EVAL_LEDGER_APP_KEY_FILE to mint one from (Prow sets
+# it; a hand-driven run usually does not), the token has to be in the
+# shell already as BENCH_GITHUB_TOKEN or GITHUB_TOKEN
+# (forges.token_env_vars), or every repetition's safeguard errors the same
+# way. Under gitlab read_gitlab_tokens has already set BENCH_GITLAB_TOKEN.
 # bench/kube_agents_bench/lane.py refuses a lane entry whose name
 # a case already declares -- devops-bench would refuse the duplicate as a
 # parse error on every repetition of that case, after the lease -- and
@@ -2351,63 +2473,73 @@ fi
 # own after every other unit (INJECT_LANE_REQUESTING, below).
 INJECT_LANE_TASKS_DIR=""
 INJECT_LANE_REQUESTING=""
+# The deploy's precedence (hack/ci-deploy.sh, section 2b): a developer's
+# EVAL_GITOPS_REPO is where the agent was told to write, so it is what the
+# safeguard reads; the project mapping otherwise. Prow refuses the
+# override at deploy time, so in CI this is the mapping.
+INJECT_LANE_REPO="${EVAL_LEDGER_REPO:-}"
+if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+  INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
+fi
+if [ -z "${INJECT_LANE_REPO}" ]; then
+  echo "ERROR: no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the run does not start." >&2
+  exit 1
+fi
+if [ "${EVAL_FORGE:-github}" = "github" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
+    && [ -z "${BENCH_GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "ERROR: no GitHub read credential: EVAL_LEDGER_APP_KEY_FILE is unset and neither BENCH_GITHUB_TOKEN nor GITHUB_TOKEN is set; the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot read the repository, so the run does not start. Export a token that can read ${INJECT_LANE_REPO} as BENCH_GITHUB_TOKEN." >&2
+  exit 1
+fi
+export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
+INJECT_LANE_TASKS_DIR="$(mktemp -d)"
+# One `<requested> <case> <copy>` line per task: how many pull requests
+# the case requests (its own checks, or the file's `requesting:` list for
+# a case the persona answers with one before its checks say so), the case,
+# and the copy's path. The cases with a non-zero count are the fan-out's
+# second phase (INJECT_LANE_REQUESTING, read where the unit queue is built):
+# they run only after every other unit has finished, so a repetition of a
+# case that requests nothing never shares the repository with a case that
+# writes by design, and the repository reset before each of them has the
+# repository to itself.
+# --gitops-repo: a repository the lane's entries pin another organisation
+# for (a local EVAL_GITOPS_REPO outside the pool's) is refused here, before
+# the lease, rather than erroring the safeguard on every repetition.
+if ! INJECT_LANE_COPIES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
+    --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" \
+    --gitops-repo "${INJECT_LANE_REPO}" \
+    --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}")"; then
+  echo "ERROR: could not append the lane safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix, or BENCH_GITOPS_REPO=${INJECT_LANE_REPO} is not a repository they can grade (above); the run would go without a working GitHub-write safeguard, so it does not start." >&2
+  exit 1
+fi
+# `<requested> <case> <path>`: the count first and the path last, so a
+# path with a space (a TMPDIR with one) cannot shift the fields read here.
+INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
+# The settle before each writer unit is the safeguard's window: a write
+# in the last seconds of the unit before must be older than it.
+WRITER_LAUNCH_PAUSE="${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
+echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries the lane safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit, each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
+# The stopped asks in the matrix (a prompt opening with the harness's stop
+# directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
+# carries one) run in the same second phase although they request no pull
+# request: a stop that fails leaves its card to open a pull request mid-run,
+# which in the first phase lands in the window of every case beside it,
+# where the write safeguard charges it only if the stopped ask names it.
+# Alone in the second phase, whose window the lane marks exclusive
+# (bench/kube_agents_bench/lane.py), a failed stop reds itself whether or
+# not it names the write, and reds only itself.
+# Read from the prompt, as the harness reads it, not from
+# api-lane-exclusions.txt, which may come to list door-only cases of other
+# kinds.
+STOPPED_ASK_CASES=""
 if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
-  # The deploy's precedence (hack/ci-deploy.sh, section 2b): a developer's
-  # EVAL_GITOPS_REPO is where the agent was told to write, so it is what the
-  # safeguard reads; the project mapping otherwise. Prow refuses the
-  # override at deploy time, so in CI this is the mapping.
-  INJECT_LANE_REPO="${EVAL_LEDGER_REPO:-}"
-  if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
-    INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
-  fi
-  if [ -z "${INJECT_LANE_REPO}" ]; then
-    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the lane's write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
+  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
     exit 1
   fi
-  export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
-  INJECT_LANE_TASKS_DIR="$(mktemp -d)"
-  # One `<requested> <case> <copy>` line per task: how many pull requests
-  # the case requests (its own checks, or the file's `requesting:` list for
-  # a case the persona answers with one before its checks say so), the case,
-  # and the copy's path. The cases with a
-  # non-zero count are the fan-out's second phase (INJECT_LANE_REQUESTING,
-  # read where the unit queue is built): writes are dated, not signed, so
-  # they run only after every other unit has finished, and a repetition of a
-  # case that requests nothing never shares the repository with a case that
-  # writes by design.
-  # --gitops-repo: a repository the lane's entries pin another organisation
-  # for (a local EVAL_GITOPS_REPO outside the pool's) is refused here, before
-  # the lease, rather than erroring the safeguard on every repetition.
-  if ! INJECT_LANE_COPIES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
-      --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" \
-      --gitops-repo "${INJECT_LANE_REPO}" \
-      --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}")"; then
-    echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix, or BENCH_GITOPS_REPO=${INJECT_LANE_REPO} is not a repository they can grade (above); the lane would run without a working GitHub-write safeguard, so it does not start." >&2
-    exit 1
-  fi
-  # `<requested> <case> <path>`: the count first and the path last, so a
-  # path with a space (a TMPDIR with one) cannot shift the fields read here.
-  INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
-  # The settle before each writer unit is the safeguard's window: a write
-  # in the last seconds of the unit before must be older than it.
-  WRITER_LAUNCH_PAUSE="${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
-  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit: ${INJECT_LANE_REQUESTING:-none}"
-else
-  # The api lane runs the same second phase, for the reset's sake rather than
-  # the safeguard's: reset_agent_pulls empties the repository before each
-  # unit of a case that requests a pull request, which is only safe when no
-  # other unit is writing to it. Same list, read from the same files (the
-  # lane file's `requesting:` included, so the file must parse here too), no
-  # copies made; the task files under bench/tasks/ run as they are. No window
-  # to settle, so the writer units keep the launch stagger.
-  WRITER_LAUNCH_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
-  if ! INJECT_LANE_REQUESTING="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
-      --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" --list-requesting "${TASKS[@]}" \
-      | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"; then
-    echo "ERROR: could not read which cases request a pull request (kube_agents_bench.lane --list-requesting, above); the fan-out cannot order them after every other unit, so the run does not start." >&2
-    exit 1
-  fi
-  echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
+fi
+if [ -n "${STOPPED_ASK_CASES}" ]; then
+  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -2505,7 +2637,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -2709,7 +2841,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # launches early and was never the last unit in 385 recorded runs). Only a
 # repetition at its 1929s maximum could be the last unit, by minutes. The
 # first runs of the fourteen-case matrix measure it, and until they have,
-# this is the projection. No Prow deadline change.
+# this is the projection. No Prow deadline change. (That was before #2260
+# moved the cases that request a pull request into a serial second phase;
+# since its return to the roster on 2026-10-26 it runs there, after every
+# other unit: unit_cost_hint has the cost.)
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -2881,7 +3016,8 @@ fi
 
 # The GitLab lane's list may hold no roster case (it held none from
 # pdb-remediation-pr's demotion of 2026-10-17, #3120, until
-# vcs-spent-branch-reuse's roster line of 2026-10-23), which empties the export by design, like a nightly part: said
+# vcs-spent-branch-reuse's roster line of 2026-10-23; pdb-remediation-pr's
+# returned 2026-10-26), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3019,6 +3155,9 @@ unit_cost_hint() {
     # measured 7-11 minutes a repetition on a dev install.
     gitops-drift-deleted-policy-triage) echo 900 ;;
     gitops-drift-load-bearing-change-triage) echo 900 ;;
+    # The same shape with a namespace as the subject (#3972). Unmeasured;
+    # priced with its siblings.
+    gitops-drift-unmanaged-object-triage) echo 900 ;;
     # The autoops-incident stack at three replicas, on the infra lock, and a
     # board read. Unmeasured; priced with autoops-warning-event-triage.
     incident-triage-workload-fold) echo 900 ;;
@@ -3051,12 +3190,19 @@ unit_cost_hint() {
     # autoops-warning-event-triage, the same plant-then-card shape, so it
     # launches early in its round rather than last at the default.
     autoops-warning-event-no-action-triage) echo 900 ;;
-    # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
-    # planted-pdb's 962s the one clean measurement. Priced with the 900 band
-    # so a nightly run launches them first. fleet-cost-idle-pool joined the
-    # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
+    # The full audits: 600-1300s a repetition on 2026-08-26, planted-pdb's
+    # 962s the one clean measurement. Priced with the 900 band so a nightly
+    # run launches them first. fleet-cost-idle-pool joined the nightly
+    # 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
-    upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
+    upgrade-readiness-lagging-cluster) echo 900 ;;
+    # On the blocking roster since 2026-10-26. Measured on the claude-opus-5-5
+    # main nightlies 2026-10-20 to 10-26: median 198s, 165-397s over 14
+    # repetitions. Priced at 600s, the floor scripts/test_ci_eval_nightly.py's
+    # audit-band test allows, rather than 900: the hint still launches it early
+    # in each round, and the presubmit wall estimate in
+    # scripts/eval_rosters.py (#3987) is priced from these hints.
+    consistency-drift-outlier) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
     # Not measured yet: the same stream as the case above, plus a stack that
     # opens the ledger, so it takes that case's hint until its record says
@@ -3111,17 +3257,20 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Nightly-only since 2026-10-17 (demoted on #3120); on the roster 2026-10-14
-    # to then (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
+    # On the roster again since 2026-10-26, after #3145; nightly-only
+    # 2026-10-17 to then (demoted on #3120); on the roster 2026-10-14 to
+    # 2026-10-17 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
     # to 2026-09-28. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
     # August); median of the September run, kept although the four graded
     # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
-    # under pull_request_opened says otherwise. While in the presubmit it was
-    # the largest hint, so it launched first in each repetition round; its
-    # three repetitions serialize on the task lock, ~62min at the hint and
-    # ~96min at the measured maximum.
+    # under pull_request_opened says otherwise. It requests a pull request, so
+    # since #2260 it runs in the second phase (unit_phase), one unit at a time
+    # after every other unit, and the hint orders it only among that phase's
+    # units (ahead of vcs-spent-branch-reuse's 1000 in each repetition round,
+    # which changes no total: the phase is serial). The writers nightlies
+    # since #3145 measured 142-265s a repetition.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -3130,7 +3279,7 @@ unit_cost_hint() {
     # Not measured yet: the same stream and stack shape as the case above, so
     # it takes that case's hint until its nightly record says otherwise.
     fleet-audit-clean-close-reads-clean) echo 1450 ;;
-    autoops-crashloop-config-triage) echo 900 ;;
+    autoops-crashloop-config-triage | autoops-missing-service-triage) echo 900 ;;
     # Nightly-only since 2026-10-21 (demoted on #3598).
     consistency-authorized-networks-probe) echo 300 ;;
     # Median of its 1155 presubmit repetitions 2026-09-04 to 09-15 (p10 248s,
@@ -3171,6 +3320,12 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Next-lane nightly only (api-lane-exclusions.txt). The opening turn files
+    # a card, then the harness sends `stop` and waits out the prompt's
+    # observe=900 window (stop_hook.py), so a repetition is never under 900s;
+    # priced in that band so a deadline cut does not take it first.
+    # Unmeasured until its first nights.
+    chat-stop-halts-delegated-remediation) echo 1100 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -3222,6 +3377,12 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # The upgrade retrospective's cases: each holds the stream, and a
+    # fleet-wide question with a stale report is a full collector run over the
+    # seeded fleet. 540s and 360s a red repetition on a dev install
+    # (2026-10-15); priced at the audit band's floor. The six after-upgrade
+    # cases ask the same fleet-wide question and take the same price.
+    upgrades-retrospective-on-demand | upgrades-retrospective-drained-budget) echo 600 ;;
     # Nightly-only since #3524. One of the five readiness-line cases of that
     # change, each the same read-only run (three project list reads, the
     # server config per location, the per-member kubectl reads); unmeasured.
@@ -3230,6 +3391,10 @@ unit_cost_hint() {
     # the default is cut from this tier rather than from all five; the four
     # siblings pack at the default until the nightly record prices them.
     upgrades-audit-control-plane-capacity) echo 600 ;;
+    upgrades-retrospective-cgroup-blind-runtime | upgrades-retrospective-cuda-pinned-gpu-job) echo 600 ;;
+    upgrades-retrospective-failclosed-webhook | upgrades-retrospective-multi-process-container) echo 600 ;;
+    upgrades-retrospective-network-policy-enforcement | upgrades-retrospective-stale-client-skew) echo 600 ;;
+    upgrades-retrospective-log-volume-gate | upgrades-rollout-family-held-by-canary-gate) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -3322,18 +3487,29 @@ for TASK in "${TASKS[@]}"; do
   fi
 done
 
-# How long a stack-bearing unit waits for lock-infra before giving up. The
-# lock is held for a unit's whole invocation and the queue launches every
-# repetition-1 unit within the first few lanes, so with N stack-bearing
-# tasks the last waiter has to outlast N-1 holders in a row: at 1800s flat
-# the third and fourth contenders in a four-tofu nightly cannot, and which
-# one loses is the mkdir race (the #1103 presubmit run showed it at N=2, a
-# 2279s audit rep starving its sibling). 1800s a contender keeps the
-# holder-died guard the flat figure was for, scaled to the matrix; the
-# presubmit, with no stack-bearing task, keeps the flat 1800s.
+# How long a stack-bearing unit waits for lock-infra before giving up, in
+# holds. The lock is held for a unit's whole invocation, and launch_units
+# keeps the lock takers it counts to INFRA_IN_FLIGHT_MAX in flight, so a
+# counted waiter outlasts the holder, the other counted unit, and every lock
+# taker with a state lock (which launch_units does not count): each release
+# is a mkdir race, and one of those can win it each time, one after another.
+# So two holds plus one per state-lock lock-taking task, not one per
+# stack-bearing task. The longest hold is the longest devops-bench run of a
+# lock taker: 2068s (autoops-quiet-followup rep 3) in the 2026-10-24
+# ci-kube-agents-eval-nightly and ci-kube-agents-eval-nightly-today runs,
+# 2279s for the audit rep in the #1103 presubmit run; 2300s covers both. With
+# the three bootstrap cases that is 5 x 2300s; without them, 2 x 2300s. A
+# holder that dies holding the lock costs one deadline per pair of waiters
+# (lock_release never ran, and nothing frees it), which the old figure of
+# 1800s per stack-bearing task multiplied.
+readonly INFRA_LOCK_LONGEST_HOLD_SECONDS=2300
 STACK_CONTENDERS=0
 for HAS in "${TASK_HAS_STACK[@]}"; do [ -n "${HAS}" ] && STACK_CONTENDERS=$((STACK_CONTENDERS + 1)); done
-INFRA_LOCK_DEADLINE=$(( 1800 * (STACK_CONTENDERS > 1 ? STACK_CONTENDERS : 1) ))
+STATE_LOCK_TAKERS=0
+for i in "${!TASK_HAS_STACK[@]}"; do
+  [ -n "${TASK_HAS_STACK[i]}" ] && [ -n "$(unit_state_lock "${TASK_NAMES[i]}")" ] && STATE_LOCK_TAKERS=$((STATE_LOCK_TAKERS + 1))
+done
+INFRA_LOCK_DEADLINE=$(( (2 + STATE_LOCK_TAKERS) * INFRA_LOCK_LONGEST_HOLD_SECONDS ))
 echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to ${INFRA_LOCK_DEADLINE}s for lock-infra"
 
 # One unit, in a background subshell: its exports stay local, its output goes
@@ -3344,6 +3520,38 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # verification wholesale (evalharness/default.py, "skipped_no_infra") and
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
+
+# The cases that need a fixture the lease-time scan saw drifted
+# (scan_lease_fixtures): one reason file each under EVAL_FIXTURE_DRIFT_DIR,
+# read by run_one_unit. The module grades every case as usual, and says so,
+# when the report is missing or unreadable; a failure to run it at all does
+# the same here. On a run that merges a change onto a base -- a presubmit
+# (PULL_NUMBER), a Tide batch (JOB_TYPE=batch, every pull of the batch merged
+# onto PULL_BASE_SHA, no PULL_NUMBER), or anything else carrying PULL_BASE_SHA
+# (a postsubmit's diff is empty) -- it is handed the files the change edits
+# (PULL_BASE_SHA to the merged HEAD clonerefs checked out), so a change to
+# what decides drift, or to a case, cannot excuse a case; such a run whose
+# file list cannot be read excuses nothing. Only a periodic, which carries
+# none of the three, maps without a list.
+FIXTURE_DRIFT_DIR="${STATE_DIR}/${EVAL_FIXTURE_DRIFT_DIR}"
+mkdir -p "${FIXTURE_DRIFT_DIR}"
+FIXTURE_DRIFT_ARGS=()
+FIXTURE_DRIFT_MATCH="true"
+if [ -n "${PULL_NUMBER:-}" ] || [ -n "${PULL_BASE_SHA:-}" ] || [ "${JOB_TYPE:-}" = "batch" ]; then
+  FIXTURE_DRIFT_CHANGED="${STATE_DIR}/${EVAL_FIXTURE_DRIFT_CHANGED_FILES}"
+  if [ -n "${PULL_BASE_SHA:-}" ] && git -C "${SCRIPT_DIR}/.." diff --name-only "${PULL_BASE_SHA}" HEAD > "${FIXTURE_DRIFT_CHANGED}" 2>/dev/null; then
+    FIXTURE_DRIFT_ARGS=(--changed-files "${FIXTURE_DRIFT_CHANGED}")
+  else
+    FIXTURE_DRIFT_MATCH=""
+    echo "WARNING: the files this run's change edits could not be listed against PULL_BASE_SHA, so no case is excused for a drifted fixture; every case is graded as usual." >&2
+  fi
+fi
+if [ -n "${FIXTURE_DRIFT_MATCH}" ] && ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.fixture_drift \
+    --report "${EVAL_LEASE_FIXTURE_REPORT_PATH:-}" --published "${EVAL_FIXTURE_STATE_PUBLISHED_PATH:-}" --out-dir "${FIXTURE_DRIFT_DIR}" \
+    ${FIXTURE_DRIFT_ARGS[@]+"${FIXTURE_DRIFT_ARGS[@]}"} "${TASKS[@]}"); then
+  rm -f "${FIXTURE_DRIFT_DIR:?}"/*
+  echo "WARNING: could not match the lease-time fixture scan to the matrix (kube_agents_bench.fixture_drift, above); every case is graded as usual." >&2
+fi
 
 # mkdir is the mutex: atomic on every filesystem this runs on. A holder that
 # dies without releasing (an OOM-killed subshell releases nothing) would
@@ -3377,11 +3585,10 @@ STATE_DIR="$(mktemp -d)"
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds four).
+#                 (audit_streams; oobe-first-run-audits holds five).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
-#                 the cases on the stream (stream_case_count), as the infra
-#                 lock's does by contender.
+#                 the cases on the stream (stream_case_count).
 #   infra      -- at most one stack-bearing (tofu) unit runs at a time,
 #                 across tasks: BENCH_PARALLEL stays false, so devops-bench's
 #                 per-run isolation (own kubeconfig, gcloud config, tofu data
@@ -3701,6 +3908,24 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
+  # A fixture this case needs was out of its designed state when the lease was
+  # scanned (scan_lease_fixtures): the repetition is recorded as
+  # infrastructure under the scan's `fixture-drift:<role>` reason and never
+  # launched, so it cannot red the pull request, and the gate keeps the case
+  # out of its coverage floor (bench/kube_agents_bench/scoring.py,
+  # grade_suite). Unwound like the install-gone skip below: only the task lock
+  # is held.
+  local drift_file="${FIXTURE_DRIFT_DIR:-}/${name}" drift_reps=0
+  if [ -n "${FIXTURE_DRIFT_DIR:-}" ] && [ -s "${drift_file}" ]; then
+    record_unit_not_run "${name}" "${rep}" "$(head -n 1 "${drift_file}")"
+    drift_reps="$(finished_rep_count "${name}")"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
+    if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+      finish_case "${task}" "${name}"
+    fi
+    return 0
+  fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: cases on
   # one stream (the consistency trio, the three patch cases, the obtainability pair)
@@ -3816,7 +4041,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
@@ -3874,7 +4099,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # (EVAL_STREAM_REPO), so a sibling job's pull request on the same audit in
   # another pool repository is not this one's. A case with no
   # `ledger_issue_contains` audit key has no stream and gets none of them.
-  # The repository takes the deploy's precedence, as the inject lane's does:
+  # The repository takes the deploy's precedence, as the write safeguard's does:
   # a developer's EVAL_GITOPS_REPO is where the agent was told to write.
   if [ -n "${audit_id}" ]; then
     local window="${STATE_DIR}/stream-${audit_id}.window" stream_repo="${EVAL_LEDGER_REPO:-}"
@@ -3950,30 +4175,25 @@ scheduled_audits pause "fan-out"
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
 
-# Two phases on the inject lane (#2079), and since #2260 on the api lane too.
-# On the inject lane for the GitHub-write safeguard, which dates a write and
-# cannot sign it while every unit of the run writes to one repository; on
-# both lanes for the repository reset, which empties that repository before
+# Two phases on both lanes (#2079, #2260): for the GitHub-write safeguard,
+# whose window holds every write made to the run's one repository while it
+# is open, and for the repository reset, which empties that repository before
 # each unit of a case that requests a pull request and may only do so while
 # nothing else writes. Such
 # a case (INJECT_LANE_REQUESTING, from the lane step; empty on a matrix with
 # no such case) therefore runs only after every other unit has finished: a
 # repetition of a case that requests nothing never shares the repository with
-# one that writes by design, so a write inside its window is its own or a
-# concurrent sibling's mistake, either of which is the red the safeguard
-# exists for. The second phase runs one unit at a time, and on the inject
-# lane every unit in it waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it
-# starts (WRITER_LAUNCH_PAUSE, set by the lane step; the api lane, which
-# grades no window, keeps the launch stagger): two requesting
-# cases side by side would red each other's by-design pull requests (each
-# excuses only the ones its own reply names), and the safeguard's window
-# opens that many seconds before the repetition's start, so a write in the
-# last seconds of the unit before -- the same case's previous repetition, or
-# the first phase's last unit -- must be older than that before the next
-# window can open. The cost is one drain of the lanes at the phase boundary
+# one that writes by design. The second phase runs one unit at a time, and
+# every unit in it waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it
+# starts (WRITER_LAUNCH_PAUSE, set by the lane step): the safeguard's window
+# opens that many seconds before the repetition's start, and a write in the
+# last seconds of the unit before -- the same case's previous repetition,
+# whose branch name the next one derives again and so names, or the first
+# phase's last unit -- must be older than that before the next window can
+# open. The cost is one drain of the lanes at the phase boundary
 # and the settle plus the serial run of the requesting units (on the
-# presubmit tier, one case's repetitions, which the task lock already ran one
-# at a time, so three settles); the order inside each phase is unchanged.
+# presubmit tier, the requesting cases' repetitions, which launch_units runs
+# one at a time, one settle each); the order inside each phase is unchanged.
 # The ordering assumes a unit's writes land before the unit ends. Under the
 # bridge's api executor the harness's delegation wait holds the unit until
 # the cards the case filed are terminal, so their workers' pull requests
@@ -3981,9 +4201,11 @@ scheduled_audits pause "fan-out"
 # still running at the delegation ceiling, and the wait's fallback paths
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
-# grades"; per-case attribution is #2611).
-unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
-  case ",${INJECT_LANE_REQUESTING:-}," in
+# grades"): unattributed there in the first phase, and charged to the unit
+# in the second, whose window is exclusive (a requesting case's and a stopped
+# ask's alike).
+unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -4013,40 +4235,115 @@ UNIT_QUEUE_WRITERS="$(
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
+# Whether a unit takes lock-infra. TASK_HAS_STACK is "true" exactly for a
+# stack-bearing case off infra_lock_exempt, and it is what run_one_unit tests.
+unit_takes_infra_lock() { # <task-index>
+  [ -n "${TASK_HAS_STACK[$1]:-}" ]
+}
+
+# Whether a unit counts toward INFRA_IN_FLIGHT_MAX: a lock taker without a
+# state lock. One with a state lock (unit_state_lock) can spend hours giving
+# lock-infra back while an exempt case holds that state, as the bootstrap
+# cases do behind oobe-first-run-audits' "onboarding"; counted, two of them
+# would fill the limit and idle lock-infra for the whole chain. Uncounted,
+# each parks its slot while it waits, as every lock taker did before.
+unit_counts_toward_infra_limit() { # <task-index>
+  unit_takes_infra_lock "$1" && [ -z "$(unit_state_lock "${TASK_NAMES[$1]}")" ]
+}
+
+# How many counted lock takers may be in flight at once: one holding
+# lock-infra and one staged behind it. One alone would stall the tofu chain
+# whenever the holder waits on something other than lock-infra (its task or
+# stream lock, wait_platform_runs); two let the staged unit take lock-infra
+# in that window, at the cost of at most one counted slot parked on the lock.
+# A second counted place can go to the same task's next rep, which waits on
+# the task lock rather than lock-infra; that costs a little at rep boundaries.
+INFRA_IN_FLIGHT_MAX=2
+
 # One phase's units, launched in queue order at the given parallelism, each
 # after the given pause. The caller `wait`s between phases; UNIT_SEQ carries
 # across them.
+#
+# Counted lock takers are limited to INFRA_IN_FLIGHT_MAX in flight (#3384). The
+# lock lets one run anyway, and before this every free slot went to the next
+# queued unit, so stack-bearing units piled up in slots waiting for lock-infra,
+# doing nothing: on 2026-10-24 the main nightly's waits held 25.7 of its ~70
+# slot-hours and it ran out of time (#3821). Past the limit, a counted lock
+# taker is held back in the queue and the next unit that is not one gets the
+# slot; the held one launches as soon as a counted lock taker's job ends. Queue
+# order is otherwise unchanged.
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
-  while read -r REP _COST IDX; do
-    [ -n "${IDX:-}" ] || continue
-    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
-      sleep 3
-    done
-    # Staggered, so N units do not open their first model call in the same
-    # second -- burst 429s at the model quota are the fan-out's failure mode;
-    # in the second phase the pause is the lane's writer pause instead (the
-    # settle on the inject lane, this stagger on the api lane).
-    sleep "${pause}"
-    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
-    UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
-    run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
+  local pending=() line i pick running pid alive infra_pids="" counted
+  # Each line carries whether its unit counts toward INFRA_IN_FLIGHT_MAX, worked
+  # out once here rather than on every poll.
+  while read -r line; do
+    [ -n "${line}" ] || continue
+    read -r REP _COST IDX <<<"${line}"
+    counted=0
+    if unit_counts_toward_infra_limit "${IDX}"; then counted=1; fi
+    pending+=("${line} ${counted}")
   done <<EOF_UNIT_QUEUE
 ${queue}
 EOF_UNIT_QUEUE
+  while [ "${#pending[@]}" -gt 0 ]; do
+    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
+      sleep 3
+    done
+    # The counted lock takers still running. `jobs` keeps the job table inside a
+    # command substitution, as the slot count above relies on.
+    running=" $(jobs -rp | tr '\n' ' ') "
+    alive=""
+    for pid in ${infra_pids}; do
+      case "${running}" in *" ${pid} "*) alive="${alive} ${pid}" ;; esac
+    done
+    infra_pids="${alive}"
+    pick=""
+    for i in "${!pending[@]}"; do
+      read -r REP _COST IDX counted <<<"${pending[i]}"
+      if [ "${counted}" = 0 ] || [ "$(printf '%s\n' ${infra_pids} | grep -c .)" -lt "${INFRA_IN_FLIGHT_MAX}" ]; then
+        pick="${i}"
+        break
+      fi
+    done
+    if [ -z "${pick}" ]; then
+      # Only counted lock takers are left and the limit is in flight: wait.
+      sleep 3
+      continue
+    fi
+    read -r REP _COST IDX counted <<<"${pending[pick]}"
+    unset 'pending[pick]'
+    if [ "${#pending[@]}" -gt 0 ]; then
+      pending=("${pending[@]}")
+    fi
+    # Staggered, so N units do not open their first model call in the same
+    # second -- burst 429s at the model quota are the fan-out's failure mode;
+    # in the second phase the pause is the writer pause instead (the settle).
+    # A unit of a case marked for a drifted fixture makes no model call and no
+    # write, so it skips the pause.
+    if [ -z "${FIXTURE_DRIFT_DIR:-}" ] || [ ! -s "${FIXTURE_DRIFT_DIR}/${TASK_NAMES[IDX]}" ]; then
+      sleep "${pause}"
+    fi
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+    UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
+    run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
+    if [ "${counted}" = 1 ]; then
+      infra_pids="${infra_pids} $!"
+    fi
+  done
 }
 
 profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
-# On the inject lane, once every unit is done: every pull request and branch
+# On both lanes, once every unit is done: every pull request and branch
 # a bot wrote to the leased project's repository since
 # this run began, in the job log by number and branch, so a red safeguard has
 # its subject named beside it and a run's leftovers are on record even when
@@ -4059,7 +4356,7 @@ fi
 # the fan-out rather than in the EXIT trap: a deadline-cut run loses this
 # line and keeps the per-repetition reasons, which is the right trade.
 report_github_leftovers() {
-  if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] || [ -z "${BENCH_GITOPS_REPO:-}" ]; then
+  if [ -z "${BENCH_GITOPS_REPO:-}" ]; then
     return 0
   fi
   # Named by forge: under EVAL_FORGE=gitlab BENCH_GITOPS_REPO is a GitLab
@@ -4151,13 +4448,12 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly and its -writers part, EVAL_MODE_NEXT=1) is a
-# periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
+# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
-# run at the same agent model (setupId) is compared with. Today's window is
-# recorded by ci-kube-agents-eval-nightly-today, the today-mode nightly kept
-# as the rollback check, over the api transport.
+# run at the same agent model (setupId) is compared with. No job records
+# today's window now: the rollback check is the today lane, refused above.
 # (ci-kube-agents-eval-nightly-gitlab-next stays out on the GitLab condition
 # above.) Whether the job's identity may append is a grant in oss-test-infra
 # this script cannot see; without it the append fails, is logged, and the
