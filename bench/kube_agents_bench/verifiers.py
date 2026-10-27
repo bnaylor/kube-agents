@@ -6705,8 +6705,9 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
         # It matched objects on the resolved cluster, so whatever it concluded
         # is an observation about the fixture and needs no help. This is the
         # ordinary path, and it costs exactly one kubectl call -- the same as
-        # an upstream check. Only an absence, or an inability to look, is worth
-        # two more round trips to explain.
+        # an upstream check -- plus one re-read for a pass under `every`
+        # (_objects_without_a_match). Only an absence, or an inability to look,
+        # is worth two more round trips to explain.
         if status != "error" and delegate_raw and delegate_raw.get("matched"):
             if status == "pass" and self.across_matches == "every" and self.path:
                 missing = self._objects_without_a_match(

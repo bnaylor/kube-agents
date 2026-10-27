@@ -903,21 +903,22 @@ cluster reads as a clean pass forever. The ordinary comparison therefore runs **
 only an answer resting on an ABSENCE is re-examined, because absence is the one observation with two
 causes:
 
-| Observation                                                                       | Status                                    |
-| --------------------------------------------------------------------------------- | ----------------------------------------- |
-| the role does not resolve                                                         | `error`, without polling                  |
-| the comparison matched objects                                                    | the ordinary `resource_property` verdict  |
-| nothing matched, and the cluster will not answer or refuses                       | `error`, after the usual retries          |
-| nothing matched, and the named `namespace` is gone from a cluster that DID answer | `fail`                                    |
-| nothing matched, and the named `resource_name` is gone from that namespace        | `fail`, or `pass` for a pathless `absent` |
-| any of the above, for a subject the runner never confirmed                        | `error` — the fixture was never planted   |
+| Observation                                                                       | Status                                                                                                                                                   |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the role does not resolve                                                         | `error`, without polling                                                                                                                                 |
+| the comparison matched objects                                                    | the ordinary `resource_property` verdict, except that under `across_matches: every` a matched object with nothing at the path turns a pass into a `fail` |
+| nothing matched, and the cluster will not answer or refuses                       | `error`, after the usual retries                                                                                                                         |
+| nothing matched, and the named `namespace` is gone from a cluster that DID answer | `fail`                                                                                                                                                   |
+| nothing matched, and the named `resource_name` is gone from that namespace        | `fail`, or `pass` for a pathless `absent`                                                                                                                |
+| any of the above, for a subject the runner never confirmed                        | `error` — the fixture was never planted                                                                                                                  |
 
 Anything about _reaching_ the cluster is an error; anything observed _on_ it is a pass or a fail —
 and an absence is only an observation about a subject the runner had seen there beforehand.
 Otherwise it is an error naming what was never confirmed, because an unplanted fixture and a
 destroyed one look identical at check time and only one of them is the run's doing. A
-check that matched objects costs exactly one `kubectl` call, the same as upstream — the two extra
-round trips buy the distinction and are only spent when there is an absence to explain.
+check that matched objects costs exactly one `kubectl` call, the same as upstream (two for a pass
+under `across_matches: every`, which re-reads the matched objects) — the two extra round trips buy
+the distinction and are only spent when there is an absence to explain.
 Classification runs inside the ordinary poll loop, so one timed-out API call is retried rather than
 recorded; only role resolution sits outside it, because a kubeconfig the runner never wrote will not
 appear part-way through a run. And a `fail` once observed is sticky: a blip on the last poll before
