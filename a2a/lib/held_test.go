@@ -1029,3 +1029,61 @@ func TestSubscribeHeldRefusesASubmissionIntakeWithoutASubmitter(t *testing.T) {
 		}
 	}
 }
+
+// Reconnect swaps the connection for a fresh dial (new connect-time grants)
+// without giving back a held delivery: the task is still held afterwards,
+// never redelivered, its heartbeat on the new connection, and its Ack lands.
+// The durable is re-subscribed, so the next task is delivered too.
+func TestReconnectKeepsAHeldDelivery(t *testing.T) {
+	h, worker := newHeldHarness(t, "recon")
+	h.ensure(2, 3*time.Second)
+	got := make(chan Delivery, 4)
+	var starts atomic.Int32
+	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		starts.Add(1)
+		got <- d
+		<-ctx.Done()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	defer sub.Stop()
+	h.submit("task-held")
+	first := <-got
+	old := worker.Conn()
+	rctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+	defer cancel()
+	if err := worker.Reconnect(rctx); err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	if worker.Conn() == old || !old.IsClosed() {
+		t.Fatal("Reconnect kept the old connection")
+	}
+	time.Sleep(7 * time.Second) // more than two AckWaits
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("the held task was delivered %d times across a reconnect, want 1", n)
+	}
+	if err := first.Ack(); err != nil {
+		t.Fatalf("Ack after Reconnect: %v", err)
+	}
+	h.submit("task-next")
+	select {
+	case d := <-got:
+		if d.Envelope().TaskID != "task-next" {
+			t.Errorf("delivered %q, want task-next", d.Envelope().TaskID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the durable was not re-subscribed after Reconnect")
+	}
+	cons, err := h.req.JetStream().Consumer(h.ctx, "TASKS", h.cfg().Durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumAckPending != 1 || info.NumRedelivered != 0 {
+		t.Errorf("ack pending %d, redelivered %d: want only task-next held and nothing redelivered", info.NumAckPending, info.NumRedelivered)
+	}
+}
