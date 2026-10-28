@@ -71,6 +71,11 @@ class EveryStoreIsPruned(RetentionTest):
         self.store("profiles", "cluster-a")
         self.assertEqual([], session_retention.tick(self.home))
         pruned = [(c[0].parent, c[1], c[2]) for c in FakeSessionDB.calls]
+        # A daily tick must not trip Hermes' own 24-hour throttle; the live gateway's
+        # store (the machine home) is never VACUUMed from here.
+        for path, _, _, kwargs in FakeSessionDB.calls:
+            self.assertLess(kwargs["min_interval_hours"], 24)
+            self.assertEqual(path.parent != self.home, kwargs["vacuum"], path)
         self.assertEqual(
             [
                 (self.home, 7, self.home / "sessions"),
@@ -91,6 +96,35 @@ class EveryStoreIsPruned(RetentionTest):
         with patch.dict(os.environ, {session_retention.RETENTION_ENV: "30"}):
             session_retention.tick(self.home)
         self.assertEqual(30, FakeSessionDB.calls[-1][1])
+
+    def test_the_tick_reads_the_period_from_hermes_merged_config(self):
+        self.store()
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config = lambda: {"sessions": {"auto_prune": True, "retention_days": 12}}
+        package = types.ModuleType("hermes_cli")
+        package.config = config
+        env = {k: v for k, v in os.environ.items() if k != session_retention.RETENTION_ENV}
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": config}), \
+                patch.dict(os.environ, env, clear=True):
+            self.assertEqual([], session_retention.tick(self.home))
+        self.assertEqual(12, FakeSessionDB.calls[-1][1])
+
+    def test_an_unreadable_config_prunes_nothing_and_says_so(self):
+        self.store()
+        config = types.ModuleType("hermes_cli.config")
+
+        def broken():
+            raise OSError("managed scope unreadable")
+
+        config.load_config = broken
+        package = types.ModuleType("hermes_cli")
+        package.config = config
+        env = {k: v for k, v in os.environ.items() if k != session_retention.RETENTION_ENV}
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": config}), \
+                patch.dict(os.environ, env, clear=True):
+            lines = session_retention.tick(self.home)
+        self.assertEqual([], FakeSessionDB.calls)
+        self.assertEqual(1, len(lines))
 
     def test_no_usable_period_prunes_nothing_and_says_so(self):
         self.store()

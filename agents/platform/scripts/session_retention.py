@@ -19,9 +19,12 @@ period, so it inherits Hermes' guarantees rather than restating them:
 
 - open, pinned and mid-turn sessions are never deleted;
 - dead automation sessions are closed first and get a full period before removal;
-- one maintenance lock and a 24-hour throttle per store, so a worker starting at
-  the same moment cannot double-run it;
-- VACUUM only after a prune that freed more than a quarter of the file.
+- one maintenance lock and a throttle per store, so a worker starting at the same
+  moment cannot double-run it (20 hours here rather than Hermes' 24, so a daily tick
+  never skips a day);
+- VACUUM only after a prune that freed more than a quarter of the file, at most every
+  30 days, and never here for the machine home, which the live gateway holds (Hermes
+  VACUUMs that store at gateway start instead).
 
 The period is the managed scope's ``sessions.retention_days``, which the operator
 renders from ``spec.harness.retention.sessionDays``. A blocked kanban card needs
@@ -59,15 +62,22 @@ SECONDS_PER_DAY = 86400
 WATCH_NAME = "Session retention"
 FAILED_PREFIX = f"⚠️ **{WATCH_NAME}:**"
 RETENTION_ENV = "SESSION_RETENTION_DAYS"  # tests and a hand run; the tick reads the managed scope
+# Hermes skips a store pruned less than min_interval_hours ago, timed from the
+# previous pass's start. At its own 24 a daily tick that starts a few seconds
+# earlier than yesterday's would skip, and the deletion would slip a day.
+MIN_INTERVAL_HOURS = 20
 
 
 def retention_days() -> int | None:
     """The period from the environment override, else Hermes' merged config (managed scope)."""
     raw = os.environ.get(RETENTION_ENV)
     if raw is None:
-        from hermes_cli.config import load_config  # the managed scope is merged in here
+        try:
+            from hermes_cli.config import load_config  # the managed scope is merged in here
 
-        raw = (load_config().get("sessions") or {}).get("retention_days")
+            raw = (load_config().get("sessions") or {}).get("retention_days")
+        except Exception:  # noqa: BLE001 - an unreadable config is "no usable period"
+            return None
     try:
         days = int(raw)
     except (TypeError, ValueError):
@@ -84,8 +94,13 @@ def homes(agent_home: Path) -> list[Path]:
     return found
 
 
-def prune_store(home: Path, days: int) -> dict:
-    """Hermes' own maintenance on ``home``'s state.db; {} when the home has none."""
+def prune_store(home: Path, days: int, *, vacuum: bool = True) -> dict:
+    """Hermes' own maintenance on ``home``'s state.db; {} when the home has none.
+
+    ``vacuum=False`` for the machine home: only the gateway opens that store, and
+    Hermes VACUUMs it at gateway start, before it serves traffic. A rewrite from
+    here would hold up the live gateway's writes for as long as it took.
+    """
     db_path = home / STATE_DB
     if not db_path.is_file():
         return {}
@@ -93,7 +108,12 @@ def prune_store(home: Path, days: int) -> dict:
 
     db = SessionDB(db_path=db_path)
     try:
-        return db.maybe_auto_prune_and_vacuum(retention_days=days, sessions_dir=home / SESSIONS_DIR)
+        return db.maybe_auto_prune_and_vacuum(
+            retention_days=days,
+            sessions_dir=home / SESSIONS_DIR,
+            min_interval_hours=MIN_INTERVAL_HOURS,
+            vacuum=vacuum,
+        )
     finally:
         close = getattr(db, "close", None)
         if callable(close):
@@ -133,7 +153,7 @@ def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
     lines: list[str] = []
     for home in homes(agent_home):
         try:
-            result = prune_store(home, days)
+            result = prune_store(home, days, vacuum=home != agent_home)
             if result.get("error"):
                 lines.append(f"{FAILED_PREFIX} pruning {label(home, agent_home)} failed: `{span_safe(result['error'])}`")
             remove_old_rotated_logs(home, days, now)

@@ -438,8 +438,11 @@ history aged out. So their history grew without bound (#3704).
 `session_retention.py` calls the same Hermes method on every profile's store
 once a day, so it keeps Hermes' guarantees: open, pinned and mid-turn sessions
 are never deleted, one maintenance lock and a 24-hour throttle per store, and
-the VACUUM gate. It also removes rotated Hermes log backups (`<name>.log.<n>`)
-older than the period; the live log files keep Hermes' size cap, and
+the VACUUM gate (more than a quarter freed, at most every 30 days). Its throttle is
+20 hours rather than Hermes' 24, so a tick starting a few seconds earlier than
+yesterday's still runs, and it never VACUUMs the machine home's store, which the
+live gateway holds; Hermes does that one at gateway start. It also removes rotated
+Hermes log backups (`<name>.log.<n>`) older than the period; the live log files keep Hermes' size cap, and
 `audit.jsonl` and its rotations are never touched.
 
 The period is the managed scope's `sessions.retention_days`, which the operator
