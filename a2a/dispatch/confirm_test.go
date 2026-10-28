@@ -1,7 +1,6 @@
 package dispatch
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -155,14 +154,17 @@ func TestARestartMidOfferDispatchesAfresh(t *testing.T) {
 	}
 }
 
-// The record is written at the confirm with the confirm's time, and carries
-// the offer's deadline and intervals.
+// The offer carries the config's accept window and passes the contract's
+// checks. The record is written at the confirm with the confirm's time, and
+// carries the offer's deadline and intervals.
 func TestTheLeaseIsWrittenAtTheConfirm(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
 	w.acceptDelay = 600 * time.Millisecond
-	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.AcceptTimeoutSeconds = 4 })
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	offered := time.Now()
@@ -178,20 +180,14 @@ func TestTheLeaseIsWrittenAtTheConfirm(t *testing.T) {
 	w.mu.Lock()
 	offer := w.offers[0]
 	w.mu.Unlock()
-	var mine record
-	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
-	if err != nil {
-		t.Fatal(err)
+	if offer.AcceptSeconds != 4 {
+		t.Errorf("the offer's acceptSeconds is %d, want the config's 4", offer.AcceptSeconds)
 	}
-	e, err := kv.Get(b.ctx, lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1"))
-	if err != nil {
-		t.Fatal(err)
+	if err := offer.Validate(); err != nil {
+		t.Errorf("the offer fails the contract: %v", err)
 	}
-	if err := json.Unmarshal(e.Value(), &mine); err != nil {
-		t.Fatal(err)
-	}
-	if !mine.Deadline.Equal(offer.Deadline) || mine.LeaseSeconds != offer.LeaseSeconds || mine.RenewSeconds != offer.RenewSeconds {
-		t.Errorf("record %+v does not carry the offer's deadline %v and intervals %d/%d", mine, offer.Deadline, offer.LeaseSeconds, offer.RenewSeconds)
+	if !rec.Deadline.Equal(offer.Deadline) || rec.LeaseSeconds != offer.LeaseSeconds || rec.RenewSeconds != offer.RenewSeconds {
+		t.Errorf("record %+v does not carry the offer's deadline %v and intervals %d/%d", rec, offer.Deadline, offer.LeaseSeconds, offer.RenewSeconds)
 	}
 	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("terminal %+v", ts)

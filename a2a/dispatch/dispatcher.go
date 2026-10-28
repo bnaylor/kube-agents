@@ -516,18 +516,6 @@ func (d *Dispatcher) bind(ctx context.Context, profile string, dur lib.DispatchD
 	d.log.Info("bound a profile durable", "durable", name)
 }
 
-// record is a lease record as the dispatcher writes it: the contract's
-// LeaseRecord and what the task's offer carried, so a task re-adopted after
-// a restart keeps its offer's deadline and intervals rather than taking the
-// config's current ones. The dispatcher is the bucket's only reader and
-// writer, so the extra fields are its own business.
-type record struct {
-	lib.LeaseRecord
-	Deadline     time.Time `json:"deadline,omitzero"`
-	LeaseSeconds int       `json:"leaseSeconds,omitempty"`
-	RenewSeconds int       `json:"renewSeconds,omitempty"`
-}
-
 // handle is one held submission, from delivery to settlement.
 func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	profile, tier, kind, taskID, ok := lib.ParseSubmitSubject(del.Subject())
@@ -772,10 +760,10 @@ func (d *Dispatcher) release(h *holding, settled bool) {
 // renewal comes, and it fails lease-expired), never a second run. An empty
 // key with a nil error means no pod took the task.
 func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig,
-	prof lib.DispatchProfile, h *holding) (record, string, error) {
+	prof lib.DispatchProfile, h *holding) (lib.LeaseRecord, string, error) {
 	envelope, err := json.Marshal(del.Envelope())
 	if err != nil {
-		return record{}, "", err
+		return lib.LeaseRecord{}, "", err
 	}
 	// The intervals this task is offered with, kept for its life.
 	h.lease, h.renew = seconds(snap.LeaseSeconds), seconds(snap.RenewSeconds)
@@ -786,7 +774,7 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 	// AckWait later): each worker runs one task at a time.
 	tried, err := d.leasedPods(ctx, h.profile, h.tier, seconds(snap.RestartGraceSeconds))
 	if err != nil {
-		return record{}, "", fmt.Errorf("read which pods hold leases: %w", err)
+		return lib.LeaseRecord{}, "", fmt.Errorf("read which pods hold leases: %w", err)
 	}
 	for {
 		d.mu.Lock()
@@ -801,7 +789,7 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		}
 		d.mu.Unlock()
 		if pod == "" {
-			return record{}, "", nil
+			return lib.LeaseRecord{}, "", nil
 		}
 		tried[pod] = true
 		subject := lib.DispatchSubject(h.profile, h.tier, pod)
@@ -821,7 +809,8 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 
 		deadline := d.now().Add(seconds(prof.ActiveDeadlineSeconds))
 		msg := lib.DispatchMessage{Type: lib.DispatchOffer, TaskID: h.taskID, Kind: h.kind, Envelope: envelope,
-			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
+			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
+			AcceptSeconds: snap.AcceptTimeoutSeconds}
 		if err := d.send(subject, msg); err != nil {
 			giveUp("")
 			log.Warn("offer not sent", "pod", pod, "err", err)
@@ -840,21 +829,21 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 			// drop it (and drops it anyway, never confirmed).
 			timer.Stop()
 			giveUp(abandonStopping)
-			return record{}, "", ctx.Err()
+			return lib.LeaseRecord{}, "", ctx.Err()
 		}
 		timer.Stop()
 		switch {
 		case answered && acc.Accepted:
 			now := d.now()
 			key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
-			rec := record{LeaseRecord: lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
-				ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease)},
+			rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
+				ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease),
 				Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
 			if err := d.putLease(ctx, key, rec); err != nil {
 				// Unrecorded, the task can't be confirmed: a restart
 				// would not know it had started.
 				giveUp(abandonUnrecorded)
-				return record{}, "", fmt.Errorf("record the lease before the confirm: %w", err)
+				return lib.LeaseRecord{}, "", fmt.Errorf("record the lease before the confirm: %w", err)
 			}
 			d.mu.Lock()
 			delete(d.offers, ok)
@@ -902,7 +891,7 @@ func (d *Dispatcher) freePodLocked(pods []string, profile, tier string, tried ma
 // start, has passed without a renewal. Its deadline and intervals are the
 // ones its offer carried, read from the record.
 func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile,
-	hk holdKey, rec record, key string) {
+	hk holdKey, rec lib.LeaseRecord, key string) {
 	pod := keyPod(key)
 	lease := recordLease(rec, seconds(snap.LeaseSeconds))
 	renew := seconds(rec.RenewSeconds)
@@ -946,7 +935,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 // a passed deadline fails it and tells the worker to abandon it. Neither ever
 // runs it again. graceUntil, set on re-adoption, keeps an expired record from
 // failing the task before then.
-func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, rec record,
+func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, rec lib.LeaseRecord,
 	key string, graceUntil time.Time) {
 	tick := time.NewTicker(max(h.renew/ticksPerRenewal, minTick))
 	defer tick.Stop()
@@ -997,7 +986,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 
 // recordLease is the lease the task was offered: the record's own, else its
 // expiry less its last renewal; fallback when the record can't say.
-func recordLease(rec record, fallback time.Duration) time.Duration {
+func recordLease(rec lib.LeaseRecord, fallback time.Duration) time.Duration {
 	if rec.LeaseSeconds > 0 {
 		return seconds(rec.LeaseSeconds)
 	}
@@ -1007,7 +996,7 @@ func recordLease(rec record, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-func deadlineLimit(rec record) time.Duration {
+func deadlineLimit(rec lib.LeaseRecord) time.Duration {
 	start := rec.ConfirmedAt
 	if start.IsZero() {
 		start = rec.RenewedAt
@@ -1277,7 +1266,7 @@ func (d *Dispatcher) renewOrphan(key string, r lib.LeaseRenewal, logIt bool) {
 		d.mu.Unlock()
 		return
 	}
-	var rec record
+	var rec lib.LeaseRecord
 	if err := json.Unmarshal(entry.Value(), &rec); err != nil {
 		if logIt {
 			d.log.Warn("renewal for a task not held here: unreadable record", "key", key, "err", err)
@@ -1377,7 +1366,7 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		var rec record
+		var rec lib.LeaseRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err == nil && !rec.Expired(now, d.cfg.SweepAfter) {
 			continue
 		}
@@ -1446,26 +1435,26 @@ func (d *Dispatcher) send(subject string, msg lib.DispatchMessage) error {
 
 // findLease looks the task up by ProfileLeaseKeyFilter. With more than one
 // record, the latest renewed wins.
-func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string) (record, string, bool, error) {
+func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string) (lib.LeaseRecord, string, bool, error) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
 	kv, err := d.bus.KV(kctx, lib.ProfileLeaseBucket)
 	if err != nil {
-		return record{}, "", false, err
+		return lib.LeaseRecord{}, "", false, err
 	}
 	lister, err := kv.ListKeysFiltered(kctx, lib.ProfileLeaseKeyFilter(profile, tier, taskID))
 	if err != nil {
-		return record{}, "", false, err
+		return lib.LeaseRecord{}, "", false, err
 	}
 	var keys []string
 	for k := range lister.Keys() {
 		keys = append(keys, k)
 	}
 	if kctx.Err() != nil {
-		return record{}, "", false, kctx.Err()
+		return lib.LeaseRecord{}, "", false, kctx.Err()
 	}
 	sort.Strings(keys)
-	var best record
+	var best lib.LeaseRecord
 	var bestKey string
 	for _, k := range keys {
 		entry, err := kv.Get(kctx, k)
@@ -1473,20 +1462,20 @@ func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string
 			continue
 		}
 		if err != nil {
-			return record{}, "", false, err
+			return lib.LeaseRecord{}, "", false, err
 		}
-		var rec record
+		var rec lib.LeaseRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
 			// A record nobody can read still says the task started.
 			d.log.Warn("unreadable lease record; treating the task as started", "key", k, "err", err)
-			rec = record{LeaseRecord: lib.LeaseRecord{TaskID: taskID, Pod: keyPod(k)}}
+			rec = lib.LeaseRecord{TaskID: taskID, Pod: keyPod(k)}
 		}
 		if bestKey == "" || rec.RenewedAt.After(best.RenewedAt) {
 			best, bestKey = rec, k
 		}
 	}
 	if bestKey == "" {
-		return record{}, "", false, nil
+		return lib.LeaseRecord{}, "", false, nil
 	}
 	best.TaskID = taskID
 	best.Pod = keyPod(bestKey)
@@ -1529,7 +1518,7 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 		if err != nil {
 			return nil, err
 		}
-		var rec record
+		var rec lib.LeaseRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err == nil && rec.Expired(now, grace) {
 			continue
 		}
@@ -1538,7 +1527,7 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 	return pods, nil
 }
 
-func (d *Dispatcher) putLease(ctx context.Context, key string, rec record) error {
+func (d *Dispatcher) putLease(ctx context.Context, key string, rec lib.LeaseRecord) error {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
 	data, err := json.Marshal(rec)
