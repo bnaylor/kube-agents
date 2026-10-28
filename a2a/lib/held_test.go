@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -934,5 +935,97 @@ func TestEnsureHeldConsumerRefusesWhenTheLookupFails(t *testing.T) {
 	}
 	if w := cons.CachedInfo().Config.AckWait; w != 90*time.Second {
 		t.Errorf("after a failed lookup the durable's AckWait is %v, want 90s unchanged", w)
+	}
+}
+
+// The dispatcher's intake (#3660): a held durable on one (profile, tier,
+// kind)'s submissions, the gateway named as submitter. The gateway's
+// submission is held; another writer's is refused by agreement and never
+// reaches the handler.
+func TestSubscribeHeldTakesASubmissionIntake(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	ctx := testCtx(t)
+	gw, err := Connect(ctx, clientURL(s), WithName("gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Close()
+	disp, err := Connect(ctx, clientURL(s), WithName("dispatcher"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disp.Close()
+	const profile = "cluster-agent"
+	cfg := SubscribeConfig{
+		Stream: "TASKS", Durable: "profile-cluster-agent-read-top",
+		Subject:   TaskSubmitSubject(profile, "read", SubmitKindTop, "*"),
+		Session:   profile,
+		Agreement: &AgreementPolicy{Submitter: "gateway"},
+	}
+	if err := gw.EnsureHeldConsumer(ctx, HeldConsumerConfig{Stream: cfg.Stream, Durable: cfg.Durable,
+		FilterSubject: cfg.Subject, MaxAckPending: 2}); err != nil {
+		t.Fatalf("EnsureHeldConsumer: %v", err)
+	}
+	got := make(chan Delivery, 4)
+	sub, err := disp.SubscribeHeld(ctx, cfg, func(ctx context.Context, d Delivery) {
+		got <- d
+		_ = d.Ack()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld on the submission intake: %v", err)
+	}
+	defer sub.Stop()
+	// The other writer is published raw: the lib refuses it at the source
+	// only when the publisher names the submitter too.
+	intruder := submission(t, Party{Session: "chat-otter"}, "task-intruder", profile)
+	raw, err := json.Marshal(intruder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishRaw(t, clientURL(s), TaskSubmitSubject(profile, "read", SubmitKindTop, "task-intruder"), raw)
+	if err := gw.Publish(ctx, TaskSubmitSubject(profile, "read", SubmitKindTop, "task-1"),
+		submission(t, Party{Session: "gateway", AgentType: "a2a-gateway"}, "task-1", profile)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case d := <-got:
+		if d.Envelope().TaskID != "task-1" || d.Subject() != TaskSubmitSubject(profile, "read", SubmitKindTop, "task-1") {
+			t.Fatalf("held %q on %q, want the gateway's task-1", d.Envelope().TaskID, d.Subject())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gateway's submission was not held")
+	}
+	select {
+	case d := <-got:
+		t.Errorf("also held %q, want only the gateway's submission", d.Envelope().TaskID)
+	case <-time.After(time.Second):
+	}
+}
+
+// A submission intake without a named submitter is refused: the negative
+// form would hold any non-profile writer's submission.
+func TestSubscribeHeldRefusesASubmissionIntakeWithoutASubmitter(t *testing.T) {
+	h, worker := newHeldHarness(t, "subm")
+	cfg := h.cfg()
+	cfg.Subject = TaskSubmitSubject("subm", "read", SubmitKindTop, "*")
+	if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "Submitter") {
+		t.Errorf("SubscribeHeld on a submission intake with no submitter = %v, want refused", err)
+	}
+	for _, subject := range []string{
+		"a2a.tasks.subm.*.top.*.submit",  // wildcard tier
+		"a2a.tasks.subm.read.*.*.submit", // wildcard kind
+		"a2a.tasks.*.read.top.*.submit",  // wildcard profile
+		"a2a.tasks.subm.read.top.task-1.submit",
+		"a2a.tasks.subm.read.top.>",
+	} {
+		cfg := h.cfg()
+		cfg.Subject = subject
+		cfg.Agreement = &AgreementPolicy{Submitter: "gateway"}
+		if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil ||
+			!strings.Contains(err.Error(), "not one profile's intake") {
+			t.Errorf("SubscribeHeld(%q) = %v, want it refused as not one profile's intake", subject, err)
+		}
 	}
 }
