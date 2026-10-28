@@ -311,23 +311,39 @@ leave open:
   (default 90), `renewSeconds` (20; a lease is at least three renewals),
   `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
   offers. A task already handed out keeps the intervals its offer carried.
-- **Hand-off.** The dispatcher writes the task's lease record, then offers the task to a free
-  warm pod on `a2a.dispatch.<profile>.<tier>.<pod>` and waits `acceptTimeoutSeconds` for its
-  `.accept`. With no accept it tries the next pod. With no free pod the submission waits over
-  its cap and is redelivered. Writing the record first means a crash mid-offer re-adopts the
-  task (and fails it if nobody renews) rather than offering it twice.
+- **Hand-off.** The dispatcher offers the task to a free warm pod on
+  `a2a.dispatch.<profile>.<tier>.<pod>` and waits `acceptTimeoutSeconds` for its `.accept`.
+  On an accept it writes the task's lease record, which starts the lease, and then sends
+  `confirm` on that pod's subject; the worker starts only on the confirm (contract addendum
+  5). An accept is a core publish, so it can be lost or late: an offer that times out is
+  abandoned on its pod before the task goes to the next one, and any accept no live offer
+  waits on, a late one included, is answered with `abandon`. A lost confirm costs the task,
+  which fails `lease-expired`, never a second run. Nothing is written while an offer is out:
+  the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
+  dispatches the task afresh. With no free pod the submission waits over its cap and is
+  redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
+  long expired that no held submission has (a settle whose delete failed). Answers a pod sends
+  for tasks it doesn't hold are held to a small budget per pod.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
   has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
   The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
-  it acks the submission, deletes the record and frees the slot at once.
+  it acks the submission, waits for the server to confirm the ack, then deletes the record
+  and frees the slot. An expired lease or a passed deadline also tells the worker to abandon
+  the task.
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
-  fails it, which covers the gap `Recreate` leaves.
+  fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
+  intervals its offer did, so a re-adopted task keeps them whatever the config says now.
 - **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
   name each durable and each profile's `.events`. When the config adds a durable or a profile
   the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
-  it holds keep running across the reconnect.
+  it holds keep running across the reconnect, which drains the old connection so answers it
+  had already received still arrive. The NATS spec's `TASKS` and callout amendments of 10/28
+  ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same from the bus's side.
+- **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
+  is set, until profiles dispatch end to end; with it unset there is no dispatcher, identity
+  or `TASKS` allowance for the profile durables.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.events`:
   `rejected` when it is refused at admission (nothing ran), `failed` once a worker had it. The
   message is `reason: <code> - <detail>`, the executors' form, which the gateway already

@@ -23,9 +23,9 @@ install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.ima
 them;
 `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and
 `A2A_CONSOLE_IMAGE` on the operator override one at a time. The AgentProfile dispatcher is
-off by default until profiles dispatch end to end: its image is in the release set, but the
-operator derives nothing for it, and renders it (its Deployment, its bus identity and the
-`TASKS` slots for the profile durables) only when `A2A_DISPATCHER_IMAGE` names an image. The Hermes bridge sidecar the
+off by default until profiles dispatch end to end. Its image is in the release set, but the
+operator derives nothing for it. It renders the dispatcher only when `A2A_DISPATCHER_IMAGE`
+names an image, which on a mirror is the mirror's copy. The Hermes bridge sidecar the
 operator renders into the agent pod under `next` is built from the `platform-agent` image of the
 same commit, so the operator takes its registry and tag from the agent image instead, and
 `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent` that declares its own
@@ -277,8 +277,7 @@ when a prefix is in effect:
 by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
 on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
 `a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
-no env of their own on a mirror; an install that turns the dispatcher on names the mirror's
-`a2a-dispatcher` in `A2A_DISPATCHER_IMAGE` itself. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.
 

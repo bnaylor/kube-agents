@@ -423,7 +423,10 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR), where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
+# AgentProfile durables when the operator renders the dispatcher, which this
+# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
+# does - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
