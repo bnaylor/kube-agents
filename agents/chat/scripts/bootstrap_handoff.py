@@ -85,6 +85,24 @@ DEADLINE_SECONDS = 3600
 DEADLINE_PER_CARD_SECONDS = 300
 SECONDS_PER_MINUTE = 60
 
+# How many per-cluster audit cards one first-run sweep files (#3702). Each card
+# is a model turn before the user has asked anything: 200 Cluster Agents filed
+# 200 turns in 44 minutes (c1913-20261021). Past the cap, a cluster is not on
+# the sweep card's roster, so the sweep's worker audits it the way it audits a
+# cluster with no ready Cluster Agent. Six is the board's worker concurrency in
+# that run, so the cards finish in one wave. The long-term value comes from the
+# sizing budget function (#3753); until then an operator can set it in this file
+# under the data dir. No model tool can write it: the file tools run in the
+# shell sandbox, which has its own volume, and it is read here in the agent pod. Absent, malformed, zero or negative means the default,
+# and the value is clamped to FIRST_RUN_CLUSTER_CARDS_MAX, so the file cannot
+# uncap the scan.
+FIRST_RUN_CLUSTER_CARDS = 6
+FIRST_RUN_CLUSTER_CARDS_MAX = 24
+FIRST_RUN_CLUSTER_CARDS_FILE = ".first_run_cluster_cards"
+# The most uncarded agents the deadline will budget for, so a hand-edited marker
+# cannot hold the hand-off open for days.
+FIRST_RUN_UNCARDED_MAX = 1000
+
 SANDBOX_TIMEOUT_SECONDS = 30
 # Absolute paths, so nothing the model left in the sandbox shadows them.
 REMOTE_SH = "/bin/sh"
@@ -182,6 +200,20 @@ def read_scan_marker(marker: Path, now: float | None = None) -> tuple[str, float
     return sweep_id, filed_at
 
 
+def uncarded_agents(marker: Path) -> int:
+    """How many ready Cluster Agents the first-run cap left without a card (#3702), from the marker.
+
+    The gate records it when it files the sweep, so the hand-off's time limit
+    still budgets for those clusters, which the sweep's worker now audits
+    itself. Zero when the marker does not say, or says something else.
+    """
+    try:
+        value = int(_read_marker(marker).get("uncarded", "0"))
+    except ValueError:
+        return 0
+    return value if 0 < value <= FIRST_RUN_UNCARDED_MAX else 0
+
+
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
@@ -272,8 +304,13 @@ def settled(state: dict) -> bool:
 
 
 def deadline(state: dict) -> int:
-    """Seconds after the sweep was filed that the hand-off stops waiting."""
-    return DEADLINE_SECONDS + DEADLINE_PER_CARD_SECONDS * len(state["clusters"])
+    """Seconds after the sweep was filed that the hand-off stops waiting.
+
+    Per cluster, card or not: a cluster the first-run cap left to the sweep
+    (``state["uncarded"]``) still has to be audited before the hand-off can
+    write a complete report.
+    """
+    return DEADLINE_SECONDS + DEADLINE_PER_CARD_SECONDS * (len(state["clusters"]) + state.get("uncarded", 0))
 
 
 def _text(value) -> str:
@@ -437,8 +474,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         if _named(meta):
             audits.append((meta, sweep["id"]))
             gaps.append(
-                f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}): no Cluster Agent, so the sweep "
-                "audited it itself"
+                f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}): no Cluster Agent card, so the "
+                "sweep audited it itself"
             )
         elif isinstance(meta, dict):
             gaps.append(f"sweep {sweep['id']}: an audit it reported has no `project` and `cluster`, so it is not listed")
@@ -739,7 +776,35 @@ def _archive(task_id: str) -> bool:
     return True
 
 
-def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, list]:
+def first_run_cluster_cards(data_dir: Path) -> int:
+    """The per-cluster card cap for one first-run sweep, from the data dir's file.
+
+    The default when the file is absent, unreadable, not an integer, or below
+    one; never more than FIRST_RUN_CLUSTER_CARDS_MAX.
+    """
+    path = data_dir / FIRST_RUN_CLUSTER_CARDS_FILE
+    try:
+        raw = path.read_text().strip()
+    except FileNotFoundError:
+        return FIRST_RUN_CLUSTER_CARDS
+    except OSError as e:
+        _log(f"could not read {path}: {e}; using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    try:
+        value = int(raw)
+    except ValueError:
+        _log(f"{path} holds {raw[:40]!r}, not a number; using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    if value < 1:
+        _log(f"{path} holds {value}; using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    if value > FIRST_RUN_CLUSTER_CARDS_MAX:
+        _log(f"{path} holds {value}; capped at {FIRST_RUN_CLUSTER_CARDS_MAX}")
+        return FIRST_RUN_CLUSTER_CARDS_MAX
+    return value
+
+
+def file_cluster_cards(state: dict, roster: list, parse_task_id, cap: int | None = None) -> tuple[int, list]:
     """File a card for every Cluster Agent on the roster that has none for this sweep.
 
     The gate, not the sweep's worker, is the one creator of these cards: asked
@@ -747,8 +812,11 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, l
     to seven clusters having filed none, and the report that followed called
     the fleet clean. Re-run every tick until the hand-off, so a create that
     failed is retried; the idempotency key keeps a retry from filing twice, and
-    a card someone archived is not filed again. Returns how many it filed and
-    the agents still without a card.
+    a card someone archived is not filed again. With ``cap``, it stops once the
+    sweep has that many cluster cards, so a roster that changes between ticks
+    cannot file past the first-run cap (#3702); an agent it skips for the cap
+    is left to the sweep and is not counted as unfiled. Returns how many it
+    filed and the agents still without a card.
     """
     have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
     stale = state.get("stale_keys", {})
@@ -756,6 +824,8 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, l
     for agent in roster:
         if agent["key"] in have:
             continue
+        if cap is not None and len(state["clusters"]) + filed >= cap:
+            break
         old = stale.get(agent["key"])
         if old and not _archive(old):
             unfiled.append(dict(agent, stale_card=old))
@@ -807,6 +877,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     state = read_board(_board_path(data_dir), sweep_id)
     if state is None:
         return None
+    state["uncarded"] = uncarded_agents(scan_marker)
     # Archiving the sweep, or every one of its cards, is how a person, the
     # re-arm runbook or a bench stack cancels it, often to plant a raw file of
     # their own; writing over that file once the deadline passed would undo
@@ -816,7 +887,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None
     agents = (roster() if callable(roster) else roster) or []
-    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id)
+    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id, cap=first_run_cluster_cards(data_dir))
     if filed_now:
         # The cards just filed have not run; nothing is settled this tick.
         return None

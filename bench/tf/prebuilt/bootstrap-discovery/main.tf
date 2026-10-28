@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
-# onboarding discovery gate on the install under test, wait for the
+# The scenario driver for bench/tasks/bootstrap-discovery-fanout and
+# bench/tasks/bootstrap-discovery-capped: re-arm the onboarding discovery gate on the install under test, wait for the
 # `bootstrap-inventory-scan` cron job to file a fresh sweep card, then wait for
 # the hand-off to the ranking stage: return once the hand-off's own card keyed
 # `bootstrap-inventory-prioritize` is on the board, or once the sweep and its
@@ -25,6 +25,11 @@
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
 # README.md §5: the previous run's `bootstrap-inventory-*` cards are archived,
 # newest first, and then the markers are removed.
+#
+# With `first_run_cluster_cards` set, step 2 first writes it to the agent's
+# `.first_run_cluster_cards`, the gate's first-run cluster card cap (#3702), so
+# the sweep the re-arm brings on is filed under it. The exit trap and the
+# destroy remove that file again.
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
@@ -84,6 +89,10 @@ locals {
   # none. A pod created in that time is not running yet and fails the exec
   # anyway, so kubectl's default of 60s only delays each failure by a minute.
   pod_wait = 5
+  # bootstrap_handoff.py's FIRST_RUN_CLUSTER_CARDS_FILE, and the value step 2
+  # writes there: empty when first_run_cluster_cards is null, so no file.
+  cap_file  = "${local.home}/.first_run_cluster_cards"
+  cards_cap = var.first_run_cluster_cards == null ? "" : tostring(var.first_run_cluster_cards)
 }
 
 resource "null_resource" "sweep" {
@@ -102,6 +111,8 @@ resource "null_resource" "sweep" {
     python            = local.python
     key_like          = local.key_like
     inventory         = local.inventory
+    cap_file          = local.cap_file
+    cards_cap         = local.cards_cap
   }
 
   provisioner "local-exec" {
@@ -118,6 +129,7 @@ resource "null_resource" "sweep" {
       # cleans up here or the sweep's cards keep their dispatcher slots.
       # errexit stays in force inside a trap, hence `set +e`.
       rearmed=""
+      capped=""
       on_exit() {
         status=$?
         # A second signal would end the cleanup part-way.
@@ -169,6 +181,11 @@ resource "null_resource" "sweep" {
             agent ${local.hermes} kanban archive "$id" >&2 || failed="$failed, archive $id"
           done
           clear_inventory || failed="$failed, remove the INVENTORY files"
+          # Terraform skips the destroy after a failed create, so this is the
+          # only removal the cap step 2 wrote gets.
+          if [ -n "$capped" ]; then
+            agent rm -f ${local.cap_file} >&2 || failed="$failed, remove ${local.cap_file}"
+          fi
           if [ -n "$failed" ]; then
             echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
           fi
@@ -330,6 +347,16 @@ resource "null_resource" "sweep" {
       PY
       )"
       rearmed=1
+      # The cap goes in before anything the gate acts on changes, so whichever
+      # gate run files the new sweep reads it: on an install whose gate was
+      # open, that run can come before the markers are removed below. Marked
+      # first, so the trap also removes a write that failed part-way.
+      cap="${local.cards_cap}"
+      if [ -n "$cap" ]; then
+        capped=1
+        agent sh -c 'printf "%s\n" "$1" > "$2"' sh "$cap" ${local.cap_file}
+        echo "First-run cluster card cap set to $cap in ${local.cap_file}."
+      fi
       # Listed first: a failure inside a `for` word list fails nothing.
       ids="$(open_cards)"
       for id in $ids; do
@@ -496,6 +523,15 @@ resource "null_resource" "sweep" {
         done
       else
         failed="$failed, list the sandbox pods"
+      fi
+      # The cap goes only where this stack wrote it. With first_run_cluster_cards
+      # null nothing was written, and a file there is an operator's setting on
+      # that install, which the gate honours on every first run; removing it
+      # would undo a choice this case never made. Left behind, the cap would
+      # bound the next sweep, the next case's and the install's real onboarding.
+      if [ -n "${self.triggers.cards_cap}" ]; then
+        kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+          rm -f ${self.triggers.cap_file} || failed="$failed, remove ${self.triggers.cap_file}"
       fi
       if [ -n "$failed" ]; then
         echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2

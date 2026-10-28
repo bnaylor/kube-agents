@@ -46,7 +46,7 @@ reach it, an entry in `gaps` saying so.
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
 clusters Step 1 kept, after dropping the excluded ones, that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
+The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
 `cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
 shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup
 probe, read-only root filesystem, added capabilities, namespace quota, addons, observability and

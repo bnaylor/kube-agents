@@ -276,6 +276,7 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     state = bootstrap_handoff.read_board(board, sweep_id)
     if state is None:
         return False
+    state["uncarded"] = bootstrap_handoff.uncarded_agents(data_dir / SCAN_FILED_MARKER)
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
         _log(

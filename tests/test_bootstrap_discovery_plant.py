@@ -87,6 +87,9 @@ _INTERPOLATIONS = {
     "local.prioritize_key": "bootstrap-inventory-prioritize",
     "local.handoff_wait": "1800",
     "local.settle_hold": "120",
+    "local.cap_file": "/opt/data/.first_run_cluster_cards",
+    # first_run_cluster_cards null, as bootstrap-discovery-fanout runs it.
+    "local.cards_cap": "",
     "var.project_id": "kube-agents-evals",
     "var.host_cluster_name": "platform-agent-host",
     "var.host_cluster_location": "us-central1",
@@ -112,6 +115,8 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.python": _INTERPOLATIONS["local.python"],
     "self.triggers.key_like": _INTERPOLATIONS["local.key_like"],
     "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
+    "self.triggers.cap_file": _INTERPOLATIONS["local.cap_file"],
+    "self.triggers.cards_cap": _INTERPOLATIONS["local.cards_cap"],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -179,6 +184,11 @@ elif "task_id=$1" in script:
         sys.exit(1)
     if os.environ.get("SIGNAL_ON_RESTORE"):
         os.kill(os.getppid(), getattr(signal, "SIG" + os.environ["SIGNAL_ON_RESTORE"]))
+elif "/opt/data/.first_run_cluster_cards" in cmd:
+    record("uncap" if "rm" in cmd else "cap")
+    if "rm" not in cmd and os.environ.get("CAP_FAIL") == "1":
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
 elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
@@ -230,8 +240,8 @@ def _render_plant(**overrides: str) -> str:
     return _render(_PLANT_BLOCK, {**_INTERPOLATIONS, **overrides})
 
 
-def _render_destroy() -> str:
-    return _render(_DESTROY_BLOCK, _DESTROY_INTERPOLATIONS)
+def _render_destroy(**overrides: str) -> str:
+    return _render(_DESTROY_BLOCK, {**_DESTROY_INTERPOLATIONS, **overrides})
 
 
 def _render(block: int, interpolations: dict) -> str:
@@ -567,6 +577,57 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual([c for c in calls if "[gate " in c], [])
         self.assertEqual(calls.count("sleep 5"), 300 // 5)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+
+    # --- first_run_cluster_cards (#3702) ------------------------------------
+
+    def _capped(self):
+        """Swap in the provisioners as rendered with first_run_cluster_cards = 2."""
+        self._script.write_text(_render_plant(**{"local.cards_cap": "2"}))
+        self._destroy_script.write_text(_render_destroy(**{"self.triggers.cards_cap": "2"}))
+
+    def test_an_unset_cap_writes_and_removes_no_file(self):
+        completed, calls = self._run_handoff()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        failed, _ = self._run(GATE_FILES=0)
+        self.assertNotEqual(failed.returncode, 0)
+        destroyed, calls = self._run(self._destroy_script)
+        self.assertEqual(destroyed.returncode, 0, destroyed.stderr)
+        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]"))], [])
+
+    def test_a_set_cap_is_written_before_the_re_arm(self):
+        self._capped()
+        completed, calls = self._run_handoff()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        cap = self._indices(calls, "[cap]")
+        self.assertEqual(len(cap), 1, calls)
+        self.assertIn(" sh 2 /opt/data/.first_run_cluster_cards [cap]", calls[cap[0]])
+        # Before the gate can act: ahead of the card archive and the marker removal.
+        self.assertLess(self._indices(calls, "[old_id]")[0], cap[0])
+        self.assertLess(cap[0], self._indices(calls, "[open_cards]")[0])
+        self.assertLess(cap[0], self._indices(calls, "[rearm]")[0])
+        # A plant that succeeds leaves it for the verifier; the destroy removes it.
+        self.assertEqual(self._indices(calls, "[uncap]"), [])
+        self.assertIn("First-run cluster card cap set to 2", completed.stdout)
+
+    def test_the_destroy_removes_a_cap_it_set(self):
+        self._capped()
+        completed, calls = self._run(self._destroy_script)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[uncap]")), 1, calls)
+
+    def test_the_trap_removes_the_cap_after_a_failed_plant(self):
+        self._capped()
+        completed, calls = self._run(GATE_FILES=0)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("filed no sweep card", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[uncap]")), 1, calls)
+
+    def test_a_cap_write_that_fails_stops_the_apply_and_is_removed(self):
+        self._capped()
+        completed, calls = self._run(CAP_FAIL=1)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self._indices(calls, "[rearm]"), [])
+        self.assertEqual(len(self._indices(calls, "[uncap]")), 1, calls)
 
 
 class Step1StateQueryTest(unittest.TestCase):

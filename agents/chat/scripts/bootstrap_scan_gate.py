@@ -180,7 +180,7 @@ def _reconcile_script(data_dir: Path) -> Path:
     return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
-def cluster_agents() -> list[dict]:
+def cluster_agents(capped: bool = True) -> list[dict]:
     """The ready Cluster Agents, one ``{name, key, title, cluster_label}`` each.
 
     The gate files one card per entry itself (``bootstrap_handoff``) and lists
@@ -212,6 +212,11 @@ def cluster_agents() -> list[dict]:
     files the sweep, so it must not take the other profiles with it. An entry
     whose stat fails with EACCES or EIO fails ``list_profiles`` itself, below;
     ``list_profiles`` leaves out a dangling symlink.
+
+    At most ``bootstrap_handoff.first_run_cluster_cards`` entries, the first by
+    profile name (#3702): each entry is a model turn before the user has asked
+    anything, and a cluster past the cap is left to the sweep, the same as one
+    whose profile is not ready.
 
     Failing to list the profiles, or to import the readiness rule, returns an
     empty list, which files the solo sweep. Raising would fail the run before
@@ -261,7 +266,18 @@ def cluster_agents() -> list[dict]:
             "title": f"Report cluster inventory: {label}",
             "cluster_label": label,
         })
-    return agents
+    # The first-run cap (#3702): the first so many by profile name, a stable
+    # order across ticks; the rest stay off the roster, so the sweep audits them.
+    agents.sort(key=lambda a: a["name"])
+    if not capped:
+        return agents
+    cap = bootstrap_handoff.first_run_cluster_cards(_data_dir())
+    if len(agents) > cap:
+        sys.stderr.write(
+            f"bootstrap_scan_gate: {len(agents)} Cluster Agents are ready; the first {cap} get audit cards "
+            "and the sweep audits the rest\n"
+        )
+    return agents[:cap]
 
 
 def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
@@ -573,7 +589,17 @@ def _task_body() -> str:
     lifecycle_holds = "the scope and its exclusions" if multi else "the `RECONCILE_EXCLUDE` opt-out"
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
-    roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in cluster_agents()) or "    (none)"
+    ready = cluster_agents(capped=False)
+    kept = ready[: bootstrap_handoff.first_run_cluster_cards(_data_dir())]
+    roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in kept) or "    (none)"
+    past_cap = ready[len(kept):]
+    past_cap_note = (
+        "**Past the first-run cap.** These clusters have a Cluster Agent but get no card this "
+        "sweep, to keep onboarding's model turns bounded. Audit them yourself in Step 3, like a "
+        "cluster the list does not name, and do not report them as lacking an agent:\n"
+        + "\n".join(f"    - {a['cluster_label']}" for a in past_cap)
+        + "\n\n"
+    ) if past_cap else ""
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -610,7 +636,7 @@ def _task_body() -> str:
         f"{_excluded_clusters_paragraph(_data_dir())}"
         "**Step 2 — do not fan out; the gate has.** This gate files one audit card per Cluster "
         "Agent itself, read from the profiles when this card was filed:\n\n"
-        f"{roster}\n\n"
+        f"{roster}\n\n{past_cap_note}"
         "**Do not create cluster cards, and do not look the roster up yourself:** your terminal "
         "runs in a sandbox that has neither `hermes` nor the profiles' configuration. **If the "
         "list above is `(none)`, there are no Cluster Agents: audit every cluster yourself in "
@@ -691,12 +717,13 @@ def file_scan_task(data_dir: Path) -> str | None:
         )
         return None
 
-    _mark_filed(data_dir, task_id)
+    ready = cluster_agents(capped=False)
+    _mark_filed(data_dir, task_id, uncarded=max(0, len(ready) - bootstrap_handoff.first_run_cluster_cards(data_dir)))
     sys.stderr.write(f"bootstrap_scan_gate: filed sweep card {task_id}\n")
     return task_id
 
 
-def _mark_filed(data_dir: Path, task_id: str) -> None:
+def _mark_filed(data_dir: Path, task_id: str, uncarded: int = 0) -> None:
     """Record the filed card so no later tick files a second one.
 
     Written with the card id and timestamp rather than an empty touch file:
@@ -706,7 +733,7 @@ def _mark_filed(data_dir: Path, task_id: str) -> None:
     marker = data_dir / SCAN_FILED_MARKER
     try:
         marker.write_text(
-            f"task_id={task_id}\nfiled_at={int(time.time())}\n",
+            f"task_id={task_id}\nfiled_at={int(time.time())}\n" + (f"uncarded={uncarded}\n" if uncarded else ""),
             encoding="utf-8",
         )
     except Exception as e:  # noqa: BLE001 - never fail the cron run
